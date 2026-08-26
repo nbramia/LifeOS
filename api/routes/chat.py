@@ -275,12 +275,21 @@ async def chat_config():
     never auto-escalated to. Unconfigured (no base URL/model/key) means
     `remote_model_available` is False and `remote_model_label` is "" — the
     picker hides the option and every existing path is unaffected.
+
+    `voice_endpoint_silence_ms`/`voice_endpoint_hard_cap_ms` (#718) drive
+    smart turn endpointing's VAD timing in auto-mode voice recording — see
+    `web/chat/voice.js`. `voice_endpoint_semantic` is reserved for a future
+    optional completeness classifier and is currently unwired on the client
+    (see `config/settings.py`'s `voice_endpoint_semantic` docstring).
     """
     return {
         "default_voice": bool(settings.chat_default_voice),
         "secure_url": (settings.tailnet_https_url or "").rstrip("/"),
         "remote_model_available": settings.remote_llm_configured,
         "remote_model_label": settings.remote_llm_label if settings.remote_llm_configured else "",
+        "voice_endpoint_silence_ms": settings.voice_endpoint_silence_ms,
+        "voice_endpoint_hard_cap_ms": settings.voice_endpoint_hard_cap_ms,
+        "voice_endpoint_semantic": bool(settings.voice_endpoint_semantic),
     }
 
 

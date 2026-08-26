@@ -202,6 +202,40 @@ class Settings(BaseSettings):
         description="whisper-relay voice gateway base URL"
     )
 
+    # Smart turn endpointing (#718): while auto-continue is on, the web client
+    # runs an energy VAD on the live recording stream and, after this much
+    # trailing silence following speech, POSTs the audio-so-far to the bare-STT
+    # route (POST /api/voice/transcribe) to check whether the user sounds done.
+    # Read by GET /api/chat/config -> web/chat/voice.js; both are pure client-
+    # side timing knobs, not used anywhere server-side.
+    voice_endpoint_silence_ms: int = Field(
+        default=1600,
+        alias="LIFEOS_VOICE_ENDPOINT_SILENCE_MS",
+        description="Trailing silence (ms) after speech in auto-mode voice recording "
+                    "before a candidate turn-endpoint check runs"
+    )
+    voice_endpoint_hard_cap_ms: int = Field(
+        default=3000,
+        alias="LIFEOS_VOICE_ENDPOINT_HARD_CAP_MS",
+        description="Continuous silence (ms) in auto-mode voice recording that finalizes "
+                    "the turn regardless of the completeness check, so it can never hang"
+    )
+    # Reserved for an optional LLM completeness classifier for ambiguous
+    # candidate transcripts (no terminal punctuation, no trailing filler word
+    # either) — see isTranscriptComplete()'s doc comment in web/chat/voice.js.
+    # Not implemented yet: it would need a new server endpoint (a classify
+    # call analogous to conversation_titler.py's generate_text() use), which
+    # is out of scope for this change. Left False and unwired on the client —
+    # flipping it currently has no effect; the heuristic alone governs every
+    # completeness decision.
+    voice_endpoint_semantic: bool = Field(
+        default=False,
+        alias="LIFEOS_VOICE_ENDPOINT_SEMANTIC",
+        description="Reserved for an optional LLM completeness classifier for ambiguous "
+                    "auto-mode turn endpoints. Not implemented — has no effect yet; the "
+                    "heuristic alone governs completeness regardless of this setting."
+    )
+
     # Agent text backend (OpenClaw voice-adapter). LifeOS proxies the "Agent"
     # text backend to /api/ask/stream here, adding the bearer token server-side
     # so it's never exposed to the browser (#361). Empty url = Agent disabled.

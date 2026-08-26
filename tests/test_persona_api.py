@@ -725,11 +725,26 @@ class TestChatConfigEndpoint:
         monkeypatch.setattr("api.routes.chat.settings.chat_default_voice", False, raising=False)
         assert client.get("/api/chat/config").json() == {
             "default_voice": False, "secure_url": "",
-            "remote_model_available": False, "remote_model_label": ""}
+            "remote_model_available": False, "remote_model_label": "",
+            "voice_endpoint_silence_ms": 1600, "voice_endpoint_hard_cap_ms": 3000,
+            "voice_endpoint_semantic": False}
         monkeypatch.setattr("api.routes.chat.settings.chat_default_voice", True, raising=False)
         assert client.get("/api/chat/config").json() == {
             "default_voice": True, "secure_url": "",
-            "remote_model_available": False, "remote_model_label": ""}
+            "remote_model_available": False, "remote_model_label": "",
+            "voice_endpoint_silence_ms": 1600, "voice_endpoint_hard_cap_ms": 3000,
+            "voice_endpoint_semantic": False}
+
+    # voice_endpoint_* (#718) drive the web client's smart turn endpointing
+    # VAD timing in auto-mode voice recording — see web/chat/voice.js.
+    def test_voice_endpoint_settings_reflect_config(self, client, monkeypatch):
+        monkeypatch.setattr("api.routes.chat.settings.voice_endpoint_silence_ms", 2200, raising=False)
+        monkeypatch.setattr("api.routes.chat.settings.voice_endpoint_hard_cap_ms", 4500, raising=False)
+        monkeypatch.setattr("api.routes.chat.settings.voice_endpoint_semantic", True, raising=False)
+        data = client.get("/api/chat/config").json()
+        assert data["voice_endpoint_silence_ms"] == 2200
+        assert data["voice_endpoint_hard_cap_ms"] == 4500
+        assert data["voice_endpoint_semantic"] is True
 
     # secure_url is the web client's one-tap escape from an insecure context to
     # the HTTPS origin the mic needs (#516).

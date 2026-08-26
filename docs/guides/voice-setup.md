@@ -58,6 +58,11 @@ These variables are read by `config/settings.py` (aliases shown). They are **not
 |----------|---------|--------|
 | `LIFEOS_VOICE_GATEWAY_URL` | `http://127.0.0.1:9788` | whisper-relay base URL that LifeOS reverse-proxies `/api/voice/*` to. Override only if the gateway runs on a different local port. |
 | `LIFEOS_CHAT_DEFAULT_VOICE` | `false` | Makes voice the **default** `/chat` input mode. Left off so a fresh clone with no gateway isn't dropped onto a non-functional dock. A `?mode=` URL param or a stored per-browser preference still overrides it. |
+| `LIFEOS_VOICE_ENDPOINT_SILENCE_MS` | `1600` | Smart turn endpointing (below): trailing silence, in ms, after speech before a candidate endpoint check runs. |
+| `LIFEOS_VOICE_ENDPOINT_HARD_CAP_MS` | `3000` | Smart turn endpointing: continuous silence, in ms, that finalizes the turn regardless of any completeness verdict. |
+| `LIFEOS_VOICE_ENDPOINT_SEMANTIC` | `false` | Reserved for an optional LLM completeness classifier — **not implemented**; flipping it currently has no effect. The heuristic alone governs completeness. |
+
+These three, along with `default_voice`/`secure_url`/the remote-model fields, are read by the web client from `GET /api/chat/config` — the endpointing pair are pure client-side VAD timing knobs with no server-side use; they exist as settings only so that timing is operator-tunable without editing `web/chat/voice.js`.
 
 Restart the API after editing `.env`:
 
@@ -74,7 +79,7 @@ In voice mode the text composer is replaced by the dock:
 - Four dock toggles (state saved per browser):
   - **Mute** — suppress spoken playback (the reply still returns as text).
   - **2×** — play spoken replies at double speed.
-  - **Auto** — auto-continue: after a reply finishes, start listening for the next turn without another tap.
+  - **Auto** — auto-continue: after a reply finishes, start listening for the next turn without another tap. While Auto is on, a recording also **ends itself** once you sound done — see "Smart turn endpointing" below — instead of always waiting for another tap.
   - **Listening** — wake-word mode, default off (#710). While on, the page holds its own mic stream and runs a local energy-based VAD (no third-party wake-word engine, no Web Speech API — that ships audio to Google). When it hears a speech burst end, it POSTs the short clip to `${voice gateway}/api/voice/transcribe` and fuzzy-matches the transcript against "Hermes" (tolerating whisper-isms like "Hermès" or "her mes" — see `matchesWakeWord()` in `web/chat/voice.js`); a match plays a short confirmation chime, then starts recording exactly as a talk-button tap would. Detection is suspended while recording, while a turn is in flight, and while a spoken reply or the chime is playing (so the assistant — or the chime itself — can never wake it), and resumes after. Leaving voice mode or unchecking Listening releases its mic entirely. **Requires a `/api/voice/transcribe` route on the voice gateway that does not exist yet as of this writing** — see the note below.
 
 ### The wake-confirmation chime
@@ -85,9 +90,24 @@ Both the sound files and the manifest are optional. If `web/chat/wake-sounds/` o
 
 **Attribution**: the bundled sound set is drawn from the PeonPing community packs — `jarvis-mk2`, `eve-walle`, `d2_deckard_cain`, and `diablo-drops` — licensed **CC-BY-NC-4.0** (non-commercial use, attribution required). This is the sole attribution notice for those files; see the license text for full terms if redistributing.
 
-### Listening's dependency: a bare-STT gateway route (not yet shipped)
+### Smart turn endpointing
 
-whisper-relay's `POST /api/voice/turn` and `/turn/stream` always run the full STT→LLM→TTS pipeline. Listening needs a **transcribe-only** route with no LLM call, no TTS, no conversation/turn persistence — it must be safe to call every second or two without creating any artifacts. LifeOS's `/api/voice/*` proxy already forwards any path generically (`api/routes/voice.py`), so once the gateway adds `POST /api/voice/transcribe` (multipart `audio` file in, `{"transcript": "..."}` out — the same audio normalization + `STTAdapter.transcribe()` step `turns.py` already uses internally, minus everything after it), Listening picks it up with no LifeOS-side change. Until then, every wake check 404s and Listening's toggle/mic-hold/VAD still work but never actually trigger.
+While **Auto** is on, a voice recording no longer only stops when you tap the talk button again — it also infers, mid-recording, when you've likely finished speaking, and ends and sends the turn itself. This runs entirely inside `web/chat/voice.js`, on the **same** recording stream the talk button already acquired (never a second microphone request), so it composes with Listening's own mic hold and wake detection above without conflict.
+
+The pipeline (`checkEndpointCandidate()`/`isTranscriptComplete()`/`handleEndpointFrame()` in `web/chat/voice.js`):
+
+1. **Pause detection.** The same local energy-VAD Listening uses for wake-burst detection runs on the recording. After `LIFEOS_VOICE_ENDPOINT_SILENCE_MS` (default 1600ms) of trailing silence *following speech*, the recording-so-far is a **candidate** endpoint — not a final decision yet.
+2. **Transcribe-so-far.** The candidate's audio is POSTed to the same bare-STT route Listening's wake check uses, `POST /api/voice/transcribe` (see the dependency note below) — no conversation/turn artifacts either way.
+3. **Completeness heuristic.** `isTranscriptComplete()` treats trailing terminal punctuation (`.`/`?`/`!`) as a finished thought. A trailing conjunction/filler word — "and", "but", "so", "because", "or", "if", "then", "um", "uh", "like", "i mean" — or no terminal punctuation at all reads as still-talking. Whisper often omits punctuation on short clips, so "no punctuation" alone is a soft signal; a false "keep listening" only costs one more candidate check (or the hard cap below), never a hang, so the heuristic is deliberately conservative about calling a turn complete.
+4. **Act.** Complete → the turn ends and sends through the exact same path a manual stop-tap uses. Incomplete → recording continues; if you keep talking, the silence timer re-arms for the next pause. Either way, `LIFEOS_VOICE_ENDPOINT_HARD_CAP_MS` (default 3000ms) of *continuous* silence ends the turn regardless of any completeness verdict, so an ambiguous or unreachable check can never leave the mic open forever.
+
+`LIFEOS_VOICE_ENDPOINT_SEMANTIC` is a reserved setting for an optional LLM completeness classifier on ambiguous candidates (no terminal punctuation, no recognized filler word either). It is **not implemented** — there is no server endpoint backing it, and flipping it currently has no effect. The heuristic above is the only completeness signal today.
+
+Endpointing only ever runs while Auto is on, voice mode is active, and a recording is actually in progress; with Auto off, recording behaves exactly as it always has — only a tap ends it.
+
+### The bare-STT gateway route (not yet shipped)
+
+Both Listening (above) and smart turn endpointing depend on the same **transcribe-only** gateway route, `POST /api/voice/transcribe` — no LLM call, no TTS, no conversation/turn persistence, safe to call every second or two without creating any artifacts. whisper-relay's `POST /api/voice/turn` and `/turn/stream` always run the full STT→LLM→TTS pipeline instead. LifeOS's `/api/voice/*` proxy already forwards any path generically (`api/routes/voice.py`), so once the gateway adds `POST /api/voice/transcribe` (multipart `audio` file in, `{"transcript": "..."}` out — the same audio normalization + `STTAdapter.transcribe()` step `turns.py` already uses internally, minus everything after it), both features pick it up with no LifeOS-side change. Until then, every wake check and endpointing candidate check 404s (`transcribeClip()` in `web/chat/voice.js` treats that as "no transcript" and moves on, not an error), so Listening never actually triggers and an endpointing candidate never gets a "complete" verdict from step 3 above. The hard cap in step 4, though, is a pure client-side silence timer with no dependency on this route — it still fires on schedule either way, so under Auto a recording that goes quiet for `LIFEOS_VOICE_ENDPOINT_HARD_CAP_MS` still ends and sends itself even before the gateway ships this route; it just never ends *early* on a genuinely finished sentence until it does.
 
 Each spoken response bubble is also **tap-to-replay** — tap it to hear the reply again. (Replay is a per-response affordance, not a dock toggle.) Empty or silent recordings are **skipped automatically** by silence detection — there is no manual "skip silent" control.
 
@@ -127,6 +147,7 @@ On the **Hermes** backend an orchestrating persona's spoken turn never spawns an
 | `Agent` toggle missing | Expected unless `LIFEOS_AGENT_BACKEND_URL` is set. |
 | `Hermes` toggle missing | Expected unless `LIFEOS_HERMES_BACKEND_URL` is set. |
 | `Listening` never triggers recording | Expected until the gateway ships `POST /api/voice/transcribe` — see above. |
+| Auto-mode recording never ends itself on a finished sentence, only on the hard cap or a tap | Expected until the gateway ships `POST /api/voice/transcribe` — see above; the hard cap alone still fires on schedule. |
 
 ---
 
