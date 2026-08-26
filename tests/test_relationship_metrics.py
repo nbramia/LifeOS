@@ -190,3 +190,59 @@ class TestRelationshipStrength:
         )
         # Check it's a reasonable precision (1 decimal for 0-100 scale)
         assert len(str(strength).split(".")[-1]) <= 1
+
+
+class TestSelfStrength:
+    """The CRM owner's strength is anchored, not computed.
+
+    Regression guard: computing it from interactions scores the owner against
+    *themselves* -- self-addressed mail, self-invited events, notes they appear
+    in -- which put the owner at 94.3 on a real install, ranking them below
+    their own partner in their own CRM.
+    """
+
+    def _owner(self, person_id="owner-id"):
+        from api.services.person_entity import PersonEntity
+        return PersonEntity(id=person_id, canonical_name="Owner", display_name="Owner")
+
+    def test_owner_is_pinned_to_max(self, monkeypatch):
+        from config.settings import settings
+        from api.services import relationship_metrics as rm
+
+        person = self._owner()
+        monkeypatch.setattr(settings, "my_person_id", person.id, raising=False)
+        assert rm.compute_strength_for_person(person) == rm.SELF_STRENGTH
+        assert rm.SELF_STRENGTH == 100.0
+
+    def test_owner_check_precedes_interaction_lookup(self, monkeypatch):
+        """The short-circuit must not depend on the interaction store at all."""
+        from config.settings import settings
+        from api.services import relationship_metrics as rm
+
+        person = self._owner()
+        monkeypatch.setattr(settings, "my_person_id", person.id, raising=False)
+
+        def _boom():
+            raise AssertionError("interaction store must not be consulted for the owner")
+
+        monkeypatch.setattr(rm, "get_interaction_store", _boom)
+        assert rm.compute_strength_for_person(person) == rm.SELF_STRENGTH
+
+    def test_non_owner_is_not_pinned(self, monkeypatch):
+        """Everyone else still goes through the normal computation."""
+        from config.settings import settings
+        from api.services import relationship_metrics as rm
+
+        monkeypatch.setattr(settings, "my_person_id", "somebody-else", raising=False)
+        person = self._owner(person_id="not-the-owner")
+        # No interactions -> a real computation yields far below the anchor.
+        assert rm.compute_strength_for_person(person) < rm.SELF_STRENGTH
+
+    def test_unset_owner_id_does_not_pin_everyone(self, monkeypatch):
+        """A blank my_person_id must not make every person the owner."""
+        from config.settings import settings
+        from api.services import relationship_metrics as rm
+
+        monkeypatch.setattr(settings, "my_person_id", "", raising=False)
+        person = self._owner(person_id="")
+        assert rm.compute_strength_for_person(person) < rm.SELF_STRENGTH

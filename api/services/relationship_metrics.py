@@ -13,12 +13,12 @@ Interaction weights are applied per source_type (e.g., imessage=1.5, gmail=0.8).
 See config/relationship_weights.py for all weights.
 """
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 from api.services.person_entity import PersonEntity, get_person_entity_store, compute_person_category
 from api.services.interaction_store import get_interaction_store
-from api.services.source_entity import get_source_entity_store, SOURCE_TYPES
+from api.services.source_entity import SOURCE_TYPES
 
 # Import weights from centralized config
 from config.relationship_weights import (
@@ -31,7 +31,6 @@ from config.relationship_weights import (
     get_interaction_weight,
     compute_weighted_interaction_count,
     compute_weighted_interaction_count_detailed,
-    INTERACTION_TYPE_WEIGHTS,
     USE_LOG_FREQUENCY_SCALING,
     LIFETIME_FREQUENCY_ENABLED,
     LIFETIME_FREQUENCY_WEIGHT,
@@ -270,6 +269,11 @@ def compute_relationship_strength_weighted(
     return round(strength * 100, 1)
 
 
+# Relationship strength for the CRM owner. Fixed rather than computed -- see
+# the short-circuit in compute_strength_for_person.
+SELF_STRENGTH = 100.0
+
+
 def compute_strength_for_person(person: PersonEntity) -> float:
     """
     Compute relationship strength for a PersonEntity.
@@ -292,6 +296,15 @@ def compute_strength_for_person(person: PersonEntity) -> float:
     """
     from api.services.relationship import get_relationship_store, TYPE_FAMILY
     from config.settings import settings
+
+    # The CRM owner is not a relationship to be scored. Their strength would
+    # otherwise be computed from interactions *with themselves* -- whatever
+    # happens to be self-addressed mail, self-invited calendar events, notes
+    # they appear in -- which produced a nonsensical 94.3 on Taylor's install,
+    # ranking her below her own partner in her own CRM. Anchor it at the
+    # maximum so "me" always sorts first and never drifts with mailbox noise.
+    if settings.my_person_id and person.id == settings.my_person_id:
+        return SELF_STRENGTH
 
     interaction_store = get_interaction_store()
 
