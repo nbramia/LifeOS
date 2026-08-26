@@ -279,3 +279,110 @@ We discussed the Q4 budget projections and identified cost reduction opportuniti
         assert len(summary) <= 500
         # Should mention key topics
         assert any(word in summary.lower() for word in ["budget", "meeting", "q4", "review"])
+
+
+class TestSummarizerEndpointConfig:
+    """The summarizer endpoint/model override, and its fallback.
+
+    llama-server serves one model per process and ignores the request's
+    "model" field; Ollama requires a real tag. Hosts with no llama-server
+    (Taylor's Mac mini) otherwise fail every summary with connection refused,
+    silently dropping the vault index's whole summary layer.
+    """
+
+    def _mock_post(self, mock_client_class, content="A summary that is comfortably long enough."):
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        resp = MagicMock()
+        resp.json.return_value = {"choices": [{"message": {"content": content}}]}
+        resp.raise_for_status = MagicMock()
+        mock_client.post.return_value = resp
+        return mock_client
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_defaults_preserve_llama_server_behaviour(self, mock_client_class, monkeypatch):
+        """Unset override => local_llm_url and the 'local' placeholder model."""
+        from config.settings import settings
+        from api.services import summarizer
+
+        monkeypatch.setattr(settings, "summarizer_llm_url", "", raising=False)
+        monkeypatch.setattr(settings, "summarizer_model", "local", raising=False)
+        monkeypatch.setattr(settings, "local_llm_url", "http://localhost:8080", raising=False)
+
+        client = self._mock_post(mock_client_class)
+        summarizer.generate_summary("x" * 200, "note.md")
+
+        url, kwargs = client.post.call_args[0][0], client.post.call_args[1]
+        assert url == "http://localhost:8080/v1/chat/completions"
+        assert kwargs["json"]["model"] == "local"
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_override_redirects_endpoint_and_model(self, mock_client_class, monkeypatch):
+        from config.settings import settings
+        from api.services import summarizer
+
+        monkeypatch.setattr(settings, "summarizer_llm_url", "http://localhost:11434", raising=False)
+        monkeypatch.setattr(settings, "summarizer_model", "qwen2.5:3b-instruct", raising=False)
+        monkeypatch.setattr(settings, "local_llm_url", "http://localhost:8080", raising=False)
+
+        client = self._mock_post(mock_client_class)
+        summarizer.generate_summary("x" * 200, "note.md")
+
+        url, kwargs = client.post.call_args[0][0], client.post.call_args[1]
+        assert url == "http://localhost:11434/v1/chat/completions"
+        assert kwargs["json"]["model"] == "qwen2.5:3b-instruct"
+
+    def test_trailing_slash_does_not_double_up(self, monkeypatch):
+        from config.settings import settings
+        from api.services.summarizer import _summarizer_base_url
+
+        monkeypatch.setattr(settings, "summarizer_llm_url", "http://localhost:11434/", raising=False)
+        assert _summarizer_base_url() == "http://localhost:11434"
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_availability_accepts_ollama_via_v1_models(self, mock_client_class, monkeypatch):
+        """Ollama has no /health; probing only that would call it unavailable."""
+        from config.settings import settings
+        from api.services.summarizer import is_summarizer_llm_available
+
+        monkeypatch.setattr(settings, "summarizer_llm_url", "http://localhost:11434", raising=False)
+
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+
+        def get(url):
+            r = MagicMock()
+            r.status_code = 404 if url.endswith("/health") else 200
+            return r
+
+        mock_client.get.side_effect = get
+        assert is_summarizer_llm_available() is True
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_availability_still_accepts_llama_server_health(self, mock_client_class, monkeypatch):
+        from config.settings import settings
+        from api.services.summarizer import is_summarizer_llm_available
+
+        monkeypatch.setattr(settings, "summarizer_llm_url", "", raising=False)
+        monkeypatch.setattr(settings, "local_llm_url", "http://localhost:8080", raising=False)
+
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        resp = MagicMock()
+        resp.status_code = 200
+        mock_client.get.return_value = resp
+
+        assert is_summarizer_llm_available() is True
+        assert mock_client.get.call_args_list[0][0][0].endswith("/health")
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_availability_false_when_neither_probe_answers(self, mock_client_class, monkeypatch):
+        from config.settings import settings
+        from api.services.summarizer import is_summarizer_llm_available
+
+        monkeypatch.setattr(settings, "summarizer_llm_url", "", raising=False)
+        mock_client_class.side_effect = Exception("connection refused")
+        assert is_summarizer_llm_available() is False
