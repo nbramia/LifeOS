@@ -189,6 +189,40 @@ class TestBackendTaggingField:
         assert tagged_conv.backend == "hermes"
 
 
+class TestConversationTitlingSeam:
+    """Verifies `/api/ask/stream` invokes the shared post-turn titling seam
+    (api/services/conversation_titler.py) once the turn finishes — the
+    seam's own behavior (not-before-2nd-message, sanitization,
+    failure-safety) is unit-tested directly in test_conversation_titler.py;
+    this only pins that the native chat path calls it, with the turn's own
+    conversation id, alongside (not instead of) the pre-existing
+    first-message truncation title (`generate_title()`)."""
+
+    @pytest.fixture
+    def client(self):
+        return TestClient(app)
+
+    def test_schedule_retitle_called_with_the_turns_conversation_id(self, client):
+        with patch('api.routes.chat.VectorStore') as mock_vs, \
+                patch('api.routes.chat.get_synthesizer') as mock_synth, \
+                patch('api.routes.chat.schedule_retitle') as mock_retitle:
+            mock_vs.return_value.search.return_value = []
+
+            async def mock_stream(*args, **kwargs):
+                yield "Test response"
+            mock_synth.return_value.stream_response = mock_stream
+
+            response = client.post("/api/ask/stream", json={"question": "test question"})
+
+        assert response.status_code == 200
+        import re
+        m = re.search(r'"conversation_id": "([^"]+)"', response.text)
+        assert m, f"no conversation_id event in: {response.text!r}"
+        conv_id = m.group(1)
+
+        mock_retitle.assert_called_once_with(conv_id)
+
+
 class TestChatRequestValidation:
     """Test request validation for chat endpoints."""
 

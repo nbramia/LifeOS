@@ -65,6 +65,7 @@ from api.routes.chat import AskStreamRequest, journal_capture_gate, resolve_effe
 from api.services.agent_system_prompt import build_turn_context
 from api.services.chat_turns import TRUNCATION_MARKER, get_turn_registry, truncation_routing
 from api.services.conversation_store import get_store
+from api.services.conversation_titler import schedule_retitle
 from api.services.hermes_persona_thread_store import get_persona_thread_store
 from api.services.journal_capture import JOURNAL_PERSONA_ID
 from api.services.model_readout import record_hermes_chat_turn_model
@@ -574,6 +575,11 @@ class _HermesTurnPersister:
                     store.add_message(conv_id, "assistant", content, routing=routing)
                 except Exception:
                     logger.warning("hermes turn persistence: failed to save assistant reply", exc_info=True)
+                else:
+                    # Shared post-turn titling seam (conversation_titler.py) —
+                    # same call the native path and the voice tee make; no-ops
+                    # unless this is exactly the 2nd user message.
+                    schedule_retitle(conv_id)
 
         if self._usage_captured:
             try:

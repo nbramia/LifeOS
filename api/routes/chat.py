@@ -16,6 +16,7 @@ from api.services.vectorstore import VectorStore
 from api.services.hybrid_search import HybridSearch
 from api.services.synthesizer import get_synthesizer
 from api.services.conversation_store import get_store, generate_title
+from api.services.conversation_titler import schedule_retitle
 from api.services.calendar import CalendarService
 from api.services.drive import DriveService
 from api.services.gmail import GmailService
@@ -1314,6 +1315,14 @@ async def ask_stream(request: AskStreamRequest):
                 )
             await turn.emit(f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n")
         finally:
+            # Post-turn intelligent titling (one shared seam — see
+            # conversation_titler.py's module docstring). Idempotent and
+            # cheap-guarded, so calling it unconditionally here — regardless
+            # of which branch above produced the turn's assistant reply, or
+            # whether the turn errored/cancelled before persisting one — is
+            # safe: it only actually fires once, right after the user's 2nd
+            # message completes a turn.
+            schedule_retitle(conversation_id)
             get_turn_registry().pop(turn)
             await turn.close()
 

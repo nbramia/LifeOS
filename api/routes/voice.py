@@ -33,6 +33,7 @@ from config.settings import settings
 
 from api.routes._proxy import TIMEOUT, filter_headers as _filter_headers
 from api.services.conversation_store import get_store
+from api.services.conversation_titler import schedule_retitle
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,11 @@ class _VoiceTurnPersister:
             store.add_message(conv_id, "assistant", response_text)
         except Exception:
             logger.warning("voice turn persistence: failed to save assistant reply", exc_info=True)
+        else:
+            # Shared post-turn titling seam (conversation_titler.py) — same
+            # call the native path and the Hermes proxy tee make; no-ops
+            # unless this is exactly the 2nd user message.
+            schedule_retitle(conv_id)
 
 
 async def _build_persister(request: Request) -> "_VoiceTurnPersister":

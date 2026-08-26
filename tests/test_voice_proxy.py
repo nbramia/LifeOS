@@ -303,6 +303,31 @@ async def test_hermes_backend_turn_persists_transcript_and_response(persist_prox
     ]
 
 
+async def test_persisted_turn_schedules_retitle(persist_proxy_client, voice_store, monkeypatch):
+    """The shared post-turn titling seam (api/services/conversation_titler.py,
+    tested directly in test_conversation_titler.py) is wired into this tee
+    too -- `finalize()` calls it right after the assistant reply is
+    persisted. conftest's `_stub_conversation_titler` autouse fixture
+    defaults this to a no-op for the whole suite; override it here with a
+    spy to prove the call site actually fires, with the right conversation
+    id, rather than asserting on its (separately-tested) internal behavior.
+    """
+    from unittest.mock import Mock
+    mock_retitle = Mock()
+    monkeypatch.setattr(voice_module, "schedule_retitle", mock_retitle)
+
+    data = {
+        "backend": "hermes", "persona_id": "fitness", "conversation_id": "voice-conv-1",
+        "transcript_out": "what's my next workout", "response_out": "leg day, per your plan",
+    }
+    resp = await persist_proxy_client.post(
+        "/api/voice/turn/stream", files=_voice_turn_files(), data=data
+    )
+    assert resp.status_code == 200
+
+    mock_retitle.assert_called_once_with("voice-conv-1")
+
+
 async def test_hermes_backend_multi_turn_groups_into_one_conversation(persist_proxy_client, voice_store):
     """Two turns of the same voice session (same `done.conversation_id`)
     group into ONE conversation, matching the Hermes text route's grouping
