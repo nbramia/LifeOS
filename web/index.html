@@ -5,8 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#16213e">
     <title>LifeOS</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+    <link rel="manifest" href="/manifest.webmanifest">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://d3js.org/d3.v7.min.js"></script>
     <script type="module" src="/static/chat/main.js"></script>
@@ -1534,6 +1537,15 @@
                 bottom: 0;
                 z-index: 100;
                 transform: translateX(-100%);
+                /* Fixed positioning escapes body's padding-top (#727 follow-up):
+                   without its own insets, the drawer (and the + new-thread button
+                   in .sidebar-header) renders under the status bar / Dynamic
+                   Island and is unreachable to touch. safe-left covers the
+                   landscape case on notched iPhones where the notch sits on the
+                   physical left edge. */
+                padding-top: var(--safe-top);
+                padding-left: var(--safe-left);
+                padding-bottom: var(--safe-bottom);
             }
 
             .sidebar.open {

@@ -70,6 +70,18 @@ Restart the API after editing `.env`:
 ./scripts/server.sh restart
 ```
 
+### Installing to a Home Screen (iOS/Android)
+
+`/`, `/chat`, and `/crm` are all standalone-capable and share a web app
+manifest (`display: "standalone"`), so adding any of them to a phone's
+Home Screen launches without browser chrome instead of opening in the
+device's default browser. This matters for voice specifically: a page
+running inside the standalone container gets its own microphone-permission
+grant, separate from — and not inherited from — the regular browser tab.
+On iOS, add the shortcut from Safari (not another default browser) via
+Share → Add to Home Screen, from the tailnet HTTPS URL above. A shortcut
+added before this feature shipped won't upgrade itself — re-add it.
+
 ## The voice dock in /chat
 
 In voice mode the text composer is replaced by the dock:
