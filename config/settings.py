@@ -17,7 +17,23 @@ logger = logging.getLogger(__name__)
 
 # Registry of specialized Telegram bots (beyond the primary). Committed, no
 # secrets — each entry references the env var holding its token.
+# The tracked file is a TEMPLATE listing every persona this repo ships.
+# Each install selects its own subset in an untracked local override, so one
+# person enabling "finance" doesn't commit that choice for everyone, and a
+# `git pull` never clobbers a local selection. Local wins entirely when present
+# (it replaces the template rather than merging, so removing an entry there
+# actually removes it).
 _TELEGRAM_BOTS_FILE = Path("config/telegram_bots.json")
+_TELEGRAM_BOTS_LOCAL_FILE = Path("config/telegram_bots.local.json")
+
+
+def _telegram_bots_source() -> "Path | None":
+    """Which registry file to read: the local override, else the template."""
+    if _TELEGRAM_BOTS_LOCAL_FILE.exists():
+        return _TELEGRAM_BOTS_LOCAL_FILE
+    if _TELEGRAM_BOTS_FILE.exists():
+        return _TELEGRAM_BOTS_FILE
+    return None
 _PRIMARY_PERSONA_FILE = Path("config/personas/primary.md")
 _BOT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
@@ -1219,15 +1235,16 @@ class Settings(BaseSettings):
         bot out of Hermes permanently. An unrecognized value falls back to
         ``"hermes"`` with a warning, same pattern as an invalid bot name.
         """
-        if not _TELEGRAM_BOTS_FILE.exists():
+        source = _telegram_bots_source()
+        if source is None:
             return []
         try:
-            entries = json.loads(_TELEGRAM_BOTS_FILE.read_text())
+            entries = json.loads(source.read_text())
         except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Could not read {_TELEGRAM_BOTS_FILE}: {e}")
+            logger.warning(f"Could not read {source}: {e}")
             return []
         if not isinstance(entries, list):
-            logger.warning(f"{_TELEGRAM_BOTS_FILE} must contain a JSON list, ignoring")
+            logger.warning(f"{source} must contain a JSON list, ignoring")
             return []
 
         # pydantic-settings loads .env into the model but does NOT export to
