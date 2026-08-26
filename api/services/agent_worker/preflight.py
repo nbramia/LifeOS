@@ -268,12 +268,58 @@ PreflightCaller = Callable[[str], str]
 
 
 def _default_llm_caller(prompt: str) -> str:
-    """Production caller: hit the Anthropic API via the existing llm_client."""
-    # Import inside the function so tests that monkeypatch run_preflight don't
-    # need the Anthropic SDK installed.
-    from api.services.llm_client import AnthropicLLMClient
+    """Production caller: pick a client in priority order, then run one
+    short completion.
 
-    client = AnthropicLLMClient(model=settings.agent_preflight_model)
+    1. Anthropic, when `settings.anthropic_api_key` is set. Byte-identical
+       to the pre-#704 behavior of this function — same import, same
+       client construction, same call — because this is the maintainer's
+       own install and every other install with a key configured; no probe
+       runs on this branch.
+    2. Otherwise, the local llama-server, when reachable
+       (`LocalLLMClient().is_available()` — one short GET /health, same
+       check `local_executor._default_llm_client` uses). Unlike that
+       function, this always probes once there's no Anthropic key —
+       preflight has no `agent_remote_executor` flag gate to hide behind;
+       it just needs *some* usable client.
+    3. Otherwise, the #699 remote provider, when `agent_remote_executor`
+       and `remote_llm_configured` — mirrors the remote branch of
+       `local_executor._default_llm_client`.
+    4. Otherwise, raise. `run_preflight`'s existing except-clause already
+       degrades this to sane=False/routing=ask — unchanged.
+    """
+    if settings.anthropic_api_key:
+        # Import inside the branch so tests that monkeypatch run_preflight
+        # don't need the Anthropic SDK installed, and so a no-key install
+        # never imports it either.
+        from api.services.llm_client import AnthropicLLMClient
+
+        client = AnthropicLLMClient(model=settings.agent_preflight_model)
+        response = client.create(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
+            temperature=0.0,
+        )
+        return response.text
+
+    from api.services.llm_client import LocalLLMClient
+
+    local_client = LocalLLMClient()
+    if local_client.is_available():
+        client = local_client
+    elif settings.agent_remote_executor and settings.remote_llm_configured:
+        client = LocalLLMClient(
+            base_url=settings.remote_llm_base_url,
+            model=settings.remote_llm_model,
+            api_key=settings.remote_llm_api_key,
+            timeout=settings.remote_llm_timeout,
+        )
+    else:
+        raise RuntimeError(
+            "no LLM client available for preflight: no Anthropic API key, "
+            "local llama-server unreachable, and no remote provider configured"
+        )
+
     response = client.create(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=1024,
