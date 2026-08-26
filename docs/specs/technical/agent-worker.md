@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-08-18
+> **Last Updated:** 2026-08-26
 
 Engineering view of the agent worker — the stand-alone process that consumes `#agent`-tagged tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -148,7 +148,7 @@ Each session also tracks `routing`, `budget`, `expected_output`, `total_input_to
 
 ## Preflight
 
-The preflight is a single Haiku call (`claude-haiku-4-5` by default) that classifies a task before executor dispatch. Cheap (~$0.001) and fast (~1s). Returns:
+The preflight classifies a task before executor dispatch, cheap (~$0.001) and fast (~1s). Its LLM caller picks in priority order: Anthropic (`claude-haiku-4-5` by default) when `ANTHROPIC_API_KEY` is set; else the local llama-server if reachable; else the remote fallback provider described under "Local executor" below, if configured and enabled; else the call raises, which `run_preflight()` degrades to `sane=False`/`routing=ask` like any other preflight failure. This keeps an install with no Anthropic key from failing every `#agent` task at the classification step, before the local-executor fallback below ever gets a chance to run. Returns:
 
 ```python
 @dataclass
@@ -169,7 +169,9 @@ Routing precedence (per the prompt instructions):
 2. `#cloud` tag → routing=claude
 3. Title contains explicit model cue ("use claude", "with opus", "using gemma") → claude / local
 4. Title contains capability-implying phrase ("search my gmail", "google drive", "send a slack message", etc.) → claude (those tools require cloud connectors)
-5. Otherwise → ask (worker pauses the task and asks via Telegram)
+5. Otherwise → `LIFEOS_AGENT_DEFAULT_ROUTE` if set, else ask (worker pauses the task and asks via Telegram)
+
+`LIFEOS_AGENT_DEFAULT_ROUTE` (empty by default) applies only when preflight would otherwise land on `ask` purely for lack of routing cues — not when ambiguity or a sanity failure is the reason, and not when the classifier inferred a cloud route that the API-consent downgrade below sends to `ask`. It exists for a single-executor install (e.g. local-only, no Claude Code/Codex/Managed Agents) where a multi-engine clarification question has nothing useful to offer. Tag overrides (`#local`, `#cloud`, etc.) always take precedence over it. An invalid value logs an error and falls back to `ask` rather than crashing the worker loop.
 
 Hardening: response is parsed defensively (handles `` ```json `` fences, partial schemas, missing keys, exceptions). On any parse failure the result defaults to `sane=false` so the worker parks the task rather than running with garbage.
 
@@ -178,6 +180,8 @@ Hardening: response is parsed defensively (handles `` ```json `` fences, partial
 ## Local executor (Gemma path)
 
 `LocalExecutor.execute(session, task) -> ExecutorOutcome`. Wraps an agent loop against an OpenAI-compatible local LLM server (llama-server with `unsloth/gemma-4-26B-A4B-it-GGUF` by default).
+
+**Remote fallback (`LIFEOS_AGENT_REMOTE_EXECUTOR`, off by default).** When enabled and an OpenAI-compatible remote provider is fully configured (`LIFEOS_REMOTE_LLM_URL`/`_MODEL`/`_API_KEY`, see [configuration.md](../../guides/configuration.md#openai-compatible-remote-provider)), a session-start reachability check that finds the local llama-server unreachable runs the session against the remote provider instead of failing — one cheap `is_available()` probe at session start, not a background prober. This exists for an install with no other `#agent` executor at all (no Claude Code, no Codex, no Managed Agents, no reachable llama-server); flag off, or the remote provider unconfigured, is byte-identical to the local-only path. It is a fallback, not a new route: an explicit `#local` tag on a host with a live llama-server is unaffected. The escalation ladder can never reach this path — its `local` rung goes through `agent_loop.py`'s `_select_client(force_local=True)`, a separate code path that never consults this flag.
 
 Per-turn flow:
 
@@ -189,7 +193,7 @@ Per-turn flow:
 6. If no tool_calls and content is non-empty: finalize with `STATUS_COMPLETED` + `final_text`.
 7. If tool emitted a yield (sleep: `yield_seconds > 0`; `yield_until`: `yield_seconds == -1`): set `STATUS_YIELDED` and return — the worker's sleep / yield-resumption loops take over.
 
-Cost: 0 dollars (`local` model maps to $0 in `pricing.py`). Wall-time enforcement still applies.
+Cost: `$0` when served by the local llama-server (`local` maps to `$0` in `pricing.py`). A session served by the remote fallback above is priced from `LIFEOS_REMOTE_LLM_INPUT_PRICE_PER_MTOK`/`_OUTPUT_PRICE_PER_MTOK` when configured, else recorded as real unpriced spend rather than $0 — the same convention every `unpriced` usage row uses. Wall-time enforcement still applies either way.
 
 ---
 

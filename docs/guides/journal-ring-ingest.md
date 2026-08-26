@@ -2,7 +2,7 @@
 
 > **Audience:** Operator configuring a capture device
 > **Status:** Complete
-> **Last Updated:** 2026-08-23
+> **Last Updated:** 2026-08-26
 
 Lets a capture device — the motivating case is the [Pebble Index](https://repebble.com/index)
 ring, which transcribes speech on-phone and can "route… transcribed text
@@ -42,9 +42,8 @@ The write itself is deterministic and done in code
 before the model's turn starts — the fragment survives whether or not the
 model does anything useful, and the pipeline reports back that it landed. This
 endpoint requires that confirmation before it answers `status: "logged"` or
-records the delivery as processed. Prior to #674 it inferred capture from "the
-pipeline returned without raising", which reported success for fragments that
-were never written and burned their dedupe keys.
+records the delivery as processed — the pipeline returning without raising is
+not by itself proof the fragment was written.
 
 One documented difference from a Telegram message: the bullet's `HH:MM`
 timestamp is whatever the persona resolves as "now, local time" at
@@ -145,8 +144,8 @@ Check `Personal/Log/<today>.md` in the vault for the new bullet.
 
 ## Related Documents
 
-- [`config/personas/journal.md`](../../config/personas/journal.md) — The persona this endpoint routes into (#659); authoritative on task/schedule extraction. Log shape is `api/services/journal_capture.py`'s since #674.
+- [`config/personas/journal.md`](../../config/personas/journal.md) — The persona this endpoint routes into (#659); authoritative on task/schedule extraction. Log shape is owned by `api/services/journal_capture.py`, below.
 - [Configuration](configuration.md#journal-ring-ingest) — `LIFEOS_JOURNAL_INGEST_TOKEN` reference.
 - [`api/routes/journal_ingest.py`](../../api/routes/journal_ingest.py) — Implementation; `_adapt_payload()` is the one function to change once a real device's webhook is observed.
-- [`api/services/journal_capture.py`](../../api/services/journal_capture.py) — The deterministic write this endpoint's capture confirmation comes from (#674).
+- [`api/services/journal_capture.py`](../../api/services/journal_capture.py) — The deterministic write this endpoint's capture confirmation comes from.
 - [Apple Health Import](apple-health.md) — The precedent this mirrors: a dedicated bearer-token ingest endpoint for an external capture device.

@@ -1,7 +1,7 @@
 # Installation Guide
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-25
+> **Last Updated:** 2026-08-26
 > **Audience:** New users
 
 > **Quick start**: If you have Claude Code, run it in the project root and point it at
@@ -340,13 +340,12 @@ the repo's own source files. This checklist is that path.
 4. **Leave everything else unconfigured.** Google OAuth (beyond whatever
    account you actually want indexed), Slack, Monarch Money, a dedicated
    Telegram bot, the Apple Data Agent — any of these you don't set up simply
-   stay unset. The nightly sync already treats several sources this way
-   (Apple-only sources report `skipped` rather than failing on a Linux/no-Mac
-   host — see [data-and-sync.md](../specs/technical/data-and-sync.md)), and
-   Monarch Money and the personal Google account join that clean-skip
-   pattern once #687 lands: an unconfigured source reports
-   "skipped (not configured)," not a failure, and the rest of the sync
-   still succeeds.
+   stay unset. The nightly sync treats an unconfigured source as a clean
+   skip, not a failure: Apple-only sources report `skipped` on a
+   Linux/no-Mac host, and Monarch Money, the personal Google account, and
+   the gsheet-journal source report "skipped (not configured)" the same way
+   — see [data-and-sync.md](../specs/technical/data-and-sync.md). Either
+   way, the rest of the sync still succeeds.
 5. **macOS as the host.** If this second machine is a Mac, see
    [Running LifeOS on macOS as the Host](#running-lifeos-on-macos-as-the-host)
    above for what's packaged (nightly sync) versus what you'll want to

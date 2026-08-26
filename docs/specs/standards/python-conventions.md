@@ -1,7 +1,7 @@
 # Python Conventions
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-25
+> **Last Updated:** 2026-08-26
 > **Audience:** All developers and AI agents
 
 Coding conventions extracted from the LifeOS codebase. Match these patterns when writing new code.
@@ -135,10 +135,10 @@ def get_by_id(self, entity_id: str) -> Optional[PersonEntity]:
 
 `with sqlite3.connect(...)` is a *transaction* context manager — it commits
 or rolls back on exit, but does not close the connection. Left alone,
-CPython's refcounting closes it once `conn` goes out of scope, which is why
-this has been safe in practice (see issue #678's fd measurements), but that
-is an implementation detail, not a guarantee: the same bare pattern leaked a
-file descriptor per batch in a tight loop and exhausted `ulimit -n` (#647).
+CPython's refcounting closes it once `conn` goes out of scope, which is
+usually safe in practice, but that is an implementation detail, not a
+guarantee: the bare pattern can leak a file descriptor per batch in a tight
+loop and exhaust `ulimit -n`.
 
 Prefer `contextlib.closing`, matching `api/services/imessage.py`:
 
@@ -159,8 +159,8 @@ with closing(sqlite3.connect(self.storage_path)) as conn, conn:
 This is the house style for new and touched code. `api/services/`'s other
 SQLite-backed stores (`agent_viz_summary.py`, `agent_viz_label_override.py`,
 `job_queue.py`, `hermes_persona_thread_store.py`, `perf_trace.py`,
-`gsheet_sync.py`, `usage_store.py`) still use the bare form; sweeping them is
-a separate follow-up, not a blocker for adopting this pattern elsewhere.
+`gsheet_sync.py`, `usage_store.py`) still use the bare form — leave them as
+found unless a change already touches that file.
 
 ## Error Handling
 

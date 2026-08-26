@@ -1,7 +1,7 @@
 # LifeOS New Instance Setup
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-25
+> **Last Updated:** 2026-08-26
 > **Audience:** New users
 
 Read this top-to-bottom. Execute each step, verify the check, then proceed.
@@ -442,9 +442,9 @@ granted works), which rsyncs `data/apple-imports/` to the Linux server.
 
 On the Apple Data Agent Mac:
 
-1. Install: `brew install openclaw/tap/wacli` (formerly `steipete/tap/wacli` —
-   the tap was renamed; a stale local tap silently disables `brew outdated`,
-   see issue #677)
+1. Install: `brew install openclaw/tap/wacli`. If `steipete/tap/wacli` is
+   already tapped, untap it first — a stale tap silently disables
+   `brew outdated`, so it won't warn you the client is out of date.
 2. Authenticate: `wacli auth` (scan the QR code with WhatsApp → Linked Devices)
 3. Verify: `wacli chats list --limit 5`
 4. Confirm the exporter picks up WhatsApp:

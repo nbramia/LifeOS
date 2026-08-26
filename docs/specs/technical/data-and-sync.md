@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Data Pipeline
-> **Last Updated:** 2026-08-25
+> **Last Updated:** 2026-08-26
 
 How LifeOS ingests and stores data from multiple sources.
 
@@ -87,6 +87,9 @@ All data syncing is consolidated into a single daily sync with proper phase orde
                  Link iMessage to have run first)
                └─ Link iMessage (retroactive: backfill phone-based links
                  against the latest CRM phone→person mapping)
+               └─ Create contact persons (a person-less contact with enough
+                 iMessage evidence gets a PersonEntity, linking the contact
+                 and its messages to it)
                └─ Link source entities (retroactive linking for all unlinked)
                └─ Photos (sync face recognition to people; macOS-only —
                  reports `skipped` on Linux)
@@ -151,6 +154,8 @@ The 7-phase structure ensures correct data flow:
 7. **Consistency Verification** checks cross-store consistency after everything else has run
 
 **Note:** Apple data (contacts, phone calls, iMessage, photos, WhatsApp) is exported from an Apple Data Agent (any spare Mac with FDA granted) via `scripts/apple_data_agent.sh` at 2:50 AM, before the main pipeline, and imported on Linux by the `apple_import` source. The export runs on that Mac (which has FDA access) and syncs to the Linux server via rsync. Three sources are macOS-only and report `skipped` (not a failure) when the nightly sync runs on the Linux host: `contacts`, `photos`, `push_birthdays`.
+
+**Unconfigured-source clean skip:** a source with no way to authenticate or nothing set up reports `skipped`, not `failed`, so one missing integration never fails the whole run and never repeats as a nightly error. This covers the macOS-only sources above on a Linux host, plus config-gated sources checked at run time: `gmail_personal`/`calendar_personal` when `config/credentials-personal.json` is absent, `monarch_money` when there's no cached session and `MONARCH_EMAIL`/`MONARCH_PASSWORD` are unset, and `google_sheets` when `config/gsheet_sync.yaml` doesn't exist (the gsheet-journal pipeline was never set up). A source that *is* configured but genuinely fails (bad credentials, network, expired session with no fallback) still records `failed` exactly as before — this only short-circuits the "never configured at all" case.
 
 ### Process Summary
 
@@ -253,17 +258,18 @@ file; the next run re-fetches and re-evaluates the whole window.
 | `apple_data_import.py` | Import Apple data exports into LifeOS | Linux server |
 | `apple_data_agent.sh` | Orchestrate export + rsync + import | Apple Data Agent Mac (cron) |
 
-WhatsApp data flows through the same Apple Data Agent → Linux pipeline. The Mac runs `wacli` (openclaw/tap/wacli) which reads the WhatsApp Desktop app's local SQLite database; `apple_data_export.export_whatsapp` dumps contacts, messages, group memberships and the LID-to-phone map to `whatsapp.json`; `apple_data_import.import_whatsapp` calls into `api/services/whatsapp.py` to create SourceEntity and Interaction records. A non-zero `wacli sync` exit (including a "Client outdated (405)" protocol rejection, distinct from an auth failure) marks the export `status: "error"` rather than silently exporting stale data as `ok` — see issue #677.
+WhatsApp data flows through the same Apple Data Agent → Linux pipeline. The Mac runs `wacli` (openclaw/tap/wacli) which reads the WhatsApp Desktop app's local SQLite database; `apple_data_export.export_whatsapp` dumps contacts, messages, group memberships and the LID-to-phone map to `whatsapp.json`; `apple_data_import.import_whatsapp` calls into `api/services/whatsapp.py` to create SourceEntity and Interaction records. A non-zero `wacli sync` exit (including a "Client outdated (405)" protocol rejection, distinct from an auth failure) marks the export `status: "error"` rather than silently exporting stale data as `ok`.
 
 ### Phase 2: Entity Processing
 
-Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below): `link_slack` → `imessage` → `link_imessage` → `link_source_entities` → `photos`.
+Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below): `link_slack` → `imessage` → `link_imessage` → `create_contact_persons` → `link_source_entities` → `photos`.
 
 | Script | Purpose | Data Source |
 |--------|---------|-------------|
 | `link_slack_entities.py` | Link Slack users to people by email | `data/crm.db` |
 | `sync_imessage_interactions.py` | Create interactions from iMessage DB; links its own unlinked messages internally before filtering | Apple Data Agent export |
 | `link_imessage_entities.py` | Retroactive: backfill phone-based links against the latest CRM phone→person mapping | `data/imessage.db` |
+| `create_contact_persons.py` | For an unlinked `contacts` SourceEntity whose normalized phone or lowercased email appears as an iMessage handle at least `LIFEOS_CONTACT_PERSON_MIN_MESSAGES` times (default 5), create a person and link both the contact and the matching messages to it — closes the gap where a contact who only ever texts, with no WhatsApp or email correspondence, would otherwise never get a person entity | `data/crm.db`, `data/imessage.db` |
 | `link_source_entities.py` | Retroactive linking for all unlinked entities | `data/crm.db` |
 | `sync_photos.py` | Sync Photos face recognition to people (macOS-only — `skipped` on Linux) | Apple Data Agent export |
 
@@ -462,32 +468,33 @@ The unified sync runner (`run_all_syncs.py`) executes `SYNC_ORDER` in this order
 7. `link_slack` - Link Slack entities by email
 8. `imessage` - Create interactions from iMessage DB (links its own unlinked messages internally)
 9. `link_imessage` - Retroactive: backfill phone-based links against the latest CRM data (see [iMessage Sync Ordering](#imessage-sync-ordering))
-10. `link_source_entities` - Retroactive linking for all unlinked entities
-11. `photos` - Sync Photos face recognition to people (macOS-only — `skipped` on Linux)
+10. `create_contact_persons` - Create a person for a person-less contact with enough iMessage evidence (`LIFEOS_CONTACT_PERSON_MIN_MESSAGES`), linking the contact and its messages to it
+11. `link_source_entities` - Retroactive linking for all unlinked entities
+12. `photos` - Sync Photos face recognition to people (macOS-only — `skipped` on Linux)
 
 **Phase 2b: Stale ID Cleanup**
-12. `repoint_stale_ids` - Re-point interactions with stale merged person IDs to canonical IDs
+13. `repoint_stale_ids` - Re-point interactions with stale merged person IDs to canonical IDs
 
 **Phase 3: Relationship Building**
-13. `person_stats_full` - Full refresh of all PersonEntity counts and timestamps
-14. `relationship_discovery` - Discover relationships, populate edge weights
-15. `strengths` - Recalculate relationship strengths
-16. `push_birthdays` - Push LifeOS birthdays to Apple Contacts (macOS-only — `skipped` on Linux)
+14. `person_stats_full` - Full refresh of all PersonEntity counts and timestamps
+15. `relationship_discovery` - Discover relationships, populate edge weights
+16. `strengths` - Recalculate relationship strengths
+17. `push_birthdays` - Push LifeOS birthdays to Apple Contacts (macOS-only — `skipped` on Linux)
 
 **Phase 4: Vector Store Indexing**
-17. `vault_reindex` - Reindex vault to ChromaDB + BM25
-18. `crm_vectorstore` - Index CRM people for semantic search
+18. `vault_reindex` - Reindex vault to ChromaDB + BM25
+19. `crm_vectorstore` - Index CRM people for semantic search
 
 **Phase 5: Content Sync**
-19. `google_docs` - Sync Google Docs to vault
-20. `google_sheets` - Sync Google Sheets to vault
-21. `monarch_money` - Monarch Money financial data (monthly, runs on 1st)
+20. `google_docs` - Sync Google Docs to vault
+21. `google_sheets` - Sync Google Sheets to vault
+22. `monarch_money` - Monarch Money financial data (monthly, runs on 1st)
 
 **Phase 6: Post-Sync Cleanup**
-22. `entity_cleanup` - Auto-hide obvious non-human entities
+23. `entity_cleanup` - Auto-hide obvious non-human entities
 
 **Phase 7: Consistency Verification**
-23. `consistency_verify` - Cross-store consistency check (orphans, stale merged IDs, cached counts, vault files that moved or vanished) and auto-fix
+24. `consistency_verify` - Cross-store consistency check (orphans, stale merged IDs, cached counts, vault files that moved or vanished) and auto-fix
 
 **Automated via systemd (Linux) / launchd (macOS):**
 - Service: `lifeos-sync` (systemd) or `com.lifeos.crm-sync` (launchd)

@@ -1,7 +1,7 @@
 # Telegram Setup
 
 **Status:** Complete
-**Last Updated:** 2026-07-09
+**Last Updated:** 2026-08-26
 **Audience:** Operators
 
 The Telegram surface is a first-class client for LifeOS. It gives you:
@@ -48,6 +48,8 @@ The bot only answers the one chat whose ID matches `TELEGRAM_CHAT_ID` — any ot
    ```
 
 Once both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set, the listener starts polling and the bot answers your messages. Send `/help` to confirm it is alive.
+
+**Send-only mode.** Telegram allows exactly one `getUpdates` poller per bot token. If another process already owns this bot's updates (e.g. a co-resident Hermes gateway using the same token so it can deliver into that chat), set `TELEGRAM_PRIMARY_LISTENER_ENABLED=false`: LifeOS stops polling but keeps sending — the scheduler still starts and still delivers reminders and summaries into the chat. Defaults to `true`, so a normal single-owner setup is unaffected.
 
 ## Primary-bot commands
 
@@ -103,7 +105,9 @@ To add one:
 
 3. Restart the server: `./scripts/server.sh restart`.
 
-Leave a bot's token unset to not run it — a fresh clone with no extra tokens runs just the primary bot. The `fitness` and `therapist` bots are pure chat surfaces; the `doctor` bot **orchestrates** (each message drives a real Claude Code repair session). The persona layer is covered in [personas.md](personas.md), and the doctor's flow in [doctor-bot.md](doctor-bot.md).
+Leave a bot's token unset to not run it — a fresh clone with no extra tokens runs just the primary bot. Its persona is still reachable in `/chat` and voice either way (`GET /api/personas` doesn't require a Telegram token); only the Telegram listener itself needs one. Every persona bot answers through Hermes by default, falling back to the native pipeline if Hermes isn't configured or reachable — see [client-surfaces.md § Telegram bot backends](../specs/technical/client-surfaces.md#telegram-bot-backends-684). The `fitness` and `therapist` bots are pure chat surfaces; the `doctor` bot **orchestrates** (each message drives a real Claude Code repair session). The persona layer is covered in [personas.md](personas.md), and the doctor's flow in [doctor-bot.md](doctor-bot.md).
+
+**Per-install bot selection.** `config/telegram_bots.json` is a tracked template listing every persona bot this repo ships. To run a different subset without carrying a permanent diff on a shared file, copy it to `config/telegram_bots.local.json` (gitignored) and edit that instead — when present, it *replaces* the template entirely rather than merging, so removing an entry there actually removes that bot.
 
 ## Alerting
 
@@ -131,6 +135,7 @@ The listener only answers the chat whose ID equals the configured `*_CHAT_ID` �
 
 ### Specifications
 - [Agent Worker](../specs/product/agent-worker.md) — What `#agent` tasks do and how they run.
+- [Client Surfaces](../specs/technical/client-surfaces.md) — Which backend (Hermes or native) answers each persona bot's turn, and the fallback contract.
 
 ### Code References
 - [`api/services/telegram.py`](../../api/services/telegram.py) — Listener, command handlers, and reply-threading logic.

@@ -1,7 +1,7 @@
 # Personas
 
 **Status:** Complete
-**Last Updated:** 2026-07-09
+**Last Updated:** 2026-08-26
 **Audience:** New users
 
 A persona is a personality and scope for the *same* LifeOS assistant. One backend, one tool catalog — several front-of-house characters. A persona changes how LifeOS frames answers, where it looks first, and its tone; it does **not** change what it can do. Every persona keeps the full LifeOS tool suite; they differ only in voice, sourcing, and scope.
@@ -110,7 +110,7 @@ Leave a bot's token variable unset to not run it; `*_CHAT_ID` is optional and de
 ## Create your own persona
 
 1. **Write the persona file.** Add `config/personas/<id>.md` with optional frontmatter and a prose body (see the skeleton and example above). Keep the frontmatter free of personal values; use `<placeholders>` in examples.
-2. **(Optional) Bind a Telegram bot.** To reach the persona from a dedicated Telegram bot, register a new bot in `config/telegram_bots.json` with a `name`, its `token_env` / `chat_id_env` variables, and `persona_file: config/personas/<id>.md`. Set `orchestrates: true` only for a self-repair-style pipeline. Bot-token and chat-id setup is covered in [configuration.md](configuration.md#telegram). A persona with no bound bot is still selectable in `/chat` and voice via `GET /api/personas`.
+2. **(Optional) Bind a Telegram bot.** To reach the persona from a dedicated Telegram bot, register a new bot in `config/telegram_bots.json` with a `name`, its `token_env` / `chat_id_env` variables, and `persona_file: config/personas/<id>.md`. Set `orchestrates: true` only for a self-repair-style pipeline. Bot-token and chat-id setup is covered in [configuration.md](configuration.md#telegram). A persona is selectable in `/chat` and voice via `GET /api/personas` regardless of whether it has a bound bot, and regardless of whether that bot's token is set — only the Telegram listener itself needs a token.
 3. **Restart the server** so the loader picks up the new persona and registry entry: `./scripts/server.sh restart`.
 
 The `/routing-health` check verifies `/chat` ↔ Telegram parity — that messaging a persona in `/chat` behaves the same as messaging its Telegram bot, across models and both text and voice. Run it after adding or changing a persona to confirm the surfaces stay in sync.
