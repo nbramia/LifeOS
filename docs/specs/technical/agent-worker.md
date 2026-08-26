@@ -103,14 +103,15 @@ poll → spend tracker check (`can_start_task(default_budget)`)
          atomic swap #agent → #agent-running   (race-free via swap-tag API)
          create session row + transcript "claim" event
          run preflight (Haiku) → PreflightResult
-             routing in {local, claude, ask}
+             routing in {local, claude, claude_code, codex, ask}
              expected_output in {text, file, external_action, structured}
              ambiguity: question | null
              sane: bool
          dispatch on routing:
-             local  → LocalExecutor.execute(session, task)
-             claude → ManagedExecutor.start(session, task)
-             ask    → Telegram clarification, park at #agent-blocked
+             local              → LocalExecutor.execute(session, task)              — inline, tick thread
+             claude             → ManagedExecutor.start(session, task)              — inline, tick thread
+             claude_code / codex → _submit_cli_dispatch(...)                        — off-tick, on _cli_pool (#753)
+             ask                → Telegram clarification, park at #agent-blocked
          on terminal outcome:
              COMPLETED → mark task done in vault + swap to #agent-completed
                          + write Agent Output note (one-off, or prepend for recurring)
@@ -287,9 +288,9 @@ Lineage budgets: every session tracks `root_session_id` + `spawn_depth`. Budget 
 - **Provenance** is marked with the additive `sessions.origin = 'operator'` column. The worker's `_dispatch_spawned_sessions` skip is relaxed to claim parentless sessions when `origin='operator'`, so they dispatch alongside spawned children without colliding with the top-level `#agent` claim path (which uses NULL origin). The prompt is enqueued as a pending message and drained as the task description on dispatch.
 - Operator sessions are root sessions (`parent_session_id=None`), so their terminal notifications surface to the operator and register a replyable follow-up (Phase 1 / #234). Because they have no backing vault task, `_handle_outcome` and `_resume_as_followup` skip the vault mutations (`_complete_task` / `_swap_tag` / `_set_task_status`) for `origin='operator'` — gated on `has_vault_task` — while still sending the notification + follow-up. The prompt is enqueued *before* the session row is created so the worker can never observe a CLAIMED operator session whose prompt hasn't landed. Default budget comes from the `agent_default_*` settings; local concurrency cap of 1 means operator local spawns queue behind running ones.
 
-### Off-tick CLI dispatch (#299)
+### Off-tick CLI dispatch (#299, #753)
 
-Spawned `claude_code` / `codex` children are long-running subprocesses. `_dispatch_spawned_sessions` runs them on a bounded `ThreadPoolExecutor` (`_cli_pool`, sized `2 × agent_max_concurrent_managed`) via `_submit_cli_dispatch`, rather than inline — so one delegated child can't park the poll loop and starve new `#agent` claims or sibling dispatch. An `_cli_inflight` set (lock-guarded) prevents a re-scan from re-submitting a child in the window before its executor flips the row `CLAIMED→RUNNING`; for CLI routes the guard is checked *before* draining pending messages so a skipped re-scan can't discard them. Per-routing concurrency stays bounded at `lifeos_agent_spawn` time (`count_active_by_routing`), independent of dispatch timing. The `local` route stays inline (in-process, GPU-bound, cap 1). `stop()` calls `shutdown(wait=False, cancel_futures=True)`; children still running are reconciled by `resume_pending()` on restart. Tests inject a `_SynchronousPool` for deterministic dispatch.
+`claude_code` / `codex` sessions are long-running subprocesses — up to the session's budget wall (14,400s by default) — so their dispatch always runs on a bounded `ThreadPoolExecutor` (`_cli_pool`, sized `2 × agent_max_concurrent_managed`) via `_submit_cli_dispatch`, never inline on the tick thread. This applies to both callers: `_dispatch_spawned_sessions` (spawned children and operator root-spawns) and `_dispatch`'s `ROUTE_CLAUDE_CODE`/`ROUTE_CODEX` branch (top-level `#agent` tasks, #753) — a single delegated child or top-level CLI task can no longer park the poll loop and starve new `#agent` claims, sleeping-session wakes, managed polling, or clarification processing/timeouts. Preflight and the fast blocked/failed/sanity short-circuits still run inline on the tick thread; only the `execute()`/`resume()` subprocess call and everything downstream of its outcome (vault tag swap, Telegram notify) move to the pool, since `_dispatch_claude_code_session`/`_dispatch_codex_session` own outcome handling themselves rather than going through `_handle_outcome`. An `_cli_inflight` set (lock-guarded) prevents a re-scan from re-submitting the same session in the window before its executor flips the row `CLAIMED→RUNNING`; for CLI routes the guard is checked *before* draining pending messages so a skipped re-scan can't discard them. Per-routing concurrency stays bounded at `lifeos_agent_spawn` time (`count_active_by_routing`), independent of dispatch timing. The `local` route stays inline (in-process, GPU-bound, cap 1). `stop()` calls `shutdown(wait=False, cancel_futures=True)`; sessions still running are reconciled by `resume_pending()` on restart. Tests inject a `_SynchronousPool` for deterministic dispatch.
 
 ### Delegation tier + single-message (#349)
 

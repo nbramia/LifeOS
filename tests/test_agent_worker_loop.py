@@ -8,6 +8,9 @@ pause, sleeps wake-up.
 from __future__ import annotations
 
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,6 +21,7 @@ from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_BUDGET_EXCEEDED,
+    STATUS_CLAIMED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_RUNNING,
@@ -109,7 +113,8 @@ class FakeApi:
         return httpx.Response(404)
 
 
-def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_executor):
+def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_executor,
+                  claude_code_executor=None, codex_executor=None, cli_pool=None):
     transport = httpx.MockTransport(api.handler)
     client = httpx.Client(transport=transport, base_url="http://api")
     sent: list[str] = []
@@ -133,6 +138,9 @@ def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_execut
         http_client=client,
         preflight_caller=preflight_caller,
         local_executor=local_executor,
+        claude_code_executor=claude_code_executor,
+        codex_executor=codex_executor,
+        cli_pool=cli_pool,
     )
     w._sent_telegram = sent  # type: ignore[attr-defined]
     w._sent_with_ids = sent_with_ids  # type: ignore[attr-defined]
@@ -1848,3 +1856,243 @@ def test_worker_pauses_at_daily_cap(tmp_path: Path):
     )
     assert w.tick() == 0
     assert executor.calls == []
+
+
+# ---------------------------------------------------------------------------
+# #753 — top-level #agent CLI-routed tasks dispatch off the tick thread
+#
+# Before this fix, `_dispatch()`'s ROUTE_CLAUDE_CODE/ROUTE_CODEX branch called
+# `_dispatch_claude_code_session`/`_dispatch_codex_session` inline, so the
+# whole CLI subprocess ran synchronously inside tick()'s claim loop — up to
+# the session's 14,400s budget wall. Nothing else in tick() (new claims,
+# sleeping-session wakes, managed polling, clarification processing/timeouts)
+# ran while that subprocess was in flight. The fix reuses `_submit_cli_dispatch`
+# — the same pool + `_cli_inflight` machinery spawned CLI children already use
+# (#299, test_agent_worker_async_cli_dispatch.py) — for the top-level path too.
+# ---------------------------------------------------------------------------
+
+class _CapturingPool:
+    """Records submitted callables without running them, so a test can
+    assert a top-level CLI dispatch was handed off (not run inline) and then
+    run it on demand. Mirrors the pool in test_agent_worker_async_cli_dispatch.py."""
+
+    def __init__(self):
+        self.submitted: list = []
+
+    def submit(self, fn, *args, **kwargs):
+        self.submitted.append((fn, args, kwargs))
+        return None
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        pass
+
+    def run_all(self) -> None:
+        for fn, args, kwargs in self.submitted:
+            fn(*args, **kwargs)
+
+
+@pytest.mark.unit
+def test_top_level_cli_task_dispatched_off_tick_not_inline(tmp_path: Path):
+    """A top-level #agent task routed to claude_code must be handed to the
+    CLI pool, not executed inline in tick() — the fix's core claim, proven
+    by a pool that records submissions without running them. Once the
+    submitted work is run (as the real pool thread would), the full
+    outcome-handling path (vault tag swap, task completion, Telegram) still
+    fires — it's the same `_dispatch_claude_code_session` used by spawned
+    sessions, just called on a pool thread instead of the tick thread."""
+    calls: list = []
+
+    class _Executor:
+        def execute(self, session, task):
+            calls.append((session.task_id, task.get("description")))
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="all done")
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["agent"]},
+    ])
+    pool = _CapturingPool()
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude_code"),
+                     local_executor=None,
+                     claude_code_executor=_Executor(),
+                     cli_pool=pool)
+
+    handled = w.tick()
+
+    assert handled == 1
+    # Handed to the pool, NOT run inline — tick() returned before the
+    # (would-be long) subprocess ever started.
+    assert len(pool.submitted) == 1
+    assert calls == []
+    assert COMPLETED_TAG not in api.tasks["t1"]["tags"]
+
+    # Running the submitted work exercises the outcome-handling path exactly
+    # as the real pool thread would.
+    pool.run_all()
+
+    assert calls == [("t1", "do the thing")]
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert api.tasks["t1"]["status"] == "done"
+    assert any("all done" in t for t in w._sent_telegram)  # type: ignore[attr-defined]
+    assert w._cli_inflight == set()
+
+
+@pytest.mark.unit
+def test_second_cli_task_claimed_and_runs_while_first_blocks(tmp_path: Path):
+    """Live bug repro (#753): two #agent tasks routed to claude_code — the
+    second must be claimed and start running while the first is still mid
+    execute(), instead of sitting unclaimed for the first task's entire run.
+    Uses a real ThreadPoolExecutor (not a synchronous stub) since this is
+    specifically a concurrency claim."""
+    start_evt = threading.Event()
+    release_evt = threading.Event()
+
+    class _Executor:
+        def execute(self, session, task):
+            if task.get("description") == "slow task":
+                start_evt.set()
+                assert release_evt.wait(timeout=5), "test deadlocked waiting for release"
+                return ExecutorOutcome(status=STATUS_COMPLETED, final_text="slow done")
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="fast done")
+
+    api = FakeApi(tasks=[
+        {"id": "t-slow", "description": "slow task", "status": "todo", "tags": ["agent"]},
+        {"id": "t-fast", "description": "fast task", "status": "todo", "tags": ["agent"]},
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude_code"),
+                     local_executor=None,
+                     claude_code_executor=_Executor(),
+                     cli_pool=ThreadPoolExecutor(max_workers=4))
+    try:
+        handled = w.tick()
+        # Both tasks claimed and dispatched in the same tick — tick() did not
+        # block on the slow task's execute().
+        assert handled == 2
+        assert start_evt.wait(timeout=2), "slow task never reached execute() on the pool"
+
+        # The fast task, submitted to the same pool, finishes without
+        # waiting on the slow one — proves real concurrency, not just
+        # deferred-then-serial execution.
+        deadline = time.time() + 5
+        while time.time() < deadline and COMPLETED_TAG not in api.tasks["t-fast"]["tags"]:
+            time.sleep(0.02)
+        assert COMPLETED_TAG in api.tasks["t-fast"]["tags"]
+        # The slow one is genuinely still blocked at this point.
+        assert COMPLETED_TAG not in api.tasks["t-slow"]["tags"]
+    finally:
+        release_evt.set()
+        w._cli_pool.shutdown(wait=True)
+
+    assert COMPLETED_TAG in api.tasks["t-slow"]["tags"]
+
+
+@pytest.mark.unit
+def test_clarification_processing_continues_while_cli_task_blocks(tmp_path: Path):
+    """(#753) A blocked CLI subprocess must not starve clarification
+    processing for an unrelated, already-blocked local session — the tick
+    thread has to stay free to keep servicing the rest of the worker's
+    responsibilities while the CLI task runs on the pool."""
+    block_evt = threading.Event()
+    release_evt = threading.Event()
+
+    class _Executor:
+        def execute(self, session, task):
+            block_evt.set()
+            assert release_evt.wait(timeout=5), "test deadlocked waiting for release"
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="slow done")
+
+    api = FakeApi(tasks=[
+        {"id": "t-slow", "description": "slow task", "status": "todo", "tags": ["agent"]},
+        {"id": "t-other", "description": "other task", "status": "blocked",
+         "tags": [BLOCKED_TAG, "local"]},
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude_code"),
+                     local_executor=None,
+                     claude_code_executor=_Executor(),
+                     cli_pool=ThreadPoolExecutor(max_workers=4))
+    try:
+        w.tick()  # dispatches t-slow onto the pool; must return without waiting
+        assert block_evt.wait(timeout=2), "slow task never reached execute()"
+
+        # Seed the unrelated BLOCKED local-routed session with an answered
+        # clarification, exactly as a live worker would have parked one from
+        # an earlier tick.
+        local_stub = _StubExecutor(outcome=ExecutorOutcome(
+            status=STATUS_COMPLETED, final_text="answered",
+        ))
+        w._local_executor = local_stub
+        other = w.session_store.create(task_id="t-other", routing="local",
+                                        status=STATUS_BLOCKED, expected_output="text")
+        w.session_store.create_pending_question(
+            other.session_id, "t-other", "which file?", sent_message_id=555,
+        )
+        w.session_store.deposit_answer(555, "the config file")
+
+        # This must complete promptly — proving the tick thread isn't stuck
+        # behind the still-blocked slow task.
+        w._process_clarification_answers()
+
+        assert local_stub.calls == [("t-other", "other task")]
+    finally:
+        release_evt.set()
+        w._cli_pool.shutdown(wait=True)
+
+
+@pytest.mark.unit
+def test_cli_inflight_guard_covers_top_level_dispatch(tmp_path: Path):
+    """(#753) Top-level CLI dispatch shares `_cli_inflight` with the spawned
+    path (#299) — a session submitted to the pool but not yet flipped
+    CLAIMED→RUNNING must not be submitted a second time, mirroring
+    test_inflight_guard_prevents_double_dispatch_across_ticks for spawned
+    children."""
+    calls: list = []
+
+    class _Executor:
+        def execute(self, session, task):
+            calls.append(session.task_id)
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="done")
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["agent"]},
+    ])
+    pool = _CapturingPool()  # never runs -> the session stays "in flight"
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude_code"),
+                     local_executor=None,
+                     claude_code_executor=_Executor(),
+                     cli_pool=pool)
+    w.session_store.create(task_id="t1", status=STATUS_CLAIMED)
+    task = {"id": "t1", "description": "do the thing", "tags": []}
+
+    w._dispatch(task)
+    w._dispatch(task)  # a second dispatch attempt before the pool thread runs
+
+    assert len(pool.submitted) == 1
+    assert calls == []
+
+
+@pytest.mark.unit
+def test_resume_pending_rolls_back_top_level_cli_session_same_as_before(tmp_path: Path):
+    """(#753) resume_pending()'s startup-recovery semantics for a top-level
+    claude_code/codex #agent session are unchanged by routing dispatch
+    through the pool — a crash-time CLAIMED/RUNNING session still rolls back
+    to #agent for retry, exactly as before this fix."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "do the thing", "status": "in_progress",
+         "tags": [RUNNING_TAG]},
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude_code"),
+                     local_executor=None)
+    w.session_store.create(task_id="t1", routing="claude_code", status=STATUS_RUNNING)
+
+    n = w.resume_pending()
+
+    assert n == 1
+    refreshed = w.session_store.get("t1")
+    assert refreshed.status == STATUS_FAILED
+    assert AGENT_TAG in api.tasks["t1"]["tags"]
+    assert RUNNING_TAG not in api.tasks["t1"]["tags"]
+    assert api.tasks["t1"]["status"] == "todo"
