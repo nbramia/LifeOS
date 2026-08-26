@@ -517,7 +517,9 @@ def test_default_llm_client_flag_on_remote_configured_local_down_selects_remote(
     assert is_remote is True
     assert model_name == "accounts/fireworks/models/deepseek-v4-flash-0731"
     assert isinstance(client, LocalLLMClient)
-    assert client.base_url == "https://remote.example/v1"
+    # #706: LocalLLMClient strips one trailing /v1 segment so the wire
+    # path is always {base}/v1/chat/completions, never .../v1/v1/....
+    assert client.base_url == "https://remote.example"
     assert client.model == "accounts/fireworks/models/deepseek-v4-flash-0731"
     assert client.timeout == 42
     assert client._auth_headers() == {"Authorization": "Bearer fw_test_key"}

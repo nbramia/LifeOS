@@ -706,7 +706,9 @@ def test_default_llm_caller_falls_back_to_remote_when_local_unreachable(monkeypa
     result = pf._default_llm_caller("some prompt")
 
     assert result == "remote reply"
-    assert captured["base_url"] == "https://remote.example/v1"
+    # #706: LocalLLMClient strips one trailing /v1 segment so the wire
+    # path is always {base}/v1/chat/completions, never .../v1/v1/....
+    assert captured["base_url"] == "https://remote.example"
     assert captured["model"] == "accounts/fireworks/models/deepseek-v4-flash-0731"
     assert captured["timeout"] == 42
     assert captured["auth"] == {"Authorization": "Bearer fw_test_key"}

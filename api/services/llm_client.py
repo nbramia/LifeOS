@@ -300,6 +300,16 @@ class LocalLLMClient:
         api_key: str | None = None,
     ):
         self.base_url = (base_url or getattr(settings, "local_llm_url", None) or "http://localhost:8080").rstrip("/")
+        # Every OpenAI-compatible provider documents its base URL *with* the
+        # /v1 suffix (Fireworks, DeepSeek, ...), while llama-server's own
+        # default has none — and every call site below already appends
+        # "/v1/chat/completions" itself. Strip exactly one trailing /v1
+        # segment so both conventions land on the same wire path instead of
+        # doubling up into ".../v1/v1/chat/completions" (#706). Segment-exact
+        # match only — "/av1" or "/v10" must NOT be stripped.
+        if self.base_url.endswith("/v1"):
+            self.base_url = self.base_url[: -len("/v1")]
+
         self.timeout = timeout or getattr(settings, "local_llm_timeout", 90)
         self._model = model
         self._api_key = api_key
@@ -727,7 +737,15 @@ class LocalLLMClient:
         )
 
     def is_available(self) -> bool:
-        """Check if the local LLM server is reachable."""
+        """Check if the local LLM server is reachable.
+
+        GET /health is a llama-server-ism, not part of the OpenAI-compatible
+        surface this class otherwise speaks — a remote provider (#654,
+        e.g. Fireworks) would 404 here regardless of the /v1 base-url
+        normalization above. That's fine: every caller (`local_executor`,
+        `preflight`) only ever calls this on the default, local-pointed
+        client to decide whether to fall back to the remote one; the
+        remote client itself is used unprobed, by design (#706)."""
         try:
             resp = self.sync_client.get("/health", timeout=3.0)
             return resp.status_code == 200
@@ -735,7 +753,8 @@ class LocalLLMClient:
             return False
 
     async def ais_available(self) -> bool:
-        """Async check if the local LLM server is reachable."""
+        """Async check if the local LLM server is reachable. See
+        `is_available` — same llama-server-only /health caveat."""
         try:
             resp = await self.async_client.get("/health", timeout=3.0)
             return resp.status_code == 200

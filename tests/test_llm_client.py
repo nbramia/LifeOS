@@ -666,6 +666,73 @@ class TestRemoteProviderConfig:
         assert captured["kwargs"]["json"]["model"] == "accounts/fireworks/models/x"
 
 
+class TestBaseUrlV1Normalization:
+    """LocalLLMClient.__init__ strips one trailing /v1 segment so both
+    OpenAI-compatible URL conventions land on the same
+    /v1/chat/completions wire path (#706)."""
+
+    def test_strips_trailing_v1(self):
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="https://api.fireworks.ai/inference/v1")
+        assert client.base_url == "https://api.fireworks.ai/inference"
+
+    def test_strips_trailing_v1_with_trailing_slash(self):
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="https://api.fireworks.ai/inference/v1/")
+        assert client.base_url == "https://api.fireworks.ai/inference"
+
+    def test_bare_v1_root_strips_to_empty_host_path(self):
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="https://host/v1")
+        assert client.base_url == "https://host"
+
+    def test_no_v1_suffix_unchanged(self):
+        """Base URL without the /v1 suffix must be byte-identical to
+        today — no normalization applied."""
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="https://api.deepseek.com")
+        assert client.base_url == "https://api.deepseek.com"
+
+    def test_llama_server_default_unchanged(self):
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient()
+        assert client.base_url == "http://localhost:8080"
+
+    def test_near_miss_av1_not_stripped(self):
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="https://host/path/av1")
+        assert client.base_url == "https://host/path/av1"
+
+    def test_near_miss_v10_not_stripped(self):
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="https://host/path/v10")
+        assert client.base_url == "https://host/path/v10"
+
+    def test_both_conventions_resolve_to_same_chat_completions_wire_path(self):
+        """The /v1 form and the no-/v1 form must both end up POSTing to
+        the same relative path once combined with base_url — this is
+        what actually fixes the doubled .../v1/v1/chat/completions 404."""
+        from api.services.llm_client import LocalLLMClient
+        with_v1 = LocalLLMClient(base_url="https://api.fireworks.ai/inference/v1")
+        without_v1 = LocalLLMClient(base_url="https://api.fireworks.ai/inference")
+        assert with_v1.base_url == without_v1.base_url
+        assert with_v1.base_url + "/v1/chat/completions" == "https://api.fireworks.ai/inference/v1/chat/completions"
+
+    def test_health_probe_path_unaffected_for_llama_server_default(self):
+        """is_available() GETs {base}/health — must remain the exact
+        llama-server default path with no /v1 involved."""
+        from unittest.mock import MagicMock
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient()
+        fake_resp = MagicMock(status_code=200)
+        fake_sync_client = MagicMock(is_closed=False)
+        fake_sync_client.get.return_value = fake_resp
+        client._sync_client = fake_sync_client
+
+        assert client.is_available() is True
+        fake_sync_client.get.assert_called_once_with("/health", timeout=3.0)
+
+
 class TestAStreamReasoningControl:
     """astream() forwards reasoning control the same way create()/acreate() do."""
 
