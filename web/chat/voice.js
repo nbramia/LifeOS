@@ -1833,6 +1833,12 @@ export function finalizeEndpointing() {
 function discardEndpointing() {
   if (!isRecording) return;
   stopRecordingAndSend({ discard: true }).catch((err) => {
+    setStatus('error', 'Error');
+    addMessage('⚠️ ' + (err?.message || 'Recording failed'), 'assistant');
+    setTalkActive(false);
+  });
+}
+
 // Idle-timeout finalize (#723) -- stops and DISCARDS, never submits. Also
 // through stopRecordingAndSend(), but with its `discard` param set:
 // this is the SAME handleSkippedEmptyRecording() teardown a manual stop on
