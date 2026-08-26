@@ -39,6 +39,11 @@ ROUTE_CLAUDE_CODE = "claude_code"
 # preflight never emits it directly except via the `#codex` tag.
 ROUTE_CODEX = "codex"
 
+# All routing destinations `parse_preflight_response` accepts from the model,
+# and the same set `settings.agent_default_route` (#707) is validated
+# against — one source of truth so the two checks can't drift apart.
+KNOWN_ROUTES = (ROUTE_LOCAL, ROUTE_CLAUDE, ROUTE_CLAUDE_CODE, ROUTE_CODEX, ROUTE_ASK)
+
 # Allowed expected-output shapes. Used to phrase the final Telegram summary.
 OUTPUT_KINDS = ("text", "file", "external_action", "structured")
 
@@ -235,7 +240,7 @@ def parse_preflight_response(text: str) -> PreflightResult:
     )
 
     routing = raw.get("routing", ROUTE_ASK)
-    if routing not in (ROUTE_LOCAL, ROUTE_CLAUDE, ROUTE_CLAUDE_CODE, ROUTE_CODEX, ROUTE_ASK):
+    if routing not in KNOWN_ROUTES:
         routing = ROUTE_ASK
 
     expected_output = raw.get("expected_output", "text")
@@ -454,6 +459,69 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
     return result
 
 
+def _apply_default_route(result: PreflightResult, original_routing: str) -> PreflightResult:
+    """Apply `settings.agent_default_route` when preflight landed on `ask`
+    purely for lack of routing cues (#707) — the "nothing to ask about" case
+    on a single-executor install. Empty setting (default) is a no-op, so an
+    unset install is byte-identical to pre-#707 behavior.
+
+    Gate: `result.routing == ROUTE_ASK and result.sane and result.ambiguity
+    is None`. Deliberately NOT a string match against `routing_reason` — the
+    LLM's reason text is free-form prose ("no tag and no title cue" today,
+    but not a stable contract), so matching on it would be brittle. This one
+    structural gate covers both "lack of cues" paths:
+      - the LLM's own rule-5 answer ("none of the routing rules matched")
+      - `parse_preflight_response`'s deterministic fallback when the model
+        omitted `routing` or returned a value outside `KNOWN_ROUTES`
+    and it correctly excludes the two "ask" outcomes the issue says must
+    stay ask: ambiguity (checked directly) and sanity failures — including
+    the empty-title short-circuit and the LLM-call-failure fallback in
+    `run_preflight`, both of which set `sane=False`.
+
+    One more `ask` source needs excluding that isn't in the issue's list:
+    `_apply_tag_overrides`'s #584 downgrade, which turns an *inferred*
+    (unconfirmed) cloud route into `ask` specifically so it can't
+    auto-dispatch. That result is also sane=True with ambiguity=None, so it
+    would slip through the gate above — this isn't "lack of cues", it's a
+    cue nobody confirmed, and silently routing it via the default would
+    undo the confirmation #584 exists for. Excluded via `original_routing`:
+    the routing value from BEFORE `_apply_tag_overrides` ran. Only when the
+    original LLM/parse outcome was *already* `ask` — not downgraded from
+    `claude` — do we know this is genuinely nothing-to-route-on.
+    """
+    if not settings.agent_default_route:
+        return result
+    if result.routing != ROUTE_ASK or not result.sane or result.ambiguity is not None:
+        return result
+    if original_routing != ROUTE_ASK:
+        return result
+
+    default_route = settings.agent_default_route
+    if default_route not in KNOWN_ROUTES:
+        # Surface loudly (AC): no precedent in this codebase for hard-failing
+        # process startup over a bad setting value (config/settings.py has no
+        # validators), so this logs an ERROR — one line per occurrence, not a
+        # crash — and falls back to `ask`, same as every other preflight
+        # error path. The worker loop must never die over a typo'd env var.
+        logger.error(
+            "invalid LIFEOS_AGENT_DEFAULT_ROUTE=%r — must be one of %s; "
+            "falling back to ask", default_route, KNOWN_ROUTES,
+        )
+        return result
+
+    result.routing = default_route
+    result.routing_reason = f"no cues; LIFEOS_AGENT_DEFAULT_ROUTE={default_route}"
+    if result.model not in ALLOWED_MODELS:
+        if default_route == ROUTE_CLAUDE:
+            result.model = MODEL_SONNET
+        elif default_route == ROUTE_LOCAL:
+            result.model = MODEL_LOCAL
+        # ROUTE_CLAUDE_CODE / ROUTE_CODEX / ROUTE_ASK: leave model as-is
+        # (CLI routes pick their own model; ROUTE_ASK is a pointless but
+        # harmless configuration — model stays unset for the operator).
+    return result
+
+
 def _apply_preset_class(result: PreflightResult, tags: list[str]) -> PreflightResult:
     """Set `result.preset_class` from an explicit `#<class>` tag if present.
 
@@ -536,6 +604,26 @@ def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
     return result
 
 
+def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> PreflightResult:
+    """Shared post-processing pipeline for every `run_preflight` return path:
+    tag overrides > default route (#707) > preset class > cost gates —
+    matching the precedence tags > explicit LLM route > default route > ask.
+
+    Centralized (rather than each return path chaining the four calls
+    itself) so `original_routing` is captured exactly once, right after the
+    parse/short-circuit result is built and before `_apply_tag_overrides`
+    (the only thing that mutates `result.routing` ahead of the default-route
+    hook) gets a chance to change it. See `_apply_default_route` for why that
+    pre-tag-override value matters.
+    """
+    original_routing = result.routing
+    result = _apply_tag_overrides(result, tags_list, title)
+    result = _apply_default_route(result, original_routing)
+    result = _apply_preset_class(result, tags_list)
+    result = _apply_cost_gates(result)
+    return result
+
+
 def run_preflight(
     title: str,
     tags: list[str] | None = None,
@@ -548,22 +636,19 @@ def run_preflight(
     # Short-circuit: empty title is always unsafe, no need to spend a Haiku call.
     if not title.strip():
         defaults = _defaults()
-        return _apply_cost_gates(_apply_preset_class(
-            _apply_tag_overrides(
-                PreflightResult(
-                    budget=defaults,
-                    routing=ROUTE_ASK,
-                    routing_reason="empty title",
-                    expected_output="text",
-                    ambiguity=None,
-                    sane=False,
-                    sane_reason="task title is empty",
-                    raw={},
-                ),
-                tags_list,
+        return _finish(
+            PreflightResult(
+                budget=defaults,
+                routing=ROUTE_ASK,
+                routing_reason="empty title",
+                expected_output="text",
+                ambiguity=None,
+                sane=False,
+                sane_reason="task title is empty",
+                raw={},
             ),
             tags_list,
-        ))
+        )
 
     call = caller or _default_llm_caller
     prompt = build_preflight_prompt(title, tags_list)
@@ -572,24 +657,18 @@ def run_preflight(
     except Exception as exc:
         logger.warning("preflight LLM call failed: %s", exc)
         defaults = _defaults()
-        return _apply_cost_gates(_apply_preset_class(
-            _apply_tag_overrides(
-                PreflightResult(
-                    budget=defaults,
-                    routing=ROUTE_ASK,
-                    routing_reason="preflight LLM call failed",
-                    expected_output="text",
-                    ambiguity=None,
-                    sane=False,
-                    sane_reason=f"preflight error: {exc}",
-                    raw={},
-                ),
-                tags_list,
+        return _finish(
+            PreflightResult(
+                budget=defaults,
+                routing=ROUTE_ASK,
+                routing_reason="preflight LLM call failed",
+                expected_output="text",
+                ambiguity=None,
+                sane=False,
+                sane_reason=f"preflight error: {exc}",
+                raw={},
             ),
             tags_list,
-        ))
+        )
 
-    return _apply_cost_gates(_apply_preset_class(
-        _apply_tag_overrides(parse_preflight_response(reply), tags_list, title),
-        tags_list,
-    ))
+    return _finish(parse_preflight_response(reply), tags_list, title)
