@@ -1,7 +1,7 @@
 # Voice Setup
 
 **Status:** Complete
-**Last Updated:** 2026-08-25
+**Last Updated:** 2026-08-26
 **Audience:** Operators
 
 This guide sets up **voice mode** in LifeOS. Voice is a tap-to-talk input mode *inside* the web `/chat` client — not a separate app or page. It reaches the same orchestrator, the same personas, and the same conversations as text chat. The speech pipeline (STT and TTS) is provided by a **separate** service, **whisper-relay**; LifeOS only reverse-proxies it and adds the browser UI.
@@ -81,6 +81,25 @@ grant, separate from — and not inherited from — the regular browser tab.
 On iOS, add the shortcut from Safari (not another default browser) via
 Share → Add to Home Screen, from the tailnet HTTPS URL above. A shortcut
 added before this feature shipped won't upgrade itself — re-add it.
+
+### Action Button deep link (iPhone Shortcuts) (#731)
+
+An iPhone's Action Button can't call LifeOS directly — it triggers a Shortcut, and the Shortcut opens a URL. `/chat` accepts two independent URL params for this:
+
+- **`?mode=voice`** — puts the page in voice mode. On a cold launch, if the **Listening** dock toggle is on (the default), this only *arms wake-listening*: the page holds a live mic and waits for a spoken wake burst ("Hermes") before it starts an actual recording — see "Listening" below. It does **not** start recording by itself, and never has.
+- **`?record=1`** (added for #731) — begins an actual recording immediately on page load, the same code path a manual tap on the talk button uses. It only fires **alongside** `?mode=voice` in the same URL (it has no effect on its own, and `?mode=voice` alone never implies it) and only on the navigation that actually carries it — reloading the page later without the param doesn't replay it. It respects the same secure-context/mic-permission guard as a manual tap: if the mic isn't usable yet (no HTTPS, permission not yet granted, etc.), you get the normal blocked-mic message in the thread instead of a silent hang.
+
+Given the Action Button press already *is* the intent to speak, point the Shortcut at both params together:
+
+```
+https://<your-machine>.<your-tailnet>.ts.net/chat?mode=voice&record=1
+```
+
+**Shortcuts recipe:** create a new Shortcut with a single **Open URL** action set to the URL above, then assign it to the Action Button (Settings → Action Button → Shortcut → pick it). The very first press still needs a manual mic-permission grant (see below) before later presses can go straight to recording.
+
+**Known limitations — verify on your own device before relying on this:**
+- Shortcuts' **Open URL** action may open the link in Safari (a regular browser tab) rather than the installed standalone Home Screen web app, depending on iOS version and whether a matching Home Screen shortcut already exists. If it lands in Safari, you're in a *different* mic-permission container than the standalone app (see "Installing to a Home Screen" above) — the first Action Button press there will need its own permission prompt even if you already granted the standalone app's icon. If Shortcuts offers an **Open App** (or "Open \<App Name\>") action targeting the already-installed Home Screen icon on your device, prefer that over **Open URL** — it's more likely to land in the standalone container consistently, though this hasn't been verified across iOS versions.
+- Because the Action Button's press-to-launch isn't a real in-page tap gesture, some browsers may be stricter about a page requesting the microphone with no click behind it. This mirrors the existing Listening feature, which already acquires the mic without a gesture whenever `?mode=voice` loads with Listening on — so this isn't new risk, but it's still worth testing once on your device rather than assuming it works.
 
 ## The voice dock in /chat
 

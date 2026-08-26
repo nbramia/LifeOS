@@ -5,12 +5,11 @@
       <stop offset="100%" style="stop-color:#ff6b6b"/>
     </linearGradient>
   </defs>
-  <!-- Background circle -->
+  <!-- Background disc -->
   <circle cx="16" cy="16" r="15" fill="#1a1a2e"/>
-  <!-- L shape representing LifeOS -->
-  <path d="M10 8 L10 20 L22 20" stroke="url(#grad)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-  <!-- Neural dot accents -->
-  <circle cx="10" cy="8" r="2" fill="#e94560"/>
-  <circle cx="22" cy="20" r="2" fill="#ff6b6b"/>
-  <circle cx="16" cy="14" r="1.5" fill="#e94560" opacity="0.7"/>
+  <!-- Bold "L" mark (LifeOS), rounded caps for a clean silhouette at small sizes -->
+  <path d="M9 7 L9 23 L23 23" stroke="url(#grad)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <!-- Two accent nodes at the mark's endpoints -->
+  <circle cx="9" cy="7" r="2.4" fill="#e94560"/>
+  <circle cx="23" cy="23" r="2.4" fill="#ff6b6b"/>
 </svg>
