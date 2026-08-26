@@ -727,13 +727,13 @@ class TestChatConfigEndpoint:
             "default_voice": False, "secure_url": "",
             "remote_model_available": False, "remote_model_label": "",
             "voice_endpoint_silence_ms": 1600, "voice_endpoint_hard_cap_ms": 3000,
-            "voice_endpoint_semantic": False}
+            "voice_endpoint_semantic": False, "voice_idle_timeout_ms": 10000}
         monkeypatch.setattr("api.routes.chat.settings.chat_default_voice", True, raising=False)
         assert client.get("/api/chat/config").json() == {
             "default_voice": True, "secure_url": "",
             "remote_model_available": False, "remote_model_label": "",
             "voice_endpoint_silence_ms": 1600, "voice_endpoint_hard_cap_ms": 3000,
-            "voice_endpoint_semantic": False}
+            "voice_endpoint_semantic": False, "voice_idle_timeout_ms": 10000}
 
     # voice_endpoint_* (#718) drive the web client's smart turn endpointing
     # VAD timing in auto-mode voice recording — see web/chat/voice.js.
@@ -745,6 +745,14 @@ class TestChatConfigEndpoint:
         assert data["voice_endpoint_silence_ms"] == 2200
         assert data["voice_endpoint_hard_cap_ms"] == 4500
         assert data["voice_endpoint_semantic"] is True
+
+    # voice_idle_timeout_ms (#723): disjoint from voice_endpoint_* above --
+    # governs a recording that captured no speech at all, not trailing
+    # silence after speech.
+    def test_voice_idle_timeout_setting_reflects_config(self, client, monkeypatch):
+        monkeypatch.setattr("api.routes.chat.settings.voice_idle_timeout_ms", 7500, raising=False)
+        data = client.get("/api/chat/config").json()
+        assert data["voice_idle_timeout_ms"] == 7500
 
     # secure_url is the web client's one-tap escape from an insecure context to
     # the HTTPS origin the mic needs (#516).

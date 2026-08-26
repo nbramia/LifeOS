@@ -749,18 +749,18 @@ function stopRecorder() {
 async function handleSkippedEmptyRecording() {
   setTalkActive(false);
   setStatus('', 'Ready');
-  // No auto-continue here (#721). stopRecordingAndSend() -- this function's
-  // only caller -- reaches it either from onTalkClick's stop branch or from
-  // its own `discard: true` branch (a spoken cancel mid-recording, #722), so
-  // every recording this handles is a deliberate stop, not a completed turn
-  // -- despite the name, that now includes a discarded non-silent recording,
-  // not only an empty/silent one. Auto-continue has to key off "a turn was
-  // submitted and its reply finished playing" (submitTurn()'s own
-  // maybeAutoContinue() call below, after `await playbackChain`) -- re-arming
-  // here as well used to treat a deliberate stop (typically a quick tap that
-  // catches too little or no audio) as if a reply had just played, instantly
-  // restarting recording with no way to stop without leaving Auto mode
-  // entirely.
+  // No auto-continue here (#721). This function's only caller,
+  // stopRecordingAndSend(), reaches it whenever the recording is being
+  // discarded rather than submitted: a manual tap-to-stop that caught too
+  // little/no audio, a #718 hard-cap/candidate finalize whose captured clip
+  // still reads as silent, or a #723 idle-timeout exit (discard) -- none
+  // of these is "a turn was submitted and its reply finished playing".
+  // Auto-continue has to key off exactly that (submitTurn()'s own
+  // maybeAutoContinue() call below, after `await playbackChain`) --
+  // re-arming here as well used to treat any of these discards as if a
+  // reply had just played, instantly restarting recording with no way to
+  // stop without leaving Auto mode entirely (#721's original bug, for the
+  // manual-stop case specifically).
 }
 
 async function beginRecordingFromTap() {
@@ -784,17 +784,28 @@ async function beginRecordingFromTap() {
   }
 }
 
-// `discard: true` (#722's spoken-cancel path) skips straight to
-// handleSkippedEmptyRecording()'s no-submit/no-auto-continue branch below
-// instead of evaluating the captured blob -- same teardown as a manual stop
-// or a silent recording, just without the isSilentBlob() check (a discard
-// doesn't care what's in the clip, so there's nothing to decode it for).
+// `discard: true` skips straight to handleSkippedEmptyRecording()'s
+// no-submit/no-auto-continue branch instead of evaluating the captured
+// blob -- the same teardown a manual stop or a silent recording uses, just
+// without the isSilentBlob() check. Two callers set it, for the same reason
+// from different evidence: a spoken cancel (#722), where the user's own
+// words are the instruction to throw the clip away, and an idle-timeout
+// exit (#723), which already knows from endpointHasSpeech -- the same VAD
+// signal #718's candidate/hard-cap logic keys off -- that the recording
+// captured no speech at all. Either way a discard doesn't care what's in
+// the clip, so there's nothing to decode it for, and neither can fall
+// through to submitTurn() on a blob that isSilentBlob()'s independently
+// tuned thresholds happen to judge as "not silent". Every other caller (a
+// manual tap, #718's hard cap/candidate finalize) omits it and keeps the
+// isSilentBlob()-decided behavior exactly.
 async function stopRecordingAndSend({ discard = false } = {}) {
   if (isStarting || !isRecording) return;
   // Set (and tear down endpointing) synchronously, before the MIN_RECORD_MS
-  // await below, so a concurrent second call -- #718's hard cap and a
-  // candidate's "complete" verdict can each reach this function -- sees
-  // `!isRecording` and returns immediately instead of double-stopping.
+  // await below, so a concurrent second call -- #718's hard cap, a
+  // candidate's "complete" verdict, and #723's idle timeout can each reach
+  // this function -- sees `!isRecording` and returns immediately instead of
+  // double-stopping. Goes through setIsRecording() so the wake tap's
+  // suspension follows the recording state (#724).
   setIsRecording(false);
   stopEndpointing();
 
@@ -1526,6 +1537,32 @@ async function triggerWakeRecording() {
 // regardless of any candidate verdict, so an ambiguous or unreachable check
 // can never hang the mic open forever.
 //
+// Idle timeout (#723): a THIRD, disjoint budget for the opposite situation --
+// no speech at ALL yet this recording, so SILENCE_MS/HARD_CAP_MS above (both
+// scoped to trailing silence *after* speech) have nothing to measure. Without
+// this, a recording nobody ever spoke into (walked away, wake-triggered by
+// noise, reply didn't need one) sits open forever: the hard cap can't save it
+// because endpointHasSpeech never flips true, so endpointSilenceMs never even
+// starts accruing. After IDLE_TIMEOUT_MS of this, stop and DISCARD -- submit
+// nothing, no turn/conversation artifacts -- via the SAME manual-stop
+// discard path an empty/silent recording already uses
+// (handleSkippedEmptyRecording(), reached through stopRecordingAndSend()'s
+// discard param below), never a parallel teardown. Crucially this must
+// never re-arm auto-continue (that re-arm is exactly what would reopen the
+// mic in a loop) -- see stopRecordingAndSend()'s doc comment: the discard
+// branch it shares with a manual empty-recording stop has had no
+// maybeAutoContinue() call since #721, so this path inherits that for free.
+//
+// Precedence vs. #718 is a straight handoff, not a race: endpointIdleMs (idle
+// timeout's own counter) only accrues while `!endpointHasSpeech`, and
+// endpointSilenceMs (#718's) only starts once `endpointHasSpeech` is true --
+// see handleEndpointFrame() below. The very first speech frame flips
+// endpointHasSpeech permanently true for the rest of THIS recording (nothing
+// resets it back to false except a brand-new recording's
+// resetEndpointState()), so the two counters can never both be live at once.
+// Speech seen this recording -> #718 owns the ending, always. No speech at
+// all -> idle timeout owns it, always.
+//
 // Guards are re-checked after every await, the same pattern
 // triggerWakeRecording() uses after its chime -- a manual stop tap, a cancel,
 // or Auto/voice mode changing while a candidate round-trip is in flight must
@@ -1533,6 +1570,7 @@ async function triggerWakeRecording() {
 // user already ended a different way.
 const ENDPOINT_DEFAULT_SILENCE_MS = 1600;
 const ENDPOINT_DEFAULT_HARD_CAP_MS = 3000;
+const ENDPOINT_DEFAULT_IDLE_TIMEOUT_MS = 10000;
 
 // Trailing words/phrases that read as "still talking" even after a pause --
 // conjunctions/connectives that normally lead into more speech, plus common
@@ -1605,23 +1643,27 @@ export function isCancelUtterance(transcript) {
   });
 }
 
-// LIFEOS_VOICE_ENDPOINT_SILENCE_MS / _HARD_CAP_MS, read from GET
-// /api/chat/config (settings.py) the same way LIFEOS_CHAT_DEFAULT_VOICE
-// reaches fetchDefaultVoiceMode() above. Both start at the designed defaults
-// and only move if/when the (already-cached, shared) config fetch resolves
-// with a valid override, so a slow or unreachable config never blocks
-// endpointing -- it just runs on the built-in timings meanwhile. There is no
-// server-side use of these values; the settings only exist to make this
-// client-side timing operator-tunable without an env-var-free config file.
+// LIFEOS_VOICE_ENDPOINT_SILENCE_MS / _HARD_CAP_MS / _IDLE_TIMEOUT_MS, read
+// from GET /api/chat/config (settings.py) the same way LIFEOS_CHAT_DEFAULT_VOICE
+// reaches fetchDefaultVoiceMode() above. All three start at the designed
+// defaults and only move if/when the (already-cached, shared) config fetch
+// resolves with a valid override, so a slow or unreachable config never
+// blocks endpointing -- it just runs on the built-in timings meanwhile.
+// There is no server-side use of these values; the settings only exist to
+// make this client-side timing operator-tunable without an env-var-free
+// config file.
 let endpointSilenceMsSetting = ENDPOINT_DEFAULT_SILENCE_MS;
 let endpointHardCapMsSetting = ENDPOINT_DEFAULT_HARD_CAP_MS;
+let endpointIdleTimeoutMsSetting = ENDPOINT_DEFAULT_IDLE_TIMEOUT_MS;
 
 function loadEndpointingConfig() {
   fetchChatConfig().then((data) => {
     const silence = Number(data.voice_endpoint_silence_ms);
     const hardCap = Number(data.voice_endpoint_hard_cap_ms);
+    const idleTimeout = Number(data.voice_idle_timeout_ms);
     if (Number.isFinite(silence) && silence > 0) endpointSilenceMsSetting = silence;
     if (Number.isFinite(hardCap) && hardCap > 0) endpointHardCapMsSetting = hardCap;
+    if (Number.isFinite(idleTimeout) && idleTimeout > 0) endpointIdleTimeoutMsSetting = idleTimeout;
   });
 }
 
@@ -1632,6 +1674,7 @@ let endpointSampleRate = 0;
 let endpointFrames = [];            // Float32Array frames captured since the current recording started
 let endpointHasSpeech = false;      // at least one speech frame seen this recording
 let endpointSilenceMs = 0;          // trailing silence since the last speech frame
+let endpointIdleMs = 0;             // (#723) silence elapsed while NO speech has been seen yet this recording
 let endpointCandidateFired = false; // a candidate check already ran for the current silence run
 let endpointChecking = false;       // a candidate transcribe/completeness round-trip is in flight
 // Bumped every time a NEW recording's endpointing tap is (re)installed
@@ -1656,6 +1699,7 @@ function resetEndpointState() {
   endpointFrames = [];
   endpointHasSpeech = false;
   endpointSilenceMs = 0;
+  endpointIdleMs = 0;
   endpointCandidateFired = false;
   endpointChecking = false;
 }
@@ -1732,7 +1776,15 @@ function handleEndpointFrame(e) {
     endpointCandidateFired = false;  // speech resumed -- re-arm the candidate timer
     return;
   }
-  if (!endpointHasSpeech) return;  // ambient silence before any speech -- not timed yet
+  if (!endpointHasSpeech) {
+    // No speech at all yet this recording (#723) -- a disjoint silence
+    // budget from endpointSilenceMs below, which only starts once speech has
+    // been seen. See the "Idle timeout" doc comment above this section for
+    // why the two can never both be counting.
+    endpointIdleMs += frameMs;
+    if (endpointIdleMs >= endpointIdleTimeoutMsSetting) finalizeIdleTimeout();
+    return;
+  }
 
   endpointSilenceMs += frameMs;
 
@@ -1779,6 +1831,20 @@ export function finalizeEndpointing() {
 // there's no real-timer path to it that a browser test can't otherwise
 // reach, so checkEndpointCandidate() itself is the only test seam needed.
 function discardEndpointing() {
+  if (!isRecording) return;
+  stopRecordingAndSend({ discard: true }).catch((err) => {
+// Idle-timeout finalize (#723) -- stops and DISCARDS, never submits. Also
+// through stopRecordingAndSend(), but with its `discard` param set:
+// this is the SAME handleSkippedEmptyRecording() teardown a manual stop on
+// an empty/silent recording already uses (see stopRecordingAndSend()'s doc
+// comment), not a parallel discard implementation -- and that path has had
+// no auto-continue re-arm since #721, so this inherits that for free. Same
+// `!isRecording` guard/no-op-if-already-stopped reasoning as
+// finalizeEndpointing() above. Exported for the same headless-test reason:
+// it's the exact function real continuous no-speech silence crossing
+// IDLE_TIMEOUT_MS calls, with no way to wait out that much real silence
+// through the live audio graph in a browser test.
+export function finalizeIdleTimeout() {
   if (!isRecording) return;
   stopRecordingAndSend({ discard: true }).catch((err) => {
     setStatus('error', 'Error');

@@ -61,8 +61,9 @@ These variables are read by `config/settings.py` (aliases shown). They are **not
 | `LIFEOS_VOICE_ENDPOINT_SILENCE_MS` | `1600` | Smart turn endpointing (below): trailing silence, in ms, after speech before a candidate endpoint check runs. |
 | `LIFEOS_VOICE_ENDPOINT_HARD_CAP_MS` | `3000` | Smart turn endpointing: continuous silence, in ms, that finalizes the turn regardless of any completeness verdict. |
 | `LIFEOS_VOICE_ENDPOINT_SEMANTIC` | `false` | Reserved for an optional LLM completeness classifier — **not implemented**; flipping it currently has no effect. The heuristic alone governs completeness. |
+| `LIFEOS_VOICE_IDLE_TIMEOUT_MS` | `10000` | Idle timeout (below): silence, in ms, with **no speech detected at all** in the recording before it's stopped and discarded unsubmitted. |
 
-These three, along with `default_voice`/`secure_url`/the remote-model fields, are read by the web client from `GET /api/chat/config` — the endpointing pair are pure client-side VAD timing knobs with no server-side use; they exist as settings only so that timing is operator-tunable without editing `web/chat/voice.js`.
+These four, along with `default_voice`/`secure_url`/the remote-model fields, are read by the web client from `GET /api/chat/config` — the endpointing/idle-timeout settings are pure client-side VAD timing knobs with no server-side use; they exist as settings only so that timing is operator-tunable without editing `web/chat/voice.js`.
 
 Restart the API after editing `.env`:
 
@@ -110,7 +111,7 @@ In voice mode the text composer is replaced by the dock:
 - Four dock toggles (state saved per browser):
   - **Mute** — suppress spoken playback (the reply still returns as text).
   - **2×** — play spoken replies at double speed.
-  - **Auto** — auto-continue: after a reply finishes, start listening for the next turn without another tap. While Auto is on, a recording also **ends itself** once you sound done — see "Smart turn endpointing" below — instead of always waiting for another tap.
+  - **Auto** — auto-continue: after a reply finishes, start listening for the next turn without another tap. While Auto is on, a recording also **ends itself**: once you sound done, see "Smart turn endpointing" below; if you never say anything at all, see "Idle timeout" below — instead of always waiting for another tap.
   - **Listening** — wake-word mode, default off (#710). While on, the page holds its own mic stream and runs a local energy-based VAD (no third-party wake-word engine, no Web Speech API — that ships audio to Google). When it hears a speech burst end, it POSTs the short clip to `${voice gateway}/api/voice/transcribe` and fuzzy-matches the transcript against "Hermes" (tolerating whisper-isms like "Hermès" or "her mes" — see `matchesWakeWord()` in `web/chat/voice.js`); a match plays a short confirmation chime, then starts recording exactly as a talk-button tap would. Detection is suspended while recording, while a turn is in flight, and while a spoken reply or the chime is playing (so the assistant — or the chime itself — can never wake it), and resumes after. Leaving voice mode or unchecking Listening releases its mic entirely. **Requires a `/api/voice/transcribe` route on the voice gateway that does not exist yet as of this writing** — see the note below.
 
 ### The wake-confirmation chime
@@ -144,6 +145,15 @@ While Auto is on, ending a recording with a cancel phrase discards it instead of
 The matcher (`isCancelUtterance()` in `web/chat/voice.js`) is **trailing-anchored**: it normalizes the transcript (lowercase, strip trailing punctuation) and checks whether the *end* of it is one of `cancel`, `cancel that`, `never mind`, `nevermind`, `forget it`, `scratch that`. This is deliberate — a substring match would treat "cancel my 3pm with Dana" as a cancellation, silently eating a legitimate request that happens to contain the word "cancel." Trailing-anchoring means that request is transcribed and submitted normally; only an utterance that *ends with* one of those phrases (most commonly the whole utterance, e.g. "Cancel.") is treated as a cancel.
 
 Cancel detection reuses the exact candidate-pause transcript step 2 above already fetches — there is no separate check interval, timer, or additional STT call for it. Its accuracy and latency are therefore identical to endpointing's own: a cancel is only noticed at the next candidate pause, gated by the same `LIFEOS_VOICE_ENDPOINT_SILENCE_MS`/`LIFEOS_VOICE_ENDPOINT_HARD_CAP_MS` settings above.
+### Idle timeout
+
+Smart turn endpointing above is entirely about trailing silence *after* speech — it has nothing to measure if you never say anything at all in a given recording. Without a separate guard, a recording nobody ever spoke into (you stepped away, a false wake trigger, or a reply that just didn't need a follow-up) would sit open indefinitely, since the hard cap in step 4 above only starts counting once speech has been heard.
+
+The **idle timeout** covers exactly that gap: if a recording captures `LIFEOS_VOICE_IDLE_TIMEOUT_MS` (default 10000ms) of silence with **no speech detected at all**, the client stops recording and **discards** it — no turn is submitted, no conversation or turn artifacts are created — through the same discard path (`handleSkippedEmptyRecording()` in `web/chat/voice.js`) an empty/silent manual stop already uses. Like a manual stop, this never re-arms Auto-continue, so the mic does not reopen on its own; getting back into recording after an idle exit takes an explicit act — the wake word (with Listening on) or a tap on the talk button. Listening's own mic hold is an independent stream from the recording, so wake detection keeps working normally through an idle exit with no extra step.
+
+The discriminator between the two timers — smart-turn-endpointing's trailing-silence timers and the idle timeout — is simply whether any speech has been detected yet in the current recording, using the same energy-VAD signal `handleEndpointFrame()` already computes for step 1 above: once speech has been heard, endpointing's timers own the rest of that recording; until then, the idle timeout owns it. The two can never fire for the same recording, since each covers a mutually exclusive phase of it (before vs. after the first speech is heard).
+
+Like smart turn endpointing, the idle timeout only ever runs while Auto is on, voice mode is active, and a recording is actually in progress — with Auto off, a recording with no speech is already discarded without a turn on a manual stop-tap (silence detection has skipped empty/silent recordings since before this feature), so there is nothing further for Auto-off to change.
 
 ### The bare-STT gateway route (not yet shipped)
 

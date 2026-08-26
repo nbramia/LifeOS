@@ -220,6 +220,20 @@ class Settings(BaseSettings):
         description="Continuous silence (ms) in auto-mode voice recording that finalizes "
                     "the turn regardless of the completeness check, so it can never hang"
     )
+    # Idle timeout (#723): a disjoint budget from the two above, for the
+    # opposite situation -- no speech at all yet this recording, so there is
+    # no trailing silence for voice_endpoint_silence_ms/_hard_cap_ms to
+    # measure. After this much silence with nothing spoken, the client stops
+    # and discards the recording (no turn submitted) rather than leaving the
+    # mic open indefinitely. Read by GET /api/chat/config -> web/chat/voice.js,
+    # same pattern as the two settings above -- also a pure client-side
+    # timing knob, not used anywhere server-side.
+    voice_idle_timeout_ms: int = Field(
+        default=10000,
+        alias="LIFEOS_VOICE_IDLE_TIMEOUT_MS",
+        description="Silence (ms) with no speech detected at all in auto-mode voice "
+                    "recording before the client stops and discards it unsubmitted"
+    )
     # Reserved for an optional LLM completeness classifier for ambiguous
     # candidate transcripts (no terminal punctuation, no trailing filler word
     # either) — see isTranscriptComplete()'s doc comment in web/chat/voice.js.
