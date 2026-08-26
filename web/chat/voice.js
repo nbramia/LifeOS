@@ -76,24 +76,48 @@ let ttsAudio = null;
 // Every write to `clipInFlight` goes through here (#734) rather than
 // assigning the module variable directly, so the wake tap's AudioContext
 // (`listenAudioCtx`, set up in startListening() below) suspends/resumes in
-// lockstep with it. `ScriptProcessorNode.onaudioprocess` runs on the main
-// thread regardless of whether handleListenFrame() has anything useful to
-// do with the frame -- while a clip plays, that node stayed connected and
-// kept firing even though canDetectWake()'s own clipInFlight guard already
-// made every call a no-op, and the live callback contended with playback.
-// suspend()/resume() stop and restart the whole graph's processing without
-// touching the mic stream or the node wiring, so a wake match still works
-// after a playback cycle with zero extra getUserMedia calls. Both branches
+// lockstep with it -- see updateListenSuspension() just below, which also
+// covers the `isRecording` half of the same problem (#724). Both branches
 // are no-ops when Listening isn't running (listenAudioCtx null) or the
 // context is already in the target state.
 function setClipInFlight(value) {
   clipInFlight = value;
+  updateListenSuspension();
+}
+
+// Shared by setClipInFlight() above and the `isRecording` writes in
+// beginRecording()/beginWebAudioRecording()/stopRecordingAndSend() below
+// (routed through setIsRecording(), #724): suspends the wake tap's
+// AudioContext whenever a clip is playing OR a recording is in progress,
+// resumes when neither. `ScriptProcessorNode.onaudioprocess` runs on the
+// main thread regardless of whether handleListenFrame() has anything useful
+// to do with the frame -- #734 covered the playback case, but the recording
+// case had the identical shape and was still open: `listenProcessor` stayed
+// connected and running for the entire time a recording was in progress,
+// even though canDetectWake()'s own `!isRecording` guard already made every
+// call a no-op (wake detection is meaningless while already recording), so
+// the live callback was pure main-thread overhead contending with the
+// recorder's/endpointer's own taps for that whole window -- exactly the
+// aggregate-cost concern the taps-inventory doc above ensureAudioContext()
+// warns about. suspend()/resume() stop and restart the whole graph's
+// processing without touching the mic stream or the node wiring, so a wake
+// match still works the instant recording ends, with zero extra
+// getUserMedia calls.
+function updateListenSuspension() {
   if (!listenAudioCtx) return;
-  if (value && listenAudioCtx.state === 'running') {
+  const shouldSuspend = clipInFlight || isRecording;
+  if (shouldSuspend && listenAudioCtx.state === 'running') {
     listenAudioCtx.suspend().catch(() => {});
-  } else if (!value && listenAudioCtx.state === 'suspended') {
+  } else if (!shouldSuspend && listenAudioCtx.state === 'suspended') {
     listenAudioCtx.resume().catch(() => {});
   }
+}
+
+// Every write to `isRecording` goes through here (#724), for the same
+// reason setClipInFlight() above exists -- see updateListenSuspension().
+function setIsRecording(value) {
+  isRecording = value;
+  updateListenSuspension();
 }
 
 // Dock defaults for a first-time visitor (no stored settings yet). 2x playback,
@@ -418,6 +442,11 @@ function applyVoiceMode() {
   // re-acquires it. startListening()/stopListening() are both idempotent.
   if (isVoiceMode() && isListeningEnabled()) startListening();
   else stopListening();
+  // The record path's own stream releases the same way on leaving voice mode
+  // (#724, see releaseMicStream()'s own doc comment) -- unlike Listening's
+  // it is NOT re-acquired on entering voice mode; it stays lazily acquired
+  // by the next tap or wake trigger, same as always.
+  if (!isVoiceMode()) releaseMicStream();
 }
 
 function setTalkActive(on) {
@@ -487,6 +516,29 @@ function requestMicInGesture() {
   });
 }
 
+// The talk-button's own stream, `micStream` -- lazily acquired above by
+// requestMicInGesture() the first time it's needed -- used to never be
+// released at all: applyVoiceMode() only ever tore down Listening's
+// separate hold on leaving voice mode, never this one, so once a session
+// had recorded even once the mic stayed live for the rest of the page's
+// life regardless of mode (#724). Guarded on `!isRecording && !isStarting`
+// so this never yanks the stream out from under a recording that's already
+// in progress or in the brief async gap while one is starting -- leaving
+// voice mode mid-recording keeps today's existing (unrelated, unchanged)
+// behavior of that recording continuing to completion; this only closes the
+// gap for the common case of leaving voice mode with nothing actively
+// recording, which is what "no lingering live mic hold" is about. Unlike
+// Listening's stream, this one is never re-acquired on *entering* voice
+// mode -- it never was, before this fix either -- it stays lazy, acquired
+// only by the next actual tap or wake trigger.
+function releaseMicStream() {
+  if (isRecording || isStarting) return;
+  if (micStream) {
+    for (const t of micStream.getTracks()) t.stop();
+    micStream = null;
+  }
+}
+
 function setupMediaRecorder(stream) {
   if (mediaRecorder && mediaRecorder.state !== 'inactive') {
     try { mediaRecorder.stop(); } catch (_) { /* ignore */ }
@@ -510,7 +562,7 @@ function beginRecording(stream) {
   setupMediaRecorder(stream);
   mediaRecorder.start(250);
   recordStartedAt = Date.now();
-  isRecording = true;
+  setIsRecording(true);
   setStatus('', 'Recording…');
   setTalkActive(true);
   maybeStartEndpointing(stream);  // #718 -- no-op unless Auto + voice mode
@@ -526,8 +578,12 @@ function beginRecording(stream) {
 //   2. `listenProcessor` (startListening()/stopListening(), "Listening"
 //      section below) -- connected for as long as voice mode + the Listening
 //      toggle are both on, which since #710 shipping the toggle on by
-//      default means essentially the whole time voice mode is open,
-//      including while a reply is playing.
+//      default means essentially the whole time voice mode is open. Its
+//      `AudioContext` is suspended (not disconnected -- see the invariant
+//      below) whenever a clip is playing or a recording is in progress
+//      (updateListenSuspension(), #734 + #724), so "connected" here is about
+//      the node wiring's lifetime, not whether it's actually processing at
+//      any given moment.
 //   3. `endpointProcessor` (maybeStartEndpointing()/stopEndpointing(), "Smart
 //      turn endpointing" section below) -- connected only while a recording
 //      that Auto-continue governs is in progress; torn down on every stop
@@ -552,7 +608,13 @@ function beginRecording(stream) {
 // `listenAudioCtx` itself in lockstep with `clipInFlight`, so the callback
 // stops firing rather than merely discarding what it computes. Suspend, not
 // `getUserMedia`-releasing teardown: the mic stream and node wiring survive
-// untouched, so resuming never re-prompts for mic permission.
+// untouched, so resuming never re-prompts for mic permission. #724 found the
+// identical gap for the *recording* window -- `canDetectWake()`'s
+// `!isRecording` guard already made detection a no-op the whole time a
+// recording was in progress, but `listenProcessor` itself stayed connected
+// and running regardless, same contention, different trigger.
+// `updateListenSuspension()` (by `setClipInFlight()`/`setIsRecording()`)
+// generalizes the fix to both conditions at once.
 //
 // Anyone adding a fourth tap (or re-enabling one of these outside its
 // documented window) must account for the aggregate main-thread cost across
@@ -580,7 +642,7 @@ function beginWebAudioRecording(stream) {
   audioSource.connect(audioProcessor);
   audioProcessor.connect(audioCtx.destination);
   recordStartedAt = Date.now();
-  isRecording = true;
+  setIsRecording(true);
   setStatus('', 'Recording…');
   setTalkActive(true);
   maybeStartEndpointing(stream);  // #718 -- no-op unless Auto + voice mode
@@ -733,7 +795,7 @@ async function stopRecordingAndSend({ discard = false } = {}) {
   // await below, so a concurrent second call -- #718's hard cap and a
   // candidate's "complete" verdict can each reach this function -- sees
   // `!isRecording` and returns immediately instead of double-stopping.
-  isRecording = false;
+  setIsRecording(false);
   stopEndpointing();
 
   const elapsed = Date.now() - recordStartedAt;
@@ -997,6 +1059,44 @@ async function maybeAutoContinue() {
 // beginRecordingFromTap() -- the same function the talk button itself calls
 // -- so a wake trigger is indistinguishable from a tap.
 //
+// Investigated for #724 (merge the two streams into one getUserMedia hold)
+// and kept separate. Findings, so the next agent doesn't relitigate this
+// from scratch:
+//   - No hard technical incompatibility rules a shared stream out. A
+//     `MediaRecorder` and a live `MediaStreamAudioSourceNode` CAN read the
+//     same `MediaStream` concurrently (each track supports multiple
+//     consumers) -- and on iOS specifically (`useWebAudioRecorder` above)
+//     the record path doesn't even use `MediaRecorder`; it uses the same
+//     `createMediaStreamSource`-based approach this section does, so that
+//     candidate conflict doesn't apply there either.
+//   - Merging streams would NOT touch the actual cost #724 was filed to
+//     reduce. The "second always-on audio graph" (battery/CPU) is a
+//     `ScriptProcessorNode`/`AudioContext` count problem, not a
+//     `getUserMedia` count problem -- fixed narrowly instead, by extending
+//     the exact suspend/resume pattern #734 built (setClipInFlight()) to
+//     also cover the recording window (updateListenSuspension()/
+//     setIsRecording(), same section above ensureAudioContext()). That
+//     closes the real contention with zero stream-lifetime changes.
+//   - Merging would NOT reliably reduce permission prompts either: a
+//     granted mic permission is scoped to the page's origin, not to any
+//     particular `getUserMedia` call or stream -- a second call on an
+//     already-granted origin does not re-prompt on its own. (#724's own
+//     issue text concedes this: permission persistence is an origin-level
+//     browser setting, not something this file's call count controls.)
+//   - What a merge WOULD cost: reference-counted release across three
+//     independent consumers (the recorder/`audioProcessor`, `listenProcessor`,
+//     `endpointProcessor`), each currently owned exclusively by its own
+//     stream and free to `track.stop()` it without asking. A shared stream
+//     means none of them may ever be the one to stop a track the others
+//     still want -- real, tractable complexity, but complexity in exchange
+//     for a benefit (one fewer live hardware capture) that's speculative
+//     beyond a single iOS Safari user report, while the codebase's own
+//     history (#734's whole existence) is evidence WebKit's iOS audio-graph
+//     behavior is fragile territory worth extra caution in, not less. Given
+//     voice mode is reported working well on both Linux desktop and iPhone
+//     today, that trade isn't worth taking without a reproducible failure
+//     to actually fix. Revisit if one shows up.
+//
 // `${endpoints.voice}/transcribe` is forwarded by the existing generic
 // `/api/voice/*` reverse proxy (api/routes/voice.py) with no LifeOS-side
 // route change. It does NOT exist in whisper-relay as of this writing --
@@ -1201,6 +1301,12 @@ async function startListening() {
   // graph's output; it never writes to that output buffer, so nothing here
   // is actually audible.
   listenProcessor.connect(listenAudioCtx.destination);
+  // Covers the edge case of the Listening toggle being switched on while a
+  // recording (or clip) is already in progress -- without this the freshly
+  // created context would start (and stay) in the 'running' state
+  // regardless of `isRecording`/`clipInFlight` until the next write to
+  // either one happened to flip it (#724).
+  updateListenSuspension();
 }
 
 // Releases the mic entirely -- called on toggle-off and on leaving voice
