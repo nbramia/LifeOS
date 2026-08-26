@@ -156,3 +156,6 @@ scripts/clear-caches.sh
 # .worktrees/ made `git status --porcelain` report dirty, which silently
 # disabled auto-deploy.sh for 62 consecutive ticks (#634).
 .worktrees/
+
+# Per-install persona selection; the tracked telegram_bots.json is the template.
+config/telegram_bots.local.json

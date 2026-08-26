@@ -17,7 +17,23 @@ logger = logging.getLogger(__name__)
 
 # Registry of specialized Telegram bots (beyond the primary). Committed, no
 # secrets — each entry references the env var holding its token.
+# The tracked file is a TEMPLATE listing every persona this repo ships.
+# Each install selects its own subset in an untracked local override, so one
+# person enabling "finance" doesn't commit that choice for everyone, and a
+# `git pull` never clobbers a local selection. Local wins entirely when present
+# (it replaces the template rather than merging, so removing an entry there
+# actually removes it).
 _TELEGRAM_BOTS_FILE = Path("config/telegram_bots.json")
+_TELEGRAM_BOTS_LOCAL_FILE = Path("config/telegram_bots.local.json")
+
+
+def _telegram_bots_source() -> "Path | None":
+    """Which registry file to read: the local override, else the template."""
+    if _TELEGRAM_BOTS_LOCAL_FILE.exists():
+        return _TELEGRAM_BOTS_LOCAL_FILE
+    if _TELEGRAM_BOTS_FILE.exists():
+        return _TELEGRAM_BOTS_FILE
+    return None
 _PRIMARY_PERSONA_FILE = Path("config/personas/primary.md")
 _BOT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
@@ -1152,6 +1168,23 @@ class Settings(BaseSettings):
         return bool(self.telegram_bot_token and self.telegram_chat_id)
 
     @property
+    def telegram_primary_listener_enabled(self) -> bool:
+        """Whether to POLL the primary bot, as opposed to only sending as it.
+
+        Sending (sendMessage) and receiving (getUpdates) are separable, but
+        Telegram allows only ONE getUpdates consumer per bot token. When the
+        primary token belongs to a bot another process already polls — e.g. a
+        Hermes gateway that owns the Telegram surface — LifeOS must send as that
+        bot without polling it, or the two clients 409 each other.
+
+        Set TELEGRAM_PRIMARY_LISTENER_ENABLED=false in that case. The scheduler
+        still starts and still delivers; only the inbound listener is skipped.
+        """
+        import os
+        raw = os.getenv("TELEGRAM_PRIMARY_LISTENER_ENABLED", "true").strip().lower()
+        return raw not in ("false", "0", "no", "off")
+
+    @property
     def telegram_primary_bot(self) -> "TelegramBotConfig":
         """The default Telegram bot, driven by TELEGRAM_BOT_TOKEN/CHAT_ID.
 
@@ -1173,7 +1206,24 @@ class Settings(BaseSettings):
 
     @property
     def telegram_bots(self) -> list["TelegramBotConfig"]:
-        """Specialized Telegram bots beyond the primary, from the registry file.
+        """Specialized Telegram bots that can actually run — token env set.
+
+        Thin wrapper over :meth:`_load_registry_bots`; see it for the registry
+        format. Callers that start Telegram listeners want this one, since a
+        listener without a token is meaningless.
+        """
+        return self._load_registry_bots(require_token=True)
+
+    def _load_registry_bots(self, require_token: bool = True) -> list["TelegramBotConfig"]:
+        """Specialized bots from the registry file.
+
+        ``require_token=True`` (the default, used by Telegram listeners) drops
+        entries whose token env var is unset. ``require_token=False`` keeps
+        them, for surfaces that do not use Telegram at all — the web /chat UI
+        and voice list personas via :meth:`list_http_personas`, and requiring a
+        Telegram bot token to see a persona there was a coupling bug: it forced
+        creating a bot you never intend to message just to use a persona in the
+        browser.
 
         Each registry entry names an env var holding the bot's token; entries
         whose token is unset are skipped (logged) so a fresh clone with no extra
@@ -1185,15 +1235,16 @@ class Settings(BaseSettings):
         bot out of Hermes permanently. An unrecognized value falls back to
         ``"hermes"`` with a warning, same pattern as an invalid bot name.
         """
-        if not _TELEGRAM_BOTS_FILE.exists():
+        source = _telegram_bots_source()
+        if source is None:
             return []
         try:
-            entries = json.loads(_TELEGRAM_BOTS_FILE.read_text())
+            entries = json.loads(source.read_text())
         except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Could not read {_TELEGRAM_BOTS_FILE}: {e}")
+            logger.warning(f"Could not read {source}: {e}")
             return []
         if not isinstance(entries, list):
-            logger.warning(f"{_TELEGRAM_BOTS_FILE} must contain a JSON list, ignoring")
+            logger.warning(f"{source} must contain a JSON list, ignoring")
             return []
 
         # pydantic-settings loads .env into the model but does NOT export to
@@ -1213,7 +1264,7 @@ class Settings(BaseSettings):
                 logger.warning(f"Skipping duplicate/reserved Telegram bot name: {name!r}")
                 continue
             token = (env.get(entry.get("token_env", "")) or "").strip()
-            if not token:
+            if not token and require_token:
                 logger.info(
                     f"Telegram bot '{name}' skipped: env var "
                     f"{entry.get('token_env')!r} is unset"
@@ -1247,9 +1298,10 @@ class Settings(BaseSettings):
     def list_http_personas(self) -> list["PersonaInfo"]:
         """Chat personas visible to HTTP clients (web, voice/whisper-relay).
 
-        Returns the primary persona plus every configured specialized bot from
-        the registry whose token env is set (``telegram_bots`` already drops the
-        unset ones). No secrets are exposed. The primary persona and any
+        Returns the primary persona plus every specialized persona in the
+        registry, whether or not it has a Telegram bot token. These surfaces do
+        not use Telegram, so a token is irrelevant to them; gating on one meant
+        a persona was invisible in the browser until you created a bot for it. No secrets are exposed. The primary persona and any
         orchestrating bot (``orchestrates: true``, e.g. the doctor self-repair
         bot) advertise ``handoff``/``agent`` capabilities; pure-chat specialized
         bots advertise none. Adding a registry entry + its token env var surfaces
@@ -1266,7 +1318,7 @@ class Settings(BaseSettings):
             capabilities=list(ORCHESTRATOR_PERSONA_CAPABILITIES),
             orchestrates=self.persona_orchestrates("primary"),
         )]
-        for bot in self.telegram_bots:
+        for bot in self._load_registry_bots(require_token=False):
             personas.append(PersonaInfo(
                 id=bot.name,
                 label=bot.label or bot.name.capitalize(),

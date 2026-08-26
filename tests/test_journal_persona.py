@@ -53,7 +53,12 @@ class TestRegistry:
         # Pure chat, like fitness/therapist/finance — not an orchestrator.
         assert not journal.get("orchestrates", False)
 
-    def test_omitted_without_token_present_with_token(self, tmp_path, monkeypatch):
+    def test_listed_for_http_with_or_without_token(self, tmp_path, monkeypatch):
+        """Journal is reachable in /chat whether or not a Telegram bot exists.
+
+        Only the Telegram listener needs a token; requiring one to see the
+        persona in a browser meant creating a bot you never intend to message.
+        """
         reg = tmp_path / "bots.json"
         reg.write_text(json.dumps([
             {"name": "journal", "token_env": "TG_JOURNAL", "persona_file": str(_PERSONA_PATH)},
@@ -61,10 +66,12 @@ class TestRegistry:
         monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
         monkeypatch.delenv("TG_JOURNAL", raising=False)
         from config.settings import settings
-        assert "journal" not in [p.id for p in settings.list_http_personas()]
+        assert "journal" in [p.id for p in settings.list_http_personas()]
+        assert [b.name for b in settings.telegram_bots] == []  # no token -> no listener
 
         monkeypatch.setenv("TG_JOURNAL", "tok")
         assert "journal" in [p.id for p in settings.list_http_personas()]
+        assert [b.name for b in settings.telegram_bots] == ["journal"]
 
     def test_pure_chat_advertises_no_capabilities(self, tmp_path, monkeypatch):
         reg = tmp_path / "bots.json"
