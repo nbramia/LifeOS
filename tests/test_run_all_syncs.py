@@ -1257,3 +1257,37 @@ class TestPersonalGoogleGating:
             result = run_all_syncs(dry_run=True)
 
         assert result["results"]["gmail_personal"]["reason"] == "google_account_not_configured"
+
+
+class TestSyncOrderInvariants:
+    """Ordering constraints in SYNC_ORDER that are easy to break silently.
+
+    These assert on the real SYNC_ORDER, not the test fixture, because the
+    bug they guard against is a reordering of the production list.
+    """
+
+    def _pos(self, source):
+        from scripts.run_all_syncs import SYNC_ORDER
+        assert source in SYNC_ORDER, f"{source} missing from SYNC_ORDER"
+        return SYNC_ORDER.index(source)
+
+    def test_strengths_runs_after_vault_reindex(self):
+        """vault_reindex creates people from vault mentions.
+
+        Scoring before it leaves those people with a NULL relationship_strength
+        and NULL dunbar_circle until the next night. Seen on a real install as
+        243 circle-less people, all created by that night's own vault_reindex.
+        """
+        assert self._pos("strengths") > self._pos("vault_reindex")
+
+    def test_strengths_runs_before_crm_vectorstore(self):
+        """People indexed for semantic search should carry fresh scores."""
+        assert self._pos("strengths") < self._pos("crm_vectorstore")
+
+    def test_strengths_runs_after_relationship_discovery(self):
+        """Strength is computed from relationship edges, so edges come first."""
+        assert self._pos("strengths") > self._pos("relationship_discovery")
+
+    def test_strengths_runs_after_person_stats_full(self):
+        """Interaction counts feed the strength computation."""
+        assert self._pos("strengths") > self._pos("person_stats_full")
