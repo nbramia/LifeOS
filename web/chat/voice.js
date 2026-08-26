@@ -73,6 +73,29 @@ let clipInFlight = false;
 let thinkingEl = null;
 let ttsAudio = null;
 
+// Every write to `clipInFlight` goes through here (#734) rather than
+// assigning the module variable directly, so the wake tap's AudioContext
+// (`listenAudioCtx`, set up in startListening() below) suspends/resumes in
+// lockstep with it. `ScriptProcessorNode.onaudioprocess` runs on the main
+// thread regardless of whether handleListenFrame() has anything useful to
+// do with the frame -- while a clip plays, that node stayed connected and
+// kept firing even though canDetectWake()'s own clipInFlight guard already
+// made every call a no-op, and the live callback contended with playback.
+// suspend()/resume() stop and restart the whole graph's processing without
+// touching the mic stream or the node wiring, so a wake match still works
+// after a playback cycle with zero extra getUserMedia calls. Both branches
+// are no-ops when Listening isn't running (listenAudioCtx null) or the
+// context is already in the target state.
+function setClipInFlight(value) {
+  clipInFlight = value;
+  if (!listenAudioCtx) return;
+  if (value && listenAudioCtx.state === 'running') {
+    listenAudioCtx.suspend().catch(() => {});
+  } else if (!value && listenAudioCtx.state === 'suspended') {
+    listenAudioCtx.resume().catch(() => {});
+  }
+}
+
 // Dock defaults for a first-time visitor (no stored settings yet). 2x playback,
 // auto-continue, and wake-word listening are on so voice mode is conversational
 // out of the box: speak, hear the reply at 2x, and be heard again without
@@ -493,6 +516,51 @@ function beginRecording(stream) {
   maybeStartEndpointing(stream);  // #718 -- no-op unless Auto + voice mode
 }
 
+// --- Audio taps: inventory and the main-thread-contention invariant (#734) ---
+//
+// This file runs up to three independent `ScriptProcessorNode`s, each on its
+// own `AudioContext`:
+//   1. `audioProcessor` (below, iOS WebAudio recorder path) -- connected only
+//      while actually recording on that platform; torn down by
+//      releaseCapture() the instant recording stops.
+//   2. `listenProcessor` (startListening()/stopListening(), "Listening"
+//      section below) -- connected for as long as voice mode + the Listening
+//      toggle are both on, which since #710 shipping the toggle on by
+//      default means essentially the whole time voice mode is open,
+//      including while a reply is playing.
+//   3. `endpointProcessor` (maybeStartEndpointing()/stopEndpointing(), "Smart
+//      turn endpointing" section below) -- connected only while a recording
+//      that Auto-continue governs is in progress; torn down on every stop
+//      path via stopRecordingAndSend()'s synchronous stopEndpointing() call.
+//
+// `ScriptProcessorNode` is deprecated specifically because its
+// `onaudioprocess` callback runs on the **main thread** -- every connected
+// node is a periodic main-thread callback, and playback (decoding, DOM/UI
+// work, GC) competes with it for the same thread. On real hardware that
+// contention is audible: scratchy, popping playback. It does NOT show up as
+// a test failure -- headless suites don't render real audio -- so this is a
+// listen-to-it-on-a-real-device regression class, which is why the rule is
+// written down here instead of left to be rediscovered.
+//
+// The invariant: **a tap that isn't actively needed must be disconnected or
+// have its `AudioContext` suspended -- not merely have its output ignored.**
+// Bug #734 was exactly this mistake: `handleListenFrame()` correctly
+// suspended *detection* while a clip played (`canDetectWake()`'s
+// `clipInFlight` guard) but left `listenProcessor` connected and firing --
+// the callback kept running on the main thread for no purpose the entire
+// time a reply was audible. The fix (`setClipInFlight()` above) suspends
+// `listenAudioCtx` itself in lockstep with `clipInFlight`, so the callback
+// stops firing rather than merely discarding what it computes. Suspend, not
+// `getUserMedia`-releasing teardown: the mic stream and node wiring survive
+// untouched, so resuming never re-prompts for mic permission.
+//
+// Anyone adding a fourth tap (or re-enabling one of these outside its
+// documented window) must account for the aggregate main-thread cost across
+// whichever taps can be simultaneously connected, not just their own. If a
+// genuine need for more concurrent taps emerges, the real fix is migrating
+// to `AudioWorklet` (runs off the main thread, the supported replacement for
+// `ScriptProcessorNode`) rather than adding another main-thread callback to
+// the pile -- deferred here as a larger, separate change.
 function ensureAudioContext() {
   const Ctx = window.AudioContext || window.webkitAudioContext;
   if (!Ctx) return;
@@ -749,7 +817,7 @@ function playSingleUrl(url) {
   // (unlockTtsAudio()'s guard, and onTalkClick's/the cancel button's
   // stop-vs-continue branch) need precisely "is a real clip currently
   // loading or playing right now", not "is a turn nominally still running".
-  clipInFlight = true;
+  setClipInFlight(true);
   let promise;
   if (useSharedTtsAudio()) {
     const audio = getTtsAudioElement();
@@ -769,7 +837,7 @@ function playSingleUrl(url) {
       audio.play().catch(reject);
     });
   }
-  return promise.finally(() => { clipInFlight = false; });
+  return promise.finally(() => { setClipInFlight(false); });
 }
 
 function enqueueClip(url) {
@@ -814,7 +882,7 @@ function stopAllAudio() {
   // its own `.finally()` never clears clipInFlight on its own -- reset it
   // explicitly here so a stopped clip doesn't leave unlockTtsAudio() (or
   // the stop-vs-continue checks above) permanently guarded off.
-  clipInFlight = false;
+  setClipInFlight(false);
 }
 
 function isBenignPlaybackError(err) {
@@ -912,6 +980,11 @@ async function maybeAutoContinue() {
 }
 
 // --- Listening: wake-word ("Hermes") detection (#710) ---
+//
+// `listenProcessor` below is tap #2 of the audio-taps inventory documented
+// above ensureAudioContext() -- see that comment for the main-thread-
+// contention invariant this section's suspend/resume machinery
+// (setClipInFlight()) exists to satisfy.
 //
 // A fourth dock toggle, default off, persisted like its siblings (dockSettings
 // above). While on and in voice mode, this holds its *own* mic stream --
@@ -1030,7 +1103,7 @@ function playWakeChimeShared(url) {
   if (clipInFlight) return Promise.resolve();
   const audio = getTtsAudioElement();
   if (!activeAudios.includes(audio)) activeAudios.push(audio);
-  clipInFlight = true;
+  setClipInFlight(true);
   const settle = playUrlOnElement(audio, url).catch(() => {});
   return Promise.race([
     settle,
@@ -1044,7 +1117,7 @@ function playWakeChimeShared(url) {
     // beyond that: the next real clip's own playUrlOnElement() call always
     // reassigns both before playing, so nothing here can leak into it.
     audio.__abortPlayback?.();
-  }).finally(() => { clipInFlight = false; });
+  }).finally(() => { setClipInFlight(false); });
 }
 
 // Plays one randomly-chosen chime and resolves once it's done. Never
@@ -1155,6 +1228,17 @@ function stopListening() {
   listenSpeechMs = 0;
   listenSilenceMs = 0;
   listenChecking = false;
+}
+
+// Test seam (#734): whether the wake tap's own AudioContext is actually
+// running right now, as opposed to merely "detection would accept a frame
+// if one arrived" (canDetectWake() above, which stays false for several
+// other reasons -- recording, a turn in flight -- that have nothing to do
+// with the graph being suspended). Lets a browser test assert the graph
+// itself stops processing while a clip plays and starts again once it ends,
+// rather than inferring it indirectly through wake-match side effects.
+export function isListenTapRunning() {
+  return !!(listenAudioCtx && listenAudioCtx.state === 'running');
 }
 
 function handleListenFrame(e) {
@@ -1308,6 +1392,11 @@ async function triggerWakeRecording() {
 }
 
 // --- Smart turn endpointing: pause + semantic completeness (#718) ---
+//
+// `endpointProcessor` below is tap #3 of the audio-taps inventory documented
+// above ensureAudioContext() -- see that comment for the main-thread-
+// contention invariant (connected only while actually needed, torn down via
+// stopEndpointing() on every stop path).
 //
 // Auto-continue (above) already reopens the mic after each reply; this layers
 // on *when to stop* a recording that started that way (or from a manual tap
@@ -1501,6 +1590,14 @@ function stopEndpointing() {
     endpointCtx = null;
   }
   resetEndpointState();
+}
+
+// Test seam (#734): whether the endpointing tap is currently wired up, so a
+// browser test can assert it's torn down after every stop path (manual stop,
+// hard-cap finalize, spoken-cancel discard) rather than inferring it
+// indirectly.
+export function isEndpointTapActive() {
+  return !!endpointProcessor;
 }
 
 function flattenEndpointFrames() {

@@ -424,3 +424,56 @@ class TestBargeInSuspension:
 
         assert result is None
         assert page.evaluate("window.__recorderStopCalls") == 0
+
+
+class TestEndpointTapTeardown:
+    """The endpointing ScriptProcessorNode (#734's tap #3 -- see the
+    audio-taps inventory above ensureAudioContext() in voice.js) must be
+    connected only while a recording it governs is actually in progress, and
+    disconnected on every path that ends that recording -- a live callback
+    left behind after the recording ends is exactly the class of bug #734
+    fixed for the wake tap. `isEndpointTapActive()` checks the tap directly
+    (`!!endpointProcessor`) rather than inferring teardown indirectly."""
+
+    def test_active_while_recording(self, page: Page, chat_base_url):
+        _open_voice_chat(page, chat_base_url)
+        assert page.evaluate("window.lifeChatVoice.isEndpointTapActive()") is False
+
+        _start_recording(page)
+
+        assert page.evaluate("window.lifeChatVoice.isEndpointTapActive()") is True
+
+    def test_torn_down_on_manual_stop(self, page: Page, chat_base_url):
+        _open_voice_chat(page, chat_base_url)
+        _start_recording(page)
+        assert page.evaluate("window.lifeChatVoice.isEndpointTapActive()") is True
+
+        # force=True: the .recording class drives an infinite CSS pulse
+        # animation, which fails Playwright's default actionability wait.
+        page.locator("#voiceTalkBtn").click(force=True)
+        page.wait_for_function("window.__recorderStopCalls === 1")
+
+        assert page.evaluate("window.lifeChatVoice.isEndpointTapActive()") is False
+
+    def test_torn_down_on_hard_cap_finalize(self, page: Page, chat_base_url):
+        _open_voice_chat(page, chat_base_url)
+        _start_recording(page)
+        assert page.evaluate("window.lifeChatVoice.isEndpointTapActive()") is True
+
+        page.evaluate("() => window.lifeChatVoice.finalizeEndpointing()")
+        page.wait_for_function("window.__recorderStopCalls === 1")
+
+        assert page.evaluate("window.lifeChatVoice.isEndpointTapActive()") is False
+
+    def test_torn_down_on_candidate_complete_finalize(self, page: Page, chat_base_url):
+        """The "submit" path -- a candidate check verdicting complete finalizes
+        through the same stopRecordingAndSend() call a manual stop uses."""
+        _open_voice_chat(page, chat_base_url)
+        _start_recording(page)
+        assert page.evaluate("window.lifeChatVoice.isEndpointTapActive()") is True
+
+        result = _check_candidate(page, "Turn off the lights.")
+        assert result is True
+        page.wait_for_function("window.__recorderStopCalls === 1")
+
+        assert page.evaluate("window.lifeChatVoice.isEndpointTapActive()") is False

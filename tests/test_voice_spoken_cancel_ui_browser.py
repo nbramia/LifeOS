@@ -271,13 +271,17 @@ class TestCancelDiscardsRecording:
     def test_cancel_tears_down_endpointing_cleanly(self, page: Page, chat_base_url):
         """No lingering timer/graph after a discard -- the talk button
         starts a fresh recording normally afterward, the same signal
-        tests/test_voice_endpointing_ui_browser.py's stale-check test uses."""
+        tests/test_voice_endpointing_ui_browser.py's stale-check test uses.
+        Also checked directly via isEndpointTapActive() (#734's tap
+        inventory) rather than only inferred through the restart."""
         _open_voice_chat_listening_off(page, chat_base_url)
         _start_recording(page)
+        assert page.evaluate("window.lifeChatVoice.isEndpointTapActive()") is True
 
         _check_candidate(page, "scratch that")
         page.wait_for_function("window.__recorderStopCalls === 1")
         assert _is_recording(page) is False
+        assert page.evaluate("window.lifeChatVoice.isEndpointTapActive()") is False
 
         _start_recording(page)
         page.wait_for_function("window.__recorderStartCalls === 2")

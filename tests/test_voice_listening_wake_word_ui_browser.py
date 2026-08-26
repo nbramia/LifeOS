@@ -129,6 +129,41 @@ navigator.mediaDevices.getUserMedia = function (constraints) {
   window.MediaRecorder = WrappedMR;
 })();
 
+// Overrides AudioContext.prototype's `state`/suspend()/resume() with a
+// JS-tracked stand-in, defaulting new contexts to 'running' (#734). Real
+// Chrome autoplay policy suspends a context created with no prior user
+// gesture on the page until later explicitly resumed or auto-unlocked by
+// the browser's per-origin media-engagement heuristics (accumulated real
+// usage history a fresh/headless browser never has) -- neither of those
+// apply to a synthetic Playwright session, so a *real* listenAudioCtx here
+// would start (and stay) 'suspended' regardless of the fix under test,
+// which is the wrong baseline: the bug this suite tests is about a tap
+// that IS running contending with playback, matching the real device the
+// issue was filed from. The override only changes what `.state` reports
+// and what suspend()/resume() toggle -- createScriptProcessor/
+// createMediaStreamSource/etc. all still hit the real implementation, so
+// the live onaudioprocess graph keeps working exactly as before.
+(function () {
+  window.__ctxSuspendCalls = 0;
+  window.__ctxResumeCalls = 0;
+  var proto = (window.AudioContext || window.webkitAudioContext).prototype;
+  var stateMap = new WeakMap();
+  Object.defineProperty(proto, 'state', {
+    configurable: true,
+    get: function () { return stateMap.has(this) ? stateMap.get(this) : 'running'; },
+  });
+  proto.suspend = function () {
+    window.__ctxSuspendCalls += 1;
+    stateMap.set(this, 'suspended');
+    return Promise.resolve();
+  };
+  proto.resume = function () {
+    window.__ctxResumeCalls += 1;
+    stateMap.set(this, 'running');
+    return Promise.resolve();
+  };
+})();
+
 (function () {
   window.__audioPlayingCount = 0;
   var proto = HTMLMediaElement.prototype;
@@ -401,6 +436,45 @@ class TestListeningSuspension:
         triggered_after = _check_wake(page, "Hermes")
 
         assert triggered_after is True, "Listening did not resume after TTS playback ended"
+        assert page.evaluate("window.__recorderStartCalls") == 1
+
+    def test_wake_tap_graph_itself_suspends_during_playback_and_resumes_after(
+            self, page: Page, chat_base_url):
+        """#734: the wake tap's callback must actually stop firing while a
+        clip plays, not merely have its output ignored (the old bug --
+        canDetectWake() already returned False here, but the still-connected
+        ScriptProcessorNode kept its onaudioprocess callback running on the
+        main thread, contending with playback). isListenTapRunning() checks
+        the graph's own AudioContext.state directly, and __gumCalls/
+        __stopCalls confirm the suspend/resume cycle never touches the mic
+        permission -- no second getUserMedia, no track stop."""
+        _open_voice_chat(page, chat_base_url)
+        page.locator("#voiceAuto").uncheck()  # isolate from auto-continue, as above
+        page.locator("#voiceListen").check()
+        page.wait_for_function("window.__gumCalls === 1")
+        page.wait_for_function("() => window.lifeChatVoice.isListenTapRunning() === true")
+
+        clip_url = page.evaluate("window.__makeWav(500)")
+        page.evaluate("(u) => { window.__turnClipUrl = u; }", clip_url)
+        page.evaluate("() => { window.lifeChatVoice.submitTurn({ transcript: 'hi' }); }")
+        page.wait_for_function("window.__audioPlayingCount > 0")
+
+        page.wait_for_function("() => window.lifeChatVoice.isListenTapRunning() === false")
+        # The mic hold itself is untouched by the suspend -- no re-prompt, no
+        # second acquisition, no track stop.
+        assert page.evaluate("window.__gumCalls") == 1
+        assert page.evaluate("window.__stopCalls") == 0
+
+        page.wait_for_function("window.__audioPlayingCount === 0", timeout=5000)
+
+        page.wait_for_function("() => window.lifeChatVoice.isListenTapRunning() === true")
+        assert page.evaluate("window.__gumCalls") == 1
+        assert page.evaluate("window.__stopCalls") == 0
+
+        # And detection genuinely works again, not just the graph being
+        # nominally "running" -- a real wake match still triggers recording.
+        triggered = _check_wake(page, "Hermes")
+        assert triggered is True
         assert page.evaluate("window.__recorderStartCalls") == 1
 
     def test_auto_continue_takes_over_after_tts_instead_of_the_wake_word(
