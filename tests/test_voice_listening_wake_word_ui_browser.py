@@ -329,6 +329,40 @@ class TestListeningMicLifecycle:
 
         page.wait_for_function("window.__gumCalls === 2")
 
+    def test_leaving_voice_mode_releases_the_talk_buttons_mic_too(
+            self, page: Page, chat_base_url):
+        """#724: `micStream` -- the talk button's own stream, acquired lazily
+        by requestMicInGesture() the first time it's needed -- used to never
+        be released at all: applyVoiceMode() only ever tore down Listening's
+        separate hold on leaving voice mode, so once a session had recorded
+        even once the mic stayed live regardless of mode for the rest of the
+        page's life. Verified with Listening off throughout so the only live
+        stream in play is the record path's own -- isolates this from
+        TestListeningMicLifecycle's other tests, which are all about
+        Listening's stream instead."""
+        _open_voice_chat(page, chat_base_url)
+        page.locator("#voiceListen").uncheck()
+        page.wait_for_function("window.__stopCalls > 0")  # Listening's own hold releasing
+        stop_calls_before = page.evaluate("window.__stopCalls")
+
+        page.locator("#voiceTalkBtn").click()
+        page.wait_for_function(
+            "document.getElementById('voiceTalkBtn').classList.contains('recording')"
+        )
+        # force=True: the .recording class drives an infinite CSS pulse that
+        # can fail Playwright's default actionability "element is stable"
+        # wait on the stop tap (see _tap_talk() in the sibling suite).
+        page.locator("#voiceTalkBtn").click(force=True)  # stop
+        page.wait_for_function(
+            "!document.getElementById('voiceTalkBtn').classList.contains('recording')"
+        )
+        # Stopping the recorder itself never touches the stream's tracks.
+        assert page.evaluate("window.__stopCalls") == stop_calls_before
+
+        page.locator("#modeTextBtn").click()  # leave voice mode
+
+        page.wait_for_function(f"window.__stopCalls > {stop_calls_before}")
+
 
 class TestListeningWakeMatch:
     """A stubbed STT response drives the real match/trigger pipeline."""
@@ -476,6 +510,51 @@ class TestListeningSuspension:
         triggered = _check_wake(page, "Hermes")
         assert triggered is True
         assert page.evaluate("window.__recorderStartCalls") == 1
+
+    def test_wake_tap_graph_suspends_during_recording_and_resumes_after(
+            self, page: Page, chat_base_url):
+        """#724: the same main-thread-contention bug #734 fixed for TTS
+        playback also applied to the recording window -- canDetectWake()'s
+        own `!isRecording` guard already made detection a no-op the entire
+        time a recording was in progress, but `listenProcessor` itself
+        stayed connected and running regardless, contending with the
+        recorder's/endpointer's own taps for nothing. Same isListenTapRunning()
+        seam as the playback-suspension test above, this time driven by a
+        real recording started the same way a talk-button tap would."""
+        _open_voice_chat(page, chat_base_url)
+        page.locator("#voiceAuto").uncheck()  # isolate from auto-continue
+        page.locator("#voiceListen").check()
+        page.wait_for_function("window.__gumCalls === 1")
+        page.wait_for_function("() => window.lifeChatVoice.isListenTapRunning() === true")
+
+        page.locator("#voiceTalkBtn").click()
+        page.wait_for_function(
+            "document.getElementById('voiceTalkBtn').classList.contains('recording')"
+        )
+
+        page.wait_for_function("() => window.lifeChatVoice.isListenTapRunning() === false")
+        # The record path's own (separate, #724-documented) stream acquisition
+        # -- Listening's own hold is untouched, no re-prompt, no track stop.
+        assert page.evaluate("window.__gumCalls") == 2
+        assert page.evaluate("window.__stopCalls") == 0
+
+        # force=True: the .recording class drives an infinite CSS pulse that
+        # can fail Playwright's default actionability "element is stable"
+        # wait on the stop tap (see _tap_talk() in the sibling suite).
+        page.locator("#voiceTalkBtn").click(force=True)  # stop
+        page.wait_for_function(
+            "!document.getElementById('voiceTalkBtn').classList.contains('recording')"
+        )
+
+        page.wait_for_function("() => window.lifeChatVoice.isListenTapRunning() === true")
+        assert page.evaluate("window.__gumCalls") == 2
+        assert page.evaluate("window.__stopCalls") == 0
+
+        # And detection genuinely works again -- a real wake match still
+        # triggers a second recording.
+        triggered = _check_wake(page, "Hermes")
+        assert triggered is True
+        assert page.evaluate("window.__recorderStartCalls") == 2
 
     def test_auto_continue_takes_over_after_tts_instead_of_the_wake_word(
             self, page: Page, chat_base_url):
