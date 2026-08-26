@@ -737,6 +737,22 @@ def data_integrity_check():
     return response
 
 
+@app.get("/manifest.webmanifest")
+async def web_manifest():
+    """Serve the web app manifest (#727).
+
+    Served from its own route rather than through /static so the
+    Content-Type is guaranteed to be application/manifest+json — some
+    browsers ignore a manifest served with the wrong content type, and
+    relying on the OS's mimetypes registry to know the .webmanifest
+    extension isn't portable across a fresh install.
+    """
+    manifest_path = Path(__file__).parent.parent / "web" / "manifest.webmanifest"
+    if manifest_path.exists():
+        return FileResponse(str(manifest_path), media_type="application/manifest+json")
+    return {"message": "Manifest not found"}
+
+
 @app.get("/")
 async def root():
     """Serve the homepage."""
