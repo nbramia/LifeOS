@@ -440,6 +440,34 @@ class Settings(BaseSettings):
                     "routing model, since llama-server ignores the request's "
                     "model field."
     )
+    # Summarization target (indexer document summaries — see
+    # api/services/summarizer.py). Same optional-override shape as
+    # local_routing_llm_url above: empty (default) falls back to
+    # local_llm_url, so a fresh clone and Nathan's llama-server install behave
+    # exactly as they do today.
+    #
+    # Unlike llama-server, which serves one model per process and ignores the
+    # request's "model" field, an Ollama endpoint REQUIRES a real model name --
+    # so this pair needs a model setting where local_routing_llm_url did not.
+    # Taylor's Mac mini has no llama-server but does run Ollama, which is the
+    # case this exists for: without it her every summary fails with connection
+    # refused and the vault index silently loses its whole summary layer.
+    summarizer_llm_url: str = Field(
+        default="",
+        alias="LIFEOS_SUMMARIZER_LLM_URL",
+        description="Optional dedicated OpenAI-compatible endpoint for "
+                    "document summarization. Empty (default) falls back to "
+                    "LIFEOS_LOCAL_LLM_URL. Point it at an Ollama server "
+                    "(e.g. http://localhost:11434) on hosts with no "
+                    "llama-server, and set LIFEOS_SUMMARIZER_MODEL to match."
+    )
+    summarizer_model: str = Field(
+        default="local",
+        alias="LIFEOS_SUMMARIZER_MODEL",
+        description="Model name sent in the summarization request. The "
+                    "default 'local' is a placeholder llama-server ignores; "
+                    "Ollama requires a real tag (e.g. 'qwen2.5:3b-instruct')."
+    )
     router_enable_thinking: bool = Field(
         default=False,
         alias="LIFEOS_ROUTER_ENABLE_THINKING",

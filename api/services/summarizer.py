@@ -2,9 +2,11 @@
 Document summarization service using local LLM.
 
 Generates brief summaries for document discovery and high-level search.
-Talks to the OpenAI-compatible local LLM server (llama-server) configured by
-``settings.local_llm_url`` — same endpoint the orchestrator uses, so there's
-no second model to keep running.
+Talks to an OpenAI-compatible LLM server: ``settings.summarizer_llm_url`` when
+set, otherwise ``settings.local_llm_url`` — the same endpoint the orchestrator
+uses, so there's no second model to keep running by default. Hosts without a
+llama-server can point the override at Ollama instead (see
+``settings.summarizer_model``, which llama-server ignores but Ollama requires).
 
 ## Tiered Summarization
 
@@ -142,11 +144,13 @@ def generate_summary(
         prompt = prompt_template.format(content=truncated)
 
         # OpenAI-compatible chat completions against the local llama-server.
-        # We pass model="local" because llama-server ignores the field but the
-        # OpenAI spec requires it to be present.
-        url = f"{settings.local_llm_url.rstrip('/')}/v1/chat/completions"
+        # llama-server ignores the "model" field (one model per process), so the
+        # default is the placeholder "local"; the OpenAI spec requires the key
+        # to be present. Ollama does NOT ignore it and needs a real tag, which
+        # is what settings.summarizer_model is for.
+        url = f"{_summarizer_base_url()}/v1/chat/completions"
         payload = {
-            "model": "local",
+            "model": settings.summarizer_model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
             "max_tokens": 512,
@@ -267,15 +271,32 @@ def _fallback_summary(content: str, file_name: str) -> str:
     return f"Document '{file_name}' containing various notes."
 
 
+def _summarizer_base_url() -> str:
+    """Endpoint for summarization calls.
+
+    Falls back to ``local_llm_url`` when unset, so installs that never set the
+    override keep their existing behaviour exactly.
+    """
+    return (settings.summarizer_llm_url or settings.local_llm_url).rstrip("/")
+
+
 def is_summarizer_llm_available() -> bool:
-    """Check if the local LLM server is reachable for summarization."""
-    try:
-        url = f"{settings.local_llm_url.rstrip('/')}/health"
-        with httpx.Client(timeout=2.0) as client:
-            response = client.get(url)
-            return response.status_code == 200
-    except Exception:
-        return False
+    """Check if the summarization LLM server is reachable.
+
+    Tries ``/health`` first (llama-server), then ``/v1/models`` (the
+    OpenAI-compatible probe, which Ollama answers and llama-server also
+    serves). Ollama has no ``/health`` route, so checking only that would
+    report a perfectly healthy Ollama endpoint as unavailable.
+    """
+    base = _summarizer_base_url()
+    for path in ("/health", "/v1/models"):
+        try:
+            with httpx.Client(timeout=2.0) as client:
+                if client.get(f"{base}{path}").status_code == 200:
+                    return True
+        except Exception:
+            continue
+    return False
 
 
 def create_summary_chunk(
