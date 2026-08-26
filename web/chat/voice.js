@@ -924,32 +924,90 @@ function loadWakeChimeManifest() {
   return wakeChimeManifestPromise;
 }
 
-// Plays one randomly-chosen chime and resolves once it's done -- on `ended`,
-// on a safety timeout (a long or stalled clip must never hang the wake), or
-// immediately if there's nothing to play. Never rejects: a missing/broken
-// sound file degrades to "no chime", not a wake failure.
+// Desktop path: a fresh, throwaway `<audio>` per chime, same as before #725.
+// Desktop's autoplay policy doesn't require a prior gesture-unlocked element
+// the way iOS/Android's does (this whole file's shared-element machinery
+// exists only to route around that mobile restriction), so there's nothing
+// to gain from sharing `ttsAudio` here -- and not sharing means a wake chime
+// can never contend with `ttsAudio` for desktop, whose per-clip `new Audio()`
+// path (playSingleUrl()'s non-shared branch) has no equivalent contention to
+// begin with. Resolves on `ended`, on the safety timeout (a long/stalled
+// clip must never hang the wake), or immediately on a synchronous throw.
+// Never rejects.
+function playWakeChimeStandalone(url) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    const timer = setTimeout(finish, WAKE_CHIME_TIMEOUT_MS);
+    const settleAndClear = () => { clearTimeout(timer); finish(); };
+    try {
+      const audio = new Audio(url);
+      audio.addEventListener('ended', settleAndClear);
+      audio.addEventListener('error', settleAndClear);
+      audio.play().catch(settleAndClear);
+    } catch (e) {
+      settleAndClear();
+    }
+  });
+}
+
+// Mobile path (#725): the chime used to play via `new Audio()` -- an element
+// never unlocked by a user gesture. iOS/Android block that unconditionally,
+// and the wake path has no gesture of its own (it fires from the wake-word
+// STT callback), so the chime was always silent there. Every other
+// non-gesture playback on this platform (status/main TTS audio) already
+// solves this by routing through the single shared element `unlockTtsAudio()`
+// unlocked from an earlier tap -- this does the same, via the same
+// `playUrlOnElement()` helper real clips use, rather than a second
+// playback routine.
+//
+// Guarded against the #608 hazard `unlockTtsAudio()` itself guards against:
+// touching `.src` while a real clip is mid-load/playback on this element
+// would abandon that clip's `oncanplaythrough` the same way. Callers only
+// ever reach this once `baseWakeGuardsOk()` (which requires `!clipInFlight`)
+// has already passed in `triggerWakeRecording()` -- but that check happens
+// before `loadWakeChimeManifest()`'s promise settles, which is always at
+// least one microtask away (even cached, `.then()` never runs synchronously)
+// and, on an uncached first load, a real network round-trip. A real clip
+// could start in that window (a turn's `status_audio`/`main_audio` event
+// firing), so the guard here is load-bearing, not defensive-only.
+// If it fires, the chime is simply skipped -- no chime is the existing,
+// accepted degraded behavior (see loadWakeChimeManifest()'s own doc comment)
+// and is far preferable to stealing a real reply out from under the user.
+function playWakeChimeShared(url) {
+  if (clipInFlight) return Promise.resolve();
+  const audio = getTtsAudioElement();
+  if (!activeAudios.includes(audio)) activeAudios.push(audio);
+  clipInFlight = true;
+  const settle = playUrlOnElement(audio, url).catch(() => {});
+  return Promise.race([
+    settle,
+    new Promise((resolve) => setTimeout(resolve, WAKE_CHIME_TIMEOUT_MS)),
+  ]).then(() => {
+    // Whichever settled first: if the timeout won while the clip was still
+    // loading/playing, abort it explicitly rather than leaving it to finish
+    // on its own -- the same mechanism stopAllAudio() uses. A no-op if the
+    // clip already finished (playUrlOnElement()'s own finish() already
+    // nulled __abortPlayback in that case). Doesn't touch `.src`/playbackRate
+    // beyond that: the next real clip's own playUrlOnElement() call always
+    // reassigns both before playing, so nothing here can leak into it.
+    audio.__abortPlayback?.();
+  }).finally(() => { clipInFlight = false; });
+}
+
+// Plays one randomly-chosen chime and resolves once it's done. Never
+// rejects: a missing/broken sound file, or a guard refusing to touch the
+// shared element, degrades to "no chime", not a wake failure.
 function playWakeChime() {
   return loadWakeChimeManifest().then((sounds) => {
     if (!sounds.length) return;
     const name = sounds[Math.floor(Math.random() * sounds.length)];
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        resolve();
-      };
-      const timer = setTimeout(finish, WAKE_CHIME_TIMEOUT_MS);
-      const settleAndClear = () => { clearTimeout(timer); finish(); };
-      try {
-        const audio = new Audio(WAKE_CHIME_DIR + encodeURIComponent(name));
-        audio.addEventListener('ended', settleAndClear);
-        audio.addEventListener('error', settleAndClear);
-        audio.play().catch(settleAndClear);
-      } catch (e) {
-        settleAndClear();
-      }
-    });
+    const url = WAKE_CHIME_DIR + encodeURIComponent(name);
+    return useSharedTtsAudio() ? playWakeChimeShared(url) : playWakeChimeStandalone(url);
   }).catch(() => {});  // belt-and-suspenders -- loadWakeChimeManifest() already never throws
 }
 
