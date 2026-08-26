@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Chat
-> **Last Updated:** 2026-08-19
+> **Last Updated:** 2026-08-26
 
 The primary chat interface for LifeOS, providing AI-powered search and synthesis across your personal knowledge base.
 
@@ -109,6 +109,8 @@ CLI handoffs run as async worker sessions and report results via Telegram and `/
 - Resume previous conversations
 - Delete conversations
 - Search across conversation history
+- A conversation starts with a placeholder title and is retitled once, automatically, after its second user message — a short title generated from the exchange itself, replacing the placeholder or first-message truncation. No manual rename exists; the system-generated title is what shows from then on.
+- A conversation on a non-default persona shows that persona's label alongside its date in the sidebar, so a fitness/journal/therapist/etc. thread is distinguishable from a primary one at a glance.
 
 ### P4.2: Keyboard Shortcuts
 

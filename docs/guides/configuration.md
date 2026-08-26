@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-08-19
+**Last Updated:** 2026-08-26
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -71,6 +71,22 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 | `LIFEOS_LOCAL_LLM_AUTOSTART` | bool | `false` | When `true`, the API service brings up `lifeos-llm` on its `Wants=` chain. Default `false` so a missing local model doesn't break the API. |
 
 **When to change `LIFEOS_LLM_BACKEND`:** the default (`anthropic`) is right for operators without a high-VRAM GPU. Switch to `local` if you have a workstation that can run `llama-server` and want zero marginal cost / no data transit to Anthropic.
+
+### OpenAI-compatible Remote Provider
+
+An explicit, per-turn model pick (like `local`) backed by a paid OpenAI-compatible endpoint — e.g. Fireworks running DeepSeek or Qwen. Never a rung the escalation ladder can reach on its own (ADR-018); it only ever runs when named explicitly. Also what the agent worker's local route can fall back to when the local llama-server is unreachable — see [agent-worker.md § Local executor](../specs/technical/agent-worker.md#local-executor-gemma-path).
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_REMOTE_LLM_URL` | str | *(empty)* | Base URL of the provider (e.g. `https://api.fireworks.ai/inference/v1`). Empty disables the provider entirely — hidden from the chat model picker, and `model_override="remote"` is ignored. |
+| `LIFEOS_REMOTE_LLM_MODEL` | str | *(empty)* | Model id to send in the request body. |
+| `LIFEOS_REMOTE_LLM_API_KEY` | str | *(empty)* | Bearer token for the provider. |
+| `LIFEOS_REMOTE_LLM_LABEL` | str | `Remote` | Display label for the chat model picker option. |
+| `LIFEOS_REMOTE_LLM_TIMEOUT` | int | `90` | Request timeout, seconds. |
+| `LIFEOS_REMOTE_LLM_INPUT_PRICE_PER_MTOK` | float | — (unset) | USD per million input tokens. Unset (distinct from `0.0`) means the rate isn't known — a turn on this provider records as unpriced rather than a guessed cost. |
+| `LIFEOS_REMOTE_LLM_OUTPUT_PRICE_PER_MTOK` | float | — (unset) | USD per million output tokens. Same unset/`0.0` distinction as the input rate. |
+
+All three of URL, model, and API key must be set for the provider to be considered configured; pricing is independent and can be added later without affecting whether turns run.
 
 ### Routing Target and Reasoning Control (#566)
 
@@ -143,6 +159,8 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 | `LIFEOS_AGENT_MAX_DESCENDANTS_PER_ROOT` | int | varies | Total descendants per root session. |
 | `LIFEOS_AGENT_MAX_CONCURRENT_LOCAL` | int | varies | Concurrent local-executor sessions. |
 | `LIFEOS_AGENT_MAX_CONCURRENT_MANAGED` | int | varies | Concurrent Managed-Agents sessions. |
+| `LIFEOS_AGENT_REMOTE_EXECUTOR` | bool | `false` | Opt-in: when the [OpenAI-compatible remote provider](#openai-compatible-remote-provider) is fully configured and the local llama-server is unreachable at session start, the local route runs the session on the remote provider instead of failing. No-op unless the remote provider is fully configured. |
+| `LIFEOS_AGENT_DEFAULT_ROUTE` | str | *(empty)* | Route preflight dispatches to instead of `ask` when a task has no routing cues at all — for a single-executor install there's nothing useful to ask about. Applies only when lack of cues, not ambiguity or a sanity failure, is why preflight would otherwise ask. Tag overrides (`#local`, `#cloud`, etc.) always win. |
 
 ## Agent Worker — Managed Agents (Cloud)
 
@@ -304,6 +322,7 @@ A capture device (e.g. the Pebble Index ring) posts transcriptions here. See [jo
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | str | — | Bot token from `@BotFather`. |
 | `TELEGRAM_CHAT_ID` | str | — | Your chat ID (find via `/getUpdates`). |
+| `TELEGRAM_PRIMARY_LISTENER_ENABLED` | bool | `true` | `false` stops LifeOS polling this bot's updates (send-only) while the scheduler and alerting keep delivering into it — for when another process already owns the one `getUpdates` poller this token allows. See [telegram-setup.md](telegram-setup.md#create-the-primary-bot). |
 
 When both are set, Telegram becomes a conversational client (full chat pipeline), the scheduled-reminder delivery channel, and the alerting destination.
 
@@ -356,6 +375,7 @@ A handful of operator-tunable files live alongside the env vars. All are gitigno
 | `config/family_members.json` | Family member person UUIDs for special handling. Template at `config/family_members.example.json`. |
 | `config/crm_settings.yaml` | CRM-side tunables (filters, dashboards). |
 | `config/gdoc_sync.example.yaml`, `config/gsheet_sync.example.yaml` | Templates for Google Docs/Sheets sync configs. |
+| `config/telegram_bots.local.json` | Optional per-install override of the tracked `config/telegram_bots.json` template — when present, it *replaces* the template entirely (not a merge), so this install's persona-bot selection is a local choice, not a change to a shared repo file. See [telegram-setup.md](telegram-setup.md#specialized-persona-bots). |
 
 ## Data Directory
 
