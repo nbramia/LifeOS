@@ -580,14 +580,17 @@ async function handleSkippedEmptyRecording() {
   setTalkActive(false);
   setStatus('', 'Ready');
   // No auto-continue here (#721). stopRecordingAndSend() -- this function's
-  // only caller -- is itself only reached from onTalkClick's stop branch, so
-  // every empty/silent recording this handles is a manual tap-to-stop, not a
-  // completed turn. Auto-continue has to key off "a turn was submitted and
-  // its reply finished playing" (submitTurn()'s own maybeAutoContinue() call
-  // below, after `await playbackChain`) -- re-arming here as well used to
-  // treat a deliberate stop (typically a quick tap that catches too little
-  // or no audio) as if a reply had just played, instantly restarting
-  // recording with no way to stop without leaving Auto mode entirely.
+  // only caller -- reaches it either from onTalkClick's stop branch or from
+  // its own `discard: true` branch (a spoken cancel mid-recording, #722), so
+  // every recording this handles is a deliberate stop, not a completed turn
+  // -- despite the name, that now includes a discarded non-silent recording,
+  // not only an empty/silent one. Auto-continue has to key off "a turn was
+  // submitted and its reply finished playing" (submitTurn()'s own
+  // maybeAutoContinue() call below, after `await playbackChain`) -- re-arming
+  // here as well used to treat a deliberate stop (typically a quick tap that
+  // catches too little or no audio) as if a reply had just played, instantly
+  // restarting recording with no way to stop without leaving Auto mode
+  // entirely.
 }
 
 async function beginRecordingFromTap() {
@@ -611,7 +614,12 @@ async function beginRecordingFromTap() {
   }
 }
 
-async function stopRecordingAndSend() {
+// `discard: true` (#722's spoken-cancel path) skips straight to
+// handleSkippedEmptyRecording()'s no-submit/no-auto-continue branch below
+// instead of evaluating the captured blob -- same teardown as a manual stop
+// or a silent recording, just without the isSilentBlob() check (a discard
+// doesn't care what's in the clip, so there's nothing to decode it for).
+async function stopRecordingAndSend({ discard = false } = {}) {
   if (isStarting || !isRecording) return;
   // Set (and tear down endpointing) synchronously, before the MIN_RECORD_MS
   // await below, so a concurrent second call -- #718's hard cap and a
@@ -629,7 +637,7 @@ async function stopRecordingAndSend() {
 
   try {
     const { blob, mime } = await stopRecorder();
-    if (await isSilentBlob(blob)) {
+    if (discard || await isSilentBlob(blob)) {
       await handleSkippedEmptyRecording();
       return;
     }
@@ -1273,12 +1281,15 @@ async function triggerWakeRecording() {
 // recording-so-far is a *candidate* endpoint, not a final decision --
 // POSTed to the same bare-STT route (`/api/voice/transcribe`) Listening's
 // wake check already uses (no conversation/turn artifacts either way), then
-// run through isTranscriptComplete() below. Complete -> finalize through the
-// SAME path a manual stop uses (stopRecordingAndSend(), never a parallel
-// submit implementation). Incomplete -> keep recording; speech resuming
-// re-arms the candidate timer. Silence that keeps growing past HARD_CAP_MS
-// finalizes regardless of any candidate verdict, so an ambiguous or
-// unreachable check can never hang the mic open forever.
+// checked for a spoken cancel (isCancelUtterance() below, #722) BEFORE the
+// completeness decision. Cancel -> discard through stopRecordingAndSend's
+// `discard: true` branch, no submit. Otherwise run through
+// isTranscriptComplete() below. Complete -> finalize through the SAME path a
+// manual stop uses (stopRecordingAndSend(), never a parallel submit
+// implementation). Incomplete -> keep recording; speech resuming re-arms the
+// candidate timer. Silence that keeps growing past HARD_CAP_MS finalizes
+// regardless of any candidate verdict, so an ambiguous or unreachable check
+// can never hang the mic open forever.
 //
 // Guards are re-checked after every await, the same pattern
 // triggerWakeRecording() uses after its chime -- a manual stop tap, a cancel,
@@ -1326,6 +1337,37 @@ export function isTranscriptComplete(transcript) {
     || ENDPOINT_TRAILING_FILLER_PHRASES.includes(lastTwoWords);
   if (endsWithFiller) return false;
   return endsWithPunctuation;
+}
+
+// Trailing phrases that read as the user abandoning the turn mid-recording
+// (#722) -- checked the same way ENDPOINT_TRAILING_FILLER_WORDS above is:
+// against the NORMALIZED end of the transcript, never a substring/includes()
+// match anywhere in it. That distinction is the entire point of this
+// feature -- "cancel my 3pm with Dana" is a real request that must still be
+// submitted; only a transcript that *ends with* one of these phrases (most
+// commonly the whole utterance, e.g. "Cancel.") means abandon it.
+const ENDPOINT_CANCEL_PHRASES = [
+  'cancel', 'cancel that', 'never mind', 'nevermind', 'forget it', 'scratch that',
+];
+
+// Pure heuristic, same shape as isTranscriptComplete() above -- exported so
+// it's testable on its own. Normalizes (lowercase, strip trailing
+// punctuation) then checks whether the trailing N words, for each phrase's
+// own word count, equal that phrase. A short standalone cancel ("Cancel.")
+// is just the N=1 case of the same check, not a separate branch.
+export function isCancelUtterance(transcript) {
+  const normalized = (transcript || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[.?!,;:'"()[\]]+$/g, '')
+    .trim();
+  if (!normalized) return false;
+  const words = normalized.split(/\s+/).filter(Boolean);
+  return ENDPOINT_CANCEL_PHRASES.some((phrase) => {
+    const phraseWords = phrase.split(' ');
+    if (words.length < phraseWords.length) return false;
+    return words.slice(-phraseWords.length).join(' ') === phrase;
+  });
 }
 
 // LIFEOS_VOICE_ENDPOINT_SILENCE_MS / _HARD_CAP_MS, read from GET
@@ -1481,14 +1523,36 @@ export function finalizeEndpointing() {
   });
 }
 
+// Discards through the SAME stop-the-recorder path as finalizeEndpointing()
+// above -- stopRecordingAndSend({ discard: true }) -- never a parallel
+// teardown implementation. `discard: true` routes past submitTurn()
+// entirely into handleSkippedEmptyRecording(), the existing no-submit path a
+// silent/empty recording already uses; that function's own doc comment is
+// why a spoken cancel, like a manual stop, never re-arms auto-continue
+// (#721) -- auto-continue only fires from submitTurn()'s own
+// maybeAutoContinue() call after a reply actually plays, which a discarded
+// recording never reaches. Called by checkEndpointCandidate() below on a
+// cancel-utterance verdict; not exported -- unlike the hard cap,
+// there's no real-timer path to it that a browser test can't otherwise
+// reach, so checkEndpointCandidate() itself is the only test seam needed.
+function discardEndpointing() {
+  if (!isRecording) return;
+  stopRecordingAndSend({ discard: true }).catch((err) => {
+    setStatus('error', 'Error');
+    addMessage('⚠️ ' + (err?.message || 'Recording failed'), 'assistant');
+    setTalkActive(false);
+  });
+}
+
 // The candidate-endpoint pipeline. Exported (samples/sampleRate params, like
 // checkForWakeWord above) so the headless test harness can drive it directly
 // -- the live onaudioprocess VAD above can't run headless either. This is the
 // exact function handleEndpointFrame() itself calls once real silence
 // crosses SILENCE_MS; nothing here is a parallel/fake implementation of that
 // logic. Returns the completeness verdict (or null when the check never
-// reached one -- suspended, superseded, or the relay call failed) so tests
-// can assert on it directly.
+// reached one -- suspended, superseded, or the relay call failed), or the
+// string 'cancelled' on a spoken-cancel verdict (#722), so tests can assert
+// on any of the three outcomes directly.
 //
 // `token` pins this check to the recording it started transcribing for
 // (see endpointRecordingToken above) -- `isRecording` alone can't tell a
@@ -1510,6 +1574,13 @@ export async function checkEndpointCandidate(samples, sampleRate) {
     // Recording ended (or Auto/voice mode changed, or a NEW recording has
     // since started) while we awaited -- a stale verdict must never act.
     if (!endpointingActive() || token !== endpointRecordingToken) return null;
+    // Checked BEFORE the completeness decision (#722) -- a cancel verdict
+    // preempts it entirely, the same way it rides the same candidate-pause
+    // transcript rather than opening a second detection path/timer/STT call.
+    if (isCancelUtterance(transcript)) {
+      discardEndpointing();
+      return 'cancelled';
+    }
     const complete = isTranscriptComplete(transcript);
     if (complete) finalizeEndpointing();
     return complete;
