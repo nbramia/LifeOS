@@ -975,6 +975,27 @@ async def test_persists_turn_and_relay_stays_byte_identical(persist_proxy_client
     ]
 
 
+async def test_persisted_turn_schedules_retitle(persist_proxy_client, hermes_store, monkeypatch):
+    """The shared post-turn titling seam (api/services/conversation_titler.py,
+    tested directly in test_conversation_titler.py) is wired into this
+    surface too -- `finalize()` calls it right after the assistant reply is
+    persisted. conftest's `_stub_conversation_titler` autouse fixture
+    defaults this to a no-op for the whole suite; override it here with a
+    spy to prove the call site actually fires, with the right conversation
+    id, rather than asserting on its (separately-tested) internal behavior.
+    """
+    from unittest.mock import Mock
+    mock_retitle = Mock()
+    monkeypatch.setattr(hp, "schedule_retitle", mock_retitle)
+
+    resp = await persist_proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi there", "persona_id": "primary"},
+    )
+    assert resp.status_code == 200
+
+    mock_retitle.assert_called_once_with("hermes-conv-1")
+
+
 async def test_persists_with_the_selected_persona(persist_proxy_client, hermes_store, tmp_path, monkeypatch):
     persona_file = tmp_path / "fitness.md"
     persona_file.write_text("FITNESS BODY")

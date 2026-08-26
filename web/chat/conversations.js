@@ -146,6 +146,22 @@ async function filterConversationsAsync(searchTerm) {
   renderConversations(allMatches);
 }
 
+// Persona suffix for the sidebar's date subtitle, e.g. "Aug 25 · (Therapist)"
+// — appended only for a conversation whose persona isn't the default
+// ("primary"). Resolves the display name from `config.personas` (loaded at
+// boot by persona.js's loadPersonas(), same source the persona picker
+// itself renders from) rather than a hardcoded name map, so a renamed or
+// newly-added persona picks up automatically. Falls back to the raw
+// persona_id if the id isn't (or isn't yet) in that list — e.g. a persona
+// removed from config after the conversation was created.
+function personaSubtitleSuffix(conv) {
+  const personaId = conv.persona_id;
+  if (!personaId || personaId === 'primary') return '';
+  const persona = (config.personas || []).find(p => p.id === personaId);
+  const label = persona ? persona.label : personaId;
+  return ` · (${label})`;
+}
+
 function renderConversations(conversations, isPartial = false) {
   const { conversationsList } = elements;
   if (conversations.length === 0 && !isPartial) {
@@ -162,7 +178,7 @@ function renderConversations(conversations, isPartial = false) {
                     <div class="conversation-icon">💬</div>
                     <div class="conversation-info">
                         <div class="conversation-title" title="${escapeHtml(conv.title || 'New conversation')}">${escapeHtml(conv.title || 'New conversation')}</div>
-                        <div class="conversation-date">${formatDate(conv.updated_at)}</div>
+                        <div class="conversation-date">${escapeHtml(formatDate(conv.updated_at) + personaSubtitleSuffix(conv))}</div>
                     </div>
                     <button class="conversation-delete" onclick="event.stopPropagation(); deleteConversation('${conv.id}')" title="Delete">✕</button>
                 </div>

@@ -356,6 +356,38 @@ def _isolate_conversation_store_db(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _stub_conversation_titler(monkeypatch):
+    """Stop an ordinary turn-completion test from firing a real background
+    call to the local LLM.
+
+    ``conversation_titler.schedule_retitle()`` is wired into the `finally` of
+    every native chat turn (``api/routes/chat.py``) and the Hermes/voice
+    persistence tees (``api/routes/hermes_proxy.py``, ``api/routes/voice.py``)
+    — unlike ``query_router``/``agent_viz_summary`` (mocked per-test, called
+    from a handful of call sites), this fires from every turn-completing test
+    in the whole suite whenever a conversation happens to reach exactly 2
+    user messages. There's no Anthropic-style host guard for the local
+    routing LLM it calls (``generate_text`` → the local llama-server), so an
+    unmocked test would either hang/slow down waiting on a real model or
+    leave a dangling ``asyncio.create_task`` if none is running. Each of the
+    three call sites imported the function by name (``from
+    api.services.conversation_titler import schedule_retitle``), so it's
+    patched at each of those three module namespaces, not just the source
+    module. Tests that actually exercise titling behavior — see
+    tests/test_conversation_titler.py — call ``conversation_titler``'s
+    functions directly instead of relying on this default.
+    """
+    noop = lambda conversation_id: None  # noqa: E731
+    import api.routes.chat as chat_mod
+    import api.routes.hermes_proxy as hermes_mod
+    import api.routes.voice as voice_mod
+
+    monkeypatch.setattr(chat_mod, "schedule_retitle", noop)
+    monkeypatch.setattr(hermes_mod, "schedule_retitle", noop)
+    monkeypatch.setattr(voice_mod, "schedule_retitle", noop)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_gmail_draft_ledger(tmp_path, monkeypatch):
     """Stop tests from opening (and writing to) the production Gmail draft
     send-gate ledger (#588).
