@@ -683,6 +683,12 @@ def _row_yield(row) -> int:
     )
 
 
+# Minimum number of *productive* runs before a source's yield history is
+# considered a trustworthy baseline. One productive run is the initial backfill;
+# its yield is a corpus size, not a nightly rate. See get_typical_yield.
+YIELD_MIN_PRODUCTIVE_RUNS = 3
+
+
 def get_typical_yield(source: str, n: int = 10) -> Optional[float]:
     """Median records produced across the last ``n`` *productive* runs of ``source``.
 
@@ -697,7 +703,24 @@ def get_typical_yield(source: str, n: int = 10) -> Optional[float]:
     redefine "typical" as zero, after which nothing can ever look wrong —
     exactly how `entity_cleanup` went unnoticed from Feb 2026.
 
-    Returns None when the source has no productive history to compare against.
+    Returns None when the source has no productive history to compare against,
+    or when it has fewer than ``YIELD_MIN_PRODUCTIVE_RUNS`` productive runs.
+
+    The minimum exists because a *single* productive run is almost always the
+    initial backfill, whose yield is the entire historical corpus rather than a
+    nightly rate. Taking the median of one sample pins "typical" at that
+    backfill forever -- and since zero-yield runs are excluded above, nothing
+    can ever bring it down. On a fresh install every quiet night then trips
+    yield collapse: observed on Taylor's day-old deployment, where gmail_work
+    backfilled 3028 records once and every incremental night after produced 0
+    for a mailbox that genuinely had no new mail.
+
+    Requiring three productive runs makes the median resistant to that single
+    outlier. The cost is a warm-up window in which a source that backfilled and
+    then genuinely died looks the same as one that is simply quiet -- we cannot
+    distinguish them from one productive sample, and a detector that cries wolf
+    every night is worse than one that waits, because an alert channel that is
+    always red gets ignored.
     """
     conn = get_sync_health_db()
     try:
@@ -719,7 +742,7 @@ def get_typical_yield(source: str, n: int = 10) -> Optional[float]:
     finally:
         conn.close()
 
-    if not rows:
+    if len(rows) < YIELD_MIN_PRODUCTIVE_RUNS:
         return None
     return float(statistics.median(_row_yield(row) for row in rows))
 

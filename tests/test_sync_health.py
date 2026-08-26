@@ -30,6 +30,8 @@ from api.services.sync_health import (
     reap_orphan_sync_runs,
     emit_sync_stats,
     detect_silent_source_entity_drift,
+    get_typical_yield,
+    YIELD_MIN_PRODUCTIVE_RUNS,
 )
 
 pytestmark = pytest.mark.unit
@@ -816,3 +818,53 @@ class TestRepeatedYieldStreak:
             # entirely, so it doesn't even count as a "different value" —
             # the two surrounding successes are adjacent in the result set).
             assert get_repeated_yield_streak("apple_import", 1294) == 2
+
+
+class TestTypicalYieldWarmup:
+    """A single productive run must not become the yield baseline.
+
+    Regression guard for the false-alarm loop seen on a day-old install: the
+    initial backfill is the only productive run, so the median of one sample
+    pins "typical" at the whole corpus. Because zero-yield runs are excluded
+    from the history, that baseline can never come down, and every genuinely
+    quiet night afterwards reports yield collapse forever.
+    """
+
+    def _productive(self, source, n):
+        for _ in range(n):
+            run_id = record_sync_start(source)
+            record_sync_complete(run_id, SyncStatus.SUCCESS, records_created=3028)
+
+    def test_single_productive_run_yields_no_baseline(self, temp_db):
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            self._productive("gmail_work", 1)
+            assert get_typical_yield("gmail_work") is None
+
+    def test_two_productive_runs_still_no_baseline(self, temp_db):
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            self._productive("gmail_work", 2)
+            assert get_typical_yield("gmail_work") is None
+
+    def test_baseline_appears_at_threshold(self, temp_db):
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            self._productive("gmail_work", YIELD_MIN_PRODUCTIVE_RUNS)
+            assert get_typical_yield("gmail_work") == 3028.0
+
+    def test_zero_runs_do_not_count_toward_threshold(self, temp_db):
+        """Quiet nights must not be mistaken for productive history."""
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            self._productive("gmail_work", 1)
+            for _ in range(10):
+                run_id = record_sync_start("gmail_work")
+                record_sync_complete(run_id, SyncStatus.SUCCESS, records_created=0)
+            assert get_typical_yield("gmail_work") is None
+
+    def test_backfill_outlier_does_not_dominate_median(self, temp_db):
+        """With enough samples the one-off backfill stops setting the bar."""
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            run_id = record_sync_start("gmail_work")
+            record_sync_complete(run_id, SyncStatus.SUCCESS, records_created=3028)
+            for _ in range(2):
+                run_id = record_sync_start("gmail_work")
+                record_sync_complete(run_id, SyncStatus.SUCCESS, records_created=5)
+            assert get_typical_yield("gmail_work") == 5.0
