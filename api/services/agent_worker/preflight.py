@@ -401,27 +401,129 @@ def parse_preflight_response(text: str) -> PreflightResult:
 PreflightCaller = Callable[[str], str]
 
 
-def _default_llm_caller(prompt: str) -> str:
-    """Production caller: pick a client in priority order, then run one
-    short completion.
+def _remote_preflight_client():
+    """Build the #654 remote-provider `LocalLLMClient`, unconditionally.
 
-    1. Anthropic, when `settings.anthropic_api_key` is set. Byte-identical
-       to the pre-#704 behavior of this function — same import, same
-       client construction, same call — because this is the maintainer's
-       own install and every other install with a key configured; no probe
-       runs on this branch.
-    2. Otherwise, the local llama-server, when reachable
-       (`LocalLLMClient().is_available()` — one short GET /health, same
-       check `local_executor._default_llm_client` uses). Unlike that
-       function, this always probes once there's no Anthropic key —
-       preflight has no `agent_remote_executor` flag gate to hide behind;
-       it just needs *some* usable client.
-    3. Otherwise, the #699 remote provider, when `agent_remote_executor`
-       and `remote_llm_configured` — mirrors the remote branch of
-       `local_executor._default_llm_client`.
-    4. Otherwise, raise. `run_preflight`'s existing except-clause already
-       degrades this to sane=False/routing=ask — unchanged.
+    Same construction as the #704 fallback branch (order 3 below): base URL,
+    model, key, and timeout all come straight from `settings.remote_llm_*`.
+    Callers are responsible for checking `settings.remote_llm_configured`
+    first — this never probes reachability itself (#706: "the remote client
+    is used unprobed, by design"), so calling it against an unconfigured
+    provider will fail on the request itself, not here.
     """
+    from api.services.llm_client import LocalLLMClient
+
+    return LocalLLMClient(
+        base_url=settings.remote_llm_base_url,
+        model=settings.remote_llm_model,
+        api_key=settings.remote_llm_api_key,
+        timeout=settings.remote_llm_timeout,
+    )
+
+
+def _default_llm_caller(prompt: str) -> str:
+    """Production caller: pick a client per `settings.agent_preflight_engine`
+    (#808), then run one short completion.
+
+    `agent_preflight_engine` values:
+
+    - `auto` (default): today's #704 priority order, unchanged —
+      1. Anthropic, when `settings.anthropic_api_key` is set. Byte-identical
+         to the pre-#704 behavior of this function — same import, same
+         client construction, same call — because this is the maintainer's
+         own install and every other install with a key configured; no
+         probe runs on this branch.
+      2. Otherwise, the local llama-server, when reachable
+         (`LocalLLMClient().is_available()` — one short GET /health, same
+         check `local_executor._default_llm_client` uses). Unlike that
+         function, this always probes once there's no Anthropic key —
+         preflight has no `agent_remote_executor` flag gate to hide behind;
+         it just needs *some* usable client.
+      3. Otherwise, the #699 remote provider, when `agent_remote_executor`
+         and `remote_llm_configured` — mirrors the remote branch of
+         `local_executor._default_llm_client`.
+      4. Otherwise, raise. `run_preflight`'s existing except-clause already
+         degrades this to sane=False/routing=ask — unchanged.
+    - `remote`: build the #654 remote provider FIRST (via
+      `_remote_preflight_client`), unprobed by design (#706), when
+      `settings.remote_llm_configured`. A failure of the call itself (bad
+      key, endpoint down, ...) is not caught here — it propagates up to
+      `run_preflight`'s existing except-clause, same as every other engine.
+      When the provider is unconfigured this raises — a forced engine
+      never silently reverts to another one (and never to the Anthropic
+      API); `run_preflight`'s except-clause degrades it to routing=ask.
+    - `anthropic`: force the Anthropic branch when a key is configured. When
+      no key is configured, raises (same fail-closed rule as `remote`).
+    - `local`: force the local llama client. Still probed via
+      `is_available()` exactly like the `auto` chain's own local branch —
+      this is a forced engine with no further engine to fall back to, so an
+      unreachable server raises (via a clear message) rather than silently
+      trying something else; `run_preflight`'s except-clause degrades that
+      the same way it degrades every other `_default_llm_caller` failure.
+    - Any other value is treated as `auto`, with one logged warning — never
+      a crash over a typo'd env var (mirrors `_apply_default_route`'s own
+      invalid-value handling for `LIFEOS_AGENT_DEFAULT_ROUTE`).
+    """
+    engine = (settings.agent_preflight_engine or "auto").strip().lower()
+    if engine not in ("auto", "remote", "anthropic", "local"):
+        logger.warning(
+            "invalid LIFEOS_AGENT_PREFLIGHT_ENGINE=%r — must be one of "
+            "auto/remote/anthropic/local; falling back to auto", engine,
+        )
+        engine = "auto"
+
+    if engine == "remote":
+        if settings.remote_llm_configured:
+            client = _remote_preflight_client()
+            response = client.create(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1024,
+                temperature=0.0,
+            )
+            return response.text
+        # Fail closed (#808): a forced engine never silently reverts to
+        # another one — in particular never to the Anthropic API, which is
+        # exactly the spend `remote` exists to avoid. `run_preflight`'s
+        # except-clause degrades this to sane=False/routing=ask, so the
+        # operator sees a confirmation question, not a surprise API bill.
+        raise RuntimeError(
+            "LIFEOS_AGENT_PREFLIGHT_ENGINE=remote but the remote provider "
+            "is not configured (LIFEOS_REMOTE_LLM_*)"
+        )
+
+    elif engine == "anthropic":
+        if settings.anthropic_api_key:
+            from api.services.llm_client import AnthropicLLMClient
+
+            client = AnthropicLLMClient(model=settings.agent_preflight_model)
+            response = client.create(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1024,
+                temperature=0.0,
+            )
+            return response.text
+        raise RuntimeError(
+            "LIFEOS_AGENT_PREFLIGHT_ENGINE=anthropic but no Anthropic API "
+            "key is configured"
+        )
+
+    elif engine == "local":
+        from api.services.llm_client import LocalLLMClient
+
+        local_client = LocalLLMClient()
+        if not local_client.is_available():
+            raise RuntimeError(
+                "LIFEOS_AGENT_PREFLIGHT_ENGINE=local but the local "
+                "llama-server is unreachable"
+            )
+        response = local_client.create(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
+            temperature=0.0,
+        )
+        return response.text
+
+    # engine == "auto".
     if settings.anthropic_api_key:
         # Import inside the branch so tests that monkeypatch run_preflight
         # don't need the Anthropic SDK installed, and so a no-key install
@@ -442,12 +544,7 @@ def _default_llm_caller(prompt: str) -> str:
     if local_client.is_available():
         client = local_client
     elif settings.agent_remote_executor and settings.remote_llm_configured:
-        client = LocalLLMClient(
-            base_url=settings.remote_llm_base_url,
-            model=settings.remote_llm_model,
-            api_key=settings.remote_llm_api_key,
-            timeout=settings.remote_llm_timeout,
-        )
+        client = _remote_preflight_client()
     else:
         raise RuntimeError(
             "no LLM client available for preflight: no Anthropic API key, "

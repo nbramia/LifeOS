@@ -684,6 +684,26 @@ class Settings(BaseSettings):
         description="Anthropic model used for the Haiku preflight call that "
                     "classifies #agent tasks (budget, routing, ambiguity, sanity)."
     )
+    agent_preflight_engine: str = Field(
+        default="auto",
+        alias="LIFEOS_AGENT_PREFLIGHT_ENGINE",
+        description="Which LLM client `_default_llm_caller` builds for the "
+                    "preflight classifier call (#808). One of: `auto` (default) "
+                    "— today's fallback order, Anthropic-if-key -> local llama "
+                    "-> #699 remote provider, byte-identical to pre-#808 "
+                    "behavior; `remote` — build the #654 remote provider "
+                    "(e.g. Fireworks/DeepSeek) first, unprobed, when "
+                    "remote_llm_configured, else fall through to the `auto` "
+                    "order with a logged warning; `anthropic` — force the "
+                    "Anthropic branch, else fall through to `auto` with a "
+                    "logged warning; `local` — force the local llama-server "
+                    "client (still probed via is_available(), same as the "
+                    "`auto` chain's own local check). An unrecognized value "
+                    "logs a warning and is treated as `auto`. This only "
+                    "changes which client runs the preflight classifier — it "
+                    "has no effect on which engine an #agent task itself is "
+                    "dispatched to."
+    )
     agent_managed_model: str = Field(
         default="claude-sonnet-5",
         alias="LIFEOS_AGENT_MANAGED_MODEL",
