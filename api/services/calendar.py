@@ -190,7 +190,7 @@ class CalendarService:
         self,
         start_date: datetime,
         end_date: datetime,
-        max_results: int = 100,
+        max_results: Optional[int] = 100,
         calendar_id: str = "primary"
     ) -> list[CalendarEvent]:
         """
@@ -199,7 +199,9 @@ class CalendarService:
         Args:
             start_date: Start of range
             end_date: End of range
-            max_results: Maximum events to return
+            max_results: Maximum events to return, across all pages. `None`
+                means no cap — follow `nextPageToken` until the range is
+                fully consumed (see `_fetch_events`).
             calendar_id: Calendar ID to query
 
         Returns:
@@ -281,7 +283,7 @@ class CalendarService:
         self,
         time_min: datetime,
         time_max: datetime,
-        max_results: int,
+        max_results: Optional[int],
         calendar_id: str,
         query: Optional[str] = None
     ) -> list[CalendarEvent]:
@@ -291,7 +293,14 @@ class CalendarService:
         Args:
             time_min: Start time
             time_max: End time
-            max_results: Maximum results
+            max_results: Maximum results, across all pages. `None` means no
+                cap — keep following `nextPageToken` until Google reports no
+                more pages, rather than the single-call behavior that used to
+                silently truncate any range with more matches than one page
+                (a 10-year backfill over a dense calendar returned only the
+                *oldest* ~2,500 events and left the newest window empty, with
+                no error). A window that fits on one page still costs exactly
+                one API call, as before.
             calendar_id: Calendar to query
             query: Optional search query
 
@@ -314,28 +323,42 @@ class CalendarService:
         # three widening windows.
         service = self.service
         try:
-            request_params = {
-                "calendarId": calendar_id,
-                "timeMin": time_min.isoformat(),
-                "timeMax": time_max.isoformat(),
-                "maxResults": max_results,
-                "singleEvents": True,
-                "orderBy": "startTime",
-            }
+            events: list[CalendarEvent] = []
+            page_token: Optional[str] = None
 
-            if query:
-                request_params["q"] = query
+            while True:
+                # Google's own hard per-page cap is 2500, regardless of what
+                # we ask for.
+                page_size = 2500 if max_results is None else min(max_results, 2500)
+                request_params = {
+                    "calendarId": calendar_id,
+                    "timeMin": time_min.isoformat(),
+                    "timeMax": time_max.isoformat(),
+                    "maxResults": page_size,
+                    "singleEvents": True,
+                    "orderBy": "startTime",
+                }
 
-            result = service.events().list(**request_params).execute()
-            items = result.get("items", [])
+                if query:
+                    request_params["q"] = query
+                if page_token:
+                    request_params["pageToken"] = page_token
 
-            events = []
-            for item in items:
-                event = self._parse_event(item)
-                if event:
-                    events.append(event)
+                result = service.events().list(**request_params).execute()
+                items = result.get("items", [])
 
-            return events
+                for item in items:
+                    event = self._parse_event(item)
+                    if event:
+                        events.append(event)
+
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
+                if max_results is not None and len(events) >= max_results:
+                    break
+
+            return events if max_results is None else events[:max_results]
 
         except Exception as e:
             # A 403, a 429, a 500 or a quota event is a failure to look, not a

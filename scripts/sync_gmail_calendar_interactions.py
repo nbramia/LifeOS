@@ -579,10 +579,14 @@ def sync_calendar_interactions(
     try:
         logger.info(f"Fetching calendar events from {account_type.value} account ({days_back} days back)...")
         api_start = time.time()
+        # No cap: follow every page so a deep backfill doesn't silently
+        # truncate to the oldest 2,500 events and leave a recent window
+        # empty (#701). Mirrors the Gmail path above, which also pages to
+        # exhaustion rather than capping.
         events = calendar.get_events_in_range(
             start_date=start_date,
             end_date=end_date,
-            max_results=2500,
+            max_results=None,
         )
         api_elapsed = time.time() - api_start
         logger.info(f"Found {len(events)} events (API call took {api_elapsed:.1f}s)")
