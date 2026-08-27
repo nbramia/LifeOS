@@ -52,6 +52,29 @@ class TestWorkEmailDomains:
         )
         assert settings.work_email_domains == ["thirdco.com", "fourthco.com"]
 
+    def test_only_second_domain_set(self, monkeypatch):
+        """LIFEOS_WORK_DOMAIN_2 alone, with no first domain, is still honored."""
+        settings = _settings(monkeypatch, LIFEOS_WORK_DOMAIN_2="othercompany.com")
+        assert settings.work_email_domains == ["othercompany.com"]
+
+    def test_first_domain_and_extra_set(self, monkeypatch):
+        """First domain ahead of the extra list, with no second domain set."""
+        settings = _settings(
+            monkeypatch,
+            LIFEOS_WORK_DOMAIN="acme.com",
+            LIFEOS_WORK_DOMAINS_EXTRA="thirdco.com,fourthco.com",
+        )
+        assert settings.work_email_domains == ["acme.com", "thirdco.com", "fourthco.com"]
+
+    def test_second_domain_and_extra_set(self, monkeypatch):
+        """Second domain ahead of the extra list, with no first domain set."""
+        settings = _settings(
+            monkeypatch,
+            LIFEOS_WORK_DOMAIN_2="othercompany.com",
+            LIFEOS_WORK_DOMAINS_EXTRA="thirdco.com,fourthco.com",
+        )
+        assert settings.work_email_domains == ["othercompany.com", "thirdco.com", "fourthco.com"]
+
     def test_first_second_and_extra_set(self, monkeypatch):
         """First domain, then second domain, ahead of the new list's entries."""
         settings = _settings(
