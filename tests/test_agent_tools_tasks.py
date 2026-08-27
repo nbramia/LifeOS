@@ -131,3 +131,13 @@ class TestManageTasksFilterDocs:
         lowered = desc.lower()
         assert "every status" in lowered
         assert "cancelled" in lowered and "todo" in lowered
+
+    def test_tags_rule_forbids_uninvited_routing_tags(self, props):
+        """#804: an assistant that invents a routing tag (#local, #claude, ...)
+        on a task the operator didn't ask to be routed launders its own engine
+        preference into the highest-precedence slot — routing tags outrank
+        every other routing safeguard. The tags field must say so."""
+        desc = props["tags"]["description"]
+        assert "operator named" in desc
+        assert "operator-authority and outrank every routing safeguard" in desc
+        assert "codex" in desc and "cloud" in desc
