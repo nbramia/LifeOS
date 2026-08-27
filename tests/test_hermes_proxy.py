@@ -144,6 +144,36 @@ async def test_status_reachability_is_cached_within_ttl(monkeypatch):
     assert calls["count"] == 1
 
 
+async def test_status_reachability_probe_is_not_duplicated_under_concurrency(monkeypatch):
+    """Two /status calls landing concurrently in the same (empty) cache
+    window must share one in-flight probe, not each fire their own — the
+    cache-only guard above only proves this for sequential callers."""
+    calls = {"count": 0}
+
+    class _SlowClient:
+        async def get(self, *a, **kw):
+            calls["count"] += 1
+            await asyncio.sleep(0.05)
+            return None
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(hp, "_client", lambda: _SlowClient())
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://concurrent.example")
+
+    app = FastAPI()
+    app.include_router(hp.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        results = await asyncio.gather(
+            c.get("/api/hermes/status"),
+            c.get("/api/hermes/status"),
+        )
+
+    assert calls["count"] == 1
+    for resp in results:
+        assert resp.json()["reachable"] is True
+
+
 async def test_ask_stream_injects_bearer_and_streams(proxy_client):
     # The browser sends NO auth; the proxy adds it server-side.
     resp = await proxy_client.post("/api/hermes/ask/stream", json={"question": "hi"})

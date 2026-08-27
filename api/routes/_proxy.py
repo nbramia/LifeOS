@@ -31,6 +31,12 @@ logger = logging.getLogger(__name__)
 _REACHABILITY_CACHE: dict[str, tuple[float, bool]] = {}
 _REACHABILITY_CACHE_TTL_SECONDS = 30
 _REACHABILITY_PROBE_TIMEOUT = httpx.Timeout(2.0)
+# One lock per base_url so concurrent /status calls that land in the same
+# expiry window (e.g. two browser tabs loading at once) share a single
+# in-flight probe instead of each firing their own — without this, "hammers
+# a downed backend" was only true for strictly sequential callers, not
+# concurrent ones.
+_REACHABILITY_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 async def _probe_reachable(client_factory: Callable[[], httpx.AsyncClient], base_url: str, backend_label: str) -> bool:
@@ -49,18 +55,27 @@ async def _probe_reachable(client_factory: Callable[[], httpx.AsyncClient], base
     if cached and cached[0] > now:
         return cached[1]
 
-    reachable = False
-    client = client_factory()
-    try:
-        await client.get(f"{base_url.rstrip('/')}/health", timeout=_REACHABILITY_PROBE_TIMEOUT)
-        reachable = True
-    except (httpx.RequestError, httpx.InvalidURL) as e:
-        logger.warning(f"{backend_label} backend at {base_url} is configured but unreachable: {e}")
-    finally:
-        await client.aclose()
+    lock = _REACHABILITY_LOCKS.setdefault(base_url, asyncio.Lock())
+    async with lock:
+        # Re-check now that we hold the lock: whoever got here first may
+        # have already refreshed the cache while we were waiting.
+        now = time.monotonic()
+        cached = _REACHABILITY_CACHE.get(base_url)
+        if cached and cached[0] > now:
+            return cached[1]
 
-    _REACHABILITY_CACHE[base_url] = (now + _REACHABILITY_CACHE_TTL_SECONDS, reachable)
-    return reachable
+        reachable = False
+        client = client_factory()
+        try:
+            await client.get(f"{base_url.rstrip('/')}/health", timeout=_REACHABILITY_PROBE_TIMEOUT)
+            reachable = True
+        except (httpx.RequestError, httpx.InvalidURL) as e:
+            logger.warning(f"{backend_label} backend at {base_url} is configured but unreachable: {e}")
+        finally:
+            await client.aclose()
+
+        _REACHABILITY_CACHE[base_url] = (now + _REACHABILITY_CACHE_TTL_SECONDS, reachable)
+        return reachable
 
 # Voice/agent turns run STT → LLM → TTS and can take a while; a generous read
 # budget so long turns aren't cut off.
