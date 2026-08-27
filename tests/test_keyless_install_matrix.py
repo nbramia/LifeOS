@@ -38,7 +38,8 @@ land on the integration branch first):
 - #704 (preflight doesn't raise)     -- landed  -> real assertion
 - #706 (LocalLLMClient /v1 doubling) -- landed  -> real assertion
 - #716 (titling doesn't raise)       -- N/A     -> real assertion (see below)
-- #787 (chat omits raw exception)    -- open    -> xfail(strict=True) placeholder
+- #787 (chat omits raw exception)    -- landed  -> real assertion (promoted from
+                                                    an xfail(strict=True) placeholder)
 
 #716's own acceptance criteria is broader than what's tested here (a
 shared local-or-remote fallback resolver, tracked by #773, so titling can
@@ -227,26 +228,16 @@ class TestTitlingDoesNotRaiseWhenNoModelIsUsable:
 
 
 class TestChatErrorMessageOmitsRawException:
-    """#787 (NOT yet landed) -- today, when a chat turn's model call
-    exhausts its retries, `agent_loop.py`'s round-loop fatal branch still
-    interpolates the raw exception straight into the user-facing text
+    """#787 (landed) -- when a chat turn's model call exhausts its retries,
+    `agent_loop.py`'s round-loop fatal branch used to interpolate the raw
+    exception straight into the user-facing text
     (`f"Sorry, I encountered an error: {e}"`). On a keyless install that
-    reads like an SDK's own internal message, not a plain "this isn't set
-    up yet" signal.
-
-    Marked `xfail(strict=True)`: once #787 removes that interpolation,
-    this test starts passing, `strict=True` turns that XPASS into a
-    failure, and that failure is the signal to delete the xfail marker and
-    let this become a normal always-on regression test -- matching #788's
-    own instruction to promote a placeholder once its fix lands.
+    read like an SDK's own internal message, not a plain "this isn't set
+    up yet" signal. #787 replaced it with fixed, generic text; this is now
+    a normal always-on regression test rather than the xfail(strict=True)
+    placeholder it started as.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="#787 not yet landed -- agent_loop.py's fatal-error branch "
-               "still interpolates str(e) into the user-facing text",
-    )
     @pytest.mark.asyncio
     async def test_fatal_round_error_omits_raw_exception_text(self, keyless_settings):
         from api.services import agent_loop
