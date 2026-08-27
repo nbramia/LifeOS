@@ -248,7 +248,75 @@ def test_check_paths_exist_flags_missing_program_binary(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_plist_program_binary_extracts_third_program_argument(tmp_path: Path):
+def test_check_paths_exist_flags_missing_or_non_executable_wrapper(tmp_path: Path):
+    """Found on review: a missing/non-executable launchd-env-wrapper.sh
+    (item 1 — every template routes through it) went completely unchecked;
+    the plist would install and load, then fail with no earlier signal."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    (venv / "bin" / "python").chmod(0o755)
+    (venv / "bin" / "uvicorn").write_text("#!/bin/sh\n")
+    (venv / "bin" / "uvicorn").chmod(0o755)
+    plist = repo / "p.plist"
+    plist.write_text(
+        "<dict>\n"
+        "    <key>ProgramArguments</key>\n"
+        "    <array>\n"
+        f"        <string>{repo}/scripts/launchd-env-wrapper.sh</string>\n"  # doesn't exist
+        f"        <string>{repo}</string>\n"
+        f"        <string>{venv}/bin/uvicorn</string>\n"
+        "    </array>\n"
+        "</dict>",
+        encoding="utf-8",
+    )
+    result = _run_sourced(repo, f'check_paths_exist "{plist}" "{venv}"')
+    assert result.returncode == 0, result.stderr
+    assert f"{repo}/scripts/launchd-env-wrapper.sh" in result.stdout
+    assert f"{venv}/bin/uvicorn" not in result.stdout  # this one IS present+executable
+
+
+@pytest.mark.unit
+def test_check_paths_exist_flags_missing_interpreted_script(tmp_path: Path):
+    """crm-sync's shape: item 3 is an interpreter (`/bin/bash`), which
+    trivially exists on every machine — the thing that can actually be
+    missing is item 4, the script it runs. Found on review: this was never
+    checked at all, so a missing sync wrapper script passed validation."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    (venv / "bin" / "python").chmod(0o755)
+    wrapper = repo / "scripts" / "launchd-env-wrapper.sh"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text("#!/bin/bash\n")
+    wrapper.chmod(0o755)
+    plist = repo / "p.plist"
+    plist.write_text(
+        "<dict>\n"
+        "    <key>ProgramArguments</key>\n"
+        "    <array>\n"
+        f"        <string>{wrapper}</string>\n"
+        f"        <string>{repo}</string>\n"
+        "        <string>/bin/bash</string>\n"
+        f"        <string>{repo}/scripts/run_sync_wrapper.sh</string>\n"  # doesn't exist
+        "    </array>\n"
+        "</dict>",
+        encoding="utf-8",
+    )
+    result = _run_sourced(repo, f'check_paths_exist "{plist}" "{venv}"')
+    assert result.returncode == 0, result.stderr
+    assert f"interpreted script: {repo}/scripts/run_sync_wrapper.sh" in result.stdout
+    assert "program binary" not in result.stdout  # /bin/bash itself is fine
+
+
+@pytest.mark.unit
+def test_plist_program_argument_extracts_the_nth_program_argument(tmp_path: Path):
     if not SETUP_LAUNCHD.exists():
         pytest.skip("scripts/setup-launchd.sh not present")
     repo = _make_sandbox(tmp_path)
@@ -265,9 +333,17 @@ def test_plist_program_binary_extracts_third_program_argument(tmp_path: Path):
         "</dict>",
         encoding="utf-8",
     )
-    result = _run_sourced(repo, f'_plist_program_binary "{plist}"')
+    result = _run_sourced(repo, f'_plist_program_argument "{plist}" 1')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "/proj/scripts/launchd-env-wrapper.sh"
+
+    result = _run_sourced(repo, f'_plist_program_argument "{plist}" 3')
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "/proj/.venvs/lifeos/bin/uvicorn"
+
+    result = _run_sourced(repo, f'_plist_program_argument "{plist}" 4')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "api.main:app"
 
 
 def _stub_plutil_ok(repo: Path) -> Path:
@@ -440,6 +516,33 @@ def test_install_plist_overwrites_a_genuinely_different_file(tmp_path: Path):
     assert dst.read_text() == "content-v2"
 
 
+@pytest.mark.unit
+def test_install_plist_backs_up_and_warns_before_replacing_a_different_file(tmp_path: Path):
+    """Found on review: overwriting a different existing plist with no more
+    signal than the run's one blanket 'Continue?' prompt (skipped entirely
+    under --yes) counts as silently replacing a working unit. A backup and
+    an explicit WARNING must appear even when nothing prompts."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    src = repo / "com.lifeos.api.plist"
+    src.write_text("content-v2", encoding="utf-8")
+    dst_dir = tmp_path / "LaunchAgents"
+    dst_dir.mkdir()
+    dst = dst_dir / "com.lifeos.api.plist"
+    dst.write_text("content-v1", encoding="utf-8")
+
+    result = _run_sourced(repo, f'install_plist "{src}" "{dst_dir}"')
+    assert result.returncode == 0, result.stderr
+    assert "WARNING" in result.stdout, result.stdout
+    assert "differs from what's currently installed" in result.stdout
+
+    backups = list(dst_dir.glob("com.lifeos.api.plist.bak.*"))
+    assert len(backups) == 1, backups
+    assert backups[0].read_text() == "content-v1", "backup must hold the PRE-replacement content"
+    assert dst.read_text() == "content-v2"
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: main() against a sandboxed HOME/LaunchAgents dir and fixture
 # templates — the actual install path, not just the helpers in isolation.
@@ -458,6 +561,11 @@ def _make_main_sandbox(tmp_path: Path, template_body: str) -> tuple[Path, Path, 
     (repo / "config" / "launchd" / "com.lifeos.api.plist.template").write_text(
         template_body, encoding="utf-8"
     )
+    # _GOOD_TEMPLATE's ProgramArguments routes through this wrapper (#776) —
+    # check_paths_exist validates it exists and is executable.
+    wrapper = repo / "scripts" / "launchd-env-wrapper.sh"
+    wrapper.write_text("#!/bin/bash\n")
+    wrapper.chmod(0o755)
     return repo, vault, fake_home, venv
 
 
@@ -500,6 +608,58 @@ def test_main_installs_a_well_formed_plist(tmp_path: Path):
     installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.api.plist"
     assert installed.exists(), (result.stdout, result.stderr)
     assert "__LIFEOS_PATH__" not in installed.read_text()
+
+
+# chromadb's real template doesn't follow the launchd-env-wrapper.sh
+# convention the others do (documented as unreliable under launchd; never
+# installed — see the real config/launchd/com.lifeos.chromadb.plist.template),
+# so its ProgramArguments' third item is never a real executable path.
+_CHROMADB_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lifeos.chromadb</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.venvs/lifeos/bin/chroma</string>
+        <string>run</string>
+        <string>--host</string>
+        <string>localhost</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__LIFEOS_PATH__</string>
+</dict>
+</plist>
+"""
+
+
+@pytest.mark.unit
+def test_main_does_not_abort_over_the_never_installed_chromadb_template(tmp_path: Path):
+    """Found on review: chromadb's plist is generated and was validated
+    against the same launchd-env-wrapper.sh convention every other
+    template follows, even though it's never installed (skipped later,
+    same as ever) — a broken/non-wrapper-shaped chromadb template could
+    abort setup for api/crm-sync too. It must be skipped at validation the
+    same way it's skipped at install."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    (repo / "config" / "launchd" / "com.lifeos.chromadb.plist.template").write_text(
+        _CHROMADB_TEMPLATE, encoding="utf-8"
+    )
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "Skipped: com.lifeos.chromadb.plist" in result.stdout
+    installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.api.plist"
+    assert installed.exists(), (result.stdout, result.stderr)
+    assert not (fake_home / "Library" / "LaunchAgents" / "com.lifeos.chromadb.plist").exists()
 
 
 @pytest.mark.unit

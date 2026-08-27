@@ -78,19 +78,21 @@ _plist_string_value() {
     ' "$plist"
 }
 
-# The third <string> inside ProgramArguments's <array> — every template
-# routes through launchd-env-wrapper.sh (#776), whose own invocation
-# contract is `<wrapper> <project_dir> <real_command> [args...]`, so item 1
-# is always the wrapper, item 2 the project dir, and item 3 the actual
-# binary launchd-env-wrapper.sh execs. Empty output if there are fewer than
-# three (a plist not shaped this way — nothing to check).
-_plist_program_binary() {
-    awk '
+# The $2'th <string> inside ProgramArguments's <array> (1-indexed). Every
+# template routes through launchd-env-wrapper.sh (#776), whose own
+# invocation contract is `<wrapper> <project_dir> <real_command>
+# [args...]`, so item 1 is always the wrapper, item 2 the project dir, and
+# item 3 the actual binary launchd-env-wrapper.sh execs — item 4 onward are
+# that binary's own arguments (for a script run via an interpreter, e.g.
+# `/bin/bash <script>`, item 4 is the script). Empty output if there are
+# fewer than $2 items (a plist not shaped this way — nothing to check).
+_plist_program_argument() {
+    awk -v n="$2" '
         /<key>ProgramArguments<\/key>/ { in_pa=1; next }
         in_pa && /<\/array>/ { exit }
         in_pa && /<string>/ {
             count++
-            if (count == 3) {
+            if (count == n) {
                 line = $0
                 gsub(/.*<string>|<\/string>.*/, "", line)
                 print line
@@ -104,8 +106,19 @@ _plist_program_binary() {
 # <path>"). Empty output means every path referenced exists on this machine.
 # Checks WorkingDirectory (parsed from the plist itself), the venv this
 # install resolved (every template uses the same __HOME__/.venvs/lifeos
-# convention, so there's nothing plist-specific to parse for that one), and
-# the specific binary ProgramArguments launches.
+# convention, so there's nothing plist-specific to parse for that one), the
+# launchd-env-wrapper.sh every template routes through (item 1), and the
+# actual binary it execs (item 3).
+#
+# Found on review: checking only item 3 misses two real failure modes. A
+# missing/non-executable wrapper (item 1) was never checked at all — the
+# plist would load and immediately fail with no earlier signal. And for a
+# plist that runs a script THROUGH an interpreter (e.g. crm-sync's
+# `/bin/bash <script>`), item 3 is just `/bin/bash`, which trivially exists
+# on every machine — checking only that validates nothing useful, while the
+# actual script (item 4) — the one thing that can realistically be missing
+# — went unchecked. When item 3's basename names a known interpreter, item
+# 4 is checked too.
 #
 # The venv's own python interpreter is checked in addition to (not instead
 # of) the specific binary: an empty or half-created venv (`python3 -m venv`
@@ -123,11 +136,25 @@ check_paths_exist() {
     if [ ! -x "$venv_dir/bin/python" ]; then
         echo "venv: $venv_dir/bin/python"
     fi
+    local wrapper
+    wrapper=$(_plist_program_argument "$plist" 1)
+    if [ -n "$wrapper" ] && [ ! -x "$wrapper" ]; then
+        echo "launchd env wrapper: $wrapper"
+    fi
     local binary
-    binary=$(_plist_program_binary "$plist")
+    binary=$(_plist_program_argument "$plist" 3)
     if [ -n "$binary" ] && [ ! -x "$binary" ]; then
         echo "program binary: $binary"
     fi
+    case "$(basename "${binary:-}" 2>/dev/null)" in
+        bash|sh|zsh|python|python3)
+            local script
+            script=$(_plist_program_argument "$plist" 4)
+            if [ -n "$script" ] && [ ! -x "$script" ]; then
+                echo "interpreted script: $script"
+            fi
+            ;;
+    esac
 }
 
 # Refuse to install a plist that is incomplete or broken. Prints the problem
@@ -170,6 +197,16 @@ validate_plist() {
 # running must never silently replace it — this script never calls
 # launchctl itself (it only ever writes files), so "don't touch what's
 # unchanged" is the whole idempotency contract.
+#
+# When the destination DOES exist and differs (found on review: this used
+# to overwrite it with no more signal than the one blanket "Continue?"
+# prompt at the top of the run — which `--yes` skips entirely, leaving zero
+# indication a different, possibly hand-edited or differently-versioned
+# plist was just replaced), the previous file is backed up alongside it
+# before being overwritten, and a WARNING names exactly what happened. This
+# doesn't block `--yes`-driven automation — the point is visibility and a
+# recovery path, not an extra confirmation gate — but nothing is now ever
+# silently replaced.
 install_plist() {
     local src="$1" dst_dir="$2"
     local filename dst
@@ -178,6 +215,11 @@ install_plist() {
     if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
         echo "  Unchanged: $filename (already installed, left in place)"
         return 0
+    fi
+    if [ -f "$dst" ]; then
+        local backup="$dst.bak.$(date +%s)"
+        cp "$dst" "$backup"
+        echo "  WARNING: $filename differs from what's currently installed — backed up the existing file to $(basename "$backup") before replacing it"
     fi
     cp "$src" "$dst"
     echo "  Installed: $filename"
@@ -266,6 +308,17 @@ VALIDATION_FAILED=false
 for plist in "$LAUNCHD_DIR"/*.plist; do
     if [ -f "$plist" ] && [[ ! "$plist" == *.template ]]; then
         filename=$(basename "$plist")
+        # Same skip as the install loop below, applied here too (found on
+        # review): chromadb's template doesn't follow the
+        # launchd-env-wrapper.sh convention the others do (it's documented
+        # as "does NOT work reliably with ChromaDB" and never installed —
+        # see the install loop's own skip), so validating it against that
+        # convention was always a false positive that could abort the
+        # entire run over a file that was never going to be installed anyway.
+        if [[ "$filename" == *"chromadb"* ]]; then
+            echo "  Skipped: $filename (not installed — see install step below)"
+            continue
+        fi
         if validate_plist "$plist" "$VENV_DIR"; then
             echo "  Valid: $filename"
         else
