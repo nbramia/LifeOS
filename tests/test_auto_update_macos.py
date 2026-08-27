@@ -201,13 +201,17 @@ def test_mark_env_mtime_applied_then_env_stale_is_false_even_with_future_mtime(t
 
 @pytest.mark.unit
 def test_env_stale_true_when_env_mtime_changes_again_after_being_applied(tmp_path: Path):
+    """active_since is realistically BEFORE both edits: env_stale now
+    requires active_since < ENV_MTIME too (found on review), so an
+    active_since after ENV_MTIME would correctly read as "already
+    current" regardless of the marker."""
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo = _make_repo_for_macos(tmp_path)
     result = _run_sourced(
         repo,
         'ENV_MTIME=100; mark_env_mtime_applied; '
-        'ENV_MTIME=200; env_stale 999999999999; echo "rc=$?"',
+        'ENV_MTIME=200; env_stale 50; echo "rc=$?"',
     )
     assert "rc=0" in result.stdout, result.stdout
 

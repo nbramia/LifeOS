@@ -144,26 +144,18 @@ api_active_since_epoch() {
     date -d "$ps_out" +%s 2>/dev/null || date -j -f "%a %b %e %T %Y" "$ps_out" +%s 2>/dev/null
 }
 
-# Is the running API service stale with respect to .env? Compares the exact
-# ENV_MTIME VALUE last actually applied via a restart (not wall-clock times)
-# against the current value — found on review: comparing $active_since
-# against $ENV_MTIME directly breaks if ENV_MTIME is ever in the future
-# (clock skew, `rsync -t`, a bad manual `touch`), since active_since stays
-# "before" a future mtime forever, restarting the service on every tick
-# indefinitely. Falls back to the original active_since comparison only
-# when no applied-marker exists yet, so behavior for an already-configured
-# install is unchanged unless/until that fallback path restarts once — at
-# which point the marker takes over and the same edit can never trigger a
-# second restart no matter what the clock does afterward.
+# Is the running API service stale with respect to .env? Requires BOTH
+# active_since predating the edit AND this exact edit not already recorded
+# as applied — see auto-deploy.sh's env_stale_for_unit() for the full
+# rationale (a future-dated mtime needs the marker to stop restarting
+# forever; a marker-only check is wrong once a manual `launchctl unload;
+# load` picks up an edit the marker never saw, and would restart the
+# service again on the very next tick even though it's already current).
 env_stale() {
     local active_since="$1" applied
     [ -n "$ENV_MTIME" ] || return 1
     applied=$(cat "$ENV_MTIME_APPLIED_FILE" 2>/dev/null) || applied=""
-    if [ -n "$applied" ]; then
-        [ "$ENV_MTIME" != "$applied" ]
-    else
-        [ "$active_since" -lt "$ENV_MTIME" ]
-    fi
+    [ "$active_since" -lt "$ENV_MTIME" ] && [ "$ENV_MTIME" != "$applied" ]
 }
 
 # Writes to a temp file, reads it back to confirm it landed intact, and only

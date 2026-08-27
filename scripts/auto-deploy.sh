@@ -115,30 +115,40 @@ env_mtime_applied_file() {
     echo "$PROJECT_DIR/data/env-mtime-applied-$1"
 }
 
-# Is $1 (a unit, started at $2) stale with respect to .env — found on
-# review: comparing $active_since (a wall-clock timestamp) against
-# $ENV_MTIME directly breaks if ENV_MTIME is ever in the future relative to
-# real time (clock skew, `rsync -t` preserving a future mtime, a manual
-# `touch` with a bad date) — active_since, even moments after a restart
-# that just happened, is still "before" a future ENV_MTIME, so the unit
-# would get restarted again on every single tick forever. Comparing the
-# exact ENV_MTIME VALUE this unit was last actually restarted for (rather
-# than wall-clock times) breaks that loop: once restarted for a given .env
-# edit, that same edit never triggers a second restart no matter what the
-# clock does afterward. Falls back to the original active_since comparison
-# only when no applied-marker exists yet for this unit (a fresh install, or
-# one upgrading to this fix for the first time), so behavior for an
-# already-configured install is unchanged unless/until that fallback path
-# itself restarts once — at which point the marker takes over.
+# Is $1 (a unit, started at $2) stale with respect to .env — requires BOTH
+# signals, not either alone (found on review — a marker-only check, once a
+# marker exists, is wrong): active_since predates the edit AND this exact
+# edit hasn't already been recorded as applied.
+#
+# Why active_since alone isn't enough: comparing it against $ENV_MTIME
+# directly breaks if ENV_MTIME is ever in the future relative to real time
+# (clock skew, `rsync -t` preserving a future mtime, a manual `touch` with
+# a bad date) — active_since, even moments after a restart that just
+# happened, is still "before" a future ENV_MTIME, so the unit would get
+# restarted again on every single tick forever. The applied-marker clause
+# closes that: once restarted for a given .env edit, comparing the exact
+# VALUE (not a wall-clock time) means that same edit can never trigger a
+# second restart no matter what the clock does afterward.
+#
+# Why the marker alone isn't enough (this is the bug found on review): the
+# marker is a record of what THIS SCRIPT last restarted for — it has no way
+# to learn about a restart it didn't perform. A manual `sudo systemctl
+# restart <unit>` (or `launchctl unload; load` on macOS) after an operator
+# edits .env directly picks up the new value without ever touching the
+# marker. A marker-only check would then find applied != ENV_MTIME
+# forever and restart the unit again on the very next tick, even though
+# active_since already postdates the edit and the unit is already current.
+# ANDing in active_since fixes this: a unit whose active_since is already
+# after ENV_MTIME is never stale, regardless of what the (now-irrelevant)
+# marker says. This also covers a unit that was stopped when .env changed
+# and started again later by the operator — starting it after the edit
+# means active_since already postdates ENV_MTIME on the very next tick,
+# stale marker notwithstanding.
 env_stale_for_unit() {
     local unit="$1" active_since="$2" applied
     [ -n "$ENV_MTIME" ] || return 1
     applied=$(cat "$(env_mtime_applied_file "$unit")" 2>/dev/null) || applied=""
-    if [ -n "$applied" ]; then
-        [ "$ENV_MTIME" != "$applied" ]
-    else
-        [ "$active_since" -lt "$ENV_MTIME" ]
-    fi
+    [ "$active_since" -lt "$ENV_MTIME" ] && [ "$ENV_MTIME" != "$applied" ]
 }
 
 # Record that $1 (a unit) has just been restarted while $ENV_MTIME was

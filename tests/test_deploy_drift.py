@@ -766,14 +766,19 @@ def test_env_stale_for_unit_true_when_env_mtime_changes_again_after_being_applie
     tmp_path: Path,
 ):
     """A genuinely new .env edit after one was already applied must still be
-    detected — the marker isn't a one-time 'never restart again' switch."""
+    detected — the marker isn't a one-time 'never restart again' switch.
+    active_since is realistically BEFORE both edits: env_stale_for_unit now
+    requires active_since < ENV_MTIME too (found on review — the marker
+    alone isn't enough, see the function's own comment), so an active_since
+    after ENV_MTIME would correctly read as "already current" regardless of
+    the marker, which is not what this test is checking."""
     if not AUTO_DEPLOY.exists():
         pytest.skip("scripts/auto-deploy.sh not present")
     repo = _make_repo_for_drift(tmp_path)
     result = _run_sourced(
         repo,
         'ENV_MTIME=100; mark_env_mtime_applied lifeos-api; '
-        'ENV_MTIME=200; env_stale_for_unit lifeos-api 999999999999; echo "rc=$?"',
+        'ENV_MTIME=200; env_stale_for_unit lifeos-api 50; echo "rc=$?"',
     )
     assert "rc=0" in result.stdout, result.stdout
 
@@ -982,6 +987,51 @@ def test_main_restarts_when_only_env_file_changed(tmp_path: Path):
     assert "restart lifeos-api" in restart_log, (result.stdout, result.stderr, restart_log)
     deploy_log = (repo / "logs" / "auto-deploy.log").read_text()
     assert ".env changed" in deploy_log, deploy_log
+
+
+@pytest.mark.unit
+def test_main_does_not_restart_again_after_a_manual_restart_already_picked_up_env(
+    tmp_path: Path,
+):
+    """Finding 1 (review): a marker-only check is wrong once a marker
+    exists. Scenario reproduced end-to-end: tick 1 restarts lifeos-api for
+    code drift, recording an env-mtime-applied marker for whatever .env
+    said at that moment. The operator then edits .env AND manually runs
+    `sudo systemctl restart lifeos-api` themselves (never going through
+    auto-deploy.sh, so the marker is never updated) — simulated here by
+    bumping the stub's recorded start time forward without calling
+    _run_main. Tick 2 must NOT restart again: active_since already
+    postdates the .env edit, so it's already current regardless of what
+    the (now-stale) marker says."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, code_epoch = _make_policy_repo(tmp_path)
+    venv = _venv_with_python(tmp_path)
+    stale = code_epoch - 3600  # started well before the code last changed
+    (state / "active_lifeos-api").touch()
+    (state / "since_lifeos-api").write_text(str(stale))
+
+    first = _run_main(repo, state, venv)
+    assert first.returncode == 0, (first.stdout, first.stderr)
+    restart_log_after_first = (state / "restart.log").read_text()
+    assert restart_log_after_first.count("restart lifeos-api") == 1, restart_log_after_first
+    applied_marker = repo / "data" / "env-mtime-applied-lifeos-api"
+    assert applied_marker.exists(), "tick 1's restart must record an applied marker"
+
+    # Operator edits .env, then manually restarts the unit themselves —
+    # never through auto-deploy.sh, so the marker above is never touched.
+    manual_restart_time = int(time.time()) + 1000
+    env_mtime = manual_restart_time - 100  # .env edited before the manual restart
+    os.utime(repo / ".env", (env_mtime, env_mtime))
+    (state / "since_lifeos-api").write_text(str(manual_restart_time))
+
+    second = _run_main(repo, state, venv)
+    assert second.returncode == 0, (second.stdout, second.stderr)
+    restart_log_after_second = (state / "restart.log").read_text()
+    assert restart_log_after_second.count("restart lifeos-api") == 1, (
+        "must not restart again — the manual restart already picked up the .env edit",
+        restart_log_after_second,
+    )
 
 
 @pytest.mark.unit
