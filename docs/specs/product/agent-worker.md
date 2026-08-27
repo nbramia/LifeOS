@@ -37,7 +37,7 @@ Within a poll cycle (default 60s), the worker:
 
 1. Runs a Haiku preflight to parse the task — budget, routing, expected output, sanity check
 2. Atomically swaps the tag to `#agent-running` (so two workers can't claim the same task)
-3. Routes the task — to your local Gemma model, a CLI engine, or Claude on Managed Agents — from your tags or an explicit request; when it can only *infer* that the cloud is needed, it asks you first
+3. Routes the task — to your local Gemma model, a CLI engine, your configured remote provider, or Claude on Managed Agents — from your tags or an explicit request; when it can only *infer* that a cloud connector is needed, it asks you first
 4. Lets the agent execute: tool calls, MCP servers, web search, file I/O, the full kit
 5. On completion: marks the task done in your vault, swaps the tag to `#agent-completed`, writes the full result to an Agent Output note (`LifeOS/Tasks/Agent Output/`), and sends you a one-paragraph Telegram summary with the actual result (linking the note)
 
@@ -55,17 +55,19 @@ Optional sub-tags steer routing:
 |-----|--------|
 | `#agent` | Required. Marks the task as eligible for autonomous execution. |
 | `#local` | Forces routing to your local LLM (Gemma by default). No API spend. Subject to local model capability. |
-| `#cloud` | Forces routing to Anthropic Managed Agents (Claude). Required for tasks that need cloud connectors. Per-token API billing. |
+| `#cloud` | Forces routing to your configured remote OpenAI-compatible provider (e.g. DeepSeek via Fireworks) — never the Anthropic API. Real per-token billing at that provider's rates. Requires the provider configured ([configuration.md](../../guides/configuration.md#openai-compatible-remote-provider)); an unconfigured install parks the task at `#agent-blocked` rather than falling back to Anthropic. |
+| `#cloud-haiku` | Forces routing to Claude Haiku on Anthropic Managed Agents. Required for tasks that need Anthropic's cloud connectors. Per-token API billing. |
+| `#cloud-sonnet` | Forces routing to Claude Sonnet on Anthropic Managed Agents. Same connector access and billing as `#cloud-haiku`. |
 | `#claude` | Forces routing to Claude Code CLI (the same surface as `/claude`). Billed against your Claude Pro subscription rather than per-token. Good for code/filesystem/browser work where the cloud connectors aren't needed. |
 | `#codex` | Forces routing to Codex CLI (the same surface as `/codex`). Billed against your ChatGPT subscription. Same caveat as `#claude`. |
 
-Without an explicit routing tag, the preflight reads the title. "With local agent" / "using gemma" force local, and naming an engine or model ("use claude", "with opus") routes there — you asked, so it dispatches.
+Without an explicit routing tag, the preflight reads the title. "With local agent" / "using gemma" force local, and naming an engine, model, or "anthropic"/"api" ("use claude", "with opus", "use the anthropic api") routes there — you asked, so it dispatches. A bare "cloud" in the title no longer counts (since #809, "cloud" means the remote provider, not Anthropic) — it falls through to the confirmation question below like any other guess.
 
-**Inference alone never spends API credits.** Phrases like "draft an email", "check my calendar", "search my gmail" still tell the preflight the task probably needs cloud connectors, but that is a guess, so the task pauses at `#agent-blocked` and asks instead of dispatching. The same happens when the title gives no signal at all. The question offers `claude code` (subscription), `codex` (subscription), `local` (on-box Gemma), and `cloud` (Anthropic API — costs credits); reply with whichever you want. A bare "claude" in your reply means the Claude Code CLI, not the API — say "cloud" or name a model to reach the API.
+**Inference alone never spends API credits.** Phrases like "draft an email", "check my calendar", "search my gmail" still tell the preflight the task probably needs cloud connectors, but that is a guess, so the task pauses at `#agent-blocked` and asks instead of dispatching. The same happens when the title gives no signal at all. The question offers `claude code` (subscription), `codex` (subscription), `local` (on-box Gemma), `cloud` (your configured remote provider — costs credits), or `anthropic`/a Claude model name like `opus` (Anthropic API — costs credits); reply with whichever you want. A bare "claude" in your reply means the Claude Code CLI, not the API — name a model or say "anthropic" to reach the API.
 
-To skip the question entirely for a task you know needs connectors, tag it `#cloud`.
+To skip the question entirely for a task you know needs the remote provider, tag it `#cloud`; for one that needs Anthropic's own cloud connectors, tag it `#cloud-haiku` or `#cloud-sonnet`.
 
-Tag precedence (first match wins): `#local` → `#claude` → `#codex` → `#cloud-haiku` → `#cloud-sonnet` → `#cloud`. The CLI routes (`#claude`, `#codex`) skip the cost-confirmation gate because they're subscription-billed; per-session dollar rollups still appear in `/agents` via the rollout ingest (the `cc:` and `cx:` session rows).
+Tag precedence (first match wins): `#local` → `#claude` → `#codex` → `#cloud-haiku` → `#cloud-sonnet` → `#cloud`. The CLI routes (`#claude`, `#codex`) skip the cost-confirmation gate because they're subscription-billed, and so does `#cloud` (the remote provider is priced but isn't the confirmation ceremony's Anthropic "expensive exception"); per-session dollar rollups still appear in `/agents` via the rollout ingest (the `cc:` and `cx:` session rows).
 
 ---
 

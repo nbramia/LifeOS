@@ -397,13 +397,16 @@ def test_local_tag_overrides_to_local_model():
 
 
 @pytest.mark.unit
-def test_cloud_tag_keeps_preflight_routing_but_defaults_model_to_sonnet():
-    """`#cloud` says cloud but leaves the model open — defaults to Sonnet
-    when preflight didn't pick a specific model."""
+def test_cloud_tag_routes_to_remote_provider_not_anthropic():
+    """(#809) `#cloud` now routes to the configured remote OpenAI-compatible
+    provider, never the Anthropic API — regardless of what preflight itself
+    returned. `model` is left empty: the remote model id comes from
+    `settings.remote_llm_model` at dispatch time, not from `ALLOWED_MODELS`."""
     result = pf.run_preflight("anything", tags=["agent", "cloud"],
                               caller=_stub_caller(routing="claude"))
-    assert result.routing == pf.ROUTE_CLAUDE
-    assert result.model == pf.MODEL_SONNET
+    assert result.routing == pf.ROUTE_REMOTE
+    assert result.routing_explicit is True
+    assert result.model == ""
 
 
 @pytest.mark.unit
@@ -557,12 +560,26 @@ def test_preset_class_set_on_empty_title_short_circuit():
 
 @pytest.mark.unit
 def test_cloud_route_emits_cost_estimate():
-    """Cloud-routed tasks get a non-zero cache-cold cost estimate so the
-    orchestrator can preview cost before dispatch."""
-    result = pf.run_preflight("research task", tags=["agent", "research", "cloud"],
+    """Cloud-routed (Anthropic API) tasks get a non-zero cache-cold cost
+    estimate so the orchestrator can preview cost before dispatch."""
+    result = pf.run_preflight("research task", tags=["agent", "research", "cloud-sonnet"],
                               caller=_stub_caller(routing="claude"))
     assert result.routing == pf.ROUTE_CLAUDE
     assert result.estimated_cost_dollars > 0
+
+
+@pytest.mark.unit
+def test_remote_route_emits_zero_estimate():
+    """(#809) `#cloud` (the remote provider) is treated like local/CLI for
+    preflight cost-preview purposes — the §6/§7 confirmation ceremony is
+    specifically for the Anthropic-API 'expensive exception', not third-party
+    spend in general. Real spend still records correctly at execution time
+    (see `LocalExecutor._record_spend`'s `is_remote` branch)."""
+    result = pf.run_preflight("anything", tags=["agent", "cloud"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_REMOTE
+    assert result.estimated_cost_dollars == 0.0
+    assert result.needs_cost_confirmation is False
 
 
 @pytest.mark.unit
@@ -579,9 +596,9 @@ def test_local_route_emits_zero_estimate():
 def test_fullstack_estimate_higher_than_research_estimate():
     """Larger preset classes are estimated more expensively — that's the
     whole point of per-class filtering."""
-    full = pf.run_preflight("any task", tags=["agent", "fullstack", "cloud"],
+    full = pf.run_preflight("any task", tags=["agent", "fullstack", "cloud-sonnet"],
                             caller=_stub_caller(routing="claude"))
-    research = pf.run_preflight("any task", tags=["agent", "research", "cloud"],
+    research = pf.run_preflight("any task", tags=["agent", "research", "cloud-sonnet"],
                                 caller=_stub_caller(routing="claude"))
     assert full.estimated_cost_dollars > research.estimated_cost_dollars
 
@@ -603,7 +620,7 @@ def test_fail_fast_refuses_when_estimate_exceeds_2x_max_dollars():
             "sane": True,
             "sane_reason": "",
         })
-    result = pf.run_preflight("expensive task", tags=["agent", "fullstack", "cloud"],
+    result = pf.run_preflight("expensive task", tags=["agent", "fullstack", "cloud-sonnet"],
                               caller=stub_caller)
     assert result.sane is False
     assert "budget_too_small" in result.sane_reason
@@ -636,7 +653,7 @@ def test_cost_confirmation_triggers_above_threshold(monkeypatch):
     """§7 acceptance: estimate > threshold sets needs_cost_confirmation."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_cost_confirm_threshold_dollars", 0.01)
-    result = pf.run_preflight("any task", tags=["agent", "fullstack", "cloud"],
+    result = pf.run_preflight("any task", tags=["agent", "fullstack", "cloud-sonnet"],
                               caller=_stub_caller(routing="claude"))
     # fullstack estimate is well over a penny.
     assert result.needs_cost_confirmation is True
@@ -696,11 +713,12 @@ def test_classifier_explicit_flag_alone_is_not_enough():
 @pytest.mark.parametrize("title", [
     "use claude to draft the email",
     "summarize this with opus",
-    "run it on the cloud model",
+    "run it on the anthropic api",
 ])
 def test_operator_naming_the_engine_dispatches_without_a_question(title):
     """The other half of the rule: an operator who asked for it gets it.
-    Same principle as the `#cloud` tag — explicit intent is consent."""
+    Same principle as the `#cloud-haiku`/`#cloud-sonnet` tags — explicit
+    intent is consent."""
     result = pf.run_preflight(title, tags=["agent"],
                               caller=_stub_caller(routing="claude", routing_explicit=True))
     assert result.routing == pf.ROUTE_CLAUDE
@@ -708,14 +726,30 @@ def test_operator_naming_the_engine_dispatches_without_a_question(title):
 
 
 @pytest.mark.unit
+def test_bare_cloud_in_title_no_longer_corroborates_anthropic():
+    """(#809) Before #809, a title merely containing the bare word "cloud"
+    counted as corroboration for a model-claimed `routing="claude"` — safe
+    when "cloud" and "the Anthropic API" were the same thing. They no longer
+    are: `#cloud` the tag now means the configured remote provider, so this
+    title must NOT dispatch straight to the API any more — it falls through
+    to the #584 downgrade-to-`ask` path instead, same as any other
+    unconfirmed cloud inference."""
+    result = pf.run_preflight("run it on the cloud model", tags=["agent"],
+                              caller=_stub_caller(routing="claude", routing_explicit=True))
+    assert result.routing == pf.ROUTE_ASK
+    assert result.routing_explicit is False
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("tag,expected_model", [
-    ("cloud", pf.MODEL_SONNET),
     ("cloud-haiku", pf.MODEL_HAIKU),
     ("cloud-sonnet", pf.MODEL_SONNET),
 ])
 def test_cloud_tags_are_consent_and_still_dispatch(tag, expected_model):
-    """`#cloud*` tasks were explicitly tagged by the operator, so they keep
-    dispatching straight to the API — the gate is about inference only."""
+    """`#cloud-haiku`/`#cloud-sonnet` tasks were explicitly tagged by the
+    operator, so they keep dispatching straight to the API — the gate is
+    about inference only. (Bare `#cloud` is covered separately — #809
+    remapped it to the remote route, not the API.)"""
     result = pf.run_preflight("any task", tags=["agent", tag],
                               caller=_stub_caller(routing="claude"))
     assert result.routing == pf.ROUTE_CLAUDE
@@ -874,6 +908,283 @@ def test_default_llm_caller_raises_when_no_client_usable(monkeypatch):
     result = pf.run_preflight("do the thing", tags=["agent"], caller=None)
     assert result.sane is False
     assert result.routing == pf.ROUTE_ASK
+
+
+# ---------------------------------------------------------------------------
+# #808 — LIFEOS_AGENT_PREFLIGHT_ENGINE: which client `_default_llm_caller`
+# builds for the preflight classifier call, independent of the #704 auto
+# order. Every test below monkeypatches anthropic_api_key, the full
+# remote_llm_* block, and agent_remote_executor explicitly (in addition to
+# agent_preflight_engine) — a host .env can set any of these ambiently, and
+# an un-monkeypatched one would silently change which branch a test
+# exercises.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_preflight_engine_auto_explicit_matches_704_order(monkeypatch):
+    """Explicit engine="auto" reproduces the #704 Anthropic-first order —
+    no probe of the local llama-server, same client construction. Proves
+    "auto" is a real branch, not just the unset-default case the untouched
+    #704 tests already cover."""
+    from config.settings import settings
+    from api.services.llm_client import AnthropicLLMClient, LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "auto", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "test-anthropic-key", raising=False)
+    monkeypatch.setattr(settings, "agent_preflight_model", "claude-haiku-4-5", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
+
+    captured = {}
+
+    def fake_init(self, api_key=None, model=None):
+        captured["model"] = model
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        return _FakeLLMResponse("anthropic reply")
+
+    monkeypatch.setattr(AnthropicLLMClient, "__init__", fake_init)
+    monkeypatch.setattr(AnthropicLLMClient, "create", fake_create)
+
+    def _forbidden_probe(self):
+        raise AssertionError("auto+key must not probe the local llama-server")
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
+
+    result = pf._default_llm_caller("some prompt")
+
+    assert result == "anthropic reply"
+    assert captured["model"] == "claude-haiku-4-5"
+
+
+@pytest.mark.unit
+def test_preflight_engine_remote_configured_builds_remote_client(monkeypatch):
+    """engine="remote" + remote_llm_configured dispatches to the remote
+    provider FIRST and unprobed — even with a usable Anthropic key AND a
+    reachable local server also available, proving it isn't merely falling
+    into the auto chain's own remote fallback."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "remote", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "unused-anthropic-key", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)  # must not matter for "remote"
+    monkeypatch.setattr(settings, "remote_llm_base_url", "https://remote.example/v1", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "accounts/fireworks/models/deepseek-v4-flash-0731", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "fw_test_key", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_timeout", 42, raising=False)
+
+    def _forbidden_probe(self):
+        raise AssertionError("remote engine must not probe reachability (#706: unprobed by design)")
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
+
+    captured = {}
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        captured["base_url"] = self.base_url
+        captured["model"] = self.model
+        captured["timeout"] = self.timeout
+        captured["auth"] = self._auth_headers()
+        captured["messages"] = messages
+        captured["max_tokens"] = max_tokens
+        captured["temperature"] = temperature
+        return _FakeLLMResponse("remote reply")
+
+    monkeypatch.setattr(LocalLLMClient, "create", fake_create)
+
+    result = pf._default_llm_caller("some prompt")
+
+    assert result == "remote reply"
+    # #706: LocalLLMClient strips one trailing /v1 segment.
+    assert captured["base_url"] == "https://remote.example"
+    assert captured["model"] == "accounts/fireworks/models/deepseek-v4-flash-0731"
+    assert captured["timeout"] == 42
+    assert captured["auth"] == {"Authorization": "Bearer fw_test_key"}
+    assert captured["messages"] == [{"role": "user", "content": "some prompt"}]
+    assert captured["max_tokens"] == 1024
+    assert captured["temperature"] == 0.0
+
+
+@pytest.mark.unit
+def test_preflight_engine_remote_unconfigured_raises_instead_of_falling_back(monkeypatch):
+    """engine="remote" but the provider isn't configured -> raise (fail
+    closed). A forced engine must never silently revert to the `auto`
+    chain — with an Anthropic key present that would mean API spend the
+    operator explicitly opted out of. `run_preflight` degrades the raise
+    to routing=ask, which is the visible outcome the operator should get."""
+    from config.settings import settings
+    from api.services.llm_client import AnthropicLLMClient, LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "remote", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "test-anthropic-key", raising=False)
+    monkeypatch.setattr(settings, "agent_preflight_model", "claude-haiku-4-5", raising=False)
+
+    def _forbidden_anthropic(self, *a, **kw):
+        raise AssertionError("forced remote engine must never construct the Anthropic client")
+
+    def _forbidden_probe(self):
+        raise AssertionError("forced remote engine must never fall back to local")
+
+    monkeypatch.setattr(AnthropicLLMClient, "__init__", _forbidden_anthropic)
+    monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
+
+    with pytest.raises(RuntimeError, match="remote provider is not configured"):
+        pf._default_llm_caller("some prompt")
+
+
+@pytest.mark.unit
+def test_preflight_engine_anthropic_forced(monkeypatch):
+    """engine="anthropic" forces the Anthropic branch when a key is present."""
+    from config.settings import settings
+    from api.services.llm_client import AnthropicLLMClient, LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "anthropic", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "test-anthropic-key", raising=False)
+    monkeypatch.setattr(settings, "agent_preflight_model", "claude-haiku-4-5", raising=False)
+
+    captured = {}
+
+    def fake_init(self, api_key=None, model=None):
+        captured["model"] = model
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        return _FakeLLMResponse("anthropic reply")
+
+    monkeypatch.setattr(AnthropicLLMClient, "__init__", fake_init)
+    monkeypatch.setattr(AnthropicLLMClient, "create", fake_create)
+
+    def _forbidden_probe(self):
+        raise AssertionError("forced anthropic engine must not probe the local llama-server")
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
+
+    result = pf._default_llm_caller("some prompt")
+
+    assert result == "anthropic reply"
+    assert captured["model"] == "claude-haiku-4-5"
+
+
+@pytest.mark.unit
+def test_preflight_engine_anthropic_unconfigured_raises_instead_of_falling_back(monkeypatch):
+    """engine="anthropic" but no key configured -> raise (fail closed),
+    never a silent hop to local or the remote provider."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "anthropic", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
+
+    def _forbidden_probe(self):
+        raise AssertionError("forced anthropic engine must never fall back to local")
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
+
+    with pytest.raises(RuntimeError, match="no Anthropic API key"):
+        pf._default_llm_caller("some prompt")
+
+
+@pytest.mark.unit
+def test_preflight_engine_local_forced_uses_probe(monkeypatch):
+    """engine="local" forces the local client and still probes
+    is_available() — even with an Anthropic key present, proving it isn't
+    falling into the auto chain's Anthropic-first branch."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "local", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "unused-anthropic-key", raising=False)
+
+    probed = {"called": False}
+
+    def fake_is_available(self):
+        probed["called"] = True
+        return True
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", fake_is_available)
+
+    captured = {}
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        captured["model"] = self.model
+        return _FakeLLMResponse("local reply")
+
+    monkeypatch.setattr(LocalLLMClient, "create", fake_create)
+
+    result = pf._default_llm_caller("some prompt")
+
+    assert result == "local reply"
+    assert probed["called"] is True
+    assert captured["model"] == "local"
+
+
+@pytest.mark.unit
+def test_preflight_engine_local_forced_raises_when_unreachable(monkeypatch):
+    """engine="local" forced with an unreachable server raises rather than
+    silently falling back to another engine — there's no further engine to
+    fall back to for a forced value. `run_preflight`'s existing except-
+    clause still degrades this to sane=False/ask, unchanged."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "local", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: False)
+
+    with pytest.raises(RuntimeError):
+        pf._default_llm_caller("some prompt")
+
+    result = pf.run_preflight("do the thing", tags=["agent"], caller=None)
+    assert result.sane is False
+    assert result.routing == pf.ROUTE_ASK
+
+
+@pytest.mark.unit
+def test_preflight_engine_invalid_value_falls_back_to_auto(monkeypatch, caplog):
+    """An unrecognized LIFEOS_AGENT_PREFLIGHT_ENGINE value never crashes —
+    it's treated as `auto` (with a logged warning), mirroring
+    `_apply_default_route`'s own invalid-value handling."""
+    import logging
+    from config.settings import settings
+    from api.services.llm_client import AnthropicLLMClient, LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "bogus-value", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "test-anthropic-key", raising=False)
+    monkeypatch.setattr(settings, "agent_preflight_model", "claude-haiku-4-5", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
+
+    def fake_init(self, api_key=None, model=None):
+        pass
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        return _FakeLLMResponse("anthropic reply")
+
+    monkeypatch.setattr(AnthropicLLMClient, "__init__", fake_init)
+    monkeypatch.setattr(AnthropicLLMClient, "create", fake_create)
+
+    def _forbidden_probe(self):
+        raise AssertionError("invalid engine treated as auto+key must not probe local")
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
+
+    with caplog.at_level(logging.WARNING, logger="api.services.agent_worker.preflight"):
+        result = pf._default_llm_caller("some prompt")
+
+    assert result == "anthropic reply"
+    assert any("invalid" in rec.message.lower() for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -1060,6 +1371,147 @@ def test_default_route_tags_still_win(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# #803 — a non-fatal sanity opinion must not gate feature requests when a
+# default route is configured: the operator's standing "run untagged tasks
+# without asking me" instruction outranks a cheap classifier's "this isn't
+# executable" hedge, exactly as #751 already does for `ambiguity`. Every
+# test here monkeypatches `settings.agent_default_route` explicitly (never
+# relies on it being unset) since a host `.env` can leak the setting in.
+# ---------------------------------------------------------------------------
+
+# The two real field verdicts referenced in #803: the classifier calling an
+# ordinary feature request "a product specification or feature request, not
+# a task an agent can execute" — once on the #747 voice-UI task, once on the
+# #774 macOS setup-script parity task.
+_FIELD_VERDICT_SANE_REASON = (
+    "This is a product specification or feature request, not a task an "
+    "agent can execute."
+)
+_FIELD_VERDICT_TITLES = [
+    "Display the user's transcribed message immediately after sending",
+    "Bring the macOS setup script's service catalog up to parity with "
+    "Linux for the agent worker and MCP-HTTP bridge",
+]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("title", _FIELD_VERDICT_TITLES)
+def test_default_route_demotes_field_verdict_sanity_and_runs(monkeypatch, title):
+    """#803 acceptance: given a default route and one of the real field
+    verdicts, the task routes and runs — the opinion is demoted to
+    `demoted_sanity` and logged, not surfaced as a block."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    reply = _golden_reply(
+        routing="ask", routing_reason="no tag and no title cue",
+        sane=False, sane_reason=_FIELD_VERDICT_SANE_REASON,
+    )
+    result = pf.run_preflight(title=title, tags=["agent"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_LOCAL
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.demoted_sanity == _FIELD_VERDICT_SANE_REASON
+
+
+@pytest.mark.unit
+def test_no_default_route_field_verdict_sanity_still_parks(monkeypatch):
+    """#3 acceptance: with no default route configured, #747's park
+    behavior is unchanged — explicit empty setting, not ambient default,
+    per the host-.env leak risk."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "")
+    reply = _golden_reply(
+        routing="local", sane=False, sane_reason=_FIELD_VERDICT_SANE_REASON,
+    )
+    result = pf.run_preflight(
+        title=_FIELD_VERDICT_TITLES[0], tags=["agent"], caller=_stub(reply),
+    )
+    assert result.sane is False
+    assert result.sane_fatal is False
+    assert result.demoted_sanity is None
+
+
+@pytest.mark.unit
+def test_default_route_does_not_demote_fatal_sanity_empty_title(monkeypatch):
+    """Fatal verdicts stay fail-closed regardless of default route: empty
+    title short-circuit."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+
+    def fail(prompt):
+        raise AssertionError("LLM should not have been called for empty title")
+
+    result = pf.run_preflight(title="   ", tags=["agent"], caller=fail)
+    assert result.sane is False
+    assert result.sane_fatal is True
+    assert result.demoted_sanity is None
+    assert result.routing == pf.ROUTE_ASK
+
+
+@pytest.mark.unit
+def test_default_route_does_not_demote_fatal_sanity_destructive_title(monkeypatch):
+    """Fatal verdicts stay fail-closed regardless of default route: the
+    deterministic destructive-title regex."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    reply = _golden_reply(routing="ask", sane=False, sane_reason="destructive: 'rm -rf /'")
+    result = pf.run_preflight(title="rm -rf /", tags=["agent"], caller=_stub(reply))
+    assert result.sane is False
+    assert result.sane_fatal is True
+    assert result.demoted_sanity is None
+    assert result.routing == pf.ROUTE_ASK
+
+
+@pytest.mark.unit
+def test_default_route_does_not_demote_fatal_sanity_llm_error(monkeypatch):
+    """Fatal verdicts stay fail-closed regardless of default route: the
+    preflight LLM call itself failing."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+
+    def boom(prompt):
+        raise RuntimeError("no client available")
+
+    result = pf.run_preflight(title="do the thing", tags=["agent"], caller=boom)
+    assert result.sane is False
+    assert result.sane_fatal is True
+    assert result.demoted_sanity is None
+    assert result.routing == pf.ROUTE_ASK
+
+
+@pytest.mark.unit
+def test_default_route_does_not_demote_fatal_sanity_unparseable_reply(monkeypatch):
+    """Fatal verdicts stay fail-closed regardless of default route: an
+    unparseable preflight reply."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    result = pf.run_preflight(title="x", tags=["agent"], caller=_stub("totally not json"))
+    assert result.sane is False
+    assert result.sane_fatal is True
+    assert result.demoted_sanity is None
+    assert result.routing == pf.ROUTE_ASK
+
+
+@pytest.mark.unit
+def test_default_route_invalid_value_does_not_demote_sanity(monkeypatch):
+    """#803 is gated on the setting being non-empty AND valid — a typo'd
+    value is not a standing instruction the operator successfully gave, so
+    a non-fatal sanity objection must still park exactly like the
+    no-default-route case."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "bogus-route")
+    reply = _golden_reply(
+        routing="local", sane=False, sane_reason=_FIELD_VERDICT_SANE_REASON,
+    )
+    result = pf.run_preflight(
+        title=_FIELD_VERDICT_TITLES[0], tags=["agent"], caller=_stub(reply),
+    )
+    assert result.sane is False
+    assert result.sane_fatal is False
+    assert result.demoted_sanity is None
+
+
+# ---------------------------------------------------------------------------
 # #757 — an uncorroborated LLM-invented route must not bypass
 # LIFEOS_AGENT_DEFAULT_ROUTE. All tests explicitly monkeypatch
 # `settings.agent_default_route` rather than relying on ambient env (a
@@ -1179,14 +1631,26 @@ def test_uncorroborated_cloud_inference_still_confirms_with_default_route_config
 
 @pytest.mark.unit
 def test_tag_override_bypasses_route_corroboration_check(monkeypatch):
-    """A `#cloud` tag is direct operator corroboration — #757's title-cue
-    check must not run on it at all, even though the model's own
+    """A `#cloud-sonnet` tag is direct operator corroboration — #757's
+    title-cue check must not run on it at all, even though the model's own
     uncorroborated route (local) would otherwise have been demoted."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "claude_code")
     reply = _golden_reply(routing="local", routing_explicit=False, routing_reason="stub")
-    result = pf.run_preflight(title="Refactor auth", tags=["agent", "cloud"], caller=_stub(reply))
+    result = pf.run_preflight(title="Refactor auth", tags=["agent", "cloud-sonnet"], caller=_stub(reply))
     assert result.routing == pf.ROUTE_CLAUDE
+    assert result.demoted_routing is None
+
+
+@pytest.mark.unit
+def test_bare_cloud_tag_also_bypasses_route_corroboration_check(monkeypatch):
+    """(#809) Same bypass, for the bare `#cloud` tag routing to `remote` —
+    it's still direct operator corroboration, just for a different route."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "claude_code")
+    reply = _golden_reply(routing="local", routing_explicit=False, routing_reason="stub")
+    result = pf.run_preflight(title="Refactor auth", tags=["agent", "cloud"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_REMOTE
     assert result.demoted_routing is None
 
 

@@ -15,6 +15,7 @@ from api.services.agent_worker.local_executor import (
     _SYSTEM_PROMPT_STATIC,
     LocalExecutor,
     _default_llm_client,
+    _remote_only_llm_client,
     _system_prompt,
 )
 from api.services.agent_worker.pricing import cost_for, is_known_model
@@ -523,6 +524,38 @@ def test_default_llm_client_flag_on_remote_configured_local_down_selects_remote(
     assert client.model == "accounts/fireworks/models/deepseek-v4-flash-0731"
     assert client.timeout == 42
     assert client._auth_headers() == {"Authorization": "Bearer fw_test_key"}
+
+
+@pytest.mark.unit
+def test_remote_only_llm_client_never_probes_local_or_checks_the_flag(monkeypatch):
+    """(#809) `_remote_only_llm_client` — the `#cloud` tag's executor — is a
+    first-class route, not a contingency: unlike `_default_llm_client`, it
+    never checks local llama-server reachability and is not gated on
+    `settings.agent_remote_executor` at all. The operator tagging a task
+    `#cloud` is itself the opt-in."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    # Flag deliberately left False/default — must not matter for this path.
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "https://remote.example/v1", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "accounts/fireworks/models/deepseek-v3", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "fw_test_key", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_timeout", 99, raising=False)
+
+    probed = []
+    monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: probed.append(1) or True)
+
+    client, model_name, is_remote = _remote_only_llm_client()
+
+    assert is_remote is True
+    assert model_name == "accounts/fireworks/models/deepseek-v3"
+    assert isinstance(client, LocalLLMClient)
+    assert client.base_url == "https://remote.example"
+    assert client.model == "accounts/fireworks/models/deepseek-v3"
+    assert client.timeout == 99
+    assert client._auth_headers() == {"Authorization": "Bearer fw_test_key"}
+    assert probed == [], "the remote-forced route must never probe local reachability"
 
 
 @pytest.mark.unit

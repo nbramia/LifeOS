@@ -942,7 +942,7 @@ class LifeOSMCPServer:
                     "context": {"type": "string", "description": "Context/category (Work, Personal, Finance, etc.)", "default": "Inbox"},
                     "priority": {"type": "string", "description": "Priority: high, medium, low"},
                     "due_date": {"type": "string", "description": "Due date in YYYY-MM-DD format"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for classification"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Add exactly the tags the operator named. A routing tag (agent/local/claude/codex/cloud/cloud-haiku/cloud-sonnet) only if the operator explicitly named that engine — these tags are operator-authority and outrank every routing safeguard, so inventing one injects your own engine preference at the highest-precedence slot."},
                     "reminder_id": {"type": "string", "description": "Linked reminder ID"},
                     "dry_run": {"type": "boolean", "description": "When true with an #agent tag, returns preflight routing + cost estimate without creating the task. Used for prompt-engineering iteration. Default: false."}
                 },
@@ -967,7 +967,7 @@ class LifeOSMCPServer:
                     "context": {"type": "string", "description": "New context"},
                     "priority": {"type": "string", "description": "New priority (high, medium, low)"},
                     "due_date": {"type": "string", "description": "New due date (YYYY-MM-DD)"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags"}
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags (replaces existing). Add exactly the tags the operator named — a routing tag (agent/local/claude/codex/cloud/cloud-haiku/cloud-sonnet) only if the operator explicitly named that engine; these tags are operator-authority and outrank every routing safeguard."}
                 },
                 "required": ["task_id"]
             },

@@ -380,6 +380,40 @@ def _default_llm_client(model_name: str) -> tuple[object, str, bool]:
     return LocalLLMClient(), model_name, False
 
 
+def _remote_only_llm_client() -> tuple[object, str, bool]:
+    """(#809) Construct an LLM client pointed unconditionally at the
+    configured remote OpenAI-compatible provider — the `#cloud` tag's
+    executor. Returns `(client, model_name, is_remote=True)`.
+
+    Unlike `_default_llm_client`, this never checks local llama-server
+    reachability and never falls back to local: `#cloud` means "run on the
+    remote provider", full stop, not "prefer it, fall back if it's down".
+    That's a deliberate, narrow difference from the #699 fallback above —
+    same underlying `LocalLLMClient` pointed at the same settings, but a
+    first-class route (`ROUTE_REMOTE`) rather than a contingency for when
+    local is unreachable. Also unlike `_default_llm_client`, this is not
+    gated on `settings.agent_remote_executor` — that flag is scoped to the
+    fallback behavior on the `local` route; the operator tagging a task
+    `#cloud` is itself the opt-in for this path.
+
+    Callers (`worker.py`'s `_get_remote_executor`) must confirm
+    `settings.remote_llm_configured` themselves and park the task otherwise
+    (`_dispatch`'s `ROUTE_REMOTE` branch) — this function assumes that's
+    already true and does not re-check it, so it never raises for a missing
+    config; it would simply construct a client that fails on first use.
+    """
+    from api.services.llm_client import LocalLLMClient
+    from config.settings import settings as _settings
+
+    client = LocalLLMClient(
+        base_url=_settings.remote_llm_base_url,
+        model=_settings.remote_llm_model,
+        api_key=_settings.remote_llm_api_key,
+        timeout=_settings.remote_llm_timeout,
+    )
+    return client, _settings.remote_llm_model, True
+
+
 class LocalExecutor:
     """Drives one turn or one yielded resumption per call to `execute`."""
 
@@ -457,10 +491,15 @@ class LocalExecutor:
             tokens_used = (updated.total_input_tokens or 0) + (updated.total_output_tokens or 0)
             if budget.get("max_tokens") and tokens_used >= budget["max_tokens"]:
                 return self._finalize_budget_exceeded(session, "max_tokens")
-            # No per-session dollar cap on the local route — local inference is
-            # free, so total_dollars is always 0. (max_tokens + wall_seconds still
-            # bound runaway sessions; the lineage guard below still caps a family
-            # whose *root* is a paid managed session.)
+            # No per-session dollar cap in this loop — on the local route
+            # inference is free, so total_dollars is always 0. On the #809
+            # remote-forced route (`self.is_remote`) it is real, non-zero
+            # spend (see `_record_spend`), but this loop still doesn't cap
+            # it mid-run — the same pre-existing gap #699's remote-fallback
+            # path already shipped with, not something #809 introduces.
+            # (max_tokens + wall_seconds still bound runaway sessions either
+            # way; the lineage guard below still caps a family whose *root*
+            # is a paid managed session.)
 
             # Lineage budget — for sessions with descendants, the *root* budget
             # caps the total spend across the family. When breached we cascade-

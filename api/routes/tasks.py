@@ -24,7 +24,16 @@ class CreateTaskRequest(BaseModel):
     description: str = Field(..., min_length=1, description="Task description")
     priority: Optional[str] = Field(default="", description="Priority: high, medium, low, or empty")
     due_date: Optional[str] = Field(default=None, description="Due date (YYYY-MM-DD)")
-    tags: Optional[list[str]] = Field(default=None, description="List of tags (e.g., ['work', 'urgent'])")
+    tags: Optional[list[str]] = Field(
+        default=None,
+        description="List of tags (e.g., ['work', 'urgent']). Add exactly the "
+                    "tags the operator named. A routing tag (agent/local/claude/"
+                    "codex/cloud/cloud-haiku/cloud-sonnet) only if the operator "
+                    "explicitly named that engine — these tags are operator-"
+                    "authority and outrank every routing safeguard, so inventing "
+                    "one injects your own engine preference at the highest-"
+                    "precedence slot.",
+    )
     reminder_id: Optional[str] = Field(default=None, description="Associated reminder ID")
     dry_run: Optional[bool] = Field(
         default=False,
@@ -63,7 +72,14 @@ class UpdateTaskRequest(BaseModel):
     context: Optional[str] = None
     priority: Optional[str] = None
     due_date: Optional[str] = None
-    tags: Optional[list[str]] = None
+    tags: Optional[list[str]] = Field(
+        default=None,
+        description="Replaces the task's tag list. Add exactly the tags the "
+                    "operator named. A routing tag (agent/local/claude/codex/"
+                    "cloud/cloud-haiku/cloud-sonnet) only if the operator "
+                    "explicitly named that engine — these tags are operator-"
+                    "authority and outrank every routing safeguard.",
+    )
 
 
 class TaskResponse(BaseModel):
@@ -146,6 +162,7 @@ def _build_preflight_preview(request: CreateTaskRequest) -> PreflightPreviewResp
     # task operations; agent_worker pulls in the LLM client.
     from api.services.agent_worker.preflight import (
         ROUTE_CLAUDE,
+        ROUTE_REMOTE,
         run_preflight,
     )
     from api.services.agent_worker.pricing import cost_for, MANAGED_SESSION_HOUR_OVERHEAD
@@ -155,15 +172,30 @@ def _build_preflight_preview(request: CreateTaskRequest) -> PreflightPreviewResp
     # Worst-case estimate: assume budget.max_tokens is fully consumed, split
     # 50/50 between input and output. Excludes cache_creation because dry_run
     # can't know preset size; this is a floor, not a calibrated estimate.
-    model = (
-        settings.agent_managed_model_for_tests or settings.agent_managed_model
-        if pre.routing == ROUTE_CLAUDE
-        else "local"
-    )
     half_tokens = max(0, pre.budget.max_tokens // 2)
-    estimated = cost_for(model, half_tokens, half_tokens)
-    if pre.routing == ROUTE_CLAUDE:
-        estimated += (pre.budget.wall_seconds / 3600.0) * MANAGED_SESSION_HOUR_OVERHEAD
+    if pre.routing == ROUTE_REMOTE:
+        # (#809) `#cloud` — priced from the remote provider's own configured
+        # rate, not the Anthropic table `cost_for` looks up. Unset rates
+        # mean "unknown, not free" (#669's convention) — the estimate floors
+        # at 0 rather than guessing, same as an unrecognized model would.
+        input_price = settings.remote_llm_input_price_per_mtok
+        output_price = settings.remote_llm_output_price_per_mtok
+        if input_price is not None and output_price is not None:
+            estimated = (
+                (half_tokens / 1_000_000) * input_price
+                + (half_tokens / 1_000_000) * output_price
+            )
+        else:
+            estimated = 0.0
+    else:
+        model = (
+            settings.agent_managed_model_for_tests or settings.agent_managed_model
+            if pre.routing == ROUTE_CLAUDE
+            else "local"
+        )
+        estimated = cost_for(model, half_tokens, half_tokens)
+        if pre.routing == ROUTE_CLAUDE:
+            estimated += (pre.budget.wall_seconds / 3600.0) * MANAGED_SESSION_HOUR_OVERHEAD
     return PreflightPreviewResponse(
         routing=pre.routing,
         routing_reason=pre.routing_reason,

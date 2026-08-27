@@ -311,6 +311,11 @@ def _build_snapshot() -> dict[str, Any]:
 def _model_label_for_routing(routing: str | None) -> str:
     if (routing or "local") == "local":
         return "Local"
+    if routing == "remote":
+        # (#809) `#cloud` — the configured remote OpenAI-compatible provider,
+        # not an Anthropic model, so it must not fall into the Claude-model-
+        # name guessing below.
+        return "Remote"
     try:
         from config.settings import settings
         m = (settings.agent_managed_model or "").lower()

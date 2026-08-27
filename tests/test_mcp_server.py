@@ -162,6 +162,35 @@ class TestMCPServerToolDiscovery:
         )
         assert "items" in tags_schema, "'tags' array schema is missing 'items'"
 
+    def test_task_tags_description_forbids_uninvited_routing_tags(self, openapi_spec):
+        """#804: an assistant filing a task must add exactly the tags the
+        operator named — a routing tag (#local/#claude/#codex/#cloud*) only
+        if the operator explicitly named that engine, because routing tags
+        are operator-authority and outrank every other routing safeguard.
+        Pin the rule text on both lifeos_task_create and lifeos_task_update's
+        `tags` field, since it's their OpenAPI-derived description (sourced
+        from CreateTaskRequest/UpdateTaskRequest in api/routes/tasks.py) that
+        an MCP client actually reads before calling the tool.
+        """
+        import importlib.util
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with patch.object(module.LifeOSMCPServer, "_load_openapi_spec", lambda self: None):
+            server = module.LifeOSMCPServer()
+        server.openapi_spec = openapi_spec
+        server._build_tools_from_spec()
+
+        for tool_name in ("lifeos_task_create", "lifeos_task_update"):
+            tool = next(t for t in server.tools if t["name"] == tool_name)
+            desc = tool["inputSchema"]["properties"]["tags"]["description"]
+            assert "operator named" in desc, f"{tool_name}: missing 'operator named' in {desc!r}"
+            assert "operator-authority and outrank every routing safeguard" in desc, (
+                f"{tool_name}: missing the authority rationale in {desc!r}"
+            )
+
 
 @pytest.mark.requires_server
 class TestMCPServerAPICalls:

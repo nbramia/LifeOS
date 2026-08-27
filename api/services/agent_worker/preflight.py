@@ -38,10 +38,29 @@ ROUTE_CLAUDE_CODE = "claude_code"
 # `agent_worker/codex_spawn.py`). Same semantics as ROUTE_CLAUDE_CODE —
 # preflight never emits it directly except via the `#codex` tag.
 ROUTE_CODEX = "codex"
+# `remote` is the #809 route for the `#cloud` tag: the configured remote
+# OpenAI-compatible provider (e.g. DeepSeek via Fireworks, #654) — never the
+# Anthropic API. Like ROUTE_CLAUDE_CODE/ROUTE_CODEX, preflight's own JSON
+# schema never emits this (the model only ever returns "local"|"claude"|
+# "ask" — see `_PREFLIGHT_INSTRUCTIONS`); it's set exclusively by
+# `_apply_tag_overrides` from the `#cloud` tag. Deliberately absent from
+# `KNOWN_ROUTES` (see that constant's comment) — unlike the CLI routes,
+# this one carries real per-token spend, so a noncompliant model hallucinating
+# the literal string "remote" must fall back to `ROUTE_ASK` at parse time
+# (the `routing not in KNOWN_ROUTES` check below), not be treated as a
+# legitimate model-chosen route needing its own corroboration carve-out.
+ROUTE_REMOTE = "remote"
 
 # All routing destinations `parse_preflight_response` accepts from the model,
 # and the same set `settings.agent_default_route` (#707) is validated
 # against — one source of truth so the two checks can't drift apart.
+# `ROUTE_REMOTE` is intentionally NOT a member (see its own comment above):
+# it's real per-token spend on a third-party provider, reachable only via the
+# explicit `#cloud` tag, and `settings.agent_default_route` should not be
+# able to silently default untagged tasks onto it any more than it can onto
+# `ROUTE_CLAUDE` (which is also excluded from default-route substitution by
+# `_apply_default_route`'s `original_routing` guard, just via a different
+# mechanism — see that function's docstring, point 3a).
 KNOWN_ROUTES = (ROUTE_LOCAL, ROUTE_CLAUDE, ROUTE_CLAUDE_CODE, ROUTE_CODEX, ROUTE_ASK)
 
 # Allowed expected-output shapes. Used to phrase the final Telegram summary.
@@ -131,6 +150,18 @@ class PreflightResult:
     # logged. `routing` itself is overwritten with the default route in the
     # same step. None when nothing was demoted. See `_apply_route_corroboration`.
     demoted_routing: str | None = None
+    # Set when a non-fatal sane=False verdict — the model's own inferred
+    # "this isn't executable" opinion, never a `sane_fatal` one — was
+    # demoted to advisory because `settings.agent_default_route` is
+    # configured and valid (#803). Holds the original `sane_reason` so the
+    # worker can log it as context, the same way `demoted_ambiguity` and
+    # `demoted_routing` are logged. `sane` itself is set to True in the same
+    # step, since a demoted sanity objection must not park or block the
+    # task. None when nothing was demoted. `sane_fatal` verdicts (empty
+    # title, the deterministic destructive-title regex, preflight-call/parse
+    # errors) are never touched — see `_apply_sanity_gate` and
+    # `_apply_default_route`.
+    demoted_sanity: str | None = None
     raw: dict = field(default_factory=dict)  # the parsed JSON for debugging
 
 
@@ -173,6 +204,11 @@ Rules:
 - Routing precedence (apply in order; first match wins):
     1) If the tag list contains "local" → routing="local"; routing_reason="#local tag present".
     2) If the tag list contains "cloud" → routing="claude"; routing_reason="#cloud tag present".
+       (This JSON field is a placeholder — tag-handling code, not this
+       prompt, owns the real dispatch: "#cloud" now sends the task to the
+       operator's configured remote provider, never the Anthropic API.
+       "#cloud-haiku"/"#cloud-sonnet" are the separate, unchanged explicit
+       Anthropic-API escape hatches.)
     3) Otherwise, look at the title for explicit model cues:
        - "with local agent", "using gemma" → "local"
        - "use claude", "with opus", "with claude opus", "with sonnet" → "claude"
@@ -205,7 +241,7 @@ Rules:
 - expected_output: classify what the agent will produce.
     "text" = a written answer; "file" = creates/edits a file; "external_action" = sends an email, posts a message, schedules a meeting; "structured" = returns structured data the caller will parse.
 - ambiguity: leave null in nearly all cases. The agent is autonomous and is expected to make reasonable assumptions, try one approach, and fall back to another if the first didn't work. Only set non-null when the title would *prevent* the agent from acting at all — e.g., "reply to John" with no John in scope, or "send the contract to her" with no antecedent for "her". Method-of-execution questions ("should I use web search or local data?", "which calendar?", "what format?") are NOT ambiguity — the agent picks one and adapts. 
-- sane: set to false ONLY for empty/garbage titles or obviously destructive shapes (e.g., "rm -rf /", "delete all my data"). Mundane tasks are sane.
+- sane: set to false ONLY for empty/garbage titles or obviously destructive shapes (e.g., "rm -rf /", "delete all my data"). Mundane tasks are sane. Feature requests and product specifications ARE executable tasks — this system builds features, not only fixes — never mark them insane.
 
 Tag list and title follow. Return ONLY the JSON.
 """
@@ -389,27 +425,129 @@ def parse_preflight_response(text: str) -> PreflightResult:
 PreflightCaller = Callable[[str], str]
 
 
-def _default_llm_caller(prompt: str) -> str:
-    """Production caller: pick a client in priority order, then run one
-    short completion.
+def _remote_preflight_client():
+    """Build the #654 remote-provider `LocalLLMClient`, unconditionally.
 
-    1. Anthropic, when `settings.anthropic_api_key` is set. Byte-identical
-       to the pre-#704 behavior of this function — same import, same
-       client construction, same call — because this is the maintainer's
-       own install and every other install with a key configured; no probe
-       runs on this branch.
-    2. Otherwise, the local llama-server, when reachable
-       (`LocalLLMClient().is_available()` — one short GET /health, same
-       check `local_executor._default_llm_client` uses). Unlike that
-       function, this always probes once there's no Anthropic key —
-       preflight has no `agent_remote_executor` flag gate to hide behind;
-       it just needs *some* usable client.
-    3. Otherwise, the #699 remote provider, when `agent_remote_executor`
-       and `remote_llm_configured` — mirrors the remote branch of
-       `local_executor._default_llm_client`.
-    4. Otherwise, raise. `run_preflight`'s existing except-clause already
-       degrades this to sane=False/routing=ask — unchanged.
+    Same construction as the #704 fallback branch (order 3 below): base URL,
+    model, key, and timeout all come straight from `settings.remote_llm_*`.
+    Callers are responsible for checking `settings.remote_llm_configured`
+    first — this never probes reachability itself (#706: "the remote client
+    is used unprobed, by design"), so calling it against an unconfigured
+    provider will fail on the request itself, not here.
     """
+    from api.services.llm_client import LocalLLMClient
+
+    return LocalLLMClient(
+        base_url=settings.remote_llm_base_url,
+        model=settings.remote_llm_model,
+        api_key=settings.remote_llm_api_key,
+        timeout=settings.remote_llm_timeout,
+    )
+
+
+def _default_llm_caller(prompt: str) -> str:
+    """Production caller: pick a client per `settings.agent_preflight_engine`
+    (#808), then run one short completion.
+
+    `agent_preflight_engine` values:
+
+    - `auto` (default): today's #704 priority order, unchanged —
+      1. Anthropic, when `settings.anthropic_api_key` is set. Byte-identical
+         to the pre-#704 behavior of this function — same import, same
+         client construction, same call — because this is the maintainer's
+         own install and every other install with a key configured; no
+         probe runs on this branch.
+      2. Otherwise, the local llama-server, when reachable
+         (`LocalLLMClient().is_available()` — one short GET /health, same
+         check `local_executor._default_llm_client` uses). Unlike that
+         function, this always probes once there's no Anthropic key —
+         preflight has no `agent_remote_executor` flag gate to hide behind;
+         it just needs *some* usable client.
+      3. Otherwise, the #699 remote provider, when `agent_remote_executor`
+         and `remote_llm_configured` — mirrors the remote branch of
+         `local_executor._default_llm_client`.
+      4. Otherwise, raise. `run_preflight`'s existing except-clause already
+         degrades this to sane=False/routing=ask — unchanged.
+    - `remote`: build the #654 remote provider FIRST (via
+      `_remote_preflight_client`), unprobed by design (#706), when
+      `settings.remote_llm_configured`. A failure of the call itself (bad
+      key, endpoint down, ...) is not caught here — it propagates up to
+      `run_preflight`'s existing except-clause, same as every other engine.
+      When the provider is unconfigured this raises — a forced engine
+      never silently reverts to another one (and never to the Anthropic
+      API); `run_preflight`'s except-clause degrades it to routing=ask.
+    - `anthropic`: force the Anthropic branch when a key is configured. When
+      no key is configured, raises (same fail-closed rule as `remote`).
+    - `local`: force the local llama client. Still probed via
+      `is_available()` exactly like the `auto` chain's own local branch —
+      this is a forced engine with no further engine to fall back to, so an
+      unreachable server raises (via a clear message) rather than silently
+      trying something else; `run_preflight`'s except-clause degrades that
+      the same way it degrades every other `_default_llm_caller` failure.
+    - Any other value is treated as `auto`, with one logged warning — never
+      a crash over a typo'd env var (mirrors `_apply_default_route`'s own
+      invalid-value handling for `LIFEOS_AGENT_DEFAULT_ROUTE`).
+    """
+    engine = (settings.agent_preflight_engine or "auto").strip().lower()
+    if engine not in ("auto", "remote", "anthropic", "local"):
+        logger.warning(
+            "invalid LIFEOS_AGENT_PREFLIGHT_ENGINE=%r — must be one of "
+            "auto/remote/anthropic/local; falling back to auto", engine,
+        )
+        engine = "auto"
+
+    if engine == "remote":
+        if settings.remote_llm_configured:
+            client = _remote_preflight_client()
+            response = client.create(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1024,
+                temperature=0.0,
+            )
+            return response.text
+        # Fail closed (#808): a forced engine never silently reverts to
+        # another one — in particular never to the Anthropic API, which is
+        # exactly the spend `remote` exists to avoid. `run_preflight`'s
+        # except-clause degrades this to sane=False/routing=ask, so the
+        # operator sees a confirmation question, not a surprise API bill.
+        raise RuntimeError(
+            "LIFEOS_AGENT_PREFLIGHT_ENGINE=remote but the remote provider "
+            "is not configured (LIFEOS_REMOTE_LLM_*)"
+        )
+
+    elif engine == "anthropic":
+        if settings.anthropic_api_key:
+            from api.services.llm_client import AnthropicLLMClient
+
+            client = AnthropicLLMClient(model=settings.agent_preflight_model)
+            response = client.create(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1024,
+                temperature=0.0,
+            )
+            return response.text
+        raise RuntimeError(
+            "LIFEOS_AGENT_PREFLIGHT_ENGINE=anthropic but no Anthropic API "
+            "key is configured"
+        )
+
+    elif engine == "local":
+        from api.services.llm_client import LocalLLMClient
+
+        local_client = LocalLLMClient()
+        if not local_client.is_available():
+            raise RuntimeError(
+                "LIFEOS_AGENT_PREFLIGHT_ENGINE=local but the local "
+                "llama-server is unreachable"
+            )
+        response = local_client.create(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
+            temperature=0.0,
+        )
+        return response.text
+
+    # engine == "auto".
     if settings.anthropic_api_key:
         # Import inside the branch so tests that monkeypatch run_preflight
         # don't need the Anthropic SDK installed, and so a no-key install
@@ -430,12 +568,7 @@ def _default_llm_caller(prompt: str) -> str:
     if local_client.is_available():
         client = local_client
     elif settings.agent_remote_executor and settings.remote_llm_configured:
-        client = LocalLLMClient(
-            base_url=settings.remote_llm_base_url,
-            model=settings.remote_llm_model,
-            api_key=settings.remote_llm_api_key,
-            timeout=settings.remote_llm_timeout,
-        )
+        client = _remote_preflight_client()
     else:
         raise RuntimeError(
             "no LLM client available for preflight: no Anthropic API key, "
@@ -482,11 +615,25 @@ def _detect_preset_class_from_tags(tags: list[str]) -> str | None:
     return None
 
 
-# Model/engine words that count as the operator naming a cloud route themselves.
-# Used to corroborate the classifier's `routing_explicit` before any API dispatch
-# happens without a confirmation (#584) — the tags are checked separately.
+# Model/engine words that count as the operator naming the Anthropic API
+# route themselves. Used to corroborate the classifier's `routing_explicit`
+# before any API dispatch happens without a confirmation (#584) — the tags
+# are checked separately.
+#
+# (#809) "cloud" was dropped from this alternation. Before #809, a title
+# merely containing the bare word "cloud" was treated as sufficient
+# corroboration for a model-claimed `routing="claude"` — safe at the time
+# because "cloud" and "the Anthropic API" were the same thing. They no
+# longer are: `#cloud` the tag now means the configured remote provider, so
+# a title that happens to say "cloud" (with no other engine word) no longer
+# unambiguously names Anthropic. Leaving it in this regex would let such a
+# title corroborate a hallucinated `routing="claude"` straight into
+# Anthropic-API spend with no confirmation — exactly the hidden-spend shape
+# #584 exists to prevent. Dropping it means that case now falls through to
+# `_apply_tag_overrides`'s downgrade-to-`ask` below, which is the safe
+# default the issue calls for: inference still asks, never spends.
 _TITLE_NAMES_A_CLOUD_ENGINE = re.compile(
-    r"(?i)\b(claude|opus|sonnet|haiku|cloud|anthropic|api)\b"
+    r"(?i)\b(claude|opus|sonnet|haiku|anthropic|api)\b"
 )
 
 # Title phrases that corroborate an LLM-chosen `local` route — lifted
@@ -543,9 +690,15 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
       `#local`        → routing=local, model=local
       `#claude`       → routing=code   (Claude Code CLI, subscription-billed)
       `#codex`        → routing=codex  (Codex CLI, subscription-billed)
-      `#cloud-haiku`  → routing=claude, model=claude-haiku-4-5
-      `#cloud-sonnet` → routing=claude, model=claude-sonnet-5
-      `#cloud`        → routing=claude, model=(whatever preflight picked, else Sonnet)
+      `#cloud-haiku`  → routing=claude, model=claude-haiku-4-5   (Anthropic API, explicit)
+      `#cloud-sonnet` → routing=claude, model=claude-sonnet-5    (Anthropic API, explicit)
+      `#cloud`        → routing=remote, model=""  (#809: the configured remote
+                         OpenAI-compatible provider, e.g. DeepSeek via
+                         Fireworks — NEVER the Anthropic API. If the remote
+                         provider isn't configured, the worker parks the task
+                         at #agent-blocked rather than falling back to
+                         Anthropic; see `worker.py`'s `ROUTE_REMOTE` branch
+                         in `_dispatch`.)
 
     Returns a new PreflightResult so the caller can chain. Tag list is
     normalized case-insensitively with optional leading `#`.
@@ -587,12 +740,23 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
         result.model = MODEL_SONNET
         return result
     if "cloud" in normalized:
-        result.routing = ROUTE_CLAUDE
+        # (#809) `#cloud` now means the configured remote OpenAI-compatible
+        # provider (e.g. DeepSeek via Fireworks, #654) — never the Anthropic
+        # API. `#cloud-haiku`/`#cloud-sonnet` above are the separate,
+        # unchanged explicit Anthropic escape hatches; only the bare `#cloud`
+        # tag's meaning moved. `model` is left "" — the remote provider's
+        # model id comes from `settings.remote_llm_model` at dispatch time
+        # (the same "the engine picks its own model" pattern the
+        # `#claude`/`#codex` branches above use), not something preflight
+        # selects among `ALLOWED_MODELS`. Whether the remote provider is
+        # actually configured is a worker-side concern (`_dispatch` parks
+        # the task at #agent-blocked when it isn't) — preflight's job here
+        # is only to name the route.
+        result.routing = ROUTE_REMOTE
         result.routing_explicit = True
         if not result.routing_reason:
             result.routing_reason = "#cloud tag present"
-        if result.model not in ALLOWED_MODELS:
-            result.model = MODEL_SONNET
+        result.model = ""
         return result
     # No tag override. A cloud route that nobody asked for must not dispatch:
     # downgrade it to `ask` so the worker confirms first (#584). The classifier's
@@ -745,13 +909,14 @@ def _apply_route_corroboration(
 
 
 def _apply_default_route(result: PreflightResult, original_routing: str) -> PreflightResult:
-    """Apply `settings.agent_default_route` (#707), and — as of #751 — demote
-    any non-null `ambiguity` to advisory once that setting is configured and
-    valid. Empty setting (default) is a no-op, so an unset install is
-    byte-identical to pre-#707 behavior; both parts of this function are
-    gated on the setting being non-empty and valid.
+    """Apply `settings.agent_default_route` (#707), and — as of #751 and #803
+    — demote any non-null `ambiguity` and any non-fatal `sane=False` to
+    advisory once that setting is configured and valid. Empty setting
+    (default) is a no-op, so an unset install is byte-identical to pre-#707
+    behavior; all three parts of this function are gated on the setting
+    being non-empty and valid.
 
-    Two independent things happen here, in order:
+    Three independent things happen here, in order:
 
     1. **Ambiguity demotion (#751).** Configuring a default route is the
        operator saying "run untagged tasks without asking me" — a cheap
@@ -763,17 +928,34 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
        question text (#748's approach) is whack-a-mole — the model keeps
        rephrasing around the pattern — so this demotes unconditionally on
        the *value being non-null* rather than trying to classify its prose.
-       This intentionally does NOT touch `result.sane` — a non-fatal
-       `sane=False` still parks the task (#747): sanity is "should this run
-       at all", a question this setting has no bearing on, whereas ambiguity
-       is "who resolves an open question", which is exactly what a standing
-       default-route instruction answers.
 
-    2. **Route substitution (#707), unchanged.** Gate:
+    2. **Sanity demotion (#803).** The same standing-instruction argument
+       applies to a non-fatal `sane=False`: the classifier has repeatedly
+       called ordinary feature requests "not a task an agent can execute",
+       and treating that opinion as authoritative when the operator has
+       already told the system to run untagged tasks costs a confirmation
+       round-trip on legitimate work. So once the setting is confirmed
+       non-empty and valid, a `sane=False` that is NOT `sane_fatal` is
+       demoted the same way ambiguity is: `sane_reason` is stashed on
+       `result.demoted_sanity` and `result.sane` is set back to True.
+       `sane_fatal` verdicts — the empty-title short-circuit, the
+       deterministic destructive-title regex (`_apply_sanity_gate`), and
+       preflight-call/parse errors — are code-established, not the model's
+       opinion, and this check's `not result.sane_fatal` guard leaves them
+       completely untouched: they still fail closed in the worker
+       regardless of this setting. Demoting sanity here (rather than only
+       logging it) also means part 3's `not result.sane` half of its gate
+       no longer blocks route substitution for a demoted verdict — a
+       demoted sanity objection is exactly as "resolved" as a demoted
+       ambiguity, so it should be able to reach the default route the same
+       way.
+
+    3. **Route substitution (#707), unchanged shape.** Gate:
        `result.routing == ROUTE_ASK and result.sane` (the `ambiguity is
        None` half of the old gate is now always true here, since part 1 just
-       cleared it) `and original_routing == ROUTE_ASK`. Deliberately NOT a
-       string match against `routing_reason` — the LLM's reason text is
+       cleared it; and `result.sane` is now True whenever part 2 demoted a
+       non-fatal objection) `and original_routing == ROUTE_ASK`. Deliberately
+       NOT a string match against `routing_reason` — the LLM's reason text is
        free-form prose ("no tag and no title cue" today, but not a stable
        contract), so matching on it would be brittle. This one structural
        gate covers both "lack of cues" paths:
@@ -781,9 +963,10 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
          - `parse_preflight_response`'s deterministic fallback when the model
            omitted `routing` or returned a value outside `KNOWN_ROUTES`
        and it correctly excludes the "ask" outcome the issue says must stay
-       ask: sanity failures — including the empty-title short-circuit and
-       the LLM-call-failure fallback in `run_preflight`, both of which set
-       `sane=False`.
+       ask: *fatal* sanity failures — including the empty-title short-circuit
+       and the LLM-call-failure fallback in `run_preflight`, both of which
+       set `sane=False` and `sane_fatal=True`, so part 2 never demotes them
+       and this gate still blocks on `not result.sane`.
 
        One more `ask` source needs excluding: `_apply_tag_overrides`'s #584
        downgrade, which turns an *inferred* (unconfirmed) cloud route into
@@ -794,10 +977,10 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
        Excluded via `original_routing`: the routing value from BEFORE
        `_apply_tag_overrides` ran. Only when the original LLM/parse outcome
        was *already* `ask` — not downgraded from `claude` — do we know this
-       is genuinely nothing-to-route-on. (Ambiguity demotion in part 1 still
-       runs on this path — the #584 downgrade blocks via `routing == ask`
-       either way, so demoting the ambiguity text just avoids a redundant
-       question, not a redundant block.)
+       is genuinely nothing-to-route-on. (Ambiguity/sanity demotion in parts
+       1-2 still run on this path — the #584 downgrade blocks via
+       `routing == ask` either way, so demoting the ambiguity/sanity text
+       just avoids a redundant question, not a redundant block.)
     """
     if not settings.agent_default_route:
         return result
@@ -809,9 +992,9 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
         # validators), so this logs an ERROR — one line per occurrence, not a
         # crash — and falls back to `ask`, same as every other preflight
         # error path. The worker loop must never die over a typo'd env var.
-        # Deliberately checked (and returned on) BEFORE ambiguity demotion —
-        # a misconfigured setting is not a *valid* standing instruction, so
-        # it must not weaken the ambiguity block either.
+        # Deliberately checked (and returned on) BEFORE ambiguity/sanity
+        # demotion — a misconfigured setting is not a *valid* standing
+        # instruction, so it must not weaken either block.
         logger.error(
             "invalid LIFEOS_AGENT_DEFAULT_ROUTE=%r — must be one of %s; "
             "falling back to ask", default_route, KNOWN_ROUTES,
@@ -825,6 +1008,14 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
         )
         result.demoted_ambiguity = result.ambiguity.question
         result.ambiguity = None
+
+    if not result.sane and not result.sane_fatal:
+        logger.info(
+            "preflight sanity objection demoted to advisory (LIFEOS_AGENT_DEFAULT_ROUTE=%s "
+            "configured): %r", default_route, result.sane_reason,
+        )
+        result.demoted_sanity = result.sane_reason
+        result.sane = True
 
     if result.routing != ROUTE_ASK or not result.sane:
         return result
@@ -878,6 +1069,16 @@ def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
     # ROUTE_CLAUDE_CODE / ROUTE_CODEX bill against a flat subscription; ROUTE_LOCAL
     # is free. Per-session $ rollups for CLI routes still populate via the
     # rollout ingest (cc:/cx: sources in /agents).
+    #
+    # (#809) ROUTE_REMOTE (the `#cloud` tag's remote OpenAI-compatible
+    # provider) is real per-token spend too, but is deliberately NOT gated
+    # here. The §6/§7 confirmation ceremony exists specifically for the
+    # Anthropic API — the operator's standing "expensive exception" — not
+    # for third-party spend in general; the remote provider is treated like
+    # local/CLI for preflight cost-preview purposes, the same way #699's
+    # remote-fallback path never triggered this gate either. Real spend
+    # still records correctly regardless — see
+    # `local_executor.LocalExecutor._record_spend`'s `is_remote` branch.
     if result.routing != ROUTE_CLAUDE:
         result.estimated_cost_dollars = 0.0
         result.needs_cost_confirmation = False
@@ -934,15 +1135,21 @@ def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> P
 
     Precedence, and why each sits where it does:
 
-      1. **Sanity gate first, and orthogonal to everything below.**
+      1. **Sanity gate first, and orthogonal to routing.**
          `_apply_sanity_gate` runs before routing is decided at all, because
          "should this run" is a different question from "how should it
-         run" — a `sane_fatal` verdict fails the task closed regardless of
-         routing/ambiguity (checked immediately in the worker, before either
-         is consulted), and a non-fatal `sane=False` parks it. Neither is
-         touched by the routing precedence below, and #751 does not change
-         this: a default route answers "who resolves an open question", not
-         "should this task run at all".
+         run". It only ever *establishes* `sane_fatal` (from the
+         deterministic destructive-title regex); it never demotes anything.
+         A `sane_fatal` verdict fails the task closed regardless of
+         routing/ambiguity/default-route configuration (checked immediately
+         in the worker, before any of them is consulted) — #751 and #803
+         both leave this untouched, since a default route answers "who
+         resolves an open question" / "does this cheap opinion outrank a
+         standing instruction", never "should this task run at all" once
+         the code itself has flagged it destructive. A non-fatal
+         `sane=False` — the model's own inferred opinion, not code-
+         established — parks the task by default, unless step 4 below
+         demotes it (#803).
       2. **Tags** (`_apply_tag_overrides`) — the operator retagging a task
          is the most direct, most recent signal available; always wins,
          over both the model's routing and (since #757) route corroboration.
@@ -982,10 +1189,21 @@ def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> P
          `ambiguity` to advisory (logged, not blocking) whenever the setting
          is configured and valid — independent of whether step 4's route
          substitution itself fires, since a corroborated route (step 3) can
-         still carry a stale ambiguity the model should not have set. This
-         step's own `original_routing` exclusion (only substitutes when the
-         *pre-tag* routing was already `ask`) is what keeps #584's
-         downgraded-to-`ask` cloud case from being rescued here too — see 3a.
+         still carry a stale ambiguity the model should not have set. As of
+         #803, it does the same for a non-fatal `sane=False`: the model's
+         own "not executable" opinion is demoted to advisory
+         (`demoted_sanity`, logged, not blocking) under the identical gate,
+         and `sane` is set back to True in the same step — a demoted
+         sanity objection is therefore just as capable of clearing this same
+         step's own route-substitution gate as a demoted ambiguity is,
+         since that gate also requires `result.sane`. `sane_fatal` verdicts never reach this
+         demotion (step 1 already established `sane_fatal` and the demotion
+         is gated on `not result.sane_fatal`), so fail-closed behavior for
+         empty titles, destructive-title matches, and preflight-call/parse
+         errors is unaffected regardless of the setting. This step's own
+         `original_routing` exclusion (only substitutes when the *pre-tag*
+         routing was already `ask`) is what keeps #584's downgraded-to-`ask`
+         cloud case from being rescued here too — see 3a.
       5. **Ask** — the fallback when nothing above resolved routing, or the
          #584 unconfirmed-cloud downgrade parked it there.
 

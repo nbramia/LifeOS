@@ -1130,6 +1130,25 @@
             cursor: pointer;
         }
 
+        /* Live-mic indicator on the Listening label (#813). Hidden unless
+           voice.js adds `.live`, which it does only while the wake tap is
+           actually holding an unsuspended capture — so the dot disappears
+           during playback/recording and whenever Listening is off, rather
+           than tracking the checkbox. Reuses the `pulse` keyframes the
+           header status dot already uses. */
+        .listen-dot {
+            display: none;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--success);
+        }
+
+        .listen-dot.live {
+            display: inline-block;
+            animation: pulse 1.4s ease-in-out infinite;
+        }
+
         /* Replayable voice responses (tap to replay) */
         .message.replayable {
             cursor: pointer;
@@ -1202,6 +1221,57 @@
             display: inline-flex;
             align-items: center;
             justify-content: center;
+        }
+
+        /* Network-resilience status row for a voice turn (#801) -- a subtle
+           "retrying" note, or a definitive "failed" state with Retry/dismiss.
+           A sibling of `.message.user`/`.message.assistant`, appended right
+           after the turn's bubble, deliberately NOT nested inside one (see
+           `turnStatusEl`'s comment in voice.js for why: `.message`'s own
+           text content is asserted verbatim by pre-existing tests). */
+        .voice-turn-status {
+            align-self: flex-end;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            max-width: min(85%, 700px);
+            padding: 0 0.25rem;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .voice-turn-status.failed {
+            color: var(--text-secondary);
+        }
+
+        .voice-turn-retry-btn,
+        .voice-turn-dismiss-btn {
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: none;
+            font-size: 0.8rem;
+            padding: 0.2rem 0.6rem;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .voice-turn-retry-btn {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+
+        .voice-turn-retry-btn:hover {
+            background: var(--accent-hover);
+        }
+
+        .voice-turn-dismiss-btn {
+            color: var(--text-muted);
+            padding: 0.2rem 0.5rem;
+        }
+
+        .voice-turn-dismiss-btn:hover {
+            color: var(--text-secondary);
         }
 
         /* Mode swap: voice mode hides the text composer, shows the dock. */
@@ -2822,6 +2892,7 @@
         .agent-route { font-size: 0.62rem; padding: 0.1rem 0.4rem; border-radius: 999px; white-space: nowrap; }
         .agent-route.cloud { background: #2a2140; color: #c4a7ff; }
         .agent-route.local { background: #1f3a33; color: #7fe0c4; }
+        .agent-route.remote { background: #1a2f45; color: #7fb8e0; }
         .agent-badge { font-size: 0.64rem; padding: 0.1rem 0.4rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.03em; }
         .agent-badge.running { background: #1e3a5f; color: #7fb4ff; }
         .agent-badge.completed { background: #1e4620; color: #7ad17f; }
@@ -2970,7 +3041,9 @@
                     <label class="dock-toggle"><input type="checkbox" id="voiceMute"> Mute</label>
                     <label class="dock-toggle"><input type="checkbox" id="voiceFast" checked> 2×</label>
                     <label class="dock-toggle"><input type="checkbox" id="voiceAuto" checked> Auto</label>
-                    <label class="dock-toggle"><input type="checkbox" id="voiceListen" checked> Listening</label>
+                    <!-- The dot only renders while the wake tap actually holds a
+                         live mic — see .listen-dot / updateListenIndicator(). -->
+                    <label class="dock-toggle"><input type="checkbox" id="voiceListen" checked> Listening<span class="listen-dot" id="voiceListenDot" role="status" aria-label="Microphone is live"></span></label>
                 </div>
             </div>
         </footer>
@@ -3212,6 +3285,7 @@
                     voiceFast: document.getElementById('voiceFast'),
                     voiceAuto: document.getElementById('voiceAuto'),
                     voiceListen: document.getElementById('voiceListen'),
+                    voiceListenDot: document.getElementById('voiceListenDot'),
                     modeTextBtn: document.getElementById('modeTextBtn'),
                     modeVoiceBtn: document.getElementById('modeVoiceBtn'),
                     backendLifeos: document.getElementById('backendLifeos'),
@@ -3259,6 +3333,11 @@
             const tip = escapeHtml((modelLabel || (r === 'claude' ? 'Cloud' : 'Local')).toString());
             if (r === 'claude') return '<span class="agent-route cloud" title="' + tip + '">☁ cloud</span>';
             if (r === 'local') return '<span class="agent-route local" title="' + tip + '">🖥 local</span>';
+            // (#809) `#cloud` tasks route here, not to Anthropic — the
+            // configured remote OpenAI-compatible provider (e.g. DeepSeek via
+            // Fireworks). Distinct badge so it isn't confused with the
+            // Anthropic-API "cloud" badge above.
+            if (r === 'remote') return '<span class="agent-route remote" title="' + tip + '">🌐 remote</span>';
             return '';
         }
 
