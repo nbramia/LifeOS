@@ -192,3 +192,57 @@ def test_rejects_reserved_primary_name(tmp_path: Path):
 
     assert result.returncode != 0
     assert not (root / "config" / "telegram_bots.local.json").exists()
+
+
+def test_hyphenated_name_gets_underscored_default_env_vars(tmp_path: Path):
+    """A hyphenated bot name (allowed by the name pattern) must not produce a
+    hyphenated — and therefore shell-invalid — default env var name."""
+    root = tmp_path
+    _init_project(root)
+
+    result = _run(root, "travel-bot", "TOKEN123", "CHAT456")
+
+    assert result.returncode == 0, result.stderr
+    appended_lines = (root / ".env").read_text().splitlines()[1:]  # skip the pre-existing line
+    assert appended_lines == [
+        "TELEGRAM_TRAVEL_BOT_BOT_TOKEN=TOKEN123",
+        "TELEGRAM_TRAVEL_BOT_CHAT_ID=CHAT456",
+    ]
+    assert all("-" not in line.split("=", 1)[0] for line in appended_lines)  # no hyphen in any KEY
+
+
+def test_refuses_duplicate_env_var_declared_with_export_prefix(tmp_path: Path):
+    """python-dotenv (and this project's loader) also accept `export KEY=value`
+    lines — the duplicate-key guard must recognize those, not just bare KEY=."""
+    root = tmp_path
+    _init_project(
+        root,
+        env_contents="ANTHROPIC_API_KEY=sk-ant-test\nexport TELEGRAM_TRAVEL_BOT_TOKEN=existing\n",
+    )
+
+    result = _run(root, "travel", "TOKEN123", "CHAT456")
+
+    assert result.returncode != 0
+    assert "TELEGRAM_TRAVEL_BOT_TOKEN" in result.stderr
+    assert "CHAT456" not in (root / ".env").read_text()
+
+
+def test_rejects_invalid_custom_env_var_name(tmp_path: Path):
+    root = tmp_path
+    _init_project(root)
+
+    result = _run(root, "travel", "TOKEN123", "CHAT456", "--token-env", "not a valid name")
+
+    assert result.returncode != 0
+    assert not (root / "config" / "telegram_bots.local.json").exists()
+    assert "TOKEN123" not in (root / ".env").read_text()
+
+
+def test_refuses_value_containing_newline(tmp_path: Path):
+    root = tmp_path
+    _init_project(root)
+
+    result = _run(root, "travel", "TOKEN123\nMALICIOUS=1", "CHAT456")
+
+    assert result.returncode != 0
+    assert "MALICIOUS" not in (root / ".env").read_text()

@@ -29,6 +29,7 @@ Out of scope, both intentionally manual/out-of-band:
 """
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -58,6 +59,9 @@ def _validate_name(name: str) -> str:
     return name
 
 
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def append_env_vars(env_path: Path, pairs: list[tuple[str, str]]) -> None:
     """Append ``KEY=value`` lines to ``env_path`` without truncating it.
 
@@ -65,6 +69,9 @@ def append_env_vars(env_path: Path, pairs: list[tuple[str, str]]) -> None:
     a symlink to its target) rather than replacing the path — the file, and
     a symlink at that path, are never removed or recreated.
     """
+    for key, value in pairs:
+        if "\n" in value or "\r" in value:
+            raise RegistrationError(f"{key} value contains a newline — refusing to write it")
     needs_leading_newline = False
     if env_path.exists() and env_path.stat().st_size > 0:
         with open(env_path, "rb") as f:
@@ -78,11 +85,15 @@ def append_env_vars(env_path: Path, pairs: list[tuple[str, str]]) -> None:
 
 
 def _existing_env_keys(env_path: Path) -> set[str]:
+    """Keys already assigned in ``env_path`` — including ``export KEY=...``
+    lines, which python-dotenv (and this project's loader) also accept."""
     if not env_path.exists():
         return set()
     keys = set()
     for line in env_path.read_text().splitlines():
         stripped = line.strip()
+        if stripped.startswith("export "):
+            stripped = stripped[len("export "):].strip()
         if stripped and not stripped.startswith("#") and "=" in stripped:
             keys.add(stripped.split("=", 1)[0].strip())
     return keys
@@ -126,6 +137,16 @@ def register_bot(
     template_path: Path,
 ) -> None:
     name = _validate_name(name)
+
+    for key in (token_env, chat_id_env):
+        if not _ENV_KEY_RE.match(key):
+            raise RegistrationError(
+                f"{key!r} is not a valid environment variable name "
+                f"(must match {_ENV_KEY_RE.pattern!r})"
+            )
+    for key, value in ((token_env, token), (chat_id_env, chat_id)):
+        if "\n" in value or "\r" in value:
+            raise RegistrationError(f"{key} value contains a newline — refusing to write it")
 
     existing_env_keys = _existing_env_keys(env_path)
     for key in (token_env, chat_id_env):
@@ -191,7 +212,10 @@ def main() -> int:
     args = parser.parse_args()
 
     root = Path(args.project_root)
-    name_upper = args.name.strip().upper()
+    # Bot names may contain hyphens (_BOT_NAME_RE allows [a-z0-9_-]+), but env
+    # var names can't — swap them to underscores so the default is always a
+    # valid, shell-sourceable identifier (e.g. "travel-bot" -> TRAVEL_BOT).
+    name_upper = args.name.strip().upper().replace("-", "_")
     token_env = args.token_env or f"TELEGRAM_{name_upper}_BOT_TOKEN"
     chat_id_env = args.chat_id_env or f"TELEGRAM_{name_upper}_CHAT_ID"
     persona_file = args.persona_file or f"config/personas/{args.name.strip().lower()}.md"
