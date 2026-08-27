@@ -1856,6 +1856,65 @@ class TestPhoneImport:
 
 
 # ---------------------------------------------------------------------------
+# main() — missing import dir is a clean skip, not a hard failure (#698)
+# ---------------------------------------------------------------------------
+
+class TestMissingImportDirIsCleanSkip:
+    """A fresh install with no Apple Data Agent ever configured must skip
+    cleanly (exit 0, SYNC_SKIPPED marker) instead of failing loud every
+    night — the apple_import-shaped sibling of #687's clean-skip pattern."""
+
+    def test_missing_import_dir_does_not_raise_and_prints_sync_skipped(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        import scripts.apple_data_import as import_mod
+
+        missing_dir = tmp_path / "does-not-exist"
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", missing_dir)
+        monkeypatch.setattr(import_mod.sys, "argv", ["apple_data_import.py", "--execute"])
+
+        # main() must fall through cleanly (no SystemExit) — a hard
+        # sys.exit(1) here is exactly the regression this issue fixes.
+        import_mod.main()
+
+        printed = capsys.readouterr().out
+        assert "SYNC_SKIPPED:" in printed
+        assert "Apple Data Agent" in printed
+
+    def test_existing_import_dir_with_manifest_is_unaffected(self, tmp_path, monkeypatch):
+        """A configured install (dir exists) must not take the new skip
+        branch at all — #646 behavior (staleness, per-source errors) is
+        untouched."""
+        import scripts.apple_data_import as import_mod
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir()
+        fresh = datetime.now(timezone.utc) - timedelta(hours=1)
+        manifest = {
+            "exported_at": fresh.isoformat(),
+            "hostname": "test-host",
+            "results": {"contacts": {"status": "ok"}},
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", import_dir)
+
+        def _stub(dry_run=False, **kwargs):
+            return {"status": "ok", "created": 0}
+
+        for name in (
+            "import_contacts", "import_imessage", "import_phone_calls",
+            "import_photos_faces", "import_whatsapp", "import_health",
+        ):
+            monkeypatch.setattr(import_mod, name, _stub)
+        monkeypatch.setattr(import_mod.sys, "argv", ["apple_data_import.py", "--execute"])
+
+        # Falls through cleanly — no SYNC_SKIPPED, no exception.
+        import_mod.main()
+
+
+# ---------------------------------------------------------------------------
 # main() — critical staleness must fail the run (issue #646)
 # ---------------------------------------------------------------------------
 

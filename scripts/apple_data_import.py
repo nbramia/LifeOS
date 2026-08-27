@@ -854,9 +854,19 @@ def main():
     dry_run = not args.execute
 
     if not IMPORT_DIR.exists():
-        logger.error(f"Import directory not found: {IMPORT_DIR}")
-        logger.info("Run the Apple Data Agent on Mac Mini first, then rsync to this machine.")
-        sys.exit(1)
+        # No Apple Data Agent has ever exported anything to this host — not
+        # broken, just never set up (issue #698, the Apple-shaped sibling of
+        # #687's clean-skip pattern). A configured install's import directory
+        # exists (even mid-outage, even stale), so this branch never fires
+        # for it — check_manifest()'s staleness/per-source-error paths below
+        # are untouched and still fail loud for a real outage.
+        message = (
+            f"No Apple Data Agent configured — {IMPORT_DIR} not found. See "
+            "docs/guides/setup.md for how to pair a Mac as the Apple Data Agent."
+        )
+        logger.info(message)
+        print(f"SYNC_SKIPPED: {message}", flush=True)
+        return
 
     manifest = check_manifest()
     if not manifest and not dry_run:
