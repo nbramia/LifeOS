@@ -1,0 +1,121 @@
+"""Coverage for scripts/launchd-env-wrapper.sh (#776).
+
+launchd's `EnvironmentVariables` dict is static at load time, so every
+generated plist's ProgramArguments routes through this wrapper first, which
+loads the project's .env into the process environment before exec'ing the
+real command.
+
+Critically, this must NOT `source` .env — systemd's EnvironmentFile= (the
+thing this wrapper stands in for) is a plain KEY=VALUE parser that never
+evaluates the value as shell. A `source`-based wrapper would instead run a
+value like `FOO=$(whoami)` as code on every service start. This file's most
+important test proves that does not happen.
+"""
+from __future__ import annotations
+
+import stat
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+WRAPPER = REPO_ROOT / "scripts" / "launchd-env-wrapper.sh"
+
+
+def _run(project_dir: Path, *command: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(WRAPPER), str(project_dir), *command],
+        capture_output=True, text=True, timeout=10,
+    )
+
+
+@pytest.mark.unit
+def test_wrapper_exports_plain_value(tmp_path: Path):
+    if not WRAPPER.exists():
+        pytest.skip("scripts/launchd-env-wrapper.sh not present")
+    (tmp_path / ".env").write_text("FOO=bar\n")
+    result = _run(tmp_path, "bash", "-c", "echo \"$FOO\"")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "bar"
+
+
+@pytest.mark.unit
+def test_wrapper_strips_matching_double_quotes(tmp_path: Path):
+    if not WRAPPER.exists():
+        pytest.skip("scripts/launchd-env-wrapper.sh not present")
+    (tmp_path / ".env").write_text('FOO="bar baz"\n')
+    result = _run(tmp_path, "bash", "-c", "echo \"$FOO\"")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "bar baz"
+
+
+@pytest.mark.unit
+def test_wrapper_strips_matching_single_quotes(tmp_path: Path):
+    if not WRAPPER.exists():
+        pytest.skip("scripts/launchd-env-wrapper.sh not present")
+    (tmp_path / ".env").write_text("FOO='bar baz'\n")
+    result = _run(tmp_path, "bash", "-c", "echo \"$FOO\"")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "bar baz"
+
+
+@pytest.mark.unit
+def test_wrapper_does_not_execute_shell_code_in_value(tmp_path: Path):
+    """The core safety property: a value containing shell metacharacters
+    must reach the child process literally, never evaluated as code."""
+    if not WRAPPER.exists():
+        pytest.skip("scripts/launchd-env-wrapper.sh not present")
+    (tmp_path / ".env").write_text("FOO=$(whoami)\n")
+    result = _run(tmp_path, "bash", "-c", "echo \"$FOO\"")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "$(whoami)"
+
+
+@pytest.mark.unit
+def test_wrapper_does_not_execute_backticks_in_value(tmp_path: Path):
+    if not WRAPPER.exists():
+        pytest.skip("scripts/launchd-env-wrapper.sh not present")
+    (tmp_path / ".env").write_text("FOO=`whoami`\n")
+    result = _run(tmp_path, "bash", "-c", "echo \"$FOO\"")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "`whoami`"
+
+
+@pytest.mark.unit
+def test_wrapper_skips_comments_and_blank_lines(tmp_path: Path):
+    if not WRAPPER.exists():
+        pytest.skip("scripts/launchd-env-wrapper.sh not present")
+    (tmp_path / ".env").write_text("# a comment\n\nFOO=bar\n")
+    result = _run(tmp_path, "bash", "-c", "echo \"$FOO\"")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "bar"
+
+
+@pytest.mark.unit
+def test_wrapper_execs_normally_when_env_file_absent(tmp_path: Path):
+    if not WRAPPER.exists():
+        pytest.skip("scripts/launchd-env-wrapper.sh not present")
+    result = _run(tmp_path, "echo", "hello")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "hello"
+
+
+@pytest.mark.unit
+def test_wrapper_usage_error_with_fewer_than_two_args(tmp_path: Path):
+    if not WRAPPER.exists():
+        pytest.skip("scripts/launchd-env-wrapper.sh not present")
+    result = subprocess.run(
+        ["bash", str(WRAPPER), str(tmp_path)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0
+    assert "Usage" in result.stderr
+
+
+@pytest.mark.unit
+def test_wrapper_is_executable():
+    if not WRAPPER.exists():
+        pytest.skip("scripts/launchd-env-wrapper.sh not present")
+    mode = WRAPPER.stat().st_mode
+    assert mode & stat.S_IXUSR

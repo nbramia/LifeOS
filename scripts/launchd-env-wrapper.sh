@@ -11,10 +11,19 @@
 # a launchd-managed service at all (#776).
 #
 # Every generated plist's ProgramArguments routes through this script first.
-# It sources the project's .env (if present) into its own process
-# environment, then execs the real command — the same ".env reaches the
-# process environment at start" behavior a systemd service already gets via
+# It loads the project's .env (if present) into its own process environment,
+# then execs the real command — the same ".env reaches the process
+# environment at start" behavior a systemd service already gets via
 # EnvironmentFile=.
+#
+# Deliberately NOT `source .env`: systemd's EnvironmentFile= is a plain
+# KEY=VALUE parser — it never evaluates the value as shell — so `source`ing
+# would be a meaningfully different (and riskier) analog: a value containing
+# `$(...)`, backticks, or other shell metacharacters would be executed as
+# code every time launchd starts this service, not treated as a literal
+# string. The loop below reads .env line by line and exports each KEY=VALUE
+# literally, stripping one layer of matching quotes — no shell evaluation of
+# the value, matching EnvironmentFile='s actual semantics.
 #
 # Usage: launchd-env-wrapper.sh <project_dir> <command> [args...]
 set -euo pipefail
@@ -28,10 +37,26 @@ PROJECT_DIR="$1"
 shift
 
 if [ -f "$PROJECT_DIR/.env" ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source "$PROJECT_DIR/.env"
-    set +a
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|'#'*) continue ;;
+        esac
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            # `${val:1:-1}` (negative length) needs bash 4.2+; macOS ships
+            # bash 3.2 as /bin/bash, so use %/# trimming instead, which
+            # works on every bash version.
+            if [[ "$val" == \"*\" && "$val" == *\" && ${#val} -ge 2 ]]; then
+                val="${val#\"}"
+                val="${val%\"}"
+            elif [[ "$val" == \'*\' && "$val" == *\' && ${#val} -ge 2 ]]; then
+                val="${val#\'}"
+                val="${val%\'}"
+            fi
+            export "$key=$val"
+        fi
+    done < "$PROJECT_DIR/.env"
 fi
 
 exec "$@"

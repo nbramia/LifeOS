@@ -80,10 +80,11 @@ def test_auto_deploy_style_functions_defined(tmp_path: Path):
     repo = _make_sandbox(tmp_path)
     result = _run_sourced(
         repo,
-        "type -t generate_plist check_placeholders check_paths_exist validate_plist main",
+        "type -t generate_plist check_placeholders check_paths_exist "
+        "validate_plist install_plist main",
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.count("function") == 5, result.stdout
+    assert result.stdout.count("function") == 6, result.stdout
 
 
 @pytest.mark.unit
@@ -110,13 +111,49 @@ def test_generate_plist_substitutes_all_placeholders(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_generate_plist_handles_sed_metacharacters_in_values(tmp_path: Path):
+    """A path containing `&`, `|`, or `\\` must reach the output literally —
+    `&` means "whole match" in a sed replacement, `|` is generate_plist's own
+    delimiter, and an unescaped `\\` can corrupt the substitution outright."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    template = repo / "t.plist.template"
+    template.write_text(
+        "<dict>\n    <key>WorkingDirectory</key>\n    <string>__LIFEOS_PATH__</string>\n</dict>",
+        encoding="utf-8",
+    )
+    output = repo / "t.plist"
+    tricky_path = r"/proj&ects/a|b\c"
+    result = _run_sourced(
+        repo,
+        f'generate_plist "{template}" "{output}" "/home/op" "{tricky_path}" "/vault"',
+    )
+    assert result.returncode == 0, result.stderr
+    assert output.read_text() == (
+        "<dict>\n    <key>WorkingDirectory</key>\n    "
+        f"<string>{tricky_path}</string>\n</dict>"
+    )
+
+
+@pytest.mark.unit
+def test_sed_escape_replacement_round_trips_special_characters(tmp_path: Path):
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    result = _run_sourced(repo, r'''esc=$(_sed_escape_replacement 'a&b\c|d'); printf 'X__T__Y' | sed "s|__T__|$esc|g"''')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == r'Xa&b\c|dY'
+
+
+@pytest.mark.unit
 def test_check_placeholders_reports_leftover_token(tmp_path: Path):
     if not SETUP_LAUNCHD.exists():
         pytest.skip("scripts/setup-launchd.sh not present")
     repo = _make_sandbox(tmp_path)
     plist = repo / "broken.plist"
     plist.write_text(
-        "<dict>\n<key>WorkingDirectory</key>\n<string>__LIFEOS_PATH__</string>\n</dict>",
+        "<dict>\n    <key>WorkingDirectory</key>\n    <string>__LIFEOS_PATH__</string>\n</dict>",
         encoding="utf-8",
     )
     result = _run_sourced(repo, f'check_placeholders "{plist}"')
@@ -131,7 +168,7 @@ def test_check_placeholders_silent_when_fully_substituted(tmp_path: Path):
     repo = _make_sandbox(tmp_path)
     plist = repo / "clean.plist"
     plist.write_text(
-        "<dict>\n<key>WorkingDirectory</key>\n<string>/proj</string>\n</dict>",
+        "<dict>\n    <key>WorkingDirectory</key>\n    <string>/proj</string>\n</dict>",
         encoding="utf-8",
     )
     result = _run_sourced(repo, f'check_placeholders "{plist}"')
@@ -146,7 +183,7 @@ def test_check_paths_exist_flags_missing_workingdirectory_and_venv(tmp_path: Pat
     repo = _make_sandbox(tmp_path)
     plist = repo / "p.plist"
     plist.write_text(
-        "<dict>\n<key>WorkingDirectory</key>\n<string>/no/such/dir</string>\n</dict>",
+        "<dict>\n    <key>WorkingDirectory</key>\n    <string>/no/such/dir</string>\n</dict>",
         encoding="utf-8",
     )
     result = _run_sourced(repo, f'check_paths_exist "{plist}" "/no/such/venv"')
@@ -166,7 +203,7 @@ def test_check_paths_exist_silent_when_paths_are_real(tmp_path: Path):
     venv.mkdir()
     plist = repo / "p.plist"
     plist.write_text(
-        f"<dict>\n<key>WorkingDirectory</key>\n<string>{workdir}</string>\n</dict>",
+        f"<dict>\n    <key>WorkingDirectory</key>\n    <string>{workdir}</string>\n</dict>",
         encoding="utf-8",
     )
     result = _run_sourced(repo, f'check_paths_exist "{plist}" "{venv}"')
@@ -190,7 +227,7 @@ def test_validate_plist_rejects_leftover_placeholder(tmp_path: Path):
     venv.mkdir()
     plist = repo / "broken.plist"
     plist.write_text(
-        "<dict>\n<key>WorkingDirectory</key>\n<string>__LIFEOS_PATH__</string>\n</dict>",
+        "<dict>\n    <key>WorkingDirectory</key>\n    <string>__LIFEOS_PATH__</string>\n</dict>",
         encoding="utf-8",
     )
     bindir = _stub_plutil_ok(repo)
@@ -210,7 +247,7 @@ def test_validate_plist_rejects_missing_workingdirectory(tmp_path: Path):
     venv.mkdir()
     plist = repo / "p.plist"
     plist.write_text(
-        "<dict>\n<key>WorkingDirectory</key>\n<string>/does/not/exist</string>\n</dict>",
+        "<dict>\n    <key>WorkingDirectory</key>\n    <string>/does/not/exist</string>\n</dict>",
         encoding="utf-8",
     )
     bindir = _stub_plutil_ok(repo)
@@ -230,7 +267,7 @@ def test_validate_plist_rejects_missing_venv(tmp_path: Path):
     workdir.mkdir()
     plist = repo / "p.plist"
     plist.write_text(
-        f"<dict>\n<key>WorkingDirectory</key>\n<string>{workdir}</string>\n</dict>",
+        f"<dict>\n    <key>WorkingDirectory</key>\n    <string>{workdir}</string>\n</dict>",
         encoding="utf-8",
     )
     bindir = _stub_plutil_ok(repo)
@@ -251,7 +288,7 @@ def test_validate_plist_accepts_well_formed_plist(tmp_path: Path):
     venv.mkdir()
     plist = repo / "p.plist"
     plist.write_text(
-        f"<dict>\n<key>WorkingDirectory</key>\n<string>{workdir}</string>\n</dict>",
+        f"<dict>\n    <key>WorkingDirectory</key>\n    <string>{workdir}</string>\n</dict>",
         encoding="utf-8",
     )
     bindir = _stub_plutil_ok(repo)
@@ -259,6 +296,62 @@ def test_validate_plist_accepts_well_formed_plist(tmp_path: Path):
     env["PATH"] = f"{bindir}:{env['PATH']}"
     result = _run_sourced(repo, f'validate_plist "{plist}" "{venv}"; echo "rc=$?"', env)
     assert "rc=0" in result.stdout, (result.stdout, result.stderr)
+
+
+# ---------------------------------------------------------------------------
+# install_plist — idempotent copy (never silently replace an unchanged unit)
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_install_plist_writes_a_new_file(tmp_path: Path):
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    src = repo / "com.lifeos.api.plist"
+    src.write_text("content-v1", encoding="utf-8")
+    dst_dir = tmp_path / "LaunchAgents"
+    dst_dir.mkdir()
+    result = _run_sourced(repo, f'install_plist "{src}" "{dst_dir}"')
+    assert result.returncode == 0, result.stderr
+    assert "Installed:" in result.stdout
+    assert (dst_dir / "com.lifeos.api.plist").read_text() == "content-v1"
+
+
+@pytest.mark.unit
+def test_install_plist_leaves_an_unchanged_file_untouched(tmp_path: Path):
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    src = repo / "com.lifeos.api.plist"
+    src.write_text("content-v1", encoding="utf-8")
+    dst_dir = tmp_path / "LaunchAgents"
+    dst_dir.mkdir()
+    dst = dst_dir / "com.lifeos.api.plist"
+    dst.write_text("content-v1", encoding="utf-8")
+    before_mtime = dst.stat().st_mtime
+
+    result = _run_sourced(repo, f'install_plist "{src}" "{dst_dir}"')
+    assert result.returncode == 0, result.stderr
+    assert "Unchanged:" in result.stdout
+    assert "Installed:" not in result.stdout
+    assert dst.stat().st_mtime == before_mtime
+
+
+@pytest.mark.unit
+def test_install_plist_overwrites_a_genuinely_different_file(tmp_path: Path):
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    src = repo / "com.lifeos.api.plist"
+    src.write_text("content-v2", encoding="utf-8")
+    dst_dir = tmp_path / "LaunchAgents"
+    dst_dir.mkdir()
+    dst = dst_dir / "com.lifeos.api.plist"
+    dst.write_text("content-v1", encoding="utf-8")
+
+    result = _run_sourced(repo, f'install_plist "{src}" "{dst_dir}"')
+    assert result.returncode == 0, result.stderr
+    assert "Installed:" in result.stdout
+    assert dst.read_text() == "content-v2"
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +409,37 @@ def test_main_installs_a_well_formed_plist(tmp_path: Path):
     installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.api.plist"
     assert installed.exists(), (result.stdout, result.stderr)
     assert "__LIFEOS_PATH__" not in installed.read_text()
+
+
+@pytest.mark.unit
+def test_main_rerun_leaves_an_unchanged_installed_plist_untouched(tmp_path: Path):
+    """Re-running setup on a host where the service is already installed
+    must not silently replace it if nothing changed (constraint: never
+    replace a working unit silently)."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+
+    def run():
+        return subprocess.run(
+            ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+            cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+        )
+
+    first = run()
+    assert first.returncode == 0, (first.stdout, first.stderr)
+    installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.api.plist"
+    assert installed.exists()
+    before_mtime = installed.stat().st_mtime
+
+    second = run()
+    assert second.returncode == 0, (second.stdout, second.stderr)
+    assert "Unchanged: com.lifeos.api.plist" in second.stdout, second.stdout
+    assert installed.stat().st_mtime == before_mtime
 
 
 @pytest.mark.unit

@@ -4,10 +4,12 @@
 # Generates plist files from templates and installs to ~/Library/LaunchAgents
 #
 # The operational body (prompting, generation, validation, install) is
-# wrapped in main() and guarded at the bottom of this file so that sourcing
-# this script — the pattern tests/test_deploy_drift.py established for
-# scripts/auto-deploy.sh — only defines functions. It never prompts, touches
-# ~/Library/LaunchAgents, or calls a real `launchctl`/`plutil`.
+# wrapped in main() and guarded at the bottom of this file — the pattern
+# tests/test_deploy_drift.py established for scripts/auto-deploy.sh — so
+# that sourcing this script never prompts, never touches
+# ~/Library/LaunchAgents, and never calls a real `launchctl`. (Top-level
+# variable assignments above and `set -e` still take effect on source, same
+# as auto-deploy.sh; only the operational run itself is gated.)
 
 set -e
 
@@ -15,17 +17,34 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIFEOS_PATH="$(cd "$SCRIPT_DIR/.." && pwd)"
 LAUNCHD_DIR="$LIFEOS_PATH/config/launchd"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
-VENV_DIR="${LIFEOS_VENV:-$HOME/.venvs/lifeos}"
+# Every template hardcodes __HOME__/.venvs/lifeos (no __VENV__ placeholder
+# exists to override it), so validation checks that exact path — not an
+# operator-configurable one — to avoid checking a different directory than
+# what's actually baked into the generated plist. Tests get an isolated venv
+# by pointing $HOME at a sandbox, same as everything else __HOME__-derived.
+VENV_DIR="$HOME/.venvs/lifeos"
 
 # --- Generation ------------------------------------------------------------
+
+# Escape a value so it's safe to drop into the replacement side of an
+# `s|X|<value>|` sed expression: a literal `&` (means "whole match" in a sed
+# replacement), `|` (our delimiter), or `\` in a real path would otherwise
+# corrupt the substitution or make sed error out.
+_sed_escape_replacement() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/&/\\\&/g' -e 's/|/\\|/g'
+}
 
 # Substitute the __HOME__/__LIFEOS_PATH__/__VAULT_PATH__ placeholder
 # convention into a template, writing the result to $2.
 generate_plist() {
     local template="$1" output="$2" home="$3" lifeos_path="$4" vault_path="$5"
-    sed -e "s|__HOME__|$home|g" \
-        -e "s|__LIFEOS_PATH__|$lifeos_path|g" \
-        -e "s|__VAULT_PATH__|$vault_path|g" \
+    local esc_home esc_lifeos_path esc_vault_path
+    esc_home=$(_sed_escape_replacement "$home")
+    esc_lifeos_path=$(_sed_escape_replacement "$lifeos_path")
+    esc_vault_path=$(_sed_escape_replacement "$vault_path")
+    sed -e "s|__HOME__|$esc_home|g" \
+        -e "s|__LIFEOS_PATH__|$esc_lifeos_path|g" \
+        -e "s|__VAULT_PATH__|$esc_vault_path|g" \
         "$template" > "$output"
 }
 
@@ -45,15 +64,17 @@ check_placeholders() {
     grep -oE '__[A-Z_]+__' "$plist" 2>/dev/null | sort -u
 }
 
-# Single-line `<key>NAME</key>` immediately followed by `<string>value</string>`
-# — the structure every template in this repo uses. Avoids depending on
-# plutil -extract (macOS-only, and this needs to work when sourced under
-# test on Linux too).
+# A `<key>NAME</key>` line (real templates indent it) immediately followed
+# by a `<string>value</string>` line — the structure every template in this
+# repo uses. Avoids depending on plutil -extract (macOS-only, and this needs
+# to work when sourced under test on Linux too). Matches the key line by
+# substring rather than exact equality so real (indented) templates match,
+# not just an unindented test fixture.
 _plist_string_value() {
-    local plist="$1" key="$2"
-    awk -v key="<key>${key}</key>" '
+    local plist="$1" key="<key>${2}</key>"
+    awk -v key="$key" '
         found { if ($0 ~ /<string>/) { gsub(/.*<string>|<\/string>.*/, ""); print; exit } }
-        $0 == key { found=1 }
+        index($0, key) > 0 { found=1 }
     ' "$plist"
 }
 
@@ -107,6 +128,24 @@ validate_plist() {
     fi
 
     [ "$ok" = true ]
+}
+
+# Copy a generated plist into place only if it differs from what's already
+# there. Re-running setup on a host where a service is already loaded and
+# running must never silently replace it — this script never calls
+# launchctl itself (it only ever writes files), so "don't touch what's
+# unchanged" is the whole idempotency contract.
+install_plist() {
+    local src="$1" dst_dir="$2"
+    local filename dst
+    filename=$(basename "$src")
+    dst="$dst_dir/$filename"
+    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+        echo "  Unchanged: $filename (already installed, left in place)"
+        return 0
+    fi
+    cp "$src" "$dst"
+    echo "  Installed: $filename"
 }
 
 # --- Operational run ---------------------------------------------------------
@@ -206,7 +245,9 @@ if [ "$VALIDATION_FAILED" = true ]; then
     exit 1
 fi
 
-# Copy to LaunchAgents (skip chromadb)
+# Copy to LaunchAgents (skip chromadb — cron watchdog instead). Only ever
+# writes an unchanged file's content over itself when it actually differs
+# (install_plist); never touches a file that already matches.
 echo ""
 echo "Installing to $LAUNCH_AGENTS..."
 
@@ -220,8 +261,7 @@ for plist in "$LAUNCHD_DIR"/*.plist; do
             echo "  Skipped: $filename (use cron watchdog instead)"
             continue
         fi
-        cp "$plist" "$LAUNCH_AGENTS/"
-        echo "  Installed: $filename"
+        install_plist "$plist" "$LAUNCH_AGENTS"
     fi
 done
 
