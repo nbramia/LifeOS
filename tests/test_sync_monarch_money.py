@@ -149,10 +149,14 @@ class TestMainRecordsSkipStatus:
         assert error_message
         assert "ConnectionError" in error_message
 
-    def test_normal_exception_message_unchanged(self, monkeypatch):
+    def test_normal_exception_message_unchanged(self, monkeypatch, caplog):
         """An exception with a real message must be recorded exactly as
         before this change — no class-name prefix added when it isn't
-        needed (#781's acceptance criteria: behavior-preserving)."""
+        needed (#781's acceptance criteria: behavior-preserving). Also
+        pins the emitted log text, since that's what run_all_syncs.py's
+        transient-failure classifier actually reads (this script runs as
+        a subprocess and the classifier inspects captured stderr)."""
+        import logging
         from api.services.sync_health import SyncStatus
         from scripts.sync_monarch_money import main
 
@@ -168,8 +172,11 @@ class TestMainRecordsSkipStatus:
         self._patch_sync_health(monkeypatch, recorded)
         monkeypatch.setattr(sys, "argv", ["sync_monarch_money.py", "--execute"])
 
-        with pytest.raises(SystemExit) as exc_info:
-            main()
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+        assert "Monarch Money sync failed: session invalid, re-auth required" in caplog.text
 
         assert exc_info.value.code == 1
         assert recorded["status"] == SyncStatus.FAILED
@@ -200,16 +207,41 @@ class TestFailureMessageEnrichment:
         e.status_code = 429
         assert _failure_message(e) == "HTTPError (status=429)"
 
-    def test_empty_message_with_response_status_and_body_included(self):
+    def test_empty_message_with_response_status_included_no_body(self):
+        """Status code is included; response body is deliberately excluded
+        (Monarch is a financial data source — an error body could carry
+        account/personal detail, and the "never log real personal data"
+        boundary applies even on this fallback path)."""
         from scripts.sync_monarch_money import _failure_message
 
         class FakeResponse:
             status_code = 500
-            text = "Internal Server Error"
+            text = "Internal Server Error: account 1234-5678 over limit"
 
         class HTTPError(Exception):
             pass
 
         e = HTTPError()
         e.response = FakeResponse()
-        assert _failure_message(e) == "HTTPError (status=500; Internal Server Error)"
+        message = _failure_message(e)
+        assert message == "HTTPError (status=500)"
+        assert "1234-5678" not in message
+
+    def test_misbehaving_response_property_does_not_crash(self):
+        """A third-party exception whose `response`/`status_code`
+        attributes raise on access must not itself crash the failure
+        handler it's meant to describe — fall back to just the class
+        name."""
+        from scripts.sync_monarch_money import _failure_message
+
+        class BoomResponse:
+            @property
+            def status_code(self):
+                raise RuntimeError("not decoded yet")
+
+        class HTTPError(Exception):
+            pass
+
+        e = HTTPError()
+        e.response = BoomResponse()
+        assert _failure_message(e) == "HTTPError"

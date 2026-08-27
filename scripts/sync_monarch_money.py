@@ -102,23 +102,33 @@ def _failure_message(e: Exception) -> str:
     transient. run_all_syncs.py's `_is_transient_failure` can never match
     an empty message, so those runs never got the automatic retry that
     already exists for transient failures. Falling back to the exception's
-    class name (and any HTTP status/response detail it carries) gives
+    class name (and any HTTP status code it carries) gives
     `_is_transient_failure` something to match — e.g. a bare
     `ConnectTimeout` or `ReadTimeout` already matches its patterns by class
     name alone, no new signature needed. A non-empty `str(e)` is returned
     unchanged (#781).
+
+    Deliberately does not include a response body: Monarch is a financial
+    data source, an error body could carry account/personal detail, and
+    the "never log real personal data" boundary applies even to the rare
+    empty-message path this only runs on. Attribute lookups are wrapped in
+    a broad except so a third-party exception with a misbehaving
+    `response`/`status_code` property can never itself crash the failure
+    handler it's meant to describe.
     """
     message = str(e)
     if message:
         return message
     parts = [type(e).__name__]
-    response = getattr(e, "response", None)
-    status = getattr(e, "status_code", None) or getattr(response, "status_code", None)
-    if status is not None:
-        parts.append(f"status={status}")
-    body = getattr(response, "text", None) if response is not None else None
-    if body:
-        parts.append(body)
+    try:
+        response = getattr(e, "response", None)
+        status = getattr(e, "status_code", None)
+        if status is None and response is not None:
+            status = getattr(response, "status_code", None)
+        if status is not None:
+            parts.append(f"status={status}")
+    except Exception:
+        pass
     return parts[0] if len(parts) == 1 else f"{parts[0]} ({'; '.join(parts[1:])})"
 
 
