@@ -5,7 +5,7 @@ Live query endpoints for financial data (accounts, transactions, cashflow, budge
 """
 import logging
 from datetime import date, timedelta
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 
@@ -75,6 +75,7 @@ async def list_transactions(
     search: Optional[str] = None,
     limit: int = 100,
     account_id: Optional[str] = None,
+    sort: Optional[Literal["asc", "desc"]] = None,
 ):
     """
     Search/filter recent transactions.
@@ -86,6 +87,8 @@ async def list_transactions(
     - search: Search by merchant name
     - limit: Max results (default 100)
     - account_id: Filter by Monarch account ID
+    - sort: "asc" (oldest first) or "desc" (newest first) by date; omit for
+      the existing default order (unchanged for callers that don't pass it)
     """
     if not start_date:
         start_date = (date.today() - timedelta(days=30)).isoformat()
@@ -101,6 +104,7 @@ async def list_transactions(
             category=category,
             limit=min(limit, 500),
             account_ids=[account_id] if account_id else None,
+            sort_order=sort,
         )
         return {
             "transactions": transactions,
