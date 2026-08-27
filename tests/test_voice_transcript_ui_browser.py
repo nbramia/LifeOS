@@ -270,6 +270,68 @@ class TestEagerTranscriptRendering:
         page.wait_for_timeout(200)
         assert _thread(page) == []
 
+    def test_server_cancelled_frame_removes_the_bubble_without_local_cancel(
+            self, page: Page, chat_base_url):
+        """A turn's lifetime is server-owned (#611) -- it can be cancelled from
+        elsewhere (another tab/device on the same conversation), not only via
+        this tab's own Cancel button. The eagerly-rendered bubble must not
+        survive that path either, even though this tab's activeTurnAbort was
+        never triggered locally."""
+        _open_voice_chat(
+            page,
+            chat_base_url,
+            frames=[
+                {"type": "transcript", "text": "remind me to call mom"},
+                {"type": "cancelled"},
+            ],
+        )
+        _fire_turn(page, blob=None)
+        expect(page.locator("#messages .message.user")).to_have_count(1)
+        page.wait_for_function(
+            "document.querySelectorAll('#messages .message.user').length === 0"
+        )
+
+    def test_failed_turn_keeps_the_user_bubble(self, page: Page, chat_base_url):
+        """A turn that errors out is not a cancellation -- the user really did
+        say this, so the bubble stays (matching askStream()'s text-path
+        behavior on error: the user's own message is never retracted, only
+        the assistant side reports the failure)."""
+        _open_voice_chat(
+            page,
+            chat_base_url,
+            frames=[{"type": "transcript", "text": "remind me to call mom"}],
+        )
+        _fire_turn(page, blob=None)
+        expect(page.locator("#messages .message.user")).to_have_text("remind me to call mom")
+        expect(page.locator("#statusText")).to_have_text("Error")
+        expect(page.locator("#messages .message.assistant")).to_be_visible()
+        assert _user_texts(page) == ["remind me to call mom"]
+
+    def test_cancel_after_done_stops_playback_without_removing_the_bubble(
+            self, page: Page, chat_base_url):
+        """The Cancel button doubles as "stop playback" once a reply has
+        already landed -- voiceBusy/clipInFlight stay true across
+        `await playbackChain` in submitTurn(), so a tap there routes through
+        the same cancelActiveTurn() a mid-turn cancel does. That tap must
+        stop audio, not delete the transcript bubble for a turn that already
+        completed and persisted server-side (distinguished via the `turnDone`
+        flag, set once `done` is processed)."""
+        _open_voice_chat(
+            page,
+            chat_base_url,
+            frames=[
+                {"type": "transcript", "text": "remind me to call mom"},
+                {"type": "done", "data": {"transcript": "remind me to call mom", "response_text": "ok"}},
+            ],
+        )
+        page.evaluate("() => window.lifeChatVoice.submitTurn({ blob: null })")
+        expect(page.locator("#statusText")).to_have_text("Ready")
+        assert _user_texts(page) == ["remind me to call mom"]
+
+        page.evaluate("() => window.lifeChatVoice.cancelActiveTurn()")
+
+        assert _user_texts(page) == ["remind me to call mom"]
+
     def test_a_second_turn_keeps_the_first_turns_bubble(self, page: Page, chat_base_url):
         """The per-turn bubble handle is reset at submit, so turn two appends
         rather than overwriting turn one."""

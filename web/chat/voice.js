@@ -75,6 +75,14 @@ let thinkingEl = null;
 // the authoritative `done` transcript can reconcile the one the earlier
 // `transcript` SSE event rendered, instead of appending a second bubble.
 let turnTranscriptEl = null;
+// True once a turn's `done` payload has been processed (#758). The Cancel
+// button doubles as a "stop playback" control while a completed reply's
+// audio is still queued (voiceBusy/clipInFlight stay true across
+// `await playbackChain`, see submitTurn()) -- tapping it then must stop the
+// audio without deleting the transcript bubble for a turn that already
+// completed and persisted server-side. Reset alongside turnTranscriptEl at
+// the top of each turn.
+let turnDone = false;
 let ttsAudio = null;
 
 // Every write to `clipInFlight` goes through here (#734) rather than
@@ -2090,6 +2098,14 @@ async function consumeTurnStream(response) {
       renderUserTranscript(event.text);
     }
     if (event.type === 'cancelled') {
+      // This frame means the turn was cancelled server-side -- possibly by
+      // this tab's own Cancel button (cancelActiveTurn(), which already
+      // cleared the bubble), but a turn's lifetime is server-owned (#611) and
+      // can just as easily be cancelled from elsewhere (another tab/device
+      // on the same conversation). Clear here too so an externally-cancelled
+      // turn leaves no trace either -- idempotent if cancelActiveTurn()
+      // already ran.
+      clearUserTranscript();
       throw new DOMException('Turn cancelled', 'AbortError');
     }
     if (event.type === 'error') {
@@ -2132,6 +2148,7 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
   setStatus('loading', mode === 'agent' ? 'Agent thinking…'
     : mode === 'hermes' ? 'Hermes thinking…' : 'Thinking…');
   turnTranscriptEl = null;
+  turnDone = false;
   // A caller-supplied transcript needs no STT round trip, so it can go in the
   // thread immediately (#758); an audio turn's bubble lands on the relay's
   // `transcript` SSE event instead.
@@ -2204,6 +2221,7 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
       }
     }
     clearThinking();
+    turnDone = true;
     // `done` is authoritative — reconciles the bubble the `transcript` event
     // already rendered, or renders it if that event never arrived.
     renderUserTranscript(data.transcript);
@@ -2235,7 +2253,10 @@ function showCancel(on) {
   if (elements.voiceCancelBtn) elements.voiceCancelBtn.classList.toggle('visible', on);
 }
 
-function cancelActiveTurn() {
+// Exported so the headless test harness can drive it directly (#758) --
+// same reason submitTurn() is exported, and needed to test the "stop
+// playback after done" case without faking real audio element timing.
+export function cancelActiveTurn() {
   activeTurnAbort?.abort();
   if (activeTurnId) {
     fetch(`${endpoints.voice}/turn/${encodeURIComponent(activeTurnId)}/cancel`, { method: 'POST' }).catch(() => {});
@@ -2244,8 +2265,12 @@ function cancelActiveTurn() {
   stopAllAudio();
   clearThinking();
   // A cancelled turn is never persisted, so it leaves no trace in the thread —
-  // drop the user bubble along with the thinking placeholder (#758).
-  clearUserTranscript();
+  // drop the user bubble along with the thinking placeholder (#758). But this
+  // button is also the "stop playback" control once a turn has already
+  // reached `done` (voiceBusy/clipInFlight stay true while audio plays out,
+  // see submitTurn()'s `await playbackChain`) -- that bubble is the
+  // authoritative, already-persisted transcript, so leave it alone then.
+  if (!turnDone) clearUserTranscript();
   activeTurnId = null;
   activeTurnAbort = null;
   voiceBusy = false;
