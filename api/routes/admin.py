@@ -55,6 +55,15 @@ async def get_status() -> IndexStatus:
     # Check if a reindex job is currently running. A "running" row left by a
     # process that has since restarted (e.g. an unrelated auto-deploy mid-job)
     # is stale, not actually in progress — exclude it (#768).
+    #
+    # limit=1 is safe even with a stale row present: this queue runs one job
+    # at a time on a single worker thread (JobQueue._worker_loop), and
+    # start_worker() reconciles any pre-existing RUNNING row before that
+    # thread starts, so there is never more than one RUNNING row queue-wide
+    # at a time in the single-process-per-database model this queue assumes
+    # (Codex review of #768 raised the two-rows case; it requires a second
+    # process concurrently claiming jobs against the same jobs.db, which
+    # this architecture doesn't support).
     queue = get_job_queue()
     running_jobs = queue.list_jobs(status="running", job_type="reindex_vault", limit=1)
     reindex_in_progress = any(

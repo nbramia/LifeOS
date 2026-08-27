@@ -54,8 +54,13 @@ def is_stale_running_job(job: "Job", process_start_time: str) -> bool:
     condition independently, using `JobQueue.process_start_time` as the
     "is the owning process still alive" signal: ISO-8601 timestamps from
     `datetime.now(timezone.utc).isoformat()` compare correctly as strings.
+
+    A missing `started_at` on a `RUNNING` row counts as stale too: `_claim_next`
+    always sets it in the same atomic UPDATE that sets status to `RUNNING`, so
+    a real, currently-executing job always has one — a `RUNNING` row without
+    it cannot be this process's own live job (Codex review of #768).
     """
-    return job.status == RUNNING and bool(job.started_at) and job.started_at < process_start_time
+    return job.status == RUNNING and (job.started_at is None or job.started_at < process_start_time)
 
 
 @dataclass
@@ -269,7 +274,7 @@ class JobQueue:
         `RUNNING` row to notice the process that owned it is gone. Since
         this queue processes one job at a time on a single worker thread
         that hasn't started yet, any row already `RUNNING` at this point
-        cannot belong to this process — it's stranded.
+        that predates this process cannot belong to it — it's stranded.
         """
         if self._worker_thread and self._worker_thread.is_alive():
             logger.warning("Worker already running")
@@ -285,20 +290,25 @@ class JobQueue:
         logger.info("Job queue worker started")
 
     def _reconcile_orphaned_jobs(self):
-        """Mark every currently-`RUNNING` job failed/orphaned.
+        """Mark every `RUNNING` job that predates this process failed/orphaned.
 
-        Called once, before the worker thread starts, so any row this finds
-        was left behind by a previous process — this process hasn't claimed
-        anything yet. Retries are intentionally not offered here (unlike
-        `_mark_failed`): the job's own process is gone, not merely a single
-        attempt, so whether to re-enqueue is a separate decision (#768).
+        Called once, before the worker thread starts, so nothing has been
+        claimed by this process yet — scoped to `started_at < process_start_time`
+        (or a missing `started_at`, which `_claim_next` never actually leaves
+        null on a real claim) rather than every `RUNNING` row unconditionally,
+        so this can never touch a job genuinely owned by a still-alive process
+        sharing the same database (Codex review of #768). Retries are
+        intentionally not offered here (unlike `_mark_failed`): the job's own
+        process is gone, not merely a single attempt, so whether to re-enqueue
+        is a separate decision.
         """
         now = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
             cur = conn.execute(
                 """UPDATE jobs SET status = ?, completed_at = ?, error = ?
-                   WHERE status = ?""",
-                (FAILED, now, "orphaned: process restarted while job was running", RUNNING),
+                   WHERE status = ? AND (started_at IS NULL OR started_at < ?)""",
+                (FAILED, now, "orphaned: process restarted while job was running",
+                 RUNNING, self.process_start_time),
             )
         if cur.rowcount:
             logger.warning(

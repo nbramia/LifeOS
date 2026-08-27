@@ -234,6 +234,17 @@ class TestJobWorker:
         assert order == [1, 2, 3]
 
 
+def _simulate_new_process(queue):
+    """Bump process_start_time to the far future, so a job already claimed
+    on `queue` (started_at set at __init__ time, necessarily earlier) reads
+    as belonging to a since-restarted previous process rather than this
+    one — the real-world ordering reconciliation depends on (#768 Codex
+    review: reconciliation is now scoped to started_at < process_start_time,
+    so simulating "stale" requires the timestamps in this relative order,
+    not just reusing the same queue object to claim-then-reconcile)."""
+    queue.process_start_time = "9999-01-01T00:00:00+00:00"
+
+
 class TestOrphanReconciliation:
     """A job left RUNNING by a process that restarted mid-job is never
     revisited by anything else in this module — cleanup_old_jobs() only
@@ -244,6 +255,7 @@ class TestOrphanReconciliation:
         job_id = queue.enqueue("a")
         queue._claim_next()  # simulate a previous process having left this RUNNING
         assert queue.get_job(job_id).status == RUNNING
+        _simulate_new_process(queue)
 
         queue.start_worker()
         queue.stop_worker()
@@ -253,12 +265,29 @@ class TestOrphanReconciliation:
         assert "orphan" in job.error.lower()
         assert job.completed_at is not None
 
+    def test_reconciliation_does_not_touch_a_job_from_this_same_process(self, queue):
+        """A RUNNING row whose started_at is AFTER this process's own start
+        cannot have been stranded by a restart of this process — reconciling
+        it unconditionally (rather than scoping to process_start_time) would
+        risk killing a job a still-alive process is genuinely executing
+        against the same database (Codex review of #768)."""
+        job_id = queue.enqueue("a")
+        queue._claim_next()
+        # No _simulate_new_process() call: process_start_time (set at
+        # __init__, before enqueue/claim above) predates started_at, so this
+        # job reads as belonging to this process's own current lifetime.
+
+        queue._reconcile_orphaned_jobs()
+
+        assert queue.get_job(job_id).status == RUNNING
+
     def test_reconciliation_does_not_offer_a_retry(self, queue):
         """Unlike _mark_failed(), reconciliation always lands on FAILED —
         the job's owning process is gone, not merely one attempt, so it must
         not be silently re-queued to PENDING regardless of attempts left."""
         job_id = queue.enqueue("a", max_attempts=5)
         queue._claim_next()
+        _simulate_new_process(queue)
         queue.start_worker()
         queue.stop_worker()
         assert queue.get_job(job_id).status == FAILED
@@ -267,6 +296,7 @@ class TestOrphanReconciliation:
         job_id = queue.enqueue("a")
         queue._claim_next()
         queue._mark_completed(job_id, {"ok": True})
+        _simulate_new_process(queue)
 
         queue.start_worker()
         queue.stop_worker()
@@ -281,11 +311,13 @@ class TestOrphanReconciliation:
         # acceptance criteria's "equivalent explicit reconciliation call")
         # avoids racing against the worker loop picking this job up itself.
         job_id = queue.enqueue("a")
+        _simulate_new_process(queue)
         queue._reconcile_orphaned_jobs()
         assert queue.get_job(job_id).status == PENDING
 
     def test_no_reconciliation_when_nothing_running(self, queue, caplog):
         queue.enqueue("a")  # stays PENDING
+        _simulate_new_process(queue)
         with caplog.at_level(logging.WARNING):
             queue.start_worker()
         queue.stop_worker()
@@ -294,10 +326,28 @@ class TestOrphanReconciliation:
     def test_reconciliation_logs_a_warning(self, queue, caplog):
         queue.enqueue("a")
         queue._claim_next()
+        _simulate_new_process(queue)
         with caplog.at_level(logging.WARNING):
             queue.start_worker()
         queue.stop_worker()
         assert "Reconciled 1 orphaned job" in caplog.text
+
+    def test_reconciliation_treats_missing_started_at_as_stale(self, queue):
+        """A RUNNING row with no started_at can't be a real live claim —
+        _claim_next always sets it in the same atomic UPDATE — so it must
+        still be reconciled even though it fails the started_at < process_
+        start_time comparison outright (#768 Codex review)."""
+        job_id = queue.enqueue("a")
+        queue._claim_next()
+        with queue._conn() as conn:
+            conn.execute("UPDATE jobs SET started_at = NULL WHERE id = ?", (job_id,))
+        # Deliberately NOT calling _simulate_new_process(): even with
+        # process_start_time unchanged, a null started_at must not survive
+        # via the `started_at < process_start_time` comparison alone.
+
+        queue._reconcile_orphaned_jobs()
+
+        assert queue.get_job(job_id).status == FAILED
 
 
 class TestStaleRunningJobHelper:
