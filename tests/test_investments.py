@@ -98,6 +98,23 @@ def test_route_and_tool_resolve_same_configured_directory():
     assert os.path.dirname(tool_path) == inv.SYNC_DIR == os.path.expanduser(settings.investments_sync_dir)
 
 
+def test_route_sync_dir_tracks_the_setting_on_import(monkeypatch, tmp_path):
+    """SYNC_DIR is cached at module-import time from settings.investments_sync_dir
+    (not a separate hardcoded literal) — reloading the route module under a
+    changed setting must pick up the new directory."""
+    import importlib
+
+    monkeypatch.setattr(settings, "investments_sync_dir", str(tmp_path))
+    reloaded = importlib.reload(inv)
+    try:
+        assert reloaded.SYNC_DIR == str(tmp_path)
+    finally:
+        # Restore the real default and re-reload so later tests (and any
+        # module-level state other tests rely on) see the normal module back.
+        monkeypatch.undo()
+        importlib.reload(inv)
+
+
 def _write_summary(tmp_path, age_days: float):
     """Write a summary.json and backdate its mtime by age_days."""
     p = tmp_path / "summary.json"
