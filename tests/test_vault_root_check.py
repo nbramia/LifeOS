@@ -10,9 +10,54 @@ vault root.
 """
 import pytest
 
-from api.services.vectorstore import sample_paths_match_vault_root
+from api.services.vectorstore import VectorStore, sample_paths_match_vault_root
 
 pytestmark = pytest.mark.unit
+
+
+class _StubCollection:
+    """Stands in for a ChromaDB collection's `.get()` — enough to test
+    `VectorStore.sample_file_paths()`'s dedup logic without a real
+    ChromaDB server."""
+
+    def __init__(self, metadatas):
+        self._metadatas = metadatas
+
+    def get(self, limit=None, include=None):
+        return {"metadatas": self._metadatas[: limit or len(self._metadatas)]}
+
+
+def _store_with_collection(collection) -> VectorStore:
+    # Bypass VectorStore.__init__ (it opens a real ChromaDB HTTP connection
+    # and loads the embedding model) — only `_collection` is needed here.
+    store = object.__new__(VectorStore)
+    store._collection = collection
+    return store
+
+
+class TestSampleFilePaths:
+    def test_dedupes_chunks_from_the_same_file(self):
+        """Each file is indexed as several chunks sharing one file_path — a
+        raw limit-sized fetch could otherwise return the same file 5 times
+        over instead of sampling 5 distinct files (Codex review finding)."""
+        metadatas = (
+            [{"file_path": "/vault/a.md"}] * 3
+            + [{"file_path": "/vault/b.md"}] * 3
+            + [{"file_path": "/vault/c.md"}] * 3
+        )
+        store = _store_with_collection(_StubCollection(metadatas))
+
+        sample = store.sample_file_paths(limit=2)
+
+        assert sample == ["/vault/a.md", "/vault/b.md"]
+
+    def test_skips_rows_missing_file_path(self):
+        metadatas = [{}, {"other": "x"}, {"file_path": "/vault/a.md"}]
+        store = _store_with_collection(_StubCollection(metadatas))
+
+        sample = store.sample_file_paths(limit=5)
+
+        assert sample == ["/vault/a.md"]
 
 
 class TestSamplePathsMatchVaultRoot:
@@ -93,12 +138,15 @@ class TestCheckVaultRootSanity:
         main._check_vault_root_sanity(check, tmp_path / "vault")
 
         assert check["status"] == "degraded"
-        assert "1/1" in check["detail"]
+        # The original request/response detail is preserved unchanged — the
+        # mismatch is reported in a separate field, not a replacement.
+        assert check["detail"] == "1 results"
+        assert "1/1" in check["vault_root_check"]
         # The mismatched path itself must never appear in the response —
         # /health/full is unauthenticated, and a real indexed path can
         # reveal personal folder/file names.
-        assert "old_vault_location" not in check["detail"]
-        assert "note.md" not in check["detail"]
+        assert "old_vault_location" not in check["vault_root_check"]
+        assert "note.md" not in check["vault_root_check"]
 
     def test_leaves_ok_unchanged_when_paths_match(self, monkeypatch, tmp_path):
         import api.main as main

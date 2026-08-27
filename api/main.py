@@ -454,7 +454,10 @@ def _check_vault_root_sanity(vault_search_check: "dict | None", vault_path) -> N
     all) can't see, since it only confirms search returns *something*.
 
     Mutates `vault_search_check` in place, downgrading an "ok" status to
-    "degraded" with an explanatory detail on mismatch. A no-op if the base
+    "degraded" and adding a `vault_root_check` field explaining the mismatch
+    — the existing `detail` from the request/response probe (e.g. "1
+    results") is left untouched, since that check is preserved unchanged
+    and this is an additional signal, not a replacement. A no-op if the base
     check isn't present or didn't itself report "ok" — this never turns a
     failing check into a passing one, or vice versa, only adds a further
     downgrade on top of an already-passing result.
@@ -471,7 +474,7 @@ def _check_vault_root_sanity(vault_search_check: "dict | None", vault_path) -> N
             # unauthenticated endpoint and a real indexed file path can
             # reveal personal folder/file names (#697 review). The counts
             # plus the configured root are enough for an operator to act on.
-            vault_search_check["detail"] = (
+            vault_search_check["vault_root_check"] = (
                 f"{len(mismatched)}/{len(sample)} sampled indexed path(s) fall outside "
                 f"the configured vault root ({vault_path.resolve()})"
             )

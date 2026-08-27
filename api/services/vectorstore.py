@@ -317,16 +317,33 @@ class VectorStore:
         return paths
 
     def sample_file_paths(self, limit: int = 5) -> list[str]:
-        """Return up to `limit` indexed file paths, without scanning the
-        whole collection (#762). Used by the vault_search health check's
-        vault-root sanity check — `get_all_file_paths()` above is the right
-        tool when every path is actually needed, but is too expensive to
-        call on every health-check request against a large vault."""
-        results = self._collection.get(limit=limit, include=["metadatas"])
+        """Return up to `limit` distinct indexed file paths, without
+        scanning the whole collection (#762). Used by the vault_search
+        health check's vault-root sanity check — `get_all_file_paths()`
+        above is the right tool when every path is actually needed, but is
+        too expensive to call on every health-check request against a large
+        vault.
+
+        Each file is indexed as several chunks (one row per chunk, all
+        sharing one `file_path`), so a raw `limit`-sized fetch risks
+        returning the same one or two files repeatedly. Over-fetch a bit
+        and dedupe to `file_path` so the sample actually spans up to
+        `limit` distinct files — still a small, bounded read regardless of
+        collection size, not a scan.
+        """
+        results = self._collection.get(limit=limit * 4, include=["metadatas"])
         paths = []
+        seen = set()
         for meta in results.get("metadatas") or []:
-            if meta and "file_path" in meta:
-                paths.append(meta["file_path"])
+            if not meta or "file_path" not in meta:
+                continue
+            path = meta["file_path"]
+            if path in seen:
+                continue
+            seen.add(path)
+            paths.append(path)
+            if len(paths) >= limit:
+                break
         return paths
 
 
