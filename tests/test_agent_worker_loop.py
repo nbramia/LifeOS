@@ -443,23 +443,91 @@ def test_default_route_does_not_rescue_fatal_sanity(tmp_path: Path, monkeypatch)
 
 
 @pytest.mark.unit
-def test_default_route_does_not_rescue_nonfatal_sanity(tmp_path: Path, monkeypatch):
-    """#751 must not weaken #747: a non-fatal sane=false (the classifier's
-    own 'not executable' opinion on a mundane title) still parks the task
-    even with a default route configured — sanity ('should this run at
-    all') is orthogonal to a default route ('who resolves an open
-    question'), and #751 only touches the latter."""
+def test_default_route_demotes_nonfatal_sanity_and_runs(tmp_path: Path, monkeypatch):
+    """#803 supersedes the pre-#803 expectation of this test (formerly
+    `test_default_route_does_not_rescue_nonfatal_sanity`, which asserted the
+    opposite): a non-fatal sane=false — the classifier's own 'not
+    executable' opinion on a mundane title, never a `sane_fatal` one — is
+    now demoted to advisory when a default route is configured, the same
+    way #751 already demotes `ambiguity`. Building features is half the
+    point of this pipeline, and a park still cost the operator a
+    confirmation round-trip for a legitimate feature request — see #803.
+    #747's fail-closed guard for genuinely fatal verdicts is untouched;
+    that's covered separately by `test_default_route_does_not_rescue_fatal_sanity`
+    below, which still parks/fails."""
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "agent_default_route", "local")
     api = FakeApi(tasks=[
         {"id": "t1", "description": "Display the transcribed message immediately after sending",
          "status": "todo", "tags": ["agent"]},
     ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="ran"))
+    sane_reason = "This is a product specification or feature request, not a task an agent can execute."
+    preflight = _golden_preflight(routing="ask", sane=False, sane_reason=sane_reason)
+    w = _make_worker(tmp_path, api, preflight_caller=preflight, local_executor=executor)
+    w.tick()
+
+    # Ran on the default route rather than parking.
+    assert executor.calls != []
+    assert FAILED_TAG not in api.tasks["t1"]["tags"]
+    assert BLOCKED_TAG not in api.tasks["t1"]["tags"]
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert not any("not executable" in s for s in sent)
+    # The opinion is preserved as context in the transcript, not surfaced
+    # as a block — mirrors how `demoted_ambiguity`/`demoted_routing` log.
+    sid = w.session_store.get("t1").session_id
+    preflight_events = [e for e in w.transcript_store.read(sid) if e["kind"] == "preflight"]
+    assert preflight_events
+    assert preflight_events[0]["payload"]["demoted_sanity"] == sane_reason
+    assert preflight_events[0]["payload"]["sane"] is True
+    # `test_default_route_does_not_rescue_fatal_sanity` (above, pre-existing
+    # and left unmodified by #803) already covers the sane_fatal case with a
+    # default route configured — proving fail-closed behavior is unaffected.
+
+
+@pytest.mark.unit
+def test_default_route_demotes_second_field_verdict_sanity_and_runs(tmp_path: Path, monkeypatch):
+    """#803: the same classifier opinion has fired twice in the field — this
+    covers the second real title (#774, a macOS setup-script parity task)
+    with a default route configured, alongside the #747 title covered by
+    `test_default_route_demotes_nonfatal_sanity_and_runs` above."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "agent_default_route", "local")
+    api = FakeApi(tasks=[
+        {"id": "t1",
+         "description": "Bring the macOS setup script's service catalog up to parity "
+                         "with Linux for the agent worker and MCP-HTTP bridge",
+         "status": "todo", "tags": ["agent"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="ran"))
+    sane_reason = "This is a product specification or feature request, not a task an agent can execute."
+    preflight = _golden_preflight(routing="ask", sane=False, sane_reason=sane_reason)
+    w = _make_worker(tmp_path, api, preflight_caller=preflight, local_executor=executor)
+    w.tick()
+
+    assert executor.calls != []
+    assert BLOCKED_TAG not in api.tasks["t1"]["tags"]
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    sid = w.session_store.get("t1").session_id
+    preflight_events = [e for e in w.transcript_store.read(sid) if e["kind"] == "preflight"]
+    assert preflight_events[0]["payload"]["demoted_sanity"] == sane_reason
+
+
+@pytest.mark.unit
+def test_no_default_route_nonfatal_sanity_still_parks(tmp_path: Path, monkeypatch):
+    """#3 acceptance: with no default route configured (explicit empty,
+    since a host `.env` can leak the setting in), #747's park behavior for
+    a non-fatal sanity objection is unchanged."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "agent_default_route", "")
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "Display the transcribed message immediately after sending",
+         "status": "todo", "tags": ["agent", "local"]},
+    ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="should not run"))
-    preflight = _golden_preflight(
-        routing="local", sane=False,
-        sane_reason="This is a product specification or feature request, not a task an agent can execute.",
-    )
+    sane_reason = "This is a product specification or feature request, not a task an agent can execute."
+    preflight = _golden_preflight(routing="local", sane=False, sane_reason=sane_reason)
     w = _make_worker(tmp_path, api, preflight_caller=preflight, local_executor=executor)
     w.tick()
 
@@ -467,6 +535,9 @@ def test_default_route_does_not_rescue_nonfatal_sanity(tmp_path: Path, monkeypat
     assert FAILED_TAG not in api.tasks["t1"]["tags"]
     assert BLOCKED_TAG in api.tasks["t1"]["tags"]
     assert w.session_store.get("t1").status == STATUS_BLOCKED
+    sid = w.session_store.get("t1").session_id
+    preflight_events = [e for e in w.transcript_store.read(sid) if e["kind"] == "preflight"]
+    assert preflight_events[0]["payload"]["demoted_sanity"] is None
 
 
 @pytest.mark.unit

@@ -1060,6 +1060,147 @@ def test_default_route_tags_still_win(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# #803 — a non-fatal sanity opinion must not gate feature requests when a
+# default route is configured: the operator's standing "run untagged tasks
+# without asking me" instruction outranks a cheap classifier's "this isn't
+# executable" hedge, exactly as #751 already does for `ambiguity`. Every
+# test here monkeypatches `settings.agent_default_route` explicitly (never
+# relies on it being unset) since a host `.env` can leak the setting in.
+# ---------------------------------------------------------------------------
+
+# The two real field verdicts referenced in #803: the classifier calling an
+# ordinary feature request "a product specification or feature request, not
+# a task an agent can execute" — once on the #747 voice-UI task, once on the
+# #774 macOS setup-script parity task.
+_FIELD_VERDICT_SANE_REASON = (
+    "This is a product specification or feature request, not a task an "
+    "agent can execute."
+)
+_FIELD_VERDICT_TITLES = [
+    "Display the user's transcribed message immediately after sending",
+    "Bring the macOS setup script's service catalog up to parity with "
+    "Linux for the agent worker and MCP-HTTP bridge",
+]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("title", _FIELD_VERDICT_TITLES)
+def test_default_route_demotes_field_verdict_sanity_and_runs(monkeypatch, title):
+    """#803 acceptance: given a default route and one of the real field
+    verdicts, the task routes and runs — the opinion is demoted to
+    `demoted_sanity` and logged, not surfaced as a block."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    reply = _golden_reply(
+        routing="ask", routing_reason="no tag and no title cue",
+        sane=False, sane_reason=_FIELD_VERDICT_SANE_REASON,
+    )
+    result = pf.run_preflight(title=title, tags=["agent"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_LOCAL
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.demoted_sanity == _FIELD_VERDICT_SANE_REASON
+
+
+@pytest.mark.unit
+def test_no_default_route_field_verdict_sanity_still_parks(monkeypatch):
+    """#3 acceptance: with no default route configured, #747's park
+    behavior is unchanged — explicit empty setting, not ambient default,
+    per the host-.env leak risk."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "")
+    reply = _golden_reply(
+        routing="local", sane=False, sane_reason=_FIELD_VERDICT_SANE_REASON,
+    )
+    result = pf.run_preflight(
+        title=_FIELD_VERDICT_TITLES[0], tags=["agent"], caller=_stub(reply),
+    )
+    assert result.sane is False
+    assert result.sane_fatal is False
+    assert result.demoted_sanity is None
+
+
+@pytest.mark.unit
+def test_default_route_does_not_demote_fatal_sanity_empty_title(monkeypatch):
+    """Fatal verdicts stay fail-closed regardless of default route: empty
+    title short-circuit."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+
+    def fail(prompt):
+        raise AssertionError("LLM should not have been called for empty title")
+
+    result = pf.run_preflight(title="   ", tags=["agent"], caller=fail)
+    assert result.sane is False
+    assert result.sane_fatal is True
+    assert result.demoted_sanity is None
+    assert result.routing == pf.ROUTE_ASK
+
+
+@pytest.mark.unit
+def test_default_route_does_not_demote_fatal_sanity_destructive_title(monkeypatch):
+    """Fatal verdicts stay fail-closed regardless of default route: the
+    deterministic destructive-title regex."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    reply = _golden_reply(routing="ask", sane=False, sane_reason="destructive: 'rm -rf /'")
+    result = pf.run_preflight(title="rm -rf /", tags=["agent"], caller=_stub(reply))
+    assert result.sane is False
+    assert result.sane_fatal is True
+    assert result.demoted_sanity is None
+    assert result.routing == pf.ROUTE_ASK
+
+
+@pytest.mark.unit
+def test_default_route_does_not_demote_fatal_sanity_llm_error(monkeypatch):
+    """Fatal verdicts stay fail-closed regardless of default route: the
+    preflight LLM call itself failing."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+
+    def boom(prompt):
+        raise RuntimeError("no client available")
+
+    result = pf.run_preflight(title="do the thing", tags=["agent"], caller=boom)
+    assert result.sane is False
+    assert result.sane_fatal is True
+    assert result.demoted_sanity is None
+    assert result.routing == pf.ROUTE_ASK
+
+
+@pytest.mark.unit
+def test_default_route_does_not_demote_fatal_sanity_unparseable_reply(monkeypatch):
+    """Fatal verdicts stay fail-closed regardless of default route: an
+    unparseable preflight reply."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    result = pf.run_preflight(title="x", tags=["agent"], caller=_stub("totally not json"))
+    assert result.sane is False
+    assert result.sane_fatal is True
+    assert result.demoted_sanity is None
+    assert result.routing == pf.ROUTE_ASK
+
+
+@pytest.mark.unit
+def test_default_route_invalid_value_does_not_demote_sanity(monkeypatch):
+    """#803 is gated on the setting being non-empty AND valid — a typo'd
+    value is not a standing instruction the operator successfully gave, so
+    a non-fatal sanity objection must still park exactly like the
+    no-default-route case."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "bogus-route")
+    reply = _golden_reply(
+        routing="local", sane=False, sane_reason=_FIELD_VERDICT_SANE_REASON,
+    )
+    result = pf.run_preflight(
+        title=_FIELD_VERDICT_TITLES[0], tags=["agent"], caller=_stub(reply),
+    )
+    assert result.sane is False
+    assert result.sane_fatal is False
+    assert result.demoted_sanity is None
+
+
+# ---------------------------------------------------------------------------
 # #757 — an uncorroborated LLM-invented route must not bypass
 # LIFEOS_AGENT_DEFAULT_ROUTE. All tests explicitly monkeypatch
 # `settings.agent_default_route` rather than relying on ambient env (a
