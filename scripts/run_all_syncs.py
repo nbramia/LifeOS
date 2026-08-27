@@ -361,24 +361,80 @@ SYNC_LOCK_PATH = Path(os.environ.get("LIFEOS_SYNC_LOCK", str(Path.home() / ".lif
 # before the process actually exits.
 _sync_lock_file = None
 
+# How long _acquire_sync_lock() will retry a contended lock before giving up
+# and proceeding without it (seconds). See that function's docstring for why
+# a bound exists at all.
+_SYNC_LOCK_ACQUIRE_TIMEOUT_S = 60
+
 
 def _acquire_sync_lock() -> None:
-    """Block until this process holds a SHARED advisory lock on
-    data/sync.lock, then hold it until process exit. Shared, not exclusive:
-    any number of sync runs may legitimately overlap and each holds its own
-    shared lock concurrently. auto-deploy.sh takes an EXCLUSIVE lock on the
-    same file around its whole restart section, so this blocks (briefly,
-    non-fatally) if a restart happens to be mid-flight when a sync starts,
-    rather than starting into one. Best-effort — a failure to acquire it
-    just means auto-deploy falls back to the systemd-unit check, not a
-    reason to abort the sync itself."""
+    """Acquire a SHARED advisory lock on data/sync.lock, then hold it until
+    process exit. Shared, not exclusive: any number of sync runs may
+    legitimately overlap and each holds its own shared lock concurrently.
+    auto-deploy.sh takes an EXCLUSIVE lock on the same file around its whole
+    restart section, so this normally only contends for the brief window a
+    restart is actually in flight.
+
+    Bounded, non-blocking retry — found on review: a plain blocking
+    `fcntl.flock(LOCK_SH)` has no timeout, so if the exclusive holder's
+    section runs unusually long (macOS: up to two restart_cycles, each with
+    up to a 600s health-check timeout — roughly 21 minutes worst case), a
+    3 AM sync could hang silently before it ever logs anything or registers
+    a row in sync_health.db, while whatever launched it (a wrapper's own
+    watchdog) counts down against a process that hasn't even started its
+    real work yet. Retries LOCK_SH|LOCK_NB once a second for up to
+    _SYNC_LOCK_ACQUIRE_TIMEOUT_S, logging once on the first contended
+    attempt, then gives up and proceeds WITHOUT the lock — best-effort, same
+    as the plain "could not open the file" case below: a failure to acquire
+    it just means auto-deploy falls back to the systemd-unit check, not a
+    reason to abort the sync itself. This only protects against a
+    normal-length restart, not one that's actually stuck; proceeding
+    unprotected after a bounded wait is safer than hanging the whole
+    nightly sync indefinitely.
+    """
     global _sync_lock_file
     try:
         SYNC_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
         _sync_lock_file = open(SYNC_LOCK_PATH, "w")
-        fcntl.flock(_sync_lock_file.fileno(), fcntl.LOCK_SH)
     except OSError as e:
-        logger.warning(f"Could not acquire sync lock: {e}")
+        # Found on review: this used to be a buried `logger.warning` — given
+        # the consequence (auto-deploy can't see this sync and may restart a
+        # service on top of it, the exact OOM host-freeze this mechanism
+        # exists to prevent), it goes through the same Telegram path a real
+        # sync failure does, not just the log file.
+        msg = (
+            f"Could not open sync lock file {SYNC_LOCK_PATH}: {e} — this "
+            "sync will run WITHOUT the lock, so auto-deploy cannot tell "
+            "it's in progress."
+        )
+        logger.warning(msg)
+        try:
+            from api.services.telegram import send_message
+            send_message(f"🚨 *LifeOS Sync*\n{msg}")
+        except Exception:
+            pass  # best-effort — a notification failure must not abort the sync
+        return
+
+    deadline = time.monotonic() + _SYNC_LOCK_ACQUIRE_TIMEOUT_S
+    logged_contention = False
+    while True:
+        try:
+            fcntl.flock(_sync_lock_file.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if not logged_contention:
+                logger.info(
+                    f"Sync lock ({SYNC_LOCK_PATH}) is held — likely a deploy "
+                    f"restart in progress; waiting up to {_SYNC_LOCK_ACQUIRE_TIMEOUT_S}s"
+                )
+                logged_contention = True
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    f"Could not acquire sync lock within {_SYNC_LOCK_ACQUIRE_TIMEOUT_S}s "
+                    "— proceeding without it"
+                )
+                return
+            time.sleep(1)
 
 
 def _handle_sigterm(signum, frame):
