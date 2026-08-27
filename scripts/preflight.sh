@@ -21,12 +21,14 @@ check_fail() { echo "  [FAIL] $1"; fail=$((fail + 1)); }
 # of surrounding matching quotes — interior whitespace/quotes are preserved.
 env_value() {
     local key="$1" raw
-    raw=$(grep -E "^${key}=" "$PROJECT_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- || true)
+    raw=$(grep -E "^${key}=" "$PROJECT_DIR/.env" 2>/dev/null | cut -d= -f2- || true)
     raw="${raw#"${raw%%[![:space:]]*}"}"
     raw="${raw%"${raw##*[![:space:]]}"}"
     if [ "${#raw}" -ge 2 ]; then
         if { [[ "$raw" == \"*\" ]] && [[ "$raw" == *\" ]]; } || { [[ "$raw" == \'*\' ]] && [[ "$raw" == *\' ]]; }; then
-            raw="${raw:1:-1}"
+            # Bash-3.2-compatible substring (macOS ships 3.2, which lacks
+            # negative-length substring expansion) — trim one char off each end.
+            raw="${raw:1:$((${#raw} - 2))}"
         fi
     fi
     printf '%s' "$raw"
