@@ -1077,26 +1077,70 @@ def get_local_llm() -> LocalLLMClient | AnthropicLLMClient:
     return _llm_client
 
 
-_anthropic_client: AnthropicLLMClient | None = None
+_anthropic_client: "AnthropicLLMClient | LocalLLMClient | None" = None
 
 
-def get_anthropic_llm() -> AnthropicLLMClient:
-    """Get or create a dedicated Anthropic client for specialist calls.
+def get_anthropic_llm() -> "AnthropicLLMClient | LocalLLMClient":
+    """Get or create the specialist client for relationship insights, fact
+    extraction, and CRM tone analysis, where frontier model quality
+    provides clear value.
 
-    Used by relationship insights, fact extraction, tone analysis, and web search
-    where frontier model quality provides clear value. These always use the Claude
-    API regardless of the LIFEOS_LLM_BACKEND setting.
+    When ANTHROPIC_API_KEY is set: unchanged from before #772 — always the
+    Claude API, regardless of LIFEOS_LLM_BACKEND. Sonnet-tier for quality,
+    resolved from LIFEOS_ANTHROPIC_SPECIALIST_MODEL (default
+    claude-sonnet-5), independent of the orchestrator model
+    (LIFEOS_ANTHROPIC_MODEL). Was previously hardcoded to the dated
+    snapshot claude-sonnet-4-20250514, which retired and 404'd every
+    caller (#470).
 
-    Sonnet-tier for quality — resolved from LIFEOS_ANTHROPIC_SPECIALIST_MODEL
-    (default claude-sonnet-5), independent of the orchestrator model
-    (LIFEOS_ANTHROPIC_MODEL). Was previously hardcoded to the dated snapshot
-    claude-sonnet-4-20250514, which retired and 404'd every caller (#470).
+    When no key is set (#772): these calls used to silently produce
+    nothing on a keyless install (no insights, no facts, no tone scores),
+    because they always built an AnthropicLLMClient regardless of
+    LIFEOS_LLM_BACKEND. Falls back in the same priority order the agent
+    worker's preflight caller already uses
+    (agent_worker/preflight.py:_default_llm_caller): the local
+    llama-server if reachable, else the configured remote provider, else
+    the (unreachable) local client anyway — every existing caller already
+    wraps its `.create()` call in a broad try/except that degrades to its
+    current empty/no-op result, so this function itself never raises for
+    "nothing is configured." A single log line records which backend a
+    keyless install fell back to.
     """
     global _anthropic_client
     if _anthropic_client is None:
-        model = settings.anthropic_specialist_model
-        _anthropic_client = AnthropicLLMClient(model=model)
-        logger.info("Created Anthropic client for specialist calls (%s)", model)
+        if settings.anthropic_api_key:
+            model = settings.anthropic_specialist_model
+            _anthropic_client = AnthropicLLMClient(model=model)
+            logger.info("Created Anthropic client for specialist calls (%s)", model)
+        else:
+            local_client = LocalLLMClient()
+            if local_client.is_available():
+                _anthropic_client = local_client
+                logger.warning(
+                    "No ANTHROPIC_API_KEY set; specialist calls (relationship "
+                    "insights, fact extraction, tone analysis) falling back "
+                    "to the local llama-server at %s", settings.local_llm_url,
+                )
+            elif settings.remote_llm_configured:
+                _anthropic_client = LocalLLMClient(
+                    base_url=settings.remote_llm_base_url,
+                    model=settings.remote_llm_model,
+                    api_key=settings.remote_llm_api_key,
+                    timeout=settings.remote_llm_timeout,
+                )
+                logger.warning(
+                    "No ANTHROPIC_API_KEY set; specialist calls (relationship "
+                    "insights, fact extraction, tone analysis) falling back "
+                    "to the remote provider at %s", settings.remote_llm_base_url,
+                )
+            else:
+                _anthropic_client = local_client
+                logger.warning(
+                    "No ANTHROPIC_API_KEY set and neither a local llama-server "
+                    "nor a configured remote provider is available; specialist "
+                    "calls (relationship insights, fact extraction, tone "
+                    "analysis) will keep failing until one is configured."
+                )
     return _anthropic_client
 
 

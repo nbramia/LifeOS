@@ -886,6 +886,67 @@ class TestSingleton:
                 pytest.skip("anthropic package not installed")
         reset_local_llm()
 
+    def test_specialist_client_falls_back_to_local_when_no_key(self):
+        """#772: a keyless install used to silently produce nothing from
+        relationship insights, fact extraction, and tone analysis, because
+        get_anthropic_llm() always built an AnthropicLLMClient regardless
+        of LIFEOS_LLM_BACKEND. With no key and a reachable local
+        llama-server, it now falls back to that instead."""
+        from api.services.llm_client import get_anthropic_llm, reset_local_llm, LocalLLMClient
+        reset_local_llm()
+        with patch("api.services.llm_client.settings") as mock_settings, \
+                patch.object(LocalLLMClient, "is_available", return_value=True):
+            mock_settings.anthropic_api_key = ""
+            mock_settings.local_llm_url = "http://localhost:8080"
+            mock_settings.local_llm_timeout = 90
+            # Must NOT be consulted -- local wins before remote is checked.
+            mock_settings.remote_llm_configured = True
+            client = get_anthropic_llm()
+            assert isinstance(client, LocalLLMClient)
+            assert client.base_url == "http://localhost:8080"
+        reset_local_llm()
+
+    def test_specialist_client_falls_back_to_remote_when_local_unreachable(self):
+        """#772: no key and the local llama-server is unreachable, but the
+        remote paid provider is fully configured -- falls back to it
+        instead of the raw Anthropic no-key error."""
+        from api.services.llm_client import get_anthropic_llm, reset_local_llm, LocalLLMClient
+        reset_local_llm()
+        with patch("api.services.llm_client.settings") as mock_settings, \
+                patch.object(LocalLLMClient, "is_available", return_value=False):
+            mock_settings.anthropic_api_key = ""
+            mock_settings.local_llm_url = "http://localhost:8080"
+            mock_settings.local_llm_timeout = 90
+            mock_settings.remote_llm_configured = True
+            mock_settings.remote_llm_base_url = "https://api.fireworks.ai/inference/v1"
+            mock_settings.remote_llm_model = "accounts/fireworks/models/deepseek-v4-flash-0731"
+            mock_settings.remote_llm_api_key = "fw-test-key"
+            mock_settings.remote_llm_timeout = 90
+            client = get_anthropic_llm()
+            assert isinstance(client, LocalLLMClient)
+            assert client.base_url == "https://api.fireworks.ai/inference"
+            assert client._model == "accounts/fireworks/models/deepseek-v4-flash-0731"
+            assert client._api_key == "fw-test-key"
+        reset_local_llm()
+
+    def test_specialist_client_degrades_when_nothing_configured(self):
+        """#772: no key, local unreachable, remote not configured -- this
+        function still returns a client (pointed at the unreachable local
+        server) instead of raising, so each caller's existing try/except
+        around its `.create()` call degrades to its current empty/no-op
+        result rather than an unhandled exception here."""
+        from api.services.llm_client import get_anthropic_llm, reset_local_llm, LocalLLMClient
+        reset_local_llm()
+        with patch("api.services.llm_client.settings") as mock_settings, \
+                patch.object(LocalLLMClient, "is_available", return_value=False):
+            mock_settings.anthropic_api_key = ""
+            mock_settings.local_llm_url = "http://localhost:8080"
+            mock_settings.local_llm_timeout = 90
+            mock_settings.remote_llm_configured = False
+            client = get_anthropic_llm()
+            assert isinstance(client, LocalLLMClient)
+        reset_local_llm()
+
 
 # ---- LLMResponse / LLMUsage ----
 
