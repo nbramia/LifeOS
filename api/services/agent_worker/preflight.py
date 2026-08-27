@@ -78,6 +78,16 @@ class PreflightResult:
     ambiguity: PreflightAmbiguity | None = None
     sane: bool = True
     sane_reason: str = ""
+    # True only when a sane=False verdict is grounded in something the *code*
+    # established deterministically — an empty title, a preflight-call
+    # failure/unparseable reply, or a title matched against
+    # `_DESTRUCTIVE_TITLE_RE` — rather than merely the model's own inferred
+    # "this isn't executable" opinion (#747). The worker fails the task
+    # closed (cancels it) only when this is True; a non-fatal sane=False is
+    # parked like an ambiguous task instead, since a cheap classifier
+    # ignoring the prompt's "mundane tasks are sane" rule has already been
+    # observed to silently destroy real work. Meaningless when sane is True.
+    sane_fatal: bool = False
     # Whether the cloud (API) route was *asked for* rather than inferred (#584).
     # Only an explicit request — a `#cloud*` tag, or a model/engine named in the
     # title — may dispatch to the Anthropic API without confirmation; an
@@ -203,6 +213,86 @@ def build_preflight_prompt(title: str, tags: list[str]) -> str:
 
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
+# Phrasings the preflight model uses when it smuggles a method-of-execution /
+# engine-selection question into `ambiguity` instead of leaving it null
+# (#748) — e.g. "Should this task be routed to a local agent for code
+# implementation, or is it a design/specification task for a human
+# engineer?". The prompt already forbids this explicitly, but this is the
+# *second* observed case of the model ignoring an explicit negative
+# constraint (see `_DESTRUCTIVE_TITLE_RE` / #747), so the code cannot rely on
+# prompt compliance alone. There's no structural field distinguishing
+# ambiguity "kinds" today — adding one would just move the same compliance
+# risk into a different JSON key the model could also ignore — so this
+# inspects the question prose directly.
+#
+# Kept deliberately narrow: BOTH halves must match. A genuine missing-
+# referent ambiguity can innocently contain a word like "engineer" or
+# "agent" (e.g. "send the update to the engineer" with no named engineer)
+# without being a routing question at all — matching on either half alone
+# would swallow that case, and a swallowed real ambiguity is worse than one
+# extra question to the operator.
+_ROUTING_DECISION_RE = re.compile(
+    r"(?i)\b(should\s+(this|it)\s+(task\s+)?be\s+(routed|handled|assigned|executed|done)\b"
+    r"|which\s+(model|engine|agent)\s+should\b"
+    r"|(is\s+this|or\s+is\s+(this|it))\s+(a\s+)?(design|specification|spec)\b)"
+)
+_EXECUTOR_NOUN_RE = re.compile(
+    r"(?i)\b(local\s+agent|human\s+engineer|code\s+implementation|"
+    r"design(?:/|\s+or\s+)?specification|a\s+human\b|which\s+engine\b|"
+    r"which\s+model\b|rout(?:e|ed|es|ing)\b)"
+)
+
+
+def _is_routing_flavored_ambiguity(question: str) -> bool:
+    """True when an `ambiguity.question` is actually a method-of-execution /
+    routing question (#748), not a genuine missing-referent ambiguity."""
+    return bool(
+        _ROUTING_DECISION_RE.search(question or "")
+        and _EXECUTOR_NOUN_RE.search(question or "")
+    )
+
+
+# Deterministic destructive-title check (#747). Matched against the title
+# directly — NOT inferred from the model's `sane_reason` prose — so the code
+# can independently confirm a fail-closed verdict rather than trust a single
+# cheap model's judgement. Deliberately narrow, mirroring the prompt's own
+# examples ("rm -rf /", "delete all my data") plus a couple of obviously
+# analogous shapes: a broad matcher would start catching mundane tasks that
+# merely mention deletion (e.g. "delete the stale draft email"), which is
+# exactly the false-positive failure mode #747 exists to fix.
+_DESTRUCTIVE_TITLE_RE = re.compile(
+    r"(?i)\brm\s+-rf\b"
+    r"|\bdelete\s+all\s+(my\s+)?(data|files|everything)\b"
+    r"|\bwipe\s+(the\s+)?(disk|drive|database|everything)\b"
+    r"|\bformat\s+(the\s+)?(disk|drive)\b"
+    r"|\bdrop\s+(the\s+)?database\b"
+)
+
+
+def _apply_sanity_gate(result: PreflightResult, title: str) -> PreflightResult:
+    """Establish `sane_fatal` independent of the model's own claim (#747).
+
+    A title matching `_DESTRUCTIVE_TITLE_RE` is always sane=False and fatal,
+    regardless of what the model returned — this is the one case the code
+    can confirm on its own, so it isn't weakened by (or dependent on) the
+    model's compliance in either direction: a model that missed an obvious
+    destructive shape doesn't get to leave it running, and a model whose
+    sane_reason merely *describes* something as destructive without this
+    pattern present doesn't get automatic fatal status from that alone.
+
+    Every other sane=False is left exactly as constructed: the empty-title
+    short-circuit and the LLM-call/parse-error fallbacks already set
+    `sane_fatal=True` directly (genuine code-level failures), and a parsed
+    LLM reply defaults `sane_fatal=False` (the model's own inferred opinion,
+    non-fatal — the worker parks it instead of cancelling the task).
+    """
+    if _DESTRUCTIVE_TITLE_RE.search(title or ""):
+        result.sane = False
+        result.sane_fatal = True
+        if not result.sane_reason:
+            result.sane_reason = "title matches a destructive-command pattern"
+    return result
+
 
 def parse_preflight_response(text: str) -> PreflightResult:
     """Parse the LLM's reply into a PreflightResult.
@@ -228,6 +318,7 @@ def parse_preflight_response(text: str) -> PreflightResult:
             ambiguity=None,
             sane=False,
             sane_reason=f"preflight parse error: {exc}",
+            sane_fatal=True,  # genuine preflight error, not a model opinion — keep fail-closed
             raw={},
         )
 
@@ -250,7 +341,19 @@ def parse_preflight_response(text: str) -> PreflightResult:
     ambiguity = None
     amb_raw = raw.get("ambiguity")
     if isinstance(amb_raw, dict) and amb_raw.get("question"):
-        ambiguity = PreflightAmbiguity(question=str(amb_raw["question"]))
+        question = str(amb_raw["question"])
+        if _is_routing_flavored_ambiguity(question):
+            # #748: the model put a method-of-execution / engine-selection
+            # question into `ambiguity` despite the prompt explicitly
+            # excluding those ("Method-of-execution questions ... are NOT
+            # ambiguity"). Routing (including LIFEOS_AGENT_DEFAULT_ROUTE,
+            # #707) owns that decision, not the operator-facing block —
+            # leave ambiguity null so the task isn't blocked on it.
+            logger.info(
+                "preflight ambiguity suppressed as routing-flavored: %r", question,
+            )
+        else:
+            ambiguity = PreflightAmbiguity(question=question)
 
     return PreflightResult(
         budget=budget,
@@ -606,16 +709,18 @@ def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
 
 def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> PreflightResult:
     """Shared post-processing pipeline for every `run_preflight` return path:
-    tag overrides > default route (#707) > preset class > cost gates —
-    matching the precedence tags > explicit LLM route > default route > ask.
+    sanity gate (#747) > tag overrides > default route (#707) > preset class
+    > cost gates — matching the precedence tags > explicit LLM route >
+    default route > ask.
 
-    Centralized (rather than each return path chaining the four calls
-    itself) so `original_routing` is captured exactly once, right after the
+    Centralized (rather than each return path chaining the calls itself) so
+    `original_routing` is captured exactly once, right after the
     parse/short-circuit result is built and before `_apply_tag_overrides`
     (the only thing that mutates `result.routing` ahead of the default-route
     hook) gets a chance to change it. See `_apply_default_route` for why that
     pre-tag-override value matters.
     """
+    result = _apply_sanity_gate(result, title)
     original_routing = result.routing
     result = _apply_tag_overrides(result, tags_list, title)
     result = _apply_default_route(result, original_routing)
@@ -645,6 +750,7 @@ def run_preflight(
                 ambiguity=None,
                 sane=False,
                 sane_reason="task title is empty",
+                sane_fatal=True,  # deterministic — the code confirmed this itself
                 raw={},
             ),
             tags_list,
@@ -666,6 +772,7 @@ def run_preflight(
                 ambiguity=None,
                 sane=False,
                 sane_reason=f"preflight error: {exc}",
+                sane_fatal=True,  # genuine preflight error, not a model opinion — keep fail-closed
                 raw={},
             ),
             tags_list,
