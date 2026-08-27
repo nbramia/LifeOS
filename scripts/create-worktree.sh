@@ -94,9 +94,95 @@ if [ -d "$worktree_path" ] && git worktree list --porcelain | grep -q "^worktree
   branch="$(git -C "$worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null)" || branch="$name"
 fi
 
+# ---------------------------------------------------------------------------
+# 5. Port allocation (mkdir-based lock)
+#
+# Runs before branch resolution / worktree creation so a port-allocation
+# failure aborts cleanly with nothing created — no worktree or branch left
+# to orphan.
+# ---------------------------------------------------------------------------
+lock_dir="$worktree_dir/.port-lock"
+
+# Portable lock mtime: GNU stat uses -c, BSD/macOS stat uses -f. Try GNU
+# first (this fleet is Linux), fall back to BSD, and validate the result is
+# all-digits so a wrong-platform invocation (which can print a multi-line
+# report to stdout and still exit 0) can't leak garbage into arithmetic.
+lock_mtime() {
+  local mtime
+  mtime="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null)"
+  [[ "$mtime" =~ ^[0-9]+$ ]] && echo "$mtime" || echo 0
+}
+
+allocate_port() {
+  local key="$1" range_start="$2" range_end="$3"
+
+  # Collect ports already assigned to other worktrees.
+  local used_ports=()
+  for info_file in "$worktree_dir"/*/.worktree-info; do
+    [ -f "$info_file" ] || continue
+    local p
+    p="$(grep "^${key}=" "$info_file" 2>/dev/null | cut -d= -f2)" || true
+    [ -n "$p" ] && used_ports+=("$p")
+  done
+  dbg "$key: used ports: ${used_ports[*]+"${used_ports[*]}"}"
+
+  for port in $(seq "$range_start" "$range_end"); do
+    # Skip if already assigned.
+    local skip=false
+    for used in "${used_ports[@]+"${used_ports[@]}"}"; do
+      if [ "$port" = "$used" ]; then
+        skip=true
+        break
+      fi
+    done
+    $skip && continue
+
+    # Skip if something is listening on this port.
+    if lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
+      continue
+    fi
+
+    echo "$port"
+    return 0
+  done
+
+  die "no free port in range $range_start-$range_end"
+}
+
+# Acquire lock (mkdir is atomic on POSIX).
+lock_max_attempts=60          # 60 * 0.5s = 30s wall-clock timeout
+lock_attempts=0
+lock_stale_seconds=300        # Break locks older than 5 minutes
+while ! mkdir "$lock_dir" 2>/dev/null; do
+  # Break stale locks (likely from a killed process).
+  if [ -d "$lock_dir" ]; then
+    lock_age=$(( $(date +%s) - $(lock_mtime "$lock_dir") ))
+    if [ "$lock_age" -gt "$lock_stale_seconds" ]; then
+      log "breaking stale lock (age: ${lock_age}s)"
+      rmdir "$lock_dir" 2>/dev/null || true
+      continue
+    fi
+  fi
+  lock_attempts=$((lock_attempts + 1))
+  if [ "$lock_attempts" -ge "$lock_max_attempts" ]; then
+    die "timed out waiting for port allocation lock after ~30s"
+  fi
+  sleep 0.5
+done
+# Ensure lock is released on exit.
+trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+
+api_port="$(allocate_port API_PORT 8100 8199)"
+chroma_port="$(allocate_port CHROMA_PORT 8200 8299)"
+log "allocated ports: API_PORT=$api_port CHROMA_PORT=$chroma_port"
+
+# Release lock early.
+rmdir "$lock_dir" 2>/dev/null || true
+
+
 if [ "$worktree_exists" = false ]; then
 # ---------------------------------------------------------------------------
-# 5. Branch resolution
+# 6. Branch resolution
 #
 # Candidate A: <name> (exact)
 # Candidate B: if name matches <type>-<rest>, also try <type>/<rest>
@@ -147,83 +233,12 @@ resolve_branch() {
 branch="$(resolve_branch)"
 
 # ---------------------------------------------------------------------------
-# 6. Create worktree
+# 7. Create worktree
 # ---------------------------------------------------------------------------
 git worktree add "$worktree_path" "$branch" >&2
 log "created worktree at $worktree_path on branch $branch"
 
 fi # worktree_exists
-
-# ---------------------------------------------------------------------------
-# 7. Port allocation (mkdir-based lock)
-# ---------------------------------------------------------------------------
-lock_dir="$worktree_dir/.port-lock"
-
-allocate_port() {
-  local key="$1" range_start="$2" range_end="$3"
-
-  # Collect ports already assigned to other worktrees.
-  local used_ports=()
-  for info_file in "$worktree_dir"/*/.worktree-info; do
-    [ -f "$info_file" ] || continue
-    local p
-    p="$(grep "^${key}=" "$info_file" 2>/dev/null | cut -d= -f2)" || true
-    [ -n "$p" ] && used_ports+=("$p")
-  done
-  dbg "$key: used ports: ${used_ports[*]+"${used_ports[*]}"}"
-
-  for port in $(seq "$range_start" "$range_end"); do
-    # Skip if already assigned.
-    local skip=false
-    for used in "${used_ports[@]+"${used_ports[@]}"}"; do
-      if [ "$port" = "$used" ]; then
-        skip=true
-        break
-      fi
-    done
-    $skip && continue
-
-    # Skip if something is listening on this port.
-    if lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
-      continue
-    fi
-
-    echo "$port"
-    return 0
-  done
-
-  die "no free port in range $range_start-$range_end"
-}
-
-# Acquire lock (mkdir is atomic on POSIX).
-lock_max_attempts=60          # 60 * 0.5s = 30s wall-clock timeout
-lock_attempts=0
-lock_stale_seconds=300        # Break locks older than 5 minutes
-while ! mkdir "$lock_dir" 2>/dev/null; do
-  # Break stale locks (likely from a killed process).
-  if [ -d "$lock_dir" ]; then
-    lock_age=$(( $(date +%s) - $(stat -f %m "$lock_dir" 2>/dev/null || stat -c %Y "$lock_dir" 2>/dev/null || echo "0") ))
-    if [ "$lock_age" -gt "$lock_stale_seconds" ]; then
-      log "breaking stale lock (age: ${lock_age}s)"
-      rmdir "$lock_dir" 2>/dev/null || true
-      continue
-    fi
-  fi
-  lock_attempts=$((lock_attempts + 1))
-  if [ "$lock_attempts" -ge "$lock_max_attempts" ]; then
-    die "timed out waiting for port allocation lock after ~30s"
-  fi
-  sleep 0.5
-done
-# Ensure lock is released on exit.
-trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
-
-api_port="$(allocate_port API_PORT 8100 8199)"
-chroma_port="$(allocate_port CHROMA_PORT 8200 8299)"
-log "allocated ports: API_PORT=$api_port CHROMA_PORT=$chroma_port"
-
-# Release lock early.
-rmdir "$lock_dir" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 8. Write .worktree-info metadata
