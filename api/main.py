@@ -362,6 +362,11 @@ async def health_check():
     from config.settings import settings
 
     checks = {
+        # Literally "is ANTHROPIC_API_KEY set" (#697's acceptance criteria),
+        # not "is an LLM available" — an install running fully on
+        # LIFEOS_LLM_BACKEND=local with no Anthropic key at all is a
+        # supported configuration that will still report degraded here,
+        # since this field only ever meant the Anthropic key specifically.
         "api_key_configured": bool(settings.anthropic_api_key and settings.anthropic_api_key.strip()),
         "reminder_scheduler": _reminder_scheduler.is_alive() if _reminder_scheduler else False,
     }
