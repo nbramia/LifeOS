@@ -537,10 +537,42 @@ def test_install_plist_backs_up_and_warns_before_replacing_a_different_file(tmp_
     assert "WARNING" in result.stdout, result.stdout
     assert "differs from what's currently installed" in result.stdout
 
-    backups = list(dst_dir.glob("com.lifeos.api.plist.bak.*"))
+    # Backed up OUTSIDE ~/Library/LaunchAgents (found on review: launchd
+    # itself scans that directory, and the directory-form `launchctl load`
+    # this script's own next-steps print would load a .bak'd plist too).
+    backups = list((repo / "config" / "launchd" / "backups").glob("com.lifeos.api.plist.*"))
     assert len(backups) == 1, backups
     assert backups[0].read_text() == "content-v1", "backup must hold the PRE-replacement content"
     assert dst.read_text() == "content-v2"
+    assert list(dst_dir.iterdir()) == [dst], "no backup file must land inside LaunchAgents"
+
+
+@pytest.mark.unit
+def test_install_plist_refuses_to_overwrite_when_backup_fails(tmp_path: Path):
+    """`set -e` is active for the whole script — a failed backup
+    (permission problem, disk full) must not silently abort the entire run
+    mid-loop with no report. install_plist refuses to overwrite THIS one
+    plist and reports it, letting the caller track the failure and
+    continue with the rest."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    src = repo / "com.lifeos.api.plist"
+    src.write_text("content-v2", encoding="utf-8")
+    dst_dir = tmp_path / "LaunchAgents"
+    dst_dir.mkdir()
+    dst = dst_dir / "com.lifeos.api.plist"
+    dst.write_text("content-v1", encoding="utf-8")
+    backups_dir = repo / "config" / "launchd" / "backups"
+    backups_dir.mkdir(parents=True)
+    backups_dir.chmod(0o000)
+    try:
+        result = _run_sourced(repo, f'install_plist "{src}" "{dst_dir}"; echo "rc=$?"')
+        assert "rc=1" in result.stdout, result.stdout
+        assert "ERROR" in result.stdout, result.stdout
+        assert dst.read_text() == "content-v1", "must not overwrite when the backup failed"
+    finally:
+        backups_dir.chmod(0o755)
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +640,50 @@ def test_main_installs_a_well_formed_plist(tmp_path: Path):
     installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.api.plist"
     assert installed.exists(), (result.stdout, result.stderr)
     assert "__LIFEOS_PATH__" not in installed.read_text()
+
+
+@pytest.mark.unit
+def test_main_with_yes_and_no_vault_arg_fails_fast_instead_of_blocking(tmp_path: Path):
+    """Found on review: --yes is meant for unattended automation, but with
+    no vault argument and no LIFEOS_VAULT_PATH in .env, this used to block
+    on an interactive `read` anyway — the opposite of what --yes asks for.
+    A 5s timeout stands in for "would have hung forever": if the fix
+    regresses, this test itself times out rather than merely failing an
+    assertion, making the failure mode obvious."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo, _vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL,
+    )
+    assert result.returncode != 0, (result.stdout, result.stderr)
+    assert "LIFEOS_VAULT_PATH" in result.stdout
+
+
+@pytest.mark.unit
+def test_main_with_yes_and_no_vault_arg_falls_back_to_env_file(tmp_path: Path):
+    """The other half of the same fix: LIFEOS_VAULT_PATH in .env must still
+    work as the vault source under --yes, not just as a failure reason."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    (repo / ".env").write_text(f"LIFEOS_VAULT_PATH={vault}\n", encoding="utf-8")
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.api.plist"
+    assert installed.exists(), (result.stdout, result.stderr)
 
 
 # chromadb's real template doesn't follow the launchd-env-wrapper.sh

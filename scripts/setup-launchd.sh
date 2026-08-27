@@ -251,9 +251,31 @@ install_plist() {
         return 0
     fi
     if [ -f "$dst" ]; then
-        local backup="$dst.bak.$(date +%s)"
-        cp "$dst" "$backup"
-        echo "  WARNING: $filename differs from what's currently installed — backed up the existing file to $(basename "$backup") before replacing it"
+        # Backed up OUTSIDE ~/Library/LaunchAgents, not alongside it (found
+        # on review): launchd itself scans that directory, and
+        # `launchctl load ~/Library/LaunchAgents` (the directory form, per
+        # this script's own printed next-steps) would load the .bak file
+        # too — a plist with the same Label loaded twice. A collision-safe
+        # name (checked, not just second-resolution timestamped) avoids a
+        # second backup in the same second silently overwriting the first.
+        local backup_dir="$LIFEOS_PATH/config/launchd/backups"
+        mkdir -p "$backup_dir"
+        local backup="$backup_dir/$filename.$(date +%s)" n=1
+        while [ -e "$backup" ]; do
+            backup="$backup_dir/$filename.$(date +%s).$n"
+            n=$((n + 1))
+        done
+        # `set -e` is active for this whole script — a `cp` failure here
+        # (permission problem, disk full) must not silently abort the
+        # entire run mid-loop with no report; explicitly checked so a
+        # failed backup means "refuse to overwrite this one plist" (this
+        # function returns 1, caller tracks and reports it) rather than an
+        # untraceable hard stop.
+        if ! cp "$dst" "$backup" 2>/dev/null; then
+            echo "  ERROR: could not back up the existing $filename before replacing it — refusing to overwrite"
+            return 1
+        fi
+        echo "  WARNING: $filename differs from what's currently installed — backed up the existing file to config/launchd/backups/$(basename "$backup") before replacing it"
     fi
     cp "$src" "$dst"
     echo "  Installed: $filename"
@@ -317,7 +339,20 @@ for arg in "$@"; do
 done
 
 if [ -z "$VAULT_PATH" ]; then
-    read -p "Enter your Obsidian vault path: " VAULT_PATH
+    # Found on review: --yes is meant for unattended automation, but with
+    # no vault argument this still blocked on an interactive `read` — the
+    # opposite of what --yes asks for. Fall back to .env's own
+    # LIFEOS_VAULT_PATH first; only prompt interactively when NOT --yes,
+    # and fail fast (rather than hang) if --yes has no path from either
+    # source.
+    VAULT_PATH=$(_read_env "LIFEOS_VAULT_PATH" "")
+    if [ -z "$VAULT_PATH" ]; then
+        if [ "$AUTO_YES" = true ]; then
+            echo "Error: no vault path given and LIFEOS_VAULT_PATH is not set in .env — required with --yes."
+            exit 1
+        fi
+        read -p "Enter your Obsidian vault path: " VAULT_PATH
+    fi
 fi
 
 # Expand ~ if present
@@ -414,6 +449,7 @@ echo "Installing to $LAUNCH_AGENTS..."
 
 mkdir -p "$LAUNCH_AGENTS"
 
+INSTALL_FAILED=false
 for plist in "$LAUNCHD_DIR"/*.plist; do
     if [ -f "$plist" ] && [[ ! "$plist" == *.template ]]; then
         filename=$(basename "$plist")
@@ -421,9 +457,22 @@ for plist in "$LAUNCHD_DIR"/*.plist; do
             echo "  Skipped: $filename ($skip_reason)"
             continue
         }
-        install_plist "$plist" "$LAUNCH_AGENTS"
+        # `set -e` is active for this whole script — calling install_plist
+        # directly (unguarded) would abort the entire loop the instant one
+        # plist's backup step fails, before the rest even get a chance.
+        # Wrapping it in `if` (a normal set -e exemption) lets one failure
+        # be tracked and reported without stopping the others.
+        if ! install_plist "$plist" "$LAUNCH_AGENTS"; then
+            INSTALL_FAILED=true
+        fi
     fi
 done
+
+if [ "$INSTALL_FAILED" = true ]; then
+    echo ""
+    echo "One or more plists could not be installed (see ERROR lines above)."
+    exit 1
+fi
 
 # Two Linux watchdogs have no macOS equivalent (#774) — GPU health polling
 # reads ROCm/amdgpu-specific sysfs, and the network-recovery watchdog
