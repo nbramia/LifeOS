@@ -139,13 +139,31 @@ def test_invalid_mode_rejected_by_pydantic(app_and_vault):
 # there would be clobbered by the next sync and corrupt the scalars it reads.
 # Blocked here, for every caller, rather than left to a persona's prompt
 # discipline (e.g. the journal persona, config/personas/journal.md).
+#
+# Since #769 the reservation only applies when the journal persona is
+# actually enabled on this install (same signal journal_ingest.py uses: a
+# `journal` entry in settings.telegram_bots, i.e. TELEGRAM_JOURNAL_BOT_TOKEN
+# is set). Tests that exercise the reservation itself explicitly enable it
+# below (`_enable_journal_persona`) as a regression guard — the test process
+# has no token set by default, matching a fresh clone.
 # ---------------------------------------------------------------------------
+
+def _enable_journal_persona(monkeypatch):
+    """Make settings.telegram_bots include the shipped `journal` entry, i.e.
+    simulate an install with TELEGRAM_JOURNAL_BOT_TOKEN configured (the
+    maintainer's install). config/telegram_bots.json already ships a
+    `journal` entry naming this exact env var."""
+    monkeypatch.setenv("TELEGRAM_JOURNAL_BOT_TOKEN", "test-token")
+
 
 @pytest.mark.parametrize("bad_path", [
     "Personal/Journal/2026-08-23.md",
     "Personal/Journal/nested/note.md",
 ])
-def test_rejects_writes_into_reserved_journal_dir(app_and_vault, bad_path):
+def test_rejects_writes_into_reserved_journal_dir(app_and_vault, bad_path, monkeypatch):
+    """Regression guard (#769): with the journal persona enabled, behavior is
+    byte-for-byte what it was before the reservation became conditional."""
+    _enable_journal_persona(monkeypatch)
     c, vault = app_and_vault
     r = c.post("/api/vault/write", json={"path": bad_path, "content": "x"})
     assert r.status_code == 400, r.text
@@ -153,7 +171,8 @@ def test_rejects_writes_into_reserved_journal_dir(app_and_vault, bad_path):
     assert not (vault / "Personal" / "Journal").exists()
 
 
-def test_rejects_reserved_journal_dir_regardless_of_mode(app_and_vault):
+def test_rejects_reserved_journal_dir_regardless_of_mode(app_and_vault, monkeypatch):
+    _enable_journal_persona(monkeypatch)
     c, _ = app_and_vault
     r = c.post("/api/vault/write", json={
         "path": "Personal/Journal/2026-08-23.md", "content": "x", "mode": "append",
@@ -161,9 +180,12 @@ def test_rejects_reserved_journal_dir_regardless_of_mode(app_and_vault):
     assert r.status_code == 400, r.text
 
 
-def test_allows_writes_into_sibling_personal_log_dir(app_and_vault):
+def test_allows_writes_into_sibling_personal_log_dir(app_and_vault, monkeypatch):
     # Personal/Log/ (the journal persona's capture target) is unaffected —
-    # only the Personal/Journal/ subtree itself is reserved.
+    # only the Personal/Journal/ subtree itself is reserved. True regardless
+    # of whether the journal persona is enabled; enable it here to exercise
+    # the stricter (default/maintainer) state.
+    _enable_journal_persona(monkeypatch)
     c, vault = app_and_vault
     r = c.post("/api/vault/write", json={
         "path": "Personal/Log/2026-08-23.md", "content": "x",
@@ -172,12 +194,38 @@ def test_allows_writes_into_sibling_personal_log_dir(app_and_vault):
     assert (vault / "Personal" / "Log" / "2026-08-23.md").read_text() == "x"
 
 
-def test_does_not_reject_journal_named_sibling_file(app_and_vault):
+def test_does_not_reject_journal_named_sibling_file(app_and_vault, monkeypatch):
     # A file that merely starts with "Journal" alongside the reserved dir
     # (not inside it) must not be caught by a naive string-prefix check.
+    _enable_journal_persona(monkeypatch)
     c, vault = app_and_vault
     r = c.post("/api/vault/write", json={
         "path": "Personal/Journal-notes.md", "content": "x",
     })
     assert r.status_code == 200, r.text
     assert (vault / "Personal" / "Journal-notes.md").read_text() == "x"
+
+
+def test_allows_writes_into_journal_dir_when_persona_not_enabled(app_and_vault):
+    """#769: when the journal persona is NOT configured on this install (no
+    TELEGRAM_JOURNAL_BOT_TOKEN — the default in this test process, matching a
+    fresh clone), a write under Personal/Journal/ is allowed like any other
+    vault path — there is no generated file here for the reservation to
+    protect."""
+    c, vault = app_and_vault
+    r = c.post("/api/vault/write", json={
+        "path": "Personal/Journal/2026-08-23.md", "content": "x",
+    })
+    assert r.status_code == 200, r.text
+    assert (vault / "Personal" / "Journal" / "2026-08-23.md").read_text() == "x"
+
+
+def test_other_validation_still_applies_when_journal_persona_not_enabled(app_and_vault):
+    """Disabling the reservation must not disable the other path-safety
+    checks (traversal, absolute paths) — those are unconditional."""
+    c, _ = app_and_vault
+    r = c.post("/api/vault/write", json={
+        "path": "Personal/Journal/../../escape.md", "content": "x",
+    })
+    assert r.status_code == 400, r.text
+    assert "must not contain `..`" in r.json()["detail"]
