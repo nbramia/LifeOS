@@ -1,4 +1,4 @@
-# ADR-022: Remote Provider as a Third `LIFEOS_LLM_BACKEND` Value
+# ADR-024: Remote Provider as a Third `LIFEOS_LLM_BACKEND` Value
 
 **Status:** Complete
 **Last Updated:** 2026-08-27

@@ -399,7 +399,7 @@ class Settings(BaseSettings):
     # LLM Backend: "anthropic" (default), "local", or "remote" (#771 —
     # makes the already-configured paid OpenAI-compatible provider below
     # the standing default engine, not just a per-turn picker option; see
-    # ADR-022). See get_local_llm() in api/services/llm_client.py for the
+    # ADR-024). See get_local_llm() in api/services/llm_client.py for the
     # resolution logic and its no-key/not-configured error paths.
     llm_backend: str = Field(default="anthropic", alias="LIFEOS_LLM_BACKEND")
 

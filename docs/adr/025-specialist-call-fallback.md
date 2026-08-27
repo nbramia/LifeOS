@@ -1,4 +1,4 @@
-# ADR-023: Specialist Calls Fall Back When No Anthropic Key Is Set
+# ADR-025: Specialist Calls Fall Back When No Anthropic Key Is Set
 
 **Status:** Complete
 **Last Updated:** 2026-08-27
@@ -9,9 +9,9 @@
 
 [ADR-009](009-llm-backend-toggle.md) established that `LIFEOS_LLM_BACKEND` controls synthesis and orchestration only — relationship insights, fact extraction, and tone analysis ("specialized calls") always use the Claude API regardless of the toggle, on the reasoning that these particular calls benefit enough from frontier-model quality to justify staying on Anthropic even when the operator has chosen `local` for everyday chat.
 
-That reasoning assumed every install had an Anthropic key available to spend, even if the operator preferred not to spend it by default. [ADR-022](022-remote-llm-backend.md) already found and fixed the analogous gap for the *default orchestrator*: a real second-user deployment with no Anthropic key, no local server, and only a remote provider configured. The same gap exists here, one layer down: on a keyless install, `get_anthropic_llm()` (`api/services/llm_client.py`) always builds an `AnthropicLLMClient`, which fails immediately. Every caller already wraps its LLM call in a broad `try`/`except` that logs and degrades to an empty result — so the failure produces no error, no crash, and no data. Relationship insights, fact extraction, and both CRM tone-analysis endpoints all silently produce nothing, indistinguishable from "no data yet."
+That reasoning assumed every install had an Anthropic key available to spend, even if the operator preferred not to spend it by default. [ADR-024](024-remote-llm-backend.md) already found and fixed the analogous gap for the *default orchestrator*: a real second-user deployment with no Anthropic key, no local server, and only a remote provider configured. The same gap exists here, one layer down: on a keyless install, `get_anthropic_llm()` (`api/services/llm_client.py`) always builds an `AnthropicLLMClient`, which fails immediately. Every caller already wraps its LLM call in a broad `try`/`except` that logs and degrades to an empty result — so the failure produces no error, no crash, and no data. Relationship insights, fact extraction, and both CRM tone-analysis endpoints all silently produce nothing, indistinguishable from "no data yet."
 
-This was found on the same real keyless second-user deployment ADR-022 was written for: none of these four features functioned at all, and nothing indicated why.
+This was found on the same real keyless second-user deployment ADR-024 was written for: none of these four features functioned at all, and nothing indicated why.
 
 ## Decision
 
@@ -19,7 +19,7 @@ This was found on the same real keyless second-user deployment ADR-022 was writt
 
 1. **Anthropic**, when a key is configured — unchanged from ADR-009. Same client construction, same model (`LIFEOS_ANTHROPIC_SPECIALIST_MODEL`), same behavior for every existing caller.
 2. **The local llama-server**, when reachable (`LocalLLMClient().is_available()` — one short `GET /health`), if no key is set.
-3. **The configured remote paid provider** (`LIFEOS_REMOTE_LLM_*`, from #654/ADR-022), if no key is set and the local server isn't reachable.
+3. **The configured remote paid provider** (`LIFEOS_REMOTE_LLM_*`, from #654/ADR-024), if no key is set and the local server isn't reachable.
 4. **The (unreachable) local client anyway**, if none of the above apply. This function still never raises for "nothing is configured" — each caller's existing `try`/`except` around its own `.create()` call degrades to its current empty/no-op result, exactly as it already does today for any other transient failure. Nothing new needs to be added to the four callers themselves.
 
 A single log line records the first time a keyless install falls back, naming which backend it fell back to (or that none is usable).
@@ -28,14 +28,14 @@ Web search is explicitly out of scope: it uses Anthropic's built-in `web_search_
 
 ## Rationale
 
-- **Matches ADR-022's precedent exactly.** The default orchestrator and the specialist calls had the identical failure shape (always-Anthropic construction, no key, immediate failure) on the same real deployment. Using the same fix — fall back to whatever else is configured — keeps the two decisions consistent rather than solving the same problem two different ways.
-- **The failure mode differs from ADR-022's, so the fix does too.** `get_local_llm()` (ADR-022) fails *loudly*, by design — an operator's explicit `LIFEOS_LLM_BACKEND` choice should error clearly if misconfigured rather than silently run somewhere else. `get_anthropic_llm()` has no equivalent explicit per-feature setting; an operator never chose "Anthropic specifically" for relationship insights the way they choose `LIFEOS_LLM_BACKEND` for chat. Since there's no explicit choice being second-guessed, and the failure mode without a fallback is *silent data loss* rather than a clear error, auto-probing (mirroring the agent worker's `_default_llm_caller` in `agent_worker/preflight.py`) is the right shape here — the opposite conclusion ADR-022 reached for the standing orchestrator default, and for a specific, applicable reason.
+- **Matches ADR-024's precedent exactly.** The default orchestrator and the specialist calls had the identical failure shape (always-Anthropic construction, no key, immediate failure) on the same real deployment. Using the same fix — fall back to whatever else is configured — keeps the two decisions consistent rather than solving the same problem two different ways.
+- **The failure mode differs from ADR-024's, so the fix does too.** `get_local_llm()` (ADR-024) fails *loudly*, by design — an operator's explicit `LIFEOS_LLM_BACKEND` choice should error clearly if misconfigured rather than silently run somewhere else. `get_anthropic_llm()` has no equivalent explicit per-feature setting; an operator never chose "Anthropic specifically" for relationship insights the way they choose `LIFEOS_LLM_BACKEND` for chat. Since there's no explicit choice being second-guessed, and the failure mode without a fallback is *silent data loss* rather than a clear error, auto-probing (mirroring the agent worker's `_default_llm_caller` in `agent_worker/preflight.py`) is the right shape here — the opposite conclusion ADR-024 reached for the standing orchestrator default, and for a specific, applicable reason.
 - **No new callers to touch.** All four callers already lazily fetch `get_anthropic_llm()` once and already wrap their use of it in a broad exception handler. Centralizing the fallback in the one shared constructor means zero changes to `relationship_insights.py`, `person_facts.py`, or the two `crm.py` tone-analysis endpoints — they keep calling the same function and get correct behavior automatically.
 - **One log line, not four.** Because the fallback lives in the shared singleton constructor rather than in each caller, the "which backend did we fall back to" question only needs answering once per process, at the point the singleton is actually built — not once per feature.
 
 ## Alternatives Considered
 
-### Fail fast, like `get_local_llm()` (ADR-022)
+### Fail fast, like `get_local_llm()` (ADR-024)
 
 Raise a named `LLMBackendNotConfiguredError`-style exception from `get_anthropic_llm()` when no key is set, mirroring the orchestrator's fail-fast behavior exactly.
 
@@ -49,9 +49,9 @@ Give specialist calls their own explicit backend toggle, independent of `LIFEOS_
 
 ### Route specialist calls through `get_local_llm()` directly instead of a separate fallback
 
-Since `get_local_llm()` (ADR-022) already resolves `LIFEOS_LLM_BACKEND` to a working client, have specialist calls just use that client too when no key is set.
+Since `get_local_llm()` (ADR-024) already resolves `LIFEOS_LLM_BACKEND` to a working client, have specialist calls just use that client too when no key is set.
 
-**Rejected because:** `get_local_llm()` is explicit-config, fail-fast by design (ADR-022) — on the exact keyless-with-nothing-set-explicitly install this issue was found on, `LIFEOS_LLM_BACKEND` was left at its default (`anthropic`), so `get_local_llm()` would raise `LLMBackendNotConfiguredError` too. Reusing it here would just move the silent-failure problem into a loud one, not solve it — specialist calls need their own reachability probe precisely because there's no reliable explicit setting to read instead.
+**Rejected because:** `get_local_llm()` is explicit-config, fail-fast by design (ADR-024) — on the exact keyless-with-nothing-set-explicitly install this issue was found on, `LIFEOS_LLM_BACKEND` was left at its default (`anthropic`), so `get_local_llm()` would raise `LLMBackendNotConfiguredError` too. Reusing it here would just move the silent-failure problem into a loud one, not solve it — specialist calls need their own reachability probe precisely because there's no reliable explicit setting to read instead.
 
 ## Consequences
 
@@ -71,7 +71,7 @@ Since `get_local_llm()` (ADR-022) already resolves `LIFEOS_LLM_BACKEND` to a wor
 
 ### Design Context
 - [ADR-009: LIFEOS_LLM_BACKEND Toggle](009-llm-backend-toggle.md) — Established specialist calls staying on Anthropic regardless of toggle; this ADR narrows that clause for the keyless case
-- [ADR-022: Remote Provider as a Third LIFEOS_LLM_BACKEND Value](022-remote-llm-backend.md) — The analogous fix for the default orchestrator; this ADR is the specialist-call counterpart, with a deliberately different (auto-probe, not fail-fast) mechanism
+- [ADR-024: Remote Provider as a Third LIFEOS_LLM_BACKEND Value](024-remote-llm-backend.md) — The analogous fix for the default orchestrator; this ADR is the specialist-call counterpart, with a deliberately different (auto-probe, not fail-fast) mechanism
 
 ### Specifications
 - [Client Surfaces](../specs/technical/client-surfaces.md) — No public HTTP response field changed by this ADR
