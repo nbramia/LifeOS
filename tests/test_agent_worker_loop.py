@@ -114,7 +114,8 @@ class FakeApi:
 
 
 def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_executor,
-                  claude_code_executor=None, codex_executor=None, cli_pool=None):
+                  claude_code_executor=None, codex_executor=None, cli_pool=None,
+                  remote_executor=None):
     transport = httpx.MockTransport(api.handler)
     client = httpx.Client(transport=transport, base_url="http://api")
     sent: list[str] = []
@@ -138,6 +139,7 @@ def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_execut
         http_client=client,
         preflight_caller=preflight_caller,
         local_executor=local_executor,
+        remote_executor=remote_executor,
         claude_code_executor=claude_code_executor,
         codex_executor=codex_executor,
         cli_pool=cli_pool,
@@ -568,10 +570,10 @@ def test_claude_routing_without_managed_credentials_blocks(tmp_path: Path, monke
     monkeypatch.setattr(_settings, "agent_preset_id", "", raising=False)
     monkeypatch.setattr(_settings, "agent_environment_id", "", raising=False)
     api = FakeApi(tasks=[
-        # `#cloud` is the operator asking for the API route; without it an
-        # inferred cloud route would park at `ask` instead (#584).
+        # `#cloud-sonnet` is the operator asking for the API route explicitly;
+        # without it an inferred cloud route would park at `ask` instead (#584).
         {"id": "t1", "description": "summarize", "status": "todo",
-         "tags": ["agent", "cloud"]},
+         "tags": ["agent", "cloud-sonnet"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
     preflight = _golden_preflight(routing="claude")
@@ -587,13 +589,70 @@ def test_claude_routing_without_managed_credentials_blocks(tmp_path: Path, monke
 
 
 @pytest.mark.unit
+def test_cloud_tag_routes_to_remote_provider_when_configured(tmp_path: Path, monkeypatch):
+    """(#809) `#cloud` — the configured remote OpenAI-compatible provider —
+    dispatches through the remote-forced executor, never Managed Agents."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "remote_llm_base_url", "https://api.fireworks.ai/inference", raising=False)
+    monkeypatch.setattr(_settings, "remote_llm_model", "accounts/fireworks/models/deepseek-v3", raising=False)
+    monkeypatch.setattr(_settings, "remote_llm_api_key", "test-fireworks-key", raising=False)
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "summarize", "status": "todo",
+         "tags": ["agent", "cloud"]},
+    ])
+    remote_executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="done", served_by="accounts/fireworks/models/deepseek-v3",
+    ))
+    local_executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    preflight = _golden_preflight(routing="claude")  # preflight's own JSON never emits "remote"
+    w = _make_worker(tmp_path, api, preflight_caller=preflight,
+                     local_executor=local_executor, remote_executor=remote_executor)
+    w.tick()
+
+    # The remote-forced executor ran; the local executor and Managed Agents
+    # (no managed credentials configured in this test) were never touched.
+    assert remote_executor.calls == [("t1", "summarize")]
+    assert local_executor.calls == []
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert BLOCKED_TAG not in api.tasks["t1"]["tags"]
+
+
+@pytest.mark.unit
+def test_cloud_tag_parks_when_remote_provider_unconfigured(tmp_path: Path, monkeypatch):
+    """(#809) `#cloud` with no remote provider configured must park at
+    #agent-blocked with a clear message — never silently fall back to the
+    Anthropic API (the old `#cloud` meaning) or to local Gemma."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "remote_llm_base_url", "", raising=False)
+    monkeypatch.setattr(_settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(_settings, "remote_llm_api_key", "", raising=False)
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "summarize", "status": "todo",
+         "tags": ["agent", "cloud"]},
+    ])
+    local_executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    remote_executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    preflight = _golden_preflight(routing="claude")
+    w = _make_worker(tmp_path, api, preflight_caller=preflight,
+                     local_executor=local_executor, remote_executor=remote_executor)
+    w.tick()
+
+    assert local_executor.calls == []
+    assert remote_executor.calls == []
+    assert BLOCKED_TAG in api.tasks["t1"]["tags"]
+    assert AGENT_TAG not in api.tasks["t1"]["tags"]
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert any("remote provider" in s and "not configured" in s for s in sent)
+
+
+@pytest.mark.unit
 def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
     """When Managed Agents is configured, the worker delegates to the
     managed executor: `start` on first tick (status=RUNNING) and `poll` on
     subsequent ticks until terminal."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "summarize my inbox", "status": "todo",
-         "tags": ["agent", "cloud"]},
+         "tags": ["agent", "cloud-sonnet"]},
     ])
 
     class _StubManagedExecutor:
@@ -715,7 +774,7 @@ def test_completion_summary_renders_four_bucket_breakdown(tmp_path: Path):
     that #137 actually landed."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "draft email", "status": "todo",
-         "tags": ["agent", "cloud"]},
+         "tags": ["agent", "cloud-sonnet"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="Drafted.",
@@ -978,7 +1037,7 @@ def test_cloud_yield_resume_creates_fresh_managed_session_with_children_output(t
     from api.services.agent_worker.session_store import STATUS_RUNNING, STATUS_YIELDED, STATUS_COMPLETED
     api = FakeApi(tasks=[
         {"id": "p1", "description": "Compare gmail vs slack — aggregate child outputs",
-         "status": "in_progress", "tags": [RUNNING_TAG, "cloud"]},
+         "status": "in_progress", "tags": [RUNNING_TAG, "cloud-sonnet"]},
     ])
     # Track what the driver was asked to do.
     create_calls: list[dict] = []
@@ -1147,7 +1206,7 @@ def test_resume_pending_kills_orphan_remote_session(tmp_path: Path):
 
     api = FakeApi(tasks=[
         {"id": "t1", "description": "cloud task", "status": "in_progress",
-         "tags": [RUNNING_TAG, "cloud"]},
+         "tags": [RUNNING_TAG, "cloud-sonnet"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED))
     w = _make_worker(tmp_path, api,
@@ -1178,7 +1237,7 @@ def test_resume_pending_rollback_survives_kill_failure(tmp_path: Path):
 
     api = FakeApi(tasks=[
         {"id": "t1", "description": "cloud task", "status": "in_progress",
-         "tags": [RUNNING_TAG, "cloud"]},
+         "tags": [RUNNING_TAG, "cloud-sonnet"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED))
     w = _make_worker(tmp_path, api,
@@ -1205,7 +1264,7 @@ def test_resume_pending_does_not_telegram_for_spawned_children(tmp_path: Path):
     from api.services.agent_worker.session_store import STATUS_RUNNING
     api = FakeApi(tasks=[
         {"id": "root_task", "description": "root", "status": "in_progress",
-         "tags": [RUNNING_TAG, "cloud"]},
+         "tags": [RUNNING_TAG, "cloud-sonnet"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED))
     w = _make_worker(tmp_path, api,

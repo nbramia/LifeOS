@@ -313,8 +313,13 @@ def test_routing_answer_parser_combined_replies():
     assert parse("It's John Doe, and let's use claude") == "claude_code"
     # Reaching the API takes a word that can only mean the API.
     assert parse("use opus") == "claude"
-    assert parse("cloud") == "claude"
     assert parse("go ahead and use the api") == "claude"
+    assert parse("use anthropic") == "claude"
+    # (#809) "cloud" no longer means the Anthropic API — it resolves to the
+    # configured remote provider, mirroring the `#cloud` tag's own remapped
+    # meaning.
+    assert parse("cloud") == "remote"
+    assert parse("use deepseek") == "remote"
     # Combined: ambiguity answer first, engine second.
     assert parse("1. John Doe 2. local") == "local"
     # Several named → the last one wins.

@@ -162,6 +162,7 @@ def _build_preflight_preview(request: CreateTaskRequest) -> PreflightPreviewResp
     # task operations; agent_worker pulls in the LLM client.
     from api.services.agent_worker.preflight import (
         ROUTE_CLAUDE,
+        ROUTE_REMOTE,
         run_preflight,
     )
     from api.services.agent_worker.pricing import cost_for, MANAGED_SESSION_HOUR_OVERHEAD
@@ -171,15 +172,30 @@ def _build_preflight_preview(request: CreateTaskRequest) -> PreflightPreviewResp
     # Worst-case estimate: assume budget.max_tokens is fully consumed, split
     # 50/50 between input and output. Excludes cache_creation because dry_run
     # can't know preset size; this is a floor, not a calibrated estimate.
-    model = (
-        settings.agent_managed_model_for_tests or settings.agent_managed_model
-        if pre.routing == ROUTE_CLAUDE
-        else "local"
-    )
     half_tokens = max(0, pre.budget.max_tokens // 2)
-    estimated = cost_for(model, half_tokens, half_tokens)
-    if pre.routing == ROUTE_CLAUDE:
-        estimated += (pre.budget.wall_seconds / 3600.0) * MANAGED_SESSION_HOUR_OVERHEAD
+    if pre.routing == ROUTE_REMOTE:
+        # (#809) `#cloud` — priced from the remote provider's own configured
+        # rate, not the Anthropic table `cost_for` looks up. Unset rates
+        # mean "unknown, not free" (#669's convention) — the estimate floors
+        # at 0 rather than guessing, same as an unrecognized model would.
+        input_price = settings.remote_llm_input_price_per_mtok
+        output_price = settings.remote_llm_output_price_per_mtok
+        if input_price is not None and output_price is not None:
+            estimated = (
+                (half_tokens / 1_000_000) * input_price
+                + (half_tokens / 1_000_000) * output_price
+            )
+        else:
+            estimated = 0.0
+    else:
+        model = (
+            settings.agent_managed_model_for_tests or settings.agent_managed_model
+            if pre.routing == ROUTE_CLAUDE
+            else "local"
+        )
+        estimated = cost_for(model, half_tokens, half_tokens)
+        if pre.routing == ROUTE_CLAUDE:
+            estimated += (pre.budget.wall_seconds / 3600.0) * MANAGED_SESSION_HOUR_OVERHEAD
     return PreflightPreviewResponse(
         routing=pre.routing,
         routing_reason=pre.routing_reason,

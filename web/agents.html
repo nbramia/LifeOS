@@ -813,6 +813,7 @@
     <select id="filter-route">
       <option value="all">all</option>
       <option value="local">local</option>
+      <option value="remote">remote</option>
       <option value="claude">claude</option>
       <option value="claude_code">claude code</option>
       <option value="codex">codex</option>
@@ -1045,6 +1046,7 @@
     if (!routing || routing === 'local') return 'Local';
     if (routing === 'claude_code' || routing === 'code') return 'Claude Code';
     if (routing === 'codex') return 'Codex';
+    if (routing === 'remote') return 'Remote';  // #809: #cloud tag, not Anthropic
     return 'Claude';
   }
 
