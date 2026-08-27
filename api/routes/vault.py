@@ -76,6 +76,19 @@ def _journal_enabled() -> bool:
 
     A fresh clone with neither configured has no generated file for this
     reservation to protect, so the reservation doesn't apply there.
+
+    The Telegram check matches on `bot.name == "journal"` rather than
+    resolving personas more indirectly — this is intentional, not a gap
+    (Codex review of #769 asked about a bot bound to the journal persona
+    under a different registry name): `"journal"` is a fixed, hardcoded
+    identifier this exact string is compared against everywhere the journal
+    persona is used — `journal_capture.JOURNAL_PERSONA_ID`,
+    `journal_ingest._JOURNAL_PERSONA_ID`, and `resolve_persona()` itself
+    (`config/settings.py`, `for bot in self.telegram_bots: if bot.name ==
+    persona_id`). Renaming that registry entry away from `"journal"` doesn't
+    make some *other* bot "the journal persona" under this check specifically
+    — it breaks every one of those call sites identically, i.e. the entire
+    capture pipeline stops working system-wide, not just this reservation.
     """
     return (
         any(bot.name == _JOURNAL_PERSONA_ID for bot in settings.telegram_bots)
