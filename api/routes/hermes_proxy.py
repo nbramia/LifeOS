@@ -248,8 +248,19 @@ def _build_envelope(raw_body: bytes) -> bytes:
         raise HTTPException(status_code=400, detail=f"Invalid request: {exc}")
 
     # Same registry-backed resolution the native /api/ask/stream uses, and the
-    # same default-to-primary behavior when no persona_id is sent.
-    persona_id = parsed.persona_id or "primary"
+    # same default-to-primary behavior when neither field is given.
+    # resolve_effective_persona_id() reverse-maps a raw `persona` preamble the
+    # same way _journal_capture_prelude's #685 gate below already does — this
+    # line used to be the bare `parsed.persona_id or "primary"` shorthand,
+    # which silently ignored `persona` entirely: a raw-persona request
+    # captured under the reverse-mapped bot but built its envelope for
+    # "primary", two different answers to "who is this?" for the same
+    # request (#691). Every live caller sends persona_id (not a raw
+    # `persona`), so this is unchanged for all of them; it only changes the
+    # (as of this writing, unreached) raw-persona shape, and raises the same
+    # HTTPException(400) for the same malformed shapes (persona_id and
+    # persona both given; an unrecognized persona_id) the prelude already did.
+    persona_id = resolve_effective_persona_id(parsed.persona_id, parsed.persona) or "primary"
     modality = "voice" if (parsed.modality or "").strip().lower() == "voice" else "text"
     # Spoken-style rules apply only on voice turns, matching the exact gate
     # ask_stream() uses in api/routes/chat.py: `modality == "voice" and

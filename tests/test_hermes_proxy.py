@@ -2633,6 +2633,36 @@ async def test_raw_persona_preamble_journal_turn_still_captures(
     }]
 
 
+# ---------------------------------------------------------------------------
+# #691: _build_envelope() used to resolve `parsed.persona_id or "primary"` —
+# ignoring a raw `persona` preamble entirely — while the #685 capture prelude
+# above already reverse-mapped it via resolve_effective_persona_id(). One
+# request, two different answers to "who is this persona": captured under
+# the reverse-mapped bot, but the envelope built (and forwarded to Hermes)
+# for "primary". Pin that both now agree.
+# ---------------------------------------------------------------------------
+
+async def test_raw_persona_envelope_matches_capture_persona(
+    proxy_client, journal_vault, journal_persona_registered,
+):
+    journal_preamble = journal_persona_registered
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": _JOURNAL_FRAGMENT, "persona": journal_preamble},
+    )
+    assert resp.status_code == 200
+
+    # Capture succeeded under "journal" (same proof as the test above).
+    written = (journal_vault / log_path_for(date.today())).read_text()
+    assert [b.split(" · ")[1] for b in _bullets(written)] == [_JOURNAL_FRAGMENT]
+
+    # The envelope actually forwarded to Hermes must resolve to the SAME
+    # persona — not silently "primary".
+    ctx = json.loads(_received["body"])["lifeos_context"]
+    assert ctx["persona"]["id"] == "journal"
+    assert ctx["persona"]["preamble"] == journal_preamble
+
+
 async def test_empty_persona_id_gets_native_400_on_proxy(proxy_client, journal_vault):
     resp = await proxy_client.post(
         "/api/hermes/ask/stream", json={"question": "hi", "persona_id": ""},
