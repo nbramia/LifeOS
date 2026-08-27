@@ -214,6 +214,62 @@ def test_check_paths_exist_silent_when_paths_are_real(tmp_path: Path):
     assert result.stdout.strip() == ""
 
 
+@pytest.mark.unit
+def test_check_paths_exist_flags_missing_program_binary(tmp_path: Path):
+    """The venv exists and has a python interpreter, but the SPECIFIC binary
+    ProgramArguments launches (e.g. uvicorn) was never installed into it —
+    a real gap a directory-only or interpreter-only check would miss."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    (venv / "bin" / "python").chmod(0o755)
+    # No uvicorn in this venv.
+    plist = repo / "p.plist"
+    plist.write_text(
+        "<dict>\n"
+        f"    <key>WorkingDirectory</key>\n    <string>{workdir}</string>\n"
+        "    <key>ProgramArguments</key>\n"
+        "    <array>\n"
+        f"        <string>{repo}/scripts/launchd-env-wrapper.sh</string>\n"
+        f"        <string>{repo}</string>\n"
+        f"        <string>{venv}/bin/uvicorn</string>\n"
+        "    </array>\n"
+        "</dict>",
+        encoding="utf-8",
+    )
+    result = _run_sourced(repo, f'check_paths_exist "{plist}" "{venv}"')
+    assert result.returncode == 0, result.stderr
+    assert f"{venv}/bin/uvicorn" in result.stdout
+
+
+@pytest.mark.unit
+def test_plist_program_binary_extracts_third_program_argument(tmp_path: Path):
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    plist = repo / "p.plist"
+    plist.write_text(
+        "<dict>\n"
+        "    <key>ProgramArguments</key>\n"
+        "    <array>\n"
+        "        <string>/proj/scripts/launchd-env-wrapper.sh</string>\n"
+        "        <string>/proj</string>\n"
+        "        <string>/proj/.venvs/lifeos/bin/uvicorn</string>\n"
+        "        <string>api.main:app</string>\n"
+        "    </array>\n"
+        "</dict>",
+        encoding="utf-8",
+    )
+    result = _run_sourced(repo, f'_plist_program_binary "{plist}"')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "/proj/.venvs/lifeos/bin/uvicorn"
+
+
 def _stub_plutil_ok(repo: Path) -> Path:
     bindir = repo / "stubbin"
     bindir.mkdir(exist_ok=True)
@@ -396,8 +452,9 @@ def _make_main_sandbox(tmp_path: Path, template_body: str) -> tuple[Path, Path, 
     (fake_home / "Library" / "LaunchAgents").mkdir(parents=True)
     venv = fake_home / ".venvs" / "lifeos"
     (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "python").write_text("#!/bin/sh\n")
-    (venv / "bin" / "python").chmod(0o755)
+    for exe in ("python", "uvicorn"):
+        (venv / "bin" / exe).write_text("#!/bin/sh\n")
+        (venv / "bin" / exe).chmod(0o755)
     (repo / "config" / "launchd" / "com.lifeos.api.plist.template").write_text(
         template_body, encoding="utf-8"
     )
@@ -411,6 +468,8 @@ _GOOD_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
     <string>com.lifeos.api</string>
     <key>ProgramArguments</key>
     <array>
+        <string>__LIFEOS_PATH__/scripts/launchd-env-wrapper.sh</string>
+        <string>__LIFEOS_PATH__</string>
         <string>__HOME__/.venvs/lifeos/bin/uvicorn</string>
     </array>
     <key>WorkingDirectory</key>

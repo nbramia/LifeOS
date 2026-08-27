@@ -78,15 +78,41 @@ _plist_string_value() {
     ' "$plist"
 }
 
+# The third <string> inside ProgramArguments's <array> — every template
+# routes through launchd-env-wrapper.sh (#776), whose own invocation
+# contract is `<wrapper> <project_dir> <real_command> [args...]`, so item 1
+# is always the wrapper, item 2 the project dir, and item 3 the actual
+# binary launchd-env-wrapper.sh execs. Empty output if there are fewer than
+# three (a plist not shaped this way — nothing to check).
+_plist_program_binary() {
+    awk '
+        /<key>ProgramArguments<\/key>/ { in_pa=1; next }
+        in_pa && /<\/array>/ { exit }
+        in_pa && /<string>/ {
+            count++
+            if (count == 3) {
+                line = $0
+                gsub(/.*<string>|<\/string>.*/, "", line)
+                print line
+                exit
+            }
+        }
+    ' "$1"
+}
+
 # Print any missing path this plist depends on (one per line: "<label>:
 # <path>"). Empty output means every path referenced exists on this machine.
-# Checks WorkingDirectory (parsed from the plist itself) and the venv this
+# Checks WorkingDirectory (parsed from the plist itself), the venv this
 # install resolved (every template uses the same __HOME__/.venvs/lifeos
-# convention, so there's nothing plist-specific to parse for that one).
-# Checks the venv's own python interpreter, not just the directory — an
-# empty or half-created venv (e.g. `python3 -m venv` ran but
-# `pip install -r requirements.txt` never did) would otherwise pass with a
-# directory that exists but launches nothing.
+# convention, so there's nothing plist-specific to parse for that one), and
+# the specific binary ProgramArguments launches.
+#
+# The venv's own python interpreter is checked in addition to (not instead
+# of) the specific binary: an empty or half-created venv (`python3 -m venv`
+# ran but `pip install -r requirements.txt` never did) has neither; a venv
+# with dependencies installed for one service but not another (e.g. crm-sync
+# came up fine, api's uvicorn was never installed) fails only the specific
+# check. Either gap alone must block install.
 check_paths_exist() {
     local plist="$1" venv_dir="$2"
     local workdir
@@ -96,6 +122,11 @@ check_paths_exist() {
     fi
     if [ ! -x "$venv_dir/bin/python" ]; then
         echo "venv: $venv_dir/bin/python"
+    fi
+    local binary
+    binary=$(_plist_program_binary "$plist")
+    if [ -n "$binary" ] && [ ! -x "$binary" ]; then
+        echo "program binary: $binary"
     fi
 }
 
