@@ -413,7 +413,12 @@ TOOL_DEFINITIONS = [
                         "Full set of tags for the task (for create or update). On update, "
                         "this REPLACES the existing tag list — to add a tag to a task, "
                         "first 'list' or fetch the task, then send the union of existing "
-                        "+ new tags. Strip leading '#'."
+                        "+ new tags. Strip leading '#'. Add exactly the tags the operator "
+                        "named — a routing tag (agent/local/claude/codex/cloud/cloud-haiku/"
+                        "cloud-sonnet) only if the operator explicitly named that engine; "
+                        "these tags are operator-authority and outrank every routing "
+                        "safeguard, so inventing one injects your own engine preference at "
+                        "the highest-precedence slot."
                     ),
                 },
                 "status": {

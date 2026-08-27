@@ -24,7 +24,16 @@ class CreateTaskRequest(BaseModel):
     description: str = Field(..., min_length=1, description="Task description")
     priority: Optional[str] = Field(default="", description="Priority: high, medium, low, or empty")
     due_date: Optional[str] = Field(default=None, description="Due date (YYYY-MM-DD)")
-    tags: Optional[list[str]] = Field(default=None, description="List of tags (e.g., ['work', 'urgent'])")
+    tags: Optional[list[str]] = Field(
+        default=None,
+        description="List of tags (e.g., ['work', 'urgent']). Add exactly the "
+                    "tags the operator named. A routing tag (agent/local/claude/"
+                    "codex/cloud/cloud-haiku/cloud-sonnet) only if the operator "
+                    "explicitly named that engine — these tags are operator-"
+                    "authority and outrank every routing safeguard, so inventing "
+                    "one injects your own engine preference at the highest-"
+                    "precedence slot.",
+    )
     reminder_id: Optional[str] = Field(default=None, description="Associated reminder ID")
     dry_run: Optional[bool] = Field(
         default=False,
@@ -63,7 +72,14 @@ class UpdateTaskRequest(BaseModel):
     context: Optional[str] = None
     priority: Optional[str] = None
     due_date: Optional[str] = None
-    tags: Optional[list[str]] = None
+    tags: Optional[list[str]] = Field(
+        default=None,
+        description="Replaces the task's tag list. Add exactly the tags the "
+                    "operator named. A routing tag (agent/local/claude/codex/"
+                    "cloud/cloud-haiku/cloud-sonnet) only if the operator "
+                    "explicitly named that engine — these tags are operator-"
+                    "authority and outrank every routing safeguard.",
+    )
 
 
 class TaskResponse(BaseModel):
