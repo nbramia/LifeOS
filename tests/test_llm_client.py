@@ -1028,7 +1028,6 @@ class TestRoutingHelpers:
         fake_client = MagicMock()
         fake_resp = MagicMock(text="result text")
         fake_client.acreate = AsyncMock(return_value=fake_resp)
-        fake_client.ais_available = AsyncMock(return_value=True)
         with patch.object(mod, "_get_local_routing_client", return_value=fake_client):
             text = await mod.generate_text("hi", max_tokens=10, temperature=0.5)
         assert text == "result text"
@@ -1052,10 +1051,6 @@ class TestRoutingHelpers:
         fake_instance = MagicMock()
         fake_resp = MagicMock(text="ok", reasoning_starved=False)
         fake_instance.acreate = AsyncMock(return_value=fake_resp)
-        # Available -- must NOT fall through to the remote branch, which
-        # would call LocalLLMClient(...) a second time and shadow the
-        # local-candidate call this test is asserting on.
-        fake_instance.ais_available = AsyncMock(return_value=True)
         with (
             patch.object(mod, "settings") as mock_settings,
             patch.object(mod, "LocalLLMClient", return_value=fake_instance) as mock_cls,
@@ -1087,7 +1082,6 @@ class TestRoutingHelpers:
         )
         fake_client = MagicMock()
         fake_client.acreate = AsyncMock(return_value=starved_resp)
-        fake_client.ais_available = AsyncMock(return_value=True)
         with patch.object(mod, "_get_local_routing_client", return_value=fake_client):
             with caplog.at_level(logging.WARNING, logger="api.services.llm_client"):
                 text = await mod.generate_text("hi", max_tokens=10)
@@ -1105,7 +1099,6 @@ class TestRoutingHelpers:
         normal_resp = LLMResponse(text="42", usage=LLMUsage(), finish_reason="stop")
         fake_client = MagicMock()
         fake_client.acreate = AsyncMock(return_value=normal_resp)
-        fake_client.ais_available = AsyncMock(return_value=True)
         with patch.object(mod, "_get_local_routing_client", return_value=fake_client):
             with caplog.at_level(logging.WARNING, logger="api.services.llm_client"):
                 text = await mod.generate_text("hi", max_tokens=10)
@@ -1121,7 +1114,6 @@ class TestRoutingHelpers:
         fake_client = MagicMock()
         fake_resp = MagicMock(text="ok", reasoning_starved=False)
         fake_client.acreate = AsyncMock(return_value=fake_resp)
-        fake_client.ais_available = AsyncMock(return_value=True)
         with patch.object(mod, "_get_local_routing_client", return_value=fake_client):
             await mod.generate_text("hi", enable_thinking=False, reasoning_effort="low")
         kwargs = fake_client.acreate.await_args.kwargs
@@ -1137,7 +1129,6 @@ class TestRoutingHelpers:
         fake_client = MagicMock()
         fake_resp = MagicMock(text="ok", reasoning_starved=False)
         fake_client.acreate = AsyncMock(return_value=fake_resp)
-        fake_client.ais_available = AsyncMock(return_value=True)
         with patch.object(mod, "_get_local_routing_client", return_value=fake_client):
             await mod.generate_text("hi")
         kwargs = fake_client.acreate.await_args.kwargs
@@ -1202,10 +1193,10 @@ class TestRoutingHelpers:
 
     def test_is_available_true_when_remote_configured_and_local_errors(self, _routing_singleton_reset):
         """#773: is_local_routing_llm_available reports true when the local
-        probe fails but a remote provider is configured -- the same
-        priority order _resolve_routing_client actually uses, so a caller
-        gating on this doesn't skip straight to its no-op fallback while a
-        working remote provider sits unused."""
+        probe fails but a remote provider is configured, so a caller
+        gating on this doesn't skip straight to its no-op fallback while
+        generate_text's own local-then-remote retry has a working remote
+        provider to fall back to."""
         from unittest.mock import MagicMock
         mod = _routing_singleton_reset
 
@@ -1229,81 +1220,126 @@ class TestRoutingHelpers:
             mock_settings.remote_llm_configured = True
             assert await mod.ais_local_routing_llm_available() is True
 
-    @pytest.mark.asyncio
-    async def test_resolve_routing_client_prefers_local_when_reachable(self, _routing_singleton_reset):
-        """#773: the shared resolver picks the local llama-server first,
-        exactly as every routing-tier caller does today, when it's
-        reachable -- byte-for-byte unchanged behavior for both live
-        deployments."""
-        from unittest.mock import AsyncMock, MagicMock
+    def test_remote_routing_client_builds_from_remote_settings(self, _routing_singleton_reset):
+        """_remote_routing_client builds a LocalLLMClient pointed at the
+        configured remote provider's settings, the fallback target
+        generate_text retries against (#773)."""
         mod = _routing_singleton_reset
 
-        local_client = MagicMock()
-        local_client.ais_available = AsyncMock(return_value=True)
-        with patch.object(mod, "_get_local_routing_client", return_value=local_client):
-            resolved = await mod._resolve_routing_client()
-        assert resolved is local_client
-
-    @pytest.mark.asyncio
-    async def test_resolve_routing_client_falls_back_to_remote_when_local_unreachable(self, _routing_singleton_reset):
-        """#773: a keyless/local-less install (only a remote provider
-        configured) now gets query routing, conversation titling,
-        agent-activity summaries, and fact filtering instead of every one
-        of those silently doing nothing."""
-        from unittest.mock import AsyncMock, MagicMock
-        mod = _routing_singleton_reset
-
-        local_client = MagicMock()
-        local_client.ais_available = AsyncMock(return_value=False)
-        with patch.object(mod, "_get_local_routing_client", return_value=local_client), \
-                patch.object(mod, "settings") as mock_settings:
-            mock_settings.remote_llm_configured = True
+        with patch.object(mod, "settings") as mock_settings:
             mock_settings.remote_llm_base_url = "https://api.fireworks.ai/inference/v1"
             mock_settings.remote_llm_model = "accounts/fireworks/models/deepseek-v4-flash-0731"
             mock_settings.remote_llm_api_key = "fw-test-key"
             mock_settings.remote_llm_timeout = 90
-            resolved = await mod._resolve_routing_client()
-        assert isinstance(resolved, mod.LocalLLMClient)
-        assert resolved is not local_client
-        assert resolved.base_url == "https://api.fireworks.ai/inference"
-        assert resolved._model == "accounts/fireworks/models/deepseek-v4-flash-0731"
-        assert resolved._api_key == "fw-test-key"
+            client = mod._remote_routing_client()
+        assert isinstance(client, mod.LocalLLMClient)
+        assert client.base_url == "https://api.fireworks.ai/inference"
+        assert client._model == "accounts/fireworks/models/deepseek-v4-flash-0731"
+        assert client._api_key == "fw-test-key"
 
     @pytest.mark.asyncio
-    async def test_resolve_routing_client_returns_local_when_neither_available(self, _routing_singleton_reset):
-        """#773: no reachable local server and no remote provider -- returns
-        the (unreachable) local client anyway, so each caller's existing
-        no-op/default degrade path still applies rather than an unhandled
-        exception here."""
+    async def test_generate_text_local_success_never_touches_remote(self, _routing_singleton_reset):
+        """#773: on a reachable local server, generate_text makes exactly
+        one call (local's acreate()) -- no availability probe, no remote
+        construction -- byte-for-byte the same request as before this
+        fallback existed."""
         from unittest.mock import AsyncMock, MagicMock
         mod = _routing_singleton_reset
 
         local_client = MagicMock()
-        local_client.ais_available = AsyncMock(return_value=False)
+        local_resp = MagicMock(text="local answer", reasoning_starved=False)
+        local_client.acreate = AsyncMock(return_value=local_resp)
+        with patch.object(mod, "_get_local_routing_client", return_value=local_client), \
+                patch.object(mod, "_remote_routing_client") as mock_remote:
+            text = await mod.generate_text("hi")
+        assert text == "local answer"
+        local_client.acreate.assert_awaited_once()
+        mock_remote.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_generate_text_falls_back_to_remote_when_local_fails(self, _routing_singleton_reset):
+        """#773: a keyless/local-less install (only a remote provider
+        configured) now gets query routing, conversation titling,
+        agent-activity summaries, and fact filtering instead of every one
+        of those silently doing nothing -- generate_text retries once
+        against the remote provider when the local call itself fails."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        local_client = MagicMock()
+        local_client.acreate = AsyncMock(side_effect=RuntimeError("connection refused"))
+        remote_client = MagicMock()
+        remote_resp = MagicMock(text="remote answer", reasoning_starved=False)
+        remote_client.acreate = AsyncMock(return_value=remote_resp)
+        with patch.object(mod, "_get_local_routing_client", return_value=local_client), \
+                patch.object(mod, "settings") as mock_settings, \
+                patch.object(mod, "_remote_routing_client", return_value=remote_client) as mock_remote:
+            mock_settings.remote_llm_configured = True
+            text = await mod.generate_text("hi")
+        assert text == "remote answer"
+        local_client.acreate.assert_awaited_once()
+        mock_remote.assert_called_once_with(None)
+
+    @pytest.mark.asyncio
+    async def test_generate_text_forwards_timeout_to_remote_fallback(self, _routing_singleton_reset):
+        """#773: a per-call timeout (three of four real callers pass one)
+        must reach the remote fallback too, not just the transient local
+        candidate."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        transient_local = MagicMock()
+        transient_local.acreate = AsyncMock(side_effect=RuntimeError("connection refused"))
+        remote_client = MagicMock()
+        remote_resp = MagicMock(text="remote answer", reasoning_starved=False)
+        remote_client.acreate = AsyncMock(return_value=remote_resp)
+        with patch.object(mod, "settings") as mock_settings, \
+                patch.object(mod, "LocalLLMClient", return_value=transient_local), \
+                patch.object(mod, "_remote_routing_client", return_value=remote_client) as mock_remote:
+            mock_settings.remote_llm_configured = True
+            mock_settings.routing_llm_url = "http://routing-box:9090"
+            text = await mod.generate_text("hi", timeout=30)
+        assert text == "remote answer"
+        mock_remote.assert_called_once_with(30)
+
+    @pytest.mark.asyncio
+    async def test_generate_text_propagates_local_failure_when_remote_not_configured(self, _routing_singleton_reset):
+        """#773: with no remote provider configured, a local failure
+        propagates exactly as it did before this fallback existed, so
+        every existing caller's own no-op/default handling (route()'s
+        keyword fallback, the titler's except Exception, etc.) still
+        applies unchanged."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        local_client = MagicMock()
+        local_client.acreate = AsyncMock(side_effect=RuntimeError("connection refused"))
         with patch.object(mod, "_get_local_routing_client", return_value=local_client), \
                 patch.object(mod, "settings") as mock_settings:
             mock_settings.remote_llm_configured = False
-            resolved = await mod._resolve_routing_client()
-        assert resolved is local_client
+            with pytest.raises(RuntimeError, match="connection refused"):
+                await mod.generate_text("hi")
 
     @pytest.mark.asyncio
-    async def test_resolve_routing_client_never_returns_anthropic(self, _routing_singleton_reset):
-        """#773: the resolver must never return an Anthropic client,
-        regardless of LIFEOS_LLM_BACKEND -- routing-tier calls stay off
-        the paid API even when it's the main orchestration backend."""
+    async def test_generate_text_never_falls_back_to_anthropic(self, _routing_singleton_reset):
+        """#773: routing-tier calls stay off the paid API even when local
+        fails and Anthropic is the main orchestration backend -- only the
+        configured remote provider (never Anthropic) is a fallback
+        target."""
         from unittest.mock import AsyncMock, MagicMock
         mod = _routing_singleton_reset
 
         local_client = MagicMock()
-        local_client.ais_available = AsyncMock(return_value=False)
+        local_client.acreate = AsyncMock(side_effect=RuntimeError("connection refused"))
         with patch.object(mod, "_get_local_routing_client", return_value=local_client), \
-                patch.object(mod, "settings") as mock_settings:
+                patch.object(mod, "settings") as mock_settings, \
+                patch.object(mod, "AnthropicLLMClient") as mock_anthropic_cls:
             mock_settings.llm_backend = "anthropic"
             mock_settings.anthropic_api_key = "sk-ant-test-key"
             mock_settings.remote_llm_configured = False
-            resolved = await mod._resolve_routing_client()
-        assert not isinstance(resolved, mod.AnthropicLLMClient)
-        assert resolved is local_client
+            with pytest.raises(RuntimeError):
+                await mod.generate_text("hi")
+        mock_anthropic_cls.assert_not_called()
 
 
 class TestDataClasses:

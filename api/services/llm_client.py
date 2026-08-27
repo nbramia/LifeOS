@@ -1163,8 +1163,9 @@ def reset_local_llm() -> None:
 # LocalLLMClient with the small text / JSON helpers those callers actually
 # need so the rest of the codebase doesn't need to think about Ollama vs
 # llama-server. Since #773, "local" is the preferred target but not the only
-# one — the local llama-server if reachable, else the configured remote
-# provider (never Anthropic either way) — see _resolve_routing_client.
+# one — generate_text()/generate_json() retry once against the configured
+# remote provider when the local call itself fails (never Anthropic either
+# way); see generate_text's docstring.
 # ============================================================================
 
 _routing_client: LocalLLMClient | None = None
@@ -1177,8 +1178,8 @@ def _get_local_routing_client() -> LocalLLMClient:
     Distinct from ``get_local_llm`` because that one switches to Anthropic
     when the backend is set to ``anthropic``; routing/validation should stay
     off the paid API even then. This is only the *local* candidate — see
-    ``_resolve_routing_client`` (#773) for the local-then-remote priority
-    order the actual callers below resolve through.
+    ``generate_text`` (#773) for the try-local-then-remote fallback the
+    actual callers below go through.
 
     Cached per resolved URL rather than unconditionally: settings.routing_llm_url
     is configurable (#566), so if it changes after the first call — an operator
@@ -1194,49 +1195,17 @@ def _get_local_routing_client() -> LocalLLMClient:
     return _routing_client
 
 
-async def _resolve_routing_client(timeout: float | None = None) -> LocalLLMClient:
-    """Resolve the client a routing-tier call (query routing, conversation
-    titling, agent-activity summaries, person-fact filtering) should
-    actually use this call: the local llama-server (#566's
-    ``routing_llm_url``) if reachable, else the configured remote provider,
-    else the local client anyway (#773).
-
-    Never Anthropic, regardless of ``LIFEOS_LLM_BACKEND`` — same invariant
-    ``_get_local_routing_client`` already documents for these calls; this
-    only adds a second non-API fallback, it doesn't relax that boundary.
-
-    Returning the (unreachable) local client in the "neither" case is
-    deliberate, not an oversight: every existing caller already treats a
-    connection failure from that client as its own no-op/default signal
-    (`route()`'s keyword fallback, the titler's `except Exception`, etc.),
-    so this function raising instead would be a new failure mode none of
-    them expect.
-
-    A per-call ``timeout`` builds a transient local candidate instead of
-    reusing the cached singleton (matches ``generate_text``'s existing
-    "don't let a slow one-off call affect the default-timeout cache"
-    rule) — three of the four real callers pass one today, so this branch
-    is the common case, not an edge case.
-    """
-    local_client = (
-        LocalLLMClient(base_url=settings.routing_llm_url, timeout=timeout)
-        if timeout is not None
-        else _get_local_routing_client()
+def _remote_routing_client(timeout: float | None = None) -> LocalLLMClient:
+    """Build the fallback client for a routing-tier call (#773): a
+    LocalLLMClient pointed at the configured remote provider. Callers must
+    check ``settings.remote_llm_configured`` first — this always
+    constructs a client, even against empty settings."""
+    return LocalLLMClient(
+        base_url=settings.remote_llm_base_url,
+        model=settings.remote_llm_model,
+        api_key=settings.remote_llm_api_key,
+        timeout=timeout or settings.remote_llm_timeout,
     )
-    try:
-        local_available = await local_client.ais_available()
-    except Exception:
-        local_available = False
-    if local_available:
-        return local_client
-    if settings.remote_llm_configured:
-        return LocalLLMClient(
-            base_url=settings.remote_llm_base_url,
-            model=settings.remote_llm_model,
-            api_key=settings.remote_llm_api_key,
-            timeout=timeout or settings.remote_llm_timeout,
-        )
-    return local_client
 
 
 def extract_json(text: str) -> dict:
@@ -1299,23 +1268,47 @@ async def generate_text(
     """Generate raw text from a routing-tier LLM.
 
     Replaces ``OllamaClient.generate(...)`` for routing / validation callers.
-    Resolves through ``_resolve_routing_client`` (#773): the local
-    llama-server (``settings.routing_llm_url``, still the #566 override
-    point) if reachable, else the configured remote provider, else the
-    local client anyway. A per-call ``timeout`` uses a transient client so
-    concurrent default-timeout calls aren't affected.
+    Tries the local llama-server (``settings.routing_llm_url``, still the
+    #566 override point) first — on a reachable local server this is
+    byte-for-byte the same single request as before #773, no added probe or
+    round trip. Only if that call itself fails does it retry once against
+    the configured remote provider (#773); if remote isn't configured
+    either, the local failure propagates exactly as it did before this
+    fallback existed, so every existing caller's own no-op/default handling
+    (`route()`'s keyword fallback, the titler's `except Exception`, etc.)
+    still applies unchanged. Never Anthropic, regardless of
+    ``LIFEOS_LLM_BACKEND`` — same invariant ``_get_local_routing_client``
+    already documents for these calls.
+
+    A per-call ``timeout`` uses a transient local client so concurrent
+    default-timeout calls aren't affected — three of the four real callers
+    pass one today, so this branch is the common case, not an edge case.
     ``enable_thinking``/``reasoning_effort`` are forwarded to
     ``LocalLLMClient.acreate`` unchanged — see ``_reasoning_control_payload``;
     both default to ``None`` (unset).
     """
-    client = await _resolve_routing_client(timeout)
-    response = await client.acreate(
+    local_client = (
+        LocalLLMClient(base_url=settings.routing_llm_url, timeout=timeout)
+        if timeout is not None
+        else _get_local_routing_client()
+    )
+    kwargs = dict(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
         temperature=temperature,
         enable_thinking=enable_thinking,
         reasoning_effort=reasoning_effort,
     )
+    try:
+        response = await local_client.acreate(**kwargs)
+    except Exception:
+        if not settings.remote_llm_configured:
+            raise
+        logger.warning(
+            "Routing-tier local LLM call failed; falling back to the "
+            "configured remote provider at %s", settings.remote_llm_base_url,
+        )
+        response = await _remote_routing_client(timeout).acreate(**kwargs)
     if response.reasoning_starved:
         logger.warning(
             "LLM reasoning starved the response: spent the entire %d-token budget "
@@ -1357,12 +1350,12 @@ def is_local_routing_llm_available() -> bool:
     """Sync availability check for routing/validation callers.
 
     True if either the local llama-server is reachable or the remote
-    provider is configured (#773) — the same priority order
-    ``_resolve_routing_client`` uses to pick the actual client, so a caller
-    gating on this doesn't skip straight to its no-op fallback while a
-    working remote provider sits unused. Remote is checked by
-    configuration, not a live probe — see ``LocalLLMClient.is_available``'s
-    own "remote is used unprobed, by design" note.
+    provider is configured (#773), so a caller gating on this doesn't skip
+    straight to its no-op fallback while ``generate_text``'s own
+    local-then-remote retry has a working remote provider to fall back to.
+    Remote is checked by configuration, not a live probe — see
+    ``LocalLLMClient.is_available``'s own "remote is used unprobed, by
+    design" note.
     """
     try:
         if _get_local_routing_client().is_available():

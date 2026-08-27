@@ -15,8 +15,9 @@ llama-server and never touches the paid Claude API, regardless of
 `LIFEOS_LLM_BACKEND` — the established pattern in this codebase for cheap,
 auxiliary, non-user-facing LLM calls. When the local server is unreachable,
 `generate_text()` falls back to the configured remote provider instead of
-silently doing nothing (`_resolve_routing_client`, #773 — this used to be
-pinned to local only, #716's original bug for this exact caller). That means
+silently doing nothing (`generate_text`'s local-then-remote retry, #773 —
+this used to be pinned to local only, #716's original bug for this exact
+caller). That means
 titling works on a no-Anthropic-key install (local, remote, or Hermes-backend
 chat) and never touches the paid API path. Thinking is explicitly disabled
 (`enable_thinking=False`), matching query_router's routing call — titling is
