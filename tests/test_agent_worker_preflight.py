@@ -975,11 +975,12 @@ def test_preflight_engine_remote_configured_builds_remote_client(monkeypatch):
 
 
 @pytest.mark.unit
-def test_preflight_engine_remote_unconfigured_falls_back_to_auto(monkeypatch, caplog):
-    """engine="remote" but the provider isn't configured -> one warning,
-    then run today's `auto` chain (here: Anthropic, since a key is
-    present) rather than raising."""
-    import logging
+def test_preflight_engine_remote_unconfigured_raises_instead_of_falling_back(monkeypatch):
+    """engine="remote" but the provider isn't configured -> raise (fail
+    closed). A forced engine must never silently revert to the `auto`
+    chain — with an Anthropic key present that would mean API spend the
+    operator explicitly opted out of. `run_preflight` degrades the raise
+    to routing=ask, which is the visible outcome the operator should get."""
     from config.settings import settings
     from api.services.llm_client import AnthropicLLMClient, LocalLLMClient
 
@@ -991,28 +992,17 @@ def test_preflight_engine_remote_unconfigured_falls_back_to_auto(monkeypatch, ca
     monkeypatch.setattr(settings, "anthropic_api_key", "test-anthropic-key", raising=False)
     monkeypatch.setattr(settings, "agent_preflight_model", "claude-haiku-4-5", raising=False)
 
-    def fake_init(self, api_key=None, model=None):
-        pass
-
-    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
-        return _FakeLLMResponse("anthropic reply")
-
-    monkeypatch.setattr(AnthropicLLMClient, "__init__", fake_init)
-    monkeypatch.setattr(AnthropicLLMClient, "create", fake_create)
+    def _forbidden_anthropic(self, *a, **kw):
+        raise AssertionError("forced remote engine must never construct the Anthropic client")
 
     def _forbidden_probe(self):
-        raise AssertionError("falling back to auto with a key present must not probe local")
+        raise AssertionError("forced remote engine must never fall back to local")
 
+    monkeypatch.setattr(AnthropicLLMClient, "__init__", _forbidden_anthropic)
     monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
 
-    with caplog.at_level(logging.WARNING, logger="api.services.agent_worker.preflight"):
-        result = pf._default_llm_caller("some prompt")
-
-    assert result == "anthropic reply"
-    assert any(
-        "remote" in rec.message.lower() and "not configured" in rec.message.lower()
-        for rec in caplog.records
-    )
+    with pytest.raises(RuntimeError, match="remote provider is not configured"):
+        pf._default_llm_caller("some prompt")
 
 
 @pytest.mark.unit
@@ -1048,11 +1038,9 @@ def test_preflight_engine_anthropic_forced(monkeypatch):
 
 
 @pytest.mark.unit
-def test_preflight_engine_anthropic_unconfigured_falls_back_to_auto(monkeypatch, caplog):
-    """engine="anthropic" but no key configured -> one warning, then run
-    today's `auto` chain (here: local, since it's reachable and no remote
-    provider is configured)."""
-    import logging
+def test_preflight_engine_anthropic_unconfigured_raises_instead_of_falling_back(monkeypatch):
+    """engine="anthropic" but no key configured -> raise (fail closed),
+    never a silent hop to local or the remote provider."""
     from config.settings import settings
     from api.services.llm_client import LocalLLMClient
 
@@ -1063,25 +1051,13 @@ def test_preflight_engine_anthropic_unconfigured_falls_back_to_auto(monkeypatch,
     monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
     monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
 
-    monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: True)
+    def _forbidden_probe(self):
+        raise AssertionError("forced anthropic engine must never fall back to local")
 
-    captured = {}
+    monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
 
-    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
-        captured["model"] = self.model
-        return _FakeLLMResponse("local reply")
-
-    monkeypatch.setattr(LocalLLMClient, "create", fake_create)
-
-    with caplog.at_level(logging.WARNING, logger="api.services.agent_worker.preflight"):
-        result = pf._default_llm_caller("some prompt")
-
-    assert result == "local reply"
-    assert captured["model"] == "local"
-    assert any(
-        "anthropic" in rec.message.lower() and "no anthropic api key" in rec.message.lower()
-        for rec in caplog.records
-    )
+    with pytest.raises(RuntimeError, match="no Anthropic API key"):
+        pf._default_llm_caller("some prompt")
 
 
 @pytest.mark.unit

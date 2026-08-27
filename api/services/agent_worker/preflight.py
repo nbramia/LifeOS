@@ -449,10 +449,11 @@ def _default_llm_caller(prompt: str) -> str:
       `settings.remote_llm_configured`. A failure of the call itself (bad
       key, endpoint down, ...) is not caught here — it propagates up to
       `run_preflight`'s existing except-clause, same as every other engine.
-      When the provider is merely unconfigured, this logs one warning and
-      falls through to run the `auto` order instead of raising outright.
+      When the provider is unconfigured this raises — a forced engine
+      never silently reverts to another one (and never to the Anthropic
+      API); `run_preflight`'s except-clause degrades it to routing=ask.
     - `anthropic`: force the Anthropic branch when a key is configured. When
-      no key is configured, logs one warning and falls through to `auto`.
+      no key is configured, raises (same fail-closed rule as `remote`).
     - `local`: force the local llama client. Still probed via
       `is_available()` exactly like the `auto` chain's own local branch —
       this is a forced engine with no further engine to fall back to, so an
@@ -480,12 +481,15 @@ def _default_llm_caller(prompt: str) -> str:
                 temperature=0.0,
             )
             return response.text
-        logger.warning(
+        # Fail closed (#808): a forced engine never silently reverts to
+        # another one — in particular never to the Anthropic API, which is
+        # exactly the spend `remote` exists to avoid. `run_preflight`'s
+        # except-clause degrades this to sane=False/routing=ask, so the
+        # operator sees a confirmation question, not a surprise API bill.
+        raise RuntimeError(
             "LIFEOS_AGENT_PREFLIGHT_ENGINE=remote but the remote provider "
-            "is not configured (remote_llm_configured=False) — falling "
-            "back to the auto order"
+            "is not configured (LIFEOS_REMOTE_LLM_*)"
         )
-        # fall through to the auto chain below
 
     elif engine == "anthropic":
         if settings.anthropic_api_key:
@@ -498,11 +502,10 @@ def _default_llm_caller(prompt: str) -> str:
                 temperature=0.0,
             )
             return response.text
-        logger.warning(
+        raise RuntimeError(
             "LIFEOS_AGENT_PREFLIGHT_ENGINE=anthropic but no Anthropic API "
-            "key is configured — falling back to the auto order"
+            "key is configured"
         )
-        # fall through to the auto chain below
 
     elif engine == "local":
         from api.services.llm_client import LocalLLMClient
@@ -520,8 +523,7 @@ def _default_llm_caller(prompt: str) -> str:
         )
         return response.text
 
-    # engine == "auto", or fell through from an unconfigured "remote"/
-    # "anthropic" forced engine above.
+    # engine == "auto".
     if settings.anthropic_api_key:
         # Import inside the branch so tests that monkeypatch run_preflight
         # don't need the Anthropic SDK installed, and so a no-key install
