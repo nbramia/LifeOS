@@ -1447,3 +1447,17 @@ class TestSyncLock:
                 run_all_syncs.main()
 
         assert seen["locked"] is True
+
+    def test_sync_lock_path_defaults_to_a_host_wide_location(self):
+        """Found on review: a lock keyed to this file's own checkout
+        location is invisible to a deploy check running from a DIFFERENT
+        git worktree (this repo is routinely worked in several). The
+        module-level default must live under $HOME, not this file's own
+        parent directory."""
+        import os as _os
+        from scripts import run_all_syncs
+
+        if "LIFEOS_SYNC_LOCK" in _os.environ:
+            pytest.skip("LIFEOS_SYNC_LOCK is set in this environment")
+        from pathlib import Path as _Path
+        assert run_all_syncs.SYNC_LOCK_PATH == _Path.home() / ".lifeos" / "sync.lock"

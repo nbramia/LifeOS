@@ -32,6 +32,7 @@ import argparse
 import fcntl
 import json
 import logging
+import os
 import re
 import signal
 import subprocess
@@ -343,7 +344,16 @@ _llm_was_running_before_sync: bool = False
 # tests can `patch("scripts.run_all_syncs.SYNC_LOCK_PATH", ...)` to point it
 # at an isolated file, the same pattern test_run_all_syncs.py already uses
 # for SYNC_SOURCES/SYNC_ORDER.
-SYNC_LOCK_PATH = Path(__file__).parent.parent / "data" / "sync.lock"
+#
+# Host-wide (under $HOME, not this file's own repo checkout) — found on
+# review: this repo is routinely worked in multiple git worktrees, each with
+# its own checkout-local data/ directory. A lock keyed to this file's own
+# location would be invisible to auto-deploy.sh running from a DIFFERENT
+# checkout, which would then restart services on top of a sync it can't see
+# — exactly the OOM host-freeze this whole mechanism exists to prevent.
+# Overridable via LIFEOS_SYNC_LOCK, matching auto-deploy.sh's and
+# auto-update-macos.sh's identical override for the same path.
+SYNC_LOCK_PATH = Path(os.environ.get("LIFEOS_SYNC_LOCK", str(Path.home() / ".lifeos" / "sync.lock")))
 
 # Kept open for the process's entire lifetime once acquired — the lock lives
 # on this file descriptor, not in any content written to the file. Module

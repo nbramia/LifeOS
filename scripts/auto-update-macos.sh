@@ -55,7 +55,10 @@ PLIST_PATH="${LIFEOS_PLIST_PATH:-$HOME/Library/LaunchAgents/$PLIST_NAME.plist}"
 ENV_MTIME_APPLIED_FILE="${LIFEOS_MACOS_ENV_APPLIED_FILE:-$PROJECT_DIR/data/macos-env-mtime-applied}"
 # Advisory lock shared with scripts/run_all_syncs.py (#793) and
 # scripts/auto-deploy.sh — see sync_in_progress_lock_acquire() below.
-SYNC_LOCK_FILE="$PROJECT_DIR/data/sync.lock"
+# Host-wide (under $HOME, not $PROJECT_DIR/data) — same path auto-deploy.sh
+# uses, and for the same reason: a sync launched from a different checkout
+# of this repo must still be visible here. Overridable via LIFEOS_SYNC_LOCK.
+SYNC_LOCK_FILE="${LIFEOS_SYNC_LOCK:-$HOME/.lifeos/sync.lock}"
 # Non-interactive git over SSH: fail fast instead of prompting for a passphrase.
 export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new'
 

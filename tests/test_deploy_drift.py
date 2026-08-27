@@ -228,9 +228,17 @@ def test_post_commit_normal_commit_api_change_still_restarts(tmp_path: Path):
 def _run_sourced(repo: Path, call: str, env_extra: dict | None = None) -> subprocess.CompletedProcess:
     """Source auto-deploy.sh (defines functions only — see module docstring)
     then run `call`. cwd=repo so PROJECT_DIR-relative git/file operations
-    inside the helpers see the synthetic repo, not the real one."""
+    inside the helpers see the synthetic repo, not the real one.
+
+    LIFEOS_SYNC_LOCK defaults to a path under the synthetic repo (#793's
+    lock is host-wide under $HOME by default — found on review — so tests
+    must opt back into isolation explicitly rather than touching the real
+    machine's actual lock file). A test that specifically exercises the
+    real cross-checkout default (host-wide, not overridden) passes its own
+    env_extra without this key, or unsets it."""
     script = repo / "scripts" / "auto-deploy.sh"
     env = dict(os.environ)
+    env["LIFEOS_SYNC_LOCK"] = str(repo / "data" / "sync.lock")
     env.update(env_extra or {})
     return subprocess.run(
         ["bash", "-c", f'source "{script}" && {call}'],
@@ -649,6 +657,63 @@ def test_two_overlapping_syncs_are_both_recognized_as_in_progress(tmp_path: Path
 
 
 @pytest.mark.unit
+def test_lock_is_visible_across_two_different_checkouts_sharing_home(tmp_path: Path):
+    """Finding 2 (review): the lock must be host-wide, not keyed to
+    $PROJECT_DIR/data — this repo is routinely worked in multiple git
+    worktrees, each with its own checkout-local data/ directory, so a lock
+    keyed to PROJECT_DIR is invisible across checkouts. A sync launched
+    from checkout B must still defer a deploy running from checkout A.
+    Two independent synthetic checkouts share $HOME (so the real default
+    $HOME/.lifeos/sync.lock path — deliberately NOT overridden via
+    LIFEOS_SYNC_LOCK here — resolves identically for both) but each has
+    its own PROJECT_DIR, proving cross-checkout visibility without
+    touching the real machine's actual lock file (HOME points at an
+    isolated sandbox for the duration of this test)."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    shared_home = tmp_path / "home"
+    shared_home.mkdir()
+    checkout_a = _make_repo_for_drift(tmp_path / "checkout-a")
+    checkout_b = _make_repo_for_drift(tmp_path / "checkout-b")
+
+    default_lock_path = shared_home / ".lifeos" / "sync.lock"
+    default_lock_path.parent.mkdir(parents=True)
+
+    env = dict(os.environ)
+    env["HOME"] = str(shared_home)
+    # Deliberately no LIFEOS_SYNC_LOCK override — exercising the real
+    # default path, not test isolation.
+
+    holder = _start_shared_lock_holder(default_lock_path, seconds=5)
+    try:
+        _wait_until_lock_held(default_lock_path)
+        script_a = checkout_a / "scripts" / "auto-deploy.sh"
+        result = subprocess.run(
+            ["bash", "-c", f'source "{script_a}" && sync_in_progress_lock_acquire; echo "rc=$?"'],
+            cwd=checkout_a, env=env, capture_output=True, text=True, timeout=30,
+        )
+        assert "rc=0" in result.stdout, result.stdout  # deferred: sees checkout B's sync
+
+        # And checkout B's OWN auto-deploy.sh sees it too, of course.
+        script_b = checkout_b / "scripts" / "auto-deploy.sh"
+        result_b = subprocess.run(
+            ["bash", "-c", f'source "{script_b}" && sync_in_progress_lock_acquire; echo "rc=$?"'],
+            cwd=checkout_b, env=env, capture_output=True, text=True, timeout=30,
+        )
+        assert "rc=0" in result_b.stdout, result_b.stdout
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+
+    # Once released, both checkouts see it as free again.
+    result_after = subprocess.run(
+        ["bash", "-c", f'source "{checkout_a / "scripts" / "auto-deploy.sh"}" && sync_in_progress_lock_acquire; echo "rc=$?"'],
+        cwd=checkout_a, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert "rc=1" in result_after.stdout, result_after.stdout
+
+
+@pytest.mark.unit
 def test_lock_release_allows_a_subsequent_acquire(tmp_path: Path):
     if not AUTO_DEPLOY.exists():
         pytest.skip("scripts/auto-deploy.sh not present")
@@ -894,13 +959,16 @@ def _write_policy_stubs(state: Path) -> Path:
     return bindir
 
 
-def _run_main(repo: Path, state: Path, venv: Path) -> subprocess.CompletedProcess:
+def _run_main(repo: Path, state: Path, venv: Path, env_extra: dict | None = None) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["PATH"] = f"{_write_policy_stubs(state)}:{env['PATH']}"
     env["LIFEOS_TEST_STATE"] = str(state)
     env["LIFEOS_VENV"] = str(venv)
     env["LIFEOS_AGENT_SESSIONS_DB"] = str(repo / "data" / "agent_sessions.db")
     env["PYTHONPATH"] = str(REPO_ROOT)
+    # Isolated by default — see _run_sourced()'s comment on LIFEOS_SYNC_LOCK.
+    env["LIFEOS_SYNC_LOCK"] = str(repo / "data" / "sync.lock")
+    env.update(env_extra or {})
     return subprocess.run(
         ["bash", "-c", "source scripts/auto-deploy.sh && main"],
         cwd=repo, env=env, capture_output=True, text=True, timeout=30,

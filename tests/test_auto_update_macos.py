@@ -52,9 +52,15 @@ def _make_repo_for_macos(tmp_path: Path) -> Path:
 
 def _run_sourced(repo: Path, call: str, env_extra: dict | None = None) -> subprocess.CompletedProcess:
     """Source auto-update-macos.sh (defines functions only) then run `call`.
-    cwd=repo so PROJECT_DIR-relative operations see the synthetic repo."""
+    cwd=repo so PROJECT_DIR-relative operations see the synthetic repo.
+
+    LIFEOS_SYNC_LOCK defaults to a path under the synthetic repo (#793's
+    lock is host-wide under $HOME by default — found on review — so tests
+    must opt back into isolation explicitly rather than touching the real
+    machine's actual lock file)."""
     script = repo / "scripts" / "auto-update-macos.sh"
     env = dict(os.environ)
+    env["LIFEOS_SYNC_LOCK"] = str(repo / "data" / "sync.lock")
     env.update(env_extra or {})
     return subprocess.run(
         ["bash", "-c", f'source "{script}" && {call}'],
@@ -265,11 +271,13 @@ def test_lock_acquire_defers_when_another_instance_of_this_script_holds_it(tmp_p
     repo = _make_repo_for_macos(tmp_path)
     (repo / "data").mkdir(exist_ok=True)
     lock_path = repo / "data" / "sync.lock"
+    holder_env = dict(os.environ)
+    holder_env["LIFEOS_SYNC_LOCK"] = str(lock_path)
     holder = subprocess.Popen(
         ["bash", "-c",
          f'source "{repo / "scripts" / "auto-update-macos.sh"}" && '
          'sync_in_progress_lock_acquire; sleep 5'],
-        cwd=repo,
+        cwd=repo, env=holder_env,
     )
     try:
         _wait_until_lock_held(lock_path)
@@ -685,6 +693,7 @@ def _run_main_macos(
         'curl() { return 0; }; '
     )
     env = dict(os.environ)
+    env["LIFEOS_SYNC_LOCK"] = str(repo / "data" / "sync.lock")
     env.update(env_extra or {})
     return subprocess.run(
         ["bash", "-c", f'source scripts/auto-update-macos.sh && {quiet_stubs}{extra_stubs} main'],
@@ -774,15 +783,17 @@ def test_main_lock_is_released_when_api_service_not_running(tmp_path: Path):
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo, _origin, _code_epoch = _make_policy_repo_macos(tmp_path)
+    lock_path = repo / "data" / "sync.lock"
+    env = dict(os.environ)
+    env["LIFEOS_SYNC_LOCK"] = str(lock_path)
     result = subprocess.run(
         ["bash", "-c",
          'source scripts/auto-update-macos.sh && '
          'api_active_since_epoch() { return 1; }; '
          'launchctl() { return 0; }; api_pid() { echo ""; }; curl() { return 0; }; main'],
-        cwd=repo, capture_output=True, text=True, timeout=30,
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
-    lock_path = repo / "data" / "sync.lock"
     assert lock_path.exists()
     probe = subprocess.run(["flock", "-x", "-n", str(lock_path), "-c", "true"])
     assert probe.returncode == 0, "lock was left held after an early exit"

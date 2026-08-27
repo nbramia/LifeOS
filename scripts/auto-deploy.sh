@@ -36,8 +36,18 @@ ENV_FILE="$PROJECT_DIR/.env"
 VENV_DIR="${LIFEOS_VENV:-$HOME/.venvs/lifeos}"
 # Advisory lock shared with scripts/run_all_syncs.py (#793) — see
 # sync_in_progress_lock_acquire() below for why this replaced a
-# pid-in-a-file marker.
-SYNC_LOCK_FILE="$PROJECT_DIR/data/sync.lock"
+# pid-in-a-file marker. Host-wide (under $HOME, not $PROJECT_DIR/data) —
+# found on review: this repo is routinely worked in multiple git worktrees
+# (each with its own checkout-local data/ directory), so a lock keyed to
+# PROJECT_DIR is invisible across checkouts. A sync launched from one
+# worktree would leave a deploy running from another worktree completely
+# unaware — taking an uncontended lock and restarting on top of a live
+# sync, exactly the OOM host-freeze this whole mechanism exists to prevent.
+# One shared path under $HOME is visible to every checkout on the host, the
+# same way the old pgrep-based check was (host-wide by construction, for
+# all its other faults). Overridable via LIFEOS_SYNC_LOCK for anything
+# unusual (containers, multiple LifeOS installs under one user).
+SYNC_LOCK_FILE="${LIFEOS_SYNC_LOCK:-$HOME/.lifeos/sync.lock}"
 # Non-interactive git over SSH: fail fast instead of prompting for a passphrase.
 export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new'
 
