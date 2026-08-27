@@ -23,7 +23,7 @@ import {
   initVoice, submitTurn, checkForWakeWord,
   checkEndpointCandidate, isTranscriptComplete, finalizeEndpointing,
   isCancelUtterance, isListenTapRunning, isListenTrackEnabled, isEndpointTapActive,
-  finalizeIdleTimeout, cancelActiveTurn,
+  finalizeIdleTimeout, cancelActiveTurn, hasHeldRecording,
 } from './voice.js';
 import { initBackend } from './backend.js';
 import { initModel, onModelChange } from './model.js';
@@ -106,5 +106,5 @@ window.lifeChatVoice = {
   submitTurn, checkForWakeWord,
   checkEndpointCandidate, isTranscriptComplete, finalizeEndpointing,
   isCancelUtterance, isListenTapRunning, isListenTrackEnabled, isEndpointTapActive,
-  finalizeIdleTimeout, cancelActiveTurn,
+  finalizeIdleTimeout, cancelActiveTurn, hasHeldRecording,
 };
