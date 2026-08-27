@@ -369,6 +369,12 @@ async def health_check():
         # since this field only ever meant the Anthropic key specifically.
         "api_key_configured": bool(settings.anthropic_api_key and settings.anthropic_api_key.strip()),
         "reminder_scheduler": _reminder_scheduler.is_alive() if _reminder_scheduler else False,
+        # Distinct from reminder_scheduler (the delivery thread, gated on
+        # Telegram being configured): this is the file watcher that picks up
+        # vault edits (e.g. via Obsidian) and re-indexes them, starts
+        # unconditionally, and previously had no liveness signal of its own
+        # (#766).
+        "scheduler_watcher": _scheduler_watcher.is_alive() if _scheduler_watcher else False,
     }
 
     all_healthy = all(checks.values())

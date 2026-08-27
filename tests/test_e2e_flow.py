@@ -218,6 +218,52 @@ class TestHealthCheck:
             assert data['status'] == 'degraded'
             assert not data['checks']['api_key_configured']
 
+    def test_health_reports_scheduler_watcher_liveness_distinct_from_reminder_scheduler(self):
+        """#766: the scheduler file watcher's liveness is a separate field
+        from reminder_scheduler (the delivery thread) — a watcher that's
+        down must be visible even when delivery is fine, and vice versa."""
+        from fastapi.testclient import TestClient
+        from unittest.mock import patch, MagicMock
+
+        from api.main import app
+        import api.main as main
+        client = TestClient(app)
+
+        alive_scheduler = MagicMock()
+        alive_scheduler.is_alive.return_value = True
+        dead_watcher = MagicMock()
+        dead_watcher.is_alive.return_value = False
+
+        with patch.object(main, "_reminder_scheduler", alive_scheduler), \
+             patch.object(main, "_scheduler_watcher", dead_watcher):
+            response = client.get("/health")
+            data = response.json()
+            assert data['checks']['reminder_scheduler'] is True
+            assert data['checks']['scheduler_watcher'] is False
+            assert data['status'] == 'degraded'
+
+        alive_watcher = MagicMock()
+        alive_watcher.is_alive.return_value = True
+
+        with patch.object(main, "_reminder_scheduler", alive_scheduler), \
+             patch.object(main, "_scheduler_watcher", alive_watcher):
+            response = client.get("/health")
+            data = response.json()
+            assert data['checks']['scheduler_watcher'] is True
+
+    def test_health_scheduler_watcher_false_when_never_started(self):
+        from fastapi.testclient import TestClient
+        from unittest.mock import patch
+
+        from api.main import app
+        import api.main as main
+        client = TestClient(app)
+
+        with patch.object(main, "_scheduler_watcher", None):
+            response = client.get("/health")
+            data = response.json()
+            assert data['checks']['scheduler_watcher'] is False
+
 
 class TestRealUserFlow:
     """

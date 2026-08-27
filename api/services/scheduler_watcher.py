@@ -108,3 +108,11 @@ class SchedulerWatcher:
             self._observer.stop()
             self._observer.join(timeout=5)
             self._observer = None
+
+    def is_alive(self) -> bool:
+        """Liveness for health reporting (#766) — mirrors
+        SchedulerScheduler.is_alive()'s shape. `Observer` is itself a
+        `threading.Thread` subclass, so this is the same "does the thread
+        that's supposed to be running still exist and hasn't died" check,
+        just for the file watcher instead of the delivery thread."""
+        return self._observer is not None and self._observer.is_alive()

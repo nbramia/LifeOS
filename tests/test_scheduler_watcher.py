@@ -91,6 +91,36 @@ class TestHandlerScheduling:
         assert set(calls) == {"/x/Old.md", "/x/New.md"}
 
 
+class TestIsAlive:
+    """Liveness reporting for /health (#766)."""
+
+    def test_false_before_start(self, store):
+        watcher = SchedulerWatcher(scheduler_dir=store.scheduler_dir)
+        assert watcher.is_alive() is False
+
+    def test_true_after_start(self, store):
+        watcher = SchedulerWatcher(scheduler_dir=store.scheduler_dir)
+        watcher.start()
+        try:
+            assert watcher.is_alive() is True
+        finally:
+            watcher.stop()
+
+    def test_false_after_stop(self, store):
+        watcher = SchedulerWatcher(scheduler_dir=store.scheduler_dir)
+        watcher.start()
+        watcher.stop()
+        assert watcher.is_alive() is False
+
+    def test_false_when_scheduler_dir_missing(self, tmp_path):
+        """start() logs a warning and returns early when the directory
+        doesn't exist, leaving _observer unset — is_alive() must reflect
+        that rather than raising."""
+        watcher = SchedulerWatcher(scheduler_dir=tmp_path / "does_not_exist")
+        watcher.start()
+        assert watcher.is_alive() is False
+
+
 class TestEndToEnd:
     def test_external_edit_propagates_to_store(self, store):
         entry = store.create(name="Watch me", schedule_type="cron",
