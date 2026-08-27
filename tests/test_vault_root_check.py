@@ -127,6 +127,7 @@ class TestCheckVaultRootSanity:
         from api.services import vectorstore as vs
 
         old_location = tmp_path / "old_vault_location"
+        configured_root = tmp_path / "vault"
 
         class _StubStore:
             def sample_file_paths(self, limit=5):
@@ -135,18 +136,20 @@ class TestCheckVaultRootSanity:
         monkeypatch.setattr(vs, "get_vector_store", lambda: _StubStore())
 
         check = {"status": "ok", "latency_ms": 5, "detail": "1 results"}
-        main._check_vault_root_sanity(check, tmp_path / "vault")
+        main._check_vault_root_sanity(check, configured_root)
 
         assert check["status"] == "degraded"
         # The original request/response detail is preserved unchanged — the
         # mismatch is reported in a separate field, not a replacement.
         assert check["detail"] == "1 results"
         assert "1/1" in check["vault_root_check"]
-        # The mismatched path itself must never appear in the response —
-        # /health/full is unauthenticated, and a real indexed path can
-        # reveal personal folder/file names.
+        # Neither the mismatched path nor the configured vault root itself
+        # may appear in the response — /health/full is unauthenticated, and
+        # either one can reveal personal folder/file names or the operator's
+        # home directory layout.
         assert "old_vault_location" not in check["vault_root_check"]
         assert "note.md" not in check["vault_root_check"]
+        assert str(configured_root.resolve()) not in check["vault_root_check"]
 
     def test_leaves_ok_unchanged_when_paths_match(self, monkeypatch, tmp_path):
         import api.main as main

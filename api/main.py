@@ -470,13 +470,15 @@ def _check_vault_root_sanity(vault_search_check: "dict | None", vault_path) -> N
         all_match, mismatched = sample_paths_match_vault_root(sample, vault_path)
         if not all_match:
             vault_search_check["status"] = "degraded"
-            # Deliberately omit the mismatched paths themselves — this is an
-            # unauthenticated endpoint and a real indexed file path can
-            # reveal personal folder/file names (#697 review). The counts
-            # plus the configured root are enough for an operator to act on.
+            # Deliberately omit the mismatched paths and the configured root
+            # itself — this is an unauthenticated endpoint, a real indexed
+            # file path can reveal personal folder/file names, and the vault
+            # root is typically an absolute path under the user's home
+            # directory (#697 review). The counts alone are enough for an
+            # operator to act on.
             vault_search_check["vault_root_check"] = (
                 f"{len(mismatched)}/{len(sample)} sampled indexed path(s) fall outside "
-                f"the configured vault root ({vault_path.resolve()})"
+                "the configured vault root"
             )
     except Exception as e:
         # Never let this additive sanity check take down the primary
