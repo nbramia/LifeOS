@@ -99,6 +99,15 @@ Query routing, fact filtering, and entity-cleanup auto-hide decisions always go 
 
 `LocalLLMClient.create`/`acreate`/`astream` (and the `generate_text`/`generate_json` routing helpers) also accept per-request `enable_thinking` (bool) and `reasoning_effort` (str) keyword arguments, sent as `chat_template_kwargs: {"enable_thinking": ...}` and `reasoning_effort` on the request body. Leaving both unset adds no new keys to the request — existing callers are unaffected.
 
+### Document Summarization Target (#742/#775)
+
+The indexer's document-summary generation (`api/services/summarizer.py`) talks to an OpenAI-compatible endpoint directly, independent of `LIFEOS_LLM_BACKEND` and the routing target above. `llama-server` ignores the request's `model` field (one model per process); Ollama does not and rejects a request naming a model it isn't serving — this pair exists so an Ollama-only host (no `llama-server`) can still get document summaries.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_SUMMARIZER_LLM_URL` | str | — (falls back to `LIFEOS_LOCAL_LLM_URL`) | Dedicated endpoint for summarization requests. Point it at an Ollama server (e.g. `http://localhost:11434`) on a host with no `llama-server`. |
+| `LIFEOS_SUMMARIZER_MODEL` | str | `local` | Model name sent in the summarization request body. The default is a placeholder `llama-server` ignores; an Ollama endpoint requires a real tag (e.g. `qwen2.5:3b-instruct`). Also backs the chat-answer synthesizer's usage-event `model` label (`api/services/synthesizer.py`) — a cosmetic reuse for consistency, not a second wire-protocol call site. |
+
 ## Embedding & Search
 
 Encoder model selection and search-pipeline knobs. Decision recorded in [ADR-012](../adr/012-embedding-pipeline.md).
