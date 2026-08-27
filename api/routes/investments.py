@@ -19,11 +19,13 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 
+from config.settings import settings
+
 router = APIRouter(prefix="/api/investments", tags=["investments"])
 
 logger = logging.getLogger(__name__)
 
-SYNC_DIR = os.path.expanduser("~/Code/Sync/investments")
+SYNC_DIR = os.path.expanduser(settings.investments_sync_dir)
 
 # Freshness alerting (#448): the macbook pipeline refreshes on weekdays (~18:30)
 # and Syncthing delivers here. A weekend plus the weekday cadence can leave the

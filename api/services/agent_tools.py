@@ -3184,7 +3184,7 @@ async def _tool_search_finances(inp: dict) -> str:
         # (see api/routes/investments.py). Read from disk — no client needed.
         import json as _json
         import os as _os
-        path = _os.path.expanduser("~/Code/Sync/investments/summary.json")
+        path = _os.path.expanduser(_os.path.join(settings.investments_sync_dir, "summary.json"))
         if not _os.path.exists(path):
             return "Investments snapshot not synced yet (macbook refresh hasn't run)."
         with open(path) as f:

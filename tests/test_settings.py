@@ -157,3 +157,28 @@ def test_monarch_vault_dir_from_env(monkeypatch):
 
     s = Settings()
     assert s.monarch_vault_dir == "Personal/Money/Monarch"
+
+
+def test_investments_sync_dir_default_matches_hardcoded_path():
+    """LIFEOS_INVESTMENTS_SYNC_DIR must default to exactly the path that was
+    previously hardcoded (~/Code/Sync/investments) in both api/routes/
+    investments.py and the search_finances 'investments' chat tool (#767) —
+    an install that never sets this var must see the same directory it
+    always has.
+
+    Asserts the FIELD default, not a live instance, so a host-level override
+    can't turn this into a false failure.
+    """
+    from config.settings import Settings
+
+    assert Settings.model_fields["investments_sync_dir"].default == "~/Code/Sync/investments"
+
+
+def test_investments_sync_dir_from_env(monkeypatch):
+    """LIFEOS_INVESTMENTS_SYNC_DIR should be configurable via env var, same
+    convention as LIFEOS_MONARCH_VAULT_DIR (#767)."""
+    monkeypatch.setenv("LIFEOS_INVESTMENTS_SYNC_DIR", "/tmp/some/other/investments")
+    from config.settings import Settings
+
+    s = Settings()
+    assert s.investments_sync_dir == "/tmp/some/other/investments"

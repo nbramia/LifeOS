@@ -1201,6 +1201,20 @@ class Settings(BaseSettings):
                     "LIFEOS_VAULT_PATH, same convention as LIFEOS_AGENT_OUTPUT_DIR."
     )
 
+    # Investments (Schwab pipeline snapshot, #767). A separate export pipeline
+    # (not part of this repo) writes summary.json/portfolio.json here; the API
+    # route and the search_finances "investments" tool both read from it.
+    # Defaults to the maintainer's existing Syncthing-synced folder so an
+    # unconfigured clone sees no data (clean "not synced" message) rather than
+    # an error, same convention as code_dir/monarch_vault_dir above.
+    investments_sync_dir: str = Field(
+        default="~/Code/Sync/investments",
+        alias="LIFEOS_INVESTMENTS_SYNC_DIR",
+        description="Directory summary.json/portfolio.json are read from for "
+                    "the investments API route and the search_finances "
+                    "'investments' chat tool action. Expanduser'd at read time."
+    )
+
     # Backup directory
     backup_path: str = Field(
         default="./data/backups",

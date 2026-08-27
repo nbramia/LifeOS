@@ -14,6 +14,7 @@ import pytest
 
 from api.routes import investments as inv
 from api.services.agent_tools import _tool_search_finances
+from config.settings import settings
 
 pytestmark = pytest.mark.unit
 
@@ -63,6 +64,55 @@ async def test_search_finances_investments_lists_all_positions(tmp_path, monkeyp
     assert "SPCX — SpaceX Class A (SPV)" in out
     # Positions without a desc (the FIL fillers) keep the bare-ticker line.
     assert "FIL01:" in out
+
+
+# ---------------------------------------------------------------------------
+# Configurable sync directory (#767) — default-matches-hardcoded-path is
+# covered by tests/test_settings.py; these cover the two call sites.
+# ---------------------------------------------------------------------------
+
+async def test_search_finances_investments_not_configured_is_clean(tmp_path, monkeypatch):
+    """When the configured directory has no summary.json, the tool returns a
+    clean message rather than raising."""
+    monkeypatch.setattr(settings, "investments_sync_dir", str(tmp_path / "nowhere"))
+    out = await _tool_search_finances({"action": "investments"})
+    assert "not synced yet" in out.lower()
+
+
+async def test_search_finances_investments_reads_configured_dir(tmp_path, monkeypatch):
+    """The chat-tool lookup honors LIFEOS_INVESTMENTS_SYNC_DIR (via settings),
+    not a hardcoded path, and reads the same directory the API route uses."""
+    monkeypatch.setattr(settings, "investments_sync_dir", str(tmp_path))
+    (tmp_path / "summary.json").write_text(json.dumps(_snapshot_with_many_positions()))
+
+    out = await _tool_search_finances({"action": "investments"})
+
+    assert "Positions (20):" in out
+
+
+def test_route_and_tool_resolve_same_configured_directory():
+    """The API route's SYNC_DIR (cached at import time) and the chat tool's
+    lookup (resolved per-call from settings.investments_sync_dir) must land
+    on the identical directory — no independent hardcoded path in either."""
+    tool_path = os.path.expanduser(os.path.join(settings.investments_sync_dir, "summary.json"))
+    assert os.path.dirname(tool_path) == inv.SYNC_DIR == os.path.expanduser(settings.investments_sync_dir)
+
+
+def test_route_sync_dir_tracks_the_setting_on_import(monkeypatch, tmp_path):
+    """SYNC_DIR is cached at module-import time from settings.investments_sync_dir
+    (not a separate hardcoded literal) — reloading the route module under a
+    changed setting must pick up the new directory."""
+    import importlib
+
+    monkeypatch.setattr(settings, "investments_sync_dir", str(tmp_path))
+    reloaded = importlib.reload(inv)
+    try:
+        assert reloaded.SYNC_DIR == str(tmp_path)
+    finally:
+        # Restore the real default and re-reload so later tests (and any
+        # module-level state other tests rely on) see the normal module back.
+        monkeypatch.undo()
+        importlib.reload(inv)
 
 
 def _write_summary(tmp_path, age_days: float):
