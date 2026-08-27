@@ -1112,6 +1112,25 @@
             cursor: pointer;
         }
 
+        /* Live-mic indicator on the Listening label (#813). Hidden unless
+           voice.js adds `.live`, which it does only while the wake tap is
+           actually holding an unsuspended capture — so the dot disappears
+           during playback/recording and whenever Listening is off, rather
+           than tracking the checkbox. Reuses the `pulse` keyframes the
+           header status dot already uses. */
+        .listen-dot {
+            display: none;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--success);
+        }
+
+        .listen-dot.live {
+            display: inline-block;
+            animation: pulse 1.4s ease-in-out infinite;
+        }
+
         /* Replayable voice responses (tap to replay) */
         .message.replayable {
             cursor: pointer;
@@ -2952,7 +2971,9 @@
                     <label class="dock-toggle"><input type="checkbox" id="voiceMute"> Mute</label>
                     <label class="dock-toggle"><input type="checkbox" id="voiceFast" checked> 2×</label>
                     <label class="dock-toggle"><input type="checkbox" id="voiceAuto" checked> Auto</label>
-                    <label class="dock-toggle"><input type="checkbox" id="voiceListen" checked> Listening</label>
+                    <!-- The dot only renders while the wake tap actually holds a
+                         live mic — see .listen-dot / updateListenIndicator(). -->
+                    <label class="dock-toggle"><input type="checkbox" id="voiceListen" checked> Listening<span class="listen-dot" id="voiceListenDot" role="status" aria-label="Microphone is live"></span></label>
                 </div>
             </div>
         </footer>
@@ -3194,6 +3215,7 @@
                     voiceFast: document.getElementById('voiceFast'),
                     voiceAuto: document.getElementById('voiceAuto'),
                     voiceListen: document.getElementById('voiceListen'),
+                    voiceListenDot: document.getElementById('voiceListenDot'),
                     modeTextBtn: document.getElementById('modeTextBtn'),
                     modeVoiceBtn: document.getElementById('modeVoiceBtn'),
                     backendLifeos: document.getElementById('backendLifeos'),
