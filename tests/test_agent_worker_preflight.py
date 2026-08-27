@@ -1057,3 +1057,152 @@ def test_default_route_tags_still_win(monkeypatch):
     result = pf.run_preflight(title="research dolphins", tags=["agent", "local"], caller=_stub(reply))
     assert result.routing == pf.ROUTE_LOCAL
     assert result.routing_reason == "#local tag present"
+
+
+# ---------------------------------------------------------------------------
+# #757 — an uncorroborated LLM-invented route must not bypass
+# LIFEOS_AGENT_DEFAULT_ROUTE. All tests explicitly monkeypatch
+# `settings.agent_default_route` rather than relying on ambient env (a
+# freshly-filed issue exists about the host's real .env leaking into tests).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_field_evidence_uncorroborated_local_route_demoted_to_default(monkeypatch):
+    """The exact field payload that motivated #757: LIFEOS_AGENT_DEFAULT_ROUTE
+    configured, the model returns routing="local" with a plausible-sounding
+    but non-cue reason, and the title has no rule-3 cue at all. The default
+    route must win, and the demotion must be recorded on `demoted_routing`
+    (and logged into the preflight transcript event by worker.py)."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "claude_code")
+    reply = _golden_reply(
+        routing="local",
+        routing_reason="Software implementation task suitable for local execution.",
+        routing_explicit=True,
+    )
+    title = (
+        "Implement in web/chat: in voice mode, render the user's transcribed "
+        "message as it streams in"
+    )
+    result = pf.run_preflight(title=title, tags=["agent"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_CLAUDE_CODE
+    assert result.demoted_routing == pf.ROUTE_LOCAL
+    assert "LIFEOS_AGENT_DEFAULT_ROUTE=claude_code" in result.routing_reason
+
+
+@pytest.mark.unit
+def test_default_route_ignores_explicit_flag_without_title_corroboration(monkeypatch):
+    """`routing_explicit=true` alone is not corroboration — same principle
+    #584 already applies to cloud, extended here to local/claude_code/codex.
+    A `true` with no matching title cue still gets demoted."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "claude_code")
+    reply = _golden_reply(
+        routing="local", routing_explicit=True, routing_reason="operator wants local",
+    )
+    result = pf.run_preflight(title="Refactor the sync pipeline", tags=["agent"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_CLAUDE_CODE
+    assert result.demoted_routing == pf.ROUTE_LOCAL
+
+
+@pytest.mark.unit
+def test_title_names_local_engine_corroborates_and_wins_over_default(monkeypatch):
+    """Title "using gemma" + default configured -> local wins (the operator
+    actually named the engine, via the prompt's own rule-3 cue)."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "claude_code")
+    reply = _golden_reply(
+        routing="local", routing_explicit=True, routing_reason="title says 'using gemma'",
+    )
+    result = pf.run_preflight(title="Summarize this using gemma", tags=["agent"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_LOCAL
+    assert result.demoted_routing is None
+
+
+@pytest.mark.unit
+def test_title_names_claude_code_corroborates_and_wins_over_default(monkeypatch):
+    """Title "use claude code" -> claude_code wins over a configured
+    default, even though preflight's own schema never asks the model to
+    emit `claude_code` directly — KNOWN_ROUTES accepts it defensively, so a
+    noncompliant model emitting it anyway still gets a corroboration check."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    reply = _golden_reply(
+        routing="claude_code", routing_explicit=True,
+        routing_reason="operator asked for claude code",
+    )
+    result = pf.run_preflight(
+        title="Use claude code to refactor this module", tags=["agent"], caller=_stub(reply),
+    )
+    assert result.routing == pf.ROUTE_CLAUDE_CODE
+    assert result.demoted_routing is None
+
+
+@pytest.mark.unit
+def test_corroborated_cloud_route_stands_even_with_default_route_configured(monkeypatch):
+    """Combined #584/#757 case: a title that genuinely names the engine
+    (rule 3) still dispatches straight to Claude even though a default
+    route is configured for something else. #757's corroboration gate is
+    out of scope for ROUTE_CLAUDE entirely — #584's own, older
+    corroboration check inside `_apply_tag_overrides` already governs it —
+    so a corroborated cloud route is untouched by #757 either way."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    result = pf.run_preflight(
+        "use claude to draft the email", tags=["agent"],
+        caller=_stub_caller(routing="claude", routing_explicit=True),
+    )
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.routing_explicit is True
+    assert result.demoted_routing is None
+
+
+@pytest.mark.unit
+def test_uncorroborated_cloud_inference_still_confirms_with_default_route_configured(monkeypatch):
+    """The other half of the combined case: an *inferred* (not corroborated)
+    cloud route must still go through #584's confirmation flow — `ask`, not
+    silently redirected to the configured default and not silently
+    dispatched to the API. This duplicates the pre-existing
+    `test_default_route_does_not_apply_to_unconfirmed_cloud_inference`
+    coverage deliberately, right next to the #757 tests, as the explicit
+    proof that #757 does not weaken #584."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    result = pf.run_preflight(
+        "search my gmail for the invoice", tags=["agent"],
+        caller=_stub_caller(routing="claude", routing_explicit=False),
+    )
+    assert result.routing == pf.ROUTE_ASK
+    assert "not explicitly requested" in result.routing_reason
+    assert result.demoted_routing is None
+
+
+@pytest.mark.unit
+def test_tag_override_bypasses_route_corroboration_check(monkeypatch):
+    """A `#cloud` tag is direct operator corroboration — #757's title-cue
+    check must not run on it at all, even though the model's own
+    uncorroborated route (local) would otherwise have been demoted."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "claude_code")
+    reply = _golden_reply(routing="local", routing_explicit=False, routing_reason="stub")
+    result = pf.run_preflight(title="Refactor auth", tags=["agent", "cloud"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.demoted_routing is None
+
+
+@pytest.mark.unit
+def test_no_default_route_uncorroborated_local_route_is_unaffected():
+    """With no default route configured, #757 is a complete no-op: the
+    field-evidence payload's routing stands exactly as it did before this
+    fix — byte-identical to today for every fresh clone."""
+    reply = _golden_reply(
+        routing="local", routing_explicit=True,
+        routing_reason="Software implementation task suitable for local execution.",
+    )
+    title = (
+        "Implement in web/chat: in voice mode, render the user's transcribed "
+        "message as it streams in"
+    )
+    result = pf.run_preflight(title=title, tags=["agent"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_LOCAL
+    assert result.demoted_routing is None

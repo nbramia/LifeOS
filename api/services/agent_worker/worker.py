@@ -2189,6 +2189,11 @@ class Worker:
             # discarding it — logged here as context for whoever reads the
             # transcript, not as a blocking question to the operator.
             "demoted_ambiguity": pre.demoted_ambiguity,
+            # (#757) A default route also demotes an uncorroborated LLM-chosen
+            # route (no title cue backing it) to the configured default —
+            # logged here the same way, so the route the model actually
+            # picked isn't lost even though it didn't take effect.
+            "demoted_routing": pre.demoted_routing,
             "sane": pre.sane,
             "sane_reason": pre.sane_reason,
             "sane_fatal": pre.sane_fatal,
