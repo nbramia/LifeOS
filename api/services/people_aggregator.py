@@ -638,6 +638,40 @@ class PersonRecord:
         return cls(**data)
 
 
+def _skip_linkedin_preamble(f) -> None:
+    """Advance ``f`` past LinkedIn's export preamble to the real header row.
+
+    A Connections.csv straight from "Export Your Data" does not start with the
+    header. LinkedIn prepends a notes block:
+
+        Notes:
+        "When exporting your connection data, you may notice that some of the
+        email addresses are missing. ..."
+        <blank line>
+        First Name,Last Name,URL,Email Address,Company,Position,Connected On
+
+    Handing that to DictReader makes "Notes:" the sole fieldname, so every row
+    yields empty First/Last Name and the whole import silently skips — a
+    zero-record "success" on a file that is perfectly good.
+
+    Scans a bounded number of lines for the header, then seeks back to its
+    start. A file that already begins with the header (previously de-preambled
+    by hand) is left untouched, so this is safe on both shapes.
+    """
+    probe_limit = 10
+    for _ in range(probe_limit):
+        pos = f.tell()
+        line = f.readline()
+        if not line:
+            break
+        if 'First Name' in line and 'Last Name' in line:
+            f.seek(pos)
+            return
+    # No header found within the probe window — rewind and let DictReader try,
+    # preserving the previous behaviour rather than consuming the file.
+    f.seek(0)
+
+
 def load_linkedin_connections(csv_path: str) -> list[dict]:
     """
     Load LinkedIn connections from CSV export.
@@ -655,6 +689,7 @@ def load_linkedin_connections(csv_path: str) -> list[dict]:
     connections = []
     try:
         with open(csv_path, 'r', encoding='utf-8') as f:
+            _skip_linkedin_preamble(f)
             reader = csv.DictReader(f)
             for row in reader:
                 connections.append({
