@@ -49,17 +49,24 @@ def journal_notes_configured() -> bool:
         return False
     try:
         config = yaml.safe_load(CONFIG_PATH.read_text())
-    except (yaml.YAMLError, OSError):
-        # Present but unreadable/malformed — be conservative rather than
+        if not config or not config.get("sync_enabled", True):
+            return False
+        return any(
+            sheet.get("outputs", {}).get("journal_notes", {}).get("enabled", False)
+            for sheet in config.get("sheets", [])
+        )
+    except Exception:
+        # Present but unreadable, or structurally malformed in a way that
+        # breaks the `.get()` chain above (e.g. `sheets: null`, a sheet
+        # entry that isn't a mapping) — be conservative rather than
         # silently treating this the same as "not configured" (mirrors the
-        # config_load_error distinction in _load_config below, #687).
+        # config_load_error distinction in _load_config below, #687): a
+        # config typo must not silently drop the reservation an install
+        # depends on. Broad on purpose — this only ever *loosens* nothing,
+        # since the caller (api/routes/vault.py) only reserves more when
+        # this returns True; a false "configured" here can at most reject a
+        # write that would otherwise have been allowed.
         return True
-    if not config or not config.get("sync_enabled", True):
-        return False
-    return any(
-        sheet.get("outputs", {}).get("journal_notes", {}).get("enabled", False)
-        for sheet in config.get("sheets", [])
-    )
 
 
 @dataclass

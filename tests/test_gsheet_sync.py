@@ -554,6 +554,28 @@ sheets:
             with patch("api.services.gsheet_sync.CONFIG_PATH", config_path):
                 assert journal_notes_configured() is True
 
+    @pytest.mark.parametrize("config_content", [
+        # `sheets:` present but null, not a list -- iterating raises TypeError.
+        "sync_enabled: true\nsheets:\n",
+        # A sheet entry that isn't a mapping -- .get() raises AttributeError.
+        "sync_enabled: true\nsheets:\n  - null\n",
+        # `journal_notes` present but not a mapping -- .get() raises AttributeError.
+        "sync_enabled: true\nsheets:\n  - sheet_id: test123\n    outputs:\n      journal_notes: true\n",
+    ])
+    def test_true_when_config_structurally_malformed(self, config_content):
+        """Valid YAML syntax but a shape the `.get()` chain can't walk (parses
+        fine, so yaml.safe_load itself doesn't raise) must still fall back to
+        the conservative "configured" default, not crash the caller (Codex
+        review of #769: api/routes/vault.py would otherwise see a 500 on a
+        vault-write instead of the reserved-path 400)."""
+        from api.services.gsheet_sync import journal_notes_configured
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(config_content)
+            with patch("api.services.gsheet_sync.CONFIG_PATH", config_path):
+                assert journal_notes_configured() is True
+
 
 class TestDailyNoteAppend:
     """Test appending to daily notes."""

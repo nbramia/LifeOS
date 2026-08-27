@@ -168,8 +168,19 @@ def _enable_journal_persona(monkeypatch):
     maintainer's install). config/telegram_bots.json already ships a
     `journal` entry naming this exact env var. Hermetic regardless of a real
     ambient `.env`: the registry loader merges `{**dotenv_values(env_file),
-    **os.environ}`, and monkeypatch.setenv always wins that merge."""
+    **os.environ}`, and monkeypatch.setenv always wins that merge.
+
+    Also forces the gsheet_sync signal off, so callers of this helper prove
+    the Telegram-bot signal alone is sufficient (Codex review of #769) —
+    not incidentally passing because the machine running these tests
+    happens to also have a real config/gsheet_sync.yaml with journal_notes
+    enabled (gsheet_sync.CONFIG_PATH is an absolute path to the real repo
+    location regardless of cwd, so it isn't neutralized by anything above)."""
     monkeypatch.setenv("TELEGRAM_JOURNAL_BOT_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "api.services.gsheet_sync.CONFIG_PATH",
+        Path(tempfile.mkdtemp(prefix="lifeos-no-gsheet-sync-")) / "nope.yaml",
+    )
 
 
 def _disable_journal_persona(monkeypatch, tmp_path):
