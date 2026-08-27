@@ -1,7 +1,7 @@
 # Scripts Reference
 
 > **Status:** Complete
-> **Last Updated:** 2026-07-09
+> **Last Updated:** 2026-08-27
 > **Audience:** Operators
 
 Reference for all LifeOS scripts with usage examples.
@@ -184,6 +184,7 @@ Example:
 | `cleanup-worktrees.sh` | Idempotent git-worktree pruning plus targeted removal of a stale worktree/branch; safe to call pre-flight before `git worktree add`. |
 | `migrate_reminders_to_scheduler.py` | One-shot, idempotent migration of the legacy `~/.lifeos/reminders.json` store into the Scheduler's `Inbox.md` source of truth. Non-destructive (keeps the JSON as backup). |
 | `install_codex_skills.py` | Convert portable LifeOS skills from `.claude/skills/` into Codex's `SKILL.md` format into `~/.codex/skills/`. Re-run after editing source skills. |
+| `register_persona_bot.py` | Safely register a new persona Telegram bot: appends its token/chat-id env vars to `.env` (append-only — a symlinked `.env` stays a symlink) and adds it to `config/telegram_bots.local.json` (seeded from the template on first use). Does not register the bot with @BotFather or restart the service — see [personas.md](personas.md#create-your-own-persona). |
 | `create-lifeos-app.sh` | Create the `LifeOS.app` Full Disk Access wrapper bundle in `/Applications` (macOS only), the FDA container cron/launchd route through for protected databases. |
 | `preflight.sh` | Pre-flight checks (called by server.sh) |
 | `run_sync_wrapper.sh` | NVMe wake + pre-flight for nightly sync |
@@ -383,3 +384,4 @@ curl -X POST http://localhost:8000/api/admin/reindex/sync
 
 - [Launchd Setup](launchd-setup.md) -- Automated service management (macOS)
 - [Troubleshooting](troubleshooting.md) -- Common issues and solutions
+- [Personas](personas.md) -- `register_persona_bot.py`'s "Create your own persona" workflow
