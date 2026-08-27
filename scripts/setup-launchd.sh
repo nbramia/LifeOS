@@ -83,6 +83,10 @@ _plist_string_value() {
 # Checks WorkingDirectory (parsed from the plist itself) and the venv this
 # install resolved (every template uses the same __HOME__/.venvs/lifeos
 # convention, so there's nothing plist-specific to parse for that one).
+# Checks the venv's own python interpreter, not just the directory — an
+# empty or half-created venv (e.g. `python3 -m venv` ran but
+# `pip install -r requirements.txt` never did) would otherwise pass with a
+# directory that exists but launches nothing.
 check_paths_exist() {
     local plist="$1" venv_dir="$2"
     local workdir
@@ -90,8 +94,8 @@ check_paths_exist() {
     if [ -n "$workdir" ] && [ ! -d "$workdir" ]; then
         echo "WorkingDirectory: $workdir"
     fi
-    if [ ! -d "$venv_dir" ]; then
-        echo "venv: $venv_dir"
+    if [ ! -x "$venv_dir/bin/python" ]; then
+        echo "venv: $venv_dir/bin/python"
     fi
 }
 

@@ -18,6 +18,7 @@ and fixture templates, with `plutil` stubbed since it's macOS-only.
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -200,7 +201,9 @@ def test_check_paths_exist_silent_when_paths_are_real(tmp_path: Path):
     workdir = tmp_path / "proj"
     workdir.mkdir()
     venv = tmp_path / "venv"
-    venv.mkdir()
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    (venv / "bin" / "python").chmod(0o755)
     plist = repo / "p.plist"
     plist.write_text(
         f"<dict>\n    <key>WorkingDirectory</key>\n    <string>{workdir}</string>\n</dict>",
@@ -278,6 +281,31 @@ def test_validate_plist_rejects_missing_venv(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_validate_plist_rejects_venv_dir_with_no_python_binary(tmp_path: Path):
+    """A venv directory that exists but was never populated (e.g.
+    `python3 -m venv` ran but `pip install -r requirements.txt` never did)
+    must fail validation — the directory existing isn't enough."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    empty_venv = tmp_path / "empty-venv"
+    empty_venv.mkdir()  # exists, but no bin/python inside
+    plist = repo / "p.plist"
+    plist.write_text(
+        f"<dict>\n    <key>WorkingDirectory</key>\n    <string>{workdir}</string>\n</dict>",
+        encoding="utf-8",
+    )
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    result = _run_sourced(repo, f'validate_plist "{plist}" "{empty_venv}"; echo "rc=$?"', env)
+    assert "rc=1" in result.stdout, (result.stdout, result.stderr)
+    assert "bin/python" in result.stdout
+
+
+@pytest.mark.unit
 def test_validate_plist_accepts_well_formed_plist(tmp_path: Path):
     if not SETUP_LAUNCHD.exists():
         pytest.skip("scripts/setup-launchd.sh not present")
@@ -285,7 +313,9 @@ def test_validate_plist_accepts_well_formed_plist(tmp_path: Path):
     workdir = tmp_path / "proj"
     workdir.mkdir()
     venv = tmp_path / "venv"
-    venv.mkdir()
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    (venv / "bin" / "python").chmod(0o755)
     plist = repo / "p.plist"
     plist.write_text(
         f"<dict>\n    <key>WorkingDirectory</key>\n    <string>{workdir}</string>\n</dict>",
@@ -365,7 +395,9 @@ def _make_main_sandbox(tmp_path: Path, template_body: str) -> tuple[Path, Path, 
     fake_home = tmp_path / "fakehome"
     (fake_home / "Library" / "LaunchAgents").mkdir(parents=True)
     venv = fake_home / ".venvs" / "lifeos"
-    venv.mkdir(parents=True)
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    (venv / "bin" / "python").chmod(0o755)
     (repo / "config" / "launchd" / "com.lifeos.api.plist.template").write_text(
         template_body, encoding="utf-8"
     )
@@ -470,8 +502,7 @@ def test_main_refuses_to_install_when_venv_missing(tmp_path: Path):
     if not SETUP_LAUNCHD.exists():
         pytest.skip("scripts/setup-launchd.sh not present")
     repo, vault, fake_home, venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
-    venv.rmdir()  # simulate a plist referencing a venv that isn't there
-    (venv.parent).rmdir()
+    shutil.rmtree(venv.parent)  # simulate a plist referencing a venv that isn't there
     bindir = _stub_plutil_ok(repo)
     env = dict(os.environ)
     env["PATH"] = f"{bindir}:{env['PATH']}"
