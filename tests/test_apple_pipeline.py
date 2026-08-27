@@ -1197,8 +1197,13 @@ class TestManifestMergeOnPartialExport:
         monkeypatch.setattr(export_mod, "export_whatsapp", self._fake_source)
 
         with caplog.at_level(logging.ERROR):
-            export_mod.main()
+            with pytest.raises(SystemExit) as exc_info:
+                export_mod.main()
 
+        # A refused merge must fail the run (apple_data_agent.sh gates its
+        # rsync/import steps on this exit code) — exit 0 here would launder
+        # the refusal into an apparent success.
+        assert exc_info.value.code == 1
         # The corrupt file on disk is untouched — not replaced with a
         # partial (whatsapp-only) manifest.
         assert (tmp_path / "manifest.json").read_text() == "{not valid json"
@@ -1227,8 +1232,10 @@ class TestManifestMergeOnPartialExport:
         monkeypatch.setattr(export_mod, "export_whatsapp", self._fake_source)
 
         with caplog.at_level(logging.ERROR):
-            export_mod.main()
+            with pytest.raises(SystemExit) as exc_info:
+                export_mod.main()
 
+        assert exc_info.value.code == 1
         on_disk = json.loads((tmp_path / "manifest.json").read_text())
         assert on_disk == existing_manifest
         assert any(r.levelno == logging.ERROR for r in caplog.records)

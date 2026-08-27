@@ -1120,6 +1120,14 @@ def main():
 
     print(json.dumps(manifest, indent=2))
 
+    # A refused merge (corrupt/malformed existing manifest) must actually
+    # fail the run, not just log an error and exit 0 — apple_data_agent.sh
+    # gates its rsync/import steps on this script's exit code, and an
+    # operator running the documented single-source troubleshooting flow
+    # by hand needs $? to reflect that nothing was written.
+    if skip_manifest_write:
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
