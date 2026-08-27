@@ -246,3 +246,41 @@ def test_refuses_value_containing_newline(tmp_path: Path):
 
     assert result.returncode != 0
     assert "MALICIOUS" not in (root / ".env").read_text()
+
+
+def test_rejects_env_var_already_used_by_a_different_registry_entry(tmp_path: Path):
+    """A --token-env/--chat-id-env that collides with a different bot's
+    already-registered vars must be refused, even when that var name isn't
+    (yet) a key in .env — e.g. because it was registered before its value
+    was actually set."""
+    root = tmp_path
+    _init_project(root)
+
+    result = _run(
+        root, "travel", "TOKEN123", "CHAT456",
+        "--token-env", "TELEGRAM_FITNESS_BOT_TOKEN",  # already used by "fitness" in TEMPLATE
+    )
+
+    assert result.returncode != 0
+    assert "TELEGRAM_FITNESS_BOT_TOKEN" in result.stderr
+    assert not (root / "config" / "telegram_bots.local.json").exists()
+    assert "TOKEN123" not in (root / ".env").read_text()
+
+
+def test_rolls_back_registry_entry_when_env_append_fails(tmp_path: Path):
+    """If appending to .env fails after the registry write already
+    succeeded, the registry must not be left with an orphaned entry for env
+    vars that were never actually set."""
+    root = tmp_path
+    _init_project(root)
+    (root / ".env").chmod(0o444)  # read-only: append fails, earlier reads still work
+
+    try:
+        result = _run(root, "travel", "TOKEN123", "CHAT456")
+    finally:
+        (root / ".env").chmod(0o644)
+
+    assert result.returncode != 0
+    # The override didn't exist before this call, so a failed run must not
+    # leave one behind.
+    assert not (root / "config" / "telegram_bots.local.json").exists()

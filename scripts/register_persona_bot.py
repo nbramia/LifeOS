@@ -159,6 +159,12 @@ def register_bot(
             raise RegistrationError(
                 f"Bot {name!r} already has an entry in {registry_path}"
             )
+        for var in (token_env, chat_id_env):
+            if entry.get("token_env") == var or entry.get("chat_id_env") == var:
+                raise RegistrationError(
+                    f"{var!r} is already used by bot {entry.get('name')!r} "
+                    f"in {registry_path}"
+                )
 
     entry: dict = {
         "name": name,
@@ -176,8 +182,21 @@ def register_bot(
     # Do the registry write first — it's the one that can raise on bad JSON
     # (_load_registry above) or a duplicate name, and we'd rather fail before
     # touching the environment file than after.
+    registry_existed = registry_path.exists()
     _write_registry(registry_path, entries + [entry])
-    append_env_vars(env_path, [(token_env, token), (chat_id_env, chat_id)])
+    try:
+        append_env_vars(env_path, [(token_env, token), (chat_id_env, chat_id)])
+    except Exception:
+        # Roll back the registry write so a failed .env append (e.g. a
+        # permissions or disk error) never leaves behind a registry entry
+        # for env vars that were never actually set. If the override didn't
+        # exist before this call, remove it rather than leaving behind a new
+        # file that merely duplicates the template.
+        if registry_existed:
+            _write_registry(registry_path, entries)
+        else:
+            registry_path.unlink(missing_ok=True)
+        raise
 
 
 def main() -> int:
