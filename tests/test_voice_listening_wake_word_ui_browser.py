@@ -3,10 +3,11 @@
 Covers the fourth dock checkbox end to end at the JS layer: it renders
 unchecked by default, persists like its siblings (mute/2x/auto), holds and
 releases its own mic stream (never the one the talk button reuses across
-taps), and its post-capture pipeline -- STT round-trip, wake-word fuzzy
-match, and entering recording -- is reachable and correctly gated even
-though headless Chromium can't produce a real spoken "Hermes" for the VAD's
-energy analysis to detect.
+taps), surfaces that hold as a live-mic dot on its own label (#813), and its
+post-capture pipeline -- STT round-trip, wake-word fuzzy match, and entering
+recording -- is reachable and correctly gated even though headless Chromium
+can't produce a real spoken "Hermes" for the VAD's energy analysis to
+detect.
 
 The real getUserMedia energy analysis (handleListenFrame() in
 web/chat/voice.js) can't run headless without genuine audio hardware, so
@@ -245,6 +246,15 @@ def _check_wake(page: Page, transcript):
 def _is_recording(page: Page):
     return page.evaluate(
         "document.getElementById('voiceTalkBtn').classList.contains('recording')"
+    )
+
+
+def _dot_is_live(page: Page):
+    """#813 -- the live-mic dot's own class, used where the dock as a whole
+    is hidden (text mode) and `to_be_visible()` would pass for the wrong
+    reason."""
+    return page.evaluate(
+        "document.getElementById('voiceListenDot').classList.contains('live')"
     )
 
 
@@ -663,3 +673,131 @@ class TestListeningSuspension:
 
         assert triggered is False, "a wake match fired while auto-continue was already recording"
         assert page.evaluate("window.__recorderStartCalls") == 1
+
+
+class TestListeningLiveIndicator:
+    """#813: the dock's live-mic dot. It tracks the *capture*, not the
+    checkbox -- on only while the wake tap actually holds an unsuspended
+    mic, off whenever the tap is suspended (playback/recording) or
+    Listening is released. The distinction is the whole point: the checkbox
+    stays checked through a whole turn, so a checkbox-driven dot would
+    claim the mic was live at exactly the moments it isn't."""
+
+    def test_dot_is_live_while_listening_holds_the_mic(self, page: Page, chat_base_url):
+        """Voice mode with the default-on toggle -- the dot appears as soon
+        as the wake tap has the mic, without any user action."""
+        _open_voice_chat(page, chat_base_url)
+        page.wait_for_function("window.__gumCalls === 1")
+        page.wait_for_function("() => window.lifeChatVoice.isListenTapRunning() === true")
+
+        expect(page.locator("#voiceListenDot")).to_be_visible()
+        assert _dot_is_live(page) is True
+
+    def test_dot_disappears_when_listening_is_unchecked(self, page: Page, chat_base_url):
+        """Unchecking releases the mic entirely (stopListening()), so the
+        dot must go with it."""
+        _open_voice_chat(page, chat_base_url)
+        page.wait_for_function("window.__gumCalls === 1")
+        page.wait_for_function("() => window.lifeChatVoice.isListenTapRunning() === true")
+        assert _dot_is_live(page) is True
+
+        page.locator("#voiceListen").uncheck()
+
+        page.wait_for_function("window.__stopCalls > 0")
+        expect(page.locator("#voiceListenDot")).not_to_be_visible()
+        assert _dot_is_live(page) is False
+
+        # ...and comes back when Listening is switched on again.
+        page.locator("#voiceListen").check()
+        page.wait_for_function("window.__gumCalls === 2")
+        expect(page.locator("#voiceListenDot")).to_be_visible()
+
+    def test_dot_is_not_live_when_listening_starts_off(self, page: Page, chat_base_url):
+        """A visitor who opted out previously (persisted unchecked) enters
+        voice mode with no mic held at all -- no dot, ever, until they opt
+        back in."""
+        _open_voice_chat(page, chat_base_url)
+        page.locator("#voiceListen").uncheck()
+        page.reload()
+        page.wait_for_selector("#voiceListen")
+
+        expect(page.locator("#voiceListen")).not_to_be_checked()
+        expect(page.locator("#voiceListenDot")).not_to_be_visible()
+        assert page.evaluate("window.__gumCalls") == 0
+
+    def test_dot_disappears_during_tts_playback_and_returns_after(
+            self, page: Page, chat_base_url):
+        """The tap is suspended for the whole clip (#734/#740) -- the mic
+        is genuinely not listening, so the dot must not say it is. The
+        checkbox stays checked throughout, which is exactly why the dot is
+        driven by updateListenSuspension() instead."""
+        _open_voice_chat(page, chat_base_url)
+        page.locator("#voiceAuto").uncheck()  # isolate from auto-continue
+        page.locator("#voiceListen").check()
+        page.wait_for_function("window.__gumCalls === 1")
+        page.wait_for_function("() => window.lifeChatVoice.isListenTapRunning() === true")
+        assert _dot_is_live(page) is True
+
+        clip_url = page.evaluate("window.__makeWav(500)")
+        page.evaluate("(u) => { window.__turnClipUrl = u; }", clip_url)
+        page.evaluate("() => { window.lifeChatVoice.submitTurn({ transcript: 'hi' }); }")
+        page.wait_for_function("window.__audioPlayingCount > 0")
+
+        expect(page.locator("#voiceListenDot")).not_to_be_visible()
+        # The toggle itself never moved -- only the capture did.
+        expect(page.locator("#voiceListen")).to_be_checked()
+
+        page.wait_for_function("window.__audioPlayingCount === 0", timeout=5000)
+
+        page.wait_for_function("() => window.lifeChatVoice.isListenTapRunning() === true")
+        expect(page.locator("#voiceListenDot")).to_be_visible()
+
+    def test_dot_disappears_while_recording_and_returns_after(
+            self, page: Page, chat_base_url):
+        """Same for the recording window (#724): the wake tap is suspended
+        while the talk button holds its own stream, so the Listening dot is
+        off -- the recording button's own pulse is the live signal then."""
+        _open_voice_chat(page, chat_base_url)
+        page.locator("#voiceAuto").uncheck()  # isolate from auto-continue
+        page.locator("#voiceListen").check()
+        page.wait_for_function("window.__gumCalls === 1")
+        page.wait_for_function("() => window.lifeChatVoice.isListenTapRunning() === true")
+        assert _dot_is_live(page) is True
+
+        page.locator("#voiceTalkBtn").click()
+        page.wait_for_function(
+            "document.getElementById('voiceTalkBtn').classList.contains('recording')"
+        )
+
+        expect(page.locator("#voiceListenDot")).not_to_be_visible()
+        expect(page.locator("#voiceListen")).to_be_checked()
+
+        # force=True: the .recording class drives an infinite CSS pulse that
+        # can fail Playwright's default actionability "element is stable"
+        # wait on the stop tap (see the suspension suite above).
+        page.locator("#voiceTalkBtn").click(force=True)  # stop
+        page.wait_for_function(
+            "!document.getElementById('voiceTalkBtn').classList.contains('recording')"
+        )
+
+        page.wait_for_function("() => window.lifeChatVoice.isListenTapRunning() === true")
+        expect(page.locator("#voiceListenDot")).to_be_visible()
+
+    def test_dot_is_not_live_in_text_mode(self, page: Page, chat_base_url):
+        """Leaving voice mode releases Listening's mic (applyVoiceMode() ->
+        stopListening()). The dock is hidden there anyway, so this asserts
+        the class itself is cleared -- the dot must not be left mid-pulse,
+        ready to reappear stale when voice mode comes back."""
+        _open_voice_chat(page, chat_base_url)
+        page.wait_for_function("window.__gumCalls === 1")
+        assert _dot_is_live(page) is True
+
+        page.locator("#modeTextBtn").click()
+
+        page.wait_for_function("window.__stopCalls > 0")
+        assert _dot_is_live(page) is False
+
+        # And it comes back on re-entering voice mode, since the mic does.
+        page.locator("#modeVoiceBtn").click()
+        page.wait_for_function("window.__gumCalls === 2")
+        expect(page.locator("#voiceListenDot")).to_be_visible()

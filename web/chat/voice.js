@@ -124,14 +124,32 @@ function setClipInFlight(value) {
 // taps-inventory block above ensureAudioContext() for why an open capture
 // is a second, independent hazard from main-thread contention.
 function updateListenSuspension() {
-  if (!listenAudioCtx) return;
   const shouldSuspend = clipInFlight || isRecording;
+  // #813 -- the dock's live-mic dot mirrors exactly what this function does
+  // to the tap, so it can never claim the mic is live while the capture is
+  // suspended. Computed before the `listenAudioCtx` bail-out below so the
+  // "Listening isn't running at all" case turns the dot off too.
+  updateListenIndicator(!!listenStream && !shouldSuspend);
+  if (!listenAudioCtx) return;
   if (shouldSuspend && listenAudioCtx.state === 'running') {
     listenAudioCtx.suspend().catch(() => {});
   } else if (!shouldSuspend && listenAudioCtx.state === 'suspended') {
     listenAudioCtx.resume().catch(() => {});
   }
   setListenTracksEnabled(!shouldSuspend);
+}
+
+// #813 -- the dock's only signal that the mic is currently open. Driven
+// solely by updateListenSuspension() above and stopListening() below, both
+// of which own the real "is the wake tap holding a live capture" state, so
+// the dot can't drift from it: it is deliberately NOT tied to the Listening
+// checkbox, which stays checked through playback and recording while the
+// capture itself is suspended (and stays checked outside voice mode, where
+// no mic is held at all).
+function updateListenIndicator(live) {
+  const dot = elements.voiceListenDot;
+  if (!dot) return;
+  dot.classList.toggle('live', !!live);
 }
 
 // Every write to `isRecording` goes through here (#724), for the same
@@ -1458,6 +1476,7 @@ function stopListening() {
   listenSpeechMs = 0;
   listenSilenceMs = 0;
   listenChecking = false;
+  updateListenIndicator(false);  // #813 -- no mic held, so no live dot
 }
 
 // Test seam (#734): whether the wake tap's own AudioContext is actually
