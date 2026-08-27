@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Operations
-> **Last Updated:** 2026-08-25
+> **Last Updated:** 2026-08-27
 > **Audience:** Operators
 
 Operational procedures that don't belong in the day-to-day coding reference: the Apple Data Agent, Monarch Money auth, and quick observability commands. Moved here from `AGENTS.md` to keep the agent-facing file lean.
@@ -12,6 +12,10 @@ Operational procedures that don't belong in the day-to-day coding reference: the
 ## Apple Data Agent (optional, macOS only)
 
 If you have a Mac with iMessage/phone data, it can export Apple ecosystem data and sync it to the Linux server nightly via `scripts/apple_data_agent.sh`.
+
+### Before your first import: check Messages retention
+
+Messages has its own history-retention setting (Messages → Settings → General → "Keep Messages"), and it silently prunes the same local database this system reads from. If it isn't set to keep history forever, older messages are already gone from the source by the time an import ever runs — no amount of re-syncing recovers them. Check this setting on your own device before the first import, and decide whether to change it: a shorter-than-expected import is very likely this setting, not a limitation of the export pipeline or of iMessage itself.
 
 ### macOS FDA (Full Disk Access)
 

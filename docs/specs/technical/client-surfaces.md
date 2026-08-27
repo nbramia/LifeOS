@@ -107,6 +107,8 @@ With #361, LifeOS `/chat` is the unified text+voice client. Voice *transport* st
 
 Web chat implements voice mode in `web/chat/voice.js` — tap-to-talk turn lifecycle (Voice|Text toggle, SSE `done` data, sequential audio, cancel via `AbortController`), same-origin via the reverse proxy. Mode persists in `sessionStorage` (`lifeos:chat:voice_mode`).
 
+**The user's transcript is rendered from the `transcript` event, not from `done` (#758).** The gateway emits `transcript` as soon as STT lands, well before the reply is synthesized, so the user's message appears in the thread at submit time — matching what the text path (`askStream()`) does — rather than only once the turn completes. `done` stays authoritative: its `transcript` reconciles that bubble in place (and renders it if the event never arrived), so the client never double-appends. A cancelled turn removes the bubble, since a turn that never reaches `done` persists nothing (see the Persistence tee above) — this holds whether the cancellation is this tab's own Cancel button or the SSE `cancelled` frame from elsewhere (a turn's lifetime is server-owned, #611, so another tab/device on the same conversation can cancel it too). A turn that instead *errors* leaves the bubble in place — the user really did say it, so only the assistant side reports the failure, matching `askStream()`'s error handling on the text path.
+
 ## Turn lifetime and cancellation (#611)
 
 A chat turn's lifetime is owned by the server, not the SSE connection watching
