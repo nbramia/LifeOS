@@ -316,6 +316,10 @@ the repo's own source files. This checklist is that path.
    `config/family_members.example.json` — full list in
    [Configuration § Configuration Files](configuration.md#configuration-files)). You should never need
    to edit a tracked file in the repo itself to configure an instance.
+   After the first sync, `scripts/setup_identity.py` turns picking yourself,
+   your partner, and your family out of the indexed people into a guided
+   conversation instead of hand-editing those files — see
+   [First Run § After First Sync](first-run.md#after-first-sync-set-your-identity).
 2. **Connect an external Hermes.** Add `LIFEOS_HERMES_BACKEND_URL` (and
    `LIFEOS_HERMES_BACKEND_TOKEN` if Hermes requires one) directly to your
    `.env` — both are deliberately absent from `.env.example` since they're

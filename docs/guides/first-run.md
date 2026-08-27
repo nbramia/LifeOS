@@ -99,33 +99,41 @@ If you've configured Google OAuth or Slack, run the initial data sync:
 
 **Note**: First sync may take 30+ minutes depending on data volume.
 
+### After First Sync: Set Your Identity
+
+After sync completes, run the guided setup script to pick yourself out of
+the indexed people, name your partner, configure family, and set your work
+email domain(s):
+
+```bash
+~/.venvs/lifeos/bin/python scripts/setup_identity.py
+```
+
+It searches the same people list the CRM UI does, writes what you answer
+into `.env` and `config/*.json` (backing up any existing files first), and
+reports what it wrote and which names it couldn't match. Safe to re-run at
+any time. Or set `LIFEOS_MY_PERSON_ID` by hand:
+
+```bash
+curl "http://localhost:8000/api/crm/people?q=YourName" | jq '.people[0].id'
+```
+
+Then restart: `./scripts/server.sh restart`
+
+This enables relationship tracking, communication gap analysis, and other CRM features that need to know which person is "you."
+
+### Pull Full History (Optional)
+
 **This is the nightly job, not a deep pass.** It deliberately looks back
 only a narrow window (30 days for Gmail/Calendar) to stay fast — a fresh
-install won't get older history from just this. Right after it completes,
-run the one-time backfill to pull each source's full history:
+install won't get older history from just this. Run the one-time backfill
+to pull each source's full history:
 
 ```bash
 ~/.venvs/lifeos/bin/python scripts/first_backfill.py --execute
 ```
 
 See [data-and-sync.md](../specs/technical/data-and-sync.md#first-backfill-entry-point) for what it covers and how long it can take.
-
-### After First Sync: Set Your Person ID
-
-After sync completes, find your person ID and add it to `.env`:
-
-```bash
-curl "http://localhost:8000/api/crm/people?q=YourName" | jq '.people[0].id'
-```
-
-Add the result to `.env`:
-```bash
-LIFEOS_MY_PERSON_ID=<the-uuid-from-above>
-```
-
-Then restart: `./scripts/server.sh restart`
-
-This enables relationship tracking, communication gap analysis, and other CRM features that need to know which person is "you."
 
 ---
 
