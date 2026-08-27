@@ -59,13 +59,16 @@ token-*.json
 .env.local
 .env-*
 *.env
+.env.bak.*
 
 # =============================================================================
 # PERSONAL CONFIGURATION (config/)
 # =============================================================================
 config/people_dictionary.json
 config/relationship_overrides.json
+config/relationship_overrides.json.bak.*
 config/family_members.json
+config/family_members.json.bak.*
 config/linkedin_tags.json
 config/linkedin_industry_mappings.json
 config/linkedin_bad_matches.json
