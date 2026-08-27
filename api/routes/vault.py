@@ -22,11 +22,18 @@ a persona's prompt instructions). Free-form fragment capture belongs in
 `Personal/Log/` instead — see `config/personas/journal.md`.
 
 The reservation only makes sense where the generated file it protects can
-exist, so it is gated on the same "is the journal persona configured" signal
+exist, so it is gated on whether either of the two independent config
+surfaces that produce it is actually configured on this install (#769): the
+same "is the journal persona configured" signal
 `api/routes/journal_ingest.py` already uses (a `journal` entry in
-`settings.telegram_bots`, i.e. `TELEGRAM_JOURNAL_BOT_TOKEN` is set) — a
-fresh clone with no journal pipeline is not blocked from writing there. An
-install that already has the token set (the maintainer's) sees no change.
+`settings.telegram_bots`, i.e. `TELEGRAM_JOURNAL_BOT_TOKEN` is set), OR
+`gsheet_sync.py`'s own `journal_notes` output being enabled in
+`config/gsheet_sync.yaml` — an install can have either configured without
+the other, and both independently generate real files under
+`Personal/Journal/` that this reservation exists to protect. A fresh clone
+with neither pipeline configured is not blocked from writing there. An
+install that already has either configured (the maintainer's has both) sees
+no change.
 """
 from __future__ import annotations
 
@@ -37,6 +44,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from api.services.gsheet_sync import journal_notes_configured
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -54,16 +62,25 @@ _JOURNAL_PERSONA_ID = "journal"
 
 
 def _journal_enabled() -> bool:
-    """Whether the journal persona is configured on this install.
+    """Whether this install actually generates files under `Personal/Journal/`.
 
-    Reuses the existing "is this persona enabled" signal (settings.telegram_bots
-    only includes a registry entry whose token env var is actually set — see
-    config/settings.py's Settings.telegram_bots / _load_registry_bots), rather
-    than introducing a new setting. A fresh clone with no
-    TELEGRAM_JOURNAL_BOT_TOKEN has no generated `Personal/Journal/` file for
-    this reservation to protect, so the reservation doesn't apply there.
+    Two independent pipelines can produce them, and neither implies the
+    other is configured, so either is sufficient to keep the reservation:
+
+    - The journal persona's Telegram bot (settings.telegram_bots only
+      includes a registry entry whose token env var is actually set — see
+      config/settings.py's Settings.telegram_bots / _load_registry_bots).
+    - gsheet_sync.py's own `journal_notes` output, enabled directly in
+      config/gsheet_sync.yaml with no dependency on the Telegram bot at all
+      (see api.services.gsheet_sync.journal_notes_configured).
+
+    A fresh clone with neither configured has no generated file for this
+    reservation to protect, so the reservation doesn't apply there.
     """
-    return any(bot.name == _JOURNAL_PERSONA_ID for bot in settings.telegram_bots)
+    return (
+        any(bot.name == _JOURNAL_PERSONA_ID for bot in settings.telegram_bots)
+        or journal_notes_configured()
+    )
 
 
 class VaultWriteRequest(BaseModel):

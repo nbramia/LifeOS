@@ -474,6 +474,87 @@ sheets:
             assert "reason" not in stats
 
 
+class TestJournalNotesConfigured:
+    """journal_notes_configured() -- the signal api/routes/vault.py (#769)
+    uses, alongside the journal persona's Telegram bot, to decide whether
+    Personal/Journal/ is reserved. Independent of GSheetSyncService/its
+    SQLite state db -- these patch CONFIG_PATH only.
+    """
+
+    def test_false_when_config_missing(self):
+        from api.services.gsheet_sync import journal_notes_configured
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("api.services.gsheet_sync.CONFIG_PATH", Path(tmpdir) / "nonexistent.yaml"):
+                assert journal_notes_configured() is False
+
+    def test_false_when_sync_disabled(self):
+        from api.services.gsheet_sync import journal_notes_configured
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text("""
+sync_enabled: false
+sheets:
+  - sheet_id: "test123"
+    outputs:
+      journal_notes:
+        enabled: true
+""")
+            with patch("api.services.gsheet_sync.CONFIG_PATH", config_path):
+                assert journal_notes_configured() is False
+
+    def test_false_when_no_sheet_has_journal_notes_enabled(self):
+        from api.services.gsheet_sync import journal_notes_configured
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text("""
+sync_enabled: true
+sheets:
+  - sheet_id: "test123"
+    outputs:
+      rolling_document:
+        enabled: true
+""")
+            with patch("api.services.gsheet_sync.CONFIG_PATH", config_path):
+                assert journal_notes_configured() is False
+
+    def test_true_when_a_sheet_has_journal_notes_enabled(self):
+        from api.services.gsheet_sync import journal_notes_configured
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text("""
+sync_enabled: true
+sheets:
+  - sheet_id: "unrelated"
+    outputs:
+      rolling_document:
+        enabled: true
+  - sheet_id: "test123"
+    outputs:
+      journal_notes:
+        enabled: true
+        folder: "Personal/Journal"
+""")
+            with patch("api.services.gsheet_sync.CONFIG_PATH", config_path):
+                assert journal_notes_configured() is True
+
+    def test_true_when_config_malformed(self):
+        """A config file that exists but fails to parse is treated as
+        configured (conservative default) rather than silently reserving
+        nothing -- mirrors the config_load_error distinction in
+        _load_config (#687): unreadable must never look like "not set up"."""
+        from api.services.gsheet_sync import journal_notes_configured
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text("sheets: [ { sheet_id: 'test123' \n")
+            with patch("api.services.gsheet_sync.CONFIG_PATH", config_path):
+                assert journal_notes_configured() is True
+
+
 class TestDailyNoteAppend:
     """Test appending to daily notes."""
 

@@ -30,6 +30,38 @@ def get_gsheet_sync_db_path() -> str:
     return str(db_dir / "gsheet_sync.db")
 
 
+def journal_notes_configured() -> bool:
+    """Whether any sheet in `config/gsheet_sync.yaml` has a `journal_notes`
+    output enabled — i.e. this install actually generates files under
+    `Personal/Journal/` via this pipeline.
+
+    `api/routes/vault.py` (#769) uses this alongside the journal persona's
+    Telegram-bot signal to decide whether to reserve that subtree: the two
+    are independent config surfaces (a sheet can be wired up here with no
+    Telegram bot ever configured, or vice versa), so either one alone must
+    be enough to protect the generated file from a clobbering write.
+
+    Reads the YAML directly rather than constructing `GSheetSyncService`,
+    which additionally opens a SQLite state db as an `__init__` side effect
+    — unwanted for a check that may run on every vault-write call.
+    """
+    if not CONFIG_PATH.exists():
+        return False
+    try:
+        config = yaml.safe_load(CONFIG_PATH.read_text())
+    except (yaml.YAMLError, OSError):
+        # Present but unreadable/malformed — be conservative rather than
+        # silently treating this the same as "not configured" (mirrors the
+        # config_load_error distinction in _load_config below, #687).
+        return True
+    if not config or not config.get("sync_enabled", True):
+        return False
+    return any(
+        sheet.get("outputs", {}).get("journal_notes", {}).get("enabled", False)
+        for sheet in config.get("sheets", [])
+    )
+
+
 @dataclass
 class SheetConfig:
     """Configuration for a single sheet to sync."""

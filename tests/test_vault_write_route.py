@@ -140,20 +140,44 @@ def test_invalid_mode_rejected_by_pydantic(app_and_vault):
 # Blocked here, for every caller, rather than left to a persona's prompt
 # discipline (e.g. the journal persona, config/personas/journal.md).
 #
-# Since #769 the reservation only applies when the journal persona is
-# actually enabled on this install (same signal journal_ingest.py uses: a
-# `journal` entry in settings.telegram_bots, i.e. TELEGRAM_JOURNAL_BOT_TOKEN
-# is set). Tests that exercise the reservation itself explicitly enable it
-# below (`_enable_journal_persona`) as a regression guard — the test process
-# has no token set by default, matching a fresh clone.
+# Since #769 the reservation only applies when this install actually
+# generates Personal/Journal/ files: either the journal persona is enabled
+# (a `journal` entry in settings.telegram_bots, i.e. TELEGRAM_JOURNAL_BOT_TOKEN
+# is set) or gsheet_sync.py's own `journal_notes` output is enabled in
+# config/gsheet_sync.yaml — the two are independent (api/routes/vault.py's
+# `_journal_enabled`). Tests that exercise the reservation itself explicitly
+# enable it below (`_enable_journal_persona`) as a regression guard.
+#
+# The "not enabled" tests pin BOTH signals to an empty state explicitly
+# (`_disable_journal_persona`) rather than relying on the ambient test
+# process having neither configured: this suite's autouse
+# `_no_local_telegram_bots_override` fixture (tests/conftest.py) already
+# keeps a real config/telegram_bots.local.json out of the run, but nothing
+# clears a real TELEGRAM_JOURNAL_BOT_TOKEN set in the actual server's `.env`
+# (settings.py's registry loader reads `.env` directly, not just
+# os.environ), and gsheet_sync.CONFIG_PATH is an absolute path to the real
+# repo's config/gsheet_sync.yaml regardless of cwd — on the maintainer's own
+# server both are plausibly already configured. Codex review of #769 caught
+# that these tests would give a false pass in this worktree while actually
+# failing on that server.
 # ---------------------------------------------------------------------------
 
 def _enable_journal_persona(monkeypatch):
     """Make settings.telegram_bots include the shipped `journal` entry, i.e.
     simulate an install with TELEGRAM_JOURNAL_BOT_TOKEN configured (the
     maintainer's install). config/telegram_bots.json already ships a
-    `journal` entry naming this exact env var."""
+    `journal` entry naming this exact env var. Hermetic regardless of a real
+    ambient `.env`: the registry loader merges `{**dotenv_values(env_file),
+    **os.environ}`, and monkeypatch.setenv always wins that merge."""
     monkeypatch.setenv("TELEGRAM_JOURNAL_BOT_TOKEN", "test-token")
+
+
+def _disable_journal_persona(monkeypatch, tmp_path):
+    """Force both signals _journal_enabled() checks to empty, regardless of
+    what the actual environment/config on this machine has configured (see
+    the module comment above)."""
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", tmp_path / "no-registry.json")
+    monkeypatch.setattr("api.services.gsheet_sync.CONFIG_PATH", tmp_path / "no-gsheet-sync.yaml")
 
 
 @pytest.mark.parametrize("bad_path", [
@@ -162,12 +186,18 @@ def _enable_journal_persona(monkeypatch):
 ])
 def test_rejects_writes_into_reserved_journal_dir(app_and_vault, bad_path, monkeypatch):
     """Regression guard (#769): with the journal persona enabled, behavior is
-    byte-for-byte what it was before the reservation became conditional."""
+    byte-for-byte what it was before the reservation became conditional —
+    asserted against the exact message text, not just a substring (Codex
+    review of #769: a substring check wouldn't catch the message itself
+    regressing)."""
     _enable_journal_persona(monkeypatch)
     c, vault = app_and_vault
     r = c.post("/api/vault/write", json={"path": bad_path, "content": "x"})
     assert r.status_code == 400, r.text
-    assert "Personal/Journal" in r.json()["detail"]
+    assert r.json()["detail"] == (
+        "path must not target Personal/Journal/ (reserved for the generated "
+        "daily journal; capture free-form notes under Personal/Log/ instead)"
+    )
     assert not (vault / "Personal" / "Journal").exists()
 
 
@@ -206,12 +236,14 @@ def test_does_not_reject_journal_named_sibling_file(app_and_vault, monkeypatch):
     assert (vault / "Personal" / "Journal-notes.md").read_text() == "x"
 
 
-def test_allows_writes_into_journal_dir_when_persona_not_enabled(app_and_vault):
-    """#769: when the journal persona is NOT configured on this install (no
-    TELEGRAM_JOURNAL_BOT_TOKEN — the default in this test process, matching a
-    fresh clone), a write under Personal/Journal/ is allowed like any other
-    vault path — there is no generated file here for the reservation to
-    protect."""
+def test_allows_writes_into_journal_dir_when_persona_not_enabled(app_and_vault, tmp_path, monkeypatch):
+    """#769: when neither pipeline that generates Personal/Journal/ files is
+    configured on this install (no journal entry in the Telegram bot
+    registry, and no gsheet_sync journal_notes output — pinned explicitly
+    here, matching a fresh clone), a write under Personal/Journal/ is
+    allowed like any other vault path — there is no generated file here for
+    the reservation to protect."""
+    _disable_journal_persona(monkeypatch, tmp_path)
     c, vault = app_and_vault
     r = c.post("/api/vault/write", json={
         "path": "Personal/Journal/2026-08-23.md", "content": "x",
@@ -220,12 +252,56 @@ def test_allows_writes_into_journal_dir_when_persona_not_enabled(app_and_vault):
     assert (vault / "Personal" / "Journal" / "2026-08-23.md").read_text() == "x"
 
 
-def test_other_validation_still_applies_when_journal_persona_not_enabled(app_and_vault):
+def test_other_validation_still_applies_when_journal_persona_not_enabled(app_and_vault, tmp_path, monkeypatch):
     """Disabling the reservation must not disable the other path-safety
     checks (traversal, absolute paths) — those are unconditional."""
+    _disable_journal_persona(monkeypatch, tmp_path)
     c, _ = app_and_vault
     r = c.post("/api/vault/write", json={
         "path": "Personal/Journal/../../escape.md", "content": "x",
     })
     assert r.status_code == 400, r.text
     assert "must not contain `..`" in r.json()["detail"]
+
+
+class TestJournalEnabledSignal:
+    """Direct, hermetic unit coverage of _journal_enabled()'s two
+    independent signals (#769 Codex review) — the route-level tests above
+    only exercise the Telegram-bot side for "enabled" and pin both signals
+    off for "not enabled"; these confirm the gsheet_sync side works too,
+    including its OR with the Telegram signal."""
+
+    def test_true_via_gsheet_journal_notes_alone(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", tmp_path / "no-registry.json")
+        config_path = tmp_path / "gsheet_sync.yaml"
+        config_path.write_text("""
+sync_enabled: true
+sheets:
+  - sheet_id: "test123"
+    outputs:
+      journal_notes:
+        enabled: true
+""")
+        monkeypatch.setattr("api.services.gsheet_sync.CONFIG_PATH", config_path)
+        from api.routes import vault
+        assert vault._journal_enabled() is True
+
+    def test_false_when_gsheet_configured_but_journal_notes_disabled(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", tmp_path / "no-registry.json")
+        config_path = tmp_path / "gsheet_sync.yaml"
+        config_path.write_text("""
+sync_enabled: true
+sheets:
+  - sheet_id: "test123"
+    outputs:
+      journal_notes:
+        enabled: false
+""")
+        monkeypatch.setattr("api.services.gsheet_sync.CONFIG_PATH", config_path)
+        from api.routes import vault
+        assert vault._journal_enabled() is False
+
+    def test_false_when_neither_signal_present(self, tmp_path, monkeypatch):
+        _disable_journal_persona(monkeypatch, tmp_path)
+        from api.routes import vault
+        assert vault._journal_enabled() is False
