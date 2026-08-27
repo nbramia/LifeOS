@@ -92,6 +92,36 @@ async def sync_monarch(dry_run: bool = True, month: str | None = None) -> dict:
     return result
 
 
+def _failure_message(e: Exception) -> str:
+    """Build the message recorded for a Monarch sync failure.
+
+    ``str(e)`` comes back empty for some exceptions the Monarch client
+    library raises — observed in production: two of eighty-one monthly
+    runs failed on first attempt with a blank error string, and both
+    succeeded moments later on a plain retry, meaning the failure was
+    transient. run_all_syncs.py's `_is_transient_failure` can never match
+    an empty message, so those runs never got the automatic retry that
+    already exists for transient failures. Falling back to the exception's
+    class name (and any HTTP status/response detail it carries) gives
+    `_is_transient_failure` something to match — e.g. a bare
+    `ConnectTimeout` or `ReadTimeout` already matches its patterns by class
+    name alone, no new signature needed. A non-empty `str(e)` is returned
+    unchanged (#781).
+    """
+    message = str(e)
+    if message:
+        return message
+    parts = [type(e).__name__]
+    response = getattr(e, "response", None)
+    status = getattr(e, "status_code", None) or getattr(response, "status_code", None)
+    if status is not None:
+        parts.append(f"status={status}")
+    body = getattr(response, "text", None) if response is not None else None
+    if body:
+        parts.append(body)
+    return parts[0] if len(parts) == 1 else f"{parts[0]} ({'; '.join(parts[1:])})"
+
+
 def main():
     parser = argparse.ArgumentParser(description='Sync Monarch Money to vault')
     parser.add_argument('--execute', action='store_true', help='Actually sync (default is dry run)')
@@ -128,11 +158,19 @@ def main():
                 logger.warning(f"Could not record sync completion: {e}")
 
     except Exception as e:
-        logger.error(f"Monarch Money sync failed: {e}")
+        failure_message = _failure_message(e)
+        # This also feeds run_all_syncs.py's transient-failure retry check:
+        # this script runs as a subprocess, and on nonzero exit that check
+        # classifies against captured stdout/stderr (which the logger call
+        # below writes to) — an empty str(e) here left nothing after
+        # "sync failed: " for the classifier to match, silently defeating
+        # the retry (#781). Use the same enriched message on both this log
+        # line and the sync_health record below.
+        logger.error(f"Monarch Money sync failed: {failure_message}")
         if run_id is not None:
             try:
                 from api.services.sync_health import record_sync_complete, SyncStatus
-                record_sync_complete(run_id, status=SyncStatus.FAILED, error_message=str(e))
+                record_sync_complete(run_id, status=SyncStatus.FAILED, error_message=failure_message)
             except Exception:
                 pass
         sys.exit(1)
