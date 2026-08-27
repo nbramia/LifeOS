@@ -17,8 +17,14 @@
     <string>com.lifeos.api</string>
 
     <!-- venv is located at ~/.venvs/lifeos to avoid macOS TCC security scanning delays -->
+    <!-- Routed through launchd-env-wrapper.sh so the service gets .env at
+         start, the way a systemd service gets it via EnvironmentFile= — a
+         launchd EnvironmentVariables dict is static at load time and does
+         NOT re-read a live .env. See scripts/launchd-env-wrapper.sh (#776). -->
     <key>ProgramArguments</key>
     <array>
+        <string>__LIFEOS_PATH__/scripts/launchd-env-wrapper.sh</string>
+        <string>__LIFEOS_PATH__</string>
         <string>__HOME__/.venvs/lifeos/bin/uvicorn</string>
         <string>api.main:app</string>
         <string>--host</string>
@@ -36,7 +42,6 @@
         <string>__HOME__/.venvs/lifeos/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>LIFEOS_VAULT_PATH</key>
         <string>__VAULT_PATH__</string>
-        <!-- ANTHROPIC_API_KEY should be set in ~/.zshrc or launchctl setenv -->
     </dict>
 
     <!-- Auto-start on boot -->
