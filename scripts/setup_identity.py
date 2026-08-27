@@ -52,22 +52,40 @@ API_BASE = os.environ.get("LIFEOS_API_URL", "http://localhost:8000").rstrip("/")
 # config directories. No network access, no prompts.
 # ============================================================================
 
+def _write_bytes_matching_mode(target_path: Path, data: bytes, mode: Optional[int]) -> None:
+    """Write `data` to a brand-new `target_path`, restrictive (owner-only)
+    from the instant it's created if `mode` is given, then relaxed to
+    exactly `mode` -- so a secret-holding file (e.g. a chmod 600 .env)
+    never has a window where the umask default leaves a copy of it
+    group/world-readable."""
+    old_umask = os.umask(0o077) if mode is not None else None
+    try:
+        target_path.write_bytes(data)
+        if mode is not None:
+            os.chmod(target_path, mode & 0o777)
+    finally:
+        if old_umask is not None:
+            os.umask(old_umask)
+
+
 def backup_file(path: Path) -> Optional[Path]:
     """Copy an existing file to <path>.bak.<UTC timestamp> before it's
     modified. Returns the backup path, or None if there was nothing to back
     up (file doesn't exist yet). The timestamp includes microseconds, and a
     numeric suffix is added on top of that if a backup with that exact name
     already exists -- so two runs in quick succession never overwrite each
-    other's backup of the pre-existing file."""
+    other's backup of the pre-existing file. The backup is created with the
+    same permissions as the file it's copying (see _write_bytes_matching_mode)."""
     if not path.exists():
         return None
+    mode = path.stat().st_mode
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup_path = path.with_name(f"{path.name}.bak.{timestamp}")
     suffix = 2
     while backup_path.exists():
         backup_path = path.with_name(f"{path.name}.bak.{timestamp}.{suffix}")
         suffix += 1
-    backup_path.write_bytes(path.read_bytes())
+    _write_bytes_matching_mode(backup_path, path.read_bytes(), mode)
     return backup_path
 
 
@@ -76,15 +94,14 @@ def _atomic_write_text(path: Path, content: str) -> None:
     disk-full event mid-write can never leave `path` truncated or
     half-written -- the original file is left intact until the new one is
     fully flushed to disk. Preserves the existing file's permissions
-    (.env may be chmod 600, e.g. for an API key) instead of letting the
-    new file fall back to the umask default."""
+    (.env may be chmod 600, e.g. for an API key): the temp file is created
+    owner-only from the start (see _write_bytes_matching_mode) rather than
+    briefly existing at the umask default before being tightened."""
     path.parent.mkdir(parents=True, exist_ok=True)
     existing_mode = path.stat().st_mode if path.exists() else None
     tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
     try:
-        tmp_path.write_text(content)
-        if existing_mode is not None:
-            os.chmod(tmp_path, existing_mode)
+        _write_bytes_matching_mode(tmp_path, content.encode(), existing_mode)
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)

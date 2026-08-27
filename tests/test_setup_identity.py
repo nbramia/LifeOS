@@ -53,6 +53,15 @@ class TestBackupFile:
         # Original is untouched by the backup call itself.
         assert target.read_text() == '{"a": 1}'
 
+    def test_backup_preserves_source_file_permissions(self, tmp_path):
+        """A chmod 600 .env (holding a secret) must not get a
+        group/world-readable backup copy."""
+        target = tmp_path / ".env"
+        target.write_text("LIFEOS_ANTHROPIC_API_KEY=sk-real-key\n")
+        target.chmod(0o600)
+        backup = backup_file(target)
+        assert (backup.stat().st_mode & 0o777) == 0o600
+
     def test_same_second_backups_do_not_collide(self, tmp_path, monkeypatch):
         """Two backups taken in the same wall-clock second (same
         microsecond, in a mocked clock) must not overwrite each other --
