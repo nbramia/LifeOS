@@ -206,6 +206,75 @@ def test_codex_completed_event_persists_final_text(stores, tmp_path):
 
 
 @pytest.mark.unit
+def test_codex_completed_event_and_outcome_carry_exit_meta(stores, tmp_path):
+    """#760: the terminal transcript event (and the ExecutorOutcome the
+    worker's earned-completion gate reads) both carry how the subprocess
+    ended — returncode, timed_out, and whether a genuine terminal stream
+    event (`session.completed`/`exec.completed`) was actually seen, not just
+    inferred from a clean returncode. Also: codex has no [NOTIFY]
+    convention, so notifications_sent is always 0."""
+    sess_store, tr_store = stores
+    session = sess_store.create(
+        task_id="t-exit", session_id="sess_codex_exit", status="claimed",
+        routing="codex", origin="operator",
+    )
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-exit"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "All finished."}},
+        {"type": "session.completed"},
+    ]
+    executor = CodexExecutor(
+        session_store=sess_store,
+        transcript_store=tr_store,
+        notification_callback=lambda _msg: None,
+        spawn_fn=lambda *a, **k: _FakeProc(lines, returncode=0),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+    outcome = executor.execute(session, {"description": "sub-task", "working_dir": str(tmp_path)})
+
+    assert outcome.notifications_sent == 0
+    assert outcome.exit_meta == {
+        "returncode": 0, "timed_out": False, "stream_terminal_event_seen": True,
+    }
+    completed = [
+        e for e in tr_store.read(session.session_id) if e["kind"] == "codex_completed"
+    ]
+    assert completed[0]["payload"]["exit_meta"] == outcome.exit_meta
+
+
+@pytest.mark.unit
+def test_codex_returncode_zero_without_terminal_event_flags_exit_meta(stores, tmp_path):
+    """A subprocess that exits 0 WITHOUT ever emitting a
+    `session.completed`/`exec.completed` event still lands on the
+    returncode==0 fallback in `_run` — but `stream_terminal_event_seen` is
+    False, the signal the worker's WIP-branch/interrupted diagnosis needs to
+    tell "the CLI told us it finished" apart from "stdout just closed"."""
+    sess_store, tr_store = stores
+    session = sess_store.create(
+        task_id="t-noterm", session_id="sess_codex_noterm", status="claimed",
+        routing="codex", origin="operator",
+    )
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-noterm"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "partial..."}},
+        # No session.completed/exec.completed — stdout just ends here.
+    ]
+    executor = CodexExecutor(
+        session_store=sess_store,
+        transcript_store=tr_store,
+        notification_callback=lambda _msg: None,
+        spawn_fn=lambda *a, **k: _FakeProc(lines, returncode=0),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+    outcome = executor.execute(session, {"description": "sub-task", "working_dir": str(tmp_path)})
+
+    assert outcome.status == STATUS_COMPLETED  # returncode==0 fallback still fires
+    assert outcome.exit_meta["stream_terminal_event_seen"] is False
+
+
+@pytest.mark.unit
 def test_high_cost_does_not_cap_subscription_route(stores, monkeypatch, tmp_path):
     """Codex is subscription-billed — a high reported cost must NOT cap the task.
     Only the managed/API route enforces a dollar cap. Here the turn reports

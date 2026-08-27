@@ -17,6 +17,8 @@ import pytest
 
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
+    STATUS_BLOCKED,
+    STATUS_CLAIMED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     SessionStore,
@@ -71,8 +73,12 @@ def _make_worker(tmp_path: Path, codex_executor, *, plain_sends, withid_sends):
 def test_codex_completion_sends_final_once_and_registers_anchor(tmp_path: Path):
     plain_sends: list[str] = []
     withid_sends: list[str] = []
+    # Long enough and non-fragment-shaped to earn completion (#760) — codex
+    # has no [NOTIFY] convention, so this test's final text must itself read
+    # as a finished summary rather than exercise the earned-completion gate.
+    final_text = "Done: found 3 events on the calendar for today."
     stub = _StubCodexExecutor(
-        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="Done: 3 events.")
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=final_text)
     )
     worker = _make_worker(
         tmp_path, codex_executor=stub,
@@ -86,8 +92,8 @@ def test_codex_completion_sends_final_once_and_registers_anchor(tmp_path: Path):
 
     # Final message sent exactly once, via the id-capturing sender, and never
     # duplicated through the plain sender.
-    assert withid_sends == ["Done: 3 events."]
-    assert "Done: 3 events." not in plain_sends
+    assert withid_sends == [final_text]
+    assert final_text not in plain_sends
 
     # The completion message is registered as a followup anchor keyed on the
     # sent message id, so a threaded reply round-trips through the resume path.
@@ -489,3 +495,149 @@ def test_codex_clean_env_drops_anthropic_credentials(monkeypatch):
 
     assert "ANTHROPIC_API_KEY" not in env
     assert env["CODEX_HOME"] == "/home/agent/.codex"  # auth still reachable
+
+
+# =============================================================================
+# #760 — earned completion / interrupted CLI sessions (codex parity)
+# =============================================================================
+
+FIELD_FRAGMENT = "Now update the cancel test to drop the no-longer-needed release:"
+
+
+def test_codex_field_fixture_lands_blocked_not_completed(tmp_path: Path):
+    """Codex has no [NOTIFY] convention (always 0), so a fragment-shaped
+    final_text with no PR mention must land BLOCKED, not completed."""
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
+    )
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    session = worker.session_store.create(task_id="cx-frag", routing="codex", origin="operator")
+    worker.session_store.set_claude_code_session_id("cx-frag", "codex-frag-1")
+
+    worker._dispatch_codex_session(session, [{"content": "do the thing"}])
+
+    assert worker.session_store.get("cx-frag").status == STATUS_BLOCKED
+    # Never sent as a bare completion — it's wrapped in the interrupted notice.
+    assert withid_sends != [FIELD_FRAGMENT]
+    assert any("interrupted" in s.lower() for s in withid_sends)
+    kinds = [e["kind"] for e in worker.transcript_store.read(session.session_id)]
+    assert "cli_session_interrupted" in kinds
+    assert "codex_handled_completion" not in kinds
+
+
+def test_codex_pr_url_in_final_text_still_completes(tmp_path: Path):
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    final_text = "Opened https://github.com/nbramia/LifeOS/pull/761 with the fix."
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=final_text)
+    )
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    session = worker.session_store.create(task_id="cx-pr", routing="codex", origin="operator")
+
+    worker._dispatch_codex_session(session, [{"content": "ship it"}])
+
+    assert withid_sends == [final_text]
+    kinds = [e["kind"] for e in worker.transcript_store.read(session.session_id)]
+    assert "codex_handled_completion" in kinds
+
+
+def test_codex_summary_like_final_text_still_completes(tmp_path: Path):
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    final_text = "Implemented the fix, ran the full test suite, and everything is green."
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=final_text)
+    )
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    session = worker.session_store.create(task_id="cx-sum", routing="codex", origin="operator")
+
+    worker._dispatch_codex_session(session, [{"content": "ship it"}])
+
+    assert withid_sends == [final_text]
+
+
+def test_codex_interrupted_message_names_discoverable_wip_branch(tmp_path: Path):
+    """Best-effort WIP-branch discovery reads codex_tool_use's `preview` field
+    (codex's tool_use payload shape differs from claude_code_tool_use's
+    `input.command`) — never runs git."""
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
+    )
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    session = worker.session_store.create(task_id="cx-wip", routing="codex", origin="operator")
+    worker.session_store.set_claude_code_session_id("cx-wip", "codex-wip-1")
+    worker.transcript_store.append(session.session_id, "codex_tool_use", {
+        "type": "command_executed",
+        "preview": "git checkout -b fix/760-codex-branch",
+    })
+
+    worker._dispatch_codex_session(session, [{"content": "do the thing"}])
+
+    # Resumable (a CLI session id is set) — the notice goes via the
+    # id-capturing sender so a reply can anchor to it, like the block-prompt
+    # path above.
+    assert any("fix/760-codex-branch" in s for s in withid_sends)
+
+
+def test_codex_interrupted_session_reply_resumes_via_followup(tmp_path: Path):
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
+    )
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    session = worker.session_store.create(task_id="cx-resume-2", routing="codex", origin="operator")
+    worker.session_store.set_claude_code_session_id("cx-resume-2", "codex-resume-1")
+
+    worker._dispatch_codex_session(session, [{"content": "do the thing"}])
+
+    assert worker.session_store.get("cx-resume-2").status == STATUS_BLOCKED
+    # This file's with_id stub always returns [777].
+    worker.session_store.deposit_answer(777, "please continue")
+
+    worker._process_clarification_answers()
+
+    assert worker.session_store.get("cx-resume-2").status == STATUS_CLAIMED
+    pending = worker.session_store.drain_pending_messages(session.session_id)
+    assert [p["content"] for p in pending] == ["please continue"]
+
+
+def test_codex_interrupted_without_session_id_fails_with_preserved_context(tmp_path: Path):
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
+    )
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    session = worker.session_store.create(task_id="cx-nosess", routing="codex", origin="operator")
+    # Deliberately do NOT set a codex thread/session id.
+
+    worker._dispatch_codex_session(session, [{"content": "do the thing"}])
+
+    assert worker.session_store.get("cx-nosess").status == STATUS_FAILED
+    assert any("can't be resumed automatically" in s for s in plain_sends)
+
+
+def test_codex_child_session_bypasses_interrupted_gate(tmp_path: Path):
+    """A spawned codex child is exempt from the gate — parity with claude_code."""
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
+    )
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    parent = worker.session_store.create(task_id="cx-parent-3", routing="local")
+    child = worker.session_store.create(
+        task_id="cx-child-3", routing="codex", parent_session_id=parent.session_id,
+    )
+
+    worker._dispatch_codex_session(child, [{"content": "sub-task"}])
+
+    kinds = [e["kind"] for e in worker.transcript_store.read(child.session_id)]
+    assert "cli_session_interrupted" not in kinds
+    assert "codex_handled_completion" in kinds

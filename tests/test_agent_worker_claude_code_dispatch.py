@@ -13,6 +13,8 @@ import pytest
 
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
+    STATUS_BLOCKED,
+    STATUS_CLAIMED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     SessionStore,
@@ -292,8 +294,10 @@ def test_vault_claude_task_marked_complete_on_finish(tmp_path: Path):
     PUT .../complete and a #agent-running → #agent-completed swap. Regression
     for CLI tasks stranded at ``[/]`` / ``#agent-running`` forever (the CLI
     dispatch path bypasses ``_handle_outcome``)."""
+    # notifications_sent=1 earns the completion (#760) — this test is about
+    # vault reconciliation, not the earned-completion gate itself.
     stub = _StubClaudeCodeExecutor(
-        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done.")
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done.", notifications_sent=1)
     )
     worker, calls = _recording_worker(tmp_path, claude_code_executor=stub)
     # origin defaults to None → vault-backed task (not an operator spawn).
@@ -730,3 +734,204 @@ def test_operator_killed_failed_outcome_does_not_mirror_to_web(tmp_path: Path):
 
     # Nothing about a failure landed in the thread.
     assert conv_store.get_messages(conv.id) == []
+
+
+# =============================================================================
+# #760 — earned completion / interrupted CLI sessions
+# =============================================================================
+
+# Verbatim field fixture: session sess_099c0b8ca254486f ended mid-turn with
+# this as its final assistant text, notifications_sent=0, no PR opened, no
+# vault task should have been marked done.
+FIELD_FRAGMENT = "Now update the cancel test to drop the no-longer-needed release:"
+
+
+def test_field_fixture_lands_blocked_not_completed(tmp_path: Path):
+    """Regression for #760: a CLI subprocess exiting with no earned
+    completion signal must NOT be marked #agent-completed — it parks BLOCKED
+    (resumable) instead."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(
+            status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT, notifications_sent=0,
+        )
+    )
+    worker, calls = _recording_worker(tmp_path, claude_code_executor=stub)
+    session = worker.session_store.create(task_id="vault-1", routing="claude_code")
+    worker.session_store.set_claude_code_session_id("vault-1", "cli-interrupted-1")
+
+    worker._dispatch_claude_code_session(session, [{"content": "print hello"}])
+
+    # Never reconciled as complete in the vault.
+    assert ("PUT", "/api/tasks/vault-1/complete") not in calls
+    assert worker.session_store.get("vault-1").status == STATUS_BLOCKED
+    kinds = [e["kind"] for e in worker.transcript_store.read(session.session_id)]
+    assert "cli_session_interrupted" in kinds
+    assert "code_handled_completion" not in kinds
+
+
+def test_interrupted_message_preserves_final_text_and_exit_meta(tmp_path: Path):
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(
+            status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT, notifications_sent=0,
+            exit_meta={"returncode": 0, "timed_out": False, "stream_terminal_event_seen": True},
+        )
+    )
+    worker, store, transcripts, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="meta-1", routing="claude_code", origin="operator")
+    store.set_claude_code_session_id("meta-1", "cli-meta-1")
+
+    worker._dispatch_claude_code_session(session, [{"content": "do the thing"}])
+
+    events = [e for e in transcripts.read(session.session_id) if e["kind"] == "cli_session_interrupted"]
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["final_text"] == FIELD_FRAGMENT
+    assert payload["exit_meta"] == {
+        "returncode": 0, "timed_out": False, "stream_terminal_event_seen": True,
+    }
+    assert any("interrupted" in s.lower() for s in sent)
+    assert any(FIELD_FRAGMENT in s for s in sent)
+
+
+def test_interrupted_message_names_discoverable_wip_branch(tmp_path: Path):
+    """Best-effort WIP-branch discovery (#760): a `git switch -c <branch>`
+    tool_use recorded earlier in this session's transcript is surfaced in
+    the interrupted message. Never runs git — pure transcript scan."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
+    )
+    worker, store, transcripts, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="wip-1", routing="claude_code", origin="operator")
+    store.set_claude_code_session_id("wip-1", "cli-wip-1")
+    transcripts.append(session.session_id, "claude_code_tool_use", {
+        "name": "Bash", "input": {"command": "git switch -c fix/760-earned-completion"},
+    })
+
+    worker._dispatch_claude_code_session(session, [{"content": "do the thing"}])
+
+    assert any("fix/760-earned-completion" in s for s in sent)
+
+
+def test_interrupted_message_omits_branch_when_none_discovered(tmp_path: Path):
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
+    )
+    worker, store, transcripts, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="nowip-1", routing="claude_code", origin="operator")
+    store.set_claude_code_session_id("nowip-1", "cli-nowip-1")
+
+    worker._dispatch_claude_code_session(session, [{"content": "do the thing"}])
+
+    assert not any("WIP branch" in s for s in sent)
+
+
+def test_interrupted_session_reply_resumes_via_followup(tmp_path: Path):
+    """The interrupted session's message is registered as a kind='followup'
+    anchor — a threaded reply round-trips through the SAME
+    _resume_as_followup machinery a genuine BLOCKED (clarify/goal/plan)
+    outcome uses, re-claiming the session for resume() on the next dispatch."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
+    )
+    worker, store, transcripts, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="resume-1", routing="claude_code", origin="operator")
+    store.set_claude_code_session_id("resume-1", "cli-resume-1")
+
+    worker._dispatch_claude_code_session(session, [{"content": "do the thing"}])
+
+    assert store.get("resume-1").status == STATUS_BLOCKED
+    # _capturing_worker's telegram_send_with_id stub always returns [1].
+    store.deposit_answer(1, "please continue")
+
+    worker._process_clarification_answers()
+
+    assert store.get("resume-1").status == STATUS_CLAIMED
+    pending = store.drain_pending_messages(session.session_id)
+    assert [p["content"] for p in pending] == ["please continue"]
+
+
+def test_interrupted_without_cli_session_id_fails_with_preserved_context(tmp_path: Path):
+    """Documented fallback (#760): no claude_code_session_id was ever
+    persisted (init never fired), so there is nothing to resume against —
+    fail with the interrupted context preserved in the message rather than
+    leave an unresumable BLOCKED row stranded forever."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
+    )
+    worker, store, transcripts, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="nosess-1", routing="claude_code", origin="operator")
+    # Deliberately do NOT set claude_code_session_id.
+
+    worker._dispatch_claude_code_session(session, [{"content": "do the thing"}])
+
+    assert store.get("nosess-1").status == STATUS_FAILED
+    assert any("can't be resumed automatically" in s for s in sent)
+    kinds = [e["kind"] for e in transcripts.read(session.session_id)]
+    assert "cli_session_interrupted" in kinds
+
+
+def test_pr_url_in_final_text_still_completes(tmp_path: Path):
+    """A PR URL is the strong completion signal — unaffected by the gate."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(
+            status=STATUS_COMPLETED,
+            final_text="Opened https://github.com/nbramia/LifeOS/pull/761 with the fix.",
+        )
+    )
+    worker, calls = _recording_worker(tmp_path, claude_code_executor=stub)
+    session = worker.session_store.create(task_id="pr-1", routing="claude_code")
+
+    worker._dispatch_claude_code_session(session, [{"content": "ship it"}])
+
+    assert ("PUT", "/api/tasks/pr-1/complete") in calls
+
+
+def test_summary_like_final_text_still_completes(tmp_path: Path):
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(
+            status=STATUS_COMPLETED,
+            final_text="Implemented the fix, ran the full test suite, and everything is green.",
+        )
+    )
+    worker, calls = _recording_worker(tmp_path, claude_code_executor=stub)
+    session = worker.session_store.create(task_id="sum-1", routing="claude_code")
+
+    worker._dispatch_claude_code_session(session, [{"content": "ship it"}])
+
+    assert ("PUT", "/api/tasks/sum-1/complete") in calls
+
+
+def test_notify_sent_still_completes_even_with_fragment_text(tmp_path: Path):
+    """notifications_sent > 0 is sufficient on its own, even over a
+    fragment-shaped final_text — parity with the genuine completion case."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(
+            status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT, notifications_sent=1,
+        )
+    )
+    worker, calls = _recording_worker(tmp_path, claude_code_executor=stub)
+    session = worker.session_store.create(task_id="notify-1", routing="claude_code")
+
+    worker._dispatch_claude_code_session(session, [{"content": "ship it"}])
+
+    assert ("PUT", "/api/tasks/notify-1/complete") in calls
+
+
+def test_child_session_bypasses_interrupted_gate(tmp_path: Path):
+    """A spawned child (has a parent) is exempt from the earned-completion
+    gate — its raw outcome (fragment included) is consumed by the parent via
+    _child_final_text, which already handles this (#349)."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
+    )
+    worker, store, transcripts, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
+    parent = store.create(task_id="parent-1", routing="local")
+    child = store.create(
+        task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
+    )
+
+    worker._dispatch_claude_code_session(child, [{"content": "sub-task"}])
+
+    kinds = [e["kind"] for e in transcripts.read(child.session_id)]
+    assert "cli_session_interrupted" not in kinds
+    assert "code_handled_completion" in kinds

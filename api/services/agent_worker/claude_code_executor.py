@@ -645,6 +645,7 @@ class ClaudeCodeExecutor:
 
         if proc.returncode == 0 or state.terminal:
             final_text = self._effective_final_text(state)
+            exit_meta = self._exit_metadata(proc, timed_out, state)
             self.session_store.update_status(session.task_id, STATUS_COMPLETED)
             self.transcript_store.append(sid, "claude_code_completed", {
                 "cost_usd": state.cost_usd,
@@ -654,10 +655,15 @@ class ClaudeCodeExecutor:
                 # can read it via _child_final_text — for children the bodies
                 # never streamed to Telegram, so this is their only path out (#349).
                 "final_text": final_text,
+                # #760: how the subprocess ended — the diagnosis that used to
+                # require reconstructing from prose logs.
+                "exit_meta": exit_meta,
             })
             return ExecutorOutcome(
                 status=STATUS_COMPLETED,
                 final_text=final_text,
+                notifications_sent=state.notifications_sent,
+                exit_meta=exit_meta,
             )
 
         # Subprocess exited non-zero without a terminal event — surface the
@@ -880,6 +886,31 @@ class ClaudeCodeExecutor:
     # ------------------------------------------------------------------
     # Watchdog + heartbeat
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _exit_metadata(proc, timed_out: threading.Event, state: "_RunState") -> dict:
+        """Best-effort description of how the subprocess ended (#760).
+
+        ``returncode`` is whatever ``proc.wait()`` observed (negative on
+        POSIX when the process died to a signal — decoded into ``signal``
+        too). ``timed_out`` is always False by the time this runs on the
+        COMPLETED path (the watchdog branch returns earlier), kept for
+        payload-shape consistency. ``stream_terminal_event_seen`` is the
+        real signal for "did the CLI actually tell us it finished the turn,
+        or did stdout just close": True only when a `result` event was
+        parsed (`_handle_result_event` sets `state.terminal`); a subprocess
+        that exits 0 without ever emitting one reached COMPLETED purely on
+        the returncode fallback.
+        """
+        rc = proc.returncode
+        meta: dict = {
+            "returncode": rc,
+            "timed_out": timed_out.is_set(),
+            "stream_terminal_event_seen": state.terminal,
+        }
+        if rc is not None and rc < 0:
+            meta["signal"] = -rc
+        return meta
 
     @staticmethod
     def _on_timeout(proc, timed_out: threading.Event) -> None:
