@@ -43,6 +43,21 @@ def register_job_handler(job_type: str, handler: Callable):
     _JOB_HANDLERS[job_type] = handler
 
 
+def is_stale_running_job(job: "Job", process_start_time: str) -> bool:
+    """Whether a `RUNNING` job predates this process (#768).
+
+    `JobQueue.start_worker()` reconciles rows like this to `FAILED` at
+    startup, but a caller reading a job's status (e.g. `GET
+    /api/admin/status`, `GET /api/jobs/{id}`) may run before that
+    reconciliation has happened — or against a queue instance that never
+    called `start_worker()` at all. This lets those callers flag the same
+    condition independently, using `JobQueue.process_start_time` as the
+    "is the owning process still alive" signal: ISO-8601 timestamps from
+    `datetime.now(timezone.utc).isoformat()` compare correctly as strings.
+    """
+    return job.status == RUNNING and bool(job.started_at) and job.started_at < process_start_time
+
+
 @dataclass
 class Job:
     id: str
@@ -83,6 +98,15 @@ class JobQueue:
         self._stop_event = threading.Event()
         self._worker_thread: threading.Thread | None = None
         self._last_cleanup: float = 0.0
+        # This instance's construction time, used as a proxy for "this
+        # process's start time" (#768): JobQueue is a per-process singleton
+        # (see get_job_queue()), created once during API startup, so a job
+        # row still RUNNING with a started_at before this timestamp cannot
+        # have been claimed by this process — the process that claimed it
+        # is gone. Exposed so callers outside this class (admin/jobs routes)
+        # can flag staleness even before start_worker()'s reconciliation
+        # below has had a chance to run.
+        self.process_start_time: str = datetime.now(timezone.utc).isoformat()
         self._init_db()
 
     def _init_db(self):
@@ -237,10 +261,20 @@ class JobQueue:
     # ---- Worker ----
 
     def start_worker(self):
-        """Start the background worker thread."""
+        """Start the background worker thread.
+
+        Reconciles orphaned jobs first (#768): a job can be left `RUNNING`
+        in the database by a process that was killed or restarted mid-job
+        (e.g. an unrelated auto-deploy), and nothing else ever revisits a
+        `RUNNING` row to notice the process that owned it is gone. Since
+        this queue processes one job at a time on a single worker thread
+        that hasn't started yet, any row already `RUNNING` at this point
+        cannot belong to this process — it's stranded.
+        """
         if self._worker_thread and self._worker_thread.is_alive():
             logger.warning("Worker already running")
             return
+        self._reconcile_orphaned_jobs()
         self._stop_event.clear()
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
@@ -249,6 +283,27 @@ class JobQueue:
         )
         self._worker_thread.start()
         logger.info("Job queue worker started")
+
+    def _reconcile_orphaned_jobs(self):
+        """Mark every currently-`RUNNING` job failed/orphaned.
+
+        Called once, before the worker thread starts, so any row this finds
+        was left behind by a previous process — this process hasn't claimed
+        anything yet. Retries are intentionally not offered here (unlike
+        `_mark_failed`): the job's own process is gone, not merely a single
+        attempt, so whether to re-enqueue is a separate decision (#768).
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """UPDATE jobs SET status = ?, completed_at = ?, error = ?
+                   WHERE status = ?""",
+                (FAILED, now, "orphaned: process restarted while job was running", RUNNING),
+            )
+        if cur.rowcount:
+            logger.warning(
+                f"Reconciled {cur.rowcount} orphaned job(s) stranded by a previous process restart"
+            )
 
     def stop_worker(self, timeout: float = 10.0):
         """Stop the background worker."""

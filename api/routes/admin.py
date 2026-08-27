@@ -14,7 +14,7 @@ import logging
 
 from api.services.indexer import IndexerService
 from api.services.vectorstore import VectorStore
-from api.services.job_queue import get_job_queue
+from api.services.job_queue import get_job_queue, is_stale_running_job
 from config.settings import settings
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -52,10 +52,14 @@ async def get_status() -> IndexStatus:
         logger.error(f"Error getting document count: {e}")
         count = 0
 
-    # Check if a reindex job is currently running
+    # Check if a reindex job is currently running. A "running" row left by a
+    # process that has since restarted (e.g. an unrelated auto-deploy mid-job)
+    # is stale, not actually in progress — exclude it (#768).
     queue = get_job_queue()
     running_jobs = queue.list_jobs(status="running", job_type="reindex_vault", limit=1)
-    reindex_in_progress = len(running_jobs) > 0
+    reindex_in_progress = any(
+        not is_stale_running_job(job, queue.process_start_time) for job in running_jobs
+    )
 
     # Get last completed reindex result
     completed_jobs = queue.list_jobs(status="completed", job_type="reindex_vault", limit=1)

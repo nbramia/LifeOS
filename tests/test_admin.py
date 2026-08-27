@@ -1,14 +1,15 @@
 """
 Tests for Admin API endpoints.
 """
-import pytest
+from unittest.mock import patch
 
-# These tests use TestClient which initializes the app (slow)
-pytestmark = pytest.mark.slow
-from unittest.mock import patch, MagicMock
+import pytest
 from fastapi.testclient import TestClient
 
 from api.main import app
+
+# These tests use TestClient which initializes the app (slow)
+pytestmark = pytest.mark.slow
 
 
 class TestAdminEndpoints:
@@ -32,6 +33,44 @@ class TestAdminEndpoints:
         assert "status" in data
         assert "document_count" in data
         assert "vault_path" in data
+
+    def test_status_ignores_stale_running_reindex_job(self, client):
+        """#768: a `reindex_vault` job stuck "running" because the process
+        that was executing it restarted mid-job (e.g. an unrelated
+        auto-deploy) must not be reported as `status: "reindexing"` — its
+        started_at predates this process's own start."""
+        from api.services.job_queue import Job
+
+        stale_job = Job(
+            id="stale-1", type="reindex_vault", status="running", params={},
+            result=None, created_at="2020-01-01T00:00:00+00:00",
+            started_at="2020-01-01T00:00:00+00:00", completed_at=None,
+            attempts=1, max_attempts=3, priority=10, error=None,
+        )
+        with patch('api.routes.admin.get_job_queue') as mock_jq:
+            mock_jq.return_value.list_jobs.return_value = [stale_job]
+            mock_jq.return_value.process_start_time = "2026-08-27T00:00:00+00:00"
+            response = client.get("/api/admin/status")
+            data = response.json()
+            assert data["status"] != "reindexing"
+
+    def test_status_reports_reindexing_for_a_genuinely_running_job(self, client):
+        """Regression guard: a job actually claimed by this process (started
+        after process_start_time) must still report "reindexing"."""
+        from api.services.job_queue import Job
+
+        live_job = Job(
+            id="live-1", type="reindex_vault", status="running", params={},
+            result=None, created_at="2026-08-27T00:00:01+00:00",
+            started_at="2026-08-27T00:00:01+00:00", completed_at=None,
+            attempts=1, max_attempts=3, priority=10, error=None,
+        )
+        with patch('api.routes.admin.get_job_queue') as mock_jq:
+            mock_jq.return_value.list_jobs.return_value = [live_job]
+            mock_jq.return_value.process_start_time = "2026-08-27T00:00:00+00:00"
+            response = client.get("/api/admin/status")
+            data = response.json()
+            assert data["status"] == "reindexing"
 
     def test_reindex_endpoint_exists(self, client):
         """Reindex endpoint should exist and enqueue a job."""
