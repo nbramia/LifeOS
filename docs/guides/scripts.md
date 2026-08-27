@@ -108,6 +108,26 @@ Orchestrate all data sync operations. On Linux the nightly run is driven by the 
 
 ---
 
+### first_backfill.py
+
+One-time deep backfill for a fresh install — run this once after initial
+setup. The nightly job above deliberately narrows Gmail/Calendar to a
+30-day window; this instead runs those sources (and everything else in
+Phases 1-4, in the same order) at their own full-history default, then
+prints a coverage report (count + earliest/latest date per source).
+
+```bash
+# Preview what would run
+~/.venvs/lifeos/bin/python scripts/first_backfill.py --dry-run
+
+# Run the backfill
+~/.venvs/lifeos/bin/python scripts/first_backfill.py --execute
+```
+
+Safe to re-run — see [data-and-sync.md](../specs/technical/data-and-sync.md#first-backfill-entry-point) for details.
+
+---
+
 ### Individual Sync Scripts
 
 All sync scripts follow the pattern:
