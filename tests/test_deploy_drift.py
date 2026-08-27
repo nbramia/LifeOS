@@ -28,6 +28,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -466,87 +467,61 @@ def test_auto_deploy_syntax_and_sourced_functions_defined(tmp_path: Path):
     repo = _make_repo_for_drift(tmp_path)
     result = _run_sourced(
         repo,
-        "type -t newest_code_mtime env_file_mtime service_active_since_epoch "
-        "worker_busy sync_marker_in_progress sync_in_progress main",
+        "type -t newest_code_mtime env_file_mtime env_mtime_applied_file "
+        "env_stale_for_unit mark_env_mtime_applied service_active_since_epoch "
+        "worker_busy sync_in_progress_systemd sync_in_progress_lock_acquire "
+        "sync_in_progress_lock_release main",
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.count("function") == 7, result.stdout
+    assert result.stdout.count("function") == 11, result.stdout
+
+
+def _wait_until_lock_held(lock_path: Path, timeout: float = 5.0) -> None:
+    """Poll until some other process holds an exclusive-incompatible lock on
+    lock_path — i.e. until a background holder has actually acquired, not
+    just been spawned."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        probe = subprocess.run(["flock", "-x", "-n", str(lock_path), "-c", "true"])
+        if probe.returncode != 0:
+            return
+        time.sleep(0.05)
+    raise TimeoutError(f"lock at {lock_path} was never acquired by the holder")
+
+
+def _start_shared_lock_holder(lock_path: Path, seconds: float = 5.0) -> subprocess.Popen:
+    """Spawn a single process — no fork/exec split — that opens lock_path,
+    holds a SHARED flock, and sleeps. Deliberately not the `flock` CLI: it
+    forks a child to run the given command while the parent (the pid Popen
+    would return) keeps the fd open, so killing that parent alone does not
+    release the lock (the forked child inherits its own copy of the fd).
+    This one-liner IS the process holding the lock, so killing this exact
+    pid releases it immediately — mirroring what
+    run_all_syncs.py's _acquire_sync_lock() actually does."""
+    return subprocess.Popen([
+        sys.executable, "-c",
+        f"import fcntl, time\n"
+        f"f = open({str(lock_path)!r}, 'w')\n"
+        f"fcntl.flock(f.fileno(), fcntl.LOCK_SH)\n"
+        f"time.sleep({seconds})\n",
+    ])
 
 
 # ---------------------------------------------------------------------------
-# #793 — sync_marker_in_progress / sync_in_progress (pid marker, not pgrep)
+# #793 — sync_in_progress_lock_acquire/_release: a shared/exclusive flock on
+# data/sync.lock, replacing an earlier pid-in-a-file marker design that
+# review found to be TOCTOU (checked once, then restarted later), vulnerable
+# to pid reuse (a dead sync's marker misread as a live, unrelated process),
+# and unable to represent two overlapping manual syncs (one global marker,
+# overwritten and cleared by whichever sync writes/exits last). A kernel-held
+# flock has none of those: any number of processes can each hold the shared
+# side independently, the kernel releases it the instant a holder exits for
+# ANY reason (including SIGKILL) with no cleanup code involved, and
+# auto-deploy.sh holds its own exclusive lock for its *entire* restart
+# section (not just a point-in-time check), closing the TOCTOU gap.
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_sync_marker_in_progress_false_when_no_marker_file(tmp_path: Path):
-    if not AUTO_DEPLOY.exists():
-        pytest.skip("scripts/auto-deploy.sh not present")
-    repo = _make_repo_for_drift(tmp_path)
-    result = _run_sourced(repo, 'sync_marker_in_progress; echo "rc=$?"')
-    assert "rc=1" in result.stdout, result.stdout
-
-
-@pytest.mark.unit
-def test_sync_marker_in_progress_true_when_recorded_pid_is_alive(tmp_path: Path):
-    if not AUTO_DEPLOY.exists():
-        pytest.skip("scripts/auto-deploy.sh not present")
-    repo = _make_repo_for_drift(tmp_path)
-    (repo / "data").mkdir(exist_ok=True)
-    proc = subprocess.Popen(["sleep", "5"])
-    try:
-        (repo / "data" / "sync_in_progress.pid").write_text(str(proc.pid))
-        result = _run_sourced(repo, 'sync_marker_in_progress; echo "rc=$?"')
-        assert "rc=0" in result.stdout, result.stdout
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
-
-
-@pytest.mark.unit
-def test_sync_marker_in_progress_false_when_recorded_pid_is_dead(tmp_path: Path):
-    """A marker left behind by a run that didn't exit cleanly (hard kill)
-    must not defer forever — a dead recorded pid means NOT in progress."""
-    if not AUTO_DEPLOY.exists():
-        pytest.skip("scripts/auto-deploy.sh not present")
-    repo = _make_repo_for_drift(tmp_path)
-    (repo / "data").mkdir(exist_ok=True)
-    proc = subprocess.Popen(["true"])
-    dead_pid = proc.pid
-    proc.wait(timeout=5)
-    (repo / "data" / "sync_in_progress.pid").write_text(str(dead_pid))
-    result = _run_sourced(repo, 'sync_marker_in_progress; echo "rc=$?"')
-    assert "rc=1" in result.stdout, result.stdout
-
-
-@pytest.mark.unit
-def test_sync_in_progress_ignores_unrelated_process_mentioning_script_name(tmp_path: Path):
-    """The exact false-positive this issue fixes: a process whose command
-    line merely mentions the sync script's name as a plain argument (not the
-    script itself, and with no marker file) must not be treated as a
-    genuinely running sync — the old `pgrep -f run_all_syncs\\.py` matched
-    on command-line text alone."""
-    if not AUTO_DEPLOY.exists():
-        pytest.skip("scripts/auto-deploy.sh not present")
-    repo = _make_repo_for_drift(tmp_path)
-    bindir = repo / "stubbin"
-    bindir.mkdir(exist_ok=True)
-    _stub_bin(bindir, "systemctl", "echo inactive\nexit 0\n")
-    env = dict(os.environ)
-    env["PATH"] = f"{bindir}:{env['PATH']}"
-    proc = subprocess.Popen(
-        ["python3", "-c", "import time; time.sleep(5)", "run_all_syncs.py"]
-    )
-    try:
-        result = _run_sourced(repo, 'sync_in_progress; echo "rc=$?"', env)
-        assert "rc=1" in result.stdout, result.stdout
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
-
-
-@pytest.mark.unit
-def test_sync_in_progress_true_when_systemd_unit_is_active(tmp_path: Path):
-    """The systemd-unit signal (a systemd-launched sync) is unchanged by
-    #793 — it's checked first and short-circuits before the marker check."""
+def test_sync_in_progress_systemd_true_when_unit_active(tmp_path: Path):
     if not AUTO_DEPLOY.exists():
         pytest.skip("scripts/auto-deploy.sh not present")
     repo = _make_repo_for_drift(tmp_path)
@@ -555,8 +530,230 @@ def test_sync_in_progress_true_when_systemd_unit_is_active(tmp_path: Path):
     _stub_bin(bindir, "systemctl", "echo active\nexit 0\n")
     env = dict(os.environ)
     env["PATH"] = f"{bindir}:{env['PATH']}"
-    result = _run_sourced(repo, 'sync_in_progress; echo "rc=$?"', env)
+    result = _run_sourced(repo, 'sync_in_progress_systemd; echo "rc=$?"', env)
     assert "rc=0" in result.stdout, result.stdout
+
+
+@pytest.mark.unit
+def test_sync_in_progress_systemd_false_when_unit_inactive(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    bindir = repo / "stubbin"
+    bindir.mkdir(exist_ok=True)
+    _stub_bin(bindir, "systemctl", "echo inactive\nexit 0\n")
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    result = _run_sourced(repo, 'sync_in_progress_systemd; echo "rc=$?"', env)
+    assert "rc=1" in result.stdout, result.stdout
+
+
+@pytest.mark.unit
+def test_lock_acquire_succeeds_when_no_sync_holds_it(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"')
+    assert "rc=1" in result.stdout, result.stdout
+
+
+@pytest.mark.unit
+def test_lock_acquire_defers_while_a_sync_holds_the_shared_lock(tmp_path: Path):
+    """The exact mechanism run_all_syncs.py uses: a shared flock held for a
+    process's whole lifetime. While held, the exclusive/non-blocking acquire
+    here must fail — sync in progress, matching acceptance criterion #1."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    (repo / "data").mkdir(exist_ok=True)
+    lock_path = repo / "data" / "sync.lock"
+    holder = _start_shared_lock_holder(lock_path, seconds=5)
+    try:
+        _wait_until_lock_held(lock_path)
+        result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"')
+        assert "rc=0" in result.stdout, result.stdout
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+
+
+@pytest.mark.unit
+def test_lock_released_immediately_when_holder_is_sigkilled(tmp_path: Path):
+    """A hard-killed sync must not defer forever — the kernel releases the
+    flock the instant the holding process dies, with no cleanup code
+    required (acceptance criterion: a stale marker can never defer
+    forever, now true by construction rather than by a pid-liveness check)."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    (repo / "data").mkdir(exist_ok=True)
+    lock_path = repo / "data" / "sync.lock"
+    holder = _start_shared_lock_holder(lock_path, seconds=30)
+    try:
+        _wait_until_lock_held(lock_path)
+        holder.kill()  # SIGKILL — no signal handler, no cleanup path runs
+        holder.wait(timeout=5)
+        result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"')
+        assert "rc=1" in result.stdout, result.stdout
+    finally:
+        if holder.poll() is None:
+            holder.terminate()
+            holder.wait(timeout=5)
+
+
+@pytest.mark.unit
+def test_lock_acquire_ignores_unrelated_process_mentioning_script_name(tmp_path: Path):
+    """The original false-positive this whole mechanism replaced: a process
+    whose command line merely mentions the sync script's name as a plain
+    argument — and never touches the lock file — must not be treated as a
+    genuinely running sync."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    proc = subprocess.Popen(
+        ["python3", "-c", "import time; time.sleep(5)", "run_all_syncs.py"]
+    )
+    try:
+        result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"')
+        assert "rc=1" in result.stdout, result.stdout
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.mark.unit
+def test_two_overlapping_syncs_are_both_recognized_as_in_progress(tmp_path: Path):
+    """Multiple concurrent manual syncs must each be recognized — no single
+    global marker for one to overwrite or clear out from under the other."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    (repo / "data").mkdir(exist_ok=True)
+    lock_path = repo / "data" / "sync.lock"
+    a = _start_shared_lock_holder(lock_path, seconds=5)
+    b = _start_shared_lock_holder(lock_path, seconds=5)
+    try:
+        _wait_until_lock_held(lock_path)
+        result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"')
+        assert "rc=0" in result.stdout, result.stdout
+        b.terminate()
+        b.wait(timeout=5)
+        # a is still holding its own shared lock, independent of b's.
+        result2 = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"')
+        assert "rc=0" in result2.stdout, result2.stdout
+    finally:
+        for p in (a, b):
+            if p.poll() is None:
+                p.terminate()
+                p.wait(timeout=5)
+
+
+@pytest.mark.unit
+def test_lock_release_allows_a_subsequent_acquire(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    result = _run_sourced(
+        repo,
+        'sync_in_progress_lock_acquire; echo "first=$?"; '
+        'sync_in_progress_lock_release; '
+        'sync_in_progress_lock_acquire; echo "second=$?"',
+    )
+    assert "first=1" in result.stdout, result.stdout
+    assert "second=1" in result.stdout, result.stdout
+
+
+# ---------------------------------------------------------------------------
+# env_stale_for_unit / mark_env_mtime_applied — fixes a future-.env-mtime
+# restart loop found on review: comparing a unit's active_since against
+# ENV_MTIME directly breaks if ENV_MTIME is ever in the future (clock skew,
+# `rsync -t`, a bad manual `touch`) — active_since stays "before" a future
+# mtime forever, so the unit would restart on every tick indefinitely.
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_env_stale_for_unit_bootstrap_true_when_no_applied_marker_yet(tmp_path: Path):
+    """No applied-marker recorded yet (fresh install, or upgrading to this
+    check for the first time): falls back to the original active_since
+    comparison, so behavior is unchanged for an already-configured install."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    result = _run_sourced(
+        repo,
+        'ENV_MTIME=200; env_stale_for_unit lifeos-api 100; echo "rc=$?"',
+    )
+    assert "rc=0" in result.stdout, result.stdout
+
+
+@pytest.mark.unit
+def test_env_stale_for_unit_bootstrap_false_when_active_since_already_newer(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    result = _run_sourced(
+        repo,
+        'ENV_MTIME=100; env_stale_for_unit lifeos-api 200; echo "rc=$?"',
+    )
+    assert "rc=1" in result.stdout, result.stdout
+
+
+@pytest.mark.unit
+def test_mark_env_mtime_applied_then_env_stale_for_unit_is_false_even_with_future_mtime(
+    tmp_path: Path,
+):
+    """The actual bug: a future ENV_MTIME must restart exactly once, not on
+    every tick forever. After mark_env_mtime_applied records the value that
+    was just restarted for, a later check against the SAME (still-future)
+    ENV_MTIME must report NOT stale — the comparison is now value-equality,
+    not a wall-clock '<'."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    future = int(time.time()) + 3600
+    result = _run_sourced(
+        repo,
+        f'ENV_MTIME={future}; '
+        f'mark_env_mtime_applied lifeos-api; '
+        f'env_stale_for_unit lifeos-api 999999999999; echo "rc=$?"',
+    )
+    assert "rc=1" in result.stdout, result.stdout
+    applied_file = repo / "data" / "env-mtime-applied-lifeos-api"
+    assert applied_file.read_text().strip() == str(future)
+
+
+@pytest.mark.unit
+def test_env_stale_for_unit_true_when_env_mtime_changes_again_after_being_applied(
+    tmp_path: Path,
+):
+    """A genuinely new .env edit after one was already applied must still be
+    detected — the marker isn't a one-time 'never restart again' switch."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    result = _run_sourced(
+        repo,
+        'ENV_MTIME=100; mark_env_mtime_applied lifeos-api; '
+        'ENV_MTIME=200; env_stale_for_unit lifeos-api 999999999999; echo "rc=$?"',
+    )
+    assert "rc=0" in result.stdout, result.stdout
+
+
+@pytest.mark.unit
+def test_env_stale_for_unit_false_when_no_env_mtime_at_all(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    result = _run_sourced(repo, 'ENV_MTIME=""; env_stale_for_unit lifeos-api 100; echo "rc=$?"')
+    assert "rc=1" in result.stdout, result.stdout
+
+
+@pytest.mark.unit
+def test_mark_env_mtime_applied_is_a_noop_when_env_mtime_unset(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    _run_sourced(repo, 'ENV_MTIME=""; mark_env_mtime_applied lifeos-api')
+    assert not (repo / "data" / "env-mtime-applied-lifeos-api").exists()
 
 
 # ---------------------------------------------------------------------------

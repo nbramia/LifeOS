@@ -34,6 +34,10 @@ cd "$PROJECT_DIR" || exit 1
 LOG_FILE="$PROJECT_DIR/logs/auto-deploy.log"
 ENV_FILE="$PROJECT_DIR/.env"
 VENV_DIR="${LIFEOS_VENV:-$HOME/.venvs/lifeos}"
+# Advisory lock shared with scripts/run_all_syncs.py (#793) — see
+# sync_in_progress_lock_acquire() below for why this replaced a
+# pid-in-a-file marker.
+SYNC_LOCK_FILE="$PROJECT_DIR/data/sync.lock"
 # Non-interactive git over SSH: fail fast instead of prompting for a passphrase.
 export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new'
 
@@ -104,6 +108,47 @@ env_file_mtime() {
     stat -c '%Y' "$ENV_FILE" 2>/dev/null
 }
 
+# Path to the per-unit record of which $ENV_MTIME value a unit was last
+# actually restarted for. Per-unit because different units can be restarted
+# (or deferred) at different times.
+env_mtime_applied_file() {
+    echo "$PROJECT_DIR/data/env-mtime-applied-$1"
+}
+
+# Is $1 (a unit, started at $2) stale with respect to .env — found on
+# review: comparing $active_since (a wall-clock timestamp) against
+# $ENV_MTIME directly breaks if ENV_MTIME is ever in the future relative to
+# real time (clock skew, `rsync -t` preserving a future mtime, a manual
+# `touch` with a bad date) — active_since, even moments after a restart
+# that just happened, is still "before" a future ENV_MTIME, so the unit
+# would get restarted again on every single tick forever. Comparing the
+# exact ENV_MTIME VALUE this unit was last actually restarted for (rather
+# than wall-clock times) breaks that loop: once restarted for a given .env
+# edit, that same edit never triggers a second restart no matter what the
+# clock does afterward. Falls back to the original active_since comparison
+# only when no applied-marker exists yet for this unit (a fresh install, or
+# one upgrading to this fix for the first time), so behavior for an
+# already-configured install is unchanged unless/until that fallback path
+# itself restarts once — at which point the marker takes over.
+env_stale_for_unit() {
+    local unit="$1" active_since="$2" applied
+    [ -n "$ENV_MTIME" ] || return 1
+    applied=$(cat "$(env_mtime_applied_file "$unit")" 2>/dev/null) || applied=""
+    if [ -n "$applied" ]; then
+        [ "$ENV_MTIME" != "$applied" ]
+    else
+        [ "$active_since" -lt "$ENV_MTIME" ]
+    fi
+}
+
+# Record that $1 (a unit) has just been restarted while $ENV_MTIME was
+# current, so env_stale_for_unit never re-triggers for this same edit.
+mark_env_mtime_applied() {
+    [ -n "$ENV_MTIME" ] || return 0
+    mkdir -p "$PROJECT_DIR/data"
+    echo "$ENV_MTIME" > "$(env_mtime_applied_file "$1")"
+}
+
 # Real wall-clock time $1's current process started, on this host's own
 # clock — the same clock `newest_code_mtime` read the mtimes from, so there's
 # no cross-host skew to worry about. Empty output (return 1) means "unknown"
@@ -160,36 +205,61 @@ except Exception as e:
     return 0                   # busy, or unknown/error -> treat as busy
 }
 
-# Authoritative "is a manually-launched sync actually running" check (#793).
-# Reads the marker scripts/run_all_syncs.py writes (its own pid) at the start
-# of a real run and removes at exit — not a command-line match. `pgrep -f
-# "run_all_syncs\.py"` used to also match an unrelated process whose command
-# line merely mentioned the script's name or path as an argument (e.g. a
-# remote-shell invocation), deferring deploys for no reason even though no
-# sync was actually running. A marker left behind by a run that didn't exit
-# cleanly (hard kill) is told apart from a genuinely live one by checking
-# that the recorded pid is still alive — a dead pid means NOT in progress,
-# so a stale marker can never defer forever.
-sync_marker_in_progress() {
-    local marker="$PROJECT_DIR/data/sync_in_progress.pid"
-    [ -f "$marker" ] || return 1
-    local pid
-    pid=$(cat "$marker" 2>/dev/null)
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
-}
-
-# Defer while the nightly sync is running. Restarting lifeos-api mid-sync
-# SIGTERMs the running reindex, and the restart's fresh allocations landing
-# on top of the still-resident embedding process has OOM-frozen the host
-# (killed the desktop). Never deploy during a sync — the next 10-min tick
-# catches up once it finishes. The systemd-unit check covers a
-# systemd-launched sync; sync_marker_in_progress covers one launched
-# manually (#793 replaced its old `pgrep -f` command-line match).
-sync_in_progress() {
+# Tier 1 of the "is a sync actually running" check: a systemd-launched sync.
+# Cheap and authoritative when it applies, so it's checked before ever
+# touching the lock file below.
+sync_in_progress_systemd() {
     case "$(systemctl show lifeos-sync.service -p ActiveState --value 2>/dev/null)" in
         activating|active|deactivating|reloading) return 0 ;;
     esac
-    sync_marker_in_progress
+    return 1
+}
+
+# Tier 2: a manually-launched sync, via the shared advisory lock
+# scripts/run_all_syncs.py holds on $SYNC_LOCK_FILE for its whole run (#793).
+#
+# This replaced two earlier approaches, each with a real failure mode found
+# on review:
+#   - `pgrep -f "run_all_syncs\.py"` matched ANY process whose command line
+#     merely mentioned the script's name/path as an argument (e.g. a
+#     remote-shell invocation, or — observed live — a code-review tool
+#     handed a diff that quotes the filename), deferring deploys for no
+#     reason.
+#   - A pid-in-a-file marker (checked once, `kill -0`'d) fixed that, but
+#     checking it once and then restarting seconds later is TOCTOU: a sync
+#     starting in that gap gets killed mid-run by the restart it should have
+#     blocked. A marker's recorded pid can also be reused by an unrelated
+#     process after the sync that wrote it exits, reading as "still alive"
+#     forever. And a single global marker can't represent two overlapping
+#     manual syncs — the second overwrites the first's marker and can clear
+#     it out from under the still-running first sync on exit.
+#
+# A kernel-held advisory lock has none of those problems. run_all_syncs.py
+# takes a SHARED lock (LOCK_SH) for its whole run — any number of syncs may
+# hold it concurrently, each independently, with no "the one marker" to
+# race. This function takes the matching EXCLUSIVE, non-blocking lock
+# (LOCK_EX | LOCK_NB) via `flock`(1) on fd 9: it succeeds (sync NOT in
+# progress) only when no process holds the shared lock, and the caller is
+# expected to hold fd 9 open for its *entire* restart section, not just this
+# check — closing the TOCTOU gap, because a sync trying to start meanwhile
+# blocks (briefly, on its own LOCK_SH acquisition) until the restart section
+# releases fd 9, rather than starting into a restart. There is no cleanup to
+# reason about on a hard kill either: the kernel releases a flock the
+# instant its holding process exits, for any reason.
+#
+# Returns 0 (sync in progress — caller must not proceed) if the lock could
+# NOT be acquired; 1 (clear to proceed) if it was acquired, in which case fd
+# 9 is left open and locked for the caller to release later.
+sync_in_progress_lock_acquire() {
+    mkdir -p "$(dirname "$SYNC_LOCK_FILE")"
+    exec 9>"$SYNC_LOCK_FILE"
+    flock -x -n 9 || return 0
+    return 1
+}
+
+sync_in_progress_lock_release() {
+    flock -u 9 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
 }
 
 # Everything below is the operational run — wrapped in a function, guarded so
@@ -206,7 +276,16 @@ case "$(_read_env "LIFEOS_AUTODEPLOY_ENABLED" "false" | tr '[:upper:]' '[:lower:
 esac
 
 # --- Defer while the nightly sync is running ------------------------------------
-if sync_in_progress; then
+if sync_in_progress_systemd; then
+    log "skip: nightly sync in progress — deferring deploy to avoid a mid-sync restart"
+    exit 0
+fi
+# Exclusive, non-blocking lock held from here through the end of this
+# function (released just before main() returns, below) — not just checked
+# once — so a sync starting anywhere in between is never restarted out from
+# under itself (#793's TOCTOU finding). Any process exit on any path below
+# also releases it, via the kernel, with or without the explicit release.
+if sync_in_progress_lock_acquire; then
     log "skip: nightly sync in progress — deferring deploy to avoid a mid-sync restart"
     exit 0
 fi
@@ -286,7 +365,7 @@ if [ -n "$CODE_MTIME" ] || [ -n "$ENV_MTIME" ]; then
         code_stale=false
         env_stale=false
         [ -n "$CODE_MTIME" ] && [ "$active_since" -lt "$CODE_MTIME" ] && code_stale=true
-        [ -n "$ENV_MTIME" ] && [ "$active_since" -lt "$ENV_MTIME" ] && env_stale=true
+        env_stale_for_unit "$unit" "$active_since" && env_stale=true
         { [ "$code_stale" = true ] || [ "$env_stale" = true ]; } || continue   # current, nothing to do
 
         if [ "$code_stale" = true ] && [ "$env_stale" = true ]; then
@@ -309,6 +388,7 @@ if [ -n "$CODE_MTIME" ] || [ -n "$ENV_MTIME" ]; then
         log "drift: $drift_msg — restarting"
         if sudo -n systemctl restart "$unit" 2>>"$LOG_FILE"; then
             RESTARTED+=("$unit")
+            mark_env_mtime_applied "$unit"
         else
             FAILED+=("$unit")
             log "ERROR: restart failed for $unit"
@@ -347,6 +427,12 @@ fi
 log "restarted ${RESTARTED[*]} for drift, health OK"
 notify_success "✅ *LifeOS Auto-Deploy*
 Restarted ${RESTARTED[*]} — was running stale code. Health OK."
+# Every exit path in this function terminates the process, and the kernel
+# releases fd 9's flock the instant that happens regardless — this explicit
+# release is redundant here, kept only so the lock's lifetime reads clearly
+# as "acquired near the top, released at the bottom" rather than "acquired,
+# then implicitly relies on process exit."
+sync_in_progress_lock_release
 exit 0
 }
 

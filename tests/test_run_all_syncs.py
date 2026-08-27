@@ -1,6 +1,8 @@
 """Tests for dependency-skip behavior and LLM memory gating in run_all_syncs."""
 
-import os
+import subprocess
+import sys
+import time
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -1294,104 +1296,154 @@ class TestSyncOrderInvariants:
         assert self._pos("strengths") > self._pos("person_stats_full")
 
 
-class TestSyncInProgressMarker:
-    """Coverage for the #793 in-progress marker. scripts/auto-deploy.sh's
-    sync_in_progress() reads this marker (a pid) instead of matching
-    `run_all_syncs.py` against every process's command line — the old
-    approach also matched an unrelated process that merely mentioned the
-    script's name/path as an argument."""
+def _external_exclusive_probe_succeeds(lock_path) -> bool:
+    """True if an independent process can grab an exclusive, non-blocking
+    flock on lock_path right now — i.e. the lock is currently free."""
+    probe = subprocess.run(["flock", "-x", "-n", str(lock_path), "-c", "true"])
+    return probe.returncode == 0
 
-    def test_write_marker_records_own_pid(self, tmp_path):
+
+class TestSyncLock:
+    """Coverage for the #793 shared advisory lock. scripts/auto-deploy.sh's
+    sync_in_progress_lock_acquire() takes a matching EXCLUSIVE, non-blocking
+    lock on the same file to decide whether a sync is running.
+
+    This replaced an earlier pid-in-a-file marker design (checked once with
+    `kill -0`) that review found to be TOCTOU (checked once, then a restart
+    could happen minutes later — a sync starting in between wasn't
+    protected), vulnerable to pid reuse (a dead sync's recorded pid, later
+    reused by an unrelated live process, reads as "still running" forever),
+    and unable to represent two overlapping manual syncs (one global marker
+    file, overwritten and cleared by whichever sync writes/exits last). A
+    kernel-held flock has none of those problems: any number of processes
+    can each hold the shared side independently and simultaneously, and the
+    kernel — not any cleanup code here — releases a process's lock the
+    instant it exits, for any reason, including SIGKILL."""
+
+    def test_acquire_sync_lock_creates_parent_directory(self, tmp_path):
+        """data/ doesn't exist on a fresh clone — acquiring the lock must
+        not depend on some other code path having created it first."""
         from scripts import run_all_syncs
 
-        marker = tmp_path / "sync_in_progress.pid"
-        with patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker):
-            run_all_syncs._write_sync_marker()
-            assert marker.read_text().strip() == str(os.getpid())
+        lock_path = tmp_path / "data" / "sync.lock"
+        assert not lock_path.parent.exists()
+        with patch("scripts.run_all_syncs.SYNC_LOCK_PATH", lock_path):
+            run_all_syncs._acquire_sync_lock()
+        assert lock_path.exists()
 
-    def test_write_marker_creates_parent_directory(self, tmp_path):
-        """data/ doesn't exist on a fresh clone — the marker write must not
-        depend on some other code path having created it first."""
+    def test_acquire_sync_lock_holds_a_shared_lock(self, tmp_path):
+        """While held, an independent exclusive/non-blocking probe on the
+        same file must fail — this is what auto-deploy.sh's
+        sync_in_progress_lock_acquire() relies on to detect it."""
         from scripts import run_all_syncs
 
-        marker = tmp_path / "data" / "sync_in_progress.pid"
-        assert not marker.parent.exists()
-        with patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker):
-            run_all_syncs._write_sync_marker()
-        assert marker.exists()
+        lock_path = tmp_path / "sync.lock"
+        with patch("scripts.run_all_syncs.SYNC_LOCK_PATH", lock_path):
+            run_all_syncs._acquire_sync_lock()
+            assert not _external_exclusive_probe_succeeds(lock_path)
 
-    def test_clear_marker_removes_its_own_marker(self, tmp_path):
+    def test_two_shared_lock_acquisitions_do_not_conflict(self, tmp_path):
+        """Two overlapping manual syncs must each be able to hold the shared
+        lock at once — this is the acceptance criterion the old one-marker
+        design could not satisfy."""
+        lock_path = tmp_path / "sync.lock"
+        script = (
+            "import fcntl, time\n"
+            f"f = open({str(lock_path)!r}, 'w')\n"
+            "fcntl.flock(f.fileno(), fcntl.LOCK_SH)\n"
+            "time.sleep(2)\n"
+        )
+        a = subprocess.Popen([sys.executable, "-c", script])
+        b = subprocess.Popen([sys.executable, "-c", script])
+        try:
+            assert a.wait(timeout=5) == 0
+            assert b.wait(timeout=5) == 0
+        finally:
+            for p in (a, b):
+                if p.poll() is None:
+                    p.kill()
+                    p.wait(timeout=5)
+
+    def test_lock_released_when_holding_process_exits_normally(self, tmp_path):
+        lock_path = tmp_path / "sync.lock"
+        subprocess.run(
+            [
+                sys.executable, "-c",
+                f"import fcntl\nf = open({str(lock_path)!r}, 'w')\n"
+                "fcntl.flock(f.fileno(), fcntl.LOCK_SH)\n",
+            ],
+            timeout=5,
+        )
+        assert _external_exclusive_probe_succeeds(lock_path)
+
+    def test_lock_released_immediately_on_sigkill(self, tmp_path):
+        """A hard-killed sync must not defer forever — the kernel releases
+        the flock the instant the holding process dies, with no cleanup
+        code able to run."""
+        lock_path = tmp_path / "sync.lock"
+        proc = subprocess.Popen([
+            sys.executable, "-c",
+            f"import fcntl, time\nf = open({str(lock_path)!r}, 'w')\n"
+            "fcntl.flock(f.fileno(), fcntl.LOCK_SH)\n"
+            "time.sleep(30)\n",
+        ])
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if not _external_exclusive_probe_succeeds(lock_path):
+                    break
+                time.sleep(0.05)
+            else:
+                raise TimeoutError("holder never acquired the lock")
+            proc.kill()  # SIGKILL — no handler, no cleanup path runs
+            proc.wait(timeout=5)
+            assert _external_exclusive_probe_succeeds(lock_path)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_lock_is_held_while_run_all_syncs_executes(self, tmp_path):
+        """End-to-end via main(): the lock must be held for the duration of
+        the actual sync work, not just at the moment main() starts."""
         from scripts import run_all_syncs
 
-        marker = tmp_path / "sync_in_progress.pid"
-        with patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker):
-            run_all_syncs._write_sync_marker()
-            assert marker.exists()
-            run_all_syncs._clear_sync_marker()
-            assert not marker.exists()
-
-    def test_clear_marker_is_a_no_op_when_marker_already_gone(self, tmp_path):
-        from scripts import run_all_syncs
-
-        marker = tmp_path / "sync_in_progress.pid"
-        with patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker):
-            run_all_syncs._clear_sync_marker()  # must not raise
-
-    def test_clear_marker_never_deletes_a_marker_owned_by_another_pid(self, tmp_path):
-        """A race where a different run's marker is on disk (this pid never
-        wrote it) must not be deleted out from under that other run."""
-        from scripts import run_all_syncs
-
-        marker = tmp_path / "sync_in_progress.pid"
-        marker.write_text("999999999")
-        with patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker):
-            run_all_syncs._clear_sync_marker()
-        assert marker.read_text().strip() == "999999999"
-
-    def test_marker_present_during_run_and_gone_after(self, tmp_path):
-        """End-to-end via main(): the marker must exist while
-        run_all_syncs() is executing and be gone once it returns."""
-        from scripts import run_all_syncs
-
-        marker = tmp_path / "sync_in_progress.pid"
+        lock_path = tmp_path / "sync.lock"
         seen = {}
 
         def fake_run_all_syncs(**kwargs):
-            seen["existed"] = marker.exists()
-            seen["pid"] = marker.read_text().strip() if seen["existed"] else None
+            seen["locked"] = not _external_exclusive_probe_succeeds(lock_path)
             return {"failed": 0}
 
         with (
-            patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker),
+            patch("scripts.run_all_syncs.SYNC_LOCK_PATH", lock_path),
             patch("scripts.run_all_syncs.run_all_syncs", side_effect=fake_run_all_syncs),
             patch("sys.argv", ["run_all_syncs.py", "--dry-run"]),
         ):
             run_all_syncs.main()
 
-        assert seen["existed"] is True
-        assert seen["pid"] == str(os.getpid())
-        assert not marker.exists()
+        assert seen["locked"] is True
 
-    def test_marker_cleared_even_when_sync_raises(self, tmp_path):
-        """The marker must not survive an unhandled exception from
-        run_all_syncs() — a crash must not leave a permanent false
-        'in progress' signal (only pid-liveness saves that case otherwise)."""
+    def test_lock_is_held_when_run_all_syncs_raises(self, tmp_path):
+        """An unhandled exception from run_all_syncs() must propagate
+        (main() doesn't swallow it) — with no marker-cleanup step needed to
+        avoid a stale in-progress signal, since the kernel handles that once
+        this process itself eventually exits."""
         from scripts import run_all_syncs
 
-        marker = tmp_path / "sync_in_progress.pid"
+        lock_path = tmp_path / "sync.lock"
+        seen = {}
 
         def boom(**kwargs):
-            assert marker.exists()
+            seen["locked"] = not _external_exclusive_probe_succeeds(lock_path)
             raise RuntimeError("simulated sync crash")
 
         with (
-            patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker),
+            patch("scripts.run_all_syncs.SYNC_LOCK_PATH", lock_path),
             patch("scripts.run_all_syncs.run_all_syncs", side_effect=boom),
             patch("sys.argv", ["run_all_syncs.py", "--dry-run"]),
         ):
             with pytest.raises(RuntimeError):
                 run_all_syncs.main()
 
-        assert not marker.exists()
-
-        assert not run_all_syncs.SYNC_MARKER_PATH.exists()
+        assert seen["locked"] is True

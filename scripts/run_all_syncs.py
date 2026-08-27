@@ -29,9 +29,9 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 
 import argparse
+import fcntl
 import json
 import logging
-import os
 import re
 import signal
 import subprocess
@@ -322,38 +322,53 @@ _active_source: str | None = None
 _llm_stopped_for_sync: bool = False
 _llm_was_running_before_sync: bool = False
 
-# In-progress marker for scripts/auto-deploy.sh's sync_in_progress() (#793).
+# In-progress signal for scripts/auto-deploy.sh's sync_in_progress() (#793).
 # Auto-deploy used to match `run_all_syncs.py` in any process's command line
 # to decide whether a sync was running — including an unrelated process that
 # merely mentioned the script's name/path as an argument, which deferred
-# deploys for no reason. This marker holds this run's own pid so a genuinely
-# live sync is told apart from a stale leftover by checking the pid is still
-# alive, not by matching text. A module-level constant (not a function-local
-# path) so tests can `patch("scripts.run_all_syncs.SYNC_MARKER_PATH", ...)`
-# to point it at an isolated file, the same pattern test_run_all_syncs.py
-# already uses for SYNC_SOURCES/SYNC_ORDER.
-SYNC_MARKER_PATH = Path(__file__).parent.parent / "data" / "sync_in_progress.pid"
+# deploys for no reason. A first fix (a pid-in-a-file marker, checked with
+# `kill -0`) traded that for three new problems found on review: checking the
+# marker once and then restarting later is TOCTOU (a sync can start in the
+# gap); a marker's pid can be reused by an unrelated process after the sync
+# that wrote it dies, reading as "still alive" forever; and one global marker
+# can't represent two overlapping manual syncs — the second overwrites the
+# first's marker and clears it out from under the still-running first sync on
+# exit. A kernel-held advisory lock has none of these problems: multiple
+# processes can each hold a shared lock concurrently (no single "the"
+# marker), the kernel releases it the instant a process exits for ANY reason
+# including SIGKILL (no stale state, no pid to reuse or misread), and there's
+# no window between "check" and "act" because auto-deploy.sh holds its own
+# (exclusive) lock across its entire restart section rather than checking
+# once and proceeding. A module-level constant (not a function-local path) so
+# tests can `patch("scripts.run_all_syncs.SYNC_LOCK_PATH", ...)` to point it
+# at an isolated file, the same pattern test_run_all_syncs.py already uses
+# for SYNC_SOURCES/SYNC_ORDER.
+SYNC_LOCK_PATH = Path(__file__).parent.parent / "data" / "sync.lock"
+
+# Kept open for the process's entire lifetime once acquired — the lock lives
+# on this file descriptor, not in any content written to the file. Module
+# level so it isn't garbage-collected (and the fd closed, releasing the lock)
+# before the process actually exits.
+_sync_lock_file = None
 
 
-def _write_sync_marker() -> None:
-    """Record that this process is a genuinely-running sync. Best-effort —
-    a failure to write it just means auto-deploy falls back to the
-    systemd-unit check, not a reason to abort the sync itself."""
+def _acquire_sync_lock() -> None:
+    """Block until this process holds a SHARED advisory lock on
+    data/sync.lock, then hold it until process exit. Shared, not exclusive:
+    any number of sync runs may legitimately overlap and each holds its own
+    shared lock concurrently. auto-deploy.sh takes an EXCLUSIVE lock on the
+    same file around its whole restart section, so this blocks (briefly,
+    non-fatally) if a restart happens to be mid-flight when a sync starts,
+    rather than starting into one. Best-effort — a failure to acquire it
+    just means auto-deploy falls back to the systemd-unit check, not a
+    reason to abort the sync itself."""
+    global _sync_lock_file
     try:
-        SYNC_MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SYNC_MARKER_PATH.write_text(str(os.getpid()))
+        SYNC_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _sync_lock_file = open(SYNC_LOCK_PATH, "w")
+        fcntl.flock(_sync_lock_file.fileno(), fcntl.LOCK_SH)
     except OSError as e:
-        logger.warning(f"Could not write sync-in-progress marker: {e}")
-
-
-def _clear_sync_marker() -> None:
-    """Remove the marker, but only if it's still ours — never delete
-    another run's marker (e.g. this process lost a race to write first)."""
-    try:
-        if SYNC_MARKER_PATH.read_text().strip() == str(os.getpid()):
-            SYNC_MARKER_PATH.unlink()
-    except OSError:
-        pass  # already gone, or never ours to begin with
+        logger.warning(f"Could not acquire sync lock: {e}")
 
 
 def _handle_sigterm(signum, frame):
@@ -370,7 +385,9 @@ def _handle_sigterm(signum, frame):
     # Restore LLM if we stopped it
     if _llm_stopped_for_sync and _llm_was_running_before_sync:
         _start_llm()
-    _clear_sync_marker()
+    # No lock cleanup needed here (unlike the old marker file): the kernel
+    # releases the flock the moment this process exits below, including for
+    # signals that skip this handler entirely (e.g. SIGKILL).
     sys.exit(128 + signum)
 
 
@@ -2275,15 +2292,14 @@ def main():
     if not args.execute and not args.dry_run:
         logger.info("Note: Running in dry-run mode. Use --execute to actually run syncs.")
 
-    # Marker for auto-deploy.sh's sync_in_progress() (#793) — written before
-    # the run starts, removed once it's done (including via SIGTERM, in
-    # _handle_sigterm above). Held for the whole run, dry-run included: the
-    # marker means "this script is executing", not "data is being written".
-    _write_sync_marker()
-    try:
-        result = run_all_syncs(sources=sources, dry_run=dry_run, force=args.force, trigger=args.trigger)
-    finally:
-        _clear_sync_marker()
+    # Shared lock for auto-deploy.sh's sync_in_progress() (#793) — acquired
+    # before the run starts, released automatically by the kernel whenever
+    # this process exits (normal return, the SIGTERM handler above, or a
+    # hard kill), so there's no cleanup call needed here. Held for the whole
+    # run, dry-run included: the lock means "this script is executing", not
+    # "data is being written".
+    _acquire_sync_lock()
+    result = run_all_syncs(sources=sources, dry_run=dry_run, force=args.force, trigger=args.trigger)
 
     # Exit with error if any sync failed
     if result["failed"] > 0:
