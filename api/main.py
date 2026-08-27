@@ -537,9 +537,18 @@ async def full_health_check():
             "detail": f"LIFEOS_LLM_BACKEND={backend!r}, local LLM not in use",
         }
     else:
-        from api.services.llm_client import LocalLLMClient
         start = time.time()
-        reachable = await LocalLLMClient().ais_available()
+        try:
+            from api.services.llm_client import LocalLLMClient
+            reachable = await LocalLLMClient().ais_available()
+        except Exception as e:
+            # ais_available() already catches its own network errors and
+            # returns False; this is belt-and-suspenders against anything
+            # else (e.g. client construction) so a local-LLM problem always
+            # surfaces as this row's error, never a 500 from the whole
+            # /health/full endpoint.
+            reachable = False
+            logger.warning(f"local_llm reachability probe raised unexpectedly: {e}")
         elapsed = int((time.time() - start) * 1000)
         if reachable:
             results["checks"]["local_llm"] = {
@@ -593,6 +602,32 @@ async def full_health_check():
         json_body={"query": "test", "top_k": 1}
     )
 
+    # 3b. Vault-root sanity check (#762) — the request/response check above
+    # only confirms search returns *something*, not that what it returns
+    # still lives where the vault is currently configured. A moved/deleted
+    # vault can leave the index serving stale content from the old location
+    # while that check keeps passing. Additive only: a healthy, unmoved
+    # vault continues to report "ok" exactly as before; this only downgrades
+    # an already-"ok" row to "degraded" on detected drift, and never touches
+    # anything when the base check itself already failed.
+    if results["checks"].get("vault_search", {}).get("status") == "ok":
+        try:
+            from api.services.vectorstore import get_vector_store, sample_paths_match_vault_root
+            sample = get_vector_store().sample_file_paths(limit=5)
+            all_match, mismatched = sample_paths_match_vault_root(sample, settings.vault_path)
+            if not all_match:
+                results["checks"]["vault_search"]["status"] = "degraded"
+                results["checks"]["vault_search"]["detail"] = (
+                    f"{len(mismatched)}/{len(sample)} sampled indexed path(s) fall outside "
+                    f"the configured vault root ({settings.vault_path.resolve()}), e.g. "
+                    f"{mismatched[0]}"
+                )
+        except Exception as e:
+            # Never let this additive sanity check take down the primary
+            # vault_search result — a vector-store hiccup here is already
+            # visible via the chromadb_server check above.
+            logger.warning(f"vault-root sanity check failed: {e}")
+
     # 3. Calendar Upcoming (GET /api/calendar/upcoming)
     await test_endpoint(
         "calendar_upcoming",
@@ -617,8 +652,13 @@ async def full_health_check():
     # so all three Google rows report the same not-configured shape (#697).
     from api.services.google_auth import get_google_auth, GoogleAccount
     if not get_google_auth(GoogleAccount.PERSONAL).credentials_path.exists():
+        # Same shape as test_endpoint()'s error rows below (status/latency_ms/
+        # error) so a monitor parsing "error" rows doesn't need a special
+        # case for this one — latency_ms is 0 since this is a local
+        # filesystem check, not a network call.
         results["checks"]["gmail_search"] = {
             "status": "error",
+            "latency_ms": 0,
             "error": "Google credentials not configured (personal account)",
         }
         results["errors"].append("gmail_search: Google credentials not configured (personal account)")
