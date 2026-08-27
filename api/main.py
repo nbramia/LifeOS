@@ -445,6 +445,43 @@ async def health_raw_state(clear: bool = False):
     }
 
 
+def _check_vault_root_sanity(vault_search_check: "dict | None", vault_path) -> None:
+    """Additive sanity check for the `vault_search` row in `GET /health/full`
+    (#762). Sample a handful of indexed file paths and confirm they still
+    fall under the currently configured vault root, catching a moved/deleted
+    vault whose index keeps serving stale content from the old location — a
+    drift the base request/response probe (does search return results at
+    all) can't see, since it only confirms search returns *something*.
+
+    Mutates `vault_search_check` in place, downgrading an "ok" status to
+    "degraded" with an explanatory detail on mismatch. A no-op if the base
+    check isn't present or didn't itself report "ok" — this never turns a
+    failing check into a passing one, or vice versa, only adds a further
+    downgrade on top of an already-passing result.
+    """
+    if not vault_search_check or vault_search_check.get("status") != "ok":
+        return
+    try:
+        from api.services.vectorstore import get_vector_store, sample_paths_match_vault_root
+        sample = get_vector_store().sample_file_paths(limit=5)
+        all_match, mismatched = sample_paths_match_vault_root(sample, vault_path)
+        if not all_match:
+            vault_search_check["status"] = "degraded"
+            # Deliberately omit the mismatched paths themselves — this is an
+            # unauthenticated endpoint and a real indexed file path can
+            # reveal personal folder/file names (#697 review). The counts
+            # plus the configured root are enough for an operator to act on.
+            vault_search_check["detail"] = (
+                f"{len(mismatched)}/{len(sample)} sampled indexed path(s) fall outside "
+                f"the configured vault root ({vault_path.resolve()})"
+            )
+    except Exception as e:
+        # Never let this additive sanity check take down the primary
+        # vault_search result — a vector-store hiccup here is already
+        # visible via the chromadb_server check above.
+        logger.warning(f"vault-root sanity check failed: {e}")
+
+
 @app.get("/health/full")
 async def full_health_check():
     """
@@ -606,6 +643,13 @@ async def full_health_check():
         "POST", "/api/search",
         json_body={"query": "test", "top_k": 1}
     )
+
+    # 3b. Vault-root sanity check (#762) — the request/response check above
+    # only confirms search returns *something*, not that what it returns
+    # still lives where the vault is currently configured. A moved/deleted
+    # vault can leave the index serving stale content from the old location
+    # while that check keeps passing.
+    _check_vault_root_sanity(results["checks"].get("vault_search"), settings.vault_path)
 
     # 3. Calendar Upcoming (GET /api/calendar/upcoming)
     await test_endpoint(

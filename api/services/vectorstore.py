@@ -6,15 +6,13 @@ Connects to ChromaDB server via HTTP for thread-safe concurrent access.
 NOTE: Heavy dependencies (chromadb, embeddings) are imported lazily
 to speed up pytest collection for unit tests.
 """
-from typing import Optional, Any, TYPE_CHECKING
+from typing import Optional
 from datetime import datetime
+from pathlib import Path
 import json
 import math
 
 from config.settings import settings
-
-if TYPE_CHECKING:
-    import chromadb
 
 
 class VectorStore:
@@ -317,6 +315,47 @@ class VectorStore:
                 if meta and "file_path" in meta:
                     paths.add(meta["file_path"])
         return paths
+
+    def sample_file_paths(self, limit: int = 5) -> list[str]:
+        """Return up to `limit` indexed file paths, without scanning the
+        whole collection (#762). Used by the vault_search health check's
+        vault-root sanity check — `get_all_file_paths()` above is the right
+        tool when every path is actually needed, but is too expensive to
+        call on every health-check request against a large vault."""
+        results = self._collection.get(limit=limit, include=["metadatas"])
+        paths = []
+        for meta in results.get("metadatas") or []:
+            if meta and "file_path" in meta:
+                paths.append(meta["file_path"])
+        return paths
+
+
+def sample_paths_match_vault_root(
+    paths: "list[str] | set[str]", vault_root: Path
+) -> "tuple[bool, list[str]]":
+    """Classify a sample of indexed file paths against the configured vault
+    root (#762). `file_path` metadata is always stored as `str(path.resolve())`
+    (see indexer.py), so a resolved-prefix check is sufficient — no need to
+    touch the filesystem for paths that no longer exist (`Path.is_relative_to`
+    does no I/O; only `vault_root.resolve()` below might, and that's on the
+    live configured root, not on the — possibly vanished — indexed paths).
+
+    Returns `(all_match, mismatched_paths)`. An empty `paths` sample trivially
+    matches (nothing to contradict "healthy") — the caller is responsible for
+    deciding whether an empty sample itself is worth reporting.
+    """
+    root = vault_root.resolve()
+    mismatched = []
+    for p in paths:
+        try:
+            if not Path(p).is_relative_to(root):
+                mismatched.append(p)
+        except (TypeError, ValueError):
+            # Not a usable path string at all — treat as a mismatch rather
+            # than silently skipping it, since that's exactly the kind of
+            # drift this check exists to surface.
+            mismatched.append(p)
+    return (not mismatched, mismatched)
 
 
 # Singleton instance
