@@ -114,5 +114,13 @@ class SchedulerWatcher:
         SchedulerScheduler.is_alive()'s shape. `Observer` is itself a
         `threading.Thread` subclass, so this is the same "does the thread
         that's supposed to be running still exist and hasn't died" check,
-        just for the file watcher instead of the delivery thread."""
-        return self._observer is not None and self._observer.is_alive()
+        just for the file watcher instead of the delivery thread.
+
+        Snapshots `self._observer` into a local before checking it: `stop()`
+        can null the attribute out from another thread (e.g. app shutdown)
+        between a null-check and a `.is_alive()` call on the attribute
+        itself, which would otherwise raise `AttributeError` and take down
+        the `/health` response instead of just reporting False.
+        """
+        observer = self._observer
+        return observer is not None and observer.is_alive()
