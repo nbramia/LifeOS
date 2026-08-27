@@ -17,12 +17,33 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIFEOS_PATH="$(cd "$SCRIPT_DIR/.." && pwd)"
 LAUNCHD_DIR="$LIFEOS_PATH/config/launchd"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
+ENV_FILE="$LIFEOS_PATH/.env"
 # Every template hardcodes __HOME__/.venvs/lifeos (no __VENV__ placeholder
 # exists to override it), so validation checks that exact path — not an
 # operator-configurable one — to avoid checking a different directory than
 # what's actually baked into the generated plist. Tests get an isolated venv
 # by pointing $HOME at a sandbox, same as everything else __HOME__-derived.
 VENV_DIR="$HOME/.venvs/lifeos"
+
+# Read a KEY=value from .env, same convention as scripts/setup-systemd.sh's
+# and scripts/auto-deploy.sh's own _read_env — stripping quotes, whitespace,
+# and inline comments.
+_read_env() {
+    local key="$1" default="$2" val
+    val=$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- \
+        | sed "s/^['\"]//;s/['\"]$//;s/ *#.*//" | tr -d '[:space:]')
+    echo "${val:-$default}"
+}
+
+# Opt-in gates for the two conditionally-installed services (#774) — same
+# env vars, same defaults, as scripts/setup-systemd.sh's Linux install, so
+# a single .env controls both platforms identically.
+AGENT_WORKER_AUTOSTART=$(_read_env "LIFEOS_AGENT_WORKER_AUTOSTART" "false" | tr '[:upper:]' '[:lower:]')
+case "$AGENT_WORKER_AUTOSTART" in
+    true|1|yes) AGENT_WORKER_AUTOSTART="true" ;;
+    *)          AGENT_WORKER_AUTOSTART="false" ;;
+esac
+MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
 
 # --- Generation ------------------------------------------------------------
 
@@ -148,11 +169,24 @@ check_paths_exist() {
     fi
     case "$(basename "${binary:-}" 2>/dev/null)" in
         bash|sh|zsh|python|python3)
+            # Item 4 is only a checkable script path when it isn't itself a
+            # flag — found while writing this: python's `-m module` form
+            # (agent-worker's actual shape) puts a flag, not a path, at
+            # item 4, and misreading it as a missing script would have
+            # broken validation for every python -m invocation. `python
+            # mcp_server.py` (mcp-http's actual shape) and `bash script.sh`
+            # (crm-sync's) both still get checked normally.
             local script
             script=$(_plist_program_argument "$plist" 4)
-            if [ -n "$script" ] && [ ! -x "$script" ]; then
-                echo "interpreted script: $script"
-            fi
+            case "$script" in
+                -*) ;;  # a flag, e.g. -m — nothing to check
+                "") ;;  # no fourth argument at all
+                *)
+                    if [ ! -x "$script" ]; then
+                        echo "interpreted script: $script"
+                    fi
+                    ;;
+            esac
             ;;
     esac
 }
@@ -225,6 +259,36 @@ install_plist() {
     echo "  Installed: $filename"
 }
 
+# Whether $1 (a plist filename, e.g. "com.lifeos.agent-worker.plist") should
+# be validated and installed at all. Echoes a one-line reason and returns 1
+# to skip; prints nothing and returns 0 to proceed. Centralizes every
+# conditional-install rule so validation and install agree on what to skip
+# and why — the exact "silence where there should be a named skip" gap #774
+# was filed to close. (Generation is unaffected — every found template is
+# still rendered into config/launchd/ regardless, same as chromadb's
+# existing precedent; this only gates the copy into ~/Library/LaunchAgents.)
+service_skip_reason() {
+    case "$1" in
+        *chromadb*)
+            echo "use cron watchdog instead — see docs/guides/operations.md"
+            return 1
+            ;;
+        *agent-worker*)
+            if [ "$AGENT_WORKER_AUTOSTART" != "true" ]; then
+                echo "set LIFEOS_AGENT_WORKER_AUTOSTART=true to enable"
+                return 1
+            fi
+            ;;
+        *mcp-http*)
+            if [ -z "$MCP_BEARER_TOKEN" ]; then
+                echo "set LIFEOS_MCP_BEARER_TOKEN to enable"
+                return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
 # --- Operational run ---------------------------------------------------------
 main() {
 
@@ -267,10 +331,20 @@ fi
 
 echo ""
 echo "Configuration:"
-echo "  Home:       $HOME"
-echo "  LifeOS:     $LIFEOS_PATH"
-echo "  Vault:      $VAULT_PATH"
-echo "  Venv:       $VENV_DIR"
+echo "  Home:         $HOME"
+echo "  LifeOS:       $LIFEOS_PATH"
+echo "  Vault:        $VAULT_PATH"
+echo "  Venv:         $VENV_DIR"
+if [ "$AGENT_WORKER_AUTOSTART" = "true" ]; then
+    echo "  Agent Worker: enabled"
+else
+    echo "  Agent Worker: disabled (set LIFEOS_AGENT_WORKER_AUTOSTART=true to enable)"
+fi
+if [ -n "$MCP_BEARER_TOKEN" ]; then
+    echo "  MCP HTTP:     enabled"
+else
+    echo "  MCP HTTP:     disabled (set LIFEOS_MCP_BEARER_TOKEN to enable)"
+fi
 echo ""
 
 if [ "$AUTO_YES" = false ]; then
@@ -308,17 +382,16 @@ VALIDATION_FAILED=false
 for plist in "$LAUNCHD_DIR"/*.plist; do
     if [ -f "$plist" ] && [[ ! "$plist" == *.template ]]; then
         filename=$(basename "$plist")
-        # Same skip as the install loop below, applied here too (found on
-        # review): chromadb's template doesn't follow the
-        # launchd-env-wrapper.sh convention the others do (it's documented
-        # as "does NOT work reliably with ChromaDB" and never installed —
-        # see the install loop's own skip), so validating it against that
-        # convention was always a false positive that could abort the
-        # entire run over a file that was never going to be installed anyway.
-        if [[ "$filename" == *"chromadb"* ]]; then
+        # A plist skipped at install (chromadb, or agent-worker/mcp-http
+        # when not opted in — see service_skip_reason()) is also skipped
+        # here: validating one against a convention it either doesn't
+        # follow (chromadb) or that's irrelevant to a service that will
+        # never be installed anyway was always a false positive that could
+        # abort the entire run over a file nothing depends on.
+        skip_reason=$(service_skip_reason "$filename") || {
             echo "  Skipped: $filename (not installed — see install step below)"
             continue
-        fi
+        }
         if validate_plist "$plist" "$VENV_DIR"; then
             echo "  Valid: $filename"
         else
@@ -344,14 +417,25 @@ mkdir -p "$LAUNCH_AGENTS"
 for plist in "$LAUNCHD_DIR"/*.plist; do
     if [ -f "$plist" ] && [[ ! "$plist" == *.template ]]; then
         filename=$(basename "$plist")
-        # Skip chromadb - should use cron watchdog
-        if [[ "$filename" == *"chromadb"* ]]; then
-            echo "  Skipped: $filename (use cron watchdog instead)"
+        skip_reason=$(service_skip_reason "$filename") || {
+            echo "  Skipped: $filename ($skip_reason)"
             continue
-        fi
+        }
         install_plist "$plist" "$LAUNCH_AGENTS"
     fi
 done
+
+# Two Linux watchdogs have no macOS equivalent (#774) — GPU health polling
+# reads ROCm/amdgpu-specific sysfs, and the network-recovery watchdog
+# reacts to a Linux-specific WiFi driver deadlock (mt7925). Neither
+# corresponds to any macOS hardware or driver, so there is nothing to
+# install; naming that here instead of leaving it silent is the point —
+# an operator scanning `launchctl list` for a missing service should be
+# able to tell "not applicable on this platform" from "just never built."
+echo ""
+echo "Not applicable on macOS (no equivalent hardware/driver):"
+echo "  lifeos-gpu-watchdog: skipped (GPU health check is ROCm/amdgpu-specific, Linux only)"
+echo "  lifeos-network-watchdog: skipped (recovers from a Linux WiFi driver deadlock, not applicable here)"
 
 echo ""
 echo "Setup complete!"
@@ -361,6 +445,12 @@ echo ""
 echo "1. Load the services:"
 echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.api.plist"
 echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.crm-sync.plist"
+if [ "$AGENT_WORKER_AUTOSTART" = "true" ]; then
+    echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.agent-worker.plist"
+fi
+if [ -n "$MCP_BEARER_TOKEN" ]; then
+    echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.mcp-http.plist"
+fi
 echo ""
 echo "2. Set up ChromaDB cron watchdog:"
 echo "   crontab -e"

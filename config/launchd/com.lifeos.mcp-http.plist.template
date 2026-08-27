@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LifeOS MCP HTTP Transport launchd configuration template.
+
+  Opt-in (#774): only installed by scripts/setup-launchd.sh when
+  LIFEOS_MCP_BEARER_TOKEN is set — mirrors the same condition gating
+  lifeos-mcp-http.service on the systemd side. A fresh install with no
+  token configured stays exactly as inert as it is today; nothing here
+  changes what an already-configured host has loaded.
+
+  To use:
+  1. Copy this file to com.lifeos.mcp-http.plist
+  2. Replace __HOME__ with your home directory path
+  3. Replace __LIFEOS_PATH__ with your LifeOS project path
+  4. Copy to ~/Library/LaunchAgents/
+  5. Run: launchctl load ~/Library/LaunchAgents/com.lifeos.mcp-http.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lifeos.mcp-http</string>
+
+    <!-- Routed through launchd-env-wrapper.sh so the bridge gets .env
+         (including LIFEOS_MCP_BEARER_TOKEN) at start, the same way
+         lifeos-mcp-http.service gets it via systemd's EnvironmentFile=
+         (#776). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__LIFEOS_PATH__/scripts/launchd-env-wrapper.sh</string>
+        <string>__LIFEOS_PATH__</string>
+        <string>__HOME__/.venvs/lifeos/bin/python</string>
+        <string>__LIFEOS_PATH__/mcp_server.py</string>
+        <string>--transport</string>
+        <string>http</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__LIFEOS_PATH__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.venvs/lifeos/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- Auto-start on boot -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart only on a non-zero exit — mirrors lifeos-mcp-http.service's
+         Restart=on-failure. A clean exit (e.g. an operator-issued stop)
+         must not be treated as a crash to recover from. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Restart throttle: wait 10 seconds before restart (matches the
+         systemd unit's RestartSec=10) -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Log files (one combined file, matching the systemd unit's
+         StandardOutput/StandardError both pointing at mcp-http.log) -->
+    <key>StandardOutPath</key>
+    <string>__LIFEOS_PATH__/logs/mcp-http.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LIFEOS_PATH__/logs/mcp-http.log</string>
+</dict>
+</plist>

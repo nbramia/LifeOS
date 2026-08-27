@@ -662,6 +662,163 @@ def test_main_does_not_abort_over_the_never_installed_chromadb_template(tmp_path
     assert not (fake_home / "Library" / "LaunchAgents" / "com.lifeos.chromadb.plist").exists()
 
 
+# ---------------------------------------------------------------------------
+# #774 — conditionally-installed agent-worker and mcp-http services
+# ---------------------------------------------------------------------------
+_AGENT_WORKER_TEMPLATE = (
+    REPO_ROOT / "config" / "launchd" / "com.lifeos.agent-worker.plist.template"
+)
+_MCP_HTTP_TEMPLATE = REPO_ROOT / "config" / "launchd" / "com.lifeos.mcp-http.plist.template"
+
+
+def _add_real_template(repo: Path, template_path: Path) -> None:
+    """Copy an actual repo template (not a synthetic fixture) into the
+    sandbox's config/launchd/, so #774's tests exercise the real templates
+    this change ships, not a stand-in."""
+    dest = repo / "config" / "launchd" / template_path.name
+    dest.write_text(template_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_main_skips_agent_worker_and_mcp_http_by_default(tmp_path: Path):
+    """Neither opt-in is set — both must be completely absent, not just
+    unloaded: no plist installed, matching 'a fresh install stays exactly
+    as inert as it is today.'"""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    if not (_AGENT_WORKER_TEMPLATE.exists() and _MCP_HTTP_TEMPLATE.exists()):
+        pytest.skip("agent-worker/mcp-http plist templates not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    _add_real_template(repo, _AGENT_WORKER_TEMPLATE)
+    _add_real_template(repo, _MCP_HTTP_TEMPLATE)
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "Agent Worker: disabled" in result.stdout
+    assert "MCP HTTP:     disabled" in result.stdout
+    assert "Skipped: com.lifeos.agent-worker.plist" in result.stdout
+    assert "Skipped: com.lifeos.mcp-http.plist" in result.stdout
+    agents = fake_home / "Library" / "LaunchAgents"
+    assert not (agents / "com.lifeos.agent-worker.plist").exists()
+    assert not (agents / "com.lifeos.mcp-http.plist").exists()
+    assert (agents / "com.lifeos.api.plist").exists()  # unaffected
+
+
+@pytest.mark.unit
+def test_main_installs_agent_worker_when_autostart_enabled(tmp_path: Path):
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    if not _AGENT_WORKER_TEMPLATE.exists():
+        pytest.skip("agent-worker plist template not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    _add_real_template(repo, _AGENT_WORKER_TEMPLATE)
+    (repo / ".env").write_text("LIFEOS_AGENT_WORKER_AUTOSTART=true\n", encoding="utf-8")
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "Agent Worker: enabled" in result.stdout
+    installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.agent-worker.plist"
+    assert installed.exists(), (result.stdout, result.stderr)
+    assert "__LIFEOS_PATH__" not in installed.read_text()
+    assert "launchctl load ~/Library/LaunchAgents/com.lifeos.agent-worker.plist" in result.stdout
+
+
+@pytest.mark.unit
+def test_main_installs_mcp_http_when_bearer_token_set(tmp_path: Path):
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    if not _MCP_HTTP_TEMPLATE.exists():
+        pytest.skip("mcp-http plist template not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    _add_real_template(repo, _MCP_HTTP_TEMPLATE)
+    (repo / "mcp_server.py").write_text("#!/usr/bin/env python3\n")
+    (repo / "mcp_server.py").chmod(0o755)
+    (repo / ".env").write_text("LIFEOS_MCP_BEARER_TOKEN=test-token-123\n", encoding="utf-8")
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "MCP HTTP:     enabled" in result.stdout
+    installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.mcp-http.plist"
+    assert installed.exists(), (result.stdout, result.stderr)
+    assert "__LIFEOS_PATH__" not in installed.read_text()
+    assert "launchctl load ~/Library/LaunchAgents/com.lifeos.mcp-http.plist" in result.stdout
+
+
+@pytest.mark.unit
+def test_main_rerun_with_autostart_still_enabled_leaves_agent_worker_untouched(tmp_path: Path):
+    """Idempotency for the new conditional services too: re-running with
+    the same opt-in state and unchanged templates must not replace an
+    already-installed, unchanged plist."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    if not _AGENT_WORKER_TEMPLATE.exists():
+        pytest.skip("agent-worker plist template not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    _add_real_template(repo, _AGENT_WORKER_TEMPLATE)
+    (repo / ".env").write_text("LIFEOS_AGENT_WORKER_AUTOSTART=true\n", encoding="utf-8")
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+
+    def run():
+        return subprocess.run(
+            ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+            cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+        )
+
+    first = run()
+    assert first.returncode == 0, (first.stdout, first.stderr)
+    installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.agent-worker.plist"
+    before_mtime = installed.stat().st_mtime
+
+    second = run()
+    assert second.returncode == 0, (second.stdout, second.stderr)
+    assert "Unchanged: com.lifeos.agent-worker.plist" in second.stdout
+    assert installed.stat().st_mtime == before_mtime
+
+
+@pytest.mark.unit
+def test_main_names_the_gpu_and_network_watchdog_gap_on_macos(tmp_path: Path):
+    """No macOS equivalent exists for these two — the run must say so
+    explicitly rather than leave the gap silent (the exact ambiguity #774
+    was filed over: an operator couldn't tell 'not applicable here' from
+    'just never built')."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "lifeos-gpu-watchdog" in result.stdout
+    assert "lifeos-network-watchdog" in result.stdout
+    assert "not applicable" in result.stdout.lower()
+
+
 @pytest.mark.unit
 def test_main_rerun_leaves_an_unchanged_installed_plist_untouched(tmp_path: Path):
     """Re-running setup on a host where the service is already installed
