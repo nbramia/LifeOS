@@ -17,6 +17,21 @@ check_pass() { echo "  [PASS] $1"; pass=$((pass + 1)); }
 check_warn() { echo "  [WARN] $1"; warn=$((warn + 1)); }
 check_fail() { echo "  [FAIL] $1"; fail=$((fail + 1)); }
 
+# Read a KEY=value from .env, stripping only outer whitespace and one layer
+# of surrounding matching quotes — interior whitespace/quotes are preserved.
+env_value() {
+    local key="$1" raw
+    raw=$(grep -E "^${key}=" "$PROJECT_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- || true)
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    if [ "${#raw}" -ge 2 ]; then
+        if { [[ "$raw" == \"*\" ]] && [[ "$raw" == *\" ]]; } || { [[ "$raw" == \'*\' ]] && [[ "$raw" == *\' ]]; }; then
+            raw="${raw:1:-1}"
+        fi
+    fi
+    printf '%s' "$raw"
+}
+
 echo ""
 echo "LifeOS Preflight Check"
 echo "======================"
@@ -31,7 +46,7 @@ fi
 
 # 2. ANTHROPIC_API_KEY set and not placeholder
 if [ -f "$PROJECT_DIR/.env" ]; then
-    api_key=$(grep -E "^ANTHROPIC_API_KEY=" "$PROJECT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d ' "'"'" || true)
+    api_key=$(env_value ANTHROPIC_API_KEY)
     if [ -n "$api_key" ] && [ "$api_key" != "sk-ant-..." ]; then
         check_pass "Anthropic API key configured"
     else
@@ -41,7 +56,7 @@ fi
 
 # 3. LIFEOS_VAULT_PATH set and directory exists
 if [ -f "$PROJECT_DIR/.env" ]; then
-    vault_path=$(grep -E "^LIFEOS_VAULT_PATH=" "$PROJECT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d ' "'"'" || true)
+    vault_path=$(env_value LIFEOS_VAULT_PATH)
     if [ -n "$vault_path" ] && [ -d "$vault_path" ]; then
         check_pass "Vault path exists: $vault_path"
     elif [ -n "$vault_path" ]; then
@@ -53,7 +68,7 @@ fi
 
 # 4. LIFEOS_USER_NAME set
 if [ -f "$PROJECT_DIR/.env" ]; then
-    user_name=$(grep -E "^LIFEOS_USER_NAME=" "$PROJECT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d ' "'"'" || true)
+    user_name=$(env_value LIFEOS_USER_NAME)
     if [ -n "$user_name" ] && [ "$user_name" != "User" ]; then
         check_pass "User name: $user_name"
     else
@@ -77,27 +92,14 @@ if [ -f "$PYTHON" ]; then
     fi
 fi
 
-# 7. Ollama running
-if curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
-    check_pass "Ollama running"
-    # 8. Check for qwen model
-    if curl -sf http://localhost:11434/api/tags 2>/dev/null | grep -q "qwen2.5"; then
-        check_pass "Ollama has qwen2.5 model"
-    else
-        check_warn "Ollama missing qwen2.5 model — ollama pull qwen2.5:7b-instruct"
-    fi
-else
-    check_warn "Ollama not running (query routing will fall back to pattern matching)"
-fi
-
-# 9. ChromaDB running
+# 7. ChromaDB running
 if curl -sf http://localhost:8001/api/v2/heartbeat > /dev/null 2>&1; then
     check_pass "ChromaDB running"
 else
     check_fail "ChromaDB not running — ./scripts/chromadb.sh start"
 fi
 
-# 10. Port 8000 available (or LifeOS already running)
+# 8. Port 8000 available (or LifeOS already running)
 if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
     check_pass "LifeOS already running on port 8000"
 elif lsof -i :8000 > /dev/null 2>&1; then
@@ -106,9 +108,9 @@ else
     check_pass "Port 8000 available"
 fi
 
-# 11. MY_PERSON_ID check (informational)
+# 9. MY_PERSON_ID check (informational)
 if [ -f "$PROJECT_DIR/.env" ]; then
-    person_id=$(grep -E "^LIFEOS_MY_PERSON_ID=" "$PROJECT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d ' "'"'" || true)
+    person_id=$(env_value LIFEOS_MY_PERSON_ID)
     if [ -n "$person_id" ]; then
         check_pass "Person ID configured"
     else
