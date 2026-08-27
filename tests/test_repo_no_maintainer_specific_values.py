@@ -64,10 +64,15 @@ _HARDWARE_MODEL_DENYLIST = ("Mac Mini",)
 # File-level allowlist for _HARDWARE_MODEL_DENYLIST matches. Repo-relative
 # path strings (as `git ls-files` reports them).
 _HARDWARE_NAME_ALLOWLIST = {
-    # #770 (open) -- the operator-facing alert text these two files still
-    # emit ("Check Mac Mini cron and rsync pipeline.", etc.) and the
-    # comments #770's own acceptance criteria calls out fixing alongside
-    # them. Remove these two entries once #770 lands.
+    # #770 landed -- it genericized the operator-facing alert text
+    # ("Check Mac Mini cron and rsync pipeline.", etc.) and the specific
+    # comments its own acceptance criteria called out. These two files
+    # still contain OTHER "Mac Mini" mentions #770 didn't touch (docstrings
+    # like "Import phone call history from the Mac Mini's JSON export",
+    # an argparse --help description, an unrelated SHA-drift-warning
+    # comment) -- same not-operator-facing rationale as the four entries
+    # below. Verified by removing these two entries and re-running the
+    # scan: it still fails on both files for exactly these residual lines.
     "scripts/apple_data_import.py",
     "scripts/run_all_syncs.py",
     # Not operator-facing (no alert or message a person sees at runtime) --
