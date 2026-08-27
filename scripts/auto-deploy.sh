@@ -160,6 +160,38 @@ except Exception as e:
     return 0                   # busy, or unknown/error -> treat as busy
 }
 
+# Authoritative "is a manually-launched sync actually running" check (#793).
+# Reads the marker scripts/run_all_syncs.py writes (its own pid) at the start
+# of a real run and removes at exit — not a command-line match. `pgrep -f
+# "run_all_syncs\.py"` used to also match an unrelated process whose command
+# line merely mentioned the script's name or path as an argument (e.g. a
+# remote-shell invocation), deferring deploys for no reason even though no
+# sync was actually running. A marker left behind by a run that didn't exit
+# cleanly (hard kill) is told apart from a genuinely live one by checking
+# that the recorded pid is still alive — a dead pid means NOT in progress,
+# so a stale marker can never defer forever.
+sync_marker_in_progress() {
+    local marker="$PROJECT_DIR/data/sync_in_progress.pid"
+    [ -f "$marker" ] || return 1
+    local pid
+    pid=$(cat "$marker" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# Defer while the nightly sync is running. Restarting lifeos-api mid-sync
+# SIGTERMs the running reindex, and the restart's fresh allocations landing
+# on top of the still-resident embedding process has OOM-frozen the host
+# (killed the desktop). Never deploy during a sync — the next 10-min tick
+# catches up once it finishes. The systemd-unit check covers a
+# systemd-launched sync; sync_marker_in_progress covers one launched
+# manually (#793 replaced its old `pgrep -f` command-line match).
+sync_in_progress() {
+    case "$(systemctl show lifeos-sync.service -p ActiveState --value 2>/dev/null)" in
+        activating|active|deactivating|reloading) return 0 ;;
+    esac
+    sync_marker_in_progress
+}
+
 # Everything below is the operational run — wrapped in a function, guarded so
 # it only fires when the file is executed directly, so tests can `source` this
 # script to call the decision helpers above (newest_code_mtime,
@@ -174,17 +206,6 @@ case "$(_read_env "LIFEOS_AUTODEPLOY_ENABLED" "false" | tr '[:upper:]' '[:lower:
 esac
 
 # --- Defer while the nightly sync is running ------------------------------------
-# Restarting lifeos-api mid-sync SIGTERMs the running reindex, and the restart's
-# fresh allocations landing on top of the still-resident embedding process has
-# OOM-frozen the host (killed the desktop). Never deploy during a sync — the next
-# 10-min tick catches up once it finishes.
-sync_in_progress() {
-    case "$(systemctl show lifeos-sync.service -p ActiveState --value 2>/dev/null)" in
-        activating|active|deactivating|reloading) return 0 ;;
-    esac
-    # Also catch a sync launched manually (not via the systemd unit).
-    pgrep -f "[r]un_all_syncs\.py" >/dev/null 2>&1
-}
 if sync_in_progress; then
     log "skip: nightly sync in progress — deferring deploy to avoid a mid-sync restart"
     exit 0

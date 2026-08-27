@@ -1,5 +1,6 @@
 """Tests for dependency-skip behavior and LLM memory gating in run_all_syncs."""
 
+import os
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -1291,3 +1292,106 @@ class TestSyncOrderInvariants:
     def test_strengths_runs_after_person_stats_full(self):
         """Interaction counts feed the strength computation."""
         assert self._pos("strengths") > self._pos("person_stats_full")
+
+
+class TestSyncInProgressMarker:
+    """Coverage for the #793 in-progress marker. scripts/auto-deploy.sh's
+    sync_in_progress() reads this marker (a pid) instead of matching
+    `run_all_syncs.py` against every process's command line — the old
+    approach also matched an unrelated process that merely mentioned the
+    script's name/path as an argument."""
+
+    def test_write_marker_records_own_pid(self, tmp_path):
+        from scripts import run_all_syncs
+
+        marker = tmp_path / "sync_in_progress.pid"
+        with patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker):
+            run_all_syncs._write_sync_marker()
+            assert marker.read_text().strip() == str(os.getpid())
+
+    def test_write_marker_creates_parent_directory(self, tmp_path):
+        """data/ doesn't exist on a fresh clone — the marker write must not
+        depend on some other code path having created it first."""
+        from scripts import run_all_syncs
+
+        marker = tmp_path / "data" / "sync_in_progress.pid"
+        assert not marker.parent.exists()
+        with patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker):
+            run_all_syncs._write_sync_marker()
+        assert marker.exists()
+
+    def test_clear_marker_removes_its_own_marker(self, tmp_path):
+        from scripts import run_all_syncs
+
+        marker = tmp_path / "sync_in_progress.pid"
+        with patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker):
+            run_all_syncs._write_sync_marker()
+            assert marker.exists()
+            run_all_syncs._clear_sync_marker()
+            assert not marker.exists()
+
+    def test_clear_marker_is_a_no_op_when_marker_already_gone(self, tmp_path):
+        from scripts import run_all_syncs
+
+        marker = tmp_path / "sync_in_progress.pid"
+        with patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker):
+            run_all_syncs._clear_sync_marker()  # must not raise
+
+    def test_clear_marker_never_deletes_a_marker_owned_by_another_pid(self, tmp_path):
+        """A race where a different run's marker is on disk (this pid never
+        wrote it) must not be deleted out from under that other run."""
+        from scripts import run_all_syncs
+
+        marker = tmp_path / "sync_in_progress.pid"
+        marker.write_text("999999999")
+        with patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker):
+            run_all_syncs._clear_sync_marker()
+        assert marker.read_text().strip() == "999999999"
+
+    def test_marker_present_during_run_and_gone_after(self, tmp_path):
+        """End-to-end via main(): the marker must exist while
+        run_all_syncs() is executing and be gone once it returns."""
+        from scripts import run_all_syncs
+
+        marker = tmp_path / "sync_in_progress.pid"
+        seen = {}
+
+        def fake_run_all_syncs(**kwargs):
+            seen["existed"] = marker.exists()
+            seen["pid"] = marker.read_text().strip() if seen["existed"] else None
+            return {"failed": 0}
+
+        with (
+            patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker),
+            patch("scripts.run_all_syncs.run_all_syncs", side_effect=fake_run_all_syncs),
+            patch("sys.argv", ["run_all_syncs.py", "--dry-run"]),
+        ):
+            run_all_syncs.main()
+
+        assert seen["existed"] is True
+        assert seen["pid"] == str(os.getpid())
+        assert not marker.exists()
+
+    def test_marker_cleared_even_when_sync_raises(self, tmp_path):
+        """The marker must not survive an unhandled exception from
+        run_all_syncs() — a crash must not leave a permanent false
+        'in progress' signal (only pid-liveness saves that case otherwise)."""
+        from scripts import run_all_syncs
+
+        marker = tmp_path / "sync_in_progress.pid"
+
+        def boom(**kwargs):
+            assert marker.exists()
+            raise RuntimeError("simulated sync crash")
+
+        with (
+            patch("scripts.run_all_syncs.SYNC_MARKER_PATH", marker),
+            patch("scripts.run_all_syncs.run_all_syncs", side_effect=boom),
+            patch("sys.argv", ["run_all_syncs.py", "--dry-run"]),
+        ):
+            with pytest.raises(RuntimeError):
+                run_all_syncs.main()
+
+        assert not marker.exists()
+
+        assert not run_all_syncs.SYNC_MARKER_PATH.exists()

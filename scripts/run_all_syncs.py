@@ -31,6 +31,7 @@ load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 import argparse
 import json
 import logging
+import os
 import re
 import signal
 import subprocess
@@ -321,6 +322,39 @@ _active_source: str | None = None
 _llm_stopped_for_sync: bool = False
 _llm_was_running_before_sync: bool = False
 
+# In-progress marker for scripts/auto-deploy.sh's sync_in_progress() (#793).
+# Auto-deploy used to match `run_all_syncs.py` in any process's command line
+# to decide whether a sync was running — including an unrelated process that
+# merely mentioned the script's name/path as an argument, which deferred
+# deploys for no reason. This marker holds this run's own pid so a genuinely
+# live sync is told apart from a stale leftover by checking the pid is still
+# alive, not by matching text. A module-level constant (not a function-local
+# path) so tests can `patch("scripts.run_all_syncs.SYNC_MARKER_PATH", ...)`
+# to point it at an isolated file, the same pattern test_run_all_syncs.py
+# already uses for SYNC_SOURCES/SYNC_ORDER.
+SYNC_MARKER_PATH = Path(__file__).parent.parent / "data" / "sync_in_progress.pid"
+
+
+def _write_sync_marker() -> None:
+    """Record that this process is a genuinely-running sync. Best-effort —
+    a failure to write it just means auto-deploy falls back to the
+    systemd-unit check, not a reason to abort the sync itself."""
+    try:
+        SYNC_MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SYNC_MARKER_PATH.write_text(str(os.getpid()))
+    except OSError as e:
+        logger.warning(f"Could not write sync-in-progress marker: {e}")
+
+
+def _clear_sync_marker() -> None:
+    """Remove the marker, but only if it's still ours — never delete
+    another run's marker (e.g. this process lost a race to write first)."""
+    try:
+        if SYNC_MARKER_PATH.read_text().strip() == str(os.getpid()):
+            SYNC_MARKER_PATH.unlink()
+    except OSError:
+        pass  # already gone, or never ours to begin with
+
 
 def _handle_sigterm(signum, frame):
     """Clean up sync_health.db on SIGTERM so we don't leave stale RUNNING rows."""
@@ -336,6 +370,7 @@ def _handle_sigterm(signum, frame):
     # Restore LLM if we stopped it
     if _llm_stopped_for_sync and _llm_was_running_before_sync:
         _start_llm()
+    _clear_sync_marker()
     sys.exit(128 + signum)
 
 
@@ -2240,7 +2275,15 @@ def main():
     if not args.execute and not args.dry_run:
         logger.info("Note: Running in dry-run mode. Use --execute to actually run syncs.")
 
-    result = run_all_syncs(sources=sources, dry_run=dry_run, force=args.force, trigger=args.trigger)
+    # Marker for auto-deploy.sh's sync_in_progress() (#793) — written before
+    # the run starts, removed once it's done (including via SIGTERM, in
+    # _handle_sigterm above). Held for the whole run, dry-run included: the
+    # marker means "this script is executing", not "data is being written".
+    _write_sync_marker()
+    try:
+        result = run_all_syncs(sources=sources, dry_run=dry_run, force=args.force, trigger=args.trigger)
+    finally:
+        _clear_sync_marker()
 
     # Exit with error if any sync failed
     if result["failed"] > 0:

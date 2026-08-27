@@ -467,10 +467,96 @@ def test_auto_deploy_syntax_and_sourced_functions_defined(tmp_path: Path):
     result = _run_sourced(
         repo,
         "type -t newest_code_mtime env_file_mtime service_active_since_epoch "
-        "worker_busy main",
+        "worker_busy sync_marker_in_progress sync_in_progress main",
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.count("function") == 5, result.stdout
+    assert result.stdout.count("function") == 7, result.stdout
+
+
+# ---------------------------------------------------------------------------
+# #793 — sync_marker_in_progress / sync_in_progress (pid marker, not pgrep)
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_sync_marker_in_progress_false_when_no_marker_file(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    result = _run_sourced(repo, 'sync_marker_in_progress; echo "rc=$?"')
+    assert "rc=1" in result.stdout, result.stdout
+
+
+@pytest.mark.unit
+def test_sync_marker_in_progress_true_when_recorded_pid_is_alive(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    (repo / "data").mkdir(exist_ok=True)
+    proc = subprocess.Popen(["sleep", "5"])
+    try:
+        (repo / "data" / "sync_in_progress.pid").write_text(str(proc.pid))
+        result = _run_sourced(repo, 'sync_marker_in_progress; echo "rc=$?"')
+        assert "rc=0" in result.stdout, result.stdout
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.mark.unit
+def test_sync_marker_in_progress_false_when_recorded_pid_is_dead(tmp_path: Path):
+    """A marker left behind by a run that didn't exit cleanly (hard kill)
+    must not defer forever — a dead recorded pid means NOT in progress."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    (repo / "data").mkdir(exist_ok=True)
+    proc = subprocess.Popen(["true"])
+    dead_pid = proc.pid
+    proc.wait(timeout=5)
+    (repo / "data" / "sync_in_progress.pid").write_text(str(dead_pid))
+    result = _run_sourced(repo, 'sync_marker_in_progress; echo "rc=$?"')
+    assert "rc=1" in result.stdout, result.stdout
+
+
+@pytest.mark.unit
+def test_sync_in_progress_ignores_unrelated_process_mentioning_script_name(tmp_path: Path):
+    """The exact false-positive this issue fixes: a process whose command
+    line merely mentions the sync script's name as a plain argument (not the
+    script itself, and with no marker file) must not be treated as a
+    genuinely running sync — the old `pgrep -f run_all_syncs\\.py` matched
+    on command-line text alone."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    bindir = repo / "stubbin"
+    bindir.mkdir(exist_ok=True)
+    _stub_bin(bindir, "systemctl", "echo inactive\nexit 0\n")
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    proc = subprocess.Popen(
+        ["python3", "-c", "import time; time.sleep(5)", "run_all_syncs.py"]
+    )
+    try:
+        result = _run_sourced(repo, 'sync_in_progress; echo "rc=$?"', env)
+        assert "rc=1" in result.stdout, result.stdout
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.mark.unit
+def test_sync_in_progress_true_when_systemd_unit_is_active(tmp_path: Path):
+    """The systemd-unit signal (a systemd-launched sync) is unchanged by
+    #793 — it's checked first and short-circuits before the marker check."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    bindir = repo / "stubbin"
+    bindir.mkdir(exist_ok=True)
+    _stub_bin(bindir, "systemctl", "echo active\nexit 0\n")
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    result = _run_sourced(repo, 'sync_in_progress; echo "rc=$?"', env)
+    assert "rc=0" in result.stdout, result.stdout
 
 
 # ---------------------------------------------------------------------------
