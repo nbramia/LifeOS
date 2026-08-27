@@ -2351,6 +2351,13 @@ class Worker:
             # logged here the same way, so the route the model actually
             # picked isn't lost even though it didn't take effect.
             "demoted_routing": pre.demoted_routing,
+            # (#803) A default route also demotes a non-fatal sane=False —
+            # the model's own inferred "not executable" opinion, never a
+            # sane_fatal one — to advisory the same way. Logged here so the
+            # opinion isn't lost even though it no longer blocks or parks
+            # the task; `pre.sane` already reads True by the time we get
+            # here when this fired, so `sane_reason` alone wouldn't show it.
+            "demoted_sanity": pre.demoted_sanity,
             "sane": pre.sane,
             "sane_reason": pre.sane_reason,
             "sane_fatal": pre.sane_fatal,
@@ -2385,7 +2392,13 @@ class Worker:
         # rule — treating that single cheap-model judgement as authoritative
         # would silently cancel real work, so it's parked below instead,
         # same as an ambiguous task: a wrong inference costs one question,
-        # not the task.
+        # not the task. As of #803, a non-fatal opinion is parked here only
+        # when no default route is configured (or the setting is invalid) —
+        # `run_preflight` already demoted it to `pre.sane=True` before this
+        # function ever sees it when a valid default route IS configured
+        # (see `_apply_default_route`), so `pre.sane` below already reads
+        # True on that path and neither gate fires; `pre.demoted_sanity`
+        # carries the opinion into the transcript event above instead.
         if not pre.sane and pre.sane_fatal:
             self._mark_failed(
                 session, task,
