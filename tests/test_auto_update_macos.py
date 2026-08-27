@@ -108,6 +108,18 @@ def test_sourcing_does_not_run_main(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_auto_update_macos_is_executable():
+    """Found on review: committed as mode 100644 — the script's own header
+    tells an operator to add it to their crontab by path, which fails with
+    'Permission denied' on a non-executable file. Same check as
+    test_launchd_env_wrapper.py's test_wrapper_is_executable."""
+    if not AUTO_UPDATE_MACOS.exists():
+        pytest.skip("scripts/auto-update-macos.sh not present")
+    mode = AUTO_UPDATE_MACOS.stat().st_mode
+    assert mode & stat.S_IXUSR
+
+
+@pytest.mark.unit
 def test_auto_update_macos_syntax_and_sourced_functions_defined(tmp_path: Path):
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
@@ -306,18 +318,26 @@ def test_lock_release_allows_a_subsequent_acquire(tmp_path: Path):
 @pytest.mark.unit
 def test_lock_acquire_logs_distinct_error_when_the_lock_helper_fails(tmp_path: Path):
     """Not `flock`(1) here — see sync_in_progress_lock_acquire()'s comment
-    for why that command isn't used on macOS at all. python3 is the
-    helper whose unexpected failure must still defer (safe default) while
-    logging something diagnosable, not the generic sync-busy message."""
+    for why that command isn't used on macOS at all. The resolved python
+    interpreter is the helper whose unexpected failure must still defer
+    (safe default) while logging something diagnosable, not the generic
+    sync-busy message. `_python_bin` is overridden directly rather than
+    stubbing a `python3` on PATH — on a real dev box the venv path
+    `_python_bin()` prefers (#10's PATH-shim fix) actually exists and would
+    silently bypass a PATH-only stub."""
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo = _make_repo_for_macos(tmp_path)
     bindir = repo / "stubbin"
     bindir.mkdir(exist_ok=True)
-    _stub_bin(bindir, "python3", "exit 2\n")  # anything but 0 or 75
+    _stub_bin(bindir, "broken-python", "exit 2\n")  # anything but 0 or 75
     env = dict(os.environ)
     env["PATH"] = f"{bindir}:{env['PATH']}"
-    result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"', env)
+    result = _run_sourced(
+        repo,
+        '_python_bin() { echo broken-python; }; sync_in_progress_lock_acquire; echo "rc=$?"',
+        env,
+    )
     assert "rc=0" in result.stdout, result.stdout  # still defers
     log = (repo / "logs" / "auto-update-macos.log").read_text()
     assert "lock acquisition failed unexpectedly" in log, log
@@ -568,7 +588,7 @@ def test_restart_cycle_success_path(tmp_path: Path):
         'launchctl() { case "$1" in unload) return 0;; load) return 0;; esac; }; '
         'api_pid() { echo ""; }; '
         'curl() { return 0; }; '
-        'restart_cycle; echo "rc=$?"',
+        'restart_cycle 60; echo "rc=$?"',
     )
     assert "rc=0" in result.stdout, result.stdout
 
@@ -589,7 +609,7 @@ def test_restart_cycle_captures_old_pid_before_unload(tmp_path: Path):
         'launchctl() { case "$1" in unload) return 0;; load) return 0;; esac; }; '
         f'wait_for_pid_gone() {{ echo "$1" > "{seen}"; return 0; }}; '
         'curl() { return 0; }; '
-        'restart_cycle; echo "rc=$?"',
+        'restart_cycle 60; echo "rc=$?"',
     )
     assert "rc=0" in result.stdout, result.stdout
     assert seen.read_text().strip() == "4242"
@@ -597,16 +617,19 @@ def test_restart_cycle_captures_old_pid_before_unload(tmp_path: Path):
 
 @pytest.mark.unit
 def test_restart_cycle_fails_when_health_never_comes_up(tmp_path: Path):
+    """health_timeout is passed in directly (main() computes it before the
+    lock is acquired — found on review: the find-scan must not run inside
+    the critical section), not derived by restart_cycle() calling
+    health_check_timeout() itself, so 0 is passed straight through here."""
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo = _make_repo_for_macos(tmp_path)
     result = _run_sourced(
         repo,
-        'health_check_timeout() { echo 0; }; '
         'launchctl() { return 0; }; '
         'api_pid() { echo ""; }; '
         'curl() { return 1; }; '
-        'restart_cycle; echo "rc=$?"',
+        'restart_cycle 0; echo "rc=$?"',
     )
     assert "rc=1" in result.stdout, result.stdout
 
@@ -626,7 +649,7 @@ def test_restart_cycle_proceeds_even_if_pid_wait_times_out(tmp_path: Path):
         'wait_for_pid_gone() { return 1; }; '
         'launchctl() { return 0; }; '
         'curl() { return 0; }; '
-        'restart_cycle; echo "rc=$?"',
+        'restart_cycle 60; echo "rc=$?"',
     )
     assert "rc=0" in result.stdout, result.stdout
     log = (repo / "logs" / "auto-update-macos.log").read_text()

@@ -138,13 +138,44 @@ api_pid() {
 # indefinitely. Comparing against the process's real start time has no
 # such bootstrap gap — it's accurate from the very first run, because it
 # never depends on this script's own history.
+#
+# Return codes distinguish "nothing to check" from "something is broken" —
+# found on review: collapsing every failure mode to a single "not running,
+# do nothing" made a genuine parsing bug (5 distinct causes were possible,
+# including BSD `date -j -f` choking on `ps`'s own leading whitespace) look
+# identical to the ordinary, expected "service isn't loaded yet" case —
+# untestable under Linux's coreutils `date`, and silently permanent on the
+# actual target OS. 0 = success (epoch on stdout). 1 = not running (no pid,
+# or the pid vanished between api_pid() and this ps call — a benign race,
+# not an error). 2 = pid is alive but its start time could not be parsed —
+# a real problem worth alerting on, not silence.
+#
+# `uname` gates which `date` form is even attempted, rather than trying GNU
+# first and falling back to BSD on any failure: a BSD `date -j -f` given
+# GNU-style input (or vice versa) can exit 0 with a nonsense epoch instead
+# of failing, which `||`-based fallback can't detect but picking the right
+# form up front avoids entirely.
 api_active_since_epoch() {
-    local pid ps_out
+    local pid ps_out epoch
     pid=$(api_pid) || return 1
     [ -n "$pid" ] && [ "$pid" != "-" ] || return 1
-    ps_out=$(ps -p "$pid" -o lstart= 2>/dev/null) || return 1
-    [ -n "$ps_out" ] || return 1
-    date -d "$ps_out" +%s 2>/dev/null || date -j -f "%a %b %e %T %Y" "$ps_out" +%s 2>/dev/null
+    ps_out=$(ps -p "$pid" -o lstart= 2>/dev/null)
+    if [ -z "$ps_out" ]; then
+        return 1  # pid vanished between api_pid() and this call — not running
+    fi
+    # Trim padding ps may add around a single requested column.
+    ps_out="${ps_out#"${ps_out%%[![:space:]]*}"}"
+    ps_out="${ps_out%"${ps_out##*[![:space:]]}"}"
+    if [ "$(uname)" = "Darwin" ]; then
+        epoch=$(date -j -f "%a %b %e %T %Y" "$ps_out" +%s 2>/dev/null)
+    else
+        epoch=$(date -d "$ps_out" +%s 2>/dev/null)
+    fi
+    if [ -z "$epoch" ]; then
+        log "ERROR: could not parse process start time from ps output: '$ps_out'"
+        return 2
+    fi
+    echo "$epoch"
 }
 
 # Is the running API service stale with respect to .env? Requires BOTH
@@ -211,6 +242,22 @@ mark_env_mtime_applied() {
 # sync — see auto-deploy.sh's identical function for why that distinction
 # matters (a broken lock mechanism must not silently look like "sync busy"
 # in the log forever).
+# Resolve a python3 interpreter: prefer the project venv's own — found on
+# review: bare `python3` under cron/launchd's minimal PATH can resolve to
+# macOS's Command Line Tools placeholder shim (prompts to install Xcode
+# tools and exits 127 rather than running anything), which the "any
+# unexpected exit code defers" hardening in the caller turns into "this
+# lock check always fails, forever." Falls back to PATH's python3 for a
+# host where the venv doesn't exist yet.
+_python_bin() {
+    local venv_python="$HOME/.venvs/lifeos/bin/python"
+    if [ -x "$venv_python" ]; then
+        echo "$venv_python"
+    else
+        echo "python3"
+    fi
+}
+
 sync_in_progress_lock_acquire() {
     mkdir -p "$(dirname "$SYNC_LOCK_FILE")"
     exec 9>"$SYNC_LOCK_FILE" || {
@@ -218,7 +265,7 @@ sync_in_progress_lock_acquire() {
         return 0
     }
     local rc
-    python3 -c '
+    "$(_python_bin)" -c '
 import fcntl, sys
 try:
     fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -296,19 +343,30 @@ health_check_timeout() {
     vault_path=$(_read_env "LIFEOS_VAULT_PATH" "")
     if [ -n "$vault_path" ] && [ -d "$vault_path" ]; then
         file_count=$(find "$vault_path" -type f 2>/dev/null | wc -l | tr -d ' ')
+        # Guard against anything but a plain non-negative integer (found on
+        # review: an unexpected `wc`/locale quirk, or a `find` failure mode
+        # that doesn't cleanly reduce to "0", must not corrupt the
+        # arithmetic below under set -u) — fall back to "no scaling."
+        case "$file_count" in
+            ''|*[!0-9]*) file_count=0 ;;
+        esac
     fi
     scaled=$((60 + file_count / 200))
     [ "$scaled" -gt 600 ] && scaled=600
     echo "$scaled"
 }
 
-# Poll /health until it responds OK or $1 seconds pass.
+# Poll /health until it responds OK or $1 seconds pass. Uses $SECONDS (real
+# elapsed wall-clock time since the shell started) rather than counting
+# iterations — found on review: `curl --max-time 5` can itself take up to
+# 5s per attempt on top of the 5s `sleep`, so counting "5 per iteration"
+# could let actual elapsed time run to nearly double the given timeout
+# before the loop notices.
 wait_for_health() {
-    local timeout="$1" waited=0
-    while [ "$waited" -lt "$timeout" ]; do
+    local timeout="$1" start=$SECONDS
+    while [ $((SECONDS - start)) -lt "$timeout" ]; do
         curl -s -f --max-time 5 http://localhost:8000/health > /dev/null 2>&1 && return 0
         sleep 5
-        waited=$((waited + 5))
     done
     return 1
 }
@@ -317,8 +375,15 @@ wait_for_health() {
 # cycle. Returns 0 if the server answers /health afterward, 1 otherwise.
 # Captures the outgoing process's pid BEFORE calling unload — see
 # wait_for_pid_gone()'s comment for why the poll must target that specific
-# pid rather than re-querying `launchctl list` after unload runs.
+# pid rather than re-querying `launchctl list` after unload runs. Takes the
+# health-check timeout as a parameter, computed once by main() BEFORE the
+# sync lock is acquired (found on review: health_check_timeout() scans the
+# whole vault via `find`, which can take real time on a large one — running
+# that scan while holding the exclusive lock made a slow vault also make a
+# waiting sync wait longer than necessary for no reason, since the scan
+# itself touches nothing the lock protects).
 restart_cycle() {
+    local health_timeout="$1"
     local old_pid
     old_pid=$(api_pid)
     launchctl unload "$PLIST_PATH" 2>>"$LOG_FILE" || true
@@ -326,7 +391,7 @@ restart_cycle() {
         log "WARNING: previous instance (pid $old_pid) did not tear down within 30s — starting anyway"
     fi
     start_with_retry || return 1
-    wait_for_health "$(health_check_timeout)"
+    wait_for_health "$health_timeout"
 }
 
 # Everything below is the operational run — wrapped in a function, guarded so
@@ -339,6 +404,11 @@ case "$(_read_env "LIFEOS_AUTODEPLOY_ENABLED" "false" | tr '[:upper:]' '[:lower:
     true|1|yes) ;;
     *) exit 0 ;;
 esac
+
+# Computed before the sync lock is acquired below — see restart_cycle()'s
+# comment for why this (a `find` scan of the whole vault) must not run
+# while holding the exclusive lock.
+HEALTH_TIMEOUT=$(health_check_timeout)
 
 # --- Defer while the nightly sync is running (or another instance of this
 # script is already mid-restart) --------------------------------------------
@@ -390,10 +460,16 @@ fi
 # --- Drift check: compare code/.env against the API process's REAL start
 # time (ground truth from the OS, not a self-tracked marker — see
 # api_active_since_epoch()'s comment for the first-run bug this fixes) ------
-ACTIVE_SINCE=$(api_active_since_epoch) || {
+ACTIVE_SINCE=$(api_active_since_epoch)
+RC=$?
+if [ "$RC" -eq 1 ]; then
     log "API service not running — nothing to check for drift"
     exit 0
-}
+elif [ "$RC" -ne 0 ]; then
+    notify_failure "🚨 *LifeOS Auto-Update (macOS)*
+Could not determine $PLIST_NAME's start time — check the host (see auto-update-macos.log)."
+    exit 1
+fi
 CODE_MTIME=$(newest_code_mtime)
 ENV_MTIME=$(env_file_mtime)
 
@@ -405,7 +481,7 @@ if [ "$STALE" != true ]; then
 fi
 
 log "drift detected (code/.env changed since $PLIST_NAME started) — restarting"
-if restart_cycle; then
+if restart_cycle "$HEALTH_TIMEOUT"; then
     mark_env_mtime_applied
     log "restart OK, health confirmed"
     notify_success "✅ *LifeOS Auto-Update (macOS)*
@@ -414,7 +490,7 @@ Restarted — was running stale code/config. Health OK."
 fi
 
 log "first restart cycle did not come up healthy — retrying once"
-if restart_cycle; then
+if restart_cycle "$HEALTH_TIMEOUT"; then
     mark_env_mtime_applied
     log "retry restart OK, health confirmed"
     notify_success "✅ *LifeOS Auto-Update (macOS)*
