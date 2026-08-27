@@ -313,6 +313,33 @@ def test_newest_code_mtime_reflects_real_api_edit(tmp_path: Path):
     assert after >= before + 1000
 
 
+# ---------------------------------------------------------------------------
+# #792 — .env's mtime is a second, independent drift signal
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_env_file_mtime_reflects_env_edit(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    (repo / ".env").write_text("LIFEOS_AUTODEPLOY_ENABLED=true\n")
+    os.utime(repo / ".env", (12345, 12345))
+    result = _run_sourced(repo, "env_file_mtime")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "12345"
+
+
+@pytest.mark.unit
+def test_env_file_mtime_empty_and_no_error_when_env_file_absent(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    result = _run_sourced(repo, 'env_file_mtime; echo "rc=$?"')
+    assert result.returncode == 0, result.stderr
+    assert "rc=0" in result.stdout, result.stdout
+    # Nothing printed before the "rc=0" line.
+    assert result.stdout.strip() == "rc=0"
+
+
 @pytest.mark.unit
 def test_service_active_since_epoch_unknown_for_inactive_unit(tmp_path: Path):
     """systemctl reporting no ActiveEnterTimestamp (inactive/nonexistent
@@ -437,9 +464,13 @@ def test_auto_deploy_syntax_and_sourced_functions_defined(tmp_path: Path):
     assert syntax.returncode == 0, syntax.stderr
 
     repo = _make_repo_for_drift(tmp_path)
-    result = _run_sourced(repo, "type -t newest_code_mtime service_active_since_epoch worker_busy main")
+    result = _run_sourced(
+        repo,
+        "type -t newest_code_mtime env_file_mtime service_active_since_epoch "
+        "worker_busy main",
+    )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.count("function") == 4, result.stdout
+    assert result.stdout.count("function") == 5, result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +634,52 @@ def test_main_no_thrash_on_repeat_run_with_no_new_commits(tmp_path: Path):
     assert restart_log_after.count("restart lifeos-api") == 1, (
         "second tick with no new commits restarted an already-current service"
     )
+
+
+@pytest.mark.unit
+def test_main_restarts_when_only_env_file_changed(tmp_path: Path):
+    """#792: editing .env (config, not tracked source) must still be
+    treated as drift — a service started after the last code change but
+    before a later .env edit must still restart."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, code_epoch = _make_policy_repo(tmp_path)
+    # Started well after the code last changed (not code-stale)...
+    active_since = code_epoch + 100
+    (state / "active_lifeos-api").touch()
+    (state / "since_lifeos-api").write_text(str(active_since))
+    # ...but .env was edited after that (env-stale).
+    env_mtime = active_since + 200
+    os.utime(repo / ".env", (env_mtime, env_mtime))
+
+    result = _run_main(repo, state, _venv_with_python(tmp_path))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+    restart_log = (state / "restart.log").read_text() if (state / "restart.log").exists() else ""
+    assert "restart lifeos-api" in restart_log, (result.stdout, result.stderr, restart_log)
+    deploy_log = (repo / "logs" / "auto-deploy.log").read_text()
+    assert ".env changed" in deploy_log, deploy_log
+
+
+@pytest.mark.unit
+def test_main_no_restart_when_neither_code_nor_env_changed_since_start(tmp_path: Path):
+    """Regression guard: the new .env signal must not become 'always
+    restart' — a service started after both the code and .env's last
+    change stays put."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, code_epoch = _make_policy_repo(tmp_path)
+    env_mtime = code_epoch - 100  # .env last changed before the code did
+    os.utime(repo / ".env", (env_mtime, env_mtime))
+    active_since = code_epoch + 100  # service started after both
+    (state / "active_lifeos-api").touch()
+    (state / "since_lifeos-api").write_text(str(active_since))
+
+    result = _run_main(repo, state, _venv_with_python(tmp_path))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+    restart_log = (state / "restart.log").read_text() if (state / "restart.log").exists() else ""
+    assert "restart lifeos-api" not in restart_log, restart_log
 
 
 @pytest.mark.unit

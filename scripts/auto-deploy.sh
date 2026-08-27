@@ -89,6 +89,21 @@ newest_code_mtime() {
         | sort -rn | head -1
 }
 
+# .env's mtime — a second, independent drift signal (#792). Editing .env is
+# expected to require a manual restart, but that expectation only holds if
+# something actually notices the edit; .env is deliberately untracked (it
+# holds secrets), so it's invisible to newest_code_mtime()'s `git ls-files`
+# above, and a config-only change (a rotated token, a new backend flag) could
+# otherwise go unnoticed by every running service indefinitely, until an
+# unrelated code change happens to restart the same unit. Kept as its own
+# check rather than folded into newest_code_mtime() itself, so that function's
+# "only tracked files count" contract — and the test asserting it — stays
+# exactly as-is. Empty output (no error) when .env doesn't exist on this host.
+env_file_mtime() {
+    [ -f "$ENV_FILE" ] || return 0
+    stat -c '%Y' "$ENV_FILE" 2>/dev/null
+}
+
 # Real wall-clock time $1's current process started, on this host's own
 # clock — the same clock `newest_code_mtime` read the mtimes from, so there's
 # no cross-host skew to worry about. Empty output (return 1) means "unknown"
@@ -237,16 +252,29 @@ RESTARTED=()
 DEFERRED=()
 FAILED=()
 CODE_MTIME=$(newest_code_mtime)
-if [ -n "$CODE_MTIME" ]; then
+ENV_MTIME=$(env_file_mtime)
+if [ -n "$CODE_MTIME" ] || [ -n "$ENV_MTIME" ]; then
     for unit in lifeos-api lifeos-agent-worker lifeos-mcp-http; do
         systemctl is-active --quiet "$unit" || continue
         active_since=$(service_active_since_epoch "$unit") || {
             log "drift-check: could not read $unit's start time — skipping"
             continue
         }
-        [ "$active_since" -ge "$CODE_MTIME" ] && continue   # current, nothing to do
+        # Stale if EITHER signal moved past this unit's start — tracked
+        # source and .env are independent triggers, not folded together (#792).
+        code_stale=false
+        env_stale=false
+        [ -n "$CODE_MTIME" ] && [ "$active_since" -lt "$CODE_MTIME" ] && code_stale=true
+        [ -n "$ENV_MTIME" ] && [ "$active_since" -lt "$ENV_MTIME" ] && env_stale=true
+        { [ "$code_stale" = true ] || [ "$env_stale" = true ]; } || continue   # current, nothing to do
 
-        drift_msg="$unit active since $(date -d "@$active_since" '+%F %T'), code on disk changed $(date -d "@$CODE_MTIME" '+%F %T')"
+        if [ "$code_stale" = true ] && [ "$env_stale" = true ]; then
+            drift_msg="$unit active since $(date -d "@$active_since" '+%F %T'), code on disk changed $(date -d "@$CODE_MTIME" '+%F %T') and .env changed $(date -d "@$ENV_MTIME" '+%F %T')"
+        elif [ "$env_stale" = true ]; then
+            drift_msg="$unit active since $(date -d "@$active_since" '+%F %T'), .env changed $(date -d "@$ENV_MTIME" '+%F %T')"
+        else
+            drift_msg="$unit active since $(date -d "@$active_since" '+%F %T'), code on disk changed $(date -d "@$CODE_MTIME" '+%F %T')"
+        fi
 
         # Worker policy: restart when idle, defer when busy (mirrors the
         # sync_in_progress guard above) — never silently stay stale, never
