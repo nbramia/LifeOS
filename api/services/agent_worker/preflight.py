@@ -38,10 +38,29 @@ ROUTE_CLAUDE_CODE = "claude_code"
 # `agent_worker/codex_spawn.py`). Same semantics as ROUTE_CLAUDE_CODE —
 # preflight never emits it directly except via the `#codex` tag.
 ROUTE_CODEX = "codex"
+# `remote` is the #809 route for the `#cloud` tag: the configured remote
+# OpenAI-compatible provider (e.g. DeepSeek via Fireworks, #654) — never the
+# Anthropic API. Like ROUTE_CLAUDE_CODE/ROUTE_CODEX, preflight's own JSON
+# schema never emits this (the model only ever returns "local"|"claude"|
+# "ask" — see `_PREFLIGHT_INSTRUCTIONS`); it's set exclusively by
+# `_apply_tag_overrides` from the `#cloud` tag. Deliberately absent from
+# `KNOWN_ROUTES` (see that constant's comment) — unlike the CLI routes,
+# this one carries real per-token spend, so a noncompliant model hallucinating
+# the literal string "remote" must fall back to `ROUTE_ASK` at parse time
+# (the `routing not in KNOWN_ROUTES` check below), not be treated as a
+# legitimate model-chosen route needing its own corroboration carve-out.
+ROUTE_REMOTE = "remote"
 
 # All routing destinations `parse_preflight_response` accepts from the model,
 # and the same set `settings.agent_default_route` (#707) is validated
 # against — one source of truth so the two checks can't drift apart.
+# `ROUTE_REMOTE` is intentionally NOT a member (see its own comment above):
+# it's real per-token spend on a third-party provider, reachable only via the
+# explicit `#cloud` tag, and `settings.agent_default_route` should not be
+# able to silently default untagged tasks onto it any more than it can onto
+# `ROUTE_CLAUDE` (which is also excluded from default-route substitution by
+# `_apply_default_route`'s `original_routing` guard, just via a different
+# mechanism — see that function's docstring, point 3a).
 KNOWN_ROUTES = (ROUTE_LOCAL, ROUTE_CLAUDE, ROUTE_CLAUDE_CODE, ROUTE_CODEX, ROUTE_ASK)
 
 # Allowed expected-output shapes. Used to phrase the final Telegram summary.
@@ -185,6 +204,11 @@ Rules:
 - Routing precedence (apply in order; first match wins):
     1) If the tag list contains "local" → routing="local"; routing_reason="#local tag present".
     2) If the tag list contains "cloud" → routing="claude"; routing_reason="#cloud tag present".
+       (This JSON field is a placeholder — tag-handling code, not this
+       prompt, owns the real dispatch: "#cloud" now sends the task to the
+       operator's configured remote provider, never the Anthropic API.
+       "#cloud-haiku"/"#cloud-sonnet" are the separate, unchanged explicit
+       Anthropic-API escape hatches.)
     3) Otherwise, look at the title for explicit model cues:
        - "with local agent", "using gemma" → "local"
        - "use claude", "with opus", "with claude opus", "with sonnet" → "claude"
@@ -591,11 +615,25 @@ def _detect_preset_class_from_tags(tags: list[str]) -> str | None:
     return None
 
 
-# Model/engine words that count as the operator naming a cloud route themselves.
-# Used to corroborate the classifier's `routing_explicit` before any API dispatch
-# happens without a confirmation (#584) — the tags are checked separately.
+# Model/engine words that count as the operator naming the Anthropic API
+# route themselves. Used to corroborate the classifier's `routing_explicit`
+# before any API dispatch happens without a confirmation (#584) — the tags
+# are checked separately.
+#
+# (#809) "cloud" was dropped from this alternation. Before #809, a title
+# merely containing the bare word "cloud" was treated as sufficient
+# corroboration for a model-claimed `routing="claude"` — safe at the time
+# because "cloud" and "the Anthropic API" were the same thing. They no
+# longer are: `#cloud` the tag now means the configured remote provider, so
+# a title that happens to say "cloud" (with no other engine word) no longer
+# unambiguously names Anthropic. Leaving it in this regex would let such a
+# title corroborate a hallucinated `routing="claude"` straight into
+# Anthropic-API spend with no confirmation — exactly the hidden-spend shape
+# #584 exists to prevent. Dropping it means that case now falls through to
+# `_apply_tag_overrides`'s downgrade-to-`ask` below, which is the safe
+# default the issue calls for: inference still asks, never spends.
 _TITLE_NAMES_A_CLOUD_ENGINE = re.compile(
-    r"(?i)\b(claude|opus|sonnet|haiku|cloud|anthropic|api)\b"
+    r"(?i)\b(claude|opus|sonnet|haiku|anthropic|api)\b"
 )
 
 # Title phrases that corroborate an LLM-chosen `local` route — lifted
@@ -652,9 +690,15 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
       `#local`        → routing=local, model=local
       `#claude`       → routing=code   (Claude Code CLI, subscription-billed)
       `#codex`        → routing=codex  (Codex CLI, subscription-billed)
-      `#cloud-haiku`  → routing=claude, model=claude-haiku-4-5
-      `#cloud-sonnet` → routing=claude, model=claude-sonnet-5
-      `#cloud`        → routing=claude, model=(whatever preflight picked, else Sonnet)
+      `#cloud-haiku`  → routing=claude, model=claude-haiku-4-5   (Anthropic API, explicit)
+      `#cloud-sonnet` → routing=claude, model=claude-sonnet-5    (Anthropic API, explicit)
+      `#cloud`        → routing=remote, model=""  (#809: the configured remote
+                         OpenAI-compatible provider, e.g. DeepSeek via
+                         Fireworks — NEVER the Anthropic API. If the remote
+                         provider isn't configured, the worker parks the task
+                         at #agent-blocked rather than falling back to
+                         Anthropic; see `worker.py`'s `ROUTE_REMOTE` branch
+                         in `_dispatch`.)
 
     Returns a new PreflightResult so the caller can chain. Tag list is
     normalized case-insensitively with optional leading `#`.
@@ -696,12 +740,23 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
         result.model = MODEL_SONNET
         return result
     if "cloud" in normalized:
-        result.routing = ROUTE_CLAUDE
+        # (#809) `#cloud` now means the configured remote OpenAI-compatible
+        # provider (e.g. DeepSeek via Fireworks, #654) — never the Anthropic
+        # API. `#cloud-haiku`/`#cloud-sonnet` above are the separate,
+        # unchanged explicit Anthropic escape hatches; only the bare `#cloud`
+        # tag's meaning moved. `model` is left "" — the remote provider's
+        # model id comes from `settings.remote_llm_model` at dispatch time
+        # (the same "the engine picks its own model" pattern the
+        # `#claude`/`#codex` branches above use), not something preflight
+        # selects among `ALLOWED_MODELS`. Whether the remote provider is
+        # actually configured is a worker-side concern (`_dispatch` parks
+        # the task at #agent-blocked when it isn't) — preflight's job here
+        # is only to name the route.
+        result.routing = ROUTE_REMOTE
         result.routing_explicit = True
         if not result.routing_reason:
             result.routing_reason = "#cloud tag present"
-        if result.model not in ALLOWED_MODELS:
-            result.model = MODEL_SONNET
+        result.model = ""
         return result
     # No tag override. A cloud route that nobody asked for must not dispatch:
     # downgrade it to `ask` so the worker confirms first (#584). The classifier's
@@ -1014,6 +1069,16 @@ def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
     # ROUTE_CLAUDE_CODE / ROUTE_CODEX bill against a flat subscription; ROUTE_LOCAL
     # is free. Per-session $ rollups for CLI routes still populate via the
     # rollout ingest (cc:/cx: sources in /agents).
+    #
+    # (#809) ROUTE_REMOTE (the `#cloud` tag's remote OpenAI-compatible
+    # provider) is real per-token spend too, but is deliberately NOT gated
+    # here. The §6/§7 confirmation ceremony exists specifically for the
+    # Anthropic API — the operator's standing "expensive exception" — not
+    # for third-party spend in general; the remote provider is treated like
+    # local/CLI for preflight cost-preview purposes, the same way #699's
+    # remote-fallback path never triggered this gate either. Real spend
+    # still records correctly regardless — see
+    # `local_executor.LocalExecutor._record_spend`'s `is_remote` branch.
     if result.routing != ROUTE_CLAUDE:
         result.estimated_cost_dollars = 0.0
         result.needs_cost_confirmation = False

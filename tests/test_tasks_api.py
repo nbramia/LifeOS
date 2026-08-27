@@ -137,6 +137,69 @@ class TestTasksAPI:
         # The dry-run path does NOT touch the task manager.
         mock_task_manager.create.assert_not_called()
 
+    def test_dry_run_remote_route_prices_from_remote_settings(self, client, mock_task_manager, monkeypatch):
+        """(#809) `#cloud`'s dry-run preview prices from
+        `settings.remote_llm_{input,output}_price_per_mtok` — never the
+        Anthropic `cost_for` table `ROUTE_CLAUDE` uses."""
+        from config.settings import settings
+        from api.services.agent_worker.preflight import (
+            PreflightBudget,
+            PreflightResult,
+            ROUTE_REMOTE,
+        )
+        monkeypatch.setattr(settings, "remote_llm_input_price_per_mtok", 0.27, raising=False)
+        monkeypatch.setattr(settings, "remote_llm_output_price_per_mtok", 1.10, raising=False)
+        fake_result = PreflightResult(
+            budget=PreflightBudget(wall_seconds=600, max_tokens=20_000, max_dollars=2.0),
+            routing=ROUTE_REMOTE,
+            routing_reason="#cloud tag present",
+            expected_output="text",
+            ambiguity=None,
+            sane=True,
+            sane_reason="",
+        )
+        with patch("api.services.agent_worker.preflight.run_preflight", return_value=fake_result):
+            response = client.post("/api/tasks", json={
+                "description": "draft my Q4 review",
+                "tags": ["agent", "cloud"],
+                "dry_run": True,
+            })
+        assert response.status_code == 200
+        data = response.json()
+        assert data["routing"] == "remote"
+        expected = (10_000 / 1_000_000) * 0.27 + (10_000 / 1_000_000) * 1.10
+        assert data["estimated_dollars"] == pytest.approx(expected)
+
+    def test_dry_run_remote_route_floors_at_zero_when_unpriced(self, client, mock_task_manager, monkeypatch):
+        """(#809) Unset remote rates mean 'unknown, not free' (#669) — the
+        dry-run estimate floors at 0 rather than guessing a rate, the same
+        convention actual spend recording uses."""
+        from config.settings import settings
+        from api.services.agent_worker.preflight import (
+            PreflightBudget,
+            PreflightResult,
+            ROUTE_REMOTE,
+        )
+        monkeypatch.setattr(settings, "remote_llm_input_price_per_mtok", None, raising=False)
+        monkeypatch.setattr(settings, "remote_llm_output_price_per_mtok", None, raising=False)
+        fake_result = PreflightResult(
+            budget=PreflightBudget(wall_seconds=600, max_tokens=20_000, max_dollars=2.0),
+            routing=ROUTE_REMOTE,
+            routing_reason="#cloud tag present",
+            expected_output="text",
+            ambiguity=None,
+            sane=True,
+            sane_reason="",
+        )
+        with patch("api.services.agent_worker.preflight.run_preflight", return_value=fake_result):
+            response = client.post("/api/tasks", json={
+                "description": "draft my Q4 review",
+                "tags": ["agent", "cloud"],
+                "dry_run": True,
+            })
+        assert response.status_code == 200
+        assert response.json()["estimated_dollars"] == 0.0
+
     def test_dry_run_without_agent_tag_falls_through_to_create(self, client, mock_task_manager):
         """dry_run is a no-op for non-#agent tasks — the task is still created."""
         response = client.post("/api/tasks", json={

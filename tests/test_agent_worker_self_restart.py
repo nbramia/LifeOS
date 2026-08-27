@@ -139,7 +139,7 @@ def test_resume_pending_self_restart_finalizes_quietly(tmp_path: Path):
     must not surface as a spurious failed/rolled-back task (#401 acceptance)."""
     api = _FakeApi(tasks=[
         {"id": "doctor_task", "description": "doctor run", "status": "in_progress",
-         "tags": [RUNNING_TAG, "cloud"]},
+         "tags": [RUNNING_TAG, "cloud-sonnet"]},
     ])
     w = _make_worker(tmp_path, api)
     session = w.session_store.create(
@@ -177,7 +177,7 @@ def test_resume_pending_marker_by_task_id(tmp_path: Path):
     """The primitive can name the run by task_id when it lacks the session_id."""
     api = _FakeApi(tasks=[
         {"id": "doctor_task", "description": "d", "status": "in_progress",
-         "tags": [RUNNING_TAG, "cloud"]},
+         "tags": [RUNNING_TAG, "cloud-sonnet"]},
     ])
     w = _make_worker(tmp_path, api)
     session = w.session_store.create(
@@ -199,7 +199,7 @@ def test_resume_pending_without_marker_still_rolls_back(tmp_path: Path):
     the self-restart path can't silently swallow real crashes (#401)."""
     api = _FakeApi(tasks=[
         {"id": "crashed_task", "description": "c", "status": "in_progress",
-         "tags": [RUNNING_TAG, "cloud"]},
+         "tags": [RUNNING_TAG, "cloud-sonnet"]},
     ])
     w = _make_worker(tmp_path, api)
     session = w.session_store.create(
@@ -223,9 +223,9 @@ def test_resume_pending_marker_only_quiets_named_session(tmp_path: Path):
     session resumed in the same startup pass."""
     api = _FakeApi(tasks=[
         {"id": "doctor_task", "description": "d", "status": "in_progress",
-         "tags": [RUNNING_TAG, "cloud"]},
+         "tags": [RUNNING_TAG, "cloud-sonnet"]},
         {"id": "other_task", "description": "o", "status": "in_progress",
-         "tags": [RUNNING_TAG, "cloud"]},
+         "tags": [RUNNING_TAG, "cloud-sonnet"]},
     ])
     w = _make_worker(tmp_path, api)
     doctor = w.session_store.create(

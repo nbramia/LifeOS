@@ -2823,6 +2823,7 @@
         .agent-route { font-size: 0.62rem; padding: 0.1rem 0.4rem; border-radius: 999px; white-space: nowrap; }
         .agent-route.cloud { background: #2a2140; color: #c4a7ff; }
         .agent-route.local { background: #1f3a33; color: #7fe0c4; }
+        .agent-route.remote { background: #1a2f45; color: #7fb8e0; }
         .agent-badge { font-size: 0.64rem; padding: 0.1rem 0.4rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.03em; }
         .agent-badge.running { background: #1e3a5f; color: #7fb4ff; }
         .agent-badge.completed { background: #1e4620; color: #7ad17f; }
@@ -3263,6 +3264,11 @@
             const tip = escapeHtml((modelLabel || (r === 'claude' ? 'Cloud' : 'Local')).toString());
             if (r === 'claude') return '<span class="agent-route cloud" title="' + tip + '">☁ cloud</span>';
             if (r === 'local') return '<span class="agent-route local" title="' + tip + '">🖥 local</span>';
+            // (#809) `#cloud` tasks route here, not to Anthropic — the
+            // configured remote OpenAI-compatible provider (e.g. DeepSeek via
+            // Fireworks). Distinct badge so it isn't confused with the
+            // Anthropic-API "cloud" badge above.
+            if (r === 'remote') return '<span class="agent-route remote" title="' + tip + '">🌐 remote</span>';
             return '';
         }
 

@@ -40,6 +40,7 @@ from api.services.agent_worker.preflight import (
     ROUTE_CLAUDE_CODE,
     ROUTE_CODEX,
     ROUTE_LOCAL,
+    ROUTE_REMOTE,
     PreflightResult,
     run_preflight,
 )
@@ -64,30 +65,41 @@ from config.settings import settings
 
 
 # The engine-choice confirmation (#584). Every route offered here except the
-# last is free of per-token cost — the two CLIs bill the operator's
-# subscriptions and Gemma runs on-box — so the API option is listed last and
-# labelled, and nothing reaches it without the operator naming it.
+# last is free of per-token cost or is the operator's own cheaper remote
+# provider — the two CLIs bill the operator's subscriptions, Gemma runs
+# on-box, and 'cloud' is the configured remote provider (#809) — so the
+# Anthropic-API option is listed last and labelled, and nothing reaches it
+# without the operator naming Anthropic/a Claude model specifically.
 ROUTING_ASK_QUESTION = (
     "Which engine should run this? "
     "Reply 'claude code' (subscription), 'codex' (subscription), "
-    "'local' (on-box Gemma), or 'cloud' (Anthropic API — costs credits)."
+    "'local' (on-box Gemma), 'cloud' (remote provider — costs credits), "
+    "or 'anthropic'/a Claude model name like 'opus' (Anthropic API — costs credits)."
 )
 
 # Engine words accepted in a reply. Ordered longest-first so "claude code"
 # matches before the bare "claude" alternative. Each named group maps to the
 # routing it selects.
+#
+# (#809) 'cloud' moved from the `api` group to its own `remote` group: the
+# tag means the configured remote provider now, not Anthropic, and a reply
+# is held to the same standard as the tag. Reaching the Anthropic API via a
+# typed reply now requires 'anthropic', 'api', 'managed', or a model name
+# ('opus'/'sonnet'/'haiku') — 'cloud' no longer implies it.
 _ROUTING_ANSWER_RE = re.compile(
     r"(?i)"
     r"(?P<claude_code>claude[\s_-]*code)"
     r"|(?P<codex>codex)"
     r"|(?P<local>local|gemma)"
-    r"|(?P<api>cloud|managed|\bapi\b|opus|sonnet|haiku)"
+    r"|(?P<remote>cloud|deepseek|fireworks)"
+    r"|(?P<api>managed|\banthropic\b|\bapi\b|opus|sonnet|haiku)"
     r"|(?P<bare_claude>claude)"
 )
 _ROUTING_ANSWER_ROUTES = {
     "claude_code": ROUTE_CLAUDE_CODE,
     "codex": ROUTE_CODEX,
     "local": ROUTE_LOCAL,
+    "remote": ROUTE_REMOTE,
     "api": ROUTE_CLAUDE,
     "bare_claude": ROUTE_CLAUDE_CODE,
 }
@@ -270,6 +282,11 @@ def _worker_label(routing: str | None, served_by: str = "") -> str:
         if served_by:
             label += f" (remote fallback: {served_by})"
         return label
+    if routing == ROUTE_REMOTE:
+        label = "Remote agent worker"
+        if served_by:
+            label += f" ({served_by})"
+        return label
     if routing == ROUTE_CLAUDE:
         return "Cloud agent worker"
     return "Agent worker"
@@ -282,6 +299,7 @@ _ENGINE_LABELS = {
     "codex": "Codex",
     "claude": "cloud Claude",
     "local": "local Gemma",
+    "remote": "remote provider",
 }
 
 
@@ -389,6 +407,7 @@ class Worker:
         http_client: httpx.Client | None = None,
         preflight_caller=None,    # injectable; defaults to Anthropic Haiku
         local_executor=None,      # injectable LocalExecutor for tests
+        remote_executor=None,     # injectable LocalExecutor (remote-forced, #809) for tests
         managed_executor=None,    # injectable ManagedExecutor for tests
         claude_code_executor=None,  # injectable ClaudeCodeExecutor for tests
         codex_executor=None,        # injectable CodexExecutor for tests
@@ -423,6 +442,7 @@ class Worker:
         self._http = http_client or httpx.Client(timeout=10.0)
         self._preflight_caller = preflight_caller  # None → use Anthropic SDK by default
         self._local_executor = local_executor  # lazily instantiated on first use
+        self._remote_executor = remote_executor  # lazily instantiated on first #cloud task (#809)
         self._managed_executor = managed_executor  # lazily instantiated on first claude task
         self._claude_code_executor = claude_code_executor  # lazily instantiated on first /claude task
         # Per-bot ClaudeCodeExecutor cache (#348). An orchestration bot (doctor)
@@ -723,7 +743,15 @@ class Worker:
                 )
                 continue
 
-            executor = self._get_local_executor(caller_session_id=session.session_id)
+            # (#809) A remote-routed parent keeps its conversation history in
+            # session_store like local does (it's the same LocalExecutor,
+            # just pointed at the remote provider) — no fresh-session
+            # restatement needed, unlike the cloud/Managed-Agents branch
+            # above. Only the executor construction differs.
+            if session.routing == ROUTE_REMOTE:
+                executor = self._get_remote_executor(caller_session_id=session.session_id)
+            else:
+                executor = self._get_local_executor(caller_session_id=session.session_id)
             try:
                 # Append the resume message first so the executor sees it on
                 # the next turn; clear yield_waiting_for *after* the executor
@@ -988,6 +1016,32 @@ class Worker:
                 # the next tick re-attempts the resume.
                 self.session_store.mark_question_processed(q["id"])
                 self._handle_outcome(session, task, outcome)
+            elif session.routing == ROUTE_REMOTE:
+                # (#809) A "cloud" reply to the engine-choice question resolves
+                # here. Same not-configured guard as the tag path in
+                # `_dispatch` (never fall through to another engine), just
+                # via `_mark_failed` rather than a re-block — mirrors how the
+                # sibling "claude"/Managed-Agents branch below handles its
+                # own not-configured case in this same resume flow.
+                if not settings.remote_llm_configured:
+                    self.session_store.mark_question_processed(q["id"])
+                    self._mark_failed(
+                        session, task,
+                        "remote route resolved but remote provider not configured — "
+                        "set LIFEOS_REMOTE_LLM_*",
+                    )
+                    continue
+                executor = self._get_remote_executor(caller_session_id=session_id)
+                try:
+                    outcome = executor.execute(session, task)
+                except Exception as exc:
+                    logger.exception(
+                        "clarification resume crashed for %s: %s", task_id, exc,
+                    )
+                    self._mark_failed(session, task, f"clarification resume crashed: {exc}")
+                    continue
+                self.session_store.mark_question_processed(q["id"])
+                self._handle_outcome(session, task, outcome)
             elif session.routing == "claude":
                 managed = self._get_managed_executor()
                 if managed is None:
@@ -1101,13 +1155,19 @@ class Worker:
 
         task = self._fetch_task(task_id) or {"id": task_id, "description": task_id}
 
-        if session.routing == ROUTE_LOCAL:
+        if session.routing in (ROUTE_LOCAL, ROUTE_REMOTE):
             # Surface-neutral prefix: follow-ups arrive from Telegram replies and
             # the web /chat thread view (#236), so don't hardcode "Telegram".
             self.session_store.append_message(
                 sid, "user", f"(operator reply) {answer}",
             )
-            executor = self._get_local_executor(caller_session_id=sid)
+            # (#809) Remote-routed follow-ups resume the same way local ones
+            # do — conversation history lives in session_store either way, so
+            # only the executor's target LLM client differs.
+            if session.routing == ROUTE_REMOTE:
+                executor = self._get_remote_executor(caller_session_id=sid)
+            else:
+                executor = self._get_local_executor(caller_session_id=sid)
             try:
                 outcome = executor.execute(session, task)
             except Exception as exc:
@@ -1201,7 +1261,9 @@ class Worker:
         CLI is subscription-billed, so a misread costs nothing, while the same
         misread in the other direction spends credits the operator didn't
         agree to. Reaching the API takes a word that can only mean the API —
-        "cloud", "api", "managed", or a model name.
+        "anthropic", "api", "managed", or a model name (#809: "cloud" no
+        longer qualifies — it resolves to the configured remote provider
+        instead, mirroring the `#cloud` tag's own remapped meaning).
         """
         if not answer:
             return None
@@ -1291,7 +1353,13 @@ class Worker:
             # Re-fetch the task description from the API so the conversation
             # context stays accurate (someone may have edited the title).
             task = self._fetch_task(session.task_id) or {"id": session.task_id, "description": ""}
-            executor = self._get_local_executor(caller_session_id=session.session_id)
+            # (#809) A remote-routed session that slept must wake back onto
+            # the remote provider, not silently switch to local Gemma — same
+            # conversation-history-based resume, different target client.
+            if session.routing == ROUTE_REMOTE:
+                executor = self._get_remote_executor(caller_session_id=session.session_id)
+            else:
+                executor = self._get_local_executor(caller_session_id=session.session_id)
             try:
                 outcome = executor.execute(session, task)
             except Exception as exc:
@@ -1605,6 +1673,52 @@ class Worker:
             session_store=self.session_store,
             transcript_store=self.transcript_store,
             tool_registry=registry,
+        )
+
+    def _get_remote_executor(self, caller_session_id: str | None = None):
+        """(#809) Return the executor for `ROUTE_REMOTE` (`#cloud`) tasks —
+        a `LocalExecutor` forced onto the configured remote provider via
+        `local_executor._remote_only_llm_client`, never the local
+        llama-server. Callers must confirm `settings.remote_llm_configured`
+        themselves first (`_dispatch`'s `ROUTE_REMOTE` branch parks the task
+        otherwise); this method doesn't re-check it.
+
+        Mirrors `_get_local_executor` exactly (same inter-agent context
+        wiring, same caller-identity-keyed tool registry) except for which
+        LLM client the executor is constructed with — kept as a separate
+        cached instance (`self._remote_executor`) rather than a parameter on
+        `_get_local_executor`, so an install running both local and #cloud
+        tasks doesn't have one execute silently switch the other's target
+        client underneath it.
+        """
+        if self._remote_executor is not None:
+            return self._remote_executor
+        from api.services.agent_worker.inter_agent import Caps, InterAgentContext
+        from api.services.agent_worker.local_executor import LocalExecutor, _remote_only_llm_client
+        from api.services.agent_worker.tools import ToolRegistry
+        ctx = None
+        if caller_session_id:
+            ctx = InterAgentContext(
+                session_store=self.session_store,
+                transcript_store=self.transcript_store,
+                caller_session_id=caller_session_id,
+                caps=Caps(
+                    max_spawn_depth=settings.agent_max_spawn_depth,
+                    max_descendants_per_root=settings.agent_max_descendants_per_root,
+                    max_concurrent_local=settings.agent_max_concurrent_local,
+                    max_concurrent_managed=settings.agent_max_concurrent_managed,
+                ),
+                worker_handle=self,
+            )
+        registry = ToolRegistry(inter_agent_context=ctx)
+        client, model_name, is_remote = _remote_only_llm_client()
+        return LocalExecutor(
+            session_store=self.session_store,
+            transcript_store=self.transcript_store,
+            tool_registry=registry,
+            llm_client=client,
+            model_name=model_name,
+            is_remote=is_remote,
         )
 
     def _get_managed_executor(self):
@@ -2433,6 +2547,35 @@ class Worker:
                 outcome = executor.execute(session, task)
             except Exception as exc:
                 logger.exception("local executor crashed for %s: %s", task_id, exc)
+                self._mark_failed(session, task, f"executor crashed: {exc}")
+                return
+            self._handle_outcome(session, task, outcome)
+            return
+
+        # Remote route (#809, `#cloud` tag): the configured remote
+        # OpenAI-compatible provider — never the Anthropic API. If it isn't
+        # configured, park the task rather than falling through to any other
+        # engine; the operator's standing rule is that the Anthropic API is
+        # never a hidden fallback, and silently running on local Gemma
+        # instead would just as surely defeat what `#cloud` was asked for.
+        if pre.routing == ROUTE_REMOTE:
+            if not settings.remote_llm_configured:
+                self._swap_tag(task_id, RUNNING_TAG, BLOCKED_TAG)
+                self._set_task_status(task_id, "blocked")
+                self.session_store.update_status(task_id, STATUS_BLOCKED)
+                self.transcript_store.append(sid, "remote_not_configured", {})
+                self._notify(
+                    f"⏸ {_worker_label(ROUTE_REMOTE)}: task '{title}' routed to #cloud but the "
+                    f"remote provider not configured — set LIFEOS_REMOTE_LLM_* "
+                    f"(LIFEOS_REMOTE_LLM_URL, LIFEOS_REMOTE_LLM_MODEL, "
+                    f"LIFEOS_REMOTE_LLM_API_KEY) in .env, then retag with #{AGENT_TAG}."
+                )
+                return
+            executor = self._get_remote_executor(caller_session_id=session.session_id)
+            try:
+                outcome = executor.execute(session, task)
+            except Exception as exc:
+                logger.exception("remote executor crashed for %s: %s", task_id, exc)
                 self._mark_failed(session, task, f"executor crashed: {exc}")
                 return
             self._handle_outcome(session, task, outcome)

@@ -397,13 +397,16 @@ def test_local_tag_overrides_to_local_model():
 
 
 @pytest.mark.unit
-def test_cloud_tag_keeps_preflight_routing_but_defaults_model_to_sonnet():
-    """`#cloud` says cloud but leaves the model open — defaults to Sonnet
-    when preflight didn't pick a specific model."""
+def test_cloud_tag_routes_to_remote_provider_not_anthropic():
+    """(#809) `#cloud` now routes to the configured remote OpenAI-compatible
+    provider, never the Anthropic API — regardless of what preflight itself
+    returned. `model` is left empty: the remote model id comes from
+    `settings.remote_llm_model` at dispatch time, not from `ALLOWED_MODELS`."""
     result = pf.run_preflight("anything", tags=["agent", "cloud"],
                               caller=_stub_caller(routing="claude"))
-    assert result.routing == pf.ROUTE_CLAUDE
-    assert result.model == pf.MODEL_SONNET
+    assert result.routing == pf.ROUTE_REMOTE
+    assert result.routing_explicit is True
+    assert result.model == ""
 
 
 @pytest.mark.unit
@@ -557,12 +560,26 @@ def test_preset_class_set_on_empty_title_short_circuit():
 
 @pytest.mark.unit
 def test_cloud_route_emits_cost_estimate():
-    """Cloud-routed tasks get a non-zero cache-cold cost estimate so the
-    orchestrator can preview cost before dispatch."""
-    result = pf.run_preflight("research task", tags=["agent", "research", "cloud"],
+    """Cloud-routed (Anthropic API) tasks get a non-zero cache-cold cost
+    estimate so the orchestrator can preview cost before dispatch."""
+    result = pf.run_preflight("research task", tags=["agent", "research", "cloud-sonnet"],
                               caller=_stub_caller(routing="claude"))
     assert result.routing == pf.ROUTE_CLAUDE
     assert result.estimated_cost_dollars > 0
+
+
+@pytest.mark.unit
+def test_remote_route_emits_zero_estimate():
+    """(#809) `#cloud` (the remote provider) is treated like local/CLI for
+    preflight cost-preview purposes — the §6/§7 confirmation ceremony is
+    specifically for the Anthropic-API 'expensive exception', not third-party
+    spend in general. Real spend still records correctly at execution time
+    (see `LocalExecutor._record_spend`'s `is_remote` branch)."""
+    result = pf.run_preflight("anything", tags=["agent", "cloud"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_REMOTE
+    assert result.estimated_cost_dollars == 0.0
+    assert result.needs_cost_confirmation is False
 
 
 @pytest.mark.unit
@@ -579,9 +596,9 @@ def test_local_route_emits_zero_estimate():
 def test_fullstack_estimate_higher_than_research_estimate():
     """Larger preset classes are estimated more expensively — that's the
     whole point of per-class filtering."""
-    full = pf.run_preflight("any task", tags=["agent", "fullstack", "cloud"],
+    full = pf.run_preflight("any task", tags=["agent", "fullstack", "cloud-sonnet"],
                             caller=_stub_caller(routing="claude"))
-    research = pf.run_preflight("any task", tags=["agent", "research", "cloud"],
+    research = pf.run_preflight("any task", tags=["agent", "research", "cloud-sonnet"],
                                 caller=_stub_caller(routing="claude"))
     assert full.estimated_cost_dollars > research.estimated_cost_dollars
 
@@ -603,7 +620,7 @@ def test_fail_fast_refuses_when_estimate_exceeds_2x_max_dollars():
             "sane": True,
             "sane_reason": "",
         })
-    result = pf.run_preflight("expensive task", tags=["agent", "fullstack", "cloud"],
+    result = pf.run_preflight("expensive task", tags=["agent", "fullstack", "cloud-sonnet"],
                               caller=stub_caller)
     assert result.sane is False
     assert "budget_too_small" in result.sane_reason
@@ -636,7 +653,7 @@ def test_cost_confirmation_triggers_above_threshold(monkeypatch):
     """§7 acceptance: estimate > threshold sets needs_cost_confirmation."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_cost_confirm_threshold_dollars", 0.01)
-    result = pf.run_preflight("any task", tags=["agent", "fullstack", "cloud"],
+    result = pf.run_preflight("any task", tags=["agent", "fullstack", "cloud-sonnet"],
                               caller=_stub_caller(routing="claude"))
     # fullstack estimate is well over a penny.
     assert result.needs_cost_confirmation is True
@@ -696,11 +713,12 @@ def test_classifier_explicit_flag_alone_is_not_enough():
 @pytest.mark.parametrize("title", [
     "use claude to draft the email",
     "summarize this with opus",
-    "run it on the cloud model",
+    "run it on the anthropic api",
 ])
 def test_operator_naming_the_engine_dispatches_without_a_question(title):
     """The other half of the rule: an operator who asked for it gets it.
-    Same principle as the `#cloud` tag — explicit intent is consent."""
+    Same principle as the `#cloud-haiku`/`#cloud-sonnet` tags — explicit
+    intent is consent."""
     result = pf.run_preflight(title, tags=["agent"],
                               caller=_stub_caller(routing="claude", routing_explicit=True))
     assert result.routing == pf.ROUTE_CLAUDE
@@ -708,14 +726,30 @@ def test_operator_naming_the_engine_dispatches_without_a_question(title):
 
 
 @pytest.mark.unit
+def test_bare_cloud_in_title_no_longer_corroborates_anthropic():
+    """(#809) Before #809, a title merely containing the bare word "cloud"
+    counted as corroboration for a model-claimed `routing="claude"` — safe
+    when "cloud" and "the Anthropic API" were the same thing. They no longer
+    are: `#cloud` the tag now means the configured remote provider, so this
+    title must NOT dispatch straight to the API any more — it falls through
+    to the #584 downgrade-to-`ask` path instead, same as any other
+    unconfirmed cloud inference."""
+    result = pf.run_preflight("run it on the cloud model", tags=["agent"],
+                              caller=_stub_caller(routing="claude", routing_explicit=True))
+    assert result.routing == pf.ROUTE_ASK
+    assert result.routing_explicit is False
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("tag,expected_model", [
-    ("cloud", pf.MODEL_SONNET),
     ("cloud-haiku", pf.MODEL_HAIKU),
     ("cloud-sonnet", pf.MODEL_SONNET),
 ])
 def test_cloud_tags_are_consent_and_still_dispatch(tag, expected_model):
-    """`#cloud*` tasks were explicitly tagged by the operator, so they keep
-    dispatching straight to the API — the gate is about inference only."""
+    """`#cloud-haiku`/`#cloud-sonnet` tasks were explicitly tagged by the
+    operator, so they keep dispatching straight to the API — the gate is
+    about inference only. (Bare `#cloud` is covered separately — #809
+    remapped it to the remote route, not the API.)"""
     result = pf.run_preflight("any task", tags=["agent", tag],
                               caller=_stub_caller(routing="claude"))
     assert result.routing == pf.ROUTE_CLAUDE
@@ -1597,14 +1631,26 @@ def test_uncorroborated_cloud_inference_still_confirms_with_default_route_config
 
 @pytest.mark.unit
 def test_tag_override_bypasses_route_corroboration_check(monkeypatch):
-    """A `#cloud` tag is direct operator corroboration — #757's title-cue
-    check must not run on it at all, even though the model's own
+    """A `#cloud-sonnet` tag is direct operator corroboration — #757's
+    title-cue check must not run on it at all, even though the model's own
     uncorroborated route (local) would otherwise have been demoted."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "claude_code")
     reply = _golden_reply(routing="local", routing_explicit=False, routing_reason="stub")
-    result = pf.run_preflight(title="Refactor auth", tags=["agent", "cloud"], caller=_stub(reply))
+    result = pf.run_preflight(title="Refactor auth", tags=["agent", "cloud-sonnet"], caller=_stub(reply))
     assert result.routing == pf.ROUTE_CLAUDE
+    assert result.demoted_routing is None
+
+
+@pytest.mark.unit
+def test_bare_cloud_tag_also_bypasses_route_corroboration_check(monkeypatch):
+    """(#809) Same bypass, for the bare `#cloud` tag routing to `remote` —
+    it's still direct operator corroboration, just for a different route."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "claude_code")
+    reply = _golden_reply(routing="local", routing_explicit=False, routing_reason="stub")
+    result = pf.run_preflight(title="Refactor auth", tags=["agent", "cloud"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_REMOTE
     assert result.demoted_routing is None
 
 
