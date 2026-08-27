@@ -291,6 +291,34 @@ def test_lock_release_allows_a_subsequent_acquire(tmp_path: Path):
     assert "second=1" in result.stdout, result.stdout
 
 
+@pytest.mark.unit
+def test_lock_acquire_logs_distinct_error_when_flock_itself_fails(tmp_path: Path):
+    if not AUTO_UPDATE_MACOS.exists():
+        pytest.skip("scripts/auto-update-macos.sh not present")
+    repo = _make_repo_for_macos(tmp_path)
+    bindir = repo / "stubbin"
+    bindir.mkdir(exist_ok=True)
+    _stub_bin(bindir, "flock", "exit 2\n")  # anything but 75 (the conflict code)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"', env)
+    assert "rc=0" in result.stdout, result.stdout  # still defers
+    log = (repo / "logs" / "auto-update-macos.log").read_text()
+    assert "flock failed unexpectedly" in log, log
+
+
+@pytest.mark.unit
+def test_mark_env_mtime_applied_logs_error_and_leaves_no_marker_on_write_failure(tmp_path: Path):
+    if not AUTO_UPDATE_MACOS.exists():
+        pytest.skip("scripts/auto-update-macos.sh not present")
+    repo = _make_repo_for_macos(tmp_path)
+    result = _run_sourced(repo, 'ENV_MTIME=100; mv() { return 1; }; mark_env_mtime_applied')
+    assert result.returncode == 0, result.stderr
+    assert not (repo / "data" / "macos-env-mtime-applied").exists()
+    log = (repo / "logs" / "auto-update-macos.log").read_text()
+    assert "could not durably record" in log, log
+
+
 # ---------------------------------------------------------------------------
 # wait_for_pid_gone — never start the next process before the old one is
 # actually gone (poll the pid captured before unload, not `launchctl list`
@@ -703,6 +731,29 @@ def test_main_skips_when_api_service_not_running(tmp_path: Path):
     assert result.returncode == 0, (result.stdout, result.stderr)
     log = (repo / "logs" / "auto-update-macos.log").read_text()
     assert "not running" in log
+
+
+@pytest.mark.unit
+def test_main_lock_is_released_when_api_service_not_running(tmp_path: Path):
+    """Regression guard for the trap-based release: this exact early exit
+    (service not running) previously had NO release call at all before the
+    lock was acquired — found and fixed on review. The lock must be free
+    immediately afterward."""
+    if not AUTO_UPDATE_MACOS.exists():
+        pytest.skip("scripts/auto-update-macos.sh not present")
+    repo, _origin, _code_epoch = _make_policy_repo_macos(tmp_path)
+    result = subprocess.run(
+        ["bash", "-c",
+         'source scripts/auto-update-macos.sh && '
+         'api_active_since_epoch() { return 1; }; '
+         'launchctl() { return 0; }; api_pid() { echo ""; }; curl() { return 0; }; main'],
+        cwd=repo, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    lock_path = repo / "data" / "sync.lock"
+    assert lock_path.exists()
+    probe = subprocess.run(["flock", "-x", "-n", str(lock_path), "-c", "true"])
+    assert probe.returncode == 0, "lock was left held after an early exit"
 
 
 @pytest.mark.unit

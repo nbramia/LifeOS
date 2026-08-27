@@ -663,6 +663,46 @@ def test_lock_release_allows_a_subsequent_acquire(tmp_path: Path):
     assert "second=1" in result.stdout, result.stdout
 
 
+@pytest.mark.unit
+def test_lock_acquire_logs_distinct_error_when_flock_itself_fails(tmp_path: Path):
+    """Found on review: every flock failure used to look identical to 'sync
+    in progress'. A genuine tool/environment failure (here simulated by a
+    broken `flock`) must still defer — the safe default — but log something
+    an operator can actually diagnose, not the generic sync-busy message."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    bindir = repo / "stubbin"
+    bindir.mkdir(exist_ok=True)
+    # Exit 2 — anything other than flock's own conflict-exit-code (75) — is
+    # an unexpected failure, not "someone else holds it".
+    _stub_bin(bindir, "flock", "exit 2\n")
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"', env)
+    assert "rc=0" in result.stdout, result.stdout  # still defers
+    log = (repo / "logs" / "auto-deploy.log").read_text()
+    assert "flock failed unexpectedly" in log, log
+
+
+@pytest.mark.unit
+def test_mark_env_mtime_applied_logs_error_and_leaves_no_marker_on_write_failure(tmp_path: Path):
+    """A kill, full disk, or permission problem during the write must not
+    leave a corrupt/partial marker — the atomic-rename-after-verify design
+    means the target either has the full correct value or doesn't exist."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    result = _run_sourced(
+        repo,
+        'ENV_MTIME=100; mv() { return 1; }; mark_env_mtime_applied lifeos-api',
+    )
+    assert result.returncode == 0, result.stderr
+    assert not (repo / "data" / "env-mtime-applied-lifeos-api").exists()
+    log = (repo / "logs" / "auto-deploy.log").read_text()
+    assert "could not durably record" in log, log
+
+
 # ---------------------------------------------------------------------------
 # env_stale_for_unit / mark_env_mtime_applied — fixes a future-.env-mtime
 # restart loop found on review: comparing a unit's active_since against
@@ -1028,6 +1068,29 @@ def test_main_still_skips_when_a_tracked_file_is_modified(tmp_path: Path):
     assert "not auto-deploying over local edits" in deploy_log, deploy_log
     restart_log = (state / "restart.log").read_text() if (state / "restart.log").exists() else ""
     assert "restart lifeos-api" not in restart_log, restart_log
+
+
+@pytest.mark.unit
+def test_main_lock_is_released_on_an_early_exit_after_acquisition(tmp_path: Path):
+    """Regression guard for the trap-based release (found on review: relying
+    only on an explicit release call at the very end of main() is fragile —
+    an early exit, like the branch guard here, happens well before that
+    line). Checking out a non-main branch trips that guard AFTER the lock is
+    acquired; the lock must still be free immediately afterward."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, _code_epoch = _make_policy_repo(tmp_path)
+    _git(repo, "checkout", "-qb", "some-feature")
+
+    result = _run_main(repo, state, _venv_with_python(tmp_path))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    deploy_log = (repo / "logs" / "auto-deploy.log").read_text()
+    assert "not main" in deploy_log, deploy_log
+
+    lock_path = repo / "data" / "sync.lock"
+    assert lock_path.exists()
+    probe = subprocess.run(["flock", "-x", "-n", str(lock_path), "-c", "true"])
+    assert probe.returncode == 0, "lock was left held after an early exit"
 
 
 def _worker_busy_rc(tmp_path: Path, statuses: list[str]) -> str:

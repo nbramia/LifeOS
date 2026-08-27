@@ -143,10 +143,29 @@ env_stale_for_unit() {
 
 # Record that $1 (a unit) has just been restarted while $ENV_MTIME was
 # current, so env_stale_for_unit never re-triggers for this same edit.
+# Writes to a temp file, reads it back to confirm it landed intact, and only
+# then atomically renames it into place — found on review: a plain `echo >
+# file` can leave an empty or truncated marker behind a kill, a full disk,
+# or a permission problem. That would only be silently "safe" (the next
+# tick just restarts and tries again) if the mtime in question isn't
+# future-dated; combined with a future one, an unwritten marker reopens the
+# very restart-loop this mechanism exists to close. On a write failure this
+# logs an ERROR instead and leaves no marker at all, rather than a corrupt one.
 mark_env_mtime_applied() {
     [ -n "$ENV_MTIME" ] || return 0
     mkdir -p "$PROJECT_DIR/data"
-    echo "$ENV_MTIME" > "$(env_mtime_applied_file "$1")"
+    local target tmp
+    target=$(env_mtime_applied_file "$1")
+    tmp="${target}.tmp.$$"
+    if printf '%s' "$ENV_MTIME" > "$tmp" 2>/dev/null \
+        && [ "$(cat "$tmp" 2>/dev/null)" = "$ENV_MTIME" ] \
+        && mv -f "$tmp" "$target" 2>/dev/null
+    then
+        :
+    else
+        log "ERROR: could not durably record env-mtime-applied for $1 — may restart again next tick"
+        rm -f "$tmp" 2>/dev/null
+    fi
 }
 
 # Real wall-clock time $1's current process started, on this host's own
@@ -250,11 +269,32 @@ sync_in_progress_systemd() {
 # Returns 0 (sync in progress — caller must not proceed) if the lock could
 # NOT be acquired; 1 (clear to proceed) if it was acquired, in which case fd
 # 9 is left open and locked for the caller to release later.
+#
+# `flock`'s own exit code distinguishes "someone else holds it" (a genuinely
+# busy lock, requested via `-E`'s conflict code) from every other failure —
+# found on review: without that, a missing `flock` binary, a bad fd, a
+# directory where the lock file should be, or a filesystem error would all
+# look identical to "sync in progress" and defer silently forever, with
+# nothing in the log to tell an operator the lock mechanism itself is
+# broken. Either way the safe default is still to defer (never restart on
+# an ambiguous signal) — this only changes what gets logged.
 sync_in_progress_lock_acquire() {
     mkdir -p "$(dirname "$SYNC_LOCK_FILE")"
-    exec 9>"$SYNC_LOCK_FILE"
-    flock -x -n 9 || return 0
-    return 1
+    exec 9>"$SYNC_LOCK_FILE" || {
+        log "ERROR: could not open $SYNC_LOCK_FILE for locking — deferring as a precaution"
+        return 0
+    }
+    local rc
+    flock -x -n -E 75 9
+    rc=$?
+    case "$rc" in
+        0) return 1 ;;    # acquired — proceed; fd 9 stays open+locked
+        75) return 0 ;;   # held by a sync (flock's own conflict-exit-code) — defer, expected
+        *)
+            log "ERROR: flock failed unexpectedly (exit $rc) acquiring $SYNC_LOCK_FILE — deferring as a precaution"
+            return 0
+            ;;
+    esac
 }
 
 sync_in_progress_lock_release() {
@@ -281,14 +321,19 @@ if sync_in_progress_systemd; then
     exit 0
 fi
 # Exclusive, non-blocking lock held from here through the end of this
-# function (released just before main() returns, below) — not just checked
-# once — so a sync starting anywhere in between is never restarted out from
-# under itself (#793's TOCTOU finding). Any process exit on any path below
-# also releases it, via the kernel, with or without the explicit release.
+# function — not just checked once — so a sync starting anywhere in between
+# is never restarted out from under itself (#793's TOCTOU finding). A trap
+# releases it on ANY exit from this point on (found on review: relying only
+# on an explicit release call at the bottom is fragile — fd 9 could be
+# inherited by a child command and outlive an early exit in a way that's
+# easy to miss when this function is next edited; every exit already
+# releases it via the kernel regardless, the trap just makes that the
+# visible, enforced contract rather than an implicit one).
 if sync_in_progress_lock_acquire; then
     log "skip: nightly sync in progress — deferring deploy to avoid a mid-sync restart"
     exit 0
 fi
+trap sync_in_progress_lock_release EXIT
 
 # --- Guards: only auto-deploy a clean main --------------------------------------
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -427,12 +472,6 @@ fi
 log "restarted ${RESTARTED[*]} for drift, health OK"
 notify_success "✅ *LifeOS Auto-Deploy*
 Restarted ${RESTARTED[*]} — was running stale code. Health OK."
-# Every exit path in this function terminates the process, and the kernel
-# releases fd 9's flock the instant that happens regardless — this explicit
-# release is redundant here, kept only so the lock's lifetime reads clearly
-# as "acquired near the top, released at the bottom" rather than "acquired,
-# then implicitly relies on process exit."
-sync_in_progress_lock_release
 exit 0
 }
 

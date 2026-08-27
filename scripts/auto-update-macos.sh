@@ -166,10 +166,23 @@ env_stale() {
     fi
 }
 
+# Writes to a temp file, reads it back to confirm it landed intact, and only
+# then atomically renames it into place — see auto-deploy.sh's
+# mark_env_mtime_applied() for why a plain `echo > file` isn't durable
+# enough here.
 mark_env_mtime_applied() {
     [ -n "$ENV_MTIME" ] || return 0
     mkdir -p "$(dirname "$ENV_MTIME_APPLIED_FILE")"
-    echo "$ENV_MTIME" > "$ENV_MTIME_APPLIED_FILE"
+    local tmp="${ENV_MTIME_APPLIED_FILE}.tmp.$$"
+    if printf '%s' "$ENV_MTIME" > "$tmp" 2>/dev/null \
+        && [ "$(cat "$tmp" 2>/dev/null)" = "$ENV_MTIME" ] \
+        && mv -f "$tmp" "$ENV_MTIME_APPLIED_FILE" 2>/dev/null
+    then
+        :
+    else
+        log "ERROR: could not durably record env-mtime-applied — may restart again next tick"
+        rm -f "$tmp" 2>/dev/null
+    fi
 }
 
 # --- Sync-in-progress defer / mutual exclusion (#793's flock, shared with
@@ -183,11 +196,27 @@ mark_env_mtime_applied() {
 # ticks) — the second one simply fails to acquire and defers this tick,
 # rather than both interleaving `launchctl unload`/`load` calls against the
 # same service.
+# `flock`'s own exit code distinguishes "someone else holds it" from every
+# other failure — see auto-deploy.sh's identical function for why that
+# matters (a broken lock mechanism must not silently look like "sync busy"
+# in the log forever).
 sync_in_progress_lock_acquire() {
     mkdir -p "$(dirname "$SYNC_LOCK_FILE")"
-    exec 9>"$SYNC_LOCK_FILE"
-    flock -x -n 9 || return 0
-    return 1
+    exec 9>"$SYNC_LOCK_FILE" || {
+        log "ERROR: could not open $SYNC_LOCK_FILE for locking — deferring as a precaution"
+        return 0
+    }
+    local rc
+    flock -x -n -E 75 9
+    rc=$?
+    case "$rc" in
+        0) return 1 ;;
+        75) return 0 ;;
+        *)
+            log "ERROR: flock failed unexpectedly (exit $rc) acquiring $SYNC_LOCK_FILE — deferring as a precaution"
+            return 0
+            ;;
+    esac
 }
 
 sync_in_progress_lock_release() {
@@ -293,25 +322,27 @@ esac
 # --- Defer while the nightly sync is running (or another instance of this
 # script is already mid-restart) --------------------------------------------
 # Exclusive, non-blocking lock held from here through the end of this
-# function (released just before each exit path below) — not just checked
-# once — so a sync (or an overlapping invocation of this same script)
-# starting anywhere in between is never raced. Every exit path also
-# terminates the process, which releases it via the kernel regardless.
+# function — not just checked once — so a sync (or an overlapping invocation
+# of this same script) starting anywhere in between is never raced. A trap
+# releases it on ANY exit from this point on (see auto-deploy.sh's identical
+# trap for why that's more robust than an explicit release call on every
+# exit path — this file had exactly the gap it warns about: the "API
+# service not running" exit below had no release call at all before the
+# trap was added).
 if sync_in_progress_lock_acquire; then
     log "skip: nightly sync (or another update in progress) — deferring to avoid a mid-sync restart"
     exit 0
 fi
+trap sync_in_progress_lock_release EXIT
 
 # --- Guards: only auto-update a clean main --------------------------------------
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
 if [ "$BRANCH" != "main" ]; then
     log "skip: on branch '$BRANCH', not main"
-    sync_in_progress_lock_release
     exit 0
 fi
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     log "skip: tracked files modified — not auto-updating over local edits"
-    sync_in_progress_lock_release
     exit 0
 fi
 
@@ -320,7 +351,6 @@ if ! git fetch --quiet origin main 2>>"$LOG_FILE"; then
     log "ERROR: git fetch failed"
     notify_failure "🚨 *LifeOS Auto-Update (macOS)*
 \`git fetch\` failed on the host — check network / SSH auth."
-    sync_in_progress_lock_release
     exit 1
 fi
 
@@ -332,7 +362,6 @@ if [ "$LOCAL" != "$REMOTE" ]; then
         log "ERROR: --ff-only pull failed (local main diverged from origin)"
         notify_failure "🚨 *LifeOS Auto-Update (macOS)*
 Fast-forward pull failed — local \`main\` has diverged from origin. Manual fix needed."
-        sync_in_progress_lock_release
         exit 1
     fi
 fi
@@ -351,7 +380,6 @@ STALE=false
 [ -n "$CODE_MTIME" ] && [ "$ACTIVE_SINCE" -lt "$CODE_MTIME" ] && STALE=true
 env_stale "$ACTIVE_SINCE" && STALE=true
 if [ "$STALE" != true ]; then
-    sync_in_progress_lock_release
     exit 0   # nothing stale
 fi
 
@@ -361,7 +389,6 @@ if restart_cycle; then
     log "restart OK, health confirmed"
     notify_success "✅ *LifeOS Auto-Update (macOS)*
 Restarted — was running stale code/config. Health OK."
-    sync_in_progress_lock_release
     exit 0
 fi
 
@@ -371,14 +398,12 @@ if restart_cycle; then
     log "retry restart OK, health confirmed"
     notify_success "✅ *LifeOS Auto-Update (macOS)*
 Restarted (after one retry) — was running stale code/config. Health OK."
-    sync_in_progress_lock_release
     exit 0
 fi
 
 log "restart FAILED after retry — alerting"
 notify_failure "🚨 *LifeOS Auto-Update (macOS)*
 Restarted $PLIST_NAME twice but \`/health\` never came back. Check the host."
-sync_in_progress_lock_release
 exit 1
 
 }
