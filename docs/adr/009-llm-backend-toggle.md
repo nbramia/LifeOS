@@ -2,7 +2,8 @@
 
 **Status:** Complete
 **Last Updated:** 2026-05-27
-**Decision:** Accepted
+**Decision:** Superseded
+**Superseded By:** [ADR-022](022-remote-llm-backend.md) — a third `remote` backend value is added alongside `anthropic`/`local`; both original values are unchanged.
 
 ## Context
 

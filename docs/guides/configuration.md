@@ -56,11 +56,11 @@ Optional pull-based deploy loop: `lifeos-autodeploy.timer` polls `origin/main` e
 
 ## LLM Backend — Synthesis and Orchestration
 
-Governs chat synthesis, intent classification, and agentic orchestration. The toggle decision is recorded in [ADR-009](../adr/009-llm-backend-toggle.md).
+Governs chat synthesis, intent classification, and agentic orchestration. The toggle decision is recorded in [ADR-009](../adr/009-llm-backend-toggle.md), extended to a third value by [ADR-022](../adr/022-remote-llm-backend.md).
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
-| `LIFEOS_LLM_BACKEND` | str | `anthropic` | `local` (llama-server on `LIFEOS_LOCAL_LLM_URL`) or `anthropic` (Claude API). Recorded in ADR-009. |
+| `LIFEOS_LLM_BACKEND` | str | `anthropic` | `anthropic` (Claude API), `local` (llama-server on `LIFEOS_LOCAL_LLM_URL`), or `remote` (the configured paid provider below, as the standing default rather than a per-turn pick — #771/ADR-022). `anthropic` with no `ANTHROPIC_API_KEY`, or `remote` without the provider fully configured, fails fast with a named error rather than silently falling back. |
 | `LIFEOS_ANTHROPIC_MODEL` | str | `claude-haiku-4-5` | **Base** Claude model for chat orchestration when `LIFEOS_LLM_BACKEND=anthropic`. Per-query escalation can override it for a turn (see below). |
 | `LIFEOS_AGENT_ESCALATION_MODEL` | str | — (off) | Switches per-query escalation **on**; empty disables it. Anthropic backend only. Despite the name it no longer names the rung an automatic escalation climbs to — that is limited to non-API engines (see below). A model named here is still what "escalate to opus"-style *user-directed* escalation resolves against. |
 | `LIFEOS_AGENT_ESCALATION_LADDER` | str | `claude_code,codex` | Comma-separated rungs climbed on each successive refusal+pushback. Rungs must cost nothing per token: `claude_code`, `codex` (subscription CLIs) or `local` (on-box Gemma). Anthropic model ids are accepted but **dropped from the climb** with a log line — LifeOS never puts a turn on the API unless you ask. Override e.g. `local,claude_code,codex`. |
@@ -74,7 +74,7 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 
 ### OpenAI-compatible Remote Provider
 
-An explicit, per-turn model pick (like `local`) backed by a paid OpenAI-compatible endpoint — e.g. Fireworks running DeepSeek or Qwen. Never a rung the escalation ladder can reach on its own (ADR-018); it only ever runs when named explicitly. Also what the agent worker's local route can fall back to when the local llama-server is unreachable — see [agent-worker.md § Local executor](../specs/technical/agent-worker.md#local-executor-gemma-path).
+A paid OpenAI-compatible endpoint — e.g. Fireworks running DeepSeek or Qwen. Reachable two ways: an explicit per-turn model pick from the chat model picker (`model_override="remote"`), or as the process-wide default via `LIFEOS_LLM_BACKEND=remote` above (#771). Never a rung the escalation ladder can reach on its own (ADR-018), regardless of which of those two ways selects it — it only ever runs when named explicitly, by an operator or by a user's per-turn pick. Also what the agent worker's local route can fall back to when the local llama-server is unreachable — see [agent-worker.md § Local executor](../specs/technical/agent-worker.md#local-executor-gemma-path).
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
@@ -440,6 +440,7 @@ LIFEOS_ALERT_EMAIL=you@example.com
 - [Journal Ring Ingest](journal-ring-ingest.md) — `LIFEOS_JOURNAL_INGEST_TOKEN` in operator-flow context.
 - [Doctor Bot](doctor-bot.md) — The self-repair orchestration bot; setup of its `TELEGRAM_DOCTOR_*` vars and the repair flow.
 - [ADR-009: LIFEOS_LLM_BACKEND toggle](../adr/009-llm-backend-toggle.md) — Why the synthesis backend is operator-configurable.
+- [ADR-022: Remote provider as a third backend value](../adr/022-remote-llm-backend.md) — Why `remote` can be the standing default, not just a per-turn pick.
 - [ADR-019: A Turn's Lifetime Is Owned by the Server](../adr/019-turn-owned-by-server.md) — Why `LIFEOS_DETACHED_TURN_TIMEOUT_SECONDS` exists.
 - [ADR-012: Embedding Pipeline](../adr/012-embedding-pipeline.md) — Why `LIFEOS_EMBEDDING_MODEL` is overridable; the OOM-protection knobs.
 - [API Reference](../specs/product/api-reference.md) — Gmail send endpoint behavior controlled by the draft send cooldown.

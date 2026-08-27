@@ -822,6 +822,51 @@ class TestSingleton:
                 pytest.skip("anthropic package not installed")
         reset_local_llm()
 
+    def test_anthropic_backend_no_key_raises_named_error(self):
+        """#771: a keyless anthropic-backend install gets a human-readable
+        error naming the missing setting, not a raw SDK exception surfacing
+        later at first use."""
+        from api.services.llm_client import get_local_llm, reset_local_llm, LLMBackendNotConfiguredError
+        reset_local_llm()
+        with patch("api.services.llm_client.settings") as mock_settings:
+            mock_settings.llm_backend = "anthropic"
+            mock_settings.anthropic_api_key = ""
+            with pytest.raises(LLMBackendNotConfiguredError, match="ANTHROPIC_API_KEY"):
+                get_local_llm()
+        reset_local_llm()
+
+    def test_remote_backend_configured_returns_local_llm_client_pointed_at_provider(self):
+        """#771: LIFEOS_LLM_BACKEND=remote with a fully-configured provider
+        builds a LocalLLMClient wired to the remote provider's settings."""
+        from api.services.llm_client import get_local_llm, reset_local_llm, LocalLLMClient
+        reset_local_llm()
+        with patch("api.services.llm_client.settings") as mock_settings:
+            mock_settings.llm_backend = "remote"
+            mock_settings.remote_llm_configured = True
+            mock_settings.remote_llm_base_url = "https://api.fireworks.ai/inference/v1"
+            mock_settings.remote_llm_model = "accounts/fireworks/models/deepseek-v4-flash-0731"
+            mock_settings.remote_llm_api_key = "fw-test-key"
+            mock_settings.remote_llm_timeout = 90
+            client = get_local_llm()
+            assert isinstance(client, LocalLLMClient)
+            assert client.base_url == "https://api.fireworks.ai/inference"
+            assert client._model == "accounts/fireworks/models/deepseek-v4-flash-0731"
+            assert client._api_key == "fw-test-key"
+        reset_local_llm()
+
+    def test_remote_backend_not_configured_raises_named_error(self):
+        """#771: LIFEOS_LLM_BACKEND=remote with an incomplete provider config
+        fails fast with a named error rather than silently falling back to
+        another backend."""
+        from api.services.llm_client import get_local_llm, reset_local_llm, LLMBackendNotConfiguredError
+        reset_local_llm()
+        with patch("api.services.llm_client.settings") as mock_settings:
+            mock_settings.llm_backend = "remote"
+            mock_settings.remote_llm_configured = False
+            with pytest.raises(LLMBackendNotConfiguredError, match="remote"):
+                get_local_llm()
+        reset_local_llm()
+
     def test_specialist_client_resolves_model_from_settings(self):
         """get_anthropic_llm() resolves LIFEOS_ANTHROPIC_SPECIALIST_MODEL,
         independent of the orchestrator model (#470 — was a hardcoded dated

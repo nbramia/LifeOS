@@ -1024,18 +1024,53 @@ class AnthropicLLMClient:
 _llm_client: LocalLLMClient | AnthropicLLMClient | None = None
 
 
+class LLMBackendNotConfiguredError(RuntimeError):
+    """Raised by get_local_llm() when LIFEOS_LLM_BACKEND selects a backend
+    that isn't actually usable yet (missing key / incomplete remote config).
+
+    Exists so a keyless or partially-configured install fails with a
+    human-readable reason naming exactly what's missing and which setting
+    fixes it, instead of the raw SDK/HTTP exception that would otherwise
+    surface later, at first use, from deep inside a chat turn (#771/#787).
+    """
+
+
 def get_local_llm() -> LocalLLMClient | AnthropicLLMClient:
     """Get or create the LLM client singleton.
 
-    Returns AnthropicLLMClient (default) or LocalLLMClient based on LIFEOS_LLM_BACKEND.
-    Set LIFEOS_LLM_BACKEND=local in .env to use a local llama-server instead.
+    Returns AnthropicLLMClient, LocalLLMClient (local llama-server), or
+    LocalLLMClient pointed at the configured paid remote provider (#771),
+    based on LIFEOS_LLM_BACKEND ("anthropic" default, "local", or "remote").
     """
     global _llm_client
     if _llm_client is None:
         backend = getattr(settings, "llm_backend", "anthropic").lower()
         if backend == "anthropic":
+            if not getattr(settings, "anthropic_api_key", ""):
+                raise LLMBackendNotConfiguredError(
+                    "LIFEOS_LLM_BACKEND is 'anthropic' (the default) but "
+                    "ANTHROPIC_API_KEY is not set. Set ANTHROPIC_API_KEY in "
+                    "your .env, or set LIFEOS_LLM_BACKEND=local (a local "
+                    "llama-server) or LIFEOS_LLM_BACKEND=remote (a "
+                    "configured OpenAI-compatible provider) instead."
+                )
             logger.info("Using Anthropic LLM backend")
             _llm_client = AnthropicLLMClient()
+        elif backend == "remote":
+            if not settings.remote_llm_configured:
+                raise LLMBackendNotConfiguredError(
+                    "LIFEOS_LLM_BACKEND is 'remote' but the remote provider "
+                    "isn't fully configured. Set LIFEOS_REMOTE_LLM_URL, "
+                    "LIFEOS_REMOTE_LLM_MODEL, and LIFEOS_REMOTE_LLM_API_KEY "
+                    "in your .env."
+                )
+            logger.info("Using remote LLM backend at %s", settings.remote_llm_base_url)
+            _llm_client = LocalLLMClient(
+                base_url=settings.remote_llm_base_url,
+                model=settings.remote_llm_model,
+                api_key=settings.remote_llm_api_key,
+                timeout=settings.remote_llm_timeout,
+            )
         else:
             logger.info("Using local LLM backend at %s", settings.local_llm_url)
             _llm_client = LocalLLMClient()

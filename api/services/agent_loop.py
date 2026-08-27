@@ -442,8 +442,11 @@ def _select_client(model: str = "", force_local: bool = False, force_remote: boo
             timeout=settings.remote_llm_timeout,
         )
     if force_local:
-        if getattr(settings, "llm_backend", "anthropic").lower() != "anthropic":
+        if getattr(settings, "llm_backend", "anthropic").lower() == "local":
             return get_local_llm()  # already local — reuse the singleton
+        # Anthropic or remote backend: the picker's "Gemma" option always
+        # means the on-box llama-server specifically, never whatever the
+        # remote-backend singleton happens to point at (#771).
         from api.services.llm_client import LocalLLMClient
         return LocalLLMClient()
     if model and getattr(settings, "llm_backend", "anthropic").lower() == "anthropic":
