@@ -160,11 +160,20 @@ def coverage_report() -> dict:
     """Per-source-type earliest/latest record date and count from the
     interactions store — the acceptance criteria's "coverage report".
     Read-only; safe to call any time, including on a totally fresh
-    install where the interactions table may not exist yet.
+    install where the interactions store doesn't exist yet.
+
+    ``sqlite3.connect`` creates an empty file at the given path if none
+    exists, which would make this script's "writes nothing of its own"
+    claim false on a fresh/all-unconfigured install — check existence
+    first rather than relying on the OperationalError fallback below to
+    keep that true.
     """
     report = {}
+    db_path = get_interaction_db_path()
+    if not Path(db_path).exists():
+        return report
     try:
-        conn = sqlite3.connect(get_interaction_db_path())
+        conn = sqlite3.connect(db_path)
     except sqlite3.Error as e:
         logger.warning(f"Could not open interactions store for coverage report: {e}")
         return report

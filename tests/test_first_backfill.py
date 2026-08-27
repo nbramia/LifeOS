@@ -204,6 +204,21 @@ class TestCoverageReport:
 
         assert fb.coverage_report() == {}
 
+    def test_missing_database_is_not_created_as_a_side_effect(self, tmp_path, monkeypatch):
+        """sqlite3.connect silently creates an empty file at a missing
+        path -- this script claims to write nothing of its own (a totally
+        fresh or all-unconfigured install has no interactions.db yet), so
+        calling the "read-only" coverage report must not leave one behind
+        (Codex review of #778)."""
+        import scripts.first_backfill as fb
+
+        db_path = tmp_path / "interactions.db"
+        monkeypatch.setattr(fb, "get_interaction_db_path", lambda: str(db_path))
+
+        fb.coverage_report()
+
+        assert not db_path.exists()
+
     def test_reports_count_and_date_range_per_source(self, tmp_path, monkeypatch):
         import scripts.first_backfill as fb
 
