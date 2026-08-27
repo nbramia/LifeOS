@@ -292,19 +292,47 @@ def test_lock_release_allows_a_subsequent_acquire(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_lock_acquire_logs_distinct_error_when_flock_itself_fails(tmp_path: Path):
+def test_lock_acquire_logs_distinct_error_when_the_lock_helper_fails(tmp_path: Path):
+    """Not `flock`(1) here — see sync_in_progress_lock_acquire()'s comment
+    for why that command isn't used on macOS at all. python3 is the
+    helper whose unexpected failure must still defer (safe default) while
+    logging something diagnosable, not the generic sync-busy message."""
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo = _make_repo_for_macos(tmp_path)
     bindir = repo / "stubbin"
     bindir.mkdir(exist_ok=True)
-    _stub_bin(bindir, "flock", "exit 2\n")  # anything but 75 (the conflict code)
+    _stub_bin(bindir, "python3", "exit 2\n")  # anything but 0 or 75
     env = dict(os.environ)
     env["PATH"] = f"{bindir}:{env['PATH']}"
     result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"', env)
     assert "rc=0" in result.stdout, result.stdout  # still defers
     log = (repo / "logs" / "auto-update-macos.log").read_text()
-    assert "flock failed unexpectedly" in log, log
+    assert "lock acquisition failed unexpectedly" in log, log
+
+
+@pytest.mark.unit
+def test_lock_acquire_never_shells_out_to_flock(tmp_path: Path):
+    """macOS doesn't ship the `flock`(1) command (util-linux, Linux-only) —
+    using it here would make the lock silently always fail to acquire on
+    the actual target platform. Confirm sync_in_progress_lock_acquire and
+    sync_in_progress_lock_release never invoke it."""
+    if not AUTO_UPDATE_MACOS.exists():
+        pytest.skip("scripts/auto-update-macos.sh not present")
+    repo = _make_repo_for_macos(tmp_path)
+    bindir = repo / "stubbin"
+    bindir.mkdir(exist_ok=True)
+    _stub_bin(bindir, "flock", 'echo "flock was called: $*" >> "$PWD/flock-calls.log"; exit 1\n')
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    result = _run_sourced(
+        repo,
+        'sync_in_progress_lock_acquire; echo "acquire=$?"; '
+        'sync_in_progress_lock_release; echo "released"',
+        env,
+    )
+    assert "acquire=1" in result.stdout, result.stdout
+    assert not (repo / "flock-calls.log").exists(), "flock(1) must never be invoked on macOS"
 
 
 @pytest.mark.unit

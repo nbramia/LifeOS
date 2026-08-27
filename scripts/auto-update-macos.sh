@@ -196,8 +196,24 @@ mark_env_mtime_applied() {
 # ticks) — the second one simply fails to acquire and defers this tick,
 # rather than both interleaving `launchctl unload`/`load` calls against the
 # same service.
-# `flock`'s own exit code distinguishes "someone else holds it" from every
-# other failure — see auto-deploy.sh's identical function for why that
+# Deliberately NOT the `flock`(1) command auto-deploy.sh uses: it's a
+# util-linux tool that ships on every Linux distro but is NOT part of a
+# stock macOS install (no equivalent bundled with Darwin) — using it here,
+# on the one script that actually targets macOS, would make every
+# invocation fail with "command not found", which the "any unexpected
+# failure means defer" hardening below would then treat as "always defer,
+# never actually update." python3's stdlib `fcntl` module wraps the exact
+# same underlying flock(2) syscall and is already a hard dependency of this
+# whole project (run_all_syncs.py itself, whose lock this checks). The
+# trick this relies on: fd 9, opened by `exec` in THIS shell, is inherited
+# by the python3 child below; flock(2) locks belong to the open file
+# description, not to any one process's fd table, so a lock the child
+# acquires on its inherited copy of fd 9 is still held by fd 9 in this
+# shell after the child exits — exactly how the real `flock`(1) command
+# implements its own "operate on an already-open fd, no wrapped command"
+# mode. Exit code 75 (matching auto-deploy.sh's `flock -E 75` convention)
+# means "someone else holds it"; anything else is a genuine error, not a
+# sync — see auto-deploy.sh's identical function for why that distinction
 # matters (a broken lock mechanism must not silently look like "sync busy"
 # in the log forever).
 sync_in_progress_lock_acquire() {
@@ -207,20 +223,30 @@ sync_in_progress_lock_acquire() {
         return 0
     }
     local rc
-    flock -x -n -E 75 9
+    python3 -c '
+import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(75)
+except OSError:
+    sys.exit(1)
+'
     rc=$?
     case "$rc" in
         0) return 1 ;;
         75) return 0 ;;
         *)
-            log "ERROR: flock failed unexpectedly (exit $rc) acquiring $SYNC_LOCK_FILE — deferring as a precaution"
+            log "ERROR: lock acquisition failed unexpectedly (exit $rc) on $SYNC_LOCK_FILE — deferring as a precaution"
             return 0
             ;;
     esac
 }
 
+# Closing fd 9 releases whatever lock it held — no separate "unlock" call
+# needed (and, per the comment above, no `flock`(1) command to make one
+# with anyway).
 sync_in_progress_lock_release() {
-    flock -u 9 2>/dev/null || true
     exec 9>&- 2>/dev/null || true
 }
 
