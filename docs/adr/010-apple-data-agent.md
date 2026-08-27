@@ -3,6 +3,7 @@
 **Status:** Complete
 **Last Updated:** 2026-05-27
 **Decision:** Accepted
+**Amended by:** [ADR-022](022-macos-fda-inheritance-and-restart.md) — corrects this ADR's `exec`/`run` description (`run` preserves FDA, `exec` loses it — this ADR had it backward) and adds two restart-safety facts this ADR never covered
 
 ## Context
 
