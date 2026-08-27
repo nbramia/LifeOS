@@ -54,7 +54,19 @@ if [ -f "$PROJECT_DIR/.env" ]; then
                 val="${val#\'}"
                 val="${val%\'}"
             fi
-            export "$key=$val"
+            # Only export a key not already present in the inherited
+            # environment — found on review: exporting unconditionally let
+            # a stale/incorrect .env value silently override one launchd
+            # already set via the plist's own EnvironmentVariables dict
+            # (e.g. LIFEOS_VAULT_PATH, validated at install time by
+            # setup-launchd.sh's check_paths_exist()). This matches
+            # systemd's EnvironmentFile=, which likewise never overrides a
+            # variable already set at the [Service] level (Environment=).
+            # `${!key+x}` (indirect expansion) tests whether $key is set at
+            # all, regardless of whether its value is empty.
+            if [ -z "${!key+x}" ]; then
+                export "$key=$val"
+            fi
         fi
     done < "$PROJECT_DIR/.env"
 fi

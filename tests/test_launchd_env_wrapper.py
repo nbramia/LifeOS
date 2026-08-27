@@ -93,6 +93,41 @@ def test_wrapper_skips_comments_and_blank_lines(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_wrapper_does_not_override_an_already_inherited_variable(tmp_path: Path):
+    """Found on review: exporting every .env key unconditionally let a
+    stale/incorrect .env value silently override one launchd already set
+    via the plist's own EnvironmentVariables dict (e.g. a validated
+    LIFEOS_VAULT_PATH) — the inherited value must win, matching how
+    systemd's EnvironmentFile= never overrides a variable already set at
+    the [Service] level."""
+    if not WRAPPER.exists():
+        pytest.skip("scripts/launchd-env-wrapper.sh not present")
+    (tmp_path / ".env").write_text("FOO=from_env_file\n")
+    result = subprocess.run(
+        ["bash", "-c", f'FOO=from_inherited_environment exec bash "{WRAPPER}" "{tmp_path}" bash -c \'echo "$FOO"\''],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "from_inherited_environment"
+
+
+@pytest.mark.unit
+def test_wrapper_still_exports_a_key_with_no_inherited_value(tmp_path: Path):
+    """The precedence fix must not become 'never export anything' — a key
+    genuinely absent from the inherited environment still comes from .env,
+    same as every other test in this file already relies on."""
+    if not WRAPPER.exists():
+        pytest.skip("scripts/launchd-env-wrapper.sh not present")
+    (tmp_path / ".env").write_text("BRAND_NEW_KEY=from_env_file\n")
+    result = subprocess.run(
+        ["bash", "-c", f'unset BRAND_NEW_KEY; exec bash "{WRAPPER}" "{tmp_path}" bash -c \'echo "$BRAND_NEW_KEY"\''],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "from_env_file"
+
+
+@pytest.mark.unit
 def test_wrapper_execs_normally_when_env_file_absent(tmp_path: Path):
     if not WRAPPER.exists():
         pytest.skip("scripts/launchd-env-wrapper.sh not present")
