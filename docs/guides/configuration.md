@@ -88,9 +88,9 @@ A paid OpenAI-compatible endpoint — e.g. Fireworks running DeepSeek or Qwen. R
 
 All three of URL, model, and API key must be set for the provider to be considered configured; pricing is independent and can be added later without affecting whether turns run.
 
-### Routing Target and Reasoning Control (#566)
+### Routing Target and Reasoning Control (#566/#773)
 
-Query routing, fact filtering, and entity-cleanup auto-hide decisions always go through the local llama-server (`_get_local_routing_client`), regardless of `LIFEOS_LLM_BACKEND`. These settings let that routing target — and whether it's asked to reason — be configured independently of the main local LLM used for chat synthesis.
+Query routing, conversation titling, agent-activity summaries, and person-fact filtering never use the Claude API, regardless of `LIFEOS_LLM_BACKEND` — these are cheap, auxiliary, non-user-facing calls that shouldn't carry API cost. The local llama-server (`_get_local_routing_client`) is the preferred target; when it's unreachable, these calls fall back to the configured remote provider (below) instead of silently doing nothing, still never to Anthropic (#773). These settings let the local routing target — and whether it's asked to reason — be configured independently of the main local LLM used for chat synthesis.
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
