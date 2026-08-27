@@ -12,20 +12,21 @@ Engineering view of the agent worker — the stand-alone process that consumes `
 
 1. [Architecture overview](#architecture-overview)
 2. [Component layout](#component-layout)
-3. [Lifecycle of a task](#lifecycle-of-a-task)
-4. [Session state machine](#session-state-machine)
-5. [Preflight](#preflight)
-6. [Local executor (Gemma path)](#local-executor-gemma-path)
-7. [Managed executor (Claude path)](#managed-executor-claude-path)
-8. [System prompts](#system-prompts)
-9. [Inter-agent coordination](#inter-agent-coordination)
-10. [Budget enforcement](#budget-enforcement)
-11. [Restart resumability](#restart-resumability)
-12. [Telegram clarification flow](#telegram-clarification-flow)
-13. [Transcripts](#transcripts)
-14. [Agent Output notes](#agent-output-notes)
-15. [Configuration surface](#configuration-surface)
-16. [Related Documents](#related-documents)
+3. [Session store schema](#session-store-schema)
+4. [Lifecycle of a task](#lifecycle-of-a-task)
+5. [Session state machine](#session-state-machine)
+6. [Preflight](#preflight)
+7. [Local executor (Gemma path)](#local-executor-gemma-path)
+8. [Managed executor (Claude path)](#managed-executor-claude-path)
+9. [System prompts](#system-prompts)
+10. [Inter-agent coordination](#inter-agent-coordination)
+11. [Budget enforcement](#budget-enforcement)
+12. [Restart resumability](#restart-resumability)
+13. [Telegram clarification flow](#telegram-clarification-flow)
+14. [Transcripts](#transcripts)
+15. [Agent Output notes](#agent-output-notes)
+16. [Configuration surface](#configuration-surface)
+17. [Related Documents](#related-documents)
 
 ---
 
@@ -85,6 +86,114 @@ External boundaries:
 - **HTTP**: `/api/tasks` for task CRUD, `/api/tasks/{id}/swap-tag` for atomic tag transitions, the Telegram Bot API for notifications.
 - **LLM**: `https://api.anthropic.com/v1` for Haiku preflight + Managed Agents API; `http://localhost:8080` (llama-server) for local execution.
 - **MCP**: `https://<host>/mcp` for the LifeOS MCP HTTP transport (used by Managed Agents and other remote MCP clients), and stdio MCP for local Claude Code.
+
+---
+
+## Session store schema
+
+`session_store.py` creates seven tables (SQLite, `data/agent_sessions.db` by default). The schema is deliberately permissive — new columns and tables have been added issue-by-issue rather than designed up front — so this list is read directly off the table-creation code (`_SCHEMA` in `session_store.py`) rather than written from memory; re-check the source if it looks stale.
+
+### `sessions`
+
+One row per agent session (1:1 with a claimed task, or a root-spawned operator session — see `origin` below). `task_id` is the primary key, **not** `session_id` — the two are related but distinct ids.
+
+| Column | Meaning |
+|---|---|
+| `task_id` (PK) | The `#agent` task this session was claimed from (or a synthetic id for operator sessions). |
+| `session_id` (UNIQUE) | Internal session identifier used for inter-agent addressing, transcripts, etc. |
+| `status` | One of `claimed`, `running`, `yielded`, `completed`, `failed`, `budget_exceeded`, `blocked`. |
+| `routing` | `local`, `claude`, `claude_code`, `codex`, or `ask` — which executor runs the session. |
+| `budget_json` | JSON-encoded budget (dollars / wall-clock / tokens) set at preflight. |
+| `started_at`, `last_activity_at` | Unix epoch seconds. |
+| `total_input_tokens`, `total_output_tokens` | Accumulated token counts. |
+| `total_cache_creation_tokens`, `total_cache_read_tokens` | Prompt-cache token buckets, tracked separately because they're billed at different rates than plain input tokens. |
+| `total_dollars` | **The accumulated-spend column.** Not `spend`, not `cost` — `total_dollars`. |
+| `total_active_seconds` | Accumulated active compute time. |
+| `expected_output` | `text`, `file`, `external_action`, or `structured`, set at preflight. |
+| `parent_session_id`, `root_session_id`, `spawn_depth` | Inter-agent lineage for spawned sessions. |
+| `yield_waiting_for` | JSON array of `session_id`s this session is yielded waiting on. |
+| `managed_agent_session_id` | Anthropic Managed Agents session id, for `routing="claude"` sessions. |
+| `preset_class` | Tool-filtering preset applied to a Managed Agents session at start. |
+| `origin` | NULL or `"agent"` = claimed from an `#agent` task; `"operator"` = root-spawned on demand with no backing task (#235). |
+| `claude_code_session_id` | Claude Code (or Codex) CLI session/thread id, for `routing="claude_code"`/`"codex"` — the column is reused for both; `routing` disambiguates which CLI it belongs to. |
+| `claude_code_model` | Claude tier for `routing="claude_code"` (`haiku`/`sonnet`/`opus`); NULL falls back to the CLI's own default (`opus`). |
+| `bot` | Telegram bot that owns this session's notices; NULL = primary bot (#348). |
+| `unpriced` | Sticky flag: set once any turn was priced against a model `pricing.py` doesn't recognize, so a reader can tell "$0.00 total" apart from "some turns couldn't be priced" (#669). |
+
+Indexed on `status`, `parent_session_id`, `root_session_id`, and (partial index) `status = 'yielded'`.
+
+### `pending_messages`
+
+Inter-agent messages queued for delivery to a peer/child/parent session — written by `lifeos_agent_send` for sessions that aren't actively running, and injected on resume for yielded sessions.
+
+| Column | Meaning |
+|---|---|
+| `id` (PK, autoincrement) | Row id. |
+| `session_id` | Recipient session. |
+| `sender_id` | Sending session's id. |
+| `content` | Message body. |
+| `created_at` | Unix epoch seconds. |
+| `delivered` | 0/1 — whether the recipient has consumed it. |
+
+### `pending_questions`
+
+Open clarification questions sent to the operator via Telegram, and completion-message follow-ups (an operator reply to a finished task's Telegram message that continues the thread). `kind` distinguishes the two: `"clarification"` blocks the session until answered; `"followup"` reopens an already-`completed` session and appends the reply as a new turn.
+
+| Column | Meaning |
+|---|---|
+| `id` (PK, autoincrement) | Row id. |
+| `session_id`, `task_id` | The session and task this question belongs to. |
+| `question` | Question text sent to the operator. |
+| `sent_message_id` | Telegram message id the answer is matched against. |
+| `sent_at` | Unix epoch seconds. |
+| `answer`, `answered_at` | Populated once the operator replies. |
+| `processed` | 0/1 — whether the worker has resumed the session on this answer. |
+| `timed_out` | 0/1 — set if the clarification aged out (default 72h) before an answer arrived. |
+| `kind` | `"clarification"` or `"followup"` (default `"clarification"`). |
+| `sent_message_ids` | JSON array of every Telegram chunk id for this notification (a long completion splits across multiple messages); NULL for legacy rows, which still match via `sent_message_id` alone. |
+| `bot` | Telegram bot that sent this question; NULL = primary. Scopes reply-matching so a doctor-bot reply can't collide with a primary-bot question sharing the same numeric message id (#348). |
+
+### `daily_spend`
+
+The daily $-cap ledger `spend_tracker.py` reads and increments.
+
+| Column | Meaning |
+|---|---|
+| `date` (PK) | Calendar date, as text. |
+| `total_dollars` | Total spend booked against that date. |
+
+### `messages`
+
+Conversation log for local-path (`routing="local"`) sessions only — Managed Agents sessions store their conversation in the JSONL transcript instead, since their authoritative state lives on the Anthropic side.
+
+| Column | Meaning |
+|---|---|
+| `session_id`, `turn_index` (composite PK) | Session and 0-based turn position. |
+| `role` | Turn role (e.g. `user`, `assistant`, `tool`). |
+| `content_json` | JSON-encoded turn content. |
+| `tokens_in`, `tokens_out` | Per-turn token counts. |
+| `created_at` | Unix epoch seconds. |
+
+### `sleeps`
+
+A session with a row here is yielded on a timer — the worker's main loop scans this table and resumes the session once `wake_at` has passed.
+
+| Column | Meaning |
+|---|---|
+| `session_id` (PK) | The yielded session. |
+| `wake_at` | Unix epoch seconds the session should resume at. |
+
+### `managed_cursor`
+
+Polling bookkeeping for Managed Agents sessions, one row per `task_id`.
+
+| Column | Meaning |
+|---|---|
+| `task_id` (PK) | The task this cursor belongs to. |
+| `last_event_id` | Last Managed Agents event id ingested, so polling resumes without re-processing. |
+| `accrued_session_hour_dollars` | Cumulative session-hour overhead already booked into the session's `total_dollars`. |
+| `final_text` | Most recent `agent.message` text seen across polls — cached because the final message and the terminal `session.status_idle` event can land on different polls, and a Telegram completion summary would otherwise have no text to show. |
+| `tool_loop_signature`, `tool_loop_count`, `tool_calls_since_message` | Runaway-loop detection counters (#139 §5), persisted so cross-poll signals survive worker restarts mid-session. |
 
 ---
 
