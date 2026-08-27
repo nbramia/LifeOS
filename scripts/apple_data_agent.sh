@@ -3,8 +3,8 @@
 # and sync it to the Linux server.
 #
 # This replaces the Mac Mini's role as the LifeOS server. Instead, it:
-# 1. Exports contacts, iMessage, phone data to data/apple-exports/
-# 2. Rsyncs exports to the Linux server at data/apple-imports/
+# 1. Exports contacts, iMessage, phone data to data/apple-imports/ (locally)
+# 2. Rsyncs exports to the Linux server, also at data/apple-imports/
 #
 # Schedule (Mac Mini crontab):
 #   50 2 * * * /path/to/LifeOS/scripts/apple_data_agent.sh
@@ -181,7 +181,8 @@ osascript -e 'tell application "Photos" to activate' >> "${LOG_FILE}" 2>&1 || tr
 sleep 600
 
 # -------------------------------------------------------------------
-# Step 2: Export Apple data to data/apple-exports/
+# Step 2: Export Apple data to data/apple-imports/ (same directory name
+# apple_data_import.py reads from — #785)
 # Route through LifeOS.app's "run" subcommand so Python inherits
 # Full Disk Access (TCC checks the responsible process — LifeOS.app).
 # "run" keeps LifeOS.app as the parent; "exec" replaces it, losing FDA.
@@ -211,7 +212,7 @@ fi
 # -------------------------------------------------------------------
 log "Step 3: Syncing to Linux server..."
 
-EXPORT_DIR="${LIFEOS_DIR}/data/apple-exports/"
+EXPORT_DIR="${LIFEOS_DIR}/data/apple-imports/"
 IMPORT_DIR="${LINUX_USER}@${LINUX_SERVER}:${LINUX_LIFEOS}/data/apple-imports/"
 
 # Create remote directory if needed — retry on transient SSH failures

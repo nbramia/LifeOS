@@ -10,12 +10,16 @@ Usage:
     python scripts/apple_data_export.py --execute --source imessage  # Single source
     python scripts/apple_data_export.py --dry-run           # Preview only
 
-Exported to: data/apple-exports/
+Exported to: data/apple-imports/
     contacts.json       — Apple Contacts data
     imessage.db         — Copy of the local iMessage cache
     phone_calls.json    — Phone/FaceTime call history
 
-The Linux server picks these up from data/apple-imports/ (via rsync).
+Uses the same directory name (data/apple-imports/) apple_data_import.py
+reads from, so a single-machine deployment (export and import on the same
+host) works with no rsync step and no manual symlink (#785). The
+two-machine flow rsyncs this directory across hosts unchanged — see
+scripts/apple_data_agent.sh.
 """
 import sys
 import json
@@ -43,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-EXPORT_DIR = PROJECT_ROOT / "data" / "apple-exports"
+EXPORT_DIR = PROJECT_ROOT / "data" / "apple-imports"
 
 
 def _parse_abcdp_labeled(field_dict: dict | None) -> list[dict]:

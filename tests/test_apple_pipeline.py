@@ -13,6 +13,22 @@ pytestmark = pytest.mark.unit
 
 
 # ---------------------------------------------------------------------------
+# Export/import directory name reconciliation — issue #785
+# ---------------------------------------------------------------------------
+
+class TestExportImportDirectoryNamesAgree:
+    """Export and import must agree on the shared handoff directory name so
+    a single-machine deployment (both steps on the same host, no rsync)
+    works with no manual symlink."""
+
+    def test_export_and_import_dirs_resolve_to_the_same_path(self):
+        from scripts.apple_data_export import EXPORT_DIR
+        from scripts.apple_data_import import IMPORT_DIR
+
+        assert EXPORT_DIR == IMPORT_DIR
+
+
+# ---------------------------------------------------------------------------
 # Contacts plist parsing
 # ---------------------------------------------------------------------------
 
