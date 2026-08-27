@@ -1205,6 +1205,57 @@
             justify-content: center;
         }
 
+        /* Network-resilience status row for a voice turn (#801) -- a subtle
+           "retrying" note, or a definitive "failed" state with Retry/dismiss.
+           A sibling of `.message.user`/`.message.assistant`, appended right
+           after the turn's bubble, deliberately NOT nested inside one (see
+           `turnStatusEl`'s comment in voice.js for why: `.message`'s own
+           text content is asserted verbatim by pre-existing tests). */
+        .voice-turn-status {
+            align-self: flex-end;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            max-width: min(85%, 700px);
+            padding: 0 0.25rem;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .voice-turn-status.failed {
+            color: var(--text-secondary);
+        }
+
+        .voice-turn-retry-btn,
+        .voice-turn-dismiss-btn {
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: none;
+            font-size: 0.8rem;
+            padding: 0.2rem 0.6rem;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .voice-turn-retry-btn {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+
+        .voice-turn-retry-btn:hover {
+            background: var(--accent-hover);
+        }
+
+        .voice-turn-dismiss-btn {
+            color: var(--text-muted);
+            padding: 0.2rem 0.5rem;
+        }
+
+        .voice-turn-dismiss-btn:hover {
+            color: var(--text-secondary);
+        }
+
         /* Mode swap: voice mode hides the text composer, shows the dock. */
         body.voice-mode .input-container,
         body.voice-mode .attachments-preview {

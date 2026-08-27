@@ -85,6 +85,24 @@ let turnTranscriptEl = null;
 let turnDone = false;
 let ttsAudio = null;
 
+// --- network resilience (#801) ---
+//
+// The last recorded clip, held until its turn *definitively* completes:
+// success, an explicit user cancel, or an explicit dismiss (the "✕" on a
+// failed turn's status row, below) -- never merely because a submission
+// attempt failed. That's the whole point: a flaky connection must never
+// force re-speaking the message. One slot, not a queue -- starting a new
+// recording (a fresh, non-retry submitTurn() call) replaces whatever was
+// held, same as today's "there's only one turn at a time" model.
+let heldRecording = null; // { blob, mime } | null
+// The status row (retrying/failed+Retry) appended after `turnTranscriptEl`
+// -- or, when no transcript is known yet, after the thread's last message --
+// tracked so a later state (a new retry attempt, success, a fresh turn) can
+// remove/replace it without hunting the DOM. Never inside `.message-content`
+// itself: `.message.user`'s own text is asserted verbatim by pre-existing
+// tests (#758's eager-transcript suite), so this lives in a sibling node.
+let turnStatusEl = null;
+
 // Every write to `clipInFlight` goes through here (#734) rather than
 // assigning the module variable directly, so the wake tap's AudioContext
 // (`listenAudioCtx`, set up in startListening() below) suspends/resumes in
@@ -2085,6 +2103,96 @@ function clearUserTranscript() {
   }
 }
 
+// --- network-resilience UI: retrying/failed status row (#801) ---
+//
+// A small row appended right after the turn's bubble (or, if none exists
+// yet -- an audio-only turn whose initial submission never even reached STT
+// -- after the thread's last message) showing either a subtle "retrying"
+// state or a definitive "failed" state with Retry/dismiss affordances.
+// Deliberately its own DOM node, sibling to `.message.user`, never a child
+// of it -- see `turnStatusEl`'s own comment for why.
+function removeVoiceTurnStatus() {
+  if (turnStatusEl) {
+    turnStatusEl.remove();
+    turnStatusEl = null;
+  }
+}
+
+function insertVoiceTurnStatus(className) {
+  removeVoiceTurnStatus();
+  const el = document.createElement('div');
+  el.className = 'voice-turn-status ' + className;
+  const anchor = turnTranscriptEl;
+  if (anchor && anchor.parentNode) {
+    anchor.parentNode.insertBefore(el, anchor.nextSibling);
+  } else {
+    elements.messagesEl.appendChild(el);
+  }
+  turnStatusEl = el;
+  return el;
+}
+
+// A subtle in-thread echo of the retry attempt already reflected in the top
+// status bar (setStatus() call at the caller) -- only rendered when a real
+// bubble exists to attach it to (a manual Retry-tap's reused bubble, or a
+// caller-supplied transcript). An audio-only turn's very first submission
+// attempt has no bubble yet (STT hasn't run), so for that case the top
+// status bar is the only "retrying" signal -- still visible, just not
+// double-shown in the thread.
+function showRetryingStatus(attempt, max) {
+  setStatus('loading', `Retrying… (${attempt}/${max})`);
+  if (!turnTranscriptEl) return;
+  const el = insertVoiceTurnStatus('retrying');
+  el.textContent = `Retrying… (${attempt}/${max})`;
+}
+
+// Definitive failure: the recording is held (heldRecording, set by the
+// caller) and this offers the only two things #801 promises -- resubmit the
+// same audio, or explicitly throw it away. No third "do nothing" outcome
+// silently loses it: the row simply stays until one of those two is tapped,
+// or the next recording replaces it (submitTurn()'s own teardown, see
+// `heldRecording`'s comment).
+function showFailedStatus(onRetry, onDismiss) {
+  const el = insertVoiceTurnStatus('failed');
+  const label = document.createElement('span');
+  label.className = 'voice-turn-status-label';
+  label.textContent = 'Couldn’t send';
+  const retryBtn = document.createElement('button');
+  retryBtn.type = 'button';
+  retryBtn.className = 'voice-turn-retry-btn';
+  retryBtn.textContent = 'Retry';
+  retryBtn.addEventListener('click', () => { removeVoiceTurnStatus(); onRetry(); });
+  const dismissBtn = document.createElement('button');
+  dismissBtn.type = 'button';
+  dismissBtn.className = 'voice-turn-dismiss-btn';
+  dismissBtn.title = 'Discard this recording';
+  dismissBtn.textContent = '✕';
+  dismissBtn.addEventListener('click', () => { removeVoiceTurnStatus(); onDismiss(); });
+  el.appendChild(label);
+  el.appendChild(retryBtn);
+  el.appendChild(dismissBtn);
+}
+
+// Ensures a bubble exists to attach the failed state to. Normally one
+// already does -- `turnTranscriptEl`, either from a caller-supplied
+// transcript or the `transcript` SSE event -- but a network-class failure on
+// the *initial* submission (never even reached the gateway) or a mid-stream
+// drop before `transcript` ever arrived leaves it null: STT never ran, so
+// there is no transcript to show. This still must not lose the recording
+// (#801's whole point), so a placeholder user bubble is created purely as an
+// anchor for the failed-state row and its Retry affordance -- never shown by
+// a successful turn (renderUserTranscript() already no-ops on empty text, so
+// this can't collide with the "no bubble on a transcript-less success" case,
+// #758/test_turn_without_a_transcript_renders_no_user_bubble).
+function ensureTurnBubble() {
+  if (turnTranscriptEl) return turnTranscriptEl;
+  turnTranscriptEl = addMessage('🎤 Voice message', 'user');
+  if (thinkingEl && thinkingEl.parentNode) {
+    thinkingEl.parentNode.appendChild(thinkingEl);
+  }
+  return turnTranscriptEl;
+}
+
 // --- SSE turn stream (ported from whisper-relay consumeTurnStream) ---
 function parseSseChunk(buffer, onEvent) {
   const lines = buffer.split('\n');
@@ -2128,7 +2236,17 @@ async function consumeTurnStream(response) {
       throw new DOMException('Turn cancelled', 'AbortError');
     }
     if (event.type === 'error') {
-      throw new Error(event.message || 'Turn failed');
+      // A definitive, server-reported failure -- whisper-relay's TurnPipeline
+      // (turns.py) always runs `registry.end(turn_id)` in its `finally`
+      // before yielding this, so the turn has already ended server-side.
+      // Tagged so submitTurn()'s catch (#801) treats this as a normal failed
+      // state, never a "mid-stream drop" needing the poll-for-completion
+      // dance below -- there's nothing ambiguous left to resolve, and a
+      // resubmit can never double-execute against a turn that's confirmed
+      // over.
+      const error = new Error(event.message || 'Turn failed');
+      error.voiceTurnDefinitive = true;
+      throw error;
     }
     if (event.type === 'status_audio') {
       if (event.message) setStatus('loading', event.message);  // spoken status text
@@ -2158,15 +2276,211 @@ async function consumeTurnStream(response) {
   return doneData;
 }
 
+// --- submission retry-with-backoff + mid-stream-drop recovery (#801) ---
+//
+// Scope: the retry ladder below covers ONLY the *initial* submission -- the
+// POST that starts a turn, before any SSE bytes have come back. Once that
+// response is `ok` and consumeTurnStream() starts reading, a failure is a
+// "mid-stream drop" instead (handled separately, below) -- deliberately
+// different semantics, because by then the turn may genuinely be running
+// server-side and a blind resubmit risks double-executing it.
+//
+// Retryable = "the request never reached a response":
+//   - fetch() itself rejecting -- offline, DNS failure, connection
+//     refused/reset, a timeout the browser surfaces as a bare TypeError.
+//     There is no HTTP status at all.
+//   - HTTP 502 from THIS repo's own proxy. Read `api/routes/voice.py`:
+//     `voice_proxy()` raises 502 from exactly one place --
+//     `except (httpx.RequestError, httpx.InvalidURL)` around the call that
+//     reaches the voice gateway -- i.e. only when the gateway itself could
+//     not be reached or timed out reaching it. A 502 here can therefore
+//     never mean a turn actually started server-side (the gateway never got
+//     the request), so it carries the same "never reached a response"
+//     guarantee a raw fetch rejection does.
+// Never retryable:
+//   - Any 4xx -- the request was rejected outright and won't get better
+//     (per the issue: "a rejected request won't get better").
+//   - Any OTHER 5xx (500, 503, 504, ...). Deliberate, not an oversight: none
+//     of them is proven to mean "never ran" the way this proxy's 502 is --
+//     `voice_turn_stream` (whisper-relay's route) always answers 200 and
+//     streams a `{"type":"error",...}` SSE event for its own internal
+//     failures (STT down, text backend unavailable), so an HTTP-level 5xx
+//     other than 502 isn't a path this code has confirmed is side-effect
+//     -free, and retrying blind against an unproven guarantee is exactly
+//     the double-execution risk this feature exists to avoid elsewhere.
+// An AbortError from the user's OWN cancel (activeTurnAbort) is handled by
+// the caller before this classification is ever consulted.
+// Test seam (#801): whether a recording is currently held for retry, without
+// exposing the blob itself -- lets a browser test assert directly that a
+// recording survived a failed submission, or was discarded on
+// cancel/dismiss/success, the same pattern isEndpointTapActive()/
+// isListenTapRunning() already use for their own internal state.
+export function hasHeldRecording() {
+  return !!heldRecording;
+}
+
+const SUBMIT_RETRY_DELAYS_MS = [1000, 3000, 9000];
+const SUBMIT_RETRY_JITTER = 0.2; // +/-20%, so concurrent retries don't sync up
+
+function isRetryableSubmitFailure(res) {
+  return res.status === 502;
+}
+
+function jitteredDelay(baseMs) {
+  const spread = baseMs * SUBMIT_RETRY_JITTER;
+  return baseMs + (Math.random() * 2 - 1) * spread;
+}
+
+// Resolves after a jittered backoff, or rejects with the same AbortError
+// shape cancelActiveTurn() already produces if `signal` fires first while
+// waiting -- a spoken/tapped cancel during a pending retry behaves exactly
+// like a cancel during the fetch itself (#801 interaction proof).
+function waitForRetry(baseMs, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(new DOMException('Turn cancelled', 'AbortError')); return; }
+    const timer = setTimeout(() => { cleanup(); resolve(); }, jitteredDelay(baseMs));
+    const onAbort = () => { cleanup(); reject(new DOMException('Turn cancelled', 'AbortError')); };
+    function cleanup() {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+    }
+    signal.addEventListener('abort', onAbort);
+  });
+}
+
+// POSTs the turn-start request, retrying network-class failures per the
+// policy above. Returns the (possibly non-ok, e.g. 4xx) Response for the
+// caller to interpret -- only a network-class failure that exhausts every
+// retry, or the user's own cancel, throws. Total attempts = 1 initial +
+// `SUBMIT_RETRY_DELAYS_MS.length` retries (4, at today's ladder).
+async function postTurnStart(form, signal) {
+  const maxRetries = SUBMIT_RETRY_DELAYS_MS.length;
+  for (let attempt = 0; ; attempt += 1) {
+    let res;
+    try {
+      res = await fetch(`${endpoints.voice}/turn/stream`, { method: 'POST', body: form, signal });
+    } catch (err) {
+      if (err?.name === 'AbortError') throw err; // user cancel -- never retried
+      if (attempt >= maxRetries) throw err; // network-class, retries exhausted
+      await backoffBeforeRetry(attempt, signal);
+      continue;
+    }
+    if (res.ok || !isRetryableSubmitFailure(res) || attempt >= maxRetries) return res;
+    await backoffBeforeRetry(attempt, signal);
+  }
+}
+
+async function backoffBeforeRetry(attempt, signal) {
+  const maxAttempts = SUBMIT_RETRY_DELAYS_MS.length + 1;
+  showRetryingStatus(attempt + 2, maxAttempts); // +2: 1-indexed, and this is the NEXT attempt
+  await waitForRetry(SUBMIT_RETRY_DELAYS_MS[attempt], signal); // throws AbortError on cancel
+}
+
+// #801 mid-stream drop: the initial POST succeeded and consumeTurnStream()
+// was reading real SSE frames when the connection died (a network error
+// mid-read, or the stream ending with no `done`/`error`/`cancelled` ever
+// seen -- see submitTurn()'s "Turn ended without a response" throw). Unlike
+// the initial-submission ladder above, this is deliberately NOT
+// auto-retried: the turn may still be running server-side, and blindly
+// resubmitting the same audio risks running it twice.
+//
+// Investigated before choosing this (read-only, whisper-relay's
+// `voice_gateway/`): `cancel.py`'s TurnRegistry only supports firing a
+// cancel by turn_id, never querying status; `storage.py.read_meta()` writes
+// a turn's full result (transcript, response_text, conversation_id) but has
+// no HTTP route exposing it. What IS exposed and does answer "did it
+// finish": `GET /api/voice/audio/{turn_id}` (`routes/voice.py`'s
+// `_serve_clip()`) -- 404s until `turns.py` writes the final TTS clip, which
+// only happens after the LLM reply is in hand, immediately before `done`.
+// So a 200 there is proof the turn actually completed, even though nothing
+// exposes the transcript/response text to redisplay -- a real gap, noted as
+// a follow-up in the PR report.
+//
+// Chosen semantics: poll that endpoint briefly (HEAD, no body download).
+// Found -> the turn completed; there is nothing left to retry, so the
+// recording is discarded and the recovered audio is offered via the
+// existing tap-to-replay affordance instead of a lost turn. Not found
+// within the window -> genuinely unknown, so no auto-retry (that could
+// double-execute); the recording stays held and Retry becomes an explicit,
+// user-initiated action, same as any other terminal failure.
+const MIDSTREAM_POLL_ATTEMPTS = 3;
+const MIDSTREAM_POLL_INTERVAL_MS = 1500;
+
+async function pollForCompletedAudio(turnId) {
+  for (let i = 0; i < MIDSTREAM_POLL_ATTEMPTS; i += 1) {
+    if (i > 0) await new Promise((r) => setTimeout(r, MIDSTREAM_POLL_INTERVAL_MS));
+    try {
+      const res = await fetch(`${endpoints.voice}/audio/${encodeURIComponent(turnId)}`, { method: 'HEAD' });
+      if (res.ok) return true;
+    } catch (e) {
+      /* unreachable -- keep polling within the budget, same as "not found yet" */
+    }
+  }
+  return false;
+}
+
+function recoverCompletedTurn(turnId) {
+  heldRecording = null; // confirmed complete server-side -- nothing left to retry
+  turnDone = true;
+  setStatus('', 'Ready');
+  const audioUrl = `${endpoints.voice}/audio/${encodeURIComponent(turnId)}`;
+  const el = addMessage(
+    'The connection dropped before the reply could be shown here, but it finished — tap to hear it.',
+    'assistant',
+  );
+  attachReplay(el, [audioUrl]);
+}
+
+function handleTerminalFailure(message) {
+  const bubble = ensureTurnBubble();
+  addMessage('⚠️ ' + message, 'assistant');
+  showFailedStatus(
+    () => {
+      const rec = heldRecording;
+      if (!rec) return;
+      submitTurn({ blob: rec.blob, mime: rec.mime, retryBubble: bubble });
+    },
+    () => { heldRecording = null; },
+  );
+}
+
+async function handleMidStreamDrop(err) {
+  const turnId = activeTurnId;
+  if (turnId) {
+    setStatus('loading', 'Reconnecting…');
+    if (await pollForCompletedAudio(turnId)) {
+      recoverCompletedTurn(turnId);
+      return;
+    }
+  }
+  setStatus('error', 'Error');
+  handleTerminalFailure(err?.message || 'Voice turn failed');
+}
+
 // Exported so the headless test harness can drive a turn without a real mic
-// (getUserMedia/MediaRecorder don't run headless).
-export async function submitTurn({ blob, mime, transcript } = {}) {
+// (getUserMedia/MediaRecorder don't run headless). `retryBubble` is internal
+// (#801) -- set only by the failed-state Retry button's own click handler
+// above, never by a real caller, so a retried turn reconciles into the SAME
+// bubble instead of submitTurn() resetting to null and letting
+// renderUserTranscript() create a second one.
+export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
   voiceBusy = true;
   state.isLoading = true;
   const mode = getBackendMode();
   setStatus('loading', mode === 'agent' ? 'Agent thinking…'
     : mode === 'hermes' ? 'Hermes thinking…' : 'Thinking…');
-  turnTranscriptEl = null;
+  removeVoiceTurnStatus();
+  if (retryBubble) {
+    turnTranscriptEl = retryBubble;
+  } else {
+    // A fresh (non-retry) turn supersedes whatever the last held
+    // recording/failed status was -- #801's "one held blob, replaced by the
+    // next recording, not an unbounded queue". Any earlier failed bubble the
+    // user never tapped Retry/dismiss on stays in the thread as history; it
+    // just loses the now-stale affordance along with removeVoiceTurnStatus()
+    // above, since its blob is about to be overwritten below.
+    turnTranscriptEl = null;
+  }
   turnDone = false;
   // A caller-supplied transcript needs no STT round trip, so it can go in the
   // thread immediately (#758); an audio turn's bubble lands on the relay's
@@ -2175,6 +2489,12 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
   showThinking();
   activeTurnId = null;
   activeTurnAbort = new AbortController();
+
+  // #801 -- hold the recording until the turn *definitively* completes (see
+  // `heldRecording`'s own comment). Set here, unconditionally, so a fresh
+  // recording AND a manual retry (which passes the same blob back in) both
+  // keep exactly one slot current.
+  if (blob) heldRecording = { blob, mime };
 
   const form = new FormData();
   if (blob) form.append('audio', blob, blobFilename(mime));
@@ -2202,15 +2522,19 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
     form.append('model_override', config.model);
   }
 
+  // #801 -- once the initial POST answers `ok` and the SSE stream starts
+  // being read, a failure switches from "retry the submission" to "mid-
+  // stream drop" semantics (see handleMidStreamDrop()'s own comment for
+  // why they differ).
+  let turnAccepted = false;
   try {
-    const res = await fetch(`${endpoints.voice}/turn/stream`, {
-      method: 'POST', body: form, signal: activeTurnAbort.signal,
-    });
+    const res = await postTurnStart(form, activeTurnAbort.signal);
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
       clearThinking();
       throw new Error(data.detail || `Request failed (${res.status})`);
     }
+    turnAccepted = true;
 
     const data = await consumeTurnStream(res);
     if (!data) {
@@ -2241,6 +2565,7 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
     }
     clearThinking();
     turnDone = true;
+    heldRecording = null; // #801 -- the turn reached the server and completed; nothing to retry
     // `done` is authoritative — reconciles the bubble the `transcript` event
     // already rendered, or renders it if that event never arrived.
     renderUserTranscript(data.transcript);
@@ -2258,8 +2583,18 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
     if (err?.name === 'AbortError') return;  // cancelled — the cancel handler resets UI
     clearThinking();
     showCancel(false);
-    setStatus('error', 'Error');
-    addMessage('⚠️ ' + (err?.message || 'Voice turn failed'), 'assistant');
+    // #801 -- a mid-stream drop (the SSE stream died after a genuine `ok`
+    // response, and this wasn't a definitive server-reported error) gets the
+    // poll-then-explicit-retry-only treatment; every other failure (the
+    // initial submission never got a usable response at all, or the server
+    // told us definitively it failed) goes straight to the ordinary
+    // failed+Retry state.
+    if (turnAccepted && !err?.voiceTurnDefinitive) {
+      await handleMidStreamDrop(err);
+    } else {
+      setStatus('error', 'Error');
+      handleTerminalFailure(err?.message || 'Voice turn failed');
+    }
   } finally {
     activeTurnId = null;
     activeTurnAbort = null;
@@ -2290,6 +2625,14 @@ export function cancelActiveTurn() {
   // see submitTurn()'s `await playbackChain`) -- that bubble is the
   // authoritative, already-persisted transcript, so leave it alone then.
   if (!turnDone) clearUserTranscript();
+  // #801 -- an explicit cancel is one of the three discard triggers
+  // (success, cancel, explicit dismiss) for the held recording, and clears
+  // any retrying/failed status row along with it. Already null/absent by
+  // the time a turn has reached `done` (cleared on success; stop-playback
+  // cancel never has anything left to discard), so this is a no-op on that
+  // path rather than a special case.
+  heldRecording = null;
+  removeVoiceTurnStatus();
   activeTurnId = null;
   activeTurnAbort = null;
   voiceBusy = false;
