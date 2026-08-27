@@ -80,6 +80,10 @@ config/gdoc_sync.yaml
 # Launchd plist files (use .plist.template to create)
 config/launchd/*.plist
 !config/launchd/*.plist.template
+# setup-launchd.sh's install_plist() backs up a differing pre-existing
+# plist here before replacing it (config/launchd/*.plist above matches
+# neither this subdirectory nor its timestamped filenames).
+config/launchd/backups/
 
 # =============================================================================
 # INTERNAL DOCUMENTATION (personal notes for AI agents)

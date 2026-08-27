@@ -54,13 +54,17 @@ def _run_sourced(repo: Path, call: str, env_extra: dict | None = None) -> subpro
     """Source auto-update-macos.sh (defines functions only) then run `call`.
     cwd=repo so PROJECT_DIR-relative operations see the synthetic repo.
 
-    LIFEOS_SYNC_LOCK defaults to a path under the synthetic repo (#793's
-    lock is host-wide under $HOME by default — found on review — so tests
-    must opt back into isolation explicitly rather than touching the real
-    machine's actual lock file)."""
+    SYNC_LOCK_FILE is fixed at `$HOME/.lifeos/sync.lock` (not configurable
+    via an env var — see the script's own comment for why: run_all_syncs.py
+    alone reads .env, so an override would silently split-brain the sync
+    and this script onto two different lock files) — so isolation from the
+    real machine's actual lock file means pointing $HOME at a directory
+    under the synthetic repo instead."""
     script = repo / "scripts" / "auto-update-macos.sh"
+    fake_home = repo / "home"
+    fake_home.mkdir(exist_ok=True)
     env = dict(os.environ)
-    env["LIFEOS_SYNC_LOCK"] = str(repo / "data" / "sync.lock")
+    env["HOME"] = str(fake_home)
     env.update(env_extra or {})
     return subprocess.run(
         ["bash", "-c", f'source "{script}" && {call}'],
@@ -112,11 +116,20 @@ def test_auto_update_macos_is_executable():
     """Found on review: committed as mode 100644 — the script's own header
     tells an operator to add it to their crontab by path, which fails with
     'Permission denied' on a non-executable file. Same check as
-    test_launchd_env_wrapper.py's test_wrapper_is_executable."""
+    test_launchd_env_wrapper.py's test_wrapper_is_executable.
+
+    Checks the git INDEX mode, not the working-tree file's stat() bit
+    (found on re-review) — the original bug was a bad index entry
+    (100644), and a local `chmod +x` on the working-tree copy alone would
+    make this test pass while a fresh `git clone` on another machine still
+    got a non-executable file."""
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
-    mode = AUTO_UPDATE_MACOS.stat().st_mode
-    assert mode & stat.S_IXUSR
+    ls_files = subprocess.run(
+        ["git", "ls-files", "-s", "--", str(AUTO_UPDATE_MACOS)],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    ).stdout
+    assert ls_files.startswith("100755"), f"git index mode is not 100755: {ls_files!r}"
 
 
 @pytest.mark.unit
@@ -262,8 +275,10 @@ def test_lock_acquire_defers_while_a_sync_holds_the_shared_lock(tmp_path: Path):
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo = _make_repo_for_macos(tmp_path)
-    (repo / "data").mkdir(exist_ok=True)
-    lock_path = repo / "data" / "sync.lock"
+    # Matches _run_sourced()'s fake $HOME/.lifeos/sync.lock — the fixed
+    # (not env-overridable) formula the script itself resolves.
+    lock_path = repo / "home" / ".lifeos" / "sync.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     holder = _start_shared_lock_holder(lock_path, seconds=5)
     try:
         _wait_until_lock_held(lock_path)
@@ -281,10 +296,16 @@ def test_lock_acquire_defers_when_another_instance_of_this_script_holds_it(tmp_p
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo = _make_repo_for_macos(tmp_path)
-    (repo / "data").mkdir(exist_ok=True)
-    lock_path = repo / "data" / "sync.lock"
+    fake_home = repo / "home"
+    lock_path = fake_home / ".lifeos" / "sync.lock"
+    # Pre-created (rather than left to the holder's own mkdir -p, which
+    # runs inside the sourced script) so _wait_until_lock_held's flock
+    # probe can't fail with "No such file or directory" — a missing-dir
+    # error also has a non-zero exit code, which would otherwise be
+    # misread as "someone else holds it" before the holder actually has.
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     holder_env = dict(os.environ)
-    holder_env["LIFEOS_SYNC_LOCK"] = str(lock_path)
+    holder_env["HOME"] = str(fake_home)
     holder = subprocess.Popen(
         ["bash", "-c",
          f'source "{repo / "scripts" / "auto-update-macos.sh"}" && '
@@ -715,8 +736,10 @@ def _run_main_macos(
         'api_pid() { echo ""; }; '
         'curl() { return 0; }; '
     )
+    fake_home = repo / "home"
+    fake_home.mkdir(exist_ok=True)
     env = dict(os.environ)
-    env["LIFEOS_SYNC_LOCK"] = str(repo / "data" / "sync.lock")
+    env["HOME"] = str(fake_home)
     env.update(env_extra or {})
     return subprocess.run(
         ["bash", "-c", f'source scripts/auto-update-macos.sh && {quiet_stubs}{extra_stubs} main'],
@@ -741,7 +764,9 @@ def test_main_skips_when_sync_lock_is_held(tmp_path: Path):
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo, _origin, code_epoch = _make_policy_repo_macos(tmp_path)
-    lock_path = repo / "data" / "sync.lock"
+    # Matches _run_main_macos()'s fake $HOME/.lifeos/sync.lock.
+    lock_path = repo / "home" / ".lifeos" / "sync.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     holder = _start_shared_lock_holder(lock_path, seconds=5)
     try:
         _wait_until_lock_held(lock_path)
@@ -806,9 +831,11 @@ def test_main_lock_is_released_when_api_service_not_running(tmp_path: Path):
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo, _origin, _code_epoch = _make_policy_repo_macos(tmp_path)
-    lock_path = repo / "data" / "sync.lock"
+    fake_home = repo / "home"
+    fake_home.mkdir(exist_ok=True)
+    lock_path = fake_home / ".lifeos" / "sync.lock"
     env = dict(os.environ)
-    env["LIFEOS_SYNC_LOCK"] = str(lock_path)
+    env["HOME"] = str(fake_home)
     result = subprocess.run(
         ["bash", "-c",
          'source scripts/auto-update-macos.sh && '
@@ -839,6 +866,31 @@ def test_main_no_restart_when_service_started_after_code_and_env(tmp_path: Path)
     log_path = repo / "logs" / "auto-update-macos.log"
     log = log_path.read_text() if log_path.exists() else ""
     assert "drift detected" not in log
+
+
+@pytest.mark.unit
+def test_main_does_not_scan_the_vault_on_a_no_op_tick(tmp_path: Path):
+    """Found on re-review: health_check_timeout() (which recursively walks
+    the whole vault via `find`) used to be computed unconditionally near
+    the top of main(), on every tick — including this one, where nothing
+    is stale and no restart happens. On a real host that keeps a
+    possibly-sleeping external disk spinning every cron tick for no
+    reason. It must only run once STALE is known true, right before the
+    first restart attempt."""
+    if not AUTO_UPDATE_MACOS.exists():
+        pytest.skip("scripts/auto-update-macos.sh not present")
+    repo, _origin, code_epoch = _make_policy_repo_macos(tmp_path)
+    active_since = code_epoch + 100
+    os.utime(repo / ".env", (active_since - 50, active_since - 50))
+    marker = repo / "health_timeout_called"
+    result = _run_main_macos(
+        repo, active_since=active_since,
+        extra_stubs=f'health_check_timeout() {{ echo called >> {str(marker)!r}; echo 60; }}; ',
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    log = (repo / "logs" / "auto-update-macos.log").read_text()
+    assert "drift detected" not in log
+    assert not marker.exists(), "health_check_timeout() ran on a no-op tick"
 
 
 @pytest.mark.unit

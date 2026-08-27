@@ -13,7 +13,6 @@ important test proves that does not happen.
 """
 from __future__ import annotations
 
-import stat
 import subprocess
 from pathlib import Path
 
@@ -150,7 +149,15 @@ def test_wrapper_usage_error_with_fewer_than_two_args(tmp_path: Path):
 
 @pytest.mark.unit
 def test_wrapper_is_executable():
+    """Checks the git INDEX mode, not the working-tree file's stat() bit
+    (found on re-review of an equivalent test in test_auto_update_macos.py)
+    — a local `chmod +x` on the working-tree copy alone would pass this
+    check while a fresh `git clone` on another machine still got whatever
+    mode is actually committed."""
     if not WRAPPER.exists():
         pytest.skip("scripts/launchd-env-wrapper.sh not present")
-    mode = WRAPPER.stat().st_mode
-    assert mode & stat.S_IXUSR
+    ls_files = subprocess.run(
+        ["git", "ls-files", "-s", "--", str(WRAPPER)],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    ).stdout
+    assert ls_files.startswith("100755"), f"git index mode is not 100755: {ls_files!r}"

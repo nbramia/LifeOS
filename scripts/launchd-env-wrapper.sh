@@ -59,11 +59,17 @@ if [ -f "$PROJECT_DIR/.env" ]; then
             # a stale/incorrect .env value silently override one launchd
             # already set via the plist's own EnvironmentVariables dict
             # (e.g. LIFEOS_VAULT_PATH, validated at install time by
-            # setup-launchd.sh's check_paths_exist()). This matches
-            # systemd's EnvironmentFile=, which likewise never overrides a
-            # variable already set at the [Service] level (Environment=).
-            # `${!key+x}` (indirect expansion) tests whether $key is set at
-            # all, regardless of whether its value is empty.
+            # setup-launchd.sh's check_paths_exist()). A value baked into
+            # the plist was deliberately set for this specific service
+            # install and already passed that validation, so a plain .env
+            # read must not be able to silently override it — this is NOT
+            # claiming parity with systemd's own precedence (systemd's
+            # documented order is actually the reverse of what an earlier
+            # version of this comment said: when both are given,
+            # EnvironmentFile= overrides Environment=, not the other way
+            # around; corrected on re-review). `${!key+x}` (indirect
+            # expansion) tests whether $key is set at all, regardless of
+            # whether its value is empty.
             if [ -z "${!key+x}" ]; then
                 export "$key=$val"
             fi

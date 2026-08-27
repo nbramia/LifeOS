@@ -1452,14 +1452,14 @@ class TestSyncLock:
         """Found on review: a lock keyed to this file's own checkout
         location is invisible to a deploy check running from a DIFFERENT
         git worktree (this repo is routinely worked in several). The
-        module-level default must live under $HOME, not this file's own
-        parent directory."""
-        import os as _os
+        module-level constant must be a fixed path under $HOME, not this
+        file's own parent directory — and not configurable via an env var
+        (found on re-review: this module alone reads .env, so an override
+        set there would silently diverge from auto-deploy.sh's and
+        auto-update-macos.sh's fixed path, which only see process env)."""
+        from pathlib import Path as _Path
         from scripts import run_all_syncs
 
-        if "LIFEOS_SYNC_LOCK" in _os.environ:
-            pytest.skip("LIFEOS_SYNC_LOCK is set in this environment")
-        from pathlib import Path as _Path
         assert run_all_syncs.SYNC_LOCK_PATH == _Path.home() / ".lifeos" / "sync.lock"
 
     def test_acquire_sync_lock_retries_while_contended_then_succeeds(self, tmp_path):

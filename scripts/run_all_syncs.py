@@ -32,7 +32,6 @@ import argparse
 import fcntl
 import json
 import logging
-import os
 import re
 import signal
 import subprocess
@@ -351,9 +350,17 @@ _llm_was_running_before_sync: bool = False
 # location would be invisible to auto-deploy.sh running from a DIFFERENT
 # checkout, which would then restart services on top of a sync it can't see
 # — exactly the OOM host-freeze this whole mechanism exists to prevent.
-# Overridable via LIFEOS_SYNC_LOCK, matching auto-deploy.sh's and
-# auto-update-macos.sh's identical override for the same path.
-SYNC_LOCK_PATH = Path(os.environ.get("LIFEOS_SYNC_LOCK", str(Path.home() / ".lifeos" / "sync.lock")))
+#
+# Deliberately not overridable via an env var (found on re-review): this
+# module loads .env with override=True, so a LIFEOS_SYNC_LOCK set there
+# would apply here but NOT to auto-deploy.sh/auto-update-macos.sh, which
+# only see process env and never source .env themselves — an operator
+# setting it in .env (where every other flag these scripts read lives)
+# would silently split the sync and the deploy gate onto two different
+# lock files, recreating the exact split-brain this fixed host-wide path
+# exists to prevent. Tests isolate this path by patching the constant
+# directly (see the module docstring above), never via an env var.
+SYNC_LOCK_PATH = Path.home() / ".lifeos" / "sync.lock"
 
 # Kept open for the process's entire lifetime once acquired — the lock lives
 # on this file descriptor, not in any content written to the file. Module

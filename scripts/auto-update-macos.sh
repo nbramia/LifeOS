@@ -57,8 +57,11 @@ ENV_MTIME_APPLIED_FILE="${LIFEOS_MACOS_ENV_APPLIED_FILE:-$PROJECT_DIR/data/macos
 # scripts/auto-deploy.sh — see sync_in_progress_lock_acquire() below.
 # Host-wide (under $HOME, not $PROJECT_DIR/data) — same path auto-deploy.sh
 # uses, and for the same reason: a sync launched from a different checkout
-# of this repo must still be visible here. Overridable via LIFEOS_SYNC_LOCK.
-SYNC_LOCK_FILE="${LIFEOS_SYNC_LOCK:-$HOME/.lifeos/sync.lock}"
+# of this repo must still be visible here. Deliberately not overridable via
+# an env var (found on re-review) — see auto-deploy.sh's identical comment
+# on SYNC_LOCK_FILE for why an override would silently split-brain against
+# run_all_syncs.py's own .env-driven lock path.
+SYNC_LOCK_FILE="$HOME/.lifeos/sync.lock"
 # Non-interactive git over SSH: fail fast instead of prompting for a passphrase.
 export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new'
 
@@ -376,12 +379,14 @@ wait_for_health() {
 # Captures the outgoing process's pid BEFORE calling unload — see
 # wait_for_pid_gone()'s comment for why the poll must target that specific
 # pid rather than re-querying `launchctl list` after unload runs. Takes the
-# health-check timeout as a parameter, computed once by main() BEFORE the
-# sync lock is acquired (found on review: health_check_timeout() scans the
-# whole vault via `find`, which can take real time on a large one — running
-# that scan while holding the exclusive lock made a slow vault also make a
-# waiting sync wait longer than necessary for no reason, since the scan
-# itself touches nothing the lock protects).
+# health-check timeout as a parameter, computed once by main() right before
+# the first restart attempt — after STALE is known true and outside the
+# lock's critical section (found on review: health_check_timeout() scans
+# the whole vault via `find`; computing it unconditionally on every tick
+# kept a possibly-sleeping external disk spinning even on the common
+# nothing-to-do path, and computing it while holding the exclusive lock
+# made a slow vault also make a waiting sync wait longer than necessary for
+# no reason, since the scan itself touches nothing the lock protects).
 restart_cycle() {
     local health_timeout="$1"
     local old_pid
@@ -404,11 +409,6 @@ case "$(_read_env "LIFEOS_AUTODEPLOY_ENABLED" "false" | tr '[:upper:]' '[:lower:
     true|1|yes) ;;
     *) exit 0 ;;
 esac
-
-# Computed before the sync lock is acquired below — see restart_cycle()'s
-# comment for why this (a `find` scan of the whole vault) must not run
-# while holding the exclusive lock.
-HEALTH_TIMEOUT=$(health_check_timeout)
 
 # --- Defer while the nightly sync is running (or another instance of this
 # script is already mid-restart) --------------------------------------------
@@ -481,6 +481,9 @@ if [ "$STALE" != true ]; then
 fi
 
 log "drift detected (code/.env changed since $PLIST_NAME started) — restarting"
+# Computed only now (STALE is true) and outside the lock's critical
+# section — see restart_cycle()'s comment above for why.
+HEALTH_TIMEOUT=$(health_check_timeout)
 if restart_cycle "$HEALTH_TIMEOUT"; then
     mark_env_mtime_applied
     log "restart OK, health confirmed"

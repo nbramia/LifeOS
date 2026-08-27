@@ -45,9 +45,13 @@ VENV_DIR="${LIFEOS_VENV:-$HOME/.venvs/lifeos}"
 # sync, exactly the OOM host-freeze this whole mechanism exists to prevent.
 # One shared path under $HOME is visible to every checkout on the host, the
 # same way the old pgrep-based check was (host-wide by construction, for
-# all its other faults). Overridable via LIFEOS_SYNC_LOCK for anything
-# unusual (containers, multiple LifeOS installs under one user).
-SYNC_LOCK_FILE="${LIFEOS_SYNC_LOCK:-$HOME/.lifeos/sync.lock}"
+# all its other faults). Deliberately not overridable via an env var (found
+# on re-review): run_all_syncs.py loads .env with override=True, so a
+# LIFEOS_SYNC_LOCK set there would apply to the sync but not to this
+# script, which only sees process env — the sync and this script's deploy
+# gate would silently lock two different files, recreating the exact
+# split-brain this fixed-host-wide-path change exists to prevent.
+SYNC_LOCK_FILE="$HOME/.lifeos/sync.lock"
 # Non-interactive git over SSH: fail fast instead of prompting for a passphrase.
 export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new'
 
@@ -171,6 +175,11 @@ env_stale_for_unit() {
 # future-dated; combined with a future one, an unwritten marker reopens the
 # very restart-loop this mechanism exists to close. On a write failure this
 # logs an ERROR instead and leaves no marker at all, rather than a corrupt one.
+# Known remaining gap (noted on re-review, pre-dates this branch): a
+# future-dated .env combined with a persistently unwritable data/ still
+# restarts every tick forever — two simultaneous faults, each one logging
+# an ERROR, so it's loud rather than silent, but not the one-shot restart
+# the single-fault case above gets.
 mark_env_mtime_applied() {
     [ -n "$ENV_MTIME" ] || return 0
     mkdir -p "$PROJECT_DIR/data"

@@ -230,15 +230,20 @@ def _run_sourced(repo: Path, call: str, env_extra: dict | None = None) -> subpro
     then run `call`. cwd=repo so PROJECT_DIR-relative git/file operations
     inside the helpers see the synthetic repo, not the real one.
 
-    LIFEOS_SYNC_LOCK defaults to a path under the synthetic repo (#793's
-    lock is host-wide under $HOME by default — found on review — so tests
-    must opt back into isolation explicitly rather than touching the real
-    machine's actual lock file). A test that specifically exercises the
-    real cross-checkout default (host-wide, not overridden) passes its own
-    env_extra without this key, or unsets it."""
+    SYNC_LOCK_FILE is fixed at `$HOME/.lifeos/sync.lock` (found on
+    re-review: an env-var override would let a `.env`-set path silently
+    diverge from run_all_syncs.py's own lock, since that script alone
+    reads .env) — so isolation from the real machine's actual lock file
+    means pointing $HOME itself at a directory under the synthetic repo,
+    the same technique test_lock_is_visible_across_two_different_checkouts_
+    sharing_home already uses to prove the real default formula, not a
+    test-only escape hatch. A test that specifically wants the process's
+    real $HOME passes its own env_extra with that key set back."""
     script = repo / "scripts" / "auto-deploy.sh"
+    fake_home = repo / "home"
+    fake_home.mkdir(exist_ok=True)
     env = dict(os.environ)
-    env["LIFEOS_SYNC_LOCK"] = str(repo / "data" / "sync.lock")
+    env["HOME"] = str(fake_home)
     env.update(env_extra or {})
     return subprocess.run(
         ["bash", "-c", f'source "{script}" && {call}'],
@@ -573,8 +578,9 @@ def test_lock_acquire_defers_while_a_sync_holds_the_shared_lock(tmp_path: Path):
     if not AUTO_DEPLOY.exists():
         pytest.skip("scripts/auto-deploy.sh not present")
     repo = _make_repo_for_drift(tmp_path)
-    (repo / "data").mkdir(exist_ok=True)
-    lock_path = repo / "data" / "sync.lock"
+    # Matches _run_sourced()'s fake $HOME/.lifeos/sync.lock.
+    lock_path = repo / "home" / ".lifeos" / "sync.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     holder = _start_shared_lock_holder(lock_path, seconds=5)
     try:
         _wait_until_lock_held(lock_path)
@@ -594,8 +600,9 @@ def test_lock_released_immediately_when_holder_is_sigkilled(tmp_path: Path):
     if not AUTO_DEPLOY.exists():
         pytest.skip("scripts/auto-deploy.sh not present")
     repo = _make_repo_for_drift(tmp_path)
-    (repo / "data").mkdir(exist_ok=True)
-    lock_path = repo / "data" / "sync.lock"
+    # Matches _run_sourced()'s fake $HOME/.lifeos/sync.lock.
+    lock_path = repo / "home" / ".lifeos" / "sync.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     holder = _start_shared_lock_holder(lock_path, seconds=30)
     try:
         _wait_until_lock_held(lock_path)
@@ -636,8 +643,9 @@ def test_two_overlapping_syncs_are_both_recognized_as_in_progress(tmp_path: Path
     if not AUTO_DEPLOY.exists():
         pytest.skip("scripts/auto-deploy.sh not present")
     repo = _make_repo_for_drift(tmp_path)
-    (repo / "data").mkdir(exist_ok=True)
-    lock_path = repo / "data" / "sync.lock"
+    # Matches _run_sourced()'s fake $HOME/.lifeos/sync.lock.
+    lock_path = repo / "home" / ".lifeos" / "sync.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     a = _start_shared_lock_holder(lock_path, seconds=5)
     b = _start_shared_lock_holder(lock_path, seconds=5)
     try:
@@ -663,12 +671,12 @@ def test_lock_is_visible_across_two_different_checkouts_sharing_home(tmp_path: P
     worktrees, each with its own checkout-local data/ directory, so a lock
     keyed to PROJECT_DIR is invisible across checkouts. A sync launched
     from checkout B must still defer a deploy running from checkout A.
-    Two independent synthetic checkouts share $HOME (so the real default
-    $HOME/.lifeos/sync.lock path — deliberately NOT overridden via
-    LIFEOS_SYNC_LOCK here — resolves identically for both) but each has
-    its own PROJECT_DIR, proving cross-checkout visibility without
-    touching the real machine's actual lock file (HOME points at an
-    isolated sandbox for the duration of this test)."""
+    Two independent synthetic checkouts share $HOME (so the fixed
+    $HOME/.lifeos/sync.lock path — not configurable, per Finding NEW-2 —
+    resolves identically for both) but each has its own PROJECT_DIR,
+    proving cross-checkout visibility without touching the real machine's
+    actual lock file (HOME points at an isolated sandbox for the duration
+    of this test)."""
     if not AUTO_DEPLOY.exists():
         pytest.skip("scripts/auto-deploy.sh not present")
     shared_home = tmp_path / "home"
@@ -681,8 +689,6 @@ def test_lock_is_visible_across_two_different_checkouts_sharing_home(tmp_path: P
 
     env = dict(os.environ)
     env["HOME"] = str(shared_home)
-    # Deliberately no LIFEOS_SYNC_LOCK override — exercising the real
-    # default path, not test isolation.
 
     holder = _start_shared_lock_holder(default_lock_path, seconds=5)
     try:
@@ -966,8 +972,11 @@ def _run_main(repo: Path, state: Path, venv: Path, env_extra: dict | None = None
     env["LIFEOS_VENV"] = str(venv)
     env["LIFEOS_AGENT_SESSIONS_DB"] = str(repo / "data" / "agent_sessions.db")
     env["PYTHONPATH"] = str(REPO_ROOT)
-    # Isolated by default — see _run_sourced()'s comment on LIFEOS_SYNC_LOCK.
-    env["LIFEOS_SYNC_LOCK"] = str(repo / "data" / "sync.lock")
+    # Isolated by default — see _run_sourced()'s comment on why this is a
+    # $HOME override, not a sync-lock-specific one.
+    fake_home = repo / "home"
+    fake_home.mkdir(exist_ok=True)
+    env["HOME"] = str(fake_home)
     env.update(env_extra or {})
     return subprocess.run(
         ["bash", "-c", "source scripts/auto-deploy.sh && main"],
@@ -1205,7 +1214,8 @@ def test_main_lock_is_released_on_an_early_exit_after_acquisition(tmp_path: Path
     deploy_log = (repo / "logs" / "auto-deploy.log").read_text()
     assert "not main" in deploy_log, deploy_log
 
-    lock_path = repo / "data" / "sync.lock"
+    # Matches _run_main()'s fake $HOME/.lifeos/sync.lock.
+    lock_path = repo / "home" / ".lifeos" / "sync.lock"
     assert lock_path.exists()
     probe = subprocess.run(["flock", "-x", "-n", str(lock_path), "-c", "true"])
     assert probe.returncode == 0, "lock was left held after an early exit"
