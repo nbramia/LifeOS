@@ -10,6 +10,7 @@ Key changes from PersonRecord:
 """
 import json
 import logging
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -1188,24 +1189,75 @@ def _load_family_config():
     return set(), set(), set()
 
 
+def _normalize_family_name(value: str) -> str:
+    """Lowercase and remove all whitespace so equivalent spellings of the
+    same name (e.g. "Van Buren" vs "VanBuren", or differing amounts of
+    internal spacing) compare equal across data sources."""
+    return re.sub(r"\s+", "", value.lower().strip())
+
+
 FAMILY_LAST_NAMES, FAMILY_EXACT_NAMES, FAMILY_PERSON_IDS = _load_family_config()
+
+
+def _check_family_config_coverage(last_names: set, exact_names: set) -> None:
+    """Warn about any configured family last name/exact name that matches
+    zero indexed people, so a typo or spelling mismatch surfaces
+    immediately instead of requiring a manual audit."""
+    if not last_names and not exact_names:
+        return
+    try:
+        people = get_person_entity_store().get_all(include_hidden=True, include_merged=True)
+    except Exception as e:
+        logger.warning(f"Could not verify family config coverage: {e}")
+        return
+
+    all_suffixes = set()
+    all_full_names = set()
+    for person in people:
+        for candidate in (person.canonical_name, person.display_name, *person.aliases):
+            if not candidate:
+                continue
+            name_parts = candidate.lower().strip().split()
+            if not name_parts:
+                continue
+            all_full_names.add("".join(name_parts))
+            for i in range(len(name_parts)):
+                all_suffixes.add("".join(name_parts[i:]))
+
+    for name in last_names:
+        if _normalize_family_name(name) not in all_suffixes:
+            logger.warning(f"Configured family last name matched zero indexed people: {name!r}")
+    for name in exact_names:
+        if _normalize_family_name(name) not in all_full_names:
+            logger.warning(f"Configured family exact name matched zero indexed people: {name!r}")
+
+
+_check_family_config_coverage(FAMILY_LAST_NAMES, FAMILY_EXACT_NAMES)
 
 
 def _is_family_member(name: str) -> bool:
     """Check if a name matches family criteria."""
     if not name:
         return False
-    name_lower = name.lower().strip()
+    name_parts = name.lower().strip().split()
+    if not name_parts:
+        return False
 
-    # Check exact name match
-    if name_lower in FAMILY_EXACT_NAMES:
+    # Normalized on every call (rather than cached at import time) so that
+    # FAMILY_LAST_NAMES/FAMILY_EXACT_NAMES can still be reloaded or
+    # monkeypatched at runtime, as existing callers already rely on.
+    normalized_exact_names = {_normalize_family_name(n) for n in FAMILY_EXACT_NAMES}
+    normalized_last_names = {_normalize_family_name(n) for n in FAMILY_LAST_NAMES}
+
+    # Check exact name match (whitespace/case-insensitive)
+    if "".join(name_parts) in normalized_exact_names:
         return True
 
-    # Check last name match
-    name_parts = name_lower.split()
-    if name_parts:
-        last_name = name_parts[-1]
-        if last_name in FAMILY_LAST_NAMES:
+    # Check last name match against every trailing word sequence, so a
+    # compound (multi-word) configured surname matches the person's full
+    # surname rather than only the final whitespace-split token.
+    for i in range(len(name_parts)):
+        if "".join(name_parts[i:]) in normalized_last_names:
             return True
 
     return False
