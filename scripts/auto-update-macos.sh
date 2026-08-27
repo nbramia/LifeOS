@@ -49,11 +49,13 @@ LOG_FILE="$PROJECT_DIR/logs/auto-update-macos.log"
 ENV_FILE="$PROJECT_DIR/.env"
 PLIST_NAME="com.lifeos.api"
 PLIST_PATH="${LIFEOS_PLIST_PATH:-$HOME/Library/LaunchAgents/$PLIST_NAME.plist}"
-# Where this script records the last time IT restarted the service — launchd
-# has no equivalent of systemd's ActiveEnterTimestamp, so (unlike
-# auto-deploy.sh, which reads the unit's own start time) this script tracks
-# its own restarts instead.
-LAST_RESTART_MARKER="${LIFEOS_MACOS_RESTART_MARKER:-$PROJECT_DIR/data/macos-autoupdate-last-restart}"
+# Where this script records which ENV_MTIME value was last actually applied
+# via a restart — see env_stale()/mark_env_mtime_applied() below (#792
+# follow-up: a future-dated mtime must restart at most once, not forever).
+ENV_MTIME_APPLIED_FILE="${LIFEOS_MACOS_ENV_APPLIED_FILE:-$PROJECT_DIR/data/macos-env-mtime-applied}"
+# Advisory lock shared with scripts/run_all_syncs.py (#793) and
+# scripts/auto-deploy.sh — see sync_in_progress_lock_acquire() below.
+SYNC_LOCK_FILE="$PROJECT_DIR/data/sync.lock"
 # Non-interactive git over SSH: fail fast instead of prompting for a passphrase.
 export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new'
 
@@ -107,27 +109,6 @@ env_file_mtime() {
     _file_mtime "$ENV_FILE"
 }
 
-last_restart_epoch() {
-    [ -f "$LAST_RESTART_MARKER" ] || return 1
-    _file_mtime "$LAST_RESTART_MARKER"
-}
-
-mark_restarted() {
-    mkdir -p "$(dirname "$LAST_RESTART_MARKER")"
-    : > "$LAST_RESTART_MARKER"
-}
-
-# --- Sync-in-progress defer (reuses #793's marker) --------------------------
-# No systemd unit to check on macOS — just the pid marker
-# scripts/run_all_syncs.py writes/removes around a real run.
-sync_marker_in_progress() {
-    local marker="$PROJECT_DIR/data/sync_in_progress.pid"
-    [ -f "$marker" ] || return 1
-    local pid
-    pid=$(cat "$marker" 2>/dev/null)
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
-}
-
 # --- launchd primitives ------------------------------------------------------
 
 # Current PID of the running service (columnar `launchctl list` output —
@@ -137,18 +118,107 @@ api_pid() {
     launchctl list 2>/dev/null | awk -v label="$PLIST_NAME" '$3 == label { print $1 }'
 }
 
-# Poll until the previous instance's PID is actually gone (empty or "-"),
-# up to $1 seconds. Returns 0 once torn down, 1 on timeout (caller proceeds
-# anyway and logs a warning — better to try starting than to hang forever).
-wait_for_teardown() {
-    local timeout="${1:-30}" waited=0 pid
-    while true; do
-        pid=$(api_pid)
-        { [ -z "$pid" ] || [ "$pid" = "-" ]; } && return 0
+# Real wall-clock time the currently-running API process actually started,
+# queried from the OS itself — return 1 (unknown) if the service isn't
+# running. launchd exposes no equivalent of systemd's ActiveEnterTimestamp
+# (see auto-deploy.sh's service_active_since_epoch), but `ps -o lstart=`
+# reports a process's real start time on both macOS (the actual target) and
+# Linux (where this is developed/tested under bash), giving the same
+# ground-truth comparison auto-deploy.sh uses for CODE_MTIME.
+#
+# This replaced an earlier design that tracked its OWN last-restart time in
+# a marker file — found on review to have a first-run bug: on the very
+# first opted-in run, a pull could update code on disk, and that marker
+# would be written as "already restarted" (main() established it as a
+# no-op baseline) without the still-running, still-old-code process ever
+# actually being restarted, silently leaving stale code running
+# indefinitely. Comparing against the process's real start time has no
+# such bootstrap gap — it's accurate from the very first run, because it
+# never depends on this script's own history.
+api_active_since_epoch() {
+    local pid ps_out
+    pid=$(api_pid) || return 1
+    [ -n "$pid" ] && [ "$pid" != "-" ] || return 1
+    ps_out=$(ps -p "$pid" -o lstart= 2>/dev/null) || return 1
+    [ -n "$ps_out" ] || return 1
+    date -d "$ps_out" +%s 2>/dev/null || date -j -f "%a %b %e %T %Y" "$ps_out" +%s 2>/dev/null
+}
+
+# Is the running API service stale with respect to .env? Compares the exact
+# ENV_MTIME VALUE last actually applied via a restart (not wall-clock times)
+# against the current value — found on review: comparing $active_since
+# against $ENV_MTIME directly breaks if ENV_MTIME is ever in the future
+# (clock skew, `rsync -t`, a bad manual `touch`), since active_since stays
+# "before" a future mtime forever, restarting the service on every tick
+# indefinitely. Falls back to the original active_since comparison only
+# when no applied-marker exists yet, so behavior for an already-configured
+# install is unchanged unless/until that fallback path restarts once — at
+# which point the marker takes over and the same edit can never trigger a
+# second restart no matter what the clock does afterward.
+env_stale() {
+    local active_since="$1" applied
+    [ -n "$ENV_MTIME" ] || return 1
+    applied=$(cat "$ENV_MTIME_APPLIED_FILE" 2>/dev/null) || applied=""
+    if [ -n "$applied" ]; then
+        [ "$ENV_MTIME" != "$applied" ]
+    else
+        [ "$active_since" -lt "$ENV_MTIME" ]
+    fi
+}
+
+mark_env_mtime_applied() {
+    [ -n "$ENV_MTIME" ] || return 0
+    mkdir -p "$(dirname "$ENV_MTIME_APPLIED_FILE")"
+    echo "$ENV_MTIME" > "$ENV_MTIME_APPLIED_FILE"
+}
+
+# --- Sync-in-progress defer / mutual exclusion (#793's flock, shared with
+# scripts/auto-deploy.sh) ----------------------------------------------------
+# No systemd unit to check on macOS — just the advisory lock
+# scripts/run_all_syncs.py holds (LOCK_SH) for its whole run. Taking the
+# matching EXCLUSIVE, non-blocking lock here (LOCK_EX | LOCK_NB) and holding
+# it for this script's ENTIRE operational body (not just this check) also
+# gives this script something it lacked on review: mutual exclusion between
+# two overlapping invocations of ITSELF (e.g. two overlapping cron/timer
+# ticks) — the second one simply fails to acquire and defers this tick,
+# rather than both interleaving `launchctl unload`/`load` calls against the
+# same service.
+sync_in_progress_lock_acquire() {
+    mkdir -p "$(dirname "$SYNC_LOCK_FILE")"
+    exec 9>"$SYNC_LOCK_FILE"
+    flock -x -n 9 || return 0
+    return 1
+}
+
+sync_in_progress_lock_release() {
+    flock -u 9 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
+}
+
+# Poll until $1 (a pid captured BEFORE `launchctl unload` was called) is
+# actually gone, up to $2 seconds. Returns 0 once torn down, 1 on timeout
+# (caller proceeds anyway and logs a warning — better to try starting than
+# to hang forever).
+#
+# Found on review: an earlier version polled api_pid() (`launchctl list`)
+# AFTER calling unload, instead of a pid captured before it — `unload`
+# deregisters the job from launchd's list as soon as it *asks* the process
+# to exit, well before the process has actually torn down, so api_pid()
+# read back empty immediately and the poll returned success instantly, with
+# the still-shutting-down old process potentially still bound to the port —
+# exactly the collision this whole restart sequence exists to prevent.
+# `kill -0` on the specific pid captured up front has no such gap: it stays
+# true until that exact process is actually gone, regardless of what
+# launchd's own bookkeeping shows in the meantime.
+wait_for_pid_gone() {
+    local pid="$1" timeout="${2:-30}" waited=0
+    [ -n "$pid" ] || return 0
+    while kill -0 "$pid" 2>/dev/null; do
         [ "$waited" -ge "$timeout" ] && return 1
         sleep 1
         waited=$((waited + 1))
     done
+    return 0
 }
 
 # Start the service, retrying once on a transient-looking failure. Never
@@ -195,10 +265,15 @@ wait_for_health() {
 
 # One full unload -> wait-for-teardown -> load(-with-retry) -> health-poll
 # cycle. Returns 0 if the server answers /health afterward, 1 otherwise.
+# Captures the outgoing process's pid BEFORE calling unload — see
+# wait_for_pid_gone()'s comment for why the poll must target that specific
+# pid rather than re-querying `launchctl list` after unload runs.
 restart_cycle() {
+    local old_pid
+    old_pid=$(api_pid)
     launchctl unload "$PLIST_PATH" 2>>"$LOG_FILE" || true
-    if ! wait_for_teardown 30; then
-        log "WARNING: previous instance did not tear down within 30s — starting anyway"
+    if ! wait_for_pid_gone "$old_pid" 30; then
+        log "WARNING: previous instance (pid $old_pid) did not tear down within 30s — starting anyway"
     fi
     start_with_retry || return 1
     wait_for_health "$(health_check_timeout)"
@@ -215,9 +290,15 @@ case "$(_read_env "LIFEOS_AUTODEPLOY_ENABLED" "false" | tr '[:upper:]' '[:lower:
     *) exit 0 ;;
 esac
 
-# --- Defer while the nightly sync is running ------------------------------------
-if sync_marker_in_progress; then
-    log "skip: nightly sync in progress — deferring update to avoid a mid-sync restart"
+# --- Defer while the nightly sync is running (or another instance of this
+# script is already mid-restart) --------------------------------------------
+# Exclusive, non-blocking lock held from here through the end of this
+# function (released just before each exit path below) — not just checked
+# once — so a sync (or an overlapping invocation of this same script)
+# starting anywhere in between is never raced. Every exit path also
+# terminates the process, which releases it via the kernel regardless.
+if sync_in_progress_lock_acquire; then
+    log "skip: nightly sync (or another update in progress) — deferring to avoid a mid-sync restart"
     exit 0
 fi
 
@@ -225,10 +306,12 @@ fi
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
 if [ "$BRANCH" != "main" ]; then
     log "skip: on branch '$BRANCH', not main"
+    sync_in_progress_lock_release
     exit 0
 fi
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     log "skip: tracked files modified — not auto-updating over local edits"
+    sync_in_progress_lock_release
     exit 0
 fi
 
@@ -237,6 +320,7 @@ if ! git fetch --quiet origin main 2>>"$LOG_FILE"; then
     log "ERROR: git fetch failed"
     notify_failure "🚨 *LifeOS Auto-Update (macOS)*
 \`git fetch\` failed on the host — check network / SSH auth."
+    sync_in_progress_lock_release
     exit 1
 fi
 
@@ -248,47 +332,53 @@ if [ "$LOCAL" != "$REMOTE" ]; then
         log "ERROR: --ff-only pull failed (local main diverged from origin)"
         notify_failure "🚨 *LifeOS Auto-Update (macOS)*
 Fast-forward pull failed — local \`main\` has diverged from origin. Manual fix needed."
+        sync_in_progress_lock_release
         exit 1
     fi
 fi
 
-# --- Drift check: compare code/.env mtimes against our own last restart ---------
-CODE_MTIME=$(newest_code_mtime)
-ENV_MTIME=$(env_file_mtime)
-RESTART_EPOCH=$(last_restart_epoch) || {
-    log "no restart baseline yet — establishing one, will compare from the next run"
-    mark_restarted
+# --- Drift check: compare code/.env against the API process's REAL start
+# time (ground truth from the OS, not a self-tracked marker — see
+# api_active_since_epoch()'s comment for the first-run bug this fixes) ------
+ACTIVE_SINCE=$(api_active_since_epoch) || {
+    log "API service not running — nothing to check for drift"
     exit 0
 }
+CODE_MTIME=$(newest_code_mtime)
+ENV_MTIME=$(env_file_mtime)
 
 STALE=false
-[ -n "$CODE_MTIME" ] && [ "$RESTART_EPOCH" -lt "$CODE_MTIME" ] && STALE=true
-[ -n "$ENV_MTIME" ] && [ "$RESTART_EPOCH" -lt "$ENV_MTIME" ] && STALE=true
+[ -n "$CODE_MTIME" ] && [ "$ACTIVE_SINCE" -lt "$CODE_MTIME" ] && STALE=true
+env_stale "$ACTIVE_SINCE" && STALE=true
 if [ "$STALE" != true ]; then
+    sync_in_progress_lock_release
     exit 0   # nothing stale
 fi
 
-log "drift detected (code/.env changed since last restart) — restarting $PLIST_NAME"
+log "drift detected (code/.env changed since $PLIST_NAME started) — restarting"
 if restart_cycle; then
-    mark_restarted
+    mark_env_mtime_applied
     log "restart OK, health confirmed"
     notify_success "✅ *LifeOS Auto-Update (macOS)*
 Restarted — was running stale code/config. Health OK."
+    sync_in_progress_lock_release
     exit 0
 fi
 
 log "first restart cycle did not come up healthy — retrying once"
 if restart_cycle; then
-    mark_restarted
+    mark_env_mtime_applied
     log "retry restart OK, health confirmed"
     notify_success "✅ *LifeOS Auto-Update (macOS)*
 Restarted (after one retry) — was running stale code/config. Health OK."
+    sync_in_progress_lock_release
     exit 0
 fi
 
 log "restart FAILED after retry — alerting"
 notify_failure "🚨 *LifeOS Auto-Update (macOS)*
 Restarted $PLIST_NAME twice but \`/health\` never came back. Check the host."
+sync_in_progress_lock_release
 exit 1
 
 }
