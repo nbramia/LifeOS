@@ -75,11 +75,16 @@ def _atomic_write_text(path: Path, content: str) -> None:
     """Write `content` to `path` via a temp file + rename, so a crash or
     disk-full event mid-write can never leave `path` truncated or
     half-written -- the original file is left intact until the new one is
-    fully flushed to disk."""
+    fully flushed to disk. Preserves the existing file's permissions
+    (.env may be chmod 600, e.g. for an API key) instead of letting the
+    new file fall back to the umask default."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing_mode = path.stat().st_mode if path.exists() else None
     tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
     try:
         tmp_path.write_text(content)
+        if existing_mode is not None:
+            os.chmod(tmp_path, existing_mode)
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
@@ -127,7 +132,10 @@ def _existing_partner_person_id(config_path: Path) -> str:
         return ""
     try:
         with open(config_path) as f:
-            return json.load(f).get("partner_person_id", "") or ""
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return ""
+        return data.get("partner_person_id", "") or ""
     except (json.JSONDecodeError, OSError):
         return ""
 

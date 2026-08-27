@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import pytest
 
 from scripts.setup_identity import (
+    _existing_partner_person_id,
     apply_identity_config,
     backup_file,
     merge_family_config,
@@ -398,3 +399,35 @@ class TestAtomicWrites:
             merge_family_config(config_path, example_path, family_last_names=["Chen"])
 
         assert config_path.read_text() == original
+
+    def test_env_write_preserves_existing_file_permissions(self, tmp_path):
+        """.env can hold secrets (API keys) and may be chmod 600 -- the
+        atomic replace must not silently widen that to the umask default."""
+        env_path = tmp_path / ".env"
+        env_path.write_text("LIFEOS_USER_NAME=Sam\n")
+        env_path.chmod(0o600)
+        example_path = tmp_path / ".env.example"
+        write_env_updates(env_path, example_path, {"LIFEOS_MY_PERSON_ID": "abc-123"})
+        assert (env_path.stat().st_mode & 0o777) == 0o600
+
+
+class TestExistingPartnerPersonId:
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert _existing_partner_person_id(tmp_path / "missing.json") == ""
+
+    def test_reads_existing_value(self, tmp_path):
+        config_path = tmp_path / "relationship_overrides.json"
+        config_path.write_text(json.dumps({"partner_person_id": "old-id"}))
+        assert _existing_partner_person_id(config_path) == "old-id"
+
+    def test_malformed_json_returns_empty_instead_of_raising(self, tmp_path):
+        config_path = tmp_path / "relationship_overrides.json"
+        config_path.write_text("not valid json{")
+        assert _existing_partner_person_id(config_path) == ""
+
+    def test_non_dict_top_level_returns_empty_instead_of_raising(self, tmp_path):
+        """A malformed config whose top level is a list (or any non-dict)
+        must not crash a warning-only lookup."""
+        config_path = tmp_path / "relationship_overrides.json"
+        config_path.write_text(json.dumps(["not", "a", "dict"]))
+        assert _existing_partner_person_id(config_path) == ""
