@@ -134,6 +134,15 @@ class TestWriteEnvUpdates:
         assert "LIFEOS_WORK_DOMAIN_2=realcompany.com" in content
         assert "# LIFEOS_WORK_DOMAIN_2=othercompany.com" not in content
 
+    def test_brand_new_env_file_defaults_to_owner_only_permissions(self, tmp_path):
+        """.env will hold secrets (API keys) once populated -- a freshly
+        created one (no pre-existing file/permissions to preserve) should
+        default to 0600, not the umask default."""
+        env_path = tmp_path / ".env"
+        example_path = tmp_path / ".env.example"
+        write_env_updates(env_path, example_path, {"LIFEOS_MY_PERSON_ID": "abc-123"})
+        assert (env_path.stat().st_mode & 0o777) == 0o600
+
     def test_quotes_values_with_whitespace(self, tmp_path):
         env_path = tmp_path / ".env"
         example_path = tmp_path / ".env.example"

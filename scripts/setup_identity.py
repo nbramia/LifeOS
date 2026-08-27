@@ -94,14 +94,15 @@ def _atomic_write_text(path: Path, content: str) -> None:
     disk-full event mid-write can never leave `path` truncated or
     half-written -- the original file is left intact until the new one is
     fully flushed to disk. Preserves the existing file's permissions
-    (.env may be chmod 600, e.g. for an API key): the temp file is created
-    owner-only from the start (see _write_bytes_matching_mode) rather than
-    briefly existing at the umask default before being tightened."""
+    (.env may be chmod 600, e.g. for an API key), or defaults a brand-new
+    file to owner-only (0600) rather than the umask default -- these are
+    all files that hold secrets or personal data (see AGENTS.md § Privacy)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     existing_mode = path.stat().st_mode if path.exists() else None
+    mode = existing_mode if existing_mode is not None else 0o600
     tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
     try:
-        _write_bytes_matching_mode(tmp_path, content.encode(), existing_mode)
+        _write_bytes_matching_mode(tmp_path, content.encode(), mode)
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
