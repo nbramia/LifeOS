@@ -426,12 +426,16 @@ class Worker:
         # bot. Bypassed entirely when a test injects `_claude_code_executor`.
         self._claude_code_executors: dict[str, object] = {}
         self._codex_executor = codex_executor  # lazily instantiated on first /codex task
-        # Spawned CLI children (claude_code/codex) are long-running subprocesses.
-        # Running them off the tick keeps the poll loop free to claim new tasks
-        # and dispatch siblings. Bounded so concurrent subprocesses stay capped;
-        # tests inject a _SynchronousPool for deterministic dispatch. `_cli_inflight`
-        # guards against the next tick re-dispatching a child that's been submitted
-        # but hasn't yet flipped CLAIMED→RUNNING.
+        # CLI dispatches (claude_code/codex) are long-running subprocesses — both
+        # spawned children/operator root-spawns AND top-level #agent tasks routed
+        # to a CLI engine (#753) go through this pool via _submit_cli_dispatch.
+        # Running them off the tick keeps the poll loop free to claim new tasks,
+        # dispatch siblings, and keep servicing sleeps/managed-polling/clarification
+        # while a session's subprocess runs (up to its budget wall, 4h by default).
+        # Bounded so concurrent subprocesses stay capped; tests inject a
+        # _SynchronousPool for deterministic dispatch. `_cli_inflight` guards
+        # against a re-scan re-dispatching a session that's been submitted but
+        # hasn't yet flipped CLAIMED→RUNNING.
         self._cli_pool = cli_pool or ThreadPoolExecutor(
             max_workers=max(2, 2 * settings.agent_max_concurrent_managed),
             thread_name_prefix="cli-dispatch",
@@ -797,7 +801,13 @@ class Worker:
                 self._submit_cli_dispatch(session, pending, self._dispatch_codex_session)
 
     def _submit_cli_dispatch(self, session, pending, dispatch_fn) -> None:
-        """Run a CLI child's dispatch on the pool instead of inline.
+        """Run a claude_code/codex dispatch (`_dispatch_claude_code_session` or
+        `_dispatch_codex_session`) on the pool instead of inline.
+
+        Shared by two callers: `_dispatch_spawned_sessions` (spawned children
+        and operator root-spawns, #299) and `_dispatch` (top-level `#agent`
+        tasks routed to a CLI engine, #753) — both hand the same long-running
+        subprocess call off the tick thread through the same pool + guard.
 
         Guards with `_cli_inflight` so a re-scan on the next tick doesn't submit
         the same session twice in the window between submission and the
@@ -2287,6 +2297,15 @@ class Worker:
         # operator-/claude-style entry path can be reused unchanged. The task
         # title is the prompt; working_dir is picked from the description so
         # the CLI runs inside the relevant project.
+        #
+        # #753: these subprocesses can run for the session's full budget wall
+        # (up to 4h) — calling _dispatch_*_session inline here would block
+        # this tick thread for that whole span, starving every other tick
+        # responsibility (new claims, sleeping-session wakes, managed
+        # polling, clarification processing/timeouts) exactly like a spawned
+        # CLI child would. Reuse _submit_cli_dispatch — the same pool +
+        # _cli_inflight machinery spawned sessions already use (#299) — so a
+        # top-level #agent task gets the identical off-tick treatment.
         if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
             from api.services.directory_resolver import resolve_working_directory
             working_dir = resolve_working_directory(title)
@@ -2301,9 +2320,9 @@ class Worker:
             if pre.routing == ROUTE_CLAUDE_CODE:
                 payload["plan_mode"] = False  # /claude expects this key
                 pending[0]["content"] = json.dumps(payload)
-                self._dispatch_claude_code_session(session, pending)
+                self._submit_cli_dispatch(session, pending, self._dispatch_claude_code_session)
             else:
-                self._dispatch_codex_session(session, pending)
+                self._submit_cli_dispatch(session, pending, self._dispatch_codex_session)
             return
 
         # Should not reach here — routing was validated in preflight.
