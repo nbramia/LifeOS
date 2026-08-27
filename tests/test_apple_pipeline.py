@@ -1363,6 +1363,77 @@ class TestAgentShaImport:
 
 
 # ---------------------------------------------------------------------------
+# Export agent label in alerts (issue #770) — no hardcoded hardware name
+# ---------------------------------------------------------------------------
+
+class TestExportAgentLabelInAlerts:
+    """Alert wording must not assume any specific machine by default, and
+    must honor an installer's LIFEOS_APPLE_EXPORT_AGENT_LABEL override."""
+
+    def test_default_label_names_no_specific_hardware(self, tmp_path, monkeypatch):
+        """Default wording (no override set) must not mention Mac Mini or
+        any other specific hardware."""
+        import scripts.apple_data_import as import_mod
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir()
+        very_stale = datetime.now(timezone.utc) - timedelta(days=10)
+        manifest = {
+            "exported_at": very_stale.isoformat(),
+            "hostname": "test-host",
+            "results": {"whatsapp": {"status": "error", "reason": "wacli not installed"}},
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", import_dir)
+
+        result = import_mod.check_manifest()
+
+        staleness_msg = result["_staleness_critical_message"]
+        assert "Mac Mini" not in staleness_msg
+        assert "export agent" in staleness_msg
+
+    def test_label_override_is_used_in_staleness_and_error_alerts(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        from config.settings import settings
+        import scripts.apple_data_import as import_mod
+
+        monkeypatch.setattr(settings, "apple_export_agent_label", "my MacBook")
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir()
+        very_stale = datetime.now(timezone.utc) - timedelta(days=10)
+        manifest = {
+            "exported_at": very_stale.isoformat(),
+            "hostname": "test-host",
+            "results": {"whatsapp": {"status": "error", "reason": "wacli not installed"}},
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", import_dir)
+
+        with caplog.at_level(logging.CRITICAL):
+            result = import_mod.check_manifest()
+
+        assert "my MacBook" in result["_staleness_critical_message"]
+        assert any(
+            "my MacBook" in r.message and "whatsapp" in r.message
+            for r in caplog.records
+        )
+
+    def test_default_setting_value_matches_current_hardcoded_wording_intent(self):
+        """Regression guard: the default must be the generic label, not
+        empty or a specific machine name — a fresh clone must see no
+        difference in *meaning*, only in no longer naming hardware."""
+        from config.settings import Settings
+
+        assert Settings().apple_export_agent_label == "the export agent"
+
+
+# ---------------------------------------------------------------------------
 # WhatsApp export (issue #677) — a failed `wacli sync` must not export as
 # status "ok", a 405 "Client outdated" must be diagnosed as client-version
 # (not auth), and a genuine auth failure must still be diagnosed as auth.

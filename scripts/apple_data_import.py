@@ -97,6 +97,9 @@ def check_manifest() -> dict | None:
     underscore marks these as synthetic, not part of the Mac-side export
     schema.
     """
+    from config.settings import settings
+    agent_label = settings.apple_export_agent_label
+
     manifest_path = IMPORT_DIR / "manifest.json"
     if not manifest_path.exists():
         logger.warning("No manifest.json found in apple-imports/")
@@ -119,7 +122,7 @@ def check_manifest() -> dict | None:
             if age_hours > STALENESS_CRITICAL_HOURS:
                 message = (
                     f"Apple import data is {age.days} days old (exported {exported_at_str}). "
-                    f"Check Mac Mini cron and rsync pipeline."
+                    f"Check {agent_label}'s scheduled job and file-transfer pipeline."
                 )
                 logger.critical(message)
                 manifest["_staleness_critical_message"] = message
@@ -153,8 +156,8 @@ def check_manifest() -> dict | None:
             if source_result.get("status") == "error":
                 reason = source_result.get("reason") or source_result.get("error") or "unknown"
                 logger.critical(
-                    f"Mac Mini export failed for {source_name}: {reason}. "
-                    f"Check wacli/tooling on the Mac Mini."
+                    f"{agent_label} failed to export {source_name}: {reason}. "
+                    f"Check wacli/tooling on {agent_label}."
                 )
 
     # Flag a Mac Mini agent whose self-update (issue #509) has fallen behind.
@@ -167,7 +170,7 @@ def check_manifest() -> dict | None:
             message = (
                 f"Apple Data Agent exported from {agent_sha[:7]}, which differs from "
                 f"this host's main ({local_sha[:7]}) — its self-update may have failed. "
-                f"Check the agent log on the Mac Mini."
+                f"Check the agent log on {agent_label}."
             )
             logger.warning(message)
             manifest["_agent_sha_drift_message"] = message
