@@ -388,6 +388,80 @@ def test_routing_flavored_ambiguity_does_not_block(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_default_route_demotes_ambiguity_and_runs(tmp_path: Path, monkeypatch):
+    """#751: with a default route configured, a genuine ambiguity no longer
+    blocks — it's demoted to advisory and the task runs on the default
+    route instead. Contrast with `test_ambiguous_title_lands_in_blocked`,
+    which covers the no-default-route case and must keep blocking."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "agent_default_route", "local")
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "reply to John", "status": "todo", "tags": ["agent"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="replied"))
+    preflight = _golden_preflight(
+        routing="ask",
+        ambiguity={"question": "Which John — John Doe or John Smith?"},
+    )
+    w = _make_worker(tmp_path, api, preflight_caller=preflight, local_executor=executor)
+    w.tick()
+
+    # Ran on the default route rather than blocking on the question.
+    assert executor.calls != []
+    assert BLOCKED_TAG not in api.tasks["t1"]["tags"]
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert not any("Which John" in s for s in sent)
+
+
+@pytest.mark.unit
+def test_default_route_does_not_rescue_fatal_sanity(tmp_path: Path, monkeypatch):
+    """#751 must not weaken #747's fail-closed guard: a deterministically
+    destructive title still fails the task even with a default route
+    configured — sanity is decided before routing is even consulted."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "agent_default_route", "local")
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "rm -rf /", "status": "todo", "tags": ["agent"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    preflight = _golden_preflight(routing="local", sane=False, sane_reason="destructive")
+    w = _make_worker(tmp_path, api, preflight_caller=preflight, local_executor=executor)
+    w.tick()
+
+    assert executor.calls == []
+    assert FAILED_TAG in api.tasks["t1"]["tags"]
+    assert w.session_store.get("t1").status == STATUS_FAILED
+
+
+@pytest.mark.unit
+def test_default_route_does_not_rescue_nonfatal_sanity(tmp_path: Path, monkeypatch):
+    """#751 must not weaken #747: a non-fatal sane=false (the classifier's
+    own 'not executable' opinion on a mundane title) still parks the task
+    even with a default route configured — sanity ('should this run at
+    all') is orthogonal to a default route ('who resolves an open
+    question'), and #751 only touches the latter."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "agent_default_route", "local")
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "Display the transcribed message immediately after sending",
+         "status": "todo", "tags": ["agent"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="should not run"))
+    preflight = _golden_preflight(
+        routing="local", sane=False,
+        sane_reason="This is a product specification or feature request, not a task an agent can execute.",
+    )
+    w = _make_worker(tmp_path, api, preflight_caller=preflight, local_executor=executor)
+    w.tick()
+
+    assert executor.calls == []
+    assert FAILED_TAG not in api.tasks["t1"]["tags"]
+    assert BLOCKED_TAG in api.tasks["t1"]["tags"]
+    assert w.session_store.get("t1").status == STATUS_BLOCKED
+
+
+@pytest.mark.unit
 def test_executor_budget_exceeded_sets_budget_exceeded_tag(tmp_path: Path):
     api = FakeApi(tasks=[
         {"id": "t1", "description": "long task", "status": "todo", "tags": ["agent", "local"]},

@@ -117,6 +117,13 @@ class PreflightResult:
     # the operator before dispatching (#139 §7). Driven by
     # settings.agent_cost_confirm_threshold_dollars.
     needs_cost_confirmation: bool = False
+    # Set when a non-null `ambiguity` was demoted to advisory-only because
+    # `settings.agent_default_route` is configured (#751) — holds the
+    # original question text so the worker can log it as context (session
+    # transcript / completion note) instead of discarding it silently.
+    # `ambiguity` itself is cleared to None in the same step, since a
+    # demoted ambiguity must not block. None when nothing was demoted.
+    demoted_ambiguity: str | None = None
     raw: dict = field(default_factory=dict)  # the parsed JSON for debugging
 
 
@@ -563,40 +570,61 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
 
 
 def _apply_default_route(result: PreflightResult, original_routing: str) -> PreflightResult:
-    """Apply `settings.agent_default_route` when preflight landed on `ask`
-    purely for lack of routing cues (#707) — the "nothing to ask about" case
-    on a single-executor install. Empty setting (default) is a no-op, so an
-    unset install is byte-identical to pre-#707 behavior.
+    """Apply `settings.agent_default_route` (#707), and — as of #751 — demote
+    any non-null `ambiguity` to advisory once that setting is configured and
+    valid. Empty setting (default) is a no-op, so an unset install is
+    byte-identical to pre-#707 behavior; both parts of this function are
+    gated on the setting being non-empty and valid.
 
-    Gate: `result.routing == ROUTE_ASK and result.sane and result.ambiguity
-    is None`. Deliberately NOT a string match against `routing_reason` — the
-    LLM's reason text is free-form prose ("no tag and no title cue" today,
-    but not a stable contract), so matching on it would be brittle. This one
-    structural gate covers both "lack of cues" paths:
-      - the LLM's own rule-5 answer ("none of the routing rules matched")
-      - `parse_preflight_response`'s deterministic fallback when the model
-        omitted `routing` or returned a value outside `KNOWN_ROUTES`
-    and it correctly excludes the two "ask" outcomes the issue says must
-    stay ask: ambiguity (checked directly) and sanity failures — including
-    the empty-title short-circuit and the LLM-call-failure fallback in
-    `run_preflight`, both of which set `sane=False`.
+    Two independent things happen here, in order:
 
-    One more `ask` source needs excluding that isn't in the issue's list:
-    `_apply_tag_overrides`'s #584 downgrade, which turns an *inferred*
-    (unconfirmed) cloud route into `ask` specifically so it can't
-    auto-dispatch. That result is also sane=True with ambiguity=None, so it
-    would slip through the gate above — this isn't "lack of cues", it's a
-    cue nobody confirmed, and silently routing it via the default would
-    undo the confirmation #584 exists for. Excluded via `original_routing`:
-    the routing value from BEFORE `_apply_tag_overrides` ran. Only when the
-    original LLM/parse outcome was *already* `ask` — not downgraded from
-    `claude` — do we know this is genuinely nothing-to-route-on.
+    1. **Ambiguity demotion (#751).** Configuring a default route is the
+       operator saying "run untagged tasks without asking me" — a cheap
+       classifier's hedging (`ambiguity`) shouldn't override that standing
+       instruction, regardless of what routing was ultimately picked. So
+       once the setting is confirmed non-empty and valid, any non-null
+       `result.ambiguity` is stashed on `result.demoted_ambiguity` (for the
+       worker to log as advisory context) and cleared. String-matching the
+       question text (#748's approach) is whack-a-mole — the model keeps
+       rephrasing around the pattern — so this demotes unconditionally on
+       the *value being non-null* rather than trying to classify its prose.
+       This intentionally does NOT touch `result.sane` — a non-fatal
+       `sane=False` still parks the task (#747): sanity is "should this run
+       at all", a question this setting has no bearing on, whereas ambiguity
+       is "who resolves an open question", which is exactly what a standing
+       default-route instruction answers.
+
+    2. **Route substitution (#707), unchanged.** Gate:
+       `result.routing == ROUTE_ASK and result.sane` (the `ambiguity is
+       None` half of the old gate is now always true here, since part 1 just
+       cleared it) `and original_routing == ROUTE_ASK`. Deliberately NOT a
+       string match against `routing_reason` — the LLM's reason text is
+       free-form prose ("no tag and no title cue" today, but not a stable
+       contract), so matching on it would be brittle. This one structural
+       gate covers both "lack of cues" paths:
+         - the LLM's own rule-5 answer ("none of the routing rules matched")
+         - `parse_preflight_response`'s deterministic fallback when the model
+           omitted `routing` or returned a value outside `KNOWN_ROUTES`
+       and it correctly excludes the "ask" outcome the issue says must stay
+       ask: sanity failures — including the empty-title short-circuit and
+       the LLM-call-failure fallback in `run_preflight`, both of which set
+       `sane=False`.
+
+       One more `ask` source needs excluding: `_apply_tag_overrides`'s #584
+       downgrade, which turns an *inferred* (unconfirmed) cloud route into
+       `ask` specifically so it can't auto-dispatch. That result is also
+       sane=True, so it would slip through the gate above — this isn't
+       "lack of cues", it's a cue nobody confirmed, and silently routing it
+       via the default would undo the confirmation #584 exists for.
+       Excluded via `original_routing`: the routing value from BEFORE
+       `_apply_tag_overrides` ran. Only when the original LLM/parse outcome
+       was *already* `ask` — not downgraded from `claude` — do we know this
+       is genuinely nothing-to-route-on. (Ambiguity demotion in part 1 still
+       runs on this path — the #584 downgrade blocks via `routing == ask`
+       either way, so demoting the ambiguity text just avoids a redundant
+       question, not a redundant block.)
     """
     if not settings.agent_default_route:
-        return result
-    if result.routing != ROUTE_ASK or not result.sane or result.ambiguity is not None:
-        return result
-    if original_routing != ROUTE_ASK:
         return result
 
     default_route = settings.agent_default_route
@@ -606,10 +634,26 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
         # validators), so this logs an ERROR — one line per occurrence, not a
         # crash — and falls back to `ask`, same as every other preflight
         # error path. The worker loop must never die over a typo'd env var.
+        # Deliberately checked (and returned on) BEFORE ambiguity demotion —
+        # a misconfigured setting is not a *valid* standing instruction, so
+        # it must not weaken the ambiguity block either.
         logger.error(
             "invalid LIFEOS_AGENT_DEFAULT_ROUTE=%r — must be one of %s; "
             "falling back to ask", default_route, KNOWN_ROUTES,
         )
+        return result
+
+    if result.ambiguity is not None:
+        logger.info(
+            "preflight ambiguity demoted to advisory (LIFEOS_AGENT_DEFAULT_ROUTE=%s "
+            "configured): %r", default_route, result.ambiguity.question,
+        )
+        result.demoted_ambiguity = result.ambiguity.question
+        result.ambiguity = None
+
+    if result.routing != ROUTE_ASK or not result.sane:
+        return result
+    if original_routing != ROUTE_ASK:
         return result
 
     result.routing = default_route
@@ -709,9 +753,37 @@ def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
 
 def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> PreflightResult:
     """Shared post-processing pipeline for every `run_preflight` return path:
-    sanity gate (#747) > tag overrides > default route (#707) > preset class
-    > cost gates — matching the precedence tags > explicit LLM route >
-    default route > ask.
+    sanity gate (#747) > tag overrides > default route (#707, now also
+    demoting ambiguity per #751) > preset class > cost gates.
+
+    Precedence, and why each sits where it does:
+
+      1. **Sanity gate first, and orthogonal to everything below.**
+         `_apply_sanity_gate` runs before routing is decided at all, because
+         "should this run" is a different question from "how should it
+         run" — a `sane_fatal` verdict fails the task closed regardless of
+         routing/ambiguity (checked immediately in the worker, before either
+         is consulted), and a non-fatal `sane=False` parks it. Neither is
+         touched by the routing precedence below, and #751 does not change
+         this: a default route answers "who resolves an open question", not
+         "should this task run at all".
+      2. **Tags** (`_apply_tag_overrides`) — the operator retagging a task
+         is the most direct, most recent signal available; always wins.
+      3. **Explicit LLM route** — preserved by tag overrides leaving a
+         non-`ask` classifier routing alone, and by `_apply_default_route`
+         only substituting when routing is still `ask` *and* was already
+         `ask` before tag overrides ran (see `original_routing` below) — so
+         a routing the model was confident enough to name outright is never
+         overridden by the default route.
+      4. **Default route** (`_apply_default_route`, #707) — substitutes
+         `ask` for the configured route only when nothing above produced a
+         real answer. As of #751, this step *also* demotes a non-null
+         `ambiguity` to advisory (logged, not blocking) whenever the setting
+         is configured and valid — independent of whether step 4's route
+         substitution itself fires, since an explicit route (step 3) can
+         still carry a stale ambiguity the model should not have set.
+      5. **Ask** — the fallback when nothing above resolved routing, or the
+         #584 unconfirmed-cloud downgrade parked it there.
 
     Centralized (rather than each return path chaining the calls itself) so
     `original_routing` is captured exactly once, right after the

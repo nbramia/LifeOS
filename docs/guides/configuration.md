@@ -160,7 +160,7 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 | `LIFEOS_AGENT_MAX_CONCURRENT_LOCAL` | int | varies | Concurrent local-executor sessions. |
 | `LIFEOS_AGENT_MAX_CONCURRENT_MANAGED` | int | varies | Concurrent Managed-Agents sessions. |
 | `LIFEOS_AGENT_REMOTE_EXECUTOR` | bool | `false` | Opt-in: when the [OpenAI-compatible remote provider](#openai-compatible-remote-provider) is fully configured and the local llama-server is unreachable at session start, the local route runs the session on the remote provider instead of failing. No-op unless the remote provider is fully configured. |
-| `LIFEOS_AGENT_DEFAULT_ROUTE` | str | *(empty)* | Route preflight dispatches to instead of `ask` when a task has no routing cues at all — for a single-executor install there's nothing useful to ask about. Applies only when lack of cues, not ambiguity or a sanity failure, is why preflight would otherwise ask. Tag overrides (`#local`, `#cloud`, etc.) always win. |
+| `LIFEOS_AGENT_DEFAULT_ROUTE` | str | *(empty)* | Route preflight dispatches to instead of `ask` when a task has no routing cues at all — for a single-executor install there's nothing useful to ask about. Applies only when lack of cues, not a sanity failure, is why preflight would otherwise ask. Tag overrides (`#local`, `#cloud`, etc.) always win. When set to a valid route, also demotes any preflight `ambiguity` to advisory (logged, not blocking) instead of parking the task on the question — see [agent-worker.md](../specs/technical/agent-worker.md#preflight) for the full precedence. |
 
 ## Agent Worker — Managed Agents (Cloud)
 

@@ -916,8 +916,20 @@ def test_default_route_applies_to_llm_omitted_routing(monkeypatch):
 
 
 @pytest.mark.unit
-def test_default_route_does_not_apply_on_ambiguity(monkeypatch):
-    """Set + ambiguity -> still ask."""
+def test_default_route_demotes_ambiguity_and_applies(monkeypatch):
+    """#751: with a default route configured, a non-null ambiguity on an
+    otherwise-runnable task is demoted to advisory (not discarded — it's
+    preserved on `demoted_ambiguity` for the session log) and the default
+    route applies, rather than the task blocking on the question.
+
+    This supersedes the pre-#751 `test_default_route_does_not_apply_on_ambiguity`
+    expectation (ambiguity used to hard-block even with a default route
+    configured) — the issue this fixes (#751) is specifically that a
+    configured default route is a standing "run untagged tasks without
+    asking me" instruction that a cheap classifier's hedging must not
+    override, and string-matching the hedge's prose (#748) proved to be
+    whack-a-mole once the model rephrased around the pattern.
+    """
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "local")
     reply = _golden_reply(
@@ -925,8 +937,9 @@ def test_default_route_does_not_apply_on_ambiguity(monkeypatch):
         ambiguity={"question": "Which John — John Doe or John Smith?"},
     )
     result = pf.run_preflight(title="reply to John", tags=["agent"], caller=_stub(reply))
-    assert result.routing == pf.ROUTE_ASK
-    assert result.ambiguity is not None
+    assert result.routing == pf.ROUTE_LOCAL
+    assert result.ambiguity is None
+    assert result.demoted_ambiguity == "Which John — John Doe or John Smith?"
 
 
 @pytest.mark.unit
@@ -983,6 +996,27 @@ def test_default_route_does_not_apply_to_unconfirmed_cloud_inference(monkeypatch
 
 
 @pytest.mark.unit
+def test_default_route_does_not_rescue_unconfirmed_cloud_even_with_ambiguity(monkeypatch):
+    """#751 must not weaken #584: even though a configured default route now
+    demotes ambiguity, it must not also rescue an inferred (unconfirmed)
+    cloud route from the #584 downgrade — never auto-spend on inferred
+    cloud routing, ambiguity or not."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    reply = _golden_reply(
+        routing="claude", routing_reason="implies email capability", routing_explicit=False,
+        ambiguity={"question": "Which recipient — no name given in the title?"},
+    )
+    result = pf.run_preflight(title="draft an email", tags=["agent"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_ASK
+    assert "not explicitly requested" in result.routing_reason
+    # The ambiguity is still demoted (advisory) — it just doesn't change the
+    # #584 outcome, since routing==ask blocks independently either way.
+    assert result.ambiguity is None
+    assert result.demoted_ambiguity == "Which recipient — no name given in the title?"
+
+
+@pytest.mark.unit
 def test_default_route_invalid_value_logs_error_and_falls_back_to_ask(monkeypatch, caplog):
     """AC: an invalid value surfaces a clear error rather than silently
     asking (or crashing the worker loop) — falls back to `ask` with a
@@ -996,6 +1030,21 @@ def test_default_route_invalid_value_logs_error_and_falls_back_to_ask(monkeypatc
     assert result.routing == pf.ROUTE_ASK
     assert any("LIFEOS_AGENT_DEFAULT_ROUTE" in rec.message for rec in caplog.records)
     assert any(rec.levelno == logging.ERROR for rec in caplog.records)
+
+
+@pytest.mark.unit
+def test_default_route_invalid_value_does_not_demote_ambiguity(monkeypatch):
+    """#751 is gated on the setting being non-empty AND valid — a typo'd
+    value is not a standing instruction the operator successfully gave, so
+    ambiguity must still block exactly like the no-default-route case."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "bogus-route")
+    reply = _golden_reply(
+        ambiguity={"question": "Which John — John Doe or John Smith?"},
+    )
+    result = pf.run_preflight(title="reply to John", tags=["agent"], caller=_stub(reply))
+    assert result.ambiguity is not None
+    assert result.demoted_ambiguity is None
 
 
 @pytest.mark.unit
