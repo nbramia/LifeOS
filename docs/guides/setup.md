@@ -135,6 +135,8 @@ cp .env.example .env
 - **Monarch Money** — Financial data (account balances, transactions, budgets)
 - **Telegram bot** — Chat interface and push notifications
 - **Slack** — Workspace message sync
+- **LinkedIn** — Connections enrichment (company, position) from a manual
+  "Get a copy of your data" CSV export — no OAuth
 - **WhatsApp** — Chat history sync via `wacli` on a paired Apple Data Agent Mac (the LifeOS
   host runs on Linux; wacli is macOS-only). Data is exported into
   `data/apple-imports/whatsapp.json` and rsynced alongside contacts/iMessage.
@@ -432,6 +434,22 @@ For a **second work account**, repeat with `--account work2`:
 1. Set up workspace OAuth
 2. Add `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_USER_TOKEN` to `.env`
 3. Restart: `./scripts/server.sh restart`
+
+### LinkedIn
+
+LinkedIn connections import from a manual CSV export — there's no API/OAuth step.
+
+1. On linkedin.com: **Settings & Privacy → Data privacy → Get a copy of your data**
+2. Select "Connections" and request the export (LinkedIn emails you a download link,
+   usually within a few minutes)
+3. Unzip the download and place `Connections.csv` at `data/LinkedInConnections.csv`
+   (the path `scripts/sync_linkedin.py` reads by default — override with
+   `--csv <path>` if you'd rather keep it elsewhere)
+4. Re-run the export periodically (e.g. every few months) to pick up new connections —
+   nothing re-fetches this automatically
+
+If the CSV is absent, the nightly sync reports LinkedIn as cleanly skipped rather
+than failing or silently doing nothing.
 
 ### WhatsApp
 
