@@ -830,6 +830,7 @@ Search recent transactions.
 - `category` (string): Filter by category name
 - `search` (string): Search merchant names
 - `limit` (int): Max results (default: 500)
+- `sort` (string, optional): `asc` (oldest first) or `desc` (newest first) by date. Omit for the default order (unchanged for existing callers).
 
 **Response:** Array of `{date, merchant, category, amount, account, notes, pending}`
 
