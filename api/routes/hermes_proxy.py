@@ -627,6 +627,9 @@ router = make_backend_router(
     transform_body=_build_envelope,
     make_observer=_make_persister,
     pre_send=_journal_capture_prelude,
+    # #688: a configured-but-down Hermes must not look "available" — see
+    # make_backend_router's docstring and _probe_reachable in _proxy.py.
+    probe_reachability=True,
 )
 
 

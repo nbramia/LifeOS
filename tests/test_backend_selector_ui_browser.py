@@ -75,6 +75,7 @@ def _wait_for_backend_ready(page: Page):
 
 
 def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=True,
+                hermes_down=False,
                 hermes_status_fails=False, hermes_status_hangs=False, status_timeout_ms=None,
                 session_items=None, personas=None, personas_fails=False,
                 conversations=None, conversation_list=None):
@@ -137,6 +138,12 @@ def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=
                 return  # never fulfill/abort — the request just sits pending
             if hermes_status_fails:
                 route.fulfill(status=500, content_type="application/json", body="{}")
+            elif hermes_down:
+                # Configured but unreachable (#688) — distinct from both
+                # "available" and "not configured" via the real server's
+                # three-field shape.
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps({"available": False, "configured": True, "reachable": False}))
             else:
                 route.fulfill(status=200, content_type="application/json",
                               body=json.dumps({"available": hermes_available}))
@@ -199,6 +206,39 @@ class TestDefaultBackendResolution:
         _open_chat(page, chat_base_url, agent_available=True, hermes_available=False)
         expect(page.locator("#backendHermes")).to_be_hidden()
         expect(page.locator(".backend-toggle")).to_be_visible()
+
+
+class TestHermesConfiguredButUnreachable:
+    """#688: a Hermes that's configured but down must default `/chat` to
+    lifeos (no failed turns at send time) while staying visible — not
+    collapsed into the same "hidden" treatment as never-configured."""
+
+    def test_defaults_to_lifeos_not_hermes(self, page: Page, chat_base_url):
+        _open_chat(page, chat_base_url, hermes_down=True)
+        expect(page.locator("#backendLifeos")).to_have_class("backend-option active")
+        assert page.evaluate("window.lifeChat.config.backend") is None
+
+    def test_hermes_option_stays_visible_but_marked_down(self, page: Page, chat_base_url):
+        _open_chat(page, chat_base_url, hermes_down=True)
+        expect(page.locator("#backendHermes")).to_be_visible()
+        assert page.evaluate(
+            "document.body.classList.contains('hermes-down')"
+        ) is True
+
+    def test_clicking_the_down_option_does_not_select_it(self, page: Page, chat_base_url):
+        _open_chat(page, chat_base_url, hermes_down=True)
+        page.locator("#backendHermes").click(force=True)
+        expect(page.locator("#backendLifeos")).to_have_class("backend-option active")
+        assert page.evaluate("window.lifeChat.config.backend") is None
+
+    def test_reachable_hermes_is_unaffected(self, page: Page, chat_base_url):
+        # Sanity check that the down-state machinery doesn't leak into the
+        # ordinary configured-and-reachable case.
+        _open_chat(page, chat_base_url, hermes_available=True)
+        expect(page.locator("#backendHermes")).to_have_class("backend-option active")
+        assert page.evaluate(
+            "document.body.classList.contains('hermes-down')"
+        ) is False
 
 
 class TestExplicitChoicePersistence:
