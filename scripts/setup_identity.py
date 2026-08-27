@@ -55,13 +55,39 @@ API_BASE = os.environ.get("LIFEOS_API_URL", "http://localhost:8000").rstrip("/")
 def backup_file(path: Path) -> Optional[Path]:
     """Copy an existing file to <path>.bak.<UTC timestamp> before it's
     modified. Returns the backup path, or None if there was nothing to back
-    up (file doesn't exist yet)."""
+    up (file doesn't exist yet). The timestamp includes microseconds, and a
+    numeric suffix is added on top of that if a backup with that exact name
+    already exists -- so two runs in quick succession never overwrite each
+    other's backup of the pre-existing file."""
     if not path.exists():
         return None
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup_path = path.with_name(f"{path.name}.bak.{timestamp}")
+    suffix = 2
+    while backup_path.exists():
+        backup_path = path.with_name(f"{path.name}.bak.{timestamp}.{suffix}")
+        suffix += 1
     backup_path.write_bytes(path.read_bytes())
     return backup_path
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write `content` to `path` via a temp file + rename, so a crash or
+    disk-full event mid-write can never leave `path` truncated or
+    half-written -- the original file is left intact until the new one is
+    fully flushed to disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    try:
+        tmp_path.write_text(content)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    _atomic_write_text(path, json.dumps(data, indent=2) + "\n")
 
 
 def _blank_template_value(value):
@@ -93,6 +119,19 @@ def _skeleton_from_example(example_path: Path) -> dict:
     return {key: _blank_template_value(value) for key, value in template.items()}
 
 
+def _existing_partner_person_id(config_path: Path) -> str:
+    """Read the current partner_person_id out of relationship_overrides.json,
+    if it exists, purely so main() can warn about drift -- never used to
+    decide what to write."""
+    if not config_path.exists():
+        return ""
+    try:
+        with open(config_path) as f:
+            return json.load(f).get("partner_person_id", "") or ""
+    except (json.JSONDecodeError, OSError):
+        return ""
+
+
 def _quote_env_value(value: str) -> str:
     """Quote an env value if it contains characters that would otherwise
     be misread (whitespace, '#')."""
@@ -104,11 +143,18 @@ def _quote_env_value(value: str) -> str:
 
 def _find_env_var_line(lines: list[str], key: str) -> Optional[int]:
     """Index of an existing KEY=... line for `key`, preferring an
-    uncommented assignment over a commented-out one. None if absent."""
+    uncommented assignment over a commented-out one. If a key is assigned
+    more than once (a pre-existing anomaly in the file -- dotenv parsers
+    apply the last assignment), the *last* match is returned, so setting
+    the key here actually changes the effective value instead of updating
+    a line an earlier duplicate would still shadow. None if absent."""
     active = re.compile(rf"^{re.escape(key)}=")
+    last_active = None
     for i, line in enumerate(lines):
         if active.match(line):
-            return i
+            last_active = i
+    if last_active is not None:
+        return last_active
     commented = re.compile(rf"^#\s*{re.escape(key)}=")
     for i, line in enumerate(lines):
         if commented.match(line):
@@ -145,7 +191,7 @@ def write_env_updates(env_path: Path, example_path: Path, updates: dict[str, str
         if lines and lines[-1].strip() != "":
             lines.append("")
         lines.extend(to_append)
-    env_path.write_text("\n".join(lines) + "\n")
+    _atomic_write_text(env_path, "\n".join(lines) + "\n")
     return backup
 
 
@@ -187,10 +233,7 @@ def merge_family_config(
                 config["family_person_ids"].append(person_id)
                 existing_ids.add(person_id)
 
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-        f.write("\n")
+    _atomic_write_json(config_path, config)
 
     return {"path": config_path, "backup": backup, "config": config}
 
@@ -219,10 +262,7 @@ def merge_relationship_overrides(
     if partner_person_id:
         config["partner_person_id"] = partner_person_id
 
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-        f.write("\n")
+    _atomic_write_json(config_path, config)
 
     return {"path": config_path, "backup": backup, "config": config}
 
@@ -389,6 +429,12 @@ def main() -> int:
             unmatched.append(partner_name)
             print(f"Could not match '{partner_name}' to an indexed person -- "
                   f"LIFEOS_PARTNER_NAME will still be set.\n")
+            existing_partner_id = _existing_partner_person_id(RELATIONSHIP_CONFIG_PATH)
+            if existing_partner_id:
+                print(f"Note: {RELATIONSHIP_CONFIG_PATH} still has a partner_person_id "
+                      f"from a previous run ({existing_partner_id}) -- it will NOT be "
+                      f"changed since '{partner_name}' didn't match anyone. Re-run and "
+                      f"pick a match to update it.\n")
 
     family_last_names = prompt_list(
         "Family surnames, comma-separated (e.g. 'Smith, Jones'; blank to skip): "

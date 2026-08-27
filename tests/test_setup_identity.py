@@ -7,6 +7,7 @@ and isn't exercised (no server, no stdin). Every test operates on files
 under tmp_path; nothing here ever touches a real .env or config/*.json.
 """
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -19,6 +20,17 @@ from scripts.setup_identity import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+class _FrozenClock:
+    """Stand-in for the `datetime` name backup_file() uses, whose now()
+    always returns the same instant -- simulates two script runs landing
+    in the same microsecond."""
+    def __init__(self, fixed_now):
+        self._fixed_now = fixed_now
+
+    def now(self, tz=None):
+        return self._fixed_now
 
 
 # ============================================================================
@@ -39,6 +51,26 @@ class TestBackupFile:
         assert backup != target
         # Original is untouched by the backup call itself.
         assert target.read_text() == '{"a": 1}'
+
+    def test_same_second_backups_do_not_collide(self, tmp_path, monkeypatch):
+        """Two backups taken in the same wall-clock second (same
+        microsecond, in a mocked clock) must not overwrite each other --
+        the second call gets a distinct name instead of clobbering the
+        first backup."""
+        import scripts.setup_identity as si
+
+        target = tmp_path / "thing.json"
+        target.write_text("version-1")
+        fixed_now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        monkeypatch.setattr(si, "datetime", _FrozenClock(fixed_now))
+
+        first_backup = backup_file(target)
+        target.write_text("version-2")
+        second_backup = backup_file(target)
+
+        assert first_backup != second_backup
+        assert first_backup.read_text() == "version-1"
+        assert second_backup.read_text() == "version-2"
 
 
 # ============================================================================
@@ -105,6 +137,20 @@ class TestWriteEnvUpdates:
         backup = write_env_updates(env_path, example_path, {"LIFEOS_MY_PERSON_ID": "abc-123"})
         assert backup is not None
         assert backup.read_text() == "LIFEOS_USER_NAME=Sam\n"
+
+    def test_duplicate_key_updates_the_line_dotenv_actually_honors(self, tmp_path):
+        """A pre-existing, malformed .env with the same key assigned twice
+        is a pre-existing anomaly this script didn't create -- but since
+        dotenv parsers apply whichever assignment comes last, the script
+        must update *that* line, or its write would have no effect on the
+        value the app actually sees."""
+        env_path = tmp_path / ".env"
+        env_path.write_text("LIFEOS_WORK_DOMAIN=first.com\nLIFEOS_USER_NAME=Sam\nLIFEOS_WORK_DOMAIN=second.com\n")
+        example_path = tmp_path / ".env.example"
+        write_env_updates(env_path, example_path, {"LIFEOS_WORK_DOMAIN": "real.com"})
+        lines = env_path.read_text().splitlines()
+        assert lines[0] == "LIFEOS_WORK_DOMAIN=first.com"
+        assert lines[2] == "LIFEOS_WORK_DOMAIN=real.com"
 
     def test_idempotent_run_twice_produces_same_result(self, tmp_path):
         env_path = tmp_path / ".env"
@@ -315,3 +361,40 @@ class TestApplyIdentityConfig:
         apply_identity_config(**config_paths, work_email_domain="acme.com")
         assert not config_paths["family_config_path"].exists()
         assert not config_paths["relationship_config_path"].exists()
+
+
+# ============================================================================
+# Atomic writes -- a failure partway through must never leave a target file
+# truncated or partially written.
+# ============================================================================
+
+class TestAtomicWrites:
+    def test_env_write_failure_leaves_original_file_untouched(self, tmp_path, monkeypatch):
+        import scripts.setup_identity as si
+
+        env_path = tmp_path / ".env"
+        env_path.write_text("LIFEOS_USER_NAME=Sam\n")
+        example_path = tmp_path / ".env.example"
+
+        monkeypatch.setattr(si.os, "replace", lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full")))
+        with pytest.raises(OSError):
+            write_env_updates(env_path, example_path, {"LIFEOS_MY_PERSON_ID": "abc-123"})
+
+        # The original file must be exactly as it was -- no truncation.
+        assert env_path.read_text() == "LIFEOS_USER_NAME=Sam\n"
+        # No leftover temp file.
+        assert list(tmp_path.glob(".env.tmp-*")) == []
+
+    def test_family_config_write_failure_leaves_original_file_untouched(self, tmp_path, monkeypatch):
+        import scripts.setup_identity as si
+
+        config_path = tmp_path / "family_members.json"
+        original = json.dumps({"family_last_names": ["Ramirez"], "family_person_ids": []})
+        config_path.write_text(original)
+        example_path = tmp_path / "family_members.example.json"
+
+        monkeypatch.setattr(si.os, "replace", lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full")))
+        with pytest.raises(OSError):
+            merge_family_config(config_path, example_path, family_last_names=["Chen"])
+
+        assert config_path.read_text() == original
