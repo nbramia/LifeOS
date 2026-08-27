@@ -877,6 +877,307 @@ def test_default_llm_caller_raises_when_no_client_usable(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# #808 — LIFEOS_AGENT_PREFLIGHT_ENGINE: which client `_default_llm_caller`
+# builds for the preflight classifier call, independent of the #704 auto
+# order. Every test below monkeypatches anthropic_api_key, the full
+# remote_llm_* block, and agent_remote_executor explicitly (in addition to
+# agent_preflight_engine) — a host .env can set any of these ambiently, and
+# an un-monkeypatched one would silently change which branch a test
+# exercises.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_preflight_engine_auto_explicit_matches_704_order(monkeypatch):
+    """Explicit engine="auto" reproduces the #704 Anthropic-first order —
+    no probe of the local llama-server, same client construction. Proves
+    "auto" is a real branch, not just the unset-default case the untouched
+    #704 tests already cover."""
+    from config.settings import settings
+    from api.services.llm_client import AnthropicLLMClient, LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "auto", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "test-anthropic-key", raising=False)
+    monkeypatch.setattr(settings, "agent_preflight_model", "claude-haiku-4-5", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
+
+    captured = {}
+
+    def fake_init(self, api_key=None, model=None):
+        captured["model"] = model
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        return _FakeLLMResponse("anthropic reply")
+
+    monkeypatch.setattr(AnthropicLLMClient, "__init__", fake_init)
+    monkeypatch.setattr(AnthropicLLMClient, "create", fake_create)
+
+    def _forbidden_probe(self):
+        raise AssertionError("auto+key must not probe the local llama-server")
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
+
+    result = pf._default_llm_caller("some prompt")
+
+    assert result == "anthropic reply"
+    assert captured["model"] == "claude-haiku-4-5"
+
+
+@pytest.mark.unit
+def test_preflight_engine_remote_configured_builds_remote_client(monkeypatch):
+    """engine="remote" + remote_llm_configured dispatches to the remote
+    provider FIRST and unprobed — even with a usable Anthropic key AND a
+    reachable local server also available, proving it isn't merely falling
+    into the auto chain's own remote fallback."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "remote", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "unused-anthropic-key", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)  # must not matter for "remote"
+    monkeypatch.setattr(settings, "remote_llm_base_url", "https://remote.example/v1", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "accounts/fireworks/models/deepseek-v4-flash-0731", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "fw_test_key", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_timeout", 42, raising=False)
+
+    def _forbidden_probe(self):
+        raise AssertionError("remote engine must not probe reachability (#706: unprobed by design)")
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
+
+    captured = {}
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        captured["base_url"] = self.base_url
+        captured["model"] = self.model
+        captured["timeout"] = self.timeout
+        captured["auth"] = self._auth_headers()
+        captured["messages"] = messages
+        captured["max_tokens"] = max_tokens
+        captured["temperature"] = temperature
+        return _FakeLLMResponse("remote reply")
+
+    monkeypatch.setattr(LocalLLMClient, "create", fake_create)
+
+    result = pf._default_llm_caller("some prompt")
+
+    assert result == "remote reply"
+    # #706: LocalLLMClient strips one trailing /v1 segment.
+    assert captured["base_url"] == "https://remote.example"
+    assert captured["model"] == "accounts/fireworks/models/deepseek-v4-flash-0731"
+    assert captured["timeout"] == 42
+    assert captured["auth"] == {"Authorization": "Bearer fw_test_key"}
+    assert captured["messages"] == [{"role": "user", "content": "some prompt"}]
+    assert captured["max_tokens"] == 1024
+    assert captured["temperature"] == 0.0
+
+
+@pytest.mark.unit
+def test_preflight_engine_remote_unconfigured_falls_back_to_auto(monkeypatch, caplog):
+    """engine="remote" but the provider isn't configured -> one warning,
+    then run today's `auto` chain (here: Anthropic, since a key is
+    present) rather than raising."""
+    import logging
+    from config.settings import settings
+    from api.services.llm_client import AnthropicLLMClient, LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "remote", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "test-anthropic-key", raising=False)
+    monkeypatch.setattr(settings, "agent_preflight_model", "claude-haiku-4-5", raising=False)
+
+    def fake_init(self, api_key=None, model=None):
+        pass
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        return _FakeLLMResponse("anthropic reply")
+
+    monkeypatch.setattr(AnthropicLLMClient, "__init__", fake_init)
+    monkeypatch.setattr(AnthropicLLMClient, "create", fake_create)
+
+    def _forbidden_probe(self):
+        raise AssertionError("falling back to auto with a key present must not probe local")
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
+
+    with caplog.at_level(logging.WARNING, logger="api.services.agent_worker.preflight"):
+        result = pf._default_llm_caller("some prompt")
+
+    assert result == "anthropic reply"
+    assert any(
+        "remote" in rec.message.lower() and "not configured" in rec.message.lower()
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.unit
+def test_preflight_engine_anthropic_forced(monkeypatch):
+    """engine="anthropic" forces the Anthropic branch when a key is present."""
+    from config.settings import settings
+    from api.services.llm_client import AnthropicLLMClient, LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "anthropic", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "test-anthropic-key", raising=False)
+    monkeypatch.setattr(settings, "agent_preflight_model", "claude-haiku-4-5", raising=False)
+
+    captured = {}
+
+    def fake_init(self, api_key=None, model=None):
+        captured["model"] = model
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        return _FakeLLMResponse("anthropic reply")
+
+    monkeypatch.setattr(AnthropicLLMClient, "__init__", fake_init)
+    monkeypatch.setattr(AnthropicLLMClient, "create", fake_create)
+
+    def _forbidden_probe(self):
+        raise AssertionError("forced anthropic engine must not probe the local llama-server")
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
+
+    result = pf._default_llm_caller("some prompt")
+
+    assert result == "anthropic reply"
+    assert captured["model"] == "claude-haiku-4-5"
+
+
+@pytest.mark.unit
+def test_preflight_engine_anthropic_unconfigured_falls_back_to_auto(monkeypatch, caplog):
+    """engine="anthropic" but no key configured -> one warning, then run
+    today's `auto` chain (here: local, since it's reachable and no remote
+    provider is configured)."""
+    import logging
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "anthropic", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: True)
+
+    captured = {}
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        captured["model"] = self.model
+        return _FakeLLMResponse("local reply")
+
+    monkeypatch.setattr(LocalLLMClient, "create", fake_create)
+
+    with caplog.at_level(logging.WARNING, logger="api.services.agent_worker.preflight"):
+        result = pf._default_llm_caller("some prompt")
+
+    assert result == "local reply"
+    assert captured["model"] == "local"
+    assert any(
+        "anthropic" in rec.message.lower() and "no anthropic api key" in rec.message.lower()
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.unit
+def test_preflight_engine_local_forced_uses_probe(monkeypatch):
+    """engine="local" forces the local client and still probes
+    is_available() — even with an Anthropic key present, proving it isn't
+    falling into the auto chain's Anthropic-first branch."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "local", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "unused-anthropic-key", raising=False)
+
+    probed = {"called": False}
+
+    def fake_is_available(self):
+        probed["called"] = True
+        return True
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", fake_is_available)
+
+    captured = {}
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        captured["model"] = self.model
+        return _FakeLLMResponse("local reply")
+
+    monkeypatch.setattr(LocalLLMClient, "create", fake_create)
+
+    result = pf._default_llm_caller("some prompt")
+
+    assert result == "local reply"
+    assert probed["called"] is True
+    assert captured["model"] == "local"
+
+
+@pytest.mark.unit
+def test_preflight_engine_local_forced_raises_when_unreachable(monkeypatch):
+    """engine="local" forced with an unreachable server raises rather than
+    silently falling back to another engine — there's no further engine to
+    fall back to for a forced value. `run_preflight`'s existing except-
+    clause still degrades this to sane=False/ask, unchanged."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "local", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: False)
+
+    with pytest.raises(RuntimeError):
+        pf._default_llm_caller("some prompt")
+
+    result = pf.run_preflight("do the thing", tags=["agent"], caller=None)
+    assert result.sane is False
+    assert result.routing == pf.ROUTE_ASK
+
+
+@pytest.mark.unit
+def test_preflight_engine_invalid_value_falls_back_to_auto(monkeypatch, caplog):
+    """An unrecognized LIFEOS_AGENT_PREFLIGHT_ENGINE value never crashes —
+    it's treated as `auto` (with a logged warning), mirroring
+    `_apply_default_route`'s own invalid-value handling."""
+    import logging
+    from config.settings import settings
+    from api.services.llm_client import AnthropicLLMClient, LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_preflight_engine", "bogus-value", raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", "test-anthropic-key", raising=False)
+    monkeypatch.setattr(settings, "agent_preflight_model", "claude-haiku-4-5", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
+
+    def fake_init(self, api_key=None, model=None):
+        pass
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        return _FakeLLMResponse("anthropic reply")
+
+    monkeypatch.setattr(AnthropicLLMClient, "__init__", fake_init)
+    monkeypatch.setattr(AnthropicLLMClient, "create", fake_create)
+
+    def _forbidden_probe(self):
+        raise AssertionError("invalid engine treated as auto+key must not probe local")
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
+
+    with caplog.at_level(logging.WARNING, logger="api.services.agent_worker.preflight"):
+        result = pf._default_llm_caller("some prompt")
+
+    assert result == "anthropic reply"
+    assert any("invalid" in rec.message.lower() for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
 # #707 — LIFEOS_AGENT_DEFAULT_ROUTE: route "ask for lack of cues" outcomes
 # instead of blocking, on installs with exactly one executor.
 # ---------------------------------------------------------------------------
