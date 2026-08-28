@@ -5,16 +5,14 @@ Tests end-to-end workflows with real components.
 NOTE: Imports are deferred to avoid loading heavy dependencies (ChromaDB,
 sentence-transformers) during pytest collection, which would slow down unit tests.
 """
+import tempfile
+import time
+from pathlib import Path
+
 import pytest
 
 # These are full integration tests requiring ChromaDB (slow)
 pytestmark = pytest.mark.slow
-
-# Standard library imports are fine at module level (lightweight)
-import tempfile
-import time
-from pathlib import Path
-from datetime import datetime
 
 
 class TestFullIndexingWorkflow:
@@ -202,7 +200,8 @@ This document describes the technical architecture of the LifeOS system.
 
     def test_watch_and_update(self, test_vault, temp_db):
         """File changes should be detected and indexed."""
-        from api.services.indexer import IndexerService
+        from api.services.indexer import IndexerService, VaultEventHandler
+        from tests.conftest import wait_for_condition
 
         indexer = IndexerService(
             vault_path=str(test_vault),
@@ -210,7 +209,6 @@ This document describes the technical architecture of the LifeOS system.
         )
 
         indexer.index_all()
-        initial_count = indexer.vector_store.get_document_count()
 
         # Start watching
         indexer.start_watching()
@@ -223,8 +221,14 @@ This document describes the technical architecture of the LifeOS system.
 Had an interesting thought about product strategy today.
 """)
 
-        # Wait for indexing
-        time.sleep(4)
+        # Wait for the watcher's batch debounce to flush and index the file,
+        # rather than sleeping a fixed duration that can undershoot it (#839).
+        def _indexed():
+            return any(fp.endswith("new_thought.md") for fp in indexer.vector_store.get_all_file_paths())
+
+        assert wait_for_condition(_indexed, timeout=VaultEventHandler._BATCH_DELAY + 30), (
+            "watcher did not index the new file within the timeout"
+        )
 
         # Search should find new content
         results = indexer.vector_store.search("product strategy insight")
