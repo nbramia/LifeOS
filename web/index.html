@@ -698,10 +698,16 @@
 
         /* LifeOS|Agent|Hermes text-backend selector (#361, three-way in #587);
            shown only when at least one of Agent/Hermes is configured
-           server-side (body.agent-available / body.hermes-available). Each
+           server-side (body.agent-available / body.hermes-configured). Each
            non-lifeos option additionally hides itself unless ITS backend is
            configured, so a machine with only one configured still gets a
            clean two-way toggle rather than a dead third button.
+
+           Hermes visibility gates on -configured, not -available (#688):
+           a configured-but-unreachable Hermes must stay visible (marked
+           unavailable via body.hermes-down below), not vanish
+           indistinguishably from "never configured". Agent has no such
+           split yet, so it still gates on -available.
 
            .mode-toggle-group shares this same pill shape for the Text|Voice
            input-mode selector (#684) — unlike the backend toggle it has no
@@ -722,7 +728,7 @@
         }
 
         body.agent-available .backend-toggle,
-        body.hermes-available .backend-toggle {
+        body.hermes-configured .backend-toggle {
             display: inline-flex;
         }
 
@@ -750,8 +756,20 @@
             display: none;
         }
 
-        body.hermes-available #backendHermes {
+        body.hermes-configured #backendHermes {
             display: inline-block;
+        }
+
+        /* Configured but unreachable (#688): visible, not silently hidden,
+           but visually marked as down and not clickable (backend.js's click
+           handler also refuses the switch — this is belt-and-suspenders). */
+        body.hermes-down #backendHermes {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        body.hermes-down #backendHermes::after {
+            content: " (unavailable)";
         }
 
         /* Agent mode has no personas — hide the picker (and, since the model

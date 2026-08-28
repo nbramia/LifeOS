@@ -8,6 +8,7 @@ voice, agent, and hermes proxies stay in lockstep.
 import asyncio
 import json
 import logging
+import time
 from typing import Callable, Optional
 
 import httpx
@@ -18,6 +19,63 @@ from config.settings import settings
 from api.services.chat_turns import get_turn_registry
 
 logger = logging.getLogger(__name__)
+
+# Reachability probe cache (#688): base_url -> (expires_at monotonic, reachable).
+# A backend can be *configured* (a URL is set) while its process is actually
+# down, and treating "configured" alone as "available" left `/chat` defaulting
+# to a dead backend and failing every turn at send time instead of falling
+# back to lifeos. Caching with a short TTL means /status never adds a
+# round-trip to every page load and never hammers a downed backend either —
+# it's re-probed at most once per TTL window. Keyed by base_url (not by
+# backend) so agent and hermes, if both opted in, never collide.
+_REACHABILITY_CACHE: dict[str, tuple[float, bool]] = {}
+_REACHABILITY_CACHE_TTL_SECONDS = 30
+_REACHABILITY_PROBE_TIMEOUT = httpx.Timeout(2.0)
+# One lock per base_url so concurrent /status calls that land in the same
+# expiry window (e.g. two browser tabs loading at once) share a single
+# in-flight probe instead of each firing their own — without this, "hammers
+# a downed backend" was only true for strictly sequential callers, not
+# concurrent ones.
+_REACHABILITY_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+async def _probe_reachable(client_factory: Callable[[], httpx.AsyncClient], base_url: str, backend_label: str) -> bool:
+    """Cheap, cached reachability probe for a configured backend (#688).
+
+    Any HTTP response at all — even a 404 — proves the process behind
+    `base_url` is up and answering; this isn't assumed to expose `/health`,
+    so only a connection-level failure (refused, timed out, DNS failure)
+    counts as unreachable. Uses the same `client_factory()` seam the real
+    proxy call uses (with a short per-request timeout override) so tests can
+    route this through the same in-process ASGI transport, no sockets
+    involved either way.
+    """
+    now = time.monotonic()
+    cached = _REACHABILITY_CACHE.get(base_url)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    lock = _REACHABILITY_LOCKS.setdefault(base_url, asyncio.Lock())
+    async with lock:
+        # Re-check now that we hold the lock: whoever got here first may
+        # have already refreshed the cache while we were waiting.
+        now = time.monotonic()
+        cached = _REACHABILITY_CACHE.get(base_url)
+        if cached and cached[0] > now:
+            return cached[1]
+
+        reachable = False
+        client = client_factory()
+        try:
+            await client.get(f"{base_url.rstrip('/')}/health", timeout=_REACHABILITY_PROBE_TIMEOUT)
+            reachable = True
+        except (httpx.RequestError, httpx.InvalidURL) as e:
+            logger.warning(f"{backend_label} backend at {base_url} is configured but unreachable: {e}")
+        finally:
+            await client.aclose()
+
+        _REACHABILITY_CACHE[base_url] = (now + _REACHABILITY_CACHE_TTL_SECONDS, reachable)
+        return reachable
 
 # Voice/agent turns run STT → LLM → TTS and can take a while; a generous read
 # budget so long turns aren't cut off.
@@ -81,6 +139,7 @@ def make_backend_router(
     transform_body: Optional[Callable[[bytes], bytes]] = None,
     make_observer: Optional[Callable[[bytes], Optional[object]]] = None,
     pre_send: Optional[Callable[[bytes], list]] = None,
+    probe_reachability: bool = False,
 ):
     """Build a `status` + `ask/stream` reverse-proxy router for a text backend.
 
@@ -183,13 +242,34 @@ def make_backend_router(
     something for this request. Every other request (no `pre_send`, or one
     that returns `[]` for this particular request — e.g. every non-journal
     Hermes turn) takes the plain path, completely unchanged.
+
+    `probe_reachability` (#688) opts `/status` into a cached reachability
+    probe (see `_probe_reachable`) rather than reporting configuration alone.
+    Default False leaves a caller (the Agent backend, as of this writing)
+    byte-identical to before this parameter existed: `available` is exactly
+    `bool(getattr(settings, url_attr))`, no network call. True (Hermes) makes
+    `available` true only when the backend is BOTH configured and reachable,
+    and adds `configured`/`reachable` fields so a caller can distinguish "not
+    set up" from "set up but down" — `available` alone collapsed those into
+    one silent-failure mode.
     """
     router = APIRouter(prefix=prefix, tags=[tag])
 
     @router.get("/status")
     async def status():
-        """Whether this text backend is configured (drives the UI selector)."""
-        return {"available": bool(getattr(settings, url_attr))}
+        """Whether this text backend is configured (and, if
+        `probe_reachability`, reachable) — drives the UI selector."""
+        base_url = getattr(settings, url_attr)
+        configured = bool(base_url)
+        if probe_reachability and configured:
+            reachable = await _probe_reachable(client_factory, base_url, backend_label)
+        else:
+            reachable = configured
+        return {
+            "available": configured and reachable,
+            "configured": configured,
+            "reachable": reachable,
+        }
 
     @router.post("/ask/stream")
     async def ask_stream(request: Request):

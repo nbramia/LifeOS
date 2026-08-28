@@ -113,21 +113,32 @@ function restoreBackendConversation() {
   }
 }
 
-// GET a backend's /status endpoint and report whether it's configured.
+// GET a backend's /status endpoint and report configured/reachable/available.
 // Bounded by STATUS_TIMEOUT_MS and never throws — any failure (network error,
-// non-2xx, timeout) reports unavailable, which is exactly the "fall back to
-// lifeos" behavior #587 requires.
+// non-2xx, timeout) reports everything false, which is exactly the "fall
+// back to lifeos" behavior #587 requires.
+//
+// `configured`/`reachable` (#688) let the UI distinguish "not set up" (fully
+// hidden, unchanged) from "set up but down" (visible, but not selectable —
+// see applyBackendUi()). A backend whose /status doesn't send those fields
+// (the Agent backend, as of this writing — it doesn't opt into the
+// reachability probe server-side) falls back to `available` for both, so it
+// behaves exactly as before this field split existed: configured and
+// reachable are the same single check.
 async function checkAvailable(url) {
-  if (!url) return false;
+  if (!url) return { available: false, configured: false, reachable: false };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), STATUS_TIMEOUT_MS);
   try {
     const resp = await fetch(url, { signal: controller.signal });
-    if (!resp.ok) return false;
+    if (!resp.ok) return { available: false, configured: false, reachable: false };
     const data = await resp.json();
-    return !!data.available;
+    const available = !!data.available;
+    const configured = typeof data.configured === 'boolean' ? data.configured : available;
+    const reachable = typeof data.reachable === 'boolean' ? data.reachable : available;
+    return { available, configured, reachable };
   } catch (e) {
-    return false;
+    return { available: false, configured: false, reachable: false };
   } finally {
     clearTimeout(timer);
   }
@@ -139,23 +150,38 @@ export async function initBackend(personasReady) {
   state.isLoading = true;
   if (elements.sendBtn) elements.sendBtn.disabled = true;
 
-  const [agentAvailable, hermesAvailable] = await Promise.all([
+  const [agentStatus, hermesStatus] = await Promise.all([
     checkAvailable(endpoints.agentStatus),
     checkAvailable(endpoints.hermesStatus),
   ]);
-  document.body.classList.toggle('agent-available', agentAvailable);
-  document.body.classList.toggle('hermes-available', hermesAvailable);
+  document.body.classList.toggle('agent-available', agentStatus.available);
+  document.body.classList.toggle('hermes-available', hermesStatus.available);
+  // Drives visibility (unlike -available, stays true while merely down —
+  // #688: a configured-but-unreachable Hermes must stay visible, marked
+  // unavailable, not vanish indistinguishably from "never configured").
+  document.body.classList.toggle('hermes-configured', hermesStatus.configured);
+  // The one state that's visible but not selectable: configured, not reachable.
+  const hermesDown = hermesStatus.configured && !hermesStatus.reachable;
+  document.body.classList.toggle('hermes-down', hermesDown);
+  if (elements.backendHermes) {
+    elements.backendHermes.title = hermesDown
+      ? 'Hermes backend (unavailable — unreachable)'
+      : 'Hermes backend';
+  }
 
   // Stored preference wins; otherwise default to hermes if available, else
   // lifeos. A stored preference for a backend that's no longer configured
   // (e.g. disabled since the last visit) must not strand the UI on a hidden
-  // option, so it's re-validated against availability too.
+  // option, so it's re-validated against availability too. "Available" here
+  // already means configured AND reachable (#688) — a down Hermes falls back
+  // to lifeos exactly like an unconfigured one, never failing a turn at send
+  // time.
   let mode = getStoredBackendMode();
   if (!mode) {
-    mode = hermesAvailable ? 'hermes' : 'lifeos';
-  } else if (mode === 'agent' && !agentAvailable) {
+    mode = hermesStatus.available ? 'hermes' : 'lifeos';
+  } else if (mode === 'agent' && !agentStatus.available) {
     mode = 'lifeos';
-  } else if (mode === 'hermes' && !hermesAvailable) {
+  } else if (mode === 'hermes' && !hermesStatus.available) {
     mode = 'lifeos';
   }
   currentMode = mode;
@@ -163,7 +189,15 @@ export async function initBackend(personasReady) {
 
   if (elements.backendLifeos) elements.backendLifeos.addEventListener('click', () => setBackendMode('lifeos'));
   if (elements.backendAgent) elements.backendAgent.addEventListener('click', () => setBackendMode('agent'));
-  if (elements.backendHermes) elements.backendHermes.addEventListener('click', () => setBackendMode('hermes'));
+  if (elements.backendHermes) {
+    elements.backendHermes.addEventListener('click', () => {
+      // A visible-but-down Hermes (#688) is not clickable — selecting it
+      // would just fail every turn at send time instead of the visible,
+      // once-per-load degradation this state already represents.
+      if (document.body.classList.contains('hermes-down')) return;
+      setBackendMode('hermes');
+    });
+  }
   applyBackendUi();
 
   // The sidebar's single initial load (#607) — gated on BOTH resolutions, not
