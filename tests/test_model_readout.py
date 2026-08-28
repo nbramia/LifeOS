@@ -12,6 +12,8 @@ override the way an actually-observed turn can) — those tests call
 `api/routes/hermes_proxy.py` calls from a real turn's `usage` event.
 """
 
+from unittest.mock import MagicMock
+
 import httpx
 import pytest
 from fastapi import FastAPI, Request
@@ -217,6 +219,16 @@ async def test_health_full_includes_the_model_readout(monkeypatch):
     monkeypatch.setattr(main.settings, "llm_backend", "anthropic")
     monkeypatch.setattr(main.settings, "anthropic_model", "claude-haiku-4-5")
     monkeypatch.setattr(main.settings, "hermes_backend_url", "")
+    # `full_health_check()`'s vault-root sanity check (#762) reaches the
+    # real `get_vector_store()` singleton whenever the vault_search probe
+    # reports "ok" -- which it does on a host that happens to have a live
+    # LifeOS API + ChromaDB running. That's a live-store touch this test
+    # doesn't need; stub it to raise, which `_check_vault_root_sanity`'s own
+    # `except Exception` already treats as a benign hiccup (#828).
+    monkeypatch.setattr(
+        "api.services.vectorstore.get_vector_store",
+        MagicMock(side_effect=Exception("no live vector store in tests (#828)")),
+    )
 
     result = await main.full_health_check()
 

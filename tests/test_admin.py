@@ -20,11 +20,13 @@ class TestAdminEndpoints:
         """Create test client."""
         return TestClient(app)
 
+    @pytest.mark.uses_live_vectorstore  # /api/admin/status reads the real VectorStore for document_count (#828)
     def test_status_endpoint_exists(self, client):
         """Status endpoint should exist."""
         response = client.get("/api/admin/status")
         assert response.status_code == 200
 
+    @pytest.mark.uses_live_vectorstore  # /api/admin/status reads the real VectorStore for document_count (#828)
     def test_status_returns_structure(self, client):
         """Status should return required fields."""
         response = client.get("/api/admin/status")
@@ -34,6 +36,7 @@ class TestAdminEndpoints:
         assert "document_count" in data
         assert "vault_path" in data
 
+    @pytest.mark.uses_live_vectorstore  # /api/admin/status reads the real VectorStore for document_count (#828)
     def test_status_ignores_stale_running_reindex_job(self, client):
         """#768: a `reindex_vault` job stuck "running" because the process
         that was executing it restarted mid-job (e.g. an unrelated
@@ -54,6 +57,7 @@ class TestAdminEndpoints:
             data = response.json()
             assert data["status"] != "reindexing"
 
+    @pytest.mark.uses_live_vectorstore  # /api/admin/status reads the real VectorStore for document_count (#828)
     def test_status_reports_reindexing_for_a_genuinely_running_job(self, client):
         """Regression guard: a job actually claimed by this process (started
         after process_start_time) must still report "reindexing"."""

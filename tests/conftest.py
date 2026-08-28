@@ -311,6 +311,82 @@ def _isolate_vault_indexer_stores(tmp_path, monkeypatch):
             pass
 
 
+# Collection names `VectorStore` actually writes to on a real install:
+# ``lifeos_vault`` (the class default, and the one ``get_vector_store()``'s
+# process-wide singleton resolves to), ``lifeos_people``
+# (``api/services/person_indexer.py::PERSON_COLLECTION``), ``lifeos_slack``
+# (``api/services/slack_indexer.py::SLACK_COLLECTION``), and
+# ``lifeos_calendar`` (``api/services/calendar_indexer.py::CALENDAR_COLLECTION``,
+# declared there even though that indexer currently writes through the
+# vault-default singleton instead — see #828 investigation). Kept here rather
+# than imported from those modules to avoid a reverse dependency (they import
+# ``VectorStore`` from ``api.services.vectorstore``, not the other way round).
+_LIVE_VECTORSTORE_COLLECTIONS = frozenset(
+    {"lifeos_vault", "lifeos_people", "lifeos_slack", "lifeos_calendar"}
+)
+
+
+@pytest.fixture(autouse=True)
+def _guard_live_vectorstore_collections(request, monkeypatch):
+    """Fail loudly if a test constructs a ``VectorStore`` against a real
+    production collection on the live ChromaDB server (#828).
+
+    ``VectorStore`` always opens a real HTTP connection
+    (``chromadb.HttpClient`` to ``settings.chroma_url``, which defaults to
+    the maintainer's real server) — unlike the SQLite-backed stores
+    elsewhere in this file, there is no local persist-dir to redirect to.
+    ``_isolate_vault_indexer_stores`` above isolates the vault-indexing path
+    by renaming the collection before construction; this fixture is the
+    backstop for every *other* call site. About thirty rows with
+    ``/tmp/tmpXXXXXXXX/vault/...`` file_paths and real vault ``note_type``
+    values turned up in the live ``lifeos_vault`` collection (#828) — almost
+    certainly debris from a test run that predates (or bypassed) that
+    per-collection isolation.
+
+    Rather than patch each of the many ``VectorStore()`` / ``get_vector_store()``
+    call sites individually (``api/routes/{admin,chat,search}.py``,
+    ``api/services/{hybrid_search,person_indexer,slack_indexer,calendar_indexer}.py``),
+    this patches the class's ``__init__`` in place: every one of those call
+    sites imported the same class object (``from api.services.vectorstore
+    import VectorStore``, or via ``get_vector_store()`` which resolves the
+    bare name in ``vectorstore.py``'s own globals either way), so mutating
+    its ``__init__`` catches all of them regardless of which module's
+    namespace holds the reference — unlike #652's ``SessionStore`` fix,
+    which had to swap the *class name* because that bug was about a default
+    argument bound once at class-definition time; here we're validating an
+    incoming argument, not changing a default, so patching the method
+    in place is enough and doesn't disturb ``_isolate_vault_indexer_stores``'s
+    own wrapper (it still resolves to the same, now-guarded, class).
+
+    Tests that legitimately need the real store opt in with
+    ``@pytest.mark.uses_live_vectorstore`` (e.g. ``test_admin.py``'s
+    ``/api/admin/status`` checks, ``test_search_api.py``'s ``/api/search``
+    integration tests — both read-only, both require ``TestClient(app)``
+    wired to the real service to mean anything).
+    """
+    if request.node.get_closest_marker("uses_live_vectorstore"):
+        return
+
+    import api.services.vectorstore as vectorstore_mod
+
+    _real_init = vectorstore_mod.VectorStore.__init__
+
+    def _guarded_init(self, collection_name="lifeos_vault", server_url=None):
+        if collection_name in _LIVE_VECTORSTORE_COLLECTIONS:
+            pytest.fail(
+                f"{request.node.nodeid} constructed "
+                f"VectorStore(collection_name={collection_name!r}), which "
+                "points at a live production ChromaDB collection. Isolate "
+                "the test with a throwaway collection name (see "
+                "_isolate_vault_indexer_stores above), or mark it "
+                "@pytest.mark.uses_live_vectorstore if it must legitimately "
+                "talk to the live store (#828)."
+            )
+        _real_init(self, collection_name=collection_name, server_url=server_url)
+
+    monkeypatch.setattr(vectorstore_mod.VectorStore, "__init__", _guarded_init)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_telegram_state_file(tmp_path, monkeypatch):
     """Keep tests off the production Telegram offset file (#357).

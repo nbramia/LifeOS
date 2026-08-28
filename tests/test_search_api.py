@@ -10,13 +10,14 @@ P1.2 Acceptance Criteria:
 - Invalid filters return 400 with clear message
 """
 import pytest
-
-# These tests use TestClient which initializes the app (slow)
-pytestmark = pytest.mark.slow
-from datetime import datetime, timedelta
 from fastapi.testclient import TestClient
 
 from api.main import app
+
+# These tests use TestClient which initializes the app (slow), and hit
+# /api/search unmocked -- they need the real VectorStore/live ChromaDB
+# collection to mean anything (#828).
+pytestmark = [pytest.mark.slow, pytest.mark.uses_live_vectorstore]
 
 
 class TestSearchEndpoint:
