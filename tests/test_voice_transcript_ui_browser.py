@@ -277,19 +277,34 @@ class TestEagerTranscriptRendering:
         this tab's own Cancel button. The eagerly-rendered bubble must not
         survive that path either, even though this tab's activeTurnAbort was
         never triggered locally."""
+        # '__gate' holds the stream open between 'transcript' and 'cancelled'
+        # so the mid-turn state (bubble rendered, Cancel button shown) can be
+        # asserted deterministically instead of racing the ~10ms it'd
+        # otherwise take the mock to run straight through to 'cancelled'.
         _open_voice_chat(
             page,
             chat_base_url,
             frames=[
+                {"type": "started", "turn_id": "turn-1"},
                 {"type": "transcript", "text": "remind me to call mom"},
+                "__gate",
                 {"type": "cancelled"},
             ],
         )
         _fire_turn(page, blob=None)
         expect(page.locator("#messages .message.user")).to_have_count(1)
+        expect(page.locator("#voiceCancelBtn")).to_have_class("voice-cancel-btn visible")
+        _release(page)
         page.wait_for_function(
             "document.querySelectorAll('#messages .message.user').length === 0"
         )
+        # This path never runs cancelActiveTurn() (no local Cancel tap), so
+        # it's the only place proving submitTurn()'s own AbortError handling
+        # resets the thinking placeholder, Cancel button, and status text
+        # itself rather than assuming a local cancel handler already did.
+        expect(page.locator("#messages .message.assistant .typing")).to_have_count(0)
+        expect(page.locator("#statusText")).to_have_text("Ready")
+        expect(page.locator("#voiceCancelBtn")).to_have_class("voice-cancel-btn")
 
     def test_failed_turn_keeps_the_user_bubble(self, page: Page, chat_base_url):
         """A turn that errors out is not a cancellation -- the user really did

@@ -2586,7 +2586,22 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
     setStatus('', 'Ready');
     await maybeAutoContinue();  // re-record if Auto-continue is on
   } catch (err) {
-    if (err?.name === 'AbortError') return;  // cancelled — the cancel handler resets UI
+    if (err?.name === 'AbortError') {
+      // A local Cancel-button tap runs cancelActiveTurn() synchronously
+      // before this ever settles -- it already reset thinking/cancel/status
+      // and nulled activeTurnAbort, so redoing that here would risk
+      // clobbering a next turn that started in the meantime. A turn
+      // cancelled server-side (the 'cancelled' SSE branch above, reachable
+      // with no local cancelActiveTurn() call -- see #827) never goes
+      // through that reset, and activeTurnAbort is still this turn's own
+      // controller in that case, so do it here instead.
+      if (activeTurnAbort) {
+        clearThinking();
+        showCancel(false);
+        setStatus('', 'Ready');
+      }
+      return;
+    }
     clearThinking();
     showCancel(false);
     // #801 -- a mid-stream drop (the SSE stream died after a genuine `ok`
