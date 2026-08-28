@@ -53,6 +53,25 @@ let voiceBusy = false;
 
 let activeTurnId = null;
 let activeTurnAbort = null;
+// True if `token` — an object `{ abort, id }` some submitTurn() call
+// captured as its own right after creating it (see `ownTurn` below) — still
+// identifies the turn currently in flight (by its AbortController's
+// identity, not its `id`: `id` starts null and is filled in only once the
+// server's `started` frame arrives, so it can't be the thing distinguishing
+// "mine" from "not mine" at submit time). False once a newer turn has
+// replaced it, whether via a fresh submitTurn() call or cancelActiveTurn()
+// clearing it first. Every settling path below (the success reconciliation,
+// the AbortError branch, mid-stream-drop recovery, terminal failure, and the
+// SSE handlers in consumeTurnStream) checks this before touching module
+// state shared across turns, so a stale turn settling late can't clobber a
+// newer turn's bookkeeping (#832) — the identity check #827 introduced for
+// one branch, generalized to every exit path. `token.id`, once known, is
+// used the other way around: to actively cancel a turn that's ALREADY been
+// superseded (submitTurn()'s own supersession below, and the `started`
+// handler's late-id case) rather than to decide what's superseded.
+function isOwnTurn(token) {
+  return activeTurnAbort === token.abort;
+}
 let activeAudios = [];
 let playbackChain = Promise.resolve();
 // Whether a real clip is currently loading/playing, on *either* the shared
@@ -2214,21 +2233,70 @@ function parseSseChunk(buffer, onEvent) {
   return remainder;
 }
 
-async function consumeTurnStream(response) {
-  playbackChain = Promise.resolve();
-  reportedPlaybackFailure = false;
+// Best-effort: tells the relay a turn is over so it can stop running (LLM +
+// TTS) rather than finish unseen. Fire-and-forget, same as every other
+// cancel-POST in this file -- nothing here can act on a failure to reach the
+// gateway, and this is already the "as a courtesy" cleanup path, not the
+// primary abort mechanism (the AbortController is that).
+function postTurnCancel(turnId) {
+  fetch(`${endpoints.voice}/turn/${encodeURIComponent(turnId)}/cancel`, { method: 'POST' }).catch(() => {});
+}
+
+async function consumeTurnStream(response, ownTurn) {
+  // Found on review (#832/F1): the reset below is reachable even when this
+  // turn has ALREADY been superseded -- a fetch() promise can resolve with a
+  // Response even after its signal fires (the abort races the "headers
+  // already arrived" resolution), so postTurnStart() returning doesn't
+  // guarantee this turn is still current by the time its OWN consumeTurnStream
+  // call is entered. Gated like everything else that touches shared state.
+  if (isOwnTurn(ownTurn)) {
+    playbackChain = Promise.resolve();
+    reportedPlaybackFailure = false;
+  }
   let doneData = null;
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
 
   const handleEvent = (event) => {
+    // A turn's events arrive progressively over the life of this stream --
+    // long enough for a newer turn to have started in the meantime (the user
+    // cancelled and immediately re-recorded). `isOwnTurn` gates every branch
+    // below that would otherwise touch module state a newer turn now owns
+    // (#832); `doneData` is this call's own local, so it's always safe to
+    // set regardless.
     if (event.type === 'started') {
-      activeTurnId = event.turn_id;
-      showCancel(true);
+      // Recorded on `ownTurn` itself unconditionally (#832/F2), even when
+      // this turn no longer owns anything -- submitTurn()'s own supersession
+      // logic can only abort+cancel a turn whose id it already knows, and a
+      // turn superseded before its `started` frame arrived has no id to give
+      // it yet. Filling this in lets a turn cancel itself the moment its own
+      // id becomes known, below.
+      ownTurn.id = event.turn_id;
+      if (isOwnTurn(ownTurn)) {
+        activeTurnId = event.turn_id;
+        showCancel(true);
+      } else {
+        // Defense-in-depth, not the common case (found on independent
+        // review, #832/N1): a real fetch() errors its body stream the
+        // instant its own AbortController fires, and reading it resumes
+        // into one synchronous reader.read()-resolves -> parseSseChunk ->
+        // handleEvent block -- so a turn superseded BEFORE its `started`
+        // frame was ever sent can't reach this branch at all in a real
+        // browser; the connection is simply gone before the id exists to
+        // act on. This exists for the narrower, still-real race where the
+        // frame was already in flight over the wire a moment before the
+        // abort (the same class of race #832/F1's postTurnStart()-resolves-
+        // after-abort comment describes) -- close enough behind the abort
+        // that this handler still runs once more before the stream
+        // actually tears down. Either way, finish the job the abort alone
+        // couldn't: tell the server to stop, so the turn doesn't run to
+        // completion (LLM + TTS) unseen.
+        postTurnCancel(event.turn_id);
+      }
     }
     if (event.type === 'transcript') {
-      renderUserTranscript(event.text);
+      if (isOwnTurn(ownTurn)) renderUserTranscript(event.text);
     }
     if (event.type === 'cancelled') {
       // This frame means the turn was cancelled server-side -- possibly by
@@ -2237,8 +2305,9 @@ async function consumeTurnStream(response) {
       // can just as easily be cancelled from elsewhere (another tab/device
       // on the same conversation). Clear here too so an externally-cancelled
       // turn leaves no trace either -- idempotent if cancelActiveTurn()
-      // already ran.
-      clearUserTranscript();
+      // already ran. Gated the same as every other branch here: a newer
+      // turn's own bubble must survive a stale cancel arriving late (#832).
+      if (isOwnTurn(ownTurn)) clearUserTranscript();
       throw new DOMException('Turn cancelled', 'AbortError');
     }
     if (event.type === 'error') {
@@ -2255,13 +2324,17 @@ async function consumeTurnStream(response) {
       throw error;
     }
     if (event.type === 'status_audio') {
-      if (event.message) setStatus('loading', event.message);  // spoken status text
-      if (shouldPlayAudio() && event.url) {
+      if (event.message && isOwnTurn(ownTurn)) setStatus('loading', event.message);  // spoken status text
+      // Gated (#832/F1): ungated, a stale turn's own clip queues onto the
+      // shared playbackChain a newer turn's `await playbackChain` then waits
+      // on -- the newer turn's status text stays right, but the user hears
+      // the stale turn's audio play out anyway.
+      if (isOwnTurn(ownTurn) && shouldPlayAudio() && event.url) {
         enqueueClip(event.url);
       }
     }
     if (event.type === 'main_audio') {
-      if (shouldPlayAudio() && event.url) {
+      if (isOwnTurn(ownTurn) && shouldPlayAudio() && event.url) {
         enqueueClip(event.url);
       }
     }
@@ -2412,13 +2485,43 @@ async function backoffBeforeRetry(attempt, signal) {
 const MIDSTREAM_POLL_ATTEMPTS = 3;
 const MIDSTREAM_POLL_INTERVAL_MS = 1500;
 
-async function pollForCompletedAudio(turnId) {
+// Rejects like waitForRetry() does if `signal` fires first -- same shape,
+// separate function because this poll's interval is fixed (never jittered),
+// and test_voice_network_resilience_ui_browser.py already asserts on that
+// exact 1500ms spacing via page.clock.fast_forward(1600).
+function sleepAbortable(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(new DOMException('Turn cancelled', 'AbortError')); return; }
+    const timer = setTimeout(() => { cleanup(); resolve(); }, ms);
+    const onAbort = () => { cleanup(); reject(new DOMException('Turn cancelled', 'AbortError')); };
+    function cleanup() {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+    }
+    signal.addEventListener('abort', onAbort);
+  });
+}
+
+// `signal` (#832/F5): this poll used to run its own ~3s budget deaf to
+// cancellation -- neither a Cancel tap nor a newer turn superseding this one
+// (submitTurn()'s own abort() on supersession) stopped it, because its sleep
+// was a bare setTimeout and its HEAD fetch carried no signal at all. Both are
+// wired to the turn's own AbortController now, so aborting it (from either
+// source) ends the poll immediately instead of after its full budget.
+async function pollForCompletedAudio(turnId, signal) {
   for (let i = 0; i < MIDSTREAM_POLL_ATTEMPTS; i += 1) {
-    if (i > 0) await new Promise((r) => setTimeout(r, MIDSTREAM_POLL_INTERVAL_MS));
+    if (i > 0) {
+      try {
+        await sleepAbortable(MIDSTREAM_POLL_INTERVAL_MS, signal);
+      } catch (e) {
+        return false; // aborted mid-wait -- no verdict, same as "not found"
+      }
+    }
     try {
-      const res = await fetch(`${endpoints.voice}/audio/${encodeURIComponent(turnId)}`, { method: 'HEAD' });
+      const res = await fetch(`${endpoints.voice}/audio/${encodeURIComponent(turnId)}`, { method: 'HEAD', signal });
       if (res.ok) return true;
     } catch (e) {
+      if (e?.name === 'AbortError') return false;
       /* unreachable -- keep polling within the budget, same as "not found yet" */
     }
   }
@@ -2450,11 +2553,22 @@ function handleTerminalFailure(message) {
   );
 }
 
-async function handleMidStreamDrop(err) {
+// `ownTurn` is checked after the poll's await -- a newer turn may have
+// started while it ran (#832, generalizing the identity check #827
+// introduced for one branch). No entry-time check: this function's only
+// caller already checks isOwnTurn() with no await before calling it (found
+// on independent review, #832/N2 -- a prior version of this comment claimed
+// an entry-time race that the code couldn't actually produce), so an
+// identical check here would never fire. The poll itself also carries
+// `ownTurn`'s own signal (#832/F5), so a supersession's abort() ends it
+// immediately rather than after its full ~3s budget.
+async function handleMidStreamDrop(err, ownTurn) {
   const turnId = activeTurnId;
   if (turnId) {
     setStatus('loading', 'Reconnecting…');
-    if (await pollForCompletedAudio(turnId)) {
+    const completed = await pollForCompletedAudio(turnId, ownTurn.abort.signal);
+    if (!isOwnTurn(ownTurn)) return;
+    if (completed) {
       recoverCompletedTurn(turnId);
       return;
     }
@@ -2493,18 +2607,41 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
   // `transcript` SSE event instead.
   renderUserTranscript(transcript);
   showThinking();
+
+  // #832/F2: this turn supersedes whatever was still active -- abort its
+  // connection and, if its id is already known, tell the relay to stop
+  // running it too (best-effort; if the id isn't known yet, the `started`
+  // handler above finishes this job the moment that turn learns its own id).
+  // Captured before either module var is reassigned below.
+  const supersededAbort = activeTurnAbort;
+  const supersededId = activeTurnId;
+  if (supersededAbort) {
+    supersededAbort.abort();
+    if (supersededId) postTurnCancel(supersededId);
+  }
+
   activeTurnId = null;
   activeTurnAbort = new AbortController();
-  // Captured so the catch below (#827) can tell "this turn's own controller
-  // is still current" from "a newer turn already replaced it" -- distinct
-  // from activeTurnAbort itself, which a later submitTurn() call reassigns.
-  const ownAbortController = activeTurnAbort;
+  // Captured so the checks below (#827, generalized by #832) can tell "this
+  // turn's own controller is still current" from "a newer turn already
+  // replaced it" -- distinct from activeTurnAbort itself, which a later
+  // submitTurn() call reassigns. `id` starts null and is filled in by
+  // consumeTurnStream()'s `started` handler once the relay assigns one --
+  // carried on this object (not just mirrored to activeTurnId) so it
+  // survives being superseded (see the supersession comment above).
+  const ownTurn = { abort: activeTurnAbort, id: null };
 
   // #801 -- hold the recording until the turn *definitively* completes (see
   // `heldRecording`'s own comment). Set here, unconditionally, so a fresh
   // recording AND a manual retry (which passes the same blob back in) both
   // keep exactly one slot current.
   if (blob) heldRecording = { blob, mime };
+  // #832/F9: identifies THIS turn's own held-recording object (or null if it
+  // never set one), distinct from `heldRecording` itself, which a later
+  // submitTurn() call can reassign to a different object. Used below to
+  // clear it on a stale-success early return WITHOUT clobbering a newer
+  // turn's own held recording if that turn has since set its own.
+  const ownHeldRecording = blob ? heldRecording : null;
 
   const form = new FormData();
   if (blob) form.append('audio', blob, blobFilename(mime));
@@ -2538,18 +2675,33 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
   // why they differ).
   let turnAccepted = false;
   try {
-    const res = await postTurnStart(form, activeTurnAbort.signal);
+    const res = await postTurnStart(form, ownTurn.abort.signal);
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
-      clearThinking();
+      // Guarded like every other settling touch below (#832): a newer turn
+      // may already own the thinking placeholder by the time this awaited
+      // response comes back.
+      if (isOwnTurn(ownTurn)) clearThinking();
       throw new Error(data.detail || `Request failed (${res.status})`);
     }
     turnAccepted = true;
 
-    const data = await consumeTurnStream(res);
+    const data = await consumeTurnStream(res, ownTurn);
     if (!data) {
-      clearThinking();
+      if (isOwnTurn(ownTurn)) clearThinking();
       throw new Error('Turn ended without a response');
+    }
+    if (!isOwnTurn(ownTurn)) {
+      // A newer turn already owns everything below -- this stale turn has
+      // nothing left to reconcile into shared state (#832). The stream was
+      // still fully drained by consumeTurnStream() above either way. This
+      // turn DID complete successfully server-side, though, so it has
+      // nothing left to retry -- clear heldRecording (#832/F9), but only if
+      // it's still THIS turn's own object: a newer turn that has since
+      // submitted its own recording already overwrote it, and that one must
+      // survive to be retried if the newer turn later fails.
+      if (heldRecording === ownHeldRecording) heldRecording = null;
+      return;
     }
 
     if (data.conversation_id) {
@@ -2586,6 +2738,14 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
     }
 
     await playbackChain;
+    // A tap on Cancel during playback (the "stop playback" use of that
+    // button once a reply has already landed -- see cancelActiveTurn()'s own
+    // comment) is exactly what settles `playbackChain` early, and that same
+    // tap already reset activeTurnAbort/voiceBusy/status itself. Checked
+    // again here, after the await, for the same reason as everywhere else in
+    // this function (#832): don't redo that reset onto whatever turn is
+    // current by the time this resumes.
+    if (!isOwnTurn(ownTurn)) return;
     showCancel(false);
     setStatus('', 'Ready');
     await maybeAutoContinue();  // re-record if Auto-continue is on
@@ -2601,13 +2761,14 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
       // controller in that case -- checked by identity, not mere presence,
       // so a stale turn settling after a newer one has already started
       // can't stomp on the newer turn's UI either.
-      if (activeTurnAbort === ownAbortController) {
+      if (isOwnTurn(ownTurn)) {
         clearThinking();
         showCancel(false);
         setStatus('', 'Ready');
       }
       return;
     }
+    if (!isOwnTurn(ownTurn)) return; // superseded -- nothing left to report (#832)
     clearThinking();
     showCancel(false);
     // #801 -- a mid-stream drop (the SSE stream died after a genuine `ok`
@@ -2617,16 +2778,24 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
     // told us definitively it failed) goes straight to the ordinary
     // failed+Retry state.
     if (turnAccepted && !err?.voiceTurnDefinitive) {
-      await handleMidStreamDrop(err);
+      await handleMidStreamDrop(err, ownTurn);
     } else {
       setStatus('error', 'Error');
       handleTerminalFailure(err?.message || 'Voice turn failed');
     }
   } finally {
-    activeTurnId = null;
-    activeTurnAbort = null;
-    voiceBusy = false;
-    state.isLoading = false;
+    // Every branch above already bails out (via `return`) once it detects a
+    // newer turn has taken over, so in practice this only ever runs while
+    // still current -- but it's the very last thing this turn does, and the
+    // one reset every prior version of this code applied unconditionally
+    // (#832), so it gets the same identity check as everywhere else rather
+    // than relying on that invariant holding forever.
+    if (isOwnTurn(ownTurn)) {
+      activeTurnId = null;
+      activeTurnAbort = null;
+      voiceBusy = false;
+      state.isLoading = false;
+    }
   }
 }
 
@@ -2639,9 +2808,7 @@ function showCancel(on) {
 // playback after done" case without faking real audio element timing.
 export function cancelActiveTurn() {
   activeTurnAbort?.abort();
-  if (activeTurnId) {
-    fetch(`${endpoints.voice}/turn/${encodeURIComponent(activeTurnId)}/cancel`, { method: 'POST' }).catch(() => {});
-  }
+  if (activeTurnId) postTurnCancel(activeTurnId);
   playbackChain = Promise.resolve();
   stopAllAudio();
   clearThinking();

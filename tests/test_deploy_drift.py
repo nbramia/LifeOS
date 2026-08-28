@@ -24,6 +24,7 @@ pulls, or restarts anything for real).
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import stat
 import subprocess
@@ -236,15 +237,24 @@ def _run_sourced(repo: Path, call: str, env_extra: dict | None = None) -> subpro
     reads .env) — so isolation from the real machine's actual lock file
     means pointing $HOME itself at a directory under the synthetic repo,
     the same technique test_lock_is_visible_across_two_different_checkouts_
-    sharing_home already uses to prove the real default formula, not a
-    test-only escape hatch. A test that specifically wants the process's
-    real $HOME passes its own env_extra with that key set back."""
+    sharing_home already uses to prove the real default formula (that test
+    builds its own env directly rather than calling this helper, precisely
+    because it needs two checkouts to share one $HOME instead of each
+    getting its own).
+
+    HOME is set AFTER layering in env_extra, not before (#833/F7) — a caller
+    building env_extra from `dict(os.environ)` (e.g. to tweak PATH) carries
+    the real $HOME along with it, and applying env_extra second would
+    silently defeat this function's whole isolation guarantee. No caller
+    here has ever needed the reverse (getting the real $HOME back via
+    env_extra); if one someday does, it should build its own env rather than
+    reopening this hole."""
     script = repo / "scripts" / "auto-deploy.sh"
     fake_home = repo / "home"
     fake_home.mkdir(exist_ok=True)
     env = dict(os.environ)
-    env["HOME"] = str(fake_home)
     env.update(env_extra or {})
+    env["HOME"] = str(fake_home)
     return subprocess.run(
         ["bash", "-c", f'source "{script}" && {call}'],
         cwd=repo, env=env, capture_output=True, text=True, timeout=30,
@@ -489,20 +499,42 @@ def test_auto_deploy_syntax_and_sourced_functions_defined(tmp_path: Path):
     assert result.stdout.count("function") == 11, result.stdout
 
 
-def _wait_until_lock_held(lock_path: Path, timeout: float = 5.0) -> None:
+def _wait_until_lock_held(lock_path: Path, timeout: float = 30.0) -> None:
     """Poll until some other process holds an exclusive-incompatible lock on
     lock_path — i.e. until a background holder has actually acquired, not
-    just been spawned."""
+    just been spawned.
+
+    #833's actual root cause (found on review), reproduced here too since
+    this file's own lock-holder tests use the identical pattern. Two
+    contributing problems, both fixed here (see
+    tests/test_auto_update_macos.py's copy of this same function for the
+    full writeup, including the reproduction numbers):
+
+    1. The probe used to shell out to the external `flock`(1) CLI on every
+       poll iteration -- a fresh fork+exec per attempt, compounding exactly
+       the process-spawn contention this is trying to survive. It now calls
+       `fcntl.flock()` directly instead.
+    2. A short (formerly 5s, then 30s) timeout assumed the HOLDER's own
+       bash-spawns-python3-spawns-flock startup chain gets scheduled
+       promptly, which doesn't hold under the genuine system-wide
+       contention a full `-m unit` run creates -- a single-file run can't
+       reproduce this at all, since --dist loadscope puts each file on one
+       worker with no intra-file concurrency."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        probe = subprocess.run(["flock", "-x", "-n", str(lock_path), "-c", "true"])
-        if probe.returncode != 0:
-            return
+        try:
+            with open(lock_path, "a") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except BlockingIOError:
+            return  # someone else holds it
+        except FileNotFoundError:
+            pass  # not created yet -- keep polling
         time.sleep(0.05)
     raise TimeoutError(f"lock at {lock_path} was never acquired by the holder")
 
 
-def _start_shared_lock_holder(lock_path: Path, seconds: float = 5.0) -> subprocess.Popen:
+def _start_shared_lock_holder(lock_path: Path, seconds: float = 60.0) -> subprocess.Popen:
     """Spawn a single process — no fork/exec split — that opens lock_path,
     holds a SHARED flock, and sleeps. Deliberately not the `flock` CLI: it
     forks a child to run the given command while the parent (the pid Popen
@@ -510,7 +542,17 @@ def _start_shared_lock_holder(lock_path: Path, seconds: float = 5.0) -> subproce
     release the lock (the forked child inherits its own copy of the fd).
     This one-liner IS the process holding the lock, so killing this exact
     pid releases it immediately — mirroring what
-    run_all_syncs.py's _acquire_sync_lock() actually does."""
+    run_all_syncs.py's _acquire_sync_lock() actually does.
+
+    `seconds` is a safety cap, not the intended hold duration (found on
+    review, #833/F6, applied here too for the same reason) — every caller
+    already calls `holder.terminate()`/`.kill()` in its own `finally`, which
+    ends this process (and so releases the flock) essentially instantly
+    regardless of how much of `seconds` remains. A short fixed value here
+    used to race the CALLING TEST's own scheduling under heavy parallel
+    load: if the wall-clock time between spawning this holder and the test's
+    assertion actually running exceeded it, the holder had already released
+    the lock naturally, before the test ever checked it."""
     return subprocess.Popen([
         sys.executable, "-c",
         f"import fcntl, time\n"
@@ -581,7 +623,7 @@ def test_lock_acquire_defers_while_a_sync_holds_the_shared_lock(tmp_path: Path):
     # Matches _run_sourced()'s fake $HOME/.lifeos/sync.lock.
     lock_path = repo / "home" / ".lifeos" / "sync.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    holder = _start_shared_lock_holder(lock_path, seconds=5)
+    holder = _start_shared_lock_holder(lock_path)
     try:
         _wait_until_lock_held(lock_path)
         result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"')
@@ -603,7 +645,7 @@ def test_lock_released_immediately_when_holder_is_sigkilled(tmp_path: Path):
     # Matches _run_sourced()'s fake $HOME/.lifeos/sync.lock.
     lock_path = repo / "home" / ".lifeos" / "sync.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    holder = _start_shared_lock_holder(lock_path, seconds=30)
+    holder = _start_shared_lock_holder(lock_path)
     try:
         _wait_until_lock_held(lock_path)
         holder.kill()  # SIGKILL — no signal handler, no cleanup path runs
@@ -646,8 +688,8 @@ def test_two_overlapping_syncs_are_both_recognized_as_in_progress(tmp_path: Path
     # Matches _run_sourced()'s fake $HOME/.lifeos/sync.lock.
     lock_path = repo / "home" / ".lifeos" / "sync.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    a = _start_shared_lock_holder(lock_path, seconds=5)
-    b = _start_shared_lock_holder(lock_path, seconds=5)
+    a = _start_shared_lock_holder(lock_path)
+    b = _start_shared_lock_holder(lock_path)
     try:
         _wait_until_lock_held(lock_path)
         result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"')
@@ -690,7 +732,7 @@ def test_lock_is_visible_across_two_different_checkouts_sharing_home(tmp_path: P
     env = dict(os.environ)
     env["HOME"] = str(shared_home)
 
-    holder = _start_shared_lock_holder(default_lock_path, seconds=5)
+    holder = _start_shared_lock_holder(default_lock_path)
     try:
         _wait_until_lock_held(default_lock_path)
         script_a = checkout_a / "scripts" / "auto-deploy.sh"
@@ -973,11 +1015,12 @@ def _run_main(repo: Path, state: Path, venv: Path, env_extra: dict | None = None
     env["LIFEOS_AGENT_SESSIONS_DB"] = str(repo / "data" / "agent_sessions.db")
     env["PYTHONPATH"] = str(REPO_ROOT)
     # Isolated by default — see _run_sourced()'s comment on why this is a
-    # $HOME override, not a sync-lock-specific one.
+    # $HOME override, not a sync-lock-specific one, and on why it's set
+    # AFTER env_extra rather than before (#833/F7).
     fake_home = repo / "home"
     fake_home.mkdir(exist_ok=True)
-    env["HOME"] = str(fake_home)
     env.update(env_extra or {})
+    env["HOME"] = str(fake_home)
     return subprocess.run(
         ["bash", "-c", "source scripts/auto-deploy.sh && main"],
         cwd=repo, env=env, capture_output=True, text=True, timeout=30,

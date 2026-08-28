@@ -13,6 +13,7 @@ emulating for these tests since every call site is a single named command).
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import stat
 import subprocess
@@ -59,38 +60,86 @@ def _run_sourced(repo: Path, call: str, env_extra: dict | None = None) -> subpro
     alone reads .env, so an override would silently split-brain the sync
     and this script onto two different lock files) — so isolation from the
     real machine's actual lock file means pointing $HOME at a directory
-    under the synthetic repo instead."""
+    under the synthetic repo instead.
+
+    HOME is set AFTER layering in env_extra, not before (found on review,
+    #833) — a caller building env_extra from `dict(os.environ)` (e.g. to
+    tweak just PATH) carries the real $HOME along with it, and applying
+    env_extra second would silently defeat this function's whole isolation
+    guarantee, sending sync_in_progress_lock_acquire against the real
+    machine's actual `~/.lifeos/sync.lock` instead of the synthetic one."""
     script = repo / "scripts" / "auto-update-macos.sh"
     fake_home = repo / "home"
     fake_home.mkdir(exist_ok=True)
     env = dict(os.environ)
-    env["HOME"] = str(fake_home)
     env.update(env_extra or {})
+    env["HOME"] = str(fake_home)
     return subprocess.run(
         ["bash", "-c", f'source "{script}" && {call}'],
         cwd=repo, env=env, capture_output=True, text=True, timeout=30,
     )
 
 
-def _wait_until_lock_held(lock_path: Path, timeout: float = 5.0) -> None:
+def _wait_until_lock_held(lock_path: Path, timeout: float = 30.0) -> None:
     """Poll until some other process holds an exclusive-incompatible lock on
     lock_path — i.e. until a background holder has actually acquired, not
-    just been spawned."""
+    just been spawned.
+
+    This is #833's actual root cause (found on review, by finally
+    reproducing it under the full unit suite rather than this file alone --
+    a single-file run can't reproduce it at all, since --dist loadscope puts
+    one file's tests on one worker with no intra-file concurrency; the flake
+    needs genuine system-wide contention from the OTHER 16 workers' worth of
+    tests). Two contributing problems, both fixed here:
+
+    1. The probe used to shell out to the external `flock`(1) CLI on every
+       poll iteration -- a fresh fork+exec per attempt, compounding exactly
+       the process-spawn contention this is trying to survive. It now calls
+       `fcntl.flock()` directly (LOCK_EX | LOCK_NB, released immediately),
+       matching what the real `flock` CLI does under the hood but without
+       spawning a process to do it.
+    2. A short (formerly 5s, then 30s -- still not enough under sustained
+       reproduction load) timeout assumed the HOLDER's own bash-spawns-
+       python3-spawns-flock startup chain gets scheduled promptly; under
+       heavy parallel load that alone can take longer, raising TimeoutError
+       here even though the holder genuinely would have acquired the lock
+       given more time -- not a hung/broken holder, just a slow one.
+       `_start_shared_lock_holder`'s own `seconds` safety cap was bumped for
+       a related but distinct reason (see its docstring)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        probe = subprocess.run(["flock", "-x", "-n", str(lock_path), "-c", "true"])
-        if probe.returncode != 0:
-            return
+        try:
+            with open(lock_path, "a") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except BlockingIOError:
+            return  # someone else holds it
+        except FileNotFoundError:
+            pass  # not created yet -- keep polling
         time.sleep(0.05)
     raise TimeoutError(f"lock at {lock_path} was never acquired by the holder")
 
 
-def _start_shared_lock_holder(lock_path: Path, seconds: float = 5.0) -> subprocess.Popen:
+def _start_shared_lock_holder(lock_path: Path, seconds: float = 60.0) -> subprocess.Popen:
     """Spawn a single process — no fork/exec split — that opens lock_path,
     holds a SHARED flock, and sleeps. Deliberately not the `flock` CLI: it
     forks a child to run the given command while the parent (the pid Popen
     would return) keeps the fd open, so killing that parent alone does not
-    release the lock. This one-liner IS the process holding the lock."""
+    release the lock. This one-liner IS the process holding the lock.
+
+    `seconds` is a safety cap, not the intended hold duration (found on
+    review, #833/F6) — every caller already calls `holder.terminate()` in
+    its own `finally`, which kills this process (and so releases the flock)
+    essentially instantly regardless of how much of `seconds` remains: no
+    signal handler is installed, so SIGTERM's default disposition (die
+    immediately) applies even mid-`time.sleep()`. The bug was treating
+    `seconds` as short (5, formerly) and load-bearing: under heavy parallel
+    load (many xdist workers, or other agents' test runs sharing this box),
+    the wall-clock time between spawning this holder and the calling test's
+    own assertion actually getting scheduled could exceed that short window,
+    so the holder released the lock on its own, naturally, before the test
+    ever checked it. A generous default removes that race without changing
+    how any test actually ends the hold."""
     return subprocess.Popen([
         sys.executable, "-c",
         f"import fcntl, time\n"
@@ -279,7 +328,7 @@ def test_lock_acquire_defers_while_a_sync_holds_the_shared_lock(tmp_path: Path):
     # (not env-overridable) formula the script itself resolves.
     lock_path = repo / "home" / ".lifeos" / "sync.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    holder = _start_shared_lock_holder(lock_path, seconds=5)
+    holder = _start_shared_lock_holder(lock_path)
     try:
         _wait_until_lock_held(lock_path)
         result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"')
@@ -739,8 +788,11 @@ def _run_main_macos(
     fake_home = repo / "home"
     fake_home.mkdir(exist_ok=True)
     env = dict(os.environ)
-    env["HOME"] = str(fake_home)
     env.update(env_extra or {})
+    # Set AFTER env_extra, not before (#833/F7, matching _run_sourced()'s own
+    # fix and comment above) -- so env_extra can never defeat this function's
+    # isolation, the same way it silently could here otherwise.
+    env["HOME"] = str(fake_home)
     return subprocess.run(
         ["bash", "-c", f'source scripts/auto-update-macos.sh && {quiet_stubs}{extra_stubs} main'],
         cwd=repo, env=env, capture_output=True, text=True, timeout=30,
@@ -767,7 +819,7 @@ def test_main_skips_when_sync_lock_is_held(tmp_path: Path):
     # Matches _run_main_macos()'s fake $HOME/.lifeos/sync.lock.
     lock_path = repo / "home" / ".lifeos" / "sync.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    holder = _start_shared_lock_holder(lock_path, seconds=5)
+    holder = _start_shared_lock_holder(lock_path)
     try:
         _wait_until_lock_held(lock_path)
         result = _run_main_macos(repo, active_since=code_epoch - 3600)
@@ -810,12 +862,17 @@ def test_main_skips_when_api_service_not_running(tmp_path: Path):
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo, _origin, _code_epoch = _make_policy_repo_macos(tmp_path)
-    result = subprocess.run(
-        ["bash", "-c",
-         'source scripts/auto-update-macos.sh && '
-         'api_active_since_epoch() { return 1; }; '
-         'launchctl() { return 0; }; api_pid() { echo ""; }; curl() { return 0; }; main'],
-        cwd=repo, capture_output=True, text=True, timeout=30,
+    # Found on review (#833): unlike every sibling test here, this one used a
+    # bare subprocess.run() with no `env=` override, so main()'s
+    # sync_in_progress_lock_acquire resolved SYNC_LOCK_FILE against the REAL
+    # $HOME — a shared machine's actual `~/.lifeos/sync.lock`, contended by
+    # concurrent test runs and real syncs alike. _run_main_macos() gives this
+    # test the same isolated fake $HOME its neighbors use; active_since is
+    # irrelevant here (extra_stubs's override wins, last-definition-wins in
+    # bash) since the point of this test is that no ground truth exists.
+    result = _run_main_macos(
+        repo, active_since=0,
+        extra_stubs='api_active_since_epoch() { return 1; }; ',
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
     log = (repo / "logs" / "auto-update-macos.log").read_text()
