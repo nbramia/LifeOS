@@ -68,6 +68,16 @@ class TestResolveWorkingDirectory:
         result = self._resolve("sync my notes")
         assert result == VAULT_DIR
 
+    def test_vault_path_honors_late_monkeypatch(self, monkeypatch, tmp_path):
+        """#837: the resolver must read settings.vault_path at call time,
+        not cache it into a module-level constant at import time — otherwise
+        whichever test imports the module first under xdist fixes the value
+        for every later test in that worker, even ones that monkeypatch
+        settings.vault_path (as test_vault_write_route.py does) before this
+        resolver is ever called."""
+        monkeypatch.setattr(settings, "vault_path", tmp_path)
+        assert self._resolve("open the vault") == str(tmp_path)
+
     @patch("api.services.directory_resolver.Path")
     def test_project_name_match(self, mock_path_cls):
         """Project directory names should be matched in task."""
