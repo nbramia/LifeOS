@@ -992,6 +992,14 @@ class Settings(BaseSettings):
         alias="LIFEOS_WORK_DOMAIN_2",
         description="Second work email domain (e.g., othercompany.com) for categorizing work contacts"
     )
+    work_email_domains_extra: str = Field(
+        default="",
+        alias="LIFEOS_WORK_DOMAINS_EXTRA",
+        description="Comma-separated list of additional work email domains, "
+                    "beyond LIFEOS_WORK_DOMAIN and LIFEOS_WORK_DOMAIN_2, for "
+                    "categorizing work contacts (e.g., 'thirdcompany.com,"
+                    "fourthcompany.com')."
+    )
     gmail_draft_send_cooldown_seconds: int = Field(
         default=300,
         alias="LIFEOS_GMAIL_DRAFT_SEND_COOLDOWN_SECONDS",
@@ -1088,8 +1096,13 @@ class Settings(BaseSettings):
 
     @property
     def work_email_domains(self) -> list[str]:
-        """All configured work email domains."""
-        return [d for d in [self.work_email_domain, self.work_email_domain_2] if d]
+        """All configured work email domains, first domain then second
+        domain then any additional domains from LIFEOS_WORK_DOMAINS_EXTRA."""
+        domains = [d for d in [self.work_email_domain, self.work_email_domain_2] if d]
+        domains.extend(
+            d.strip() for d in (self.work_email_domains_extra or "").split(",") if d.strip()
+        )
+        return domains
 
     def is_sync_enabled(self, account: str, service: str) -> bool:
         """Check if sync is enabled for account+service (gmail/calendar)."""

@@ -243,6 +243,7 @@ Subprocess orchestration triggered from Telegram. See [claude-code-orchestration
 | `LIFEOS_MY_PERSON_ID` | str | — | Your CRM PersonEntity UUID. Set after first sync — find it via `curl "localhost:8000/api/crm/people?q=<your-name>" \| jq '.people[0].id'`. |
 | `LIFEOS_WORK_DOMAIN` | str | — | Your primary work email domain. |
 | `LIFEOS_WORK_DOMAIN_2` | str | — | Second work email domain if you have one. |
+| `LIFEOS_WORK_DOMAINS_EXTRA` | str | — | Comma-separated list of any further work email domains beyond the first two (e.g. `thirdco.com,fourthco.com`). |
 | `LIFEOS_TIMEZONE` | str | — | IANA timezone (e.g., `America/New_York`). |
 
 ## Relationships
