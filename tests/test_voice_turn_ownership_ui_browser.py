@@ -30,6 +30,7 @@ marker, so this runs at pre-push (`browser and not requires_server`).
 import http.server
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -100,27 +101,34 @@ window.__releaseTurn = function (i) { window.__gatesOpen[i] = true; };
 window.__audioGateOpen = false;
 window.__audioFound = false;
 window.__audioProbeSawSignal = false;
+window.__audioProbeCallCount = 0;
 
 (function () {
   window.fetch = function (url, opts) {
     var urlStr = typeof url === 'string' ? url : (url && url.url) || String(url);
+    var signal = opts && opts.signal;
+    function abortError() { return new DOMException('Turn cancelled', 'AbortError'); }
 
     if (urlStr.indexOf('/api/voice/turn/stream') !== -1) {
       var idx = window.__turnCallCount++;
       var frames = (window.__turnQueue[idx] || {}).frames || [];
-      // Deliberately NOT abort-aware (unlike the other voice test files'
-      // gates): submitTurn() now actively aborts a superseded turn's own
-      // AbortController the moment a newer turn starts (#832/F2), which
-      // would otherwise tear this stream down before a '__gate'-held frame
-      // ever reaches handleEvent -- exactly the frame these tests exist to
-      // deliver. A frame already in flight over the wire can still arrive
-      // after a client-side abort in the real world (the same race #832/F1's
-      // consumeTurnStream()-entry comment describes for postTurnStart()), so
-      // gate release alone -- never the signal -- controls delivery here,
-      // to test that race and the supersession-abort path independently.
+      // Abort-aware (found on independent review, #832/N1): a real fetch()
+      // errors its body stream the instant its own signal aborts, and
+      // reading it resumes into a single synchronous
+      // reader.read()-resolves -> parseSseChunk -> handleEvent block -- so a
+      // frame is either processed before the abort (this turn was still own
+      // when it arrived) or never delivered at all. A previous version of
+      // this mock ignored the signal so a '__gate'-held frame could still be
+      // released after supersession's own abort() had already fired,
+      // exercising a branch (consumeTurnStream()'s 'started' handler's
+      // late-id best-effort cancel) that a real browser can't actually
+      // reach this way -- see test_late_success_does_not_clobber_the_newer_
+      // turn's own comment for what that branch is still real
+      // defense-in-depth against instead.
       function waitForGate() {
-        return new Promise(function (resolve) {
+        return new Promise(function (resolve, reject) {
           (function poll() {
+            if (signal && signal.aborted) return reject(abortError());
             if (window.__gatesOpen[idx]) return resolve();
             setTimeout(poll, 10);
           })();
@@ -131,10 +139,11 @@ window.__audioProbeSawSignal = false;
           var enc = new TextEncoder();
           var i = 0;
           (function next() {
+            if (signal && signal.aborted) return controller.error(abortError());
             if (i >= frames.length) return controller.close();
             var frame = frames[i++];
             if (frame === '__gate') {
-              return waitForGate().then(next);
+              return waitForGate().then(next, function (e) { controller.error(e); });
             }
             if (frame === '__error') {
               return controller.error(new TypeError('Failed to fetch'));
@@ -159,6 +168,7 @@ window.__audioProbeSawSignal = false;
 
     if (urlStr.indexOf('/api/voice/audio/') !== -1) {
       if (opts && opts.signal) window.__audioProbeSawSignal = true;
+      window.__audioProbeCallCount += 1;
       return new Promise(function (resolve) {
         (function poll() {
           if (window.__audioGateOpen) {
@@ -296,17 +306,27 @@ class TestOverlappingTurnOwnership:
         expect(page.locator("#statusText")).to_have_text("Thinking…")
         assert _is_loading(page) is True
 
-        # A's late 'started' frame carried its id, and by then it was already
-        # superseded -- consumeTurnStream()'s 'started' handler POSTs a
-        # best-effort cancel for it right then (#832/F2), since the earlier
-        # supersession abort (fired when B started, before A's id was known)
-        # could only close the connection, not tell the server to stop.
-        assert page.evaluate("() => window.__cancelLog") == ["turn-A-stale"]
+        # A's decoy 'started'/'done' frames never actually arrive: the gate
+        # mock is abort-aware (see its own comment), and submitTurn()'s
+        # supersession already aborted A's controller the moment B started --
+        # before A's id was ever known, so there is nothing for the 'started'
+        # handler's else-branch (consumeTurnStream()'s own best-effort late-
+        # cancel, #832/F2) to reach here. That branch is real defense-in-depth
+        # for a genuine race a live network can still produce (an already-
+        # in-flight frame landing microtasks after abort() -- see #832/F1's
+        # postTurnStart()-resolves-post-abort comment for the same class of
+        # race), but this specific "gate held before the id was ever sent"
+        # shape can't reach it: an aborted stream never gets to deliver a
+        # frame that was never even in flight yet. Confirmed empirically
+        # (#832/N1): the only way to make it reach that branch is to hold
+        # the mock's gate open through an abort, which a real `fetch()`
+        # cannot do once its own signal fires.
+        assert page.evaluate("() => window.__cancelLog") == []
 
         # Cancel must still target the NEWER turn (activeTurnId === 'turn-B',
         # not A's decoy) -- proof activeTurnId/activeTurnAbort survived.
         page.evaluate("() => window.lifeChatVoice.cancelActiveTurn()")
-        assert page.evaluate("() => window.__cancelLog") == ["turn-A-stale", "turn-B"]
+        assert page.evaluate("() => window.__cancelLog") == ["turn-B"]
         expect(page.locator("#messages .message.user")).to_have_count(0)
         expect(page.locator("#statusText")).to_have_text("Ready")
         assert _is_loading(page) is False
@@ -454,6 +474,50 @@ class TestOverlappingTurnOwnership:
         page.evaluate("() => { window.__audioGateOpen = true; }")  # let it finish cleanly
         _await_turn(page, 0)
 
+    def test_sleep_abortable_actually_interrupts_the_poll_wait(self, page: Page, chat_base_url):
+        """#832/N5: it's not enough for pollForCompletedAudio()'s inter-
+        attempt sleep (sleepAbortable()) to merely accept a signal parameter
+        -- it has to actually register an abort listener and reject early,
+        or a cancellation arriving during that 1500ms wait (rather than
+        during the HEAD fetch itself, already proven by the wiring test
+        above) would still block the turn for the rest of the interval.
+        Times how long cancelActiveTurn() takes to actually unblock the
+        turn, rather than asserting on the interval's exact length, since
+        the real behavior under test is "does the abort cut the wait short,"
+        not "how long is the configured interval." Never a sleep-based wait
+        for the moment to act -- the gate keeps the probe resolving
+        instantly on the FIRST attempt so window.__audioProbeCallCount is a
+        precise, non-racy signal that attempt 2 is now in its sleep."""
+        _open_voice_chat(page, chat_base_url)
+        page.evaluate(
+            "() => { window.__audioFound = false; window.__audioGateOpen = true; "
+            "window.__audioProbeCallCount = 0; }"
+        )
+        _set_queue(page, [
+            {"frames": [
+                {"type": "started", "turn_id": "turn-A"},
+                {"type": "transcript", "text": "first"},
+                "__error",
+            ]},
+        ])
+        _fire_turn(page)
+        # First HEAD attempt resolved (not found) -- pollForCompletedAudio()
+        # is now inside sleepAbortable()'s ~1500ms wait before attempt 2.
+        page.wait_for_function("window.__audioProbeCallCount >= 1")
+
+        started = time.monotonic()
+        page.evaluate("() => window.lifeChatVoice.cancelActiveTurn()")
+        _await_turn(page, 0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0, (
+            f"cancelActiveTurn() took {elapsed:.2f}s to unblock the turn -- "
+            "sleepAbortable() did not actually abort on cancellation"
+        )
+        # And the abort really did cut the wait short, not race a
+        # coincidentally-fast interval: no second attempt was ever made.
+        assert page.evaluate("() => window.__audioProbeCallCount") == 1
+
     @pytest.mark.parametrize("audio_found", [True, False])
     def test_midstream_drop_poll_completing_late_does_not_clobber_the_newer_turn(
             self, page: Page, chat_base_url, audio_found):
@@ -523,6 +587,27 @@ class TestOverlappingTurnOwnership:
         expect(page.locator("#voiceCancelBtn")).to_have_class("voice-cancel-btn")
         assert _is_loading(page) is False
 
+    # N3 (#832, "if cheap") asked for a committed test of F9's identity-
+    # checked heldRecording clear on the stale-SUCCESS early return
+    # specifically. Attempted and dropped after verifying it was vacuous:
+    # with this file's gate mock realistically abort-aware (N1), gating A's
+    # stream before any frame means submitTurn()'s own supersession abort()
+    # (fired the instant B starts) kills A via the AbortError branch before
+    # A ever reaches 'done' -- so a test built that way never exercises the
+    # success-path clear at all (confirmed: it still passed with the
+    # identity check reverted to an unconditional `heldRecording = null`).
+    # Reaching the success early-return with `data` genuinely populated
+    # despite being superseded needs the SAME class of narrow race N1's own
+    # comment on postTurnStart() describes (a promise already settled before
+    # its abort registers) -- real, but not deterministically constructible
+    # in this mock without reintroducing the non-realistic always-open gate
+    # N1 asked to remove. F9's clear is verified by code inspection instead:
+    # every other call site that nulls heldRecording unconditionally
+    # (recoverCompletedTurn(), the failed-status dismiss button) already
+    # runs only once ownership or DOM removal has independently guaranteed
+    # it's operating on the current turn's own slot -- this early-return is
+    # the one place that guarantee doesn't hold, which is exactly why it
+    # alone needed the identity check.
 
 # --- post-playback continuation guard (df9bf88, #832 follow-up) -----------
 #
@@ -545,14 +630,41 @@ class TestOverlappingTurnOwnership:
 # tests/test_voice_rate_toggle_playback_ui_browser.py already establish,
 # rather than this file's own gate-driven SSE mock.
 _PLAYBACK_INSTRUMENT_SCRIPT = """
-window.__turnClipUrl = null;
+// Each POST to /api/voice/turn/stream consumes the NEXT entry of
+// window.__turnQueue, in call order -- same convention as this file's main
+// SSE mock (_FETCH_MOCK above), so two overlapping submitTurn() calls can
+// each get independently-gated frames. '__gate' stalls a turn's stream
+// until window.__gatesOpen[<that turn's queue index>] is set true.
+window.__turnQueue = [];
+window.__turnCallCount = 0;
+window.__gatesOpen = {};
 window.fetch = function (url, opts) {
   var urlStr = typeof url === 'string' ? url : (url && url.url) || String(url);
   if (urlStr.indexOf('/api/voice/turn/stream') !== -1) {
-    var sse = 'data: ' + JSON.stringify({ type: 'started', turn_id: 'turn-playback' }) + '\\n\\n'
-            + 'data: ' + JSON.stringify({ type: 'main_audio', url: window.__turnClipUrl }) + '\\n\\n'
-            + 'data: ' + JSON.stringify({ type: 'done', data: { response_text: 'ok' } }) + '\\n\\n';
-    return Promise.resolve(new Response(sse, {
+    var idx = window.__turnCallCount++;
+    var frames = (window.__turnQueue[idx] || {}).frames || [];
+    function waitForGate() {
+      return new Promise(function (resolve) {
+        (function poll() {
+          if (window.__gatesOpen[idx]) return resolve();
+          setTimeout(poll, 10);
+        })();
+      });
+    }
+    var body = new ReadableStream({
+      start: function (controller) {
+        var enc = new TextEncoder();
+        var i = 0;
+        (function next() {
+          if (i >= frames.length) return controller.close();
+          var frame = frames[i++];
+          if (frame === '__gate') return waitForGate().then(next);
+          controller.enqueue(enc.encode('data: ' + JSON.stringify(frame) + '\\n\\n'));
+          setTimeout(next, 10);
+        })();
+      },
+    });
+    return Promise.resolve(new Response(body, {
       status: 200, headers: { 'Content-Type': 'text/event-stream' },
     }));
   }
@@ -572,12 +684,19 @@ navigator.mediaDevices.getUserMedia = function (constraints) {
 
 (function () {
   window.__audioPlayingCount = 0;
+  // Every URL that actually reached a real 'playing' event (#832/N4) --
+  // not merely passed to play(), since a rejected play() promise is silent
+  // and would make "URL X was never really heard" a false pass.
+  window.__playedUrls = [];
   var proto = HTMLMediaElement.prototype;
   var origPlay = proto.play;
   proto.play = function () {
     if (!this.__wired832) {
       this.__wired832 = true;
-      this.addEventListener('playing', function () { window.__audioPlayingCount += 1; });
+      this.addEventListener('playing', function () {
+        window.__audioPlayingCount += 1;
+        window.__playedUrls.push(this.src);
+      });
       var onEnd = function () { window.__audioPlayingCount = Math.max(0, window.__audioPlayingCount - 1); };
       this.addEventListener('ended', onEnd);
       this.addEventListener('pause', onEnd);
@@ -633,12 +752,43 @@ def _open_playback_chat(page: Page, base_url, *, auto):
     page.wait_for_selector("#voiceTalkBtn")
 
 
+def _set_playback_queue(page: Page, turns):
+    """`turns` is a list of {"frames": [...]} dicts, consumed in fetch-call
+    order -- same convention as _set_queue() above."""
+    page.evaluate(
+        "(q) => { window.__turnQueue = JSON.parse(q); window.__turnCallCount = 0; "
+        "window.__gatesOpen = {}; }",
+        json.dumps(turns),
+    )
+
+
+def _fire_playback_turn(page: Page, transcript="hi"):
+    """Starts submitTurn() without awaiting it, stashing the promise on
+    window.__turns the same way _fire_turn() does for the muted mock, so
+    _await_playback_turn() can wait on it precisely."""
+    page.evaluate(
+        "(t) => { window.__turns = window.__turns || []; "
+        "window.__turns.push(window.lifeChatVoice.submitTurn({ transcript: t })); }",
+        transcript,
+    )
+
+
+def _await_playback_turn(page: Page, idx: int):
+    page.evaluate("(i) => window.__turns[i]", idx)
+
+
 class TestPostPlaybackCancelGuard:
     def test_cancel_during_playback_does_not_rearm_auto_continue(self, page: Page, chat_base_url):
         _open_playback_chat(page, chat_base_url, auto=True)
         clip_url = page.evaluate("window.__makeWav(3000)")  # long enough to tap Cancel mid-playback
-        page.evaluate("(u) => { window.__turnClipUrl = u; }", clip_url)
-        page.evaluate("() => { window.lifeChatVoice.submitTurn({ transcript: 'hi' }); }")
+        _set_playback_queue(page, [
+            {"frames": [
+                {"type": "started", "turn_id": "turn-playback"},
+                {"type": "main_audio", "url": clip_url},
+                {"type": "done", "data": {"response_text": "ok"}},
+            ]},
+        ])
+        _fire_playback_turn(page)
 
         page.wait_for_function("window.__audioPlayingCount > 0")
         page.locator("#voiceCancelBtn").click()  # the real "stop playback" tap
@@ -651,3 +801,69 @@ class TestPostPlaybackCancelGuard:
             "auto-continue re-armed a recording after Cancel stopped mid-reply playback"
         )
         expect(page.locator("#statusText")).to_have_text("Ready")
+
+
+class TestStaleAudioNeverPlays:
+    def test_stale_turns_audio_never_plays_and_newer_turns_status_survives(
+            self, page: Page, chat_base_url):
+        """#832/N4: F1 was the HIGH-severity finding in independent review
+        and had no committed regression test -- consumeTurnStream()'s
+        'status_audio'/'main_audio' handlers gated `setStatus` on isOwnTurn
+        but left `enqueueClip()` ungated, so a stale turn's own clip queued
+        onto the shared playbackChain a newer turn's `await playbackChain`
+        then waited on and played, audibly, over the newer turn's own reply.
+        Needs real playback (this file's main mock runs muted), so this
+        reuses TestPostPlaybackCancelGuard's real-WAV-clip instrumentation,
+        extended to two independently-gated overlapping turns."""
+        _open_playback_chat(page, chat_base_url, auto=False)
+        # Distinct durations, not just distinct variable names: __makeWav()
+        # is deterministic, so two equal-duration clips produce byte-
+        # identical data: URIs -- indistinguishable in __playedUrls. All
+        # short: enqueueClip() appends to the ONE shared playbackChain, so if
+        # F1's bug were present, A's clips would queue in BEHIND B's still-
+        # playing one rather than fail outright -- short clips let the whole
+        # chain (B's own, and A's if the bug is back) fully drain within the
+        # test instead of a long B clip masking a late, buggy A playback.
+        clip_a_status = page.evaluate("window.__makeWav(210)")
+        clip_a_main = page.evaluate("window.__makeWav(220)")
+        clip_b_status = page.evaluate("window.__makeWav(230)")
+        clip_b_main = page.evaluate("window.__makeWav(240)")
+        _set_playback_queue(page, [
+            {"frames": [
+                "__gate",
+                {"type": "status_audio", "url": clip_a_status, "message": "stale status"},
+                {"type": "main_audio", "url": clip_a_main},
+                {"type": "done", "data": {"response_text": "stale-done"}},
+            ]},
+            {"frames": [
+                {"type": "started", "turn_id": "turn-B"},
+                {"type": "transcript", "text": "second"},
+                {"type": "status_audio", "url": clip_b_status, "message": "B status"},
+                {"type": "main_audio", "url": clip_b_main},
+                "__gate",  # never released -- B just needs to stay current
+            ]},
+        ])
+        _fire_playback_turn(page)  # turn A -- stalls before any frame
+        _fire_playback_turn(page)  # turn B -- overlaps A; becomes the current turn
+
+        page.wait_for_function("window.__audioPlayingCount > 0")  # B's own clip(s) playing
+        expect(page.locator("#statusText")).to_have_text("B status")
+
+        # A's frames arrive only now, well after B took over.
+        page.evaluate("() => { window.__gatesOpen[0] = true; }")
+        _await_playback_turn(page, 0)
+
+        # Let the whole shared chain fully drain -- B's own clips, and (in
+        # the buggy case) any of A's queued in behind them -- before
+        # inspecting what actually played.
+        page.wait_for_function("window.__audioPlayingCount === 0", timeout=5000)
+        page.wait_for_timeout(200)  # settle past the chain's own .then() bookkeeping
+
+        played = page.evaluate("() => window.__playedUrls")
+        assert clip_a_status not in played, "a stale turn's spoken status clip was heard"
+        assert clip_a_main not in played, "a stale turn's main reply clip was heard"
+        # Sanity: B's own clips genuinely did play -- this isn't passing
+        # because nothing played at all.
+        assert clip_b_status in played
+        assert clip_b_main in played
+        expect(page.locator("#statusText")).to_have_text("B status")

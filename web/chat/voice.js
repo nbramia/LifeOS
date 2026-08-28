@@ -2277,12 +2277,21 @@ async function consumeTurnStream(response, ownTurn) {
         activeTurnId = event.turn_id;
         showCancel(true);
       } else {
-        // Already superseded by the time this arrived -- the abort() fired
-        // at supersession time could only close the connection, not tell
-        // the server to stop (and if this turn hadn't even reached `started`
-        // yet, submitTurn()'s supersession had no id to cancel with at all).
-        // Finish that job now that the id is known, so the turn doesn't run
-        // to completion (LLM + TTS) unseen.
+        // Defense-in-depth, not the common case (found on independent
+        // review, #832/N1): a real fetch() errors its body stream the
+        // instant its own AbortController fires, and reading it resumes
+        // into one synchronous reader.read()-resolves -> parseSseChunk ->
+        // handleEvent block -- so a turn superseded BEFORE its `started`
+        // frame was ever sent can't reach this branch at all in a real
+        // browser; the connection is simply gone before the id exists to
+        // act on. This exists for the narrower, still-real race where the
+        // frame was already in flight over the wire a moment before the
+        // abort (the same class of race #832/F1's postTurnStart()-resolves-
+        // after-abort comment describes) -- close enough behind the abort
+        // that this handler still runs once more before the stream
+        // actually tears down. Either way, finish the job the abort alone
+        // couldn't: tell the server to stop, so the turn doesn't run to
+        // completion (LLM + TTS) unseen.
         postTurnCancel(event.turn_id);
       }
     }
@@ -2544,18 +2553,16 @@ function handleTerminalFailure(message) {
   );
 }
 
-// `ownTurn` is checked at every point this async function is about to touch
-// module state shared across turns: once up front (a newer turn may already
-// own things by the time this is even called) and again after the poll's
-// await (a newer turn may have started while it ran) -- #832, generalizing
-// the identity check #827 introduced for one branch. Nothing awaits between
-// either check and the state it guards, so neither window can go stale
-// between the check and the touch. The poll itself also carries `ownTurn`'s
-// own signal (#832/F5), so a supersession's abort() ends it immediately
-// rather than after its full ~3s budget regardless of this function's own
-// checks.
+// `ownTurn` is checked after the poll's await -- a newer turn may have
+// started while it ran (#832, generalizing the identity check #827
+// introduced for one branch). No entry-time check: this function's only
+// caller already checks isOwnTurn() with no await before calling it (found
+// on independent review, #832/N2 -- a prior version of this comment claimed
+// an entry-time race that the code couldn't actually produce), so an
+// identical check here would never fire. The poll itself also carries
+// `ownTurn`'s own signal (#832/F5), so a supersession's abort() ends it
+// immediately rather than after its full ~3s budget.
 async function handleMidStreamDrop(err, ownTurn) {
-  if (!isOwnTurn(ownTurn)) return;
   const turnId = activeTurnId;
   if (turnId) {
     setStatus('loading', 'Reconnecting…');
