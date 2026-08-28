@@ -59,13 +59,20 @@ def _run_sourced(repo: Path, call: str, env_extra: dict | None = None) -> subpro
     alone reads .env, so an override would silently split-brain the sync
     and this script onto two different lock files) — so isolation from the
     real machine's actual lock file means pointing $HOME at a directory
-    under the synthetic repo instead."""
+    under the synthetic repo instead.
+
+    HOME is set AFTER layering in env_extra, not before (found on review,
+    #833) — a caller building env_extra from `dict(os.environ)` (e.g. to
+    tweak just PATH) carries the real $HOME along with it, and applying
+    env_extra second would silently defeat this function's whole isolation
+    guarantee, sending sync_in_progress_lock_acquire against the real
+    machine's actual `~/.lifeos/sync.lock` instead of the synthetic one."""
     script = repo / "scripts" / "auto-update-macos.sh"
     fake_home = repo / "home"
     fake_home.mkdir(exist_ok=True)
     env = dict(os.environ)
-    env["HOME"] = str(fake_home)
     env.update(env_extra or {})
+    env["HOME"] = str(fake_home)
     return subprocess.run(
         ["bash", "-c", f'source "{script}" && {call}'],
         cwd=repo, env=env, capture_output=True, text=True, timeout=30,
@@ -810,12 +817,17 @@ def test_main_skips_when_api_service_not_running(tmp_path: Path):
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo, _origin, _code_epoch = _make_policy_repo_macos(tmp_path)
-    result = subprocess.run(
-        ["bash", "-c",
-         'source scripts/auto-update-macos.sh && '
-         'api_active_since_epoch() { return 1; }; '
-         'launchctl() { return 0; }; api_pid() { echo ""; }; curl() { return 0; }; main'],
-        cwd=repo, capture_output=True, text=True, timeout=30,
+    # Found on review (#833): unlike every sibling test here, this one used a
+    # bare subprocess.run() with no `env=` override, so main()'s
+    # sync_in_progress_lock_acquire resolved SYNC_LOCK_FILE against the REAL
+    # $HOME — a shared machine's actual `~/.lifeos/sync.lock`, contended by
+    # concurrent test runs and real syncs alike. _run_main_macos() gives this
+    # test the same isolated fake $HOME its neighbors use; active_since is
+    # irrelevant here (extra_stubs's override wins, last-definition-wins in
+    # bash) since the point of this test is that no ground truth exists.
+    result = _run_main_macos(
+        repo, active_since=0,
+        extra_stubs='api_active_since_epoch() { return 1; }; ',
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
     log = (repo / "logs" / "auto-update-macos.log").read_text()
