@@ -1058,6 +1058,12 @@ def main():
     if args.source:
         sources = {args.source: sources[args.source]}
 
+    # Computed once so every source touched by this invocation — and the
+    # top-level manifest fields — agree exactly (issue #820, acceptance
+    # criterion: a full export's per-source and top-level timestamps match).
+    exported_at = datetime.now(timezone.utc).isoformat()
+    agent_sha = _get_agent_sha()
+
     results = {}
     for name, func in sources.items():
         logger.info(f"{'[DRY RUN] ' if dry_run else ''}Exporting {name}...")
@@ -1066,6 +1072,16 @@ def main():
         except Exception as e:
             logger.error(f"Failed to export {name}: {e}")
             results[name] = {"status": "error", "error": str(e)}
+
+    # Issue #820: freshness belongs to each source, not just the top of the
+    # file. A partial (--source) run's merge below preserves entries for
+    # sources it didn't touch — those keep whatever exported_at/agent_sha
+    # they were stamped with on their own last run, instead of silently
+    # inheriting this run's timestamp the way the top-level field used to.
+    for source_result in results.values():
+        if isinstance(source_result, dict):
+            source_result["exported_at"] = exported_at
+            source_result["agent_sha"] = agent_sha
 
     # Write manifest. A single-source run (--source) must merge into any
     # existing manifest rather than replacing it wholesale — otherwise the
@@ -1107,9 +1123,9 @@ def main():
             skip_manifest_write = True
 
     manifest = {
-        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "exported_at": exported_at,
         "hostname": __import__("socket").gethostname(),
-        "agent_sha": _get_agent_sha(),
+        "agent_sha": agent_sha,
         "results": manifest_results,
     }
 

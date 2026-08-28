@@ -951,6 +951,184 @@ class TestStalenessAlerting:
 
 
 # ---------------------------------------------------------------------------
+# Per-source freshness (issue #820) — a partial export run must not refresh
+# the manifest's top-level timestamp for sources it did not run.
+# ---------------------------------------------------------------------------
+
+class TestPerSourceStaleness:
+    """check_manifest judges each source's staleness from its own recorded
+    exported_at, not the shared top-level one — so a fresh run of source B
+    doesn't mask a week-old preserved entry for source A (#786 made that
+    preservation possible; this closes the staleness gap it opened)."""
+
+    def _write_manifest(self, import_dir: Path, top_level_exported_at: str, results: dict):
+        import_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "exported_at": top_level_exported_at,
+            "hostname": "test-host",
+            "results": results,
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+    def test_preserved_stale_entry_judged_on_own_timestamp(self, tmp_path, caplog):
+        """The exact #786/#820 scenario: source A (contacts) was preserved
+        from a run 10 days ago; source B (whatsapp) ran moments ago and
+        refreshed the top-level exported_at. A must still be flagged stale —
+        judged from its own timestamp, not B's fresh one."""
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        now = datetime.now(timezone.utc)
+        very_stale = now - timedelta(days=10)
+        fresh = now - timedelta(minutes=1)
+        self._write_manifest(
+            import_dir,
+            top_level_exported_at=fresh.isoformat(),  # the run that just happened
+            results={
+                "contacts": {"status": "ok", "count": 5, "exported_at": very_stale.isoformat()},
+                "whatsapp": {"status": "ok", "count": 2, "exported_at": fresh.isoformat()},
+            },
+        )
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            with caplog.at_level(logging.DEBUG):
+                result = check_manifest()
+
+        assert result is not None
+        # Top-level check alone sees only the fresh timestamp — no top-level
+        # staleness message...
+        assert "_staleness_critical_message" not in result
+        # ...but the per-source check still catches contacts on its own record.
+        assert "contacts" in result.get("_stale_sources", {})
+        assert "whatsapp" not in result.get("_stale_sources", {})
+        assert any(
+            r.levelno >= logging.CRITICAL and "contacts" in r.message
+            for r in caplog.records
+        )
+
+    def test_fresh_full_run_no_per_source_staleness(self, tmp_path):
+        """A full export where every source ran just now must not be flagged
+        — per-source and top-level timestamps agree and are both fresh."""
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        fresh = datetime.now(timezone.utc) - timedelta(minutes=1)
+        self._write_manifest(
+            import_dir,
+            top_level_exported_at=fresh.isoformat(),
+            results={
+                "contacts": {"status": "ok", "exported_at": fresh.isoformat()},
+                "whatsapp": {"status": "ok", "exported_at": fresh.isoformat()},
+            },
+        )
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            result = check_manifest()
+
+        assert result is not None
+        assert result.get("_stale_sources", {}) == {}
+
+    def test_legacy_manifest_without_per_source_timestamps_falls_back(self, tmp_path, caplog):
+        """A manifest written before #820 has no per-source exported_at at
+        all — must still import, relying entirely on the pre-existing
+        top-level staleness check (already covered by TestStalenessAlerting)
+        rather than crashing or silently skipping staleness detection."""
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        very_stale = datetime.now(timezone.utc) - timedelta(days=10)
+        self._write_manifest(
+            import_dir,
+            top_level_exported_at=very_stale.isoformat(),
+            results={
+                "contacts": {"status": "ok", "count": 5},  # no exported_at — legacy shape
+            },
+        )
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            with caplog.at_level(logging.DEBUG):
+                result = check_manifest()
+
+        assert result is not None
+        # No per-source signal (nothing to fall back to per-source), but the
+        # top-level check still fires exactly as it did before this change.
+        assert result.get("_stale_sources", {}) == {}
+        assert "10 days old" in result.get("_staleness_critical_message", "")
+
+    def test_import_run_fails_for_the_stale_source_specifically(self, tmp_path, monkeypatch):
+        """End-to-end through main(): a preserved stale contacts entry fails
+        the run even though whatsapp (this run's actual work) is healthy and
+        fresh — and the failure is attributed to contacts, not a generic
+        top-level staleness catch-all."""
+        import scripts.apple_data_import as import_mod
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir(parents=True)
+        now = datetime.now(timezone.utc)
+        very_stale = now - timedelta(days=10)
+        fresh = now - timedelta(minutes=1)
+        manifest = {
+            "exported_at": fresh.isoformat(),
+            "hostname": "test-host",
+            "results": {
+                "contacts": {"status": "ok", "count": 5, "exported_at": very_stale.isoformat()},
+                "whatsapp": {"status": "ok", "count": 2, "exported_at": fresh.isoformat()},
+            },
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", import_dir)
+        monkeypatch.setattr(
+            import_mod, "import_contacts",
+            lambda dry_run=False, **kw: {"status": "ok", "created": 5},
+        )
+        monkeypatch.setattr(
+            import_mod, "import_whatsapp",
+            lambda dry_run=False, **kw: {"status": "ok", "imported": 2},
+        )
+        for name in ("import_imessage", "import_phone_calls", "import_photos_faces", "import_health"):
+            monkeypatch.setattr(import_mod, name, lambda dry_run=False, **kw: {"status": "ok"})
+        monkeypatch.setattr(import_mod.sys, "argv", ["apple_data_import.py", "--execute"])
+
+        with pytest.raises(SystemExit) as exc_info:
+            import_mod.main()
+
+        assert exc_info.value.code == 1
+
+    def test_configured_working_source_produces_identical_result(self, tmp_path, monkeypatch):
+        """A source that is configured and healthy (fresh per-source
+        timestamp, no error) must produce an identical result dict after
+        this change — the staleness/error overrides must be true no-ops."""
+        import scripts.apple_data_import as import_mod
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir(parents=True)
+        fresh = datetime.now(timezone.utc) - timedelta(minutes=1)
+        manifest = {
+            "exported_at": fresh.isoformat(),
+            "hostname": "test-host",
+            "results": {
+                "contacts": {"status": "ok", "count": 5, "exported_at": fresh.isoformat()},
+            },
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", import_dir)
+        monkeypatch.setattr(
+            import_mod, "import_contacts",
+            lambda dry_run=False, **kw: {"status": "ok", "created": 3, "updated": 1, "linked": 2},
+        )
+        monkeypatch.setattr(import_mod.sys, "argv", [
+            "apple_data_import.py", "--execute", "--source", "contacts",
+        ])
+
+        import_mod.main()  # must not raise / exit
+
+
+# ---------------------------------------------------------------------------
 # Agent self-update SHA (issue #509) — export side
 # ---------------------------------------------------------------------------
 
@@ -1081,8 +1259,12 @@ class TestManifestMergeOnPartialExport:
 
         manifest = json.loads((tmp_path / "manifest.json").read_text())
         results = manifest["results"]
-        # The run source reflects the new result...
-        assert results["whatsapp"] == {"status": "ok", "count": 1, "path": "fake"}
+        # The run source reflects the new result, stamped with this run's own
+        # freshness (issue #820: per-source exported_at/agent_sha)...
+        assert results["whatsapp"] == {
+            "status": "ok", "count": 1, "path": "fake",
+            "exported_at": manifest["exported_at"], "agent_sha": "newsha456",
+        }
         # ...and every other source's prior entry is untouched.
         assert results["contacts"] == {"status": "ok", "count": 5}
         assert results["imessage"] == {"status": "ok", "count": 10}
@@ -1108,7 +1290,12 @@ class TestManifestMergeOnPartialExport:
         export_mod.main()
 
         manifest = json.loads((tmp_path / "manifest.json").read_text())
-        assert manifest["results"] == {"contacts": {"status": "ok", "count": 1, "path": "fake"}}
+        assert manifest["results"] == {
+            "contacts": {
+                "status": "ok", "count": 1, "path": "fake",
+                "exported_at": manifest["exported_at"], "agent_sha": "newsha456",
+            }
+        }
 
     def test_full_run_still_fully_replaces_manifest(self, tmp_path, monkeypatch):
         """Regression guard: an all-sources run (no --source) must remain a
@@ -1149,7 +1336,10 @@ class TestManifestMergeOnPartialExport:
         assert set(manifest["results"].keys()) == {
             "contacts", "imessage", "phone", "photos", "whatsapp",
         }
-        assert manifest["results"]["contacts"] == {"status": "ok", "count": 1, "path": "fake"}
+        assert manifest["results"]["contacts"] == {
+            "status": "ok", "count": 1, "path": "fake",
+            "exported_at": manifest["exported_at"], "agent_sha": "newsha456",
+        }
 
     def test_single_source_dry_run_does_not_write_manifest(self, tmp_path, monkeypatch):
         """Out of scope for #786: dry-run stays preview-only, no manifest
