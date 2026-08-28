@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LifeOS Local LLM (llama-server) launchd configuration template.
+
+  Opt-in (#774/#830): only installed by scripts/setup-launchd.sh when
+  LIFEOS_LOCAL_LLM_AUTOSTART=true — mirrors the same env var gating
+  lifeos-llm.service on the systemd side
+  (config/systemd/lifeos-llm.service). A fresh install with this unset
+  stays exactly as inert as it is today; nothing here changes what an
+  already-configured host has loaded.
+
+  Model source: `-hf <repo>` (default, llama.cpp manages the HuggingFace
+  cache) or `-m <gguf>` (with an optional mmproj flag for vision models)
+  when LIFEOS_LLM_MODEL_PATH is set (local override for a stale HF cache — see
+  docs/guides/agent-worker-setup.md). scripts/setup-launchd.sh computes
+  these the same way scripts/setup-systemd.sh does and fills in the
+  model-source-args marker line below (see inject_llm_source_args in that
+  script) with one <string> per argument token — a launchd
+  ProgramArguments array can't hold a single space-separated string the
+  way systemd's ExecStart= line can. That marker line's exact text must
+  stay unique in this file (nothing else in the file may contain it
+  literally) since it's matched and replaced by line, not substituted
+  in place.
+
+  No ROCBLAS_USE_HIPBLASLT here (unlike the systemd unit): that variable
+  tunes AMD's hipBLASLt/rocBLAS backend, which doesn't exist on macOS —
+  llama-server uses the Metal backend on Apple Silicon instead, with no
+  equivalent tuning flag needed.
+
+  launchd has no StartLimitBurst equivalent: KeepAlive below restarts on
+  every non-zero exit, forever, throttled only by ThrottleInterval — a
+  persistently bad model path (e.g. a typo'd LIFEOS_LLM_MODEL_PATH)
+  restart-loops indefinitely instead of giving up after N attempts the way
+  systemd's StartLimitBurst/StartLimitIntervalSec would. Watch
+  logs/llama-server.log if this service won't stay up.
+
+  To use:
+  1. Copy this file to com.lifeos.llm.plist
+  2. Replace __HOME__ with your home directory path
+  3. Replace __LIFEOS_PATH__ with your LifeOS project path
+  4. Replace __LLAMA_CPP_DIR__ with your llama.cpp checkout path
+  5. Replace the model-source-args marker line in ProgramArguments below
+     with the model source <string> args (see scripts/setup-launchd.sh)
+  6. Copy to ~/Library/LaunchAgents/
+  7. Run: launchctl load ~/Library/LaunchAgents/com.lifeos.llm.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lifeos.llm</string>
+
+    <!-- Routed through launchd-env-wrapper.sh so the process gets .env at
+         start, the same way lifeos-llm.service gets it via systemd's
+         EnvironmentFile= (#776). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__LIFEOS_PATH__/scripts/launchd-env-wrapper.sh</string>
+        <string>__LIFEOS_PATH__</string>
+        <string>__LLAMA_CPP_DIR__/build/bin/llama-server</string>
+        __LLM_SOURCE_ARGS_LINES__
+        <string>-ngl</string>
+        <string>99</string>
+        <string>-fa</string>
+        <string>on</string>
+        <string>--jinja</string>
+        <string>--no-mmap</string>
+        <string>-c</string>
+        <string>32768</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>8080</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__LLAMA_CPP_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.venvs/lifeos/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- Auto-start on boot -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart only on a non-zero exit — mirrors lifeos-llm.service's
+         Restart=on-failure. This plist is only ever installed when
+         LIFEOS_LOCAL_LLM_AUTOSTART=true, so there's no launchd analog
+         needed for systemd's separate "installed but disabled" state. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Restart throttle: wait 10 seconds before restart (matches the
+         systemd unit's RestartSec=10) -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Log files (matches the systemd unit's StandardOutput/StandardError
+         both pointing at logs/llama-server.log) -->
+    <key>StandardOutPath</key>
+    <string>__LIFEOS_PATH__/logs/llama-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LIFEOS_PATH__/logs/llama-server.log</string>
+</dict>
+</plist>

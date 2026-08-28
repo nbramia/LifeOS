@@ -24,6 +24,10 @@ ENV_FILE="$LIFEOS_PATH/.env"
 # what's actually baked into the generated plist. Tests get an isolated venv
 # by pointing $HOME at a sandbox, same as everything else __HOME__-derived.
 VENV_DIR="$HOME/.venvs/lifeos"
+# Same convention as scripts/setup-systemd.sh's LLAMA_DIR: a shell env var
+# override, else ~/llama.cpp default. Feeds __LLAMA_CPP_DIR__ in
+# com.lifeos.llm.plist.template.
+LLAMA_DIR="${LIFEOS_LLAMA_DIR:-$HOME/llama.cpp}"
 
 # Read a KEY=value from .env, same convention as scripts/setup-systemd.sh's
 # and scripts/auto-deploy.sh's own _read_env — stripping quotes, whitespace,
@@ -35,15 +39,42 @@ _read_env() {
     echo "${val:-$default}"
 }
 
-# Opt-in gates for the two conditionally-installed services (#774) — same
-# env vars, same defaults, as scripts/setup-systemd.sh's Linux install, so
-# a single .env controls both platforms identically.
+# Opt-in gates for the three conditionally-installed services (#774, #830)
+# — same env vars, same defaults, as scripts/setup-systemd.sh's Linux
+# install, so a single .env controls all three identically on both
+# platforms.
 AGENT_WORKER_AUTOSTART=$(_read_env "LIFEOS_AGENT_WORKER_AUTOSTART" "false" | tr '[:upper:]' '[:lower:]')
 case "$AGENT_WORKER_AUTOSTART" in
     true|1|yes) AGENT_WORKER_AUTOSTART="true" ;;
     *)          AGENT_WORKER_AUTOSTART="false" ;;
 esac
 MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
+LLM_AUTOSTART=$(_read_env "LIFEOS_LOCAL_LLM_AUTOSTART" "false" | tr '[:upper:]' '[:lower:]')
+case "$LLM_AUTOSTART" in
+    true|1|yes) LLM_AUTOSTART="true" ;;
+    *)          LLM_AUTOSTART="false" ;;
+esac
+
+# Model source args for com.lifeos.llm.plist — same computation as
+# scripts/setup-systemd.sh's LLM_SOURCE_ARGS: `-hf <repo>` by default, or
+# `-m <gguf> [--mmproj <mmproj>]` when LIFEOS_LLM_MODEL_PATH overrides a
+# stale HuggingFace cache (see docs/guides/agent-worker-setup.md). Kept as
+# an array, not a joined string, because launchd's ProgramArguments is a
+# real argv array — each token needs its own <string> element; see
+# inject_llm_source_args below.
+LLM_MODEL=$(_read_env "LIFEOS_LLM_MODEL" "unsloth/gemma-4-26B-A4B-it-GGUF")
+LLM_MODEL_PATH=$(_read_env "LIFEOS_LLM_MODEL_PATH" "")
+LLM_MMPROJ_PATH=$(_read_env "LIFEOS_LLM_MMPROJ_PATH" "")
+if [ -n "$LLM_MODEL_PATH" ]; then
+    LLM_SOURCE_ARGS_TOKENS=("-m" "$LLM_MODEL_PATH")
+    if [ -n "$LLM_MMPROJ_PATH" ]; then
+        LLM_SOURCE_ARGS_TOKENS+=("--mmproj" "$LLM_MMPROJ_PATH")
+    fi
+    LLM_SOURCE_DISPLAY="$LLM_MODEL_PATH (local file)"
+else
+    LLM_SOURCE_ARGS_TOKENS=("-hf" "$LLM_MODEL")
+    LLM_SOURCE_DISPLAY="$LLM_MODEL (HuggingFace)"
+fi
 
 # --- Generation ------------------------------------------------------------
 
@@ -55,18 +86,63 @@ _sed_escape_replacement() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/&/\\\&/g' -e 's/|/\\|/g'
 }
 
-# Substitute the __HOME__/__LIFEOS_PATH__/__VAULT_PATH__ placeholder
-# convention into a template, writing the result to $2.
+# XML-escape a value for safe use inside a plist <string> element (found on
+# review, #830): a path containing `&`, `<`, or `>` (e.g. `/Users/x/R&D/model.gguf`
+# — a real-world directory name) produces invalid XML if dropped in raw,
+# which then fails plutil validation and aborts the whole install. `&` must
+# be escaped first, or escaping `<`/`>` afterward would double-escape it.
+_xml_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+# Substitute the __HOME__/__LIFEOS_PATH__/__VAULT_PATH__/__LLAMA_CPP_DIR__
+# placeholder convention into a template, writing the result to $2.
+# llama_dir ($6) is optional — templates that don't reference
+# __LLAMA_CPP_DIR__ (everything but com.lifeos.llm.plist.template) simply
+# ignore it. __LLAMA_CPP_DIR__ is XML-escaped before the sed-escape (composed,
+# not either alone — sed-escape alone would leave a raw `&` in the plist,
+# and XML-escaping alone would leave literal `&` from `&amp;` unescaped for
+# sed's own replacement syntax). __HOME__/__LIFEOS_PATH__/__VAULT_PATH__
+# intentionally keep their existing sed-only behavior — locked in by
+# test_generate_plist_handles_sed_metacharacters_in_values, unrelated to
+# this new placeholder.
 generate_plist() {
-    local template="$1" output="$2" home="$3" lifeos_path="$4" vault_path="$5"
-    local esc_home esc_lifeos_path esc_vault_path
+    local template="$1" output="$2" home="$3" lifeos_path="$4" vault_path="$5" llama_dir="$6"
+    local esc_home esc_lifeos_path esc_vault_path esc_llama_dir
     esc_home=$(_sed_escape_replacement "$home")
     esc_lifeos_path=$(_sed_escape_replacement "$lifeos_path")
     esc_vault_path=$(_sed_escape_replacement "$vault_path")
+    esc_llama_dir=$(_sed_escape_replacement "$(_xml_escape "$llama_dir")")
     sed -e "s|__HOME__|$esc_home|g" \
         -e "s|__LIFEOS_PATH__|$esc_lifeos_path|g" \
         -e "s|__VAULT_PATH__|$esc_vault_path|g" \
+        -e "s|__LLAMA_CPP_DIR__|$esc_llama_dir|g" \
         "$template" > "$output"
+}
+
+# The launchd analog of scripts/setup-systemd.sh's single LLM_SOURCE_ARGS
+# string: ProgramArguments is a real argv array, so each token
+# (LLM_SOURCE_ARGS_TOKENS, computed above) needs its own <string> element
+# rather than one space-joined string. sed's `r` command inserts a file's
+# raw content immediately after the matched line; the paired `d` then
+# removes the marker line itself. Only ever called for com.lifeos.llm.plist
+# — no other template has this marker, so check_placeholders would (rightly)
+# fail any plist where this was skipped by mistake.
+#
+# Each token is XML-escaped (found on review, #830): these come straight
+# from operator-supplied LIFEOS_LLM_MODEL/_MODEL_PATH/_MMPROJ_PATH, and a
+# path containing `&`, `<`, or `>` would otherwise produce invalid XML that
+# fails plutil validation and aborts the whole install.
+inject_llm_source_args() {
+    local plist="$1"
+    local args_file tok
+    args_file=$(mktemp)
+    for tok in "${LLM_SOURCE_ARGS_TOKENS[@]}"; do
+        printf '        <string>%s</string>\n' "$(_xml_escape "$tok")" >> "$args_file"
+    done
+    sed -e "/__LLM_SOURCE_ARGS_LINES__/r $args_file" -e "/__LLM_SOURCE_ARGS_LINES__/d" "$plist" > "$plist.tmp"
+    mv "$plist.tmp" "$plist"
+    rm -f "$args_file"
 }
 
 # --- Validation (#776) -------------------------------------------------------
@@ -307,6 +383,12 @@ service_skip_reason() {
                 return 1
             fi
             ;;
+        *.llm.plist)
+            if [ "$LLM_AUTOSTART" != "true" ]; then
+                echo "set LIFEOS_LOCAL_LLM_AUTOSTART=true to enable"
+                return 1
+            fi
+            ;;
     esac
     return 0
 }
@@ -380,6 +462,14 @@ if [ -n "$MCP_BEARER_TOKEN" ]; then
 else
     echo "  MCP HTTP:     disabled (set LIFEOS_MCP_BEARER_TOKEN to enable)"
 fi
+if [ "$LLM_AUTOSTART" = "true" ]; then
+    echo "  Local LLM:    enabled ($LLM_SOURCE_DISPLAY)"
+else
+    echo "  Local LLM:    disabled (set LIFEOS_LOCAL_LLM_AUTOSTART=true to enable)"
+fi
+if [ -n "$LLM_MODEL_PATH" ] && [ ! -f "$LLM_MODEL_PATH" ]; then
+    echo "  WARNING: LIFEOS_LLM_MODEL_PATH=$LLM_MODEL_PATH does not exist"
+fi
 echo ""
 
 if [ "$AUTO_YES" = false ]; then
@@ -402,7 +492,10 @@ for template in "$LAUNCHD_DIR"/*.plist.template; do
     if [ -f "$template" ]; then
         output="${template%.template}"
         filename=$(basename "$output")
-        generate_plist "$template" "$output" "$HOME" "$LIFEOS_PATH" "$VAULT_PATH"
+        generate_plist "$template" "$output" "$HOME" "$LIFEOS_PATH" "$VAULT_PATH" "$LLAMA_DIR"
+        if [ "$filename" = "com.lifeos.llm.plist" ]; then
+            inject_llm_source_args "$output"
+        fi
         echo "  Generated: $filename"
     fi
 done
@@ -496,6 +589,9 @@ echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.api.plist"
 echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.crm-sync.plist"
 if [ "$AGENT_WORKER_AUTOSTART" = "true" ]; then
     echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.agent-worker.plist"
+fi
+if [ "$LLM_AUTOSTART" = "true" ]; then
+    echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.llm.plist"
 fi
 if [ -n "$MCP_BEARER_TOKEN" ]; then
     echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.mcp-http.plist"

@@ -18,9 +18,11 @@ and fixture templates, with `plutil` stubbed since it's macOS-only.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess
+import xml.dom.minidom
 from pathlib import Path
 
 import pytest
@@ -145,6 +147,19 @@ def test_sed_escape_replacement_round_trips_special_characters(tmp_path: Path):
     result = _run_sourced(repo, r'''esc=$(_sed_escape_replacement 'a&b\c|d'); printf 'X__T__Y' | sed "s|__T__|$esc|g"''')
     assert result.returncode == 0, result.stderr
     assert result.stdout == r'Xa&b\c|dY'
+
+
+@pytest.mark.unit
+def test_xml_escape_escapes_ampersand_lt_gt(tmp_path: Path):
+    """#830: values that flow into a plist <string> element (llama.cpp dir,
+    model-source args) need real XML escaping, not just sed-safety — a raw
+    `&`, `<`, or `>` is invalid XML outside an entity reference."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    result = _run_sourced(repo, r'''_xml_escape 'R&D <models> here' ''')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "R&amp;D &lt;models&gt; here"
 
 
 @pytest.mark.unit
@@ -869,6 +884,294 @@ def test_main_rerun_with_autostart_still_enabled_leaves_agent_worker_untouched(t
     second = run()
     assert second.returncode == 0, (second.stdout, second.stderr)
     assert "Unchanged: com.lifeos.agent-worker.plist" in second.stdout
+    assert installed.stat().st_mtime == before_mtime
+
+
+# ---------------------------------------------------------------------------
+# #830 — conditionally-installed local LLM (llama-server) service
+# ---------------------------------------------------------------------------
+_LLM_TEMPLATE = REPO_ROOT / "config" / "launchd" / "com.lifeos.llm.plist.template"
+
+
+def _add_llama_server_binary(fake_home: Path) -> Path:
+    """Stub a llama.cpp checkout at the default __LLAMA_CPP_DIR__ location
+    (fake_home/llama.cpp, matching LLAMA_DIR="${LIFEOS_LLAMA_DIR:-$HOME/llama.cpp}"
+    in setup-launchd.sh) so check_paths_exist's WorkingDirectory/binary
+    checks pass. Returns the llama.cpp dir."""
+    llama_dir = fake_home / "llama.cpp"
+    binary = llama_dir / "build" / "bin" / "llama-server"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    return llama_dir
+
+
+@pytest.mark.unit
+def test_generate_plist_substitutes_llama_cpp_dir_placeholder(tmp_path: Path):
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    template = repo / "t.plist.template"
+    template.write_text(
+        "<dict><key>WorkingDirectory</key><string>__LLAMA_CPP_DIR__</string></dict>",
+        encoding="utf-8",
+    )
+    output = repo / "t.plist"
+    result = _run_sourced(
+        repo,
+        f'generate_plist "{template}" "{output}" "/home/op" "/proj" "/vault" "/opt/llama.cpp"',
+    )
+    assert result.returncode == 0, result.stderr
+    text = output.read_text()
+    assert "__LLAMA_CPP_DIR__" not in text
+    assert "/opt/llama.cpp" in text
+
+
+@pytest.mark.unit
+def test_inject_llm_source_args_replaces_marker_with_one_string_per_token(tmp_path: Path):
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    plist = repo / "p.plist"
+    plist.write_text(
+        "<array>\n"
+        "        <string>/bin/llama-server</string>\n"
+        "        __LLM_SOURCE_ARGS_LINES__\n"
+        "        <string>-ngl</string>\n"
+        "</array>\n",
+        encoding="utf-8",
+    )
+    result = _run_sourced(
+        repo,
+        f'LLM_SOURCE_ARGS_TOKENS=("-hf" "some/repo"); inject_llm_source_args "{plist}"',
+    )
+    assert result.returncode == 0, result.stderr
+    text = plist.read_text()
+    assert "__LLM_SOURCE_ARGS_LINES__" not in text
+    assert "<string>-hf</string>" in text
+    assert "<string>some/repo</string>" in text
+    # Order preserved and no stray duplication of the surrounding lines.
+    assert text.count("<string>-ngl</string>") == 1
+    assert text.index("<string>-hf</string>") < text.index("<string>some/repo</string>")
+
+
+@pytest.mark.unit
+def test_main_skips_llm_by_default(tmp_path: Path):
+    """Same 'fresh install stays exactly as inert as it is today' contract
+    as agent-worker/mcp-http: with no opt-in set, nothing is installed."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    if not _LLM_TEMPLATE.exists():
+        pytest.skip("llm plist template not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    _add_real_template(repo, _LLM_TEMPLATE)
+    _add_llama_server_binary(fake_home)
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "Local LLM:    disabled" in result.stdout
+    assert "Skipped: com.lifeos.llm.plist" in result.stdout
+    agents = fake_home / "Library" / "LaunchAgents"
+    assert not (agents / "com.lifeos.llm.plist").exists()
+    assert (agents / "com.lifeos.api.plist").exists()  # unaffected
+
+
+@pytest.mark.unit
+def test_main_installs_llm_when_autostart_enabled(tmp_path: Path):
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    if not _LLM_TEMPLATE.exists():
+        pytest.skip("llm plist template not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    _add_real_template(repo, _LLM_TEMPLATE)
+    _add_llama_server_binary(fake_home)
+    (repo / ".env").write_text("LIFEOS_LOCAL_LLM_AUTOSTART=true\n", encoding="utf-8")
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "Local LLM:    enabled" in result.stdout
+    installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.llm.plist"
+    assert installed.exists(), (result.stdout, result.stderr)
+    text = installed.read_text()
+    assert not re.search(r"__[A-Z_]+__", text), text  # no leftover placeholders
+    assert "<string>-hf</string>" in text
+    assert "<string>unsloth/gemma-4-26B-A4B-it-GGUF</string>" in text
+    assert "launchctl load ~/Library/LaunchAgents/com.lifeos.llm.plist" in result.stdout
+
+
+@pytest.mark.unit
+def test_main_installs_llm_with_model_path_override(tmp_path: Path):
+    """LIFEOS_LLM_MODEL_PATH/_MMPROJ_PATH switch the args to `-m`/`--mmproj`
+    — same override scripts/setup-systemd.sh honors for a stale HF cache."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    if not _LLM_TEMPLATE.exists():
+        pytest.skip("llm plist template not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    _add_real_template(repo, _LLM_TEMPLATE)
+    _add_llama_server_binary(fake_home)
+    model_path = tmp_path / "model.gguf"
+    model_path.write_text("fake gguf")
+    mmproj_path = tmp_path / "mmproj.gguf"
+    mmproj_path.write_text("fake mmproj")
+    (repo / ".env").write_text(
+        "LIFEOS_LOCAL_LLM_AUTOSTART=true\n"
+        f"LIFEOS_LLM_MODEL_PATH={model_path}\n"
+        f"LIFEOS_LLM_MMPROJ_PATH={mmproj_path}\n",
+        encoding="utf-8",
+    )
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "WARNING" not in result.stdout, result.stdout
+    installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.llm.plist"
+    text = installed.read_text()
+    assert f"<string>-m</string>\n        <string>{model_path}</string>" in text
+    assert f"<string>--mmproj</string>\n        <string>{mmproj_path}</string>" in text
+    assert "<string>-hf</string>" not in text
+
+
+@pytest.mark.unit
+def test_main_installs_llm_with_ampersand_in_model_path(tmp_path: Path):
+    """Found on review: a real-world directory name like `R&D` in
+    LIFEOS_LLM_MODEL_PATH produced invalid plist XML (a bare `&` is not
+    legal outside an entity reference) — the stubbed plutil in other tests
+    doesn't catch this since it always exits 0, so this test parses the
+    installed plist as real XML instead."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    if not _LLM_TEMPLATE.exists():
+        pytest.skip("llm plist template not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    _add_real_template(repo, _LLM_TEMPLATE)
+    _add_llama_server_binary(fake_home)
+    model_dir = tmp_path / "R&D"
+    model_dir.mkdir()
+    model_path = model_dir / "model.gguf"
+    model_path.write_text("fake gguf")
+    (repo / ".env").write_text(
+        f"LIFEOS_LOCAL_LLM_AUTOSTART=true\nLIFEOS_LLM_MODEL_PATH={model_path}\n",
+        encoding="utf-8",
+    )
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.llm.plist"
+    text = installed.read_text()
+    assert "R&amp;D" in text
+    assert "R&D" not in text  # the raw, unescaped form must not appear
+    xml.dom.minidom.parseString(text)  # raises ExpatError if not well-formed
+
+
+@pytest.mark.unit
+def test_main_warns_when_model_path_configured_but_missing(tmp_path: Path):
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    if not _LLM_TEMPLATE.exists():
+        pytest.skip("llm plist template not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    _add_real_template(repo, _LLM_TEMPLATE)
+    _add_llama_server_binary(fake_home)
+    (repo / ".env").write_text(
+        "LIFEOS_LOCAL_LLM_AUTOSTART=true\nLIFEOS_LLM_MODEL_PATH=/no/such/model.gguf\n",
+        encoding="utf-8",
+    )
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "WARNING: LIFEOS_LLM_MODEL_PATH=/no/such/model.gguf does not exist" in result.stdout
+
+
+@pytest.mark.unit
+def test_main_aborts_install_when_llama_server_binary_missing(tmp_path: Path):
+    """check_paths_exist validates the actual llama-server binary
+    (ProgramArguments item 3) and WorkingDirectory the same way it already
+    does for uvicorn/mcp_server.py — an operator who enables the local LLM
+    before building llama.cpp gets a named error, not a broken install.
+    A single failing plist aborts the whole run (existing behavior), so
+    even com.lifeos.api.plist must not be installed."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    if not _LLM_TEMPLATE.exists():
+        pytest.skip("llm plist template not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    _add_real_template(repo, _LLM_TEMPLATE)
+    # Deliberately no _add_llama_server_binary(fake_home) call.
+    (repo / ".env").write_text("LIFEOS_LOCAL_LLM_AUTOSTART=true\n", encoding="utf-8")
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0, (result.stdout, result.stderr)
+    assert "llama-server" in result.stdout
+    agents = fake_home / "Library" / "LaunchAgents"
+    assert not (agents / "com.lifeos.llm.plist").exists()
+    assert not (agents / "com.lifeos.api.plist").exists()
+
+
+@pytest.mark.unit
+def test_main_rerun_with_llm_autostart_still_enabled_leaves_it_untouched(tmp_path: Path):
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    if not _LLM_TEMPLATE.exists():
+        pytest.skip("llm plist template not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    _add_real_template(repo, _LLM_TEMPLATE)
+    _add_llama_server_binary(fake_home)
+    (repo / ".env").write_text("LIFEOS_LOCAL_LLM_AUTOSTART=true\n", encoding="utf-8")
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+
+    def run():
+        return subprocess.run(
+            ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+            cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+        )
+
+    first = run()
+    assert first.returncode == 0, (first.stdout, first.stderr)
+    installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.llm.plist"
+    before_mtime = installed.stat().st_mtime
+
+    second = run()
+    assert second.returncode == 0, (second.stdout, second.stderr)
+    assert "Unchanged: com.lifeos.llm.plist" in second.stdout
     assert installed.stat().st_mtime == before_mtime
 
 
