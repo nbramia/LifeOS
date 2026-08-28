@@ -2199,11 +2199,17 @@ function parseSseChunk(buffer, onEvent) {
   const remainder = lines.pop() || '';
   for (const line of lines) {
     if (!line.startsWith('data: ')) continue;
+    let event;
     try {
-      onEvent(JSON.parse(line.slice(6)));
+      event = JSON.parse(line.slice(6));
     } catch {
-      /* ignore malformed chunks */
+      continue; // ignore malformed chunks
     }
+    // Outside the try: `cancelled`/`error` events intentionally throw from
+    // onEvent (handleEvent, below) to unwind consumeTurnStream's read loop --
+    // that must propagate to submitTurn()'s catch, not get swallowed here
+    // alongside a genuine JSON.parse failure.
+    onEvent(event);
   }
   return remainder;
 }
@@ -2489,6 +2495,10 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
   showThinking();
   activeTurnId = null;
   activeTurnAbort = new AbortController();
+  // Captured so the catch below (#827) can tell "this turn's own controller
+  // is still current" from "a newer turn already replaced it" -- distinct
+  // from activeTurnAbort itself, which a later submitTurn() call reassigns.
+  const ownAbortController = activeTurnAbort;
 
   // #801 -- hold the recording until the turn *definitively* completes (see
   // `heldRecording`'s own comment). Set here, unconditionally, so a fresh
@@ -2580,7 +2590,24 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
     setStatus('', 'Ready');
     await maybeAutoContinue();  // re-record if Auto-continue is on
   } catch (err) {
-    if (err?.name === 'AbortError') return;  // cancelled — the cancel handler resets UI
+    if (err?.name === 'AbortError') {
+      // A local Cancel-button tap runs cancelActiveTurn() synchronously
+      // before this ever settles -- it already reset thinking/cancel/status
+      // and nulled activeTurnAbort, so redoing that here would risk
+      // clobbering a next turn that started in the meantime. A turn
+      // cancelled server-side (the 'cancelled' SSE branch above, reachable
+      // with no local cancelActiveTurn() call -- see #827) never goes
+      // through that reset, and activeTurnAbort is still THIS turn's own
+      // controller in that case -- checked by identity, not mere presence,
+      // so a stale turn settling after a newer one has already started
+      // can't stomp on the newer turn's UI either.
+      if (activeTurnAbort === ownAbortController) {
+        clearThinking();
+        showCancel(false);
+        setStatus('', 'Ready');
+      }
+      return;
+    }
     clearThinking();
     showCancel(false);
     // #801 -- a mid-stream drop (the SSE stream died after a genuine `ok`
