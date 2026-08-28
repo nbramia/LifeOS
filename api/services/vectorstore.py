@@ -11,8 +11,15 @@ from datetime import datetime
 from pathlib import Path
 import json
 import math
+import os
 
 from config.settings import settings
+
+# note_type values written by non-vault sources (api/services/calendar_indexer.py,
+# api/services/slack_indexer.py). These index real content under a relative
+# pseudo-path (e.g. "calendar/<event-id>"), not a vault document, so they must
+# never be mistaken for a vault-root sample (#762 follow-up).
+_NON_VAULT_NOTE_TYPES = ["calendar_event", "slack_message"]
 
 
 class VectorStore:
@@ -317,27 +324,52 @@ class VectorStore:
         return paths
 
     def sample_file_paths(self, limit: int = 5) -> list[str]:
-        """Return up to `limit` distinct indexed file paths, without
+        """Return up to `limit` distinct indexed *vault* file paths, without
         scanning the whole collection (#762). Used by the vault_search
         health check's vault-root sanity check — `get_all_file_paths()`
         above is the right tool when every path is actually needed, but is
         too expensive to call on every health-check request against a large
         vault.
 
+        The collection also holds non-vault sources (calendar events, Slack
+        messages) indexed under relative pseudo-paths, not real vault
+        documents. On a real vault these can dominate the front of insertion
+        order (e.g. thousands of calendar-event rows), so a plain unfiltered
+        fetch can return nothing but non-vault rows — every one of them
+        trivially "outside the vault root" and a false `degraded` (#762
+        follow-up). Push the exclusion down to ChromaDB via `where` so the
+        fetch still targets real vault rows regardless of how many non-vault
+        rows precede them, instead of over-fetching further and further to
+        try to skip past them client-side.
+
         Each file is indexed as several chunks (one row per chunk, all
         sharing one `file_path`), so a raw `limit`-sized fetch risks
         returning the same one or two files repeatedly. Over-fetch a bit
         and dedupe to `file_path` so the sample actually spans up to
-        `limit` distinct files — still a small, bounded read regardless of
-        collection size, not a scan.
+        `limit` distinct files. At the health check's default `limit=50`
+        this fetches at most 250 rows — still a small, bounded read
+        regardless of collection size (250 rows out of 45k+ on a real vault
+        is well under 1%), not a scan.
         """
-        results = self._collection.get(limit=limit * 4, include=["metadatas"])
+        results = self._collection.get(
+            limit=limit * 5,
+            where={"note_type": {"$nin": _NON_VAULT_NOTE_TYPES}},
+            include=["metadatas"],
+        )
         paths = []
         seen = set()
         for meta in results.get("metadatas") or []:
             if not meta or "file_path" not in meta:
                 continue
             path = meta["file_path"]
+            # Defense in depth: vault documents always store an absolute,
+            # resolved path (indexer.py: `str(path.resolve())`), while every
+            # non-vault source uses a relative pseudo-path or doc id. This
+            # catches any future non-vault source we haven't added to
+            # `_NON_VAULT_NOTE_TYPES` above, without needing to keep the two
+            # lists in lockstep.
+            if not os.path.isabs(path):
+                continue
             if path in seen:
                 continue
             seen.add(path)
