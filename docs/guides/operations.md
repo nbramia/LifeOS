@@ -126,6 +126,25 @@ systemctl list-timers lifeos-autodeploy.timer
 
 **Caveat:** it deploys whatever lands on `main` *without* re-running the test suite — safe only because merged `main` is expected to be green. It does not gate on tests by design (running the suite would take the API down and thrash the shared server).
 
+**Drift detection:** on every tick (pull or no pull), each active service's start time is compared against two independent signals: the newest mtime among tracked source files, and `.env`'s own mtime (a config-only edit — a rotated token, a new backend flag — needs a restart too, even with no code change). A unit whose start time predates either signal is restarted. Per-unit, per-signal "applied" markers under `data/` remember the exact `.env` mtime value each unit was last restarted for, so a **future-dated** mtime (clock skew, `rsync -t`, a bad manual `touch`) can only trigger one restart, never an infinite loop — and a manual `sudo systemctl restart <unit>` after an operator edits `.env` directly is still correctly recognized as "already current" on the next tick, since the check requires both signals (start time *and* marker mismatch), not the marker alone.
+
+**Sync-in-progress lock:** never restarts a service while the nightly sync is running (a mid-sync restart can OOM-freeze the host). A systemd-launched sync is detected via `lifeos-sync.service`'s own `ActiveState`; a manually-launched one via a kernel-held advisory lock (`flock`) that `scripts/run_all_syncs.py` holds (shared mode) for its entire run and `auto-deploy.sh` takes exclusively around its whole restart section — not just a point-in-time check, closing the race where a sync could start in the gap between checking and restarting. The lock path is **host-wide** (`$HOME/.lifeos/sync.lock`, fixed — not configurable via `.env`, since `run_all_syncs.py` and the deploy scripts would otherwise resolve an override differently and silently lock two different files), not tied to any one git checkout: this repo is routinely worked in multiple worktrees, each with its own `data/` directory, so a sync launched from one worktree must still be visible to a deploy running from a different one.
+
+---
+
+## Auto-Deploy on macOS (self-hosted redeploy)
+
+The macOS analog of the section above, for a launchd-managed API service: `scripts/auto-update-macos.sh`, same opt-in flag (`LIFEOS_AUTODEPLOY_ENABLED`), same drift signals (code mtime, `.env` mtime with the same future-mtime-safe applied-marker logic), and the same host-wide sync lock (shared with the Linux side and with `run_all_syncs.py` — a sync launched on either platform is visible to a deploy check on either). It is **not** installed as a timer by any script in this repo; an operator who wants it to run periodically adds their own cron entry.
+
+**Why this exists as a separate script, not a shared one:** launchd has no equivalent of systemd's `ActiveEnterTimestamp`, so drift detection reads the running API process's actual start time from the OS (`ps -o lstart=`) instead of a self-tracked marker — accurate from the very first run, with no bootstrap gap. The restart sequence itself is the one a real field deployment converged on after taking the API down twice in one night:
+
+1. **Unload, then poll for the previous process to actually be gone** before loading the next one — `launchctl unload` returns once it has *asked* the process to exit, not once it has; starting immediately after let the new process's `bind()` collide with the old one still tearing down. The pid polled is the one captured *before* `unload` runs, not re-derived from `launchctl list` afterward (which can report empty the instant `unload` is called, well before the process is actually gone).
+2. **Retry the start once** on a transient-looking `launchctl load` failure (a bare I/O-type error has been observed to be transient here).
+3. **Poll `/health` with a timeout scaled to the on-disk vault size**, not a fixed short window — a larger vault takes longer to embed/reindex on boot.
+4. **One more full restart cycle** if `/health` still isn't up, then alert a human (Telegram) and stop — never restart indefinitely, never silently stay down.
+
+Never uses `launchctl kickstart` — see the kickstart-avoidance guidance under Apple Data Agent above; the same wedging risk applies here.
+
 ---
 
 ## Shared Credentials Across Tools (#658)
@@ -206,3 +225,4 @@ value dressed up as confirmed-live.
 - [Observability — Technical](../specs/technical/observability.md) — Perf tracing and monitoring design
 - [Data & Sync](../specs/technical/data-and-sync.md) — Nightly sync pipeline phases
 - [Troubleshooting](troubleshooting.md) — General operational troubleshooting
+- [Scripts Reference](scripts.md) — `auto-deploy.sh` / `auto-update-macos.sh` / `setup-launchd.sh` usage and flags

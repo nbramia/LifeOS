@@ -201,6 +201,7 @@ Example:
 | `clear-caches.sh` | Clear embedding and search caches |
 | `network-watchdog.sh` | WiFi link health check and self-heal (re-activate → bounce radio → reload driver → restart NetworkManager) |
 | `auto-deploy.sh` | Poll `origin/main`; on a fast-forward advance, pull and restart the code services that changed. Pull-based, guarded (main branch + clean tree + `--ff-only`), opt-in via `LIFEOS_AUTODEPLOY_ENABLED`. Run by `lifeos-autodeploy.timer`. |
+| `auto-update-macos.sh` | The macOS analog of `auto-deploy.sh` for the launchd-managed API service. Same opt-in flag and guards; not installed as a timer by this repo — an operator adds their own cron/launchd entry. See [Auto-Deploy on macOS](operations.md#auto-deploy-on-macos-self-hosted-redeploy) in operations.md. |
 | `cleanup-worktrees.sh` | Idempotent git-worktree pruning plus targeted removal of a stale worktree/branch; safe to call pre-flight before `git worktree add`. |
 | `migrate_reminders_to_scheduler.py` | One-shot, idempotent migration of the legacy `~/.lifeos/reminders.json` store into the Scheduler's `Inbox.md` source of truth. Non-destructive (keeps the JSON as backup). |
 | `install_codex_skills.py` | Convert portable LifeOS skills from `.claude/skills/` into Codex's `SKILL.md` format into `~/.codex/skills/`. Re-run after editing source skills. |
@@ -252,7 +253,11 @@ Installs and enables:
 
 ### setup-launchd.sh
 
-Configure launchd services from templates (macOS only). Interactive: prompts for the vault path (or accepts it as an optional argument), generates plist files from `config/launchd/` templates, and installs them to `~/Library/LaunchAgents/`. ChromaDB is intentionally skipped — use a cron watchdog for it (see [launchd-setup.md](launchd-setup.md)).
+Configure launchd services from templates (macOS only). Interactive: prompts for the vault path (or accepts it as an optional argument, or falls back to `LIFEOS_VAULT_PATH` in `.env` under `--yes`), generates plist files from `config/launchd/` templates, and installs them to `~/Library/LaunchAgents/`. ChromaDB is intentionally skipped — use a cron watchdog for it (see [launchd-setup.md](launchd-setup.md)).
+
+Installs, conditionally, the same two services `setup-systemd.sh` gates on Linux — **agent-worker** (only when `LIFEOS_AGENT_WORKER_AUTOSTART=true`) and **MCP HTTP** (only when `LIFEOS_MCP_BEARER_TOKEN` is set) — using the same env vars, so one `.env` controls both platforms identically (#774). Neither is generated-and-skipped like ChromaDB; with its flag unset, no plist for it is installed at all. The GPU and network watchdogs have no macOS equivalent (different hardware/driver entirely) — the run prints them as explicitly skipped, not silence, at the end.
+
+Re-running never silently replaces a differently-configured, already-installed plist: if the generated content differs from what's on disk, the existing file is backed up to `config/launchd/backups/` before being overwritten, with a `WARNING` line naming what happened.
 
 ```bash
 ./scripts/setup-launchd.sh                 # prompts for vault path
@@ -405,3 +410,4 @@ curl -X POST http://localhost:8000/api/admin/reindex/sync
 - [Launchd Setup](launchd-setup.md) -- Automated service management (macOS)
 - [Troubleshooting](troubleshooting.md) -- Common issues and solutions
 - [Personas](personas.md) -- `register_persona_bot.py`'s "Create your own persona" workflow
+- [Operations](operations.md) -- Auto-Deploy (Linux and macOS) drift detection, sync lock, and restart-sequence detail

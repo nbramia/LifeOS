@@ -1,5 +1,8 @@
 """Tests for dependency-skip behavior and LLM memory gating in run_all_syncs."""
 
+import subprocess
+import sys
+import time
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -1291,3 +1294,270 @@ class TestSyncOrderInvariants:
     def test_strengths_runs_after_person_stats_full(self):
         """Interaction counts feed the strength computation."""
         assert self._pos("strengths") > self._pos("person_stats_full")
+
+
+def _external_exclusive_probe_succeeds(lock_path) -> bool:
+    """True if an independent process can grab an exclusive, non-blocking
+    flock on lock_path right now — i.e. the lock is currently free."""
+    probe = subprocess.run(["flock", "-x", "-n", str(lock_path), "-c", "true"])
+    return probe.returncode == 0
+
+
+class TestSyncLock:
+    """Coverage for the #793 shared advisory lock. scripts/auto-deploy.sh's
+    sync_in_progress_lock_acquire() takes a matching EXCLUSIVE, non-blocking
+    lock on the same file to decide whether a sync is running.
+
+    This replaced an earlier pid-in-a-file marker design (checked once with
+    `kill -0`) that review found to be TOCTOU (checked once, then a restart
+    could happen minutes later — a sync starting in between wasn't
+    protected), vulnerable to pid reuse (a dead sync's recorded pid, later
+    reused by an unrelated live process, reads as "still running" forever),
+    and unable to represent two overlapping manual syncs (one global marker
+    file, overwritten and cleared by whichever sync writes/exits last). A
+    kernel-held flock has none of those problems: any number of processes
+    can each hold the shared side independently and simultaneously, and the
+    kernel — not any cleanup code here — releases a process's lock the
+    instant it exits, for any reason, including SIGKILL."""
+
+    def test_acquire_sync_lock_creates_parent_directory(self, tmp_path):
+        """data/ doesn't exist on a fresh clone — acquiring the lock must
+        not depend on some other code path having created it first."""
+        from scripts import run_all_syncs
+
+        lock_path = tmp_path / "data" / "sync.lock"
+        assert not lock_path.parent.exists()
+        with patch("scripts.run_all_syncs.SYNC_LOCK_PATH", lock_path):
+            run_all_syncs._acquire_sync_lock()
+        assert lock_path.exists()
+
+    def test_acquire_sync_lock_holds_a_shared_lock(self, tmp_path):
+        """While held, an independent exclusive/non-blocking probe on the
+        same file must fail — this is what auto-deploy.sh's
+        sync_in_progress_lock_acquire() relies on to detect it."""
+        from scripts import run_all_syncs
+
+        lock_path = tmp_path / "sync.lock"
+        with patch("scripts.run_all_syncs.SYNC_LOCK_PATH", lock_path):
+            run_all_syncs._acquire_sync_lock()
+            assert not _external_exclusive_probe_succeeds(lock_path)
+
+    def test_two_shared_lock_acquisitions_do_not_conflict(self, tmp_path):
+        """Two overlapping manual syncs must each be able to hold the shared
+        lock at once — this is the acceptance criterion the old one-marker
+        design could not satisfy."""
+        lock_path = tmp_path / "sync.lock"
+        script = (
+            "import fcntl, time\n"
+            f"f = open({str(lock_path)!r}, 'w')\n"
+            "fcntl.flock(f.fileno(), fcntl.LOCK_SH)\n"
+            "time.sleep(2)\n"
+        )
+        a = subprocess.Popen([sys.executable, "-c", script])
+        b = subprocess.Popen([sys.executable, "-c", script])
+        try:
+            assert a.wait(timeout=5) == 0
+            assert b.wait(timeout=5) == 0
+        finally:
+            for p in (a, b):
+                if p.poll() is None:
+                    p.kill()
+                    p.wait(timeout=5)
+
+    def test_lock_released_when_holding_process_exits_normally(self, tmp_path):
+        lock_path = tmp_path / "sync.lock"
+        subprocess.run(
+            [
+                sys.executable, "-c",
+                f"import fcntl\nf = open({str(lock_path)!r}, 'w')\n"
+                "fcntl.flock(f.fileno(), fcntl.LOCK_SH)\n",
+            ],
+            timeout=5,
+        )
+        assert _external_exclusive_probe_succeeds(lock_path)
+
+    def test_lock_released_immediately_on_sigkill(self, tmp_path):
+        """A hard-killed sync must not defer forever — the kernel releases
+        the flock the instant the holding process dies, with no cleanup
+        code able to run."""
+        lock_path = tmp_path / "sync.lock"
+        proc = subprocess.Popen([
+            sys.executable, "-c",
+            f"import fcntl, time\nf = open({str(lock_path)!r}, 'w')\n"
+            "fcntl.flock(f.fileno(), fcntl.LOCK_SH)\n"
+            "time.sleep(30)\n",
+        ])
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if not _external_exclusive_probe_succeeds(lock_path):
+                    break
+                time.sleep(0.05)
+            else:
+                raise TimeoutError("holder never acquired the lock")
+            proc.kill()  # SIGKILL — no handler, no cleanup path runs
+            proc.wait(timeout=5)
+            assert _external_exclusive_probe_succeeds(lock_path)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_lock_is_held_while_run_all_syncs_executes(self, tmp_path):
+        """End-to-end via main(): the lock must be held for the duration of
+        the actual sync work, not just at the moment main() starts."""
+        from scripts import run_all_syncs
+
+        lock_path = tmp_path / "sync.lock"
+        seen = {}
+
+        def fake_run_all_syncs(**kwargs):
+            seen["locked"] = not _external_exclusive_probe_succeeds(lock_path)
+            return {"failed": 0}
+
+        with (
+            patch("scripts.run_all_syncs.SYNC_LOCK_PATH", lock_path),
+            patch("scripts.run_all_syncs.run_all_syncs", side_effect=fake_run_all_syncs),
+            patch("sys.argv", ["run_all_syncs.py", "--dry-run"]),
+        ):
+            run_all_syncs.main()
+
+        assert seen["locked"] is True
+
+    def test_lock_is_held_when_run_all_syncs_raises(self, tmp_path):
+        """An unhandled exception from run_all_syncs() must propagate
+        (main() doesn't swallow it) — with no marker-cleanup step needed to
+        avoid a stale in-progress signal, since the kernel handles that once
+        this process itself eventually exits."""
+        from scripts import run_all_syncs
+
+        lock_path = tmp_path / "sync.lock"
+        seen = {}
+
+        def boom(**kwargs):
+            seen["locked"] = not _external_exclusive_probe_succeeds(lock_path)
+            raise RuntimeError("simulated sync crash")
+
+        with (
+            patch("scripts.run_all_syncs.SYNC_LOCK_PATH", lock_path),
+            patch("scripts.run_all_syncs.run_all_syncs", side_effect=boom),
+            patch("sys.argv", ["run_all_syncs.py", "--dry-run"]),
+        ):
+            with pytest.raises(RuntimeError):
+                run_all_syncs.main()
+
+        assert seen["locked"] is True
+
+    def test_sync_lock_path_defaults_to_a_host_wide_location(self):
+        """Found on review: a lock keyed to this file's own checkout
+        location is invisible to a deploy check running from a DIFFERENT
+        git worktree (this repo is routinely worked in several). The
+        module-level constant must be a fixed path under $HOME, not this
+        file's own parent directory — and not configurable via an env var
+        (found on re-review: this module alone reads .env, so an override
+        set there would silently diverge from auto-deploy.sh's and
+        auto-update-macos.sh's fixed path, which only see process env)."""
+        from pathlib import Path as _Path
+        from scripts import run_all_syncs
+
+        assert run_all_syncs.SYNC_LOCK_PATH == _Path.home() / ".lifeos" / "sync.lock"
+
+    def test_acquire_sync_lock_retries_while_contended_then_succeeds(self, tmp_path):
+        """A restart's exclusive hold is transient — the shared acquire
+        must wait it out rather than failing immediately, and succeed once
+        the holder releases."""
+        from scripts import run_all_syncs
+
+        lock_path = tmp_path / "sync.lock"
+        holder_script = (
+            "import fcntl, time\n"
+            f"f = open({str(lock_path)!r}, 'w')\n"
+            "fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
+            "time.sleep(1.5)\n"
+        )
+        holder = subprocess.Popen([sys.executable, "-c", holder_script])
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and _external_exclusive_probe_succeeds(lock_path):
+                time.sleep(0.05)
+            with (
+                patch("scripts.run_all_syncs.SYNC_LOCK_PATH", lock_path),
+                patch("scripts.run_all_syncs._SYNC_LOCK_ACQUIRE_TIMEOUT_S", 10),
+            ):
+                start = time.monotonic()
+                run_all_syncs._acquire_sync_lock()
+                elapsed = time.monotonic() - start
+            assert elapsed >= 0.5, "should have waited for the exclusive holder to release"
+            # Now genuinely holds the shared lock itself.
+            assert not _external_exclusive_probe_succeeds(lock_path)
+        finally:
+            holder.wait(timeout=5)
+
+    def test_acquire_sync_lock_gives_up_after_timeout_when_never_released(self, tmp_path):
+        """Found on review: a plain blocking LOCK_SH has no timeout at
+        all — a stuck restart could hang a nightly sync indefinitely
+        before it ever logs anything or registers in sync_health.db. Must
+        give up and proceed WITHOUT the lock after the bound, not hang
+        past it."""
+        from scripts import run_all_syncs
+
+        lock_path = tmp_path / "sync.lock"
+        holder_script = (
+            "import fcntl, time\n"
+            f"f = open({str(lock_path)!r}, 'w')\n"
+            "fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
+            "time.sleep(30)\n"
+        )
+        holder = subprocess.Popen([sys.executable, "-c", holder_script])
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and _external_exclusive_probe_succeeds(lock_path):
+                time.sleep(0.05)
+            with (
+                patch("scripts.run_all_syncs.SYNC_LOCK_PATH", lock_path),
+                patch("scripts.run_all_syncs._SYNC_LOCK_ACQUIRE_TIMEOUT_S", 2),
+            ):
+                start = time.monotonic()
+                run_all_syncs._acquire_sync_lock()
+                elapsed = time.monotonic() - start
+            assert 1.5 <= elapsed <= 10, f"should give up around the 2s bound, took {elapsed}"
+            # Gave up without acquiring — the original holder still has it.
+            assert not _external_exclusive_probe_succeeds(lock_path)
+        finally:
+            holder.terminate()
+            holder.wait(timeout=5)
+
+    def test_acquire_sync_lock_notifies_telegram_on_open_failure(self, tmp_path):
+        """Found on review: this used to be a buried `logger.warning` —
+        given the consequence (auto-deploy can't see this sync and may
+        restart a service on top of it), a real failure must reach the
+        same Telegram path a sync failure does, not just the log file."""
+        from scripts import run_all_syncs
+
+        # A path whose PARENT is a plain file (not a directory) makes
+        # parent creation impossible, forcing open() to raise OSError.
+        blocker = tmp_path / "not_a_directory"
+        blocker.write_text("x")
+        bad_lock_path = blocker / "sync.lock"
+        with (
+            patch("scripts.run_all_syncs.SYNC_LOCK_PATH", bad_lock_path),
+            patch("api.services.telegram.send_message") as mock_send,
+        ):
+            run_all_syncs._acquire_sync_lock()  # must not raise
+        assert mock_send.called, "a failure to open the lock file must alert a human"
+        assert "sync lock" in mock_send.call_args[0][0].lower()
+
+    def test_acquire_sync_lock_open_failure_does_not_abort_sync_on_notify_failure(self, tmp_path):
+        """The Telegram notification itself is best-effort — if sending it
+        also fails, that must not raise out of _acquire_sync_lock() and
+        abort the sync that's about to start."""
+        from scripts import run_all_syncs
+
+        blocker = tmp_path / "not_a_directory"
+        blocker.write_text("x")
+        bad_lock_path = blocker / "sync.lock"
+        with (
+            patch("scripts.run_all_syncs.SYNC_LOCK_PATH", bad_lock_path),
+            patch("api.services.telegram.send_message", side_effect=RuntimeError("network down")),
+        ):
+            run_all_syncs._acquire_sync_lock()  # must not raise
