@@ -86,18 +86,33 @@ _sed_escape_replacement() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/&/\\\&/g' -e 's/|/\\|/g'
 }
 
+# XML-escape a value for safe use inside a plist <string> element (found on
+# review, #830): a path containing `&`, `<`, or `>` (e.g. `/Users/x/R&D/model.gguf`
+# — a real-world directory name) produces invalid XML if dropped in raw,
+# which then fails plutil validation and aborts the whole install. `&` must
+# be escaped first, or escaping `<`/`>` afterward would double-escape it.
+_xml_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
 # Substitute the __HOME__/__LIFEOS_PATH__/__VAULT_PATH__/__LLAMA_CPP_DIR__
 # placeholder convention into a template, writing the result to $2.
 # llama_dir ($6) is optional — templates that don't reference
 # __LLAMA_CPP_DIR__ (everything but com.lifeos.llm.plist.template) simply
-# ignore it.
+# ignore it. __LLAMA_CPP_DIR__ is XML-escaped before the sed-escape (composed,
+# not either alone — sed-escape alone would leave a raw `&` in the plist,
+# and XML-escaping alone would leave literal `&` from `&amp;` unescaped for
+# sed's own replacement syntax). __HOME__/__LIFEOS_PATH__/__VAULT_PATH__
+# intentionally keep their existing sed-only behavior — locked in by
+# test_generate_plist_handles_sed_metacharacters_in_values, unrelated to
+# this new placeholder.
 generate_plist() {
     local template="$1" output="$2" home="$3" lifeos_path="$4" vault_path="$5" llama_dir="$6"
     local esc_home esc_lifeos_path esc_vault_path esc_llama_dir
     esc_home=$(_sed_escape_replacement "$home")
     esc_lifeos_path=$(_sed_escape_replacement "$lifeos_path")
     esc_vault_path=$(_sed_escape_replacement "$vault_path")
-    esc_llama_dir=$(_sed_escape_replacement "$llama_dir")
+    esc_llama_dir=$(_sed_escape_replacement "$(_xml_escape "$llama_dir")")
     sed -e "s|__HOME__|$esc_home|g" \
         -e "s|__LIFEOS_PATH__|$esc_lifeos_path|g" \
         -e "s|__VAULT_PATH__|$esc_vault_path|g" \
@@ -113,12 +128,17 @@ generate_plist() {
 # removes the marker line itself. Only ever called for com.lifeos.llm.plist
 # — no other template has this marker, so check_placeholders would (rightly)
 # fail any plist where this was skipped by mistake.
+#
+# Each token is XML-escaped (found on review, #830): these come straight
+# from operator-supplied LIFEOS_LLM_MODEL/_MODEL_PATH/_MMPROJ_PATH, and a
+# path containing `&`, `<`, or `>` would otherwise produce invalid XML that
+# fails plutil validation and aborts the whole install.
 inject_llm_source_args() {
     local plist="$1"
     local args_file tok
     args_file=$(mktemp)
     for tok in "${LLM_SOURCE_ARGS_TOKENS[@]}"; do
-        printf '        <string>%s</string>\n' "$tok" >> "$args_file"
+        printf '        <string>%s</string>\n' "$(_xml_escape "$tok")" >> "$args_file"
     done
     sed -e "/__LLM_SOURCE_ARGS_LINES__/r $args_file" -e "/__LLM_SOURCE_ARGS_LINES__/d" "$plist" > "$plist.tmp"
     mv "$plist.tmp" "$plist"

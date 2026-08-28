@@ -22,6 +22,7 @@ import re
 import shutil
 import stat
 import subprocess
+import xml.dom.minidom
 from pathlib import Path
 
 import pytest
@@ -146,6 +147,19 @@ def test_sed_escape_replacement_round_trips_special_characters(tmp_path: Path):
     result = _run_sourced(repo, r'''esc=$(_sed_escape_replacement 'a&b\c|d'); printf 'X__T__Y' | sed "s|__T__|$esc|g"''')
     assert result.returncode == 0, result.stderr
     assert result.stdout == r'Xa&b\c|dY'
+
+
+@pytest.mark.unit
+def test_xml_escape_escapes_ampersand_lt_gt(tmp_path: Path):
+    """#830: values that flow into a plist <string> element (llama.cpp dir,
+    model-source args) need real XML escaping, not just sed-safety — a raw
+    `&`, `<`, or `>` is invalid XML outside an entity reference."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    repo = _make_sandbox(tmp_path)
+    result = _run_sourced(repo, r'''_xml_escape 'R&D <models> here' ''')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "R&amp;D &lt;models&gt; here"
 
 
 @pytest.mark.unit
@@ -1033,6 +1047,44 @@ def test_main_installs_llm_with_model_path_override(tmp_path: Path):
     assert f"<string>-m</string>\n        <string>{model_path}</string>" in text
     assert f"<string>--mmproj</string>\n        <string>{mmproj_path}</string>" in text
     assert "<string>-hf</string>" not in text
+
+
+@pytest.mark.unit
+def test_main_installs_llm_with_ampersand_in_model_path(tmp_path: Path):
+    """Found on review: a real-world directory name like `R&D` in
+    LIFEOS_LLM_MODEL_PATH produced invalid plist XML (a bare `&` is not
+    legal outside an entity reference) — the stubbed plutil in other tests
+    doesn't catch this since it always exits 0, so this test parses the
+    installed plist as real XML instead."""
+    if not SETUP_LAUNCHD.exists():
+        pytest.skip("scripts/setup-launchd.sh not present")
+    if not _LLM_TEMPLATE.exists():
+        pytest.skip("llm plist template not present")
+    repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
+    _add_real_template(repo, _LLM_TEMPLATE)
+    _add_llama_server_binary(fake_home)
+    model_dir = tmp_path / "R&D"
+    model_dir.mkdir()
+    model_path = model_dir / "model.gguf"
+    model_path.write_text("fake gguf")
+    (repo / ".env").write_text(
+        f"LIFEOS_LOCAL_LLM_AUTOSTART=true\nLIFEOS_LLM_MODEL_PATH={model_path}\n",
+        encoding="utf-8",
+    )
+    bindir = _stub_plutil_ok(repo)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    result = subprocess.run(
+        ["bash", "scripts/setup-launchd.sh", str(vault), "--yes"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    installed = fake_home / "Library" / "LaunchAgents" / "com.lifeos.llm.plist"
+    text = installed.read_text()
+    assert "R&amp;D" in text
+    assert "R&D" not in text  # the raw, unescaped form must not appear
+    xml.dom.minidom.parseString(text)  # raises ExpatError if not well-formed
 
 
 @pytest.mark.unit
