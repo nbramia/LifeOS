@@ -92,11 +92,39 @@ def test_bare_indexer_service_never_reaches_a_production_collection_name(tmp_pat
 
 
 @pytest.mark.unit
+def test_vectorstore_singletons_are_reset_before_every_test():
+    """#828 follow-up: every process-wide singleton that can hold a live
+    VectorStore/HybridSearch/*Indexer instance must be `None` at the start
+    of any test, regardless of what ran before it in this worker process
+    (xdist reuses one process across many tests). This is what
+    `_reset_vectorstore_singletons` in conftest.py exists to guarantee --
+    without it, a test that legitimately populated one of these with a
+    real instance would leak it to whatever test happens to run next in
+    the same worker, bypassing the construction-time guard entirely
+    (the guard only sees `VectorStore.__init__`, not singleton reuse)."""
+    import api.main as main_mod
+    import api.routes.ask as ask_route_mod
+    import api.routes.search as search_route_mod
+    import api.services.calendar_indexer as calendar_indexer_mod
+    import api.services.slack_indexer as slack_indexer_mod
+    import api.services.vectorstore as vectorstore_mod
+
+    assert vectorstore_mod._vector_store is None
+    assert search_route_mod._vector_store is None
+    assert search_route_mod._hybrid_search is None
+    assert ask_route_mod._hybrid_search is None
+    assert slack_indexer_mod._slack_indexer is None
+    assert calendar_indexer_mod._calendar_indexer is None
+    assert main_mod._calendar_indexer is None
+
+
+@pytest.mark.unit
 @pytest.mark.uses_live_vectorstore
 def test_marker_opts_a_test_out_of_the_guard():
-    """The opt-in marker used by test_admin.py / test_search_api.py must
-    actually suppress the guard, exercising the composition those files
-    rely on (this test's own marker, above)."""
+    """The opt-in marker exists precisely so a future test that legitimately
+    needs the live store can bypass the guard -- no current test needs it
+    (test_admin.py and test_search_api.py were both converted to mock the
+    store instead), so this test exercises the marker directly."""
     from unittest.mock import MagicMock, patch
 
     from api.services.vectorstore import VectorStore

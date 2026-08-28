@@ -20,23 +20,27 @@ class TestAdminEndpoints:
         """Create test client."""
         return TestClient(app)
 
-    @pytest.mark.uses_live_vectorstore  # /api/admin/status reads the real VectorStore for document_count (#828)
     def test_status_endpoint_exists(self, client):
         """Status endpoint should exist."""
-        response = client.get("/api/admin/status")
+        # /api/admin/status's VectorStore() call is already wrapped in its
+        # own try/except that falls back to document_count=0 (admin.py:46-53)
+        # -- these tests only care about the response shape/status, not a
+        # real count, so mock VectorStore rather than reaching the live
+        # store (#828).
+        with patch('api.routes.admin.VectorStore'):
+            response = client.get("/api/admin/status")
         assert response.status_code == 200
 
-    @pytest.mark.uses_live_vectorstore  # /api/admin/status reads the real VectorStore for document_count (#828)
     def test_status_returns_structure(self, client):
         """Status should return required fields."""
-        response = client.get("/api/admin/status")
+        with patch('api.routes.admin.VectorStore'):
+            response = client.get("/api/admin/status")
         data = response.json()
 
         assert "status" in data
         assert "document_count" in data
         assert "vault_path" in data
 
-    @pytest.mark.uses_live_vectorstore  # /api/admin/status reads the real VectorStore for document_count (#828)
     def test_status_ignores_stale_running_reindex_job(self, client):
         """#768: a `reindex_vault` job stuck "running" because the process
         that was executing it restarted mid-job (e.g. an unrelated
@@ -50,14 +54,14 @@ class TestAdminEndpoints:
             started_at="2020-01-01T00:00:00+00:00", completed_at=None,
             attempts=1, max_attempts=3, priority=10, error=None,
         )
-        with patch('api.routes.admin.get_job_queue') as mock_jq:
+        with patch('api.routes.admin.VectorStore'), \
+                patch('api.routes.admin.get_job_queue') as mock_jq:
             mock_jq.return_value.list_jobs.return_value = [stale_job]
             mock_jq.return_value.process_start_time = "2026-08-27T00:00:00+00:00"
             response = client.get("/api/admin/status")
             data = response.json()
             assert data["status"] != "reindexing"
 
-    @pytest.mark.uses_live_vectorstore  # /api/admin/status reads the real VectorStore for document_count (#828)
     def test_status_reports_reindexing_for_a_genuinely_running_job(self, client):
         """Regression guard: a job actually claimed by this process (started
         after process_start_time) must still report "reindexing"."""
@@ -69,7 +73,8 @@ class TestAdminEndpoints:
             started_at="2026-08-27T00:00:01+00:00", completed_at=None,
             attempts=1, max_attempts=3, priority=10, error=None,
         )
-        with patch('api.routes.admin.get_job_queue') as mock_jq:
+        with patch('api.routes.admin.VectorStore'), \
+                patch('api.routes.admin.get_job_queue') as mock_jq:
             mock_jq.return_value.list_jobs.return_value = [live_job]
             mock_jq.return_value.process_start_time = "2026-08-27T00:00:00+00:00"
             response = client.get("/api/admin/status")

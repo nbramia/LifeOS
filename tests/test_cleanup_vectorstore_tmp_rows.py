@@ -36,6 +36,18 @@ class TestIsStrayTmpRow:
     def test_matches_a_tmp_vault_path(self):
         assert is_stray_tmp_row("/tmp/tmp8f2k3a9x/vault/Work/ML/meeting.md")
 
+    def test_matches_a_macos_var_folders_path(self):
+        """`tempfile` on macOS defaults to `/var/folders/...`, not `/tmp/`."""
+        assert is_stray_tmp_row("/var/folders/zz/tmp8f2k3a9x/T/vault/note.md")
+
+    def test_matches_a_macos_private_var_folders_path(self):
+        """The resolved (symlink-followed) form of the same macOS tmp path."""
+        assert is_stray_tmp_row("/private/var/folders/zz/tmp8f2k3a9x/T/vault/note.md")
+
+    def test_non_string_file_path_does_not_match(self):
+        assert not is_stray_tmp_row(None)
+        assert not is_stray_tmp_row(123)
+
     def test_does_not_match_a_real_vault_path(self):
         assert not is_stray_tmp_row("/home/nathan/LifeOS Vault/Work/ML/meeting.md")
 
@@ -43,7 +55,8 @@ class TestIsStrayTmpRow:
         assert not is_stray_tmp_row("calendar/abc123")
 
     def test_does_not_match_a_relative_slack_pseudo_path(self):
-        assert not is_stray_tmp_row("slack/C123/1700000000.000100")
+        # Real format per api/services/slack_indexer.py: "slack:{channel_id}:{ts}"
+        assert not is_stray_tmp_row("slack:C123:1700000000.000100")
 
     def test_does_not_match_a_path_merely_mentioning_tmp(self):
         """Prefix check, not substring — a real note path that happens to
@@ -53,6 +66,12 @@ class TestIsStrayTmpRow:
 
     def test_empty_path_does_not_match(self):
         assert not is_stray_tmp_row("")
+
+    def test_a_sibling_directory_sharing_the_prefix_string_does_not_match(self):
+        """Matched with a trailing separator, not a bare prefix — a real
+        directory that happens to start with the same characters (e.g.
+        `/tmp-backup/...`) is a different directory, not `/tmp`."""
+        assert not is_stray_tmp_row("/tmp-backup/vault/note.md")
 
     def test_vault_root_check_wins_even_under_tmp(self):
         """Belt-and-suspenders: if the *configured* vault root itself lives
@@ -73,7 +92,7 @@ class TestFindStrayRows:
             ("id2", "/tmp/tmp8f2k3a9x/vault/Work/ML/meeting.md"),
             ("id3", "calendar/abc123"),
             ("id4", "/tmp/tmpzz11xy00/vault/Personal/journal.md"),
-            ("id5", "slack/C123/1700000000.000100"),
+            ("id5", "slack:C123:1700000000.000100"),
         ]
         collection = _PagingStubCollection(rows)
 
