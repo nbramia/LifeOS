@@ -21,6 +21,12 @@ import os
 
 import pytest
 
+# Lightweight (no chromadb/torch at module scope) -- used below to build
+# _LIVE_VECTORSTORE_COLLECTIONS without hardcoding these as string literals.
+from api.services.calendar_indexer import CALENDAR_COLLECTION
+from api.services.person_indexer import PERSON_COLLECTION
+from api.services.slack_indexer import SLACK_COLLECTION
+
 # git exports GIT_DIR (absolute when the invoker is a linked worktree) to hook
 # subprocesses — and the pre-push hook runs this suite. Tests that spawn `git`
 # in tmp fixture repos would inherit it and silently operate on the REAL repo:
@@ -309,6 +315,146 @@ def _isolate_vault_indexer_stores(tmp_path, monkeypatch):
             created[0]._client.delete_collection(collection)
         except Exception:
             pass
+
+
+# Collection names `VectorStore` actually writes to on a real install:
+# `VectorStore`'s own class default (also what `get_vector_store()`'s
+# process-wide singleton resolves to) plus every non-vault indexer's own
+# explicit collection constant (imported at the top of this file).
+#
+# `CALENDAR_COLLECTION` is dead in practice: `CalendarIndexer` writes through
+# the vault-default `get_vector_store()` singleton instead of a collection of
+# its own (see #828 investigation) -- kept in the guard's blocklist anyway,
+# in case that ever changes.
+_LIVE_VECTORSTORE_COLLECTIONS = frozenset(
+    {
+        "lifeos_vault",  # VectorStore's own class default -- not exported as a constant
+        PERSON_COLLECTION,
+        SLACK_COLLECTION,
+        CALENDAR_COLLECTION,
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _guard_live_vectorstore_collections(request, monkeypatch):
+    """Fail loudly if a test constructs a ``VectorStore`` against a real
+    production collection on the live ChromaDB server (#828).
+
+    ``VectorStore`` always opens a real HTTP connection
+    (``chromadb.HttpClient`` to ``settings.chroma_url``, which defaults to
+    the maintainer's real server) — unlike the SQLite-backed stores
+    elsewhere in this file, there is no local persist-dir to redirect to.
+    ``_isolate_vault_indexer_stores`` above isolates the vault-indexing path
+    by renaming the collection before construction; this fixture is the
+    backstop for every *other* call site. 45 rows with
+    ``/tmp/tmpXXXXXXXX/vault/...`` file_paths and real vault ``note_type``
+    values turned up in the live ``lifeos_vault`` collection (#828) —
+    debris from `test_indexer.py`/`test_integration.py`/`test_people.py`'s
+    `tempfile.TemporaryDirectory()`-based vault fixtures, predating (or
+    bypassing) that per-collection isolation.
+
+    Rather than patch each of the many ``VectorStore()`` / ``get_vector_store()``
+    call sites individually (``api/routes/{admin,ask,chat,search}.py``,
+    ``api/services/{hybrid_search,person_indexer,slack_indexer,calendar_indexer}.py``),
+    this patches the class's ``__init__`` in place: every one of those call
+    sites imported the same class object (``from api.services.vectorstore
+    import VectorStore``, or via ``get_vector_store()`` which resolves the
+    bare name in ``vectorstore.py``'s own globals either way), so mutating
+    its ``__init__`` catches all of them regardless of which module's
+    namespace holds the reference — unlike #652's ``SessionStore`` fix,
+    which had to swap the *class name* because that bug was about a default
+    argument bound once at class-definition time; here we're validating an
+    incoming argument, not changing a default, so patching the method
+    in place is enough and doesn't disturb ``_isolate_vault_indexer_stores``'s
+    own wrapper (it still resolves to the same, now-guarded, class).
+
+    One caller is structurally outside this guard's reach:
+    ``api/services/relationship_discovery.py``'s Slack-discovery path calls
+    ``chromadb.HttpClient`` directly rather than going through
+    ``VectorStore`` at all (read-only; already patched in its own tests).
+
+    Every current caller in the test suite is fully mocked, so no test
+    currently needs to opt in — but a future test that genuinely requires
+    the real service can with ``@pytest.mark.uses_live_vectorstore``.
+    """
+    if request.node.get_closest_marker("uses_live_vectorstore"):
+        return
+
+    import inspect
+
+    import api.services.vectorstore as vectorstore_mod
+
+    _real_init = vectorstore_mod.VectorStore.__init__
+    _real_sig = inspect.signature(_real_init)
+
+    def _guarded_init(self, *args, **kwargs):
+        # Bind against the real __init__'s own signature (rather than
+        # hardcoding its parameter names/defaults here) so a future change
+        # to that signature can't silently make this check stop working.
+        bound = _real_sig.bind_partial(self, *args, **kwargs)
+        bound.apply_defaults()
+        collection_name = bound.arguments.get("collection_name")
+        if collection_name in _LIVE_VECTORSTORE_COLLECTIONS:
+            pytest.fail(
+                f"{request.node.nodeid} constructed "
+                f"VectorStore(collection_name={collection_name!r}), which "
+                "points at a live production ChromaDB collection. Isolate "
+                "the test with a throwaway collection name (see "
+                "_isolate_vault_indexer_stores above), or mark it "
+                "@pytest.mark.uses_live_vectorstore if it must legitimately "
+                "talk to the live store (#828)."
+            )
+        _real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(vectorstore_mod.VectorStore, "__init__", _guarded_init)
+
+
+@pytest.fixture(autouse=True)
+def _reset_vectorstore_singletons(monkeypatch):
+    """Clear every process-wide singleton that can hold a live
+    VectorStore/HybridSearch/*Indexer instance, around every test (#828
+    follow-up).
+
+    A handful of modules memoize a real instance in a module-level global
+    the first time their getter is called: ``api.services.vectorstore``'s
+    own ``get_vector_store()``; ``api.routes.search`` and ``api.routes.ask``
+    each have their own separate ``get_vector_store()`` / ``get_hybrid_search()``
+    pair; ``api.services.slack_indexer.get_slack_indexer()`` and
+    ``api.services.calendar_indexer.get_calendar_indexer()`` (the latter
+    also cached a second time, under the same name, in ``api.main`` once
+    startup calls it) each hold a real ``VectorStore``-backed indexer that
+    *writes* to a live collection. If a future test legitimately populates
+    one of these with a real, live-connected instance (via
+    ``@pytest.mark.uses_live_vectorstore``), xdist reusing one process for
+    many tests (``--dist loadscope`` groups by module, but a worker still
+    runs many modules over its lifetime) means a *later*, unmarked test in
+    the same worker that calls the same getter would silently receive that
+    already-constructed live instance without ever calling
+    ``VectorStore.__init__`` again — completely bypassing the guard above,
+    which can only see construction, not reuse. Reset before and after
+    every test so no test can ever inherit another test's cached singleton,
+    live or otherwise.
+    """
+    import api.main as main_mod
+    import api.routes.ask as ask_route_mod
+    import api.routes.search as search_route_mod
+    import api.services.calendar_indexer as calendar_indexer_mod
+    import api.services.slack_indexer as slack_indexer_mod
+    import api.services.vectorstore as vectorstore_mod
+
+    def _clear():
+        monkeypatch.setattr(vectorstore_mod, "_vector_store", None)
+        monkeypatch.setattr(search_route_mod, "_vector_store", None)
+        monkeypatch.setattr(search_route_mod, "_hybrid_search", None)
+        monkeypatch.setattr(ask_route_mod, "_hybrid_search", None)
+        monkeypatch.setattr(slack_indexer_mod, "_slack_indexer", None)
+        monkeypatch.setattr(calendar_indexer_mod, "_calendar_indexer", None)
+        monkeypatch.setattr(main_mod, "_calendar_indexer", None)
+
+    _clear()
+    yield
+    _clear()
 
 
 @pytest.fixture(autouse=True)

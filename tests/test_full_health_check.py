@@ -19,6 +19,24 @@ from fastapi.testclient import TestClient
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _stub_vault_root_sanity_vectorstore(monkeypatch):
+    """`full_health_check()`'s vault-root sanity check (#762) reaches the
+    real `get_vector_store()` singleton whenever the vault_search probe
+    reports "ok" -- which, on a host that happens to have a live LifeOS API
+    + ChromaDB running (as the maintainer's does), it does. That's a
+    live-store touch none of this file's tests need; stub it to raise,
+    which `_check_vault_root_sanity`'s own `except Exception` already
+    treats as a benign hiccup -- the same fail-closed behavior this file's
+    module docstring already relies on for the OTHER live probes
+    `full_health_check()` makes (#828).
+    """
+    monkeypatch.setattr(
+        "api.services.vectorstore.get_vector_store",
+        MagicMock(side_effect=Exception("no live vector store in tests (#828)")),
+    )
+
+
 def test_health_api_key_configured_true_with_key():
     from unittest.mock import patch
     from api.main import app

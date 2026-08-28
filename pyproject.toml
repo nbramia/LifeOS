@@ -39,6 +39,7 @@ markers = [
     "integration: Tests that require running server or external APIs",
     "browser: Browser-based UI tests using Playwright",
     "requires_server: Tests that require the API server to be running. On a browser test this is what separates it from the server-free set (`browser and not requires_server`) that the pre-push hook runs.",
+    "uses_live_vectorstore: Tests that legitimately construct a VectorStore against a real production collection on the live ChromaDB server (opts out of the conftest guard added for #828).",
 ]
 
 [tool.ruff.lint.per-file-ignores]

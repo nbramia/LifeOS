@@ -10,13 +10,51 @@ P1.2 Acceptance Criteria:
 - Invalid filters return 400 with clear message
 """
 import pytest
-
-# These tests use TestClient which initializes the app (slow)
-pytestmark = pytest.mark.slow
-from datetime import datetime, timedelta
 from fastapi.testclient import TestClient
 
+import api.routes.search as search_route_mod
 from api.main import app
+
+# These tests use TestClient which initializes the app (slow).
+pytestmark = pytest.mark.slow
+
+
+class _StubHybridSearch:
+    """Deterministic stand-in for HybridSearch (#828): these tests are
+    about /api/search's request/response contract (result shape, filter
+    pass-through, top_k truncation) -- none of them need the live
+    ChromaDB collection's actual content, and depending on it coupled
+    these tests to whatever embedding model and documents the live vault
+    happens to have.
+    """
+
+    def __init__(self, results=None):
+        self.results = results if results is not None else list(_DEFAULT_RESULTS)
+
+    def search(self, query, top_k=20, date_from=None, date_to=None, **_kwargs):
+        return self.results[:top_k]
+
+
+_DEFAULT_RESULTS = [
+    {
+        "content": f"Stub result {i} about test content.",
+        "file_path": f"/vault/Work/note{i}.md",
+        "file_name": f"note{i}.md",
+        "note_type": "Work" if i % 2 == 0 else "Personal",
+        "modified_date": "2025-06-01T00:00:00+00:00",
+        "people": ["Alex"] if i == 0 else [],
+        "tags": ["test"],
+        "score": 1.0 - i * 0.1,
+        "semantic_score": 0.9 - i * 0.1,
+        "recency_score": 0.5,
+    }
+    for i in range(8)
+]
+
+
+@pytest.fixture(autouse=True)
+def _stub_hybrid_search(monkeypatch):
+    monkeypatch.setattr(search_route_mod, "get_hybrid_search", lambda: _StubHybridSearch())
 
 
 class TestSearchEndpoint:

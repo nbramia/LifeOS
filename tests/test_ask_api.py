@@ -9,14 +9,45 @@ P1.3 Acceptance Criteria:
 - Claude API errors return graceful error response
 - Empty question returns 400 error
 """
-import pytest
+from unittest.mock import patch, MagicMock
 
-# These tests use TestClient which initializes the app (slow)
-pytestmark = pytest.mark.slow
-from unittest.mock import patch, MagicMock, AsyncMock
+import pytest
 from fastapi.testclient import TestClient
 
+import api.routes.ask as ask_route_mod
 from api.main import app
+
+# These tests use TestClient which initializes the app (slow).
+pytestmark = pytest.mark.slow
+
+
+class _StubHybridSearch:
+    """Deterministic stand-in for HybridSearch (#828): these tests are
+    about /api/ask's retrieval -> prompt -> synthesis wiring and response
+    shape (source dedup, field presence), not the live vault's actual
+    content -- and Claude synthesis is already mocked per-test via
+    `get_claude_response`, so retrieval should be too.
+    """
+
+    def __init__(self, chunks=None):
+        self.chunks = chunks if chunks is not None else list(_DEFAULT_CHUNKS)
+
+    def search(self, query, top_k=10, date_from=None, date_to=None, **_kwargs):
+        return self.chunks[:top_k]
+
+
+# Two chunks share a file_path so test_ask_deduplicates_sources actually
+# exercises the route's dedup-by-file_path logic.
+_DEFAULT_CHUNKS = [
+    {"content": "Budget is $1M for Q1.", "file_name": "budget.md", "file_path": "/vault/budget.md", "score": 0.9},
+    {"content": "More budget detail.", "file_name": "budget.md", "file_path": "/vault/budget.md", "score": 0.8},
+    {"content": "Other note content.", "file_name": "other.md", "file_path": "/vault/other.md", "score": 0.5},
+]
+
+
+@pytest.fixture(autouse=True)
+def _stub_hybrid_search(monkeypatch):
+    monkeypatch.setattr(ask_route_mod, "get_hybrid_search", lambda: _StubHybridSearch())
 
 
 class TestAskEndpoint:
@@ -182,7 +213,7 @@ class TestSynthesizerService:
             synth = Synthesizer()
             # Reset the cached client so the mock takes effect
             synth._client = mock_client
-            result = synth.synthesize("Test prompt")
+            synth.synthesize("Test prompt")
 
             mock_client.create.assert_called_once()
 
@@ -197,7 +228,7 @@ class TestSynthesizerService:
 
         # Should raise after retries (handled at route level)
         try:
-            result = synth.synthesize("Test prompt")
-        except Exception as e:
+            synth.synthesize("Test prompt")
+        except Exception:
             # Re-raising is acceptable if handled at route level
             pass
