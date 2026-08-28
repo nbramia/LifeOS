@@ -11,7 +11,7 @@ This directory contains Architecture Decision Records (ADRs) — immutable recor
 - `007-linux-migration.md` — Linux migration and local LLM orchestration (supersedes 005)
 - `008-managed-agents-cloud-routing.md` — Routing agent-worker sessions to cloud Claude via Managed Agents **(Amended by 018)**
 - `009-llm-backend-toggle.md` — `LIFEOS_LLM_BACKEND` switch between Anthropic and local llama-server
-- `010-apple-data-agent.md` — Mac as nightly source for iMessage, calls, and contacts
+- `010-apple-data-agent.md` — Mac as nightly source for iMessage, calls, and contacts **(Amended by 022)**
 - `011-external-agent-ingest.md` — Read-only direct-access ingest path for external agents
 - `012-embedding-pipeline.md` — GPU embedding pipeline with CPU fallback
 - `013-fitness-store.md` — Self-data fitness store, separate from the person-centric CRM model
@@ -23,6 +23,7 @@ This directory contains Architecture Decision Records (ADRs) — immutable recor
 - `019-turn-owned-by-server.md` — a chat turn's lifetime is owned by the server, not the SSE connection watching it **(Amended by 020)**
 - `020-voice-cancel-gate-lifted.md` — the voice-only detachment exception in 019 is removed now that whisper-relay cancels explicitly (amends 019)
 - `021-voice-turn-persistence-tee.md` — `POST turn/stream` tees a Hermes-backend voice turn into the conversation store, the one exception to 016's "no voice logic" (amends 016)
+- `022-macos-fda-inheritance-and-restart.md` — corrects 010's `exec`/`run` FDA-inheritance description and documents two macOS restart-safety lessons (amends 010)
 
 ## Key Principles
 

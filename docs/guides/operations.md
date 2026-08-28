@@ -19,9 +19,11 @@ Messages has its own history-retention setting (Messages → Settings → Genera
 
 ### macOS FDA (Full Disk Access)
 
-`/Applications/LifeOS.app` is a bash-script-based .app bundle with **Full Disk Access**. macOS cron cannot access `~/Library/Messages/` without FDA, so the Apple Data Agent cron job routes through this wrapper.
+`/Applications/LifeOS.app` is a bash-script-based .app bundle with **Full Disk Access**. macOS cron cannot access `~/Library/Messages/` without FDA, so the Apple Data Agent cron job routes through this wrapper. The grant must be added to `/Applications/LifeOS.app` itself in System Settings → Privacy & Security → Full Disk Access — never to `/bin/bash`, `/bin/zsh`, or the Python interpreter it eventually invokes. TCC grants are per-bundle, and neither a bare shell nor a venv's `python3` has a stable enough identity to hold a persistent grant on (recreating the venv would silently break the export).
 
-If adding new cron jobs or scripts on macOS that need to access protected directories, route them through `LifeOS exec`.
+**Use `LifeOS run`, not `LifeOS exec`, for anything that touches protected data.** macOS TCC attributes FDA to the *responsible* (parent) process, not to whichever binary happens to be running. `LifeOS.app`'s `run` subcommand runs the command as a real subprocess with the wrapper script staying alive as its parent, so the child inherits FDA. Its `exec` subcommand replaces the wrapper's own process image via shell `exec`, which breaks the parent chain and silently loses FDA — the child just reads empty or protected-looking data, with no error. `scripts/apple_data_agent.sh` (the working export path) has always used `run`; if adding new cron jobs or scripts on macOS that need to access protected directories, route them through `LifeOS run` the same way. See [ADR-022](../adr/022-macos-fda-inheritance-and-restart.md) for the full mechanism and why [ADR-010](../adr/010-apple-data-agent.md) originally described this backward.
+
+**Restarting the API service (or anything routed through LifeOS.app) on macOS:** never force-restart with `launchctl kickstart` — it has wedged the service rather than cleanly restarting it. Use a clean stop-then-start instead: `./scripts/service.sh stop` then `./scripts/service.sh start` (or, for a harder reset, `./scripts/service.sh uninstall` then `./scripts/service.sh install` to fully tear down and rebootstrap the launchd job). If that bootstrap/load step fails with a bare `Input/output error`, that's a known-transient launchd/TCC hiccup — retry the identical command before assuming anything is actually misconfigured.
 
 ### Self-update (issue #509)
 
@@ -198,6 +200,8 @@ value dressed up as confirmed-live.
 ## Related Documents
 
 - [AGENTS.md](../../AGENTS.md) — Agent-facing project reference (points here for operational detail)
+- [ADR-022: macOS FDA Inheritance and Safe Service Restart](../adr/022-macos-fda-inheritance-and-restart.md) — Design rationale for the `run`-not-`exec` and restart guidance in the FDA section above
+- [ADR-010: Apple Data Agent](../adr/010-apple-data-agent.md) — The `.app` wrapper design; amended by ADR-022
 - [Apple Health Import](apple-health.md) — Health/Fitness data import specifics
 - [Observability — Technical](../specs/technical/observability.md) — Perf tracing and monitoring design
 - [Data & Sync](../specs/technical/data-and-sync.md) — Nightly sync pipeline phases
