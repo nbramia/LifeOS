@@ -1,7 +1,7 @@
 # Troubleshooting
 
 > **Status:** Complete
-> **Last Updated:** 2026-07-09
+> **Last Updated:** 2026-08-28
 > **Audience:** Operators
 
 Common issues and solutions organized by category.
@@ -139,6 +139,40 @@ tail -50 logs/chromadb-error.log
 source ~/.venvs/lifeos/bin/activate
 chroma run --path ./data/chromadb --port 8001
 ```
+
+---
+
+## LLM Backend Issues
+
+### Server won't start: "LIFEOS_LLM_BACKEND is ... but ... is not set"
+
+**Symptom**: `LLMBackendNotConfiguredError` at startup.
+
+**Cause**: `LIFEOS_LLM_BACKEND=anthropic` (the default) with no `ANTHROPIC_API_KEY`, or `LIFEOS_LLM_BACKEND=remote` with `LIFEOS_REMOTE_LLM_URL`/`_MODEL`/`_API_KEY` incomplete. Both backends fail fast rather than silently falling back — see [ADR-024](../adr/024-remote-llm-backend.md).
+
+**Solution**: Set the missing variable(s), or switch `LIFEOS_LLM_BACKEND` to a backend you have configured (`local` needs only a reachable `LIFEOS_LOCAL_LLM_URL`). See [Configuration → LLM Backend](configuration.md#llm-backend--synthesis-and-orchestration).
+
+---
+
+### Remote provider requests fail (401/404) or hang
+
+**Symptom**: Chat turns on the "Remote" model picker option, or with `LIFEOS_LLM_BACKEND=remote`, error out or time out.
+
+**Causes**: Wrong bearer token; a model id the provider doesn't serve; a base URL with an extra or missing `/v1` (either convention is accepted — see [Configuration](configuration.md#openai-compatible-remote-provider)); the provider is genuinely down.
+
+**Solution**: Confirm `LIFEOS_REMOTE_LLM_URL`/`_MODEL`/`_API_KEY` against the provider's own docs, and raise `LIFEOS_REMOTE_LLM_TIMEOUT` (default 90s) if requests are timing out rather than erroring.
+
+---
+
+## Hermes / Front-Door Issues
+
+### `/chat` shows "Hermes" as unavailable, or a Telegram persona bot falls back to native replies
+
+**Symptom**: The Hermes option is missing from the backend picker, or a persona bot that should route through Hermes answers natively instead (sometimes with a one-time in-channel notice).
+
+**Cause**: `LIFEOS_HERMES_BACKEND_URL` is unset (`configured: false`), or set but the gateway isn't reachable (`configured: true, reachable: false`) — see `GET /api/hermes/status` in [api-reference.md](../specs/product/api-reference.md).
+
+**Solution**: This is a safe degraded mode, not a bug — LifeOS answers natively either way. To use Hermes, set `LIFEOS_HERMES_BACKEND_URL` (and `LIFEOS_HERMES_BACKEND_TOKEN` if the gateway requires one) and confirm the gateway itself is up. A bot can also be opted out of Hermes permanently with `"backend": "lifeos"` in `config/telegram_bots.local.json` — see [personas.md](personas.md).
 
 ---
 
@@ -360,3 +394,4 @@ If these solutions don't work:
 
 - [Scripts Reference](scripts.md) -- All LifeOS scripts with usage examples
 - [Configuration](configuration.md) -- Environment variables and config files
+- [API Reference](../specs/product/api-reference.md) -- `GET /api/hermes/status` and other backend status fields

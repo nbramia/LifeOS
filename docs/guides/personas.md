@@ -95,11 +95,14 @@ The persona layer is shared across Telegram, web `/chat`, and voice.
   "name": "travel",
   "token_env": "TELEGRAM_TRAVEL_BOT_TOKEN",
   "chat_id_env": "TELEGRAM_TRAVEL_CHAT_ID",
-  "persona_file": "config/personas/travel.md"
+  "persona_file": "config/personas/travel.md",
+  "backend": "hermes"
 }
 ```
 
 Leave a bot's token variable unset to not run it; `*_CHAT_ID` is optional and defaults to the primary chat id. To run a specialized bot, register it in this file and point it at a persona.
+
+`backend` picks how a persona's Telegram turns are served: `"hermes"` (the default) routes them through the Hermes gateway if `LIFEOS_HERMES_BACKEND_URL` is configured, falling back to the native LifeOS path automatically if Hermes is unset or unreachable; `"lifeos"` opts a bot out of Hermes permanently. This only affects Telegram — `/chat` and voice always talk to LifeOS directly. See [Telegram bot backends](../specs/technical/client-surfaces.md#telegram-bot-backends-684) in client-surfaces.md.
 
 **Web `/chat` and voice.** The *same* personas are exposed to the web and voice surfaces through `GET /api/personas`, which lists selectable personas (`primary` plus the configured specialized bots). The web client renders these as a picker (`web/chat/persona.js`); the chosen `persona_id` rides along on `POST /api/ask/stream`, and the server applies the matching persona preamble. On spoken turns (`modality: "voice"`) the server also appends that persona's `voice` frontmatter rules.
 

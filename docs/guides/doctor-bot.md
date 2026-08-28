@@ -1,7 +1,7 @@
 # Doctor Bot — Self-Repair Surface
 
 **Status:** Complete
-**Last Updated:** 2026-08-26
+**Last Updated:** 2026-08-28
 **Audience:** Operator
 
 The **doctor** bot's only job is fixing LifeOS itself. You message it when you notice LifeOS misbehaving or missing something; it converses with you to define the **goal**, locks that goal, then — on your approval — orchestrates the work end to end and reports back. It is a **goal-first orchestrator**: it supervises the implementation (subagents do the coding via `/implement`) rather than hand-coding inline, and every change lands through a reviewed, tested PR — never a direct push to `main`.
@@ -56,7 +56,7 @@ This is the operator's-eye summary; the exact contract the session runs lives in
 
 ## Adding another orchestration bot
 
-The doctor's machinery is generic. To add another orchestration surface, add an entry to [`config/telegram_bots.json`](../../config/telegram_bots.json) with `"orchestrates": true`, write its contract in `config/personas/<name>.md`, and set its `*_BOT_TOKEN`. A pure-chat specialized bot is the same minus `orchestrates` (it routes to the chat pipeline with its persona).
+The doctor's machinery is generic. To add another orchestration surface, add an entry to your per-install `config/telegram_bots.local.json` (not the tracked `config/telegram_bots.json` template — see [`scripts/register_persona_bot.py`](../../scripts/register_persona_bot.py) to automate this) with `"orchestrates": true`, write its contract in `config/personas/<name>.md`, and set its `*_BOT_TOKEN`. A pure-chat specialized bot is the same minus `orchestrates` (it routes to the chat pipeline with its persona).
 
 ## Related Documents
 

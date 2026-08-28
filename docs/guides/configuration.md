@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-08-26
+**Last Updated:** 2026-08-28
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -62,6 +62,7 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 |---|---|---|---|
 | `LIFEOS_LLM_BACKEND` | str | `anthropic` | `anthropic` (Claude API), `local` (llama-server on `LIFEOS_LOCAL_LLM_URL`), or `remote` (the configured paid provider below, as the standing default rather than a per-turn pick — #771/ADR-024). `anthropic` with no `ANTHROPIC_API_KEY`, or `remote` without the provider fully configured, fails fast with a named error rather than silently falling back. |
 | `LIFEOS_ANTHROPIC_MODEL` | str | `claude-haiku-4-5` | **Base** Claude model for chat orchestration when `LIFEOS_LLM_BACKEND=anthropic`. Per-query escalation can override it for a turn (see below). |
+| `LIFEOS_ANTHROPIC_SPECIALIST_MODEL` | str | `claude-sonnet-5` | Sonnet-tier model for specialist calls (relationship insights, fact extraction, tone analysis) — independent of the orchestrator model above. Pin aliases here, never dated snapshots (`claude-*-20YYMMDD`): snapshots retire and 404, silently breaking specialist features (#470). |
 | `LIFEOS_AGENT_ESCALATION_MODEL` | str | — (off) | Switches per-query escalation **on**; empty disables it. Anthropic backend only. Despite the name it no longer names the rung an automatic escalation climbs to — that is limited to non-API engines (see below). A model named here is still what "escalate to opus"-style *user-directed* escalation resolves against. |
 | `LIFEOS_AGENT_ESCALATION_LADDER` | str | `claude_code,codex` | Comma-separated rungs climbed on each successive refusal+pushback. Rungs must cost nothing per token: `claude_code`, `codex` (subscription CLIs) or `local` (on-box Gemma). Anthropic model ids are accepted but **dropped from the climb** with a log line — LifeOS never puts a turn on the API unless you ask. Override e.g. `local,claude_code,codex`. |
 | `ANTHROPIC_API_KEY` | str | — | Required when `LIFEOS_LLM_BACKEND=anthropic`. Also the preferred client for specialized calls (relationship insights, fact extraction, tone analysis — [ADR-025](../adr/025-specialist-call-fallback.md)) regardless of `LIFEOS_LLM_BACKEND`; when unset, those calls fall back to the local llama-server if reachable, else the remote provider below, instead of silently producing nothing (#772). Web search has no local equivalent and is unaffected — see below. |
@@ -119,6 +120,10 @@ Encoder model selection and search-pipeline knobs. Decision recorded in [ADR-012
 | `LIFEOS_RERANKER_MODEL` | str | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder for the rerank stage. |
 | `LIFEOS_RERANKER_ENABLED` | bool | `true` | Disable to skip the rerank pass (faster, lower precision). |
 | `LIFEOS_EMBEDDING_MEMORY_THRESHOLD_MB` | int | `28000` | Pre-flight free-RAM gate before phase 4 (embedding). Below this threshold the phase is skipped to avoid kernel OOM. Read directly from the environment by `scripts/run_all_syncs.py` (not a Pydantic Setting). |
+| `LIFEOS_EMBEDDING_BATCH_SIZE` | int | `8` | Max texts per `model.encode()` batch. Bounds peak VRAM per embedding call so one large document's chunks can't spike GPU memory and exhaust a unified-memory iGPU's SDMA queues, freezing the host (#483). Semantically neutral — only affects peak memory. |
+| `LIFEOS_EMBEDDING_GPU_LOCK_ENABLED` | bool | `true` | Serializes GPU embedding across processes (API server, agent worker, nightly sync, ad-hoc scripts) via a cross-process file lock, so they can't all grab GPU compute queues at once (#521). |
+| `LIFEOS_EMBEDDING_GPU_LOCK_PATH` | str | `./data/gpu_embed.lock` | `flock()` path for the cross-process GPU embedding lock (#521). Relative paths resolve against the process cwd, which every LifeOS process shares. Set to empty to disable the lock. |
+| `LIFEOS_EMBEDDING_GPU_LOCK_TIMEOUT` | float | `300.0` | Max seconds to wait for the cross-process GPU embedding lock before giving up. |
 | `HF_HUB_OFFLINE` | bool | `1` | Standard HuggingFace flag. `1` forces the embedding loader to use the local model cache only, skipping the huggingface.co etag round-trip on every model load. Set in `.env.example` to avoid DNS-failure retry storms during the nightly sync window (model files are pinned by `requirements.txt`). Honored directly by the HuggingFace libraries, not a Pydantic Setting. |
 | `TRANSFORMERS_OFFLINE` | bool | `1` | Companion to `HF_HUB_OFFLINE` for the `transformers` library. Same rationale. |
 
@@ -171,6 +176,7 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 | `LIFEOS_AGENT_MAX_CONCURRENT_MANAGED` | int | varies | Concurrent Managed-Agents sessions. |
 | `LIFEOS_AGENT_REMOTE_EXECUTOR` | bool | `false` | Opt-in: when the [OpenAI-compatible remote provider](#openai-compatible-remote-provider) is fully configured and the local llama-server is unreachable at session start, the local route runs the session on the remote provider instead of failing. No-op unless the remote provider is fully configured. |
 | `LIFEOS_AGENT_DEFAULT_ROUTE` | str | *(empty)* | Route preflight dispatches to instead of `ask` when a task has no routing cues at all — for a single-executor install there's nothing useful to ask about. Applies only when lack of cues, not a sanity failure, is why preflight would otherwise ask. Tag overrides (`#local`, `#cloud`, etc.) always win. When set to a valid route, also demotes any preflight `ambiguity` to advisory (logged, not blocking) instead of parking the task on the question — see [agent-worker.md](../specs/technical/agent-worker.md#preflight) for the full precedence. |
+| `LIFEOS_LOCAL_AGENT_ENABLE_THINKING` | bool | `false` | Whether `run_agent_loop`'s tool-round and synthesis calls request reasoning/thinking from a **local** model (Anthropic backend ignores this). Default `false` (#567): measured on the real orchestrator with Gemma 4 26B-A4B across 6 multi-step questions — thinking on averaged 233.0s/1032 chars, off 72.6s, with no answer-quality regression. |
 
 ## Agent Worker — Managed Agents (Cloud)
 
@@ -190,6 +196,7 @@ Read-only ingest of Claude Code's per-session JSONL transcripts. Decision: [ADR-
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
+| `LIFEOS_AGENT_VIZ_PREFETCH_ENABLED` | bool | `true` | When true, a background loop walks the `/agents` snapshot between user actions and pre-computes Gemma summaries for any session without one cached, yielding to the agent worker when it's running. `false` makes summaries strictly click-on-demand. Applies to every session type shown on `/agents`, not just Claude Code. |
 | `LIFEOS_CLAUDE_CODE_VIZ_ENABLED` | bool | `true` | Master switch. `false` disables the entire Claude Code ingest path. |
 | `LIFEOS_CLAUDE_CODE_PROJECTS_DIR` | path | `~/.claude/projects` | Where to read Claude Code JSONLs from. |
 | `LIFEOS_CLAUDE_CODE_LOOKBACK_DAYS` | int | varies | How far back to scan transcripts. |
@@ -254,6 +261,7 @@ Subprocess orchestration triggered from Telegram. See [claude-code-orchestration
 | `LIFEOS_PARTNER_NAME` | str | — | Partner's first name. |
 | `LIFEOS_THERAPIST_PATTERNS` | str | — | Therapist name patterns, pipe-separated (e.g., `Dr. Example\|Example Therapist`). |
 | `LIFEOS_PERSONAL_RELATIONSHIP_PATTERNS` | str | — | Pipe-separated patterns identifying personal meetings. |
+| `LIFEOS_CONTACT_PERSON_MIN_MESSAGES` | int | `5` | Minimum iMessage count on a contact's phone/email handle before `scripts/create_contact_persons.py` creates a PersonEntity for an otherwise person-less Apple Contacts record — filters out one-off wrong-number contacts. |
 
 ## Vault Structure
 
@@ -290,6 +298,7 @@ All work toggles default to `false` — work data is not indexed unless explicit
 | Variable | Type | Default | Sets |
 |---|---|---|---|
 | `LIFEOS_PHOTOS_PATH` | path | `~/Pictures/Photos Library.photoslibrary` | Apple Photos library path. Read by the Apple Data Agent on macOS (see [ADR-010](../adr/010-apple-data-agent.md)). |
+| `LIFEOS_APPLE_EXPORT_AGENT_LABEL` | str | `the export agent` | Name for the Apple Data Agent machine used in staleness/failure alerts from `scripts/apple_data_import.py` (e.g. `Mac Mini`, `my MacBook`). Generic default since the export agent's hardware is installer-specific (#770). |
 
 ## Fitness & Health
 

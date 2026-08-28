@@ -4,9 +4,9 @@
 
 LifeOS is a self-hosted AI assistant that connects to your Gmail, Google Calendar, Google Docs/Sheets/Drive, iMessage, phone calls, WhatsApp, Slack, Obsidian vault, Granola meeting transcripts, iPhotos, LinkedIn, Apple contacts, Monarch finances, and Apple Health — then makes all of it **available and actionable through natural language.**
 
-You can talk to it by text or **voice**, through a web chat, through Telegram, or through any MCP client (Claude Desktop, Claude Code). It can answer from your data, take action on your behalf (draft email, schedule things, edit files), and hand long tasks to an autonomous agent that works while you don't.
+**Front doors:** a web chat, Telegram, voice (wake word or push-to-talk, from a browser or an iOS Home Screen app), any MCP client (Claude Desktop, Claude Code), or a [Hermes](docs/specs/technical/client-surfaces.md) gateway that fronts your persona bots and falls back to LifeOS's native pipeline if Hermes is unreachable. It can answer from your data, take action on your behalf (draft email, schedule things, edit files), and hand long tasks to an autonomous agent that works while you don't.
 
-All of your data is indexed and stored **locally** — your vault, messages, photos, financial summaries, and health data never leave your machine. By default, orchestration and synthesis call the Claude API (`LIFEOS_LLM_BACKEND=anthropic`, the default), which sends the current query and its retrieved context to Anthropic; set `LIFEOS_LLM_BACKEND=local` to route everything through a local llama-server and keep inference on your own hardware too. A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your relationship graph fresh.
+All of your data is indexed and stored **locally** — your vault, messages, photos, financial summaries, and health data never leave your machine. By default, orchestration and synthesis call the Claude API (`LIFEOS_LLM_BACKEND=anthropic`, the default), which sends the current query and its retrieved context to Anthropic. For a no-API-key path, `LIFEOS_LLM_BACKEND=local` routes everything through a local llama-server on your own hardware, and `LIFEOS_LLM_BACKEND=remote` points at any OpenAI-compatible hosted provider (e.g. Fireworks) instead. A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your relationship graph fresh.
 
 > **New here?** Jump to [Quick Start](#quick-start), or the [Installation Guide](docs/guides/installation.md) for the full walkthrough (including a minimal "just an API key and a vault" path).
 
@@ -105,7 +105,7 @@ LifeOS includes an external **agent worker** that picks up tasks you've tagged `
 ```
 
 - **Hands-free completion.** Tag a task and forget it. Telegram tells you when it's done, what it did, and what it cost.
-- **Choose your engine.** `#local` runs on your self-hosted Gemma — free, private, fast on workstation-class GPUs. `#cloud` runs on Anthropic's [Managed Agents](docs/specs/product/agent-worker.md) with Gmail / Calendar / Drive / Slack / Asana / Ramp connectors out of the box. `#claude` and `#codex` hand off to those CLI engines. No tag, and the agent infers from the title.
+- **Choose your engine.** `#local` runs on your self-hosted Gemma — free, private, fast on workstation-class GPUs. `#cloud` runs on your configured `LIFEOS_REMOTE_LLM_*` provider (e.g. Fireworks); `#cloud-haiku` / `#cloud-sonnet` still route to Anthropic's [Managed Agents](docs/specs/product/agent-worker.md) with Gmail / Calendar / Drive / Slack / Asana / Ramp connectors out of the box. `#claude` and `#codex` hand off to those CLI engines. No tag, and the agent infers from the title.
 - **Budgets in the title.** *"max $0.50"*, *"5 min"*, *"10k tokens"* — parsed in natural language. Daily and per-task caps are enforced from outside the agent loop, with a global daily $-ceiling backstop.
 - **Asks when genuinely stuck.** An ambiguous task gets one targeted Telegram question; reply and the agent resumes. No answer within 72 hours (configurable) and the task is parked with a heads-up.
 - **Spawns its own teammates.** Agents can spawn child sessions, message them, and yield until they finish — good for fan-out research and parallel pipelines.
@@ -141,17 +141,18 @@ When LifeOS itself misbehaves or is missing a capability, you don't file a bug �
 - **Python 3.11+**
 - **ChromaDB** (installed via `pip`; the only hard external service)
 - An **Obsidian vault** (or any folder of markdown notes)
-- **A Claude API key** on the default backend — *or* a **GPU** (AMD ROCm / NVIDIA CUDA) to run everything locally
+- **A Claude API key** on the default backend — *or* a **GPU** (AMD ROCm / NVIDIA CUDA) to run everything locally — *or* an API key for any OpenAI-compatible hosted provider (e.g. Fireworks), for a no-local-GPU / no-Anthropic-key path
 
-macOS is only required for native Apple integrations (iMessage, calls, Contacts, Photos). A Mac can also act as an [Apple Data Agent](docs/guides/operations.md) satellite, exporting Apple data nightly to a Linux host.
+macOS is only required for native Apple integrations (iMessage, calls, Contacts, Photos) — LifeOS itself, including the local LLM, runs the same on macOS as on Linux, with `setup-launchd.sh` standing in for `setup-systemd.sh`. A Mac can also act as an [Apple Data Agent](docs/guides/operations.md) satellite, exporting Apple data nightly to a Linux host. Someone other than the maintainer can also install LifeOS config-only, talking to it through an external Hermes front door instead of running their own sync — see [Setting up for a second user](docs/guides/installation.md#setting-up-for-a-second-user-config-only).
 
 ### LLM options
 
-Orchestration and synthesis run against the Claude API (default) or a local OpenAI-compatible llama-server. Pick what matches your hardware and privacy posture:
+Orchestration and synthesis run against the Claude API (default), a local OpenAI-compatible llama-server, or a hosted OpenAI-compatible provider. Pick what matches your hardware, budget, and privacy posture:
 
 | Hardware / preference | Config | Notes |
 |----------------------|--------|-------|
 | No GPU / prefer cloud (default) | `LIFEOS_LLM_BACKEND=anthropic` + `ANTHROPIC_API_KEY` | Default model `claude-haiku-4-5` (override via `LIFEOS_ANTHROPIC_MODEL`). Query text + retrieved context is sent to Anthropic. |
+| No GPU, no Anthropic key | `LIFEOS_LLM_BACKEND=remote` + `LIFEOS_REMOTE_LLM_URL`/`_MODEL`/`_API_KEY` | Any OpenAI-compatible endpoint (e.g. Fireworks). Query text + retrieved context is sent to that provider. |
 | 8 GB RAM | `LIFEOS_LLM_BACKEND=local` + a small (~7B) model | Set `LIFEOS_LOCAL_LLM_URL` if not on `localhost:8080`. |
 | 16–32 GB RAM | `LIFEOS_LLM_BACKEND=local` + a medium (~14–32B) model | |
 | 64 GB+ VRAM | `LIFEOS_LLM_BACKEND=local` + a large (70–120B) model | Default local model: `unsloth/gemma-4-26B-A4B-it-GGUF`. |
@@ -167,7 +168,7 @@ To stay fully local, set `LIFEOS_LLM_BACKEND=local` and point `LIFEOS_LOCAL_LLM_
 
 ## Quick Start
 
-The minimal setup is a Claude API key and a folder of notes — everything else (Google, Slack, Telegram, Apple, voice, finances) is optional and layered on later.
+The minimal setup is an LLM credential and a folder of notes — everything else (Google, Slack, Telegram, Apple, voice, finances) is optional and layered on later. Two no-GPU paths:
 
 ```bash
 # 1. Clone and install
@@ -181,8 +182,16 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env — minimal required:
 #   LIFEOS_VAULT_PATH   → your Obsidian/markdown folder
+#
+# Path A — Claude API key (default backend):
 #   ANTHROPIC_API_KEY   → your Claude API key
-# (or LIFEOS_LLM_BACKEND=local with a running llama-server on LIFEOS_LOCAL_LLM_URL)
+#
+# Path B — no Claude key, use any OpenAI-compatible hosted provider (e.g. Fireworks):
+#   LIFEOS_LLM_BACKEND=remote
+#   LIFEOS_REMOTE_LLM_URL, LIFEOS_REMOTE_LLM_MODEL, LIFEOS_REMOTE_LLM_API_KEY
+#
+# (or LIFEOS_LLM_BACKEND=local with a running llama-server on LIFEOS_LOCAL_LLM_URL,
+# if you'd rather run inference on your own GPU)
 
 # 3. Start the vector DB + server
 ./scripts/chromadb.sh start
@@ -192,7 +201,9 @@ cp .env.example .env
 #   http://localhost:8000/chat
 ```
 
-For services that persist across reboots on Linux, run `sudo ./scripts/setup-systemd.sh` to install systemd units.
+For services that persist across reboots on Linux, run `sudo ./scripts/setup-systemd.sh` to install systemd units (macOS: `./scripts/setup-launchd.sh`).
+
+After the first sync, `scripts/setup_identity.py` walks you through telling LifeOS who you are (guided, replaces hand-editing `.env`/`config/family_members.json`), and `scripts/first_backfill.py` runs a one-time deep backfill beyond the nightly sync's narrower lookback window — see [First Run](docs/guides/first-run.md).
 
 Full walkthrough (including which external accounts each integration needs): [Installation Guide](docs/guides/installation.md).
 
@@ -214,7 +225,7 @@ Most queries go straight to the orchestrator, which decides — over multiple ro
   <img src="docs/images/query-pipeline.svg" width="940" alt="Query pipeline: input surfaces (web, Telegram, voice, MCP) on the left feed a query into the central orchestrator agent loop; the top shows the intra-query tool-call loop (search_vault, email, calendar, web, tasks, people) repeated over multiple rounds; the bottom shows model handoff — the agent loop runs on a local Gemma or cloud Haiku base, Haiku auto-escalates to the Claude Code or Codex CLI engines, and reaches Sonnet or Opus only when the user asks; the right shows the response returning to the same surface.">
 </p>
 
-The orchestrator defaults to Claude via the Anthropic API (`LIFEOS_LLM_BACKEND=anthropic`, model from `LIFEOS_ANTHROPIC_MODEL`); set `LIFEOS_LLM_BACKEND=local` to route through a local llama-server. Internals: [Search & Indexing](docs/specs/technical/search-indexing.md) · [Architecture](docs/specs/technical/architecture.md).
+The orchestrator defaults to Claude via the Anthropic API (`LIFEOS_LLM_BACKEND=anthropic`, model from `LIFEOS_ANTHROPIC_MODEL`); set `LIFEOS_LLM_BACKEND=local` to route through a local llama-server, or `LIFEOS_LLM_BACKEND=remote` to route through a hosted OpenAI-compatible provider instead. Internals: [Search & Indexing](docs/specs/technical/search-indexing.md) · [Architecture](docs/specs/technical/architecture.md).
 
 ### CRM UI
 
@@ -294,7 +305,7 @@ Services are categorized by criticality and fallback behavior:
 | Component | Technology |
 |-----------|------------|
 | Backend | FastAPI (port 8000) |
-| LLM (orchestration + synthesis) | Claude via Anthropic API (default; `LIFEOS_ANTHROPIC_MODEL`, defaults to `claude-haiku-4-5`), or a local llama.cpp server (`LIFEOS_LLM_BACKEND=local`) |
+| LLM (orchestration + synthesis) | Claude via Anthropic API (default; `LIFEOS_ANTHROPIC_MODEL`, defaults to `claude-haiku-4-5`), a local llama.cpp server (`LIFEOS_LLM_BACKEND=local`), or any hosted OpenAI-compatible provider such as Fireworks (`LIFEOS_LLM_BACKEND=remote`) |
 | Embeddings | sentence-transformers (`mxbai-embed-large-v1` by default; `gte-Qwen2-1.5B-instruct` is a supported upgrade) |
 | Vector DB | ChromaDB (port 8001) |
 | Keyword Search | SQLite FTS5 (BM25) |
