@@ -160,6 +160,45 @@ def check_manifest() -> dict | None:
                     f"Check wacli/tooling on {agent_label}."
                 )
 
+    # Issue #820: a partial (--source) export run preserves other sources'
+    # manifest entries (#786) rather than clobbering them, but the top-level
+    # exported_at above describes only the run that just happened — checking
+    # staleness from it alone means a fresh run of one source silently masks
+    # a week-old preserved entry for another. Sources exported by the fixed
+    # apple_data_export.py now carry their own exported_at; judge each one's
+    # staleness from that value instead. A source with no per-source
+    # exported_at is a legacy manifest (pre-#820, or an entry from before
+    # this field existed) — leave it to the top-level check above, which
+    # already covers that case exactly as it did before this change.
+    stale_sources: dict[str, str] = {}
+    if isinstance(results, dict):
+        for source_name, source_result in results.items():
+            if not isinstance(source_result, dict):
+                continue
+            source_exported_at_str = source_result.get("exported_at")
+            if not source_exported_at_str:
+                continue
+            try:
+                source_exported_at = datetime.fromisoformat(source_exported_at_str)
+                if source_exported_at.tzinfo is None:
+                    source_exported_at = source_exported_at.replace(tzinfo=timezone.utc)
+                source_age_hours = (
+                    datetime.now(timezone.utc) - source_exported_at
+                ).total_seconds() / 3600
+            except (ValueError, TypeError):
+                continue
+            if source_age_hours > STALENESS_CRITICAL_HOURS:
+                message = (
+                    f"{source_name} data is {source_age_hours / 24:.0f} days old "
+                    f"(exported {source_exported_at_str}), regardless of any other "
+                    f"source's more recent run. Check {agent_label}'s scheduled job "
+                    "and file-transfer pipeline."
+                )
+                logger.critical(message)
+                stale_sources[source_name] = message
+    if stale_sources:
+        manifest["_stale_sources"] = stale_sources
+
     # Flag a Mac Mini agent whose self-update (issue #509) has fallen behind.
     # `agent_sha` is absent on manifests written before this change — that's
     # expected and not a problem, so only compare when it's actually present.
@@ -942,6 +981,26 @@ def main():
                 existing["reason"] = reason
             else:
                 results[name] = {"status": "error", "reason": reason}
+
+    # Issue #820: a source whose OWN recorded exported_at is critically
+    # stale fails the run for that source specifically, independent of the
+    # top-level manifest_staleness check below (which only sees the shared
+    # timestamp and would miss this on a manifest freshened by an unrelated
+    # partial run). Same scoping as the error override above — only sources
+    # this invocation considered (respecting --source) are checked.
+    if manifest:
+        stale_sources = manifest.get("_stale_sources") or {}
+        for name, message in stale_sources.items():
+            if name not in sources:
+                continue
+            existing = results.get(name)
+            if isinstance(existing, dict) and existing.get("status") == "error":
+                continue
+            if isinstance(existing, dict):
+                existing["status"] = "error"
+                existing["reason"] = message
+            else:
+                results[name] = {"status": "error", "reason": message}
 
     # Issue #646: staleness past STALENESS_CRITICAL_HOURS must fail the run,
     # not just log a CRITICAL that doesn't drive record_failure/alerting —

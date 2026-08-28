@@ -1058,6 +1058,12 @@ def main():
     if args.source:
         sources = {args.source: sources[args.source]}
 
+    # Computed once so every source touched by this invocation — and the
+    # top-level manifest fields — agree exactly (issue #820, acceptance
+    # criterion: a full export's per-source and top-level timestamps match).
+    exported_at = datetime.now(timezone.utc).isoformat()
+    agent_sha = _get_agent_sha()
+
     results = {}
     for name, func in sources.items():
         logger.info(f"{'[DRY RUN] ' if dry_run else ''}Exporting {name}...")
@@ -1066,6 +1072,16 @@ def main():
         except Exception as e:
             logger.error(f"Failed to export {name}: {e}")
             results[name] = {"status": "error", "error": str(e)}
+
+    # Issue #820: freshness belongs to each source, not just the top of the
+    # file. A partial (--source) run's merge below preserves entries for
+    # sources it didn't touch — those keep whatever exported_at/agent_sha
+    # they were stamped with on their own last run, instead of silently
+    # inheriting this run's timestamp the way the top-level field used to.
+    for source_result in results.values():
+        if isinstance(source_result, dict):
+            source_result["exported_at"] = exported_at
+            source_result["agent_sha"] = agent_sha
 
     # Write manifest. A single-source run (--source) must merge into any
     # existing manifest rather than replacing it wholesale — otherwise the
@@ -1089,6 +1105,29 @@ def main():
             existing_results = existing_manifest.get("results")
             if isinstance(existing_results, dict):
                 manifest_results = {**existing_results, **results}
+                # Issue #820: a preserved entry from before per-source
+                # timestamps existed has no exported_at of its own — this is
+                # the last point where the old top-level value (describing
+                # when that entry actually last ran) is still recoverable,
+                # since this same write is about to replace the top-level
+                # field with this run's timestamp. Without backfilling here,
+                # the very next partial run after upgrading would silently
+                # reproduce the original bug for every source this run
+                # didn't touch, just one generation later.
+                old_exported_at = existing_manifest.get("exported_at")
+                old_agent_sha = existing_manifest.get("agent_sha")
+                for name, entry in manifest_results.items():
+                    if name in results or not isinstance(entry, dict):
+                        continue  # freshly stamped above, or not a dict
+                    if not entry.get("exported_at") and old_exported_at:
+                        logger.info(
+                            f"Backfilling {name}'s manifest entry with the "
+                            f"previous top-level exported_at ({old_exported_at}) "
+                            "— legacy entry, no per-source timestamp of its own."
+                        )
+                        entry["exported_at"] = old_exported_at
+                    if not entry.get("agent_sha") and old_agent_sha:
+                        entry["agent_sha"] = old_agent_sha
             else:
                 logger.error(
                     f"Existing manifest at {manifest_path} has no usable "
@@ -1107,9 +1146,9 @@ def main():
             skip_manifest_write = True
 
     manifest = {
-        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "exported_at": exported_at,
         "hostname": __import__("socket").gethostname(),
-        "agent_sha": _get_agent_sha(),
+        "agent_sha": agent_sha,
         "results": manifest_results,
     }
 
