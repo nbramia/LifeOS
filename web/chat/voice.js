@@ -2627,6 +2627,14 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
     }
 
     await playbackChain;
+    // A tap on Cancel during playback (the "stop playback" use of that
+    // button once a reply has already landed -- see cancelActiveTurn()'s own
+    // comment) is exactly what settles `playbackChain` early, and that same
+    // tap already reset activeTurnAbort/voiceBusy/status itself. Checked
+    // again here, after the await, for the same reason as everywhere else in
+    // this function (#832): don't redo that reset onto whatever turn is
+    // current by the time this resumes.
+    if (!isOwnTurn(ownAbortController)) return;
     showCancel(false);
     setStatus('', 'Ready');
     await maybeAutoContinue();  // re-record if Auto-continue is on
