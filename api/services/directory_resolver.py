@@ -22,7 +22,6 @@ _LIFEOS_WORDS = [
 _CODE_WORDS = ["script", "code", "function", "cron"]
 
 _HOME = os.path.expanduser("~")
-_VAULT_DIR = str(settings.vault_path)
 _CODE_DIR = os.path.expanduser(settings.code_dir)
 _LIFEOS_DIR = os.path.join(_CODE_DIR, "LifeOS")
 
@@ -56,10 +55,10 @@ def resolve_working_directory(task: str) -> str:
     # 1. Vault/notes keywords
     for phrase in _VAULT_PHRASES:
         if phrase in task_lower:
-            return _VAULT_DIR
+            return str(settings.vault_path)
     for word in _VAULT_WORDS:
         if re.search(rf"\b{word}\b", task_lower):
-            return _VAULT_DIR
+            return str(settings.vault_path)
 
     # 2. LifeOS-specific keywords
     for phrase in _LIFEOS_PHRASES:
