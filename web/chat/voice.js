@@ -2199,11 +2199,17 @@ function parseSseChunk(buffer, onEvent) {
   const remainder = lines.pop() || '';
   for (const line of lines) {
     if (!line.startsWith('data: ')) continue;
+    let event;
     try {
-      onEvent(JSON.parse(line.slice(6)));
+      event = JSON.parse(line.slice(6));
     } catch {
-      /* ignore malformed chunks */
+      continue; // ignore malformed chunks
     }
+    // Outside the try: `cancelled`/`error` events intentionally throw from
+    // onEvent (handleEvent, below) to unwind consumeTurnStream's read loop --
+    // that must propagate to submitTurn()'s catch, not get swallowed here
+    // alongside a genuine JSON.parse failure.
+    onEvent(event);
   }
   return remainder;
 }

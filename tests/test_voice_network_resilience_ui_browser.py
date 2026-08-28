@@ -410,6 +410,13 @@ class TestRetryReconciliation:
         expect(page.locator("#messages .message.user")).to_have_count(1)
         expect(page.locator("#messages .message.user")).to_have_text("first try")
         expect(page.locator(".voice-turn-status.failed")).to_have_count(0)
+        # The retried submitTurn() clears heldRecording only once its `done`
+        # frame lands -- everything asserted above is already true the
+        # instant the click fires (a reconciled bubble needs no round trip),
+        # so waiting on "Ready" (set right after `heldRecording = null` in
+        # submitTurn's success path) is what actually orders this assertion
+        # after the retry's async completion, instead of racing it.
+        expect(page.locator("#statusText")).to_have_text("Ready")
         assert _user_texts(page) == ["first try"]
         assert page.evaluate("() => window.lifeChatVoice.hasHeldRecording()") is False
 
