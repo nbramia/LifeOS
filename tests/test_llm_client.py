@@ -822,6 +822,51 @@ class TestSingleton:
                 pytest.skip("anthropic package not installed")
         reset_local_llm()
 
+    def test_anthropic_backend_no_key_raises_named_error(self):
+        """#771: a keyless anthropic-backend install gets a human-readable
+        error naming the missing setting, not a raw SDK exception surfacing
+        later at first use."""
+        from api.services.llm_client import get_local_llm, reset_local_llm, LLMBackendNotConfiguredError
+        reset_local_llm()
+        with patch("api.services.llm_client.settings") as mock_settings:
+            mock_settings.llm_backend = "anthropic"
+            mock_settings.anthropic_api_key = ""
+            with pytest.raises(LLMBackendNotConfiguredError, match="ANTHROPIC_API_KEY"):
+                get_local_llm()
+        reset_local_llm()
+
+    def test_remote_backend_configured_returns_local_llm_client_pointed_at_provider(self):
+        """#771: LIFEOS_LLM_BACKEND=remote with a fully-configured provider
+        builds a LocalLLMClient wired to the remote provider's settings."""
+        from api.services.llm_client import get_local_llm, reset_local_llm, LocalLLMClient
+        reset_local_llm()
+        with patch("api.services.llm_client.settings") as mock_settings:
+            mock_settings.llm_backend = "remote"
+            mock_settings.remote_llm_configured = True
+            mock_settings.remote_llm_base_url = "https://api.fireworks.ai/inference/v1"
+            mock_settings.remote_llm_model = "accounts/fireworks/models/deepseek-v4-flash-0731"
+            mock_settings.remote_llm_api_key = "fw-test-key"
+            mock_settings.remote_llm_timeout = 90
+            client = get_local_llm()
+            assert isinstance(client, LocalLLMClient)
+            assert client.base_url == "https://api.fireworks.ai/inference"
+            assert client._model == "accounts/fireworks/models/deepseek-v4-flash-0731"
+            assert client._api_key == "fw-test-key"
+        reset_local_llm()
+
+    def test_remote_backend_not_configured_raises_named_error(self):
+        """#771: LIFEOS_LLM_BACKEND=remote with an incomplete provider config
+        fails fast with a named error rather than silently falling back to
+        another backend."""
+        from api.services.llm_client import get_local_llm, reset_local_llm, LLMBackendNotConfiguredError
+        reset_local_llm()
+        with patch("api.services.llm_client.settings") as mock_settings:
+            mock_settings.llm_backend = "remote"
+            mock_settings.remote_llm_configured = False
+            with pytest.raises(LLMBackendNotConfiguredError, match="remote"):
+                get_local_llm()
+        reset_local_llm()
+
     def test_specialist_client_resolves_model_from_settings(self):
         """get_anthropic_llm() resolves LIFEOS_ANTHROPIC_SPECIALIST_MODEL,
         independent of the orchestrator model (#470 — was a hardcoded dated
@@ -839,6 +884,86 @@ class TestSingleton:
                 assert client._model != mock_settings.anthropic_model  # independent
             except ImportError:
                 pytest.skip("anthropic package not installed")
+        reset_local_llm()
+
+    def test_specialist_client_keyed_install_never_probes_local(self):
+        """#772: the central "keyed install byte-for-byte unchanged"
+        requirement -- with a key set, get_anthropic_llm() must not
+        construct or probe a LocalLLMClient at all, not just happen to
+        return an AnthropicLLMClient."""
+        from api.services.llm_client import get_anthropic_llm, reset_local_llm, AnthropicLLMClient, LocalLLMClient
+        reset_local_llm()
+        with patch("api.services.llm_client.settings") as mock_settings, \
+                patch.object(LocalLLMClient, "is_available") as mock_is_available:
+            mock_settings.anthropic_api_key = "sk-ant-test-key"
+            mock_settings.anthropic_specialist_model = "claude-sonnet-5"
+            try:
+                client = get_anthropic_llm()
+                assert isinstance(client, AnthropicLLMClient)
+            except ImportError:
+                pytest.skip("anthropic package not installed")
+            mock_is_available.assert_not_called()
+        reset_local_llm()
+
+    def test_specialist_client_falls_back_to_local_when_no_key(self):
+        """#772: a keyless install used to silently produce nothing from
+        relationship insights, fact extraction, and tone analysis, because
+        get_anthropic_llm() always built an AnthropicLLMClient regardless
+        of LIFEOS_LLM_BACKEND. With no key and a reachable local
+        llama-server, it now falls back to that instead."""
+        from api.services.llm_client import get_anthropic_llm, reset_local_llm, LocalLLMClient
+        reset_local_llm()
+        with patch("api.services.llm_client.settings") as mock_settings, \
+                patch.object(LocalLLMClient, "is_available", return_value=True):
+            mock_settings.anthropic_api_key = ""
+            mock_settings.local_llm_url = "http://localhost:8080"
+            mock_settings.local_llm_timeout = 90
+            # Must NOT be consulted -- local wins before remote is checked.
+            mock_settings.remote_llm_configured = True
+            client = get_anthropic_llm()
+            assert isinstance(client, LocalLLMClient)
+            assert client.base_url == "http://localhost:8080"
+        reset_local_llm()
+
+    def test_specialist_client_falls_back_to_remote_when_local_unreachable(self):
+        """#772: no key and the local llama-server is unreachable, but the
+        remote paid provider is fully configured -- falls back to it
+        instead of the raw Anthropic no-key error."""
+        from api.services.llm_client import get_anthropic_llm, reset_local_llm, LocalLLMClient
+        reset_local_llm()
+        with patch("api.services.llm_client.settings") as mock_settings, \
+                patch.object(LocalLLMClient, "is_available", return_value=False):
+            mock_settings.anthropic_api_key = ""
+            mock_settings.local_llm_url = "http://localhost:8080"
+            mock_settings.local_llm_timeout = 90
+            mock_settings.remote_llm_configured = True
+            mock_settings.remote_llm_base_url = "https://api.fireworks.ai/inference/v1"
+            mock_settings.remote_llm_model = "accounts/fireworks/models/deepseek-v4-flash-0731"
+            mock_settings.remote_llm_api_key = "fw-test-key"
+            mock_settings.remote_llm_timeout = 90
+            client = get_anthropic_llm()
+            assert isinstance(client, LocalLLMClient)
+            assert client.base_url == "https://api.fireworks.ai/inference"
+            assert client._model == "accounts/fireworks/models/deepseek-v4-flash-0731"
+            assert client._api_key == "fw-test-key"
+        reset_local_llm()
+
+    def test_specialist_client_degrades_when_nothing_configured(self):
+        """#772: no key, local unreachable, remote not configured -- this
+        function still returns a client (pointed at the unreachable local
+        server) instead of raising, so each caller's existing try/except
+        around its `.create()` call degrades to its current empty/no-op
+        result rather than an unhandled exception here."""
+        from api.services.llm_client import get_anthropic_llm, reset_local_llm, LocalLLMClient
+        reset_local_llm()
+        with patch("api.services.llm_client.settings") as mock_settings, \
+                patch.object(LocalLLMClient, "is_available", return_value=False):
+            mock_settings.anthropic_api_key = ""
+            mock_settings.local_llm_url = "http://localhost:8080"
+            mock_settings.local_llm_timeout = 90
+            mock_settings.remote_llm_configured = False
+            client = get_anthropic_llm()
+            assert isinstance(client, LocalLLMClient)
         reset_local_llm()
 
 
@@ -933,6 +1058,7 @@ class TestRoutingHelpers:
             mock_settings.routing_llm_url = "http://routing-box:9090"
             await mod.generate_text("hi", timeout=30)
 
+        assert mock_cls.call_count == 1
         kwargs = mock_cls.call_args.kwargs
         assert kwargs["base_url"] == "http://routing-box:9090"
         assert kwargs["timeout"] == 30
@@ -1053,14 +1179,167 @@ class TestRoutingHelpers:
             assert third is second
 
     def test_is_available_swallows_errors(self, _routing_singleton_reset):
-        """is_local_routing_llm_available returns False rather than propagating."""
+        """is_local_routing_llm_available returns False rather than
+        propagating, when neither local nor a remote provider is usable."""
         from unittest.mock import MagicMock
         mod = _routing_singleton_reset
 
         bad_client = MagicMock()
         bad_client.is_available.side_effect = RuntimeError("boom")
-        with patch.object(mod, "_get_local_routing_client", return_value=bad_client):
+        with patch.object(mod, "_get_local_routing_client", return_value=bad_client), \
+                patch.object(mod, "settings") as mock_settings:
+            mock_settings.remote_llm_configured = False
             assert mod.is_local_routing_llm_available() is False
+
+    def test_is_available_true_when_remote_configured_and_local_errors(self, _routing_singleton_reset):
+        """#773: is_local_routing_llm_available reports true when the local
+        probe fails but a remote provider is configured, so a caller
+        gating on this doesn't skip straight to its no-op fallback while
+        generate_text's own local-then-remote retry has a working remote
+        provider to fall back to."""
+        from unittest.mock import MagicMock
+        mod = _routing_singleton_reset
+
+        bad_client = MagicMock()
+        bad_client.is_available.side_effect = RuntimeError("boom")
+        with patch.object(mod, "_get_local_routing_client", return_value=bad_client), \
+                patch.object(mod, "settings") as mock_settings:
+            mock_settings.remote_llm_configured = True
+            assert mod.is_local_routing_llm_available() is True
+
+    @pytest.mark.asyncio
+    async def test_ais_available_true_when_remote_configured_and_local_errors(self, _routing_singleton_reset):
+        """Async counterpart of the sync test above -- same priority order."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        bad_client = MagicMock()
+        bad_client.ais_available = AsyncMock(side_effect=RuntimeError("boom"))
+        with patch.object(mod, "_get_local_routing_client", return_value=bad_client), \
+                patch.object(mod, "settings") as mock_settings:
+            mock_settings.remote_llm_configured = True
+            assert await mod.ais_local_routing_llm_available() is True
+
+    def test_remote_routing_client_builds_from_remote_settings(self, _routing_singleton_reset):
+        """_remote_routing_client builds a LocalLLMClient pointed at the
+        configured remote provider's settings, the fallback target
+        generate_text retries against (#773)."""
+        mod = _routing_singleton_reset
+
+        with patch.object(mod, "settings") as mock_settings:
+            mock_settings.remote_llm_base_url = "https://api.fireworks.ai/inference/v1"
+            mock_settings.remote_llm_model = "accounts/fireworks/models/deepseek-v4-flash-0731"
+            mock_settings.remote_llm_api_key = "fw-test-key"
+            mock_settings.remote_llm_timeout = 90
+            client = mod._remote_routing_client()
+        assert isinstance(client, mod.LocalLLMClient)
+        assert client.base_url == "https://api.fireworks.ai/inference"
+        assert client._model == "accounts/fireworks/models/deepseek-v4-flash-0731"
+        assert client._api_key == "fw-test-key"
+
+    @pytest.mark.asyncio
+    async def test_generate_text_local_success_never_touches_remote(self, _routing_singleton_reset):
+        """#773: on a reachable local server, generate_text makes exactly
+        one call (local's acreate()) -- no availability probe, no remote
+        construction -- byte-for-byte the same request as before this
+        fallback existed."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        local_client = MagicMock()
+        local_resp = MagicMock(text="local answer", reasoning_starved=False)
+        local_client.acreate = AsyncMock(return_value=local_resp)
+        with patch.object(mod, "_get_local_routing_client", return_value=local_client), \
+                patch.object(mod, "_remote_routing_client") as mock_remote:
+            text = await mod.generate_text("hi")
+        assert text == "local answer"
+        local_client.acreate.assert_awaited_once()
+        mock_remote.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_generate_text_falls_back_to_remote_when_local_fails(self, _routing_singleton_reset):
+        """#773: a keyless/local-less install (only a remote provider
+        configured) now gets query routing, conversation titling,
+        agent-activity summaries, and fact filtering instead of every one
+        of those silently doing nothing -- generate_text retries once
+        against the remote provider when the local call itself fails."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        local_client = MagicMock()
+        local_client.acreate = AsyncMock(side_effect=RuntimeError("connection refused"))
+        remote_client = MagicMock()
+        remote_resp = MagicMock(text="remote answer", reasoning_starved=False)
+        remote_client.acreate = AsyncMock(return_value=remote_resp)
+        with patch.object(mod, "_get_local_routing_client", return_value=local_client), \
+                patch.object(mod, "settings") as mock_settings, \
+                patch.object(mod, "_remote_routing_client", return_value=remote_client) as mock_remote:
+            mock_settings.remote_llm_configured = True
+            text = await mod.generate_text("hi")
+        assert text == "remote answer"
+        local_client.acreate.assert_awaited_once()
+        mock_remote.assert_called_once_with(None)
+
+    @pytest.mark.asyncio
+    async def test_generate_text_forwards_timeout_to_remote_fallback(self, _routing_singleton_reset):
+        """#773: a per-call timeout (three of four real callers pass one)
+        must reach the remote fallback too, not just the transient local
+        candidate."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        transient_local = MagicMock()
+        transient_local.acreate = AsyncMock(side_effect=RuntimeError("connection refused"))
+        remote_client = MagicMock()
+        remote_resp = MagicMock(text="remote answer", reasoning_starved=False)
+        remote_client.acreate = AsyncMock(return_value=remote_resp)
+        with patch.object(mod, "settings") as mock_settings, \
+                patch.object(mod, "LocalLLMClient", return_value=transient_local), \
+                patch.object(mod, "_remote_routing_client", return_value=remote_client) as mock_remote:
+            mock_settings.remote_llm_configured = True
+            mock_settings.routing_llm_url = "http://routing-box:9090"
+            text = await mod.generate_text("hi", timeout=30)
+        assert text == "remote answer"
+        mock_remote.assert_called_once_with(30)
+
+    @pytest.mark.asyncio
+    async def test_generate_text_propagates_local_failure_when_remote_not_configured(self, _routing_singleton_reset):
+        """#773: with no remote provider configured, a local failure
+        propagates exactly as it did before this fallback existed, so
+        every existing caller's own no-op/default handling (route()'s
+        keyword fallback, the titler's except Exception, etc.) still
+        applies unchanged."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        local_client = MagicMock()
+        local_client.acreate = AsyncMock(side_effect=RuntimeError("connection refused"))
+        with patch.object(mod, "_get_local_routing_client", return_value=local_client), \
+                patch.object(mod, "settings") as mock_settings:
+            mock_settings.remote_llm_configured = False
+            with pytest.raises(RuntimeError, match="connection refused"):
+                await mod.generate_text("hi")
+
+    @pytest.mark.asyncio
+    async def test_generate_text_never_falls_back_to_anthropic(self, _routing_singleton_reset):
+        """#773: routing-tier calls stay off the paid API even when local
+        fails and Anthropic is the main orchestration backend -- only the
+        configured remote provider (never Anthropic) is a fallback
+        target."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        local_client = MagicMock()
+        local_client.acreate = AsyncMock(side_effect=RuntimeError("connection refused"))
+        with patch.object(mod, "_get_local_routing_client", return_value=local_client), \
+                patch.object(mod, "settings") as mock_settings, \
+                patch.object(mod, "AnthropicLLMClient") as mock_anthropic_cls:
+            mock_settings.llm_backend = "anthropic"
+            mock_settings.anthropic_api_key = "sk-ant-test-key"
+            mock_settings.remote_llm_configured = False
+            with pytest.raises(RuntimeError):
+                await mod.generate_text("hi")
+        mock_anthropic_cls.assert_not_called()
 
 
 class TestDataClasses:

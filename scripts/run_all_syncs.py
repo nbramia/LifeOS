@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 
 import argparse
+import fcntl
 import json
 import logging
 import re
@@ -321,6 +322,127 @@ _active_source: str | None = None
 _llm_stopped_for_sync: bool = False
 _llm_was_running_before_sync: bool = False
 
+# In-progress signal for scripts/auto-deploy.sh's sync_in_progress() (#793).
+# Auto-deploy used to match `run_all_syncs.py` in any process's command line
+# to decide whether a sync was running — including an unrelated process that
+# merely mentioned the script's name/path as an argument, which deferred
+# deploys for no reason. A first fix (a pid-in-a-file marker, checked with
+# `kill -0`) traded that for three new problems found on review: checking the
+# marker once and then restarting later is TOCTOU (a sync can start in the
+# gap); a marker's pid can be reused by an unrelated process after the sync
+# that wrote it dies, reading as "still alive" forever; and one global marker
+# can't represent two overlapping manual syncs — the second overwrites the
+# first's marker and clears it out from under the still-running first sync on
+# exit. A kernel-held advisory lock has none of these problems: multiple
+# processes can each hold a shared lock concurrently (no single "the"
+# marker), the kernel releases it the instant a process exits for ANY reason
+# including SIGKILL (no stale state, no pid to reuse or misread), and there's
+# no window between "check" and "act" because auto-deploy.sh holds its own
+# (exclusive) lock across its entire restart section rather than checking
+# once and proceeding. A module-level constant (not a function-local path) so
+# tests can `patch("scripts.run_all_syncs.SYNC_LOCK_PATH", ...)` to point it
+# at an isolated file, the same pattern test_run_all_syncs.py already uses
+# for SYNC_SOURCES/SYNC_ORDER.
+#
+# Host-wide (under $HOME, not this file's own repo checkout) — found on
+# review: this repo is routinely worked in multiple git worktrees, each with
+# its own checkout-local data/ directory. A lock keyed to this file's own
+# location would be invisible to auto-deploy.sh running from a DIFFERENT
+# checkout, which would then restart services on top of a sync it can't see
+# — exactly the OOM host-freeze this whole mechanism exists to prevent.
+#
+# Deliberately not overridable via an env var (found on re-review): this
+# module loads .env with override=True, so a LIFEOS_SYNC_LOCK set there
+# would apply here but NOT to auto-deploy.sh/auto-update-macos.sh, which
+# only see process env and never source .env themselves — an operator
+# setting it in .env (where every other flag these scripts read lives)
+# would silently split the sync and the deploy gate onto two different
+# lock files, recreating the exact split-brain this fixed host-wide path
+# exists to prevent. Tests isolate this path by patching the constant
+# directly (see the module docstring above), never via an env var.
+SYNC_LOCK_PATH = Path.home() / ".lifeos" / "sync.lock"
+
+# Kept open for the process's entire lifetime once acquired — the lock lives
+# on this file descriptor, not in any content written to the file. Module
+# level so it isn't garbage-collected (and the fd closed, releasing the lock)
+# before the process actually exits.
+_sync_lock_file = None
+
+# How long _acquire_sync_lock() will retry a contended lock before giving up
+# and proceeding without it (seconds). See that function's docstring for why
+# a bound exists at all.
+_SYNC_LOCK_ACQUIRE_TIMEOUT_S = 60
+
+
+def _acquire_sync_lock() -> None:
+    """Acquire a SHARED advisory lock on data/sync.lock, then hold it until
+    process exit. Shared, not exclusive: any number of sync runs may
+    legitimately overlap and each holds its own shared lock concurrently.
+    auto-deploy.sh takes an EXCLUSIVE lock on the same file around its whole
+    restart section, so this normally only contends for the brief window a
+    restart is actually in flight.
+
+    Bounded, non-blocking retry — found on review: a plain blocking
+    `fcntl.flock(LOCK_SH)` has no timeout, so if the exclusive holder's
+    section runs unusually long (macOS: up to two restart_cycles, each with
+    up to a 600s health-check timeout — roughly 21 minutes worst case), a
+    3 AM sync could hang silently before it ever logs anything or registers
+    a row in sync_health.db, while whatever launched it (a wrapper's own
+    watchdog) counts down against a process that hasn't even started its
+    real work yet. Retries LOCK_SH|LOCK_NB once a second for up to
+    _SYNC_LOCK_ACQUIRE_TIMEOUT_S, logging once on the first contended
+    attempt, then gives up and proceeds WITHOUT the lock — best-effort, same
+    as the plain "could not open the file" case below: a failure to acquire
+    it just means auto-deploy falls back to the systemd-unit check, not a
+    reason to abort the sync itself. This only protects against a
+    normal-length restart, not one that's actually stuck; proceeding
+    unprotected after a bounded wait is safer than hanging the whole
+    nightly sync indefinitely.
+    """
+    global _sync_lock_file
+    try:
+        SYNC_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _sync_lock_file = open(SYNC_LOCK_PATH, "w")
+    except OSError as e:
+        # Found on review: this used to be a buried `logger.warning` — given
+        # the consequence (auto-deploy can't see this sync and may restart a
+        # service on top of it, the exact OOM host-freeze this mechanism
+        # exists to prevent), it goes through the same Telegram path a real
+        # sync failure does, not just the log file.
+        msg = (
+            f"Could not open sync lock file {SYNC_LOCK_PATH}: {e} — this "
+            "sync will run WITHOUT the lock, so auto-deploy cannot tell "
+            "it's in progress."
+        )
+        logger.warning(msg)
+        try:
+            from api.services.telegram import send_message
+            send_message(f"🚨 *LifeOS Sync*\n{msg}")
+        except Exception:
+            pass  # best-effort — a notification failure must not abort the sync
+        return
+
+    deadline = time.monotonic() + _SYNC_LOCK_ACQUIRE_TIMEOUT_S
+    logged_contention = False
+    while True:
+        try:
+            fcntl.flock(_sync_lock_file.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if not logged_contention:
+                logger.info(
+                    f"Sync lock ({SYNC_LOCK_PATH}) is held — likely a deploy "
+                    f"restart in progress; waiting up to {_SYNC_LOCK_ACQUIRE_TIMEOUT_S}s"
+                )
+                logged_contention = True
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    f"Could not acquire sync lock within {_SYNC_LOCK_ACQUIRE_TIMEOUT_S}s "
+                    "— proceeding without it"
+                )
+                return
+            time.sleep(1)
+
 
 def _handle_sigterm(signum, frame):
     """Clean up sync_health.db on SIGTERM so we don't leave stale RUNNING rows."""
@@ -336,6 +458,9 @@ def _handle_sigterm(signum, frame):
     # Restore LLM if we stopped it
     if _llm_stopped_for_sync and _llm_was_running_before_sync:
         _start_llm()
+    # No lock cleanup needed here (unlike the old marker file): the kernel
+    # releases the flock the moment this process exits below, including for
+    # signals that skip this handler entirely (e.g. SIGKILL).
     sys.exit(128 + signum)
 
 
@@ -442,8 +567,8 @@ def log_sync_summary_to_markdown(result: dict, trigger: str = "unknown"):
                 lines.append(f"- {src}")
 
     # Apple Data Agent SHA drift (#646) — a silently-broken self-update on
-    # the Mac Mini export agent, surfaced here instead of a log line no
-    # batched report reads.
+    # the (installer-configurable) export agent, surfaced here instead of a
+    # log line no batched report reads.
     apple_agent_sha_drift = result.get("apple_agent_sha_drift")
     if apple_agent_sha_drift:
         lines.append("")
@@ -562,8 +687,8 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         lines.append(f"  {investments_stale}")
 
     # Apple Data Agent SHA drift (#646) — surface here so a silently-broken
-    # Mac Mini self-update reaches the operator (the bare log line does not
-    # feed any batched report).
+    # export agent's self-update reaches the operator (the bare log line
+    # does not feed any batched report).
     apple_agent_sha_drift = result.get("apple_agent_sha_drift")
     if apple_agent_sha_drift:
         lines.append("")
@@ -672,17 +797,18 @@ SYNC_ORDER = [
     "calendar_work",            # Work Google Calendar events
     "calendar_work2",           # Second work Google Calendar events
     "linkedin",                 # LinkedIn connections CSV
-    "contacts",                 # Apple Contacts (native via pyobjc, or imported from Mac Mini)
+    "contacts",                 # Apple Contacts (native via pyobjc, or imported from the export agent)
     # NOTE: phone and imessage are NOT in this list on macOS - they require Full Disk Access
     # which launchd doesn't have. They run via cron at 2:50 AM through Terminal.app:
     #   - scripts/run_sync_with_fda.sh (cron entry, opens Terminal)
     #   - scripts/run_fda_syncs.py (actual sync runner with health tracking)
     # Cron schedule: 50 2 * * * /path/to/run_sync_with_fda.sh
     #
-    # On Linux, Apple data is imported from Mac Mini exports.
-    # WhatsApp is also bundled into the apple_import step (the Mac Mini runs
-    # wacli and rsyncs whatsapp.json alongside the other exports).
-    "apple_import",             # Import Apple data + WhatsApp from Mac Mini (Linux only)
+    # On Linux, Apple data is imported from the (installer-configurable)
+    # export agent's exports. WhatsApp is also bundled into the apple_import
+    # step (the export agent runs wacli and rsyncs whatsapp.json alongside
+    # the other exports).
+    "apple_import",             # Import Apple data + WhatsApp from the export agent (Linux only)
     "slack",                    # Slack users + DM messages
 
     # === Phase 2: Entity Processing ===
@@ -2239,6 +2365,13 @@ def main():
     if not args.execute and not args.dry_run:
         logger.info("Note: Running in dry-run mode. Use --execute to actually run syncs.")
 
+    # Shared lock for auto-deploy.sh's sync_in_progress() (#793) — acquired
+    # before the run starts, released automatically by the kernel whenever
+    # this process exits (normal return, the SIGTERM handler above, or a
+    # hard kill), so there's no cleanup call needed here. Held for the whole
+    # run, dry-run included: the lock means "this script is executing", not
+    # "data is being written".
+    _acquire_sync_lock()
     result = run_all_syncs(sources=sources, dry_run=dry_run, force=args.force, trigger=args.trigger)
 
     # Exit with error if any sync failed

@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LifeOS Agent Worker launchd configuration template.
+
+  Opt-in (#774): only installed by scripts/setup-launchd.sh when
+  LIFEOS_AGENT_WORKER_AUTOSTART=true — mirrors the same env var gating
+  lifeos-agent-worker.service on the systemd side. A fresh install with
+  this unset stays exactly as inert as it is today; nothing here changes
+  what an already-configured host has loaded.
+
+  To use:
+  1. Copy this file to com.lifeos.agent-worker.plist
+  2. Replace __HOME__ with your home directory path
+  3. Replace __LIFEOS_PATH__ with your LifeOS project path
+  4. Copy to ~/Library/LaunchAgents/
+  5. Run: launchctl load ~/Library/LaunchAgents/com.lifeos.agent-worker.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lifeos.agent-worker</string>
+
+    <!-- Routed through launchd-env-wrapper.sh so the worker gets .env at
+         start, the same way lifeos-agent-worker.service gets it via
+         systemd's EnvironmentFile= (#776). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__LIFEOS_PATH__/scripts/launchd-env-wrapper.sh</string>
+        <string>__LIFEOS_PATH__</string>
+        <string>__HOME__/.venvs/lifeos/bin/python</string>
+        <string>-m</string>
+        <string>api.services.agent_worker.worker</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__LIFEOS_PATH__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.venvs/lifeos/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- Auto-start on boot -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on ANY exit (crash or clean) — mirrors
+         lifeos-agent-worker.service's Restart=always. The worker only
+         polls the API over HTTP and retries through outages, so it
+         doesn't need to follow the API's own restarts; an operator-issued
+         `launchctl unload` is the only thing that keeps it down. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Restart throttle: wait 10 seconds before restart (matches the
+         systemd unit's RestartSec=10) -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Log files (one combined file, matching the systemd unit's
+         StandardOutput/StandardError both pointing at agent-worker.log) -->
+    <key>StandardOutPath</key>
+    <string>__LIFEOS_PATH__/logs/agent-worker.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LIFEOS_PATH__/logs/agent-worker.log</string>
+</dict>
+</plist>

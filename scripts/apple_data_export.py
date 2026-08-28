@@ -10,12 +10,16 @@ Usage:
     python scripts/apple_data_export.py --execute --source imessage  # Single source
     python scripts/apple_data_export.py --dry-run           # Preview only
 
-Exported to: data/apple-exports/
+Exported to: data/apple-imports/
     contacts.json       — Apple Contacts data
     imessage.db         — Copy of the local iMessage cache
     phone_calls.json    — Phone/FaceTime call history
 
-The Linux server picks these up from data/apple-imports/ (via rsync).
+Uses the same directory name (data/apple-imports/) apple_data_import.py
+reads from, so a single-machine deployment (export and import on the same
+host) works with no rsync step and no manual symlink (#785). The
+two-machine flow rsyncs this directory across hosts unchanged — see
+scripts/apple_data_agent.sh.
 """
 import sys
 import json
@@ -43,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-EXPORT_DIR = PROJECT_ROOT / "data" / "apple-exports"
+EXPORT_DIR = PROJECT_ROOT / "data" / "apple-imports"
 
 
 def _parse_abcdp_labeled(field_dict: dict | None) -> list[dict]:
@@ -1063,21 +1067,66 @@ def main():
             logger.error(f"Failed to export {name}: {e}")
             results[name] = {"status": "error", "error": str(e)}
 
-    # Write manifest
+    # Write manifest. A single-source run (--source) must merge into any
+    # existing manifest rather than replacing it wholesale — otherwise the
+    # documented single-source troubleshooting flow (e.g. re-running just
+    # WhatsApp after a fix) silently discards every other source's
+    # last-known status (#786). A full run (no --source) always produces a
+    # full replacement, same as before this change.
+    #
+    # If the existing manifest can't be read, or has no usable results dict,
+    # we do NOT fall back to overwriting it with just this run's result —
+    # that would reproduce the exact data-loss bug this fix exists to
+    # prevent, just triggered by corruption instead of an ordinary
+    # single-source run. Leave the file untouched and fail loud instead.
+    manifest_results = results
+    manifest_path = EXPORT_DIR / "manifest.json"
+    skip_manifest_write = False
+    if not dry_run and args.source and manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                existing_manifest = json.load(f)
+            existing_results = existing_manifest.get("results")
+            if isinstance(existing_results, dict):
+                manifest_results = {**existing_results, **results}
+            else:
+                logger.error(
+                    f"Existing manifest at {manifest_path} has no usable "
+                    "'results' dict — refusing to overwrite it with just this "
+                    "run's result, which would discard every other source's "
+                    "last-known status. Leaving the manifest untouched."
+                )
+                skip_manifest_write = True
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(
+                f"Could not read existing manifest to merge ({e}) — refusing "
+                "to overwrite it with just this run's result, which would "
+                "discard every other source's last-known status. Leaving "
+                "the manifest untouched."
+            )
+            skip_manifest_write = True
+
     manifest = {
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "hostname": __import__("socket").gethostname(),
         "agent_sha": _get_agent_sha(),
-        "results": results,
+        "results": manifest_results,
     }
 
-    if not dry_run:
-        manifest_path = EXPORT_DIR / "manifest.json"
+    if not dry_run and not skip_manifest_write:
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
         logger.info(f"Manifest written to {manifest_path}")
 
     print(json.dumps(manifest, indent=2))
+
+    # A refused merge (corrupt/malformed existing manifest) must actually
+    # fail the run, not just log an error and exit 0 — apple_data_agent.sh
+    # gates its rsync/import steps on this script's exit code, and an
+    # operator running the documented single-source troubleshooting flow
+    # by hand needs $? to reflect that nothing was written.
+    if skip_manifest_write:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

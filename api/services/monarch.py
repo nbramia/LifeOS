@@ -199,8 +199,14 @@ class MonarchClient:
         category: Optional[str] = None,
         limit: int = 500,
         account_ids: Optional[list[str]] = None,
+        sort_order: Optional[str] = None,
     ) -> list[dict]:
-        """Get transactions, optionally filtered by date range and category."""
+        """Get transactions, optionally filtered by date range and category.
+
+        sort_order: "asc" or "desc" to sort by date; None (default) leaves
+        results in whatever order the Monarch API returns — unchanged for
+        callers that don't ask for a specific order (#779).
+        """
         mm = await self._get_client()
         kwargs = {"limit": limit, "offset": 0, "search": search}
         if account_ids:
@@ -210,7 +216,26 @@ class MonarchClient:
         if end_date:
             kwargs["end_date"] = end_date
 
-        data = await mm.get_transactions(**kwargs)
+        if sort_order in ("asc", "desc"):
+            # The underlying monarchmoney client always requests offset=0 and
+            # hardcodes its own ordering with no direction control. A plain
+            # limit-capped fetch therefore only ever returns *some* `limit`
+            # matches in whatever order the server picks — not necessarily
+            # the range's true oldest/newest. Sorting that limit-truncated
+            # subset client-side would just reorder the same arbitrary
+            # matches, not surface the actual oldest/newest transactions in
+            # the full range. So: probe how many transactions match the
+            # filters, fetch all of them, sort client-side, then apply the
+            # caller's limit against the full sorted range.
+            probe_kwargs = dict(kwargs)
+            probe_kwargs["limit"] = 1
+            probe = await mm.get_transactions(**probe_kwargs)
+            total_count = probe.get("allTransactions", probe).get("totalCount", 0) or 0
+            fetch_kwargs = dict(kwargs)
+            fetch_kwargs["limit"] = max(total_count, 1)
+            data = await mm.get_transactions(**fetch_kwargs)
+        else:
+            data = await mm.get_transactions(**kwargs)
 
         # Navigate response structure
         all_txns = data.get("allTransactions", data)
@@ -257,6 +282,10 @@ class MonarchClient:
                 "is_split": txn.get("isSplitTransaction", False),
                 "tags": tags,
             })
+
+        if sort_order in ("asc", "desc"):
+            result.sort(key=lambda t: t.get("date") or "", reverse=(sort_order == "desc"))
+            result = result[:limit]
 
         return result
 

@@ -45,16 +45,42 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
     """
     from api.services.imessage import get_imessage_store, join_imessages_to_entities
 
-    # STEP 1: Export new messages from Apple's Messages database
+    # STEP 1: Export new messages from Apple's Messages database.
+    #
+    # This only applies when running directly on a macOS host with Full Disk
+    # Access granted for ~/Library/Messages/chat.db. On Linux (the
+    # maintainer's configured setup) — or a Mac with no Messages database, or
+    # no Full Disk Access granted yet — this step is a routine no-op, not an
+    # error: on Linux, messages instead arrive via apple_data_import.py's
+    # rsync'd imessage.db, and steps 2/3 below process those regardless
+    # (issue #698, the imessage-shaped sibling of #687's clean-skip pattern).
+    #
+    # Only these two specific "not configured for this host" signatures are
+    # treated as a silent skip. Anything else is left to propagate, so a
+    # configured export that genuinely breaks (corrupt db, disk full, ...)
+    # still fails the run loud with the real traceback in stderr — not
+    # swallowed behind a misleading benign log line.
     logger.info("Exporting new messages from Messages.app database...")
     imessage_store = get_imessage_store()
     export_stats = {}
-    try:
-        export_stats = imessage_store.export_from_source()
-        logger.info(f"Exported {export_stats['messages_exported']} new messages")
-    except Exception as e:
-        logger.error(f"Failed to export messages: {e}")
-        # Continue anyway - we can still sync existing messages
+    if sys.platform != "darwin":
+        logger.info(
+            "Not running on macOS — iMessage arrives via apple_data_import.py "
+            "instead, nothing to export directly here"
+        )
+    elif not imessage_store.SOURCE_DB_PATH.exists():
+        logger.info(f"No Messages.app database at {imessage_store.SOURCE_DB_PATH} — nothing to export")
+    else:
+        try:
+            export_stats = imessage_store.export_from_source()
+            logger.info(f"Exported {export_stats['messages_exported']} new messages")
+        except PermissionError as e:
+            logger.info(
+                f"Skipping direct iMessage export — Full Disk Access not granted "
+                f"for the Messages database ({e}). Grant Full Disk Access to the "
+                "Python binary in System Settings → Privacy & Security, then "
+                "see docs/guides/setup.md."
+            )
 
     # STEP 2: Link exported messages to PersonEntity records
     # Always run linking — on Linux, messages arrive via apple_data_import.py

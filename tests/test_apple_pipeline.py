@@ -13,6 +13,22 @@ pytestmark = pytest.mark.unit
 
 
 # ---------------------------------------------------------------------------
+# Export/import directory name reconciliation — issue #785
+# ---------------------------------------------------------------------------
+
+class TestExportImportDirectoryNamesAgree:
+    """Export and import must agree on the shared handoff directory name so
+    a single-machine deployment (both steps on the same host, no rsync)
+    works with no manual symlink."""
+
+    def test_export_and_import_dirs_resolve_to_the_same_path(self):
+        from scripts.apple_data_export import EXPORT_DIR
+        from scripts.apple_data_import import IMPORT_DIR
+
+        assert EXPORT_DIR == IMPORT_DIR
+
+
+# ---------------------------------------------------------------------------
 # Contacts plist parsing
 # ---------------------------------------------------------------------------
 
@@ -1024,6 +1040,208 @@ class TestAgentShaExport:
 
 
 # ---------------------------------------------------------------------------
+# Manifest merge on partial (single-source) export runs — issue #786
+# ---------------------------------------------------------------------------
+
+class TestManifestMergeOnPartialExport:
+    """A single-source export run must merge into the existing manifest
+    rather than replacing it, so other sources' last-known status survives.
+    A full (no --source) run must remain a full replacement, unchanged."""
+
+    def _fake_source(self, dry_run=False):
+        return {"status": "ok", "count": 1, "path": "fake"}
+
+    def test_single_source_run_preserves_other_sources(self, tmp_path, monkeypatch):
+        import scripts.apple_data_export as export_mod
+
+        existing_manifest = {
+            "exported_at": "2026-01-01T00:00:00+00:00",
+            "hostname": "old-host",
+            "agent_sha": "oldsha123",
+            "results": {
+                "contacts": {"status": "ok", "count": 5},
+                "imessage": {"status": "ok", "count": 10},
+                "phone": {"status": "error", "error": "boom"},
+                "photos": {"status": "ok", "count": 2},
+                "whatsapp": {"status": "error", "reason": "wacli outdated"},
+            },
+        }
+        (tmp_path / "manifest.json").write_text(json.dumps(existing_manifest))
+
+        monkeypatch.setattr(export_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(export_mod, "EXPORT_DIR", tmp_path)
+        monkeypatch.setattr(export_mod, "_get_agent_sha", lambda: "newsha456")
+        monkeypatch.setattr(
+            export_mod.sys, "argv",
+            ["apple_data_export.py", "--execute", "--source", "whatsapp"],
+        )
+        monkeypatch.setattr(export_mod, "export_whatsapp", self._fake_source)
+
+        export_mod.main()
+
+        manifest = json.loads((tmp_path / "manifest.json").read_text())
+        results = manifest["results"]
+        # The run source reflects the new result...
+        assert results["whatsapp"] == {"status": "ok", "count": 1, "path": "fake"}
+        # ...and every other source's prior entry is untouched.
+        assert results["contacts"] == {"status": "ok", "count": 5}
+        assert results["imessage"] == {"status": "ok", "count": 10}
+        assert results["phone"] == {"status": "error", "error": "boom"}
+        assert results["photos"] == {"status": "ok", "count": 2}
+
+    def test_single_source_run_with_no_existing_manifest_writes_just_that_source(
+        self, tmp_path, monkeypatch
+    ):
+        """Fresh install: no manifest yet, single-source run — today's
+        behavior for a fresh install must be unchanged."""
+        import scripts.apple_data_export as export_mod
+
+        monkeypatch.setattr(export_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(export_mod, "EXPORT_DIR", tmp_path)
+        monkeypatch.setattr(export_mod, "_get_agent_sha", lambda: "newsha456")
+        monkeypatch.setattr(
+            export_mod.sys, "argv",
+            ["apple_data_export.py", "--execute", "--source", "contacts"],
+        )
+        monkeypatch.setattr(export_mod, "export_contacts", self._fake_source)
+
+        export_mod.main()
+
+        manifest = json.loads((tmp_path / "manifest.json").read_text())
+        assert manifest["results"] == {"contacts": {"status": "ok", "count": 1, "path": "fake"}}
+
+    def test_full_run_still_fully_replaces_manifest(self, tmp_path, monkeypatch):
+        """Regression guard: an all-sources run (no --source) must remain a
+        byte-for-byte full replacement — this is the maintainer's nightly
+        path and must not gain merge semantics."""
+        import scripts.apple_data_export as export_mod
+
+        existing_manifest = {
+            "exported_at": "2026-01-01T00:00:00+00:00",
+            "hostname": "old-host",
+            "agent_sha": "oldsha123",
+            "results": {
+                "contacts": {"status": "ok", "count": 999},
+                "stale_source_no_longer_run": {"status": "ok", "count": 1},
+            },
+        }
+        (tmp_path / "manifest.json").write_text(json.dumps(existing_manifest))
+
+        monkeypatch.setattr(export_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(export_mod, "EXPORT_DIR", tmp_path)
+        monkeypatch.setattr(export_mod, "_get_agent_sha", lambda: "newsha456")
+        monkeypatch.setattr(export_mod.sys, "argv", ["apple_data_export.py", "--execute"])
+
+        for name in (
+            "export_contacts",
+            "export_imessage",
+            "export_phone_calls",
+            "export_photos_faces",
+            "export_whatsapp",
+        ):
+            monkeypatch.setattr(export_mod, name, self._fake_source)
+
+        export_mod.main()
+
+        manifest = json.loads((tmp_path / "manifest.json").read_text())
+        # Only the five real sources from this run — the stale leftover key
+        # from the old manifest must NOT survive a full run.
+        assert set(manifest["results"].keys()) == {
+            "contacts", "imessage", "phone", "photos", "whatsapp",
+        }
+        assert manifest["results"]["contacts"] == {"status": "ok", "count": 1, "path": "fake"}
+
+    def test_single_source_dry_run_does_not_write_manifest(self, tmp_path, monkeypatch):
+        """Out of scope for #786: dry-run stays preview-only, no manifest
+        write at all, merge or otherwise."""
+        import scripts.apple_data_export as export_mod
+
+        existing_manifest = {
+            "exported_at": "2026-01-01T00:00:00+00:00",
+            "hostname": "old-host",
+            "results": {"contacts": {"status": "ok", "count": 5}},
+        }
+        (tmp_path / "manifest.json").write_text(json.dumps(existing_manifest))
+
+        monkeypatch.setattr(export_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(export_mod, "EXPORT_DIR", tmp_path)
+        monkeypatch.setattr(
+            export_mod.sys, "argv",
+            ["apple_data_export.py", "--dry-run", "--source", "whatsapp"],
+        )
+        monkeypatch.setattr(export_mod, "export_whatsapp", self._fake_source)
+
+        export_mod.main()
+
+        # manifest.json on disk is exactly what it was before — untouched.
+        on_disk = json.loads((tmp_path / "manifest.json").read_text())
+        assert on_disk == existing_manifest
+
+    def test_single_source_run_with_corrupt_manifest_leaves_it_untouched(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A single-source run must never fall back to overwriting an
+        unreadable/corrupt manifest with just its own result — that would
+        reproduce the exact data-loss bug #786 fixes, just triggered by
+        corruption instead of an ordinary single-source run."""
+        import scripts.apple_data_export as export_mod
+
+        (tmp_path / "manifest.json").write_text("{not valid json")
+
+        monkeypatch.setattr(export_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(export_mod, "EXPORT_DIR", tmp_path)
+        monkeypatch.setattr(
+            export_mod.sys, "argv",
+            ["apple_data_export.py", "--execute", "--source", "whatsapp"],
+        )
+        monkeypatch.setattr(export_mod, "export_whatsapp", self._fake_source)
+
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(SystemExit) as exc_info:
+                export_mod.main()
+
+        # A refused merge must fail the run (apple_data_agent.sh gates its
+        # rsync/import steps on this exit code) — exit 0 here would launder
+        # the refusal into an apparent success.
+        assert exc_info.value.code == 1
+        # The corrupt file on disk is untouched — not replaced with a
+        # partial (whatsapp-only) manifest.
+        assert (tmp_path / "manifest.json").read_text() == "{not valid json"
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+    def test_single_source_run_with_non_dict_results_leaves_it_untouched(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Same guard, for a manifest that parses but whose 'results' key
+        isn't a dict (unexpected shape) — still must not be overwritten."""
+        import scripts.apple_data_export as export_mod
+
+        existing_manifest = {
+            "exported_at": "2026-01-01T00:00:00+00:00",
+            "hostname": "old-host",
+            "results": "not-a-dict",
+        }
+        (tmp_path / "manifest.json").write_text(json.dumps(existing_manifest))
+
+        monkeypatch.setattr(export_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(export_mod, "EXPORT_DIR", tmp_path)
+        monkeypatch.setattr(
+            export_mod.sys, "argv",
+            ["apple_data_export.py", "--execute", "--source", "whatsapp"],
+        )
+        monkeypatch.setattr(export_mod, "export_whatsapp", self._fake_source)
+
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(SystemExit) as exc_info:
+                export_mod.main()
+
+        assert exc_info.value.code == 1
+        on_disk = json.loads((tmp_path / "manifest.json").read_text())
+        assert on_disk == existing_manifest
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
 # Agent self-update SHA (issue #509) — import side
 # ---------------------------------------------------------------------------
 
@@ -1149,6 +1367,77 @@ class TestAgentShaImport:
 
         assert result is not None
         assert not any("differs from" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Export agent label in alerts (issue #770) — no hardcoded hardware name
+# ---------------------------------------------------------------------------
+
+class TestExportAgentLabelInAlerts:
+    """Alert wording must not assume any specific machine by default, and
+    must honor an installer's LIFEOS_APPLE_EXPORT_AGENT_LABEL override."""
+
+    def test_default_label_names_no_specific_hardware(self, tmp_path, monkeypatch):
+        """Default wording (no override set) must not mention Mac Mini or
+        any other specific hardware."""
+        import scripts.apple_data_import as import_mod
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir()
+        very_stale = datetime.now(timezone.utc) - timedelta(days=10)
+        manifest = {
+            "exported_at": very_stale.isoformat(),
+            "hostname": "test-host",
+            "results": {"whatsapp": {"status": "error", "reason": "wacli not installed"}},
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", import_dir)
+
+        result = import_mod.check_manifest()
+
+        staleness_msg = result["_staleness_critical_message"]
+        assert "Mac Mini" not in staleness_msg
+        assert "export agent" in staleness_msg
+
+    def test_label_override_is_used_in_staleness_and_error_alerts(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        from config.settings import settings
+        import scripts.apple_data_import as import_mod
+
+        monkeypatch.setattr(settings, "apple_export_agent_label", "my MacBook")
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir()
+        very_stale = datetime.now(timezone.utc) - timedelta(days=10)
+        manifest = {
+            "exported_at": very_stale.isoformat(),
+            "hostname": "test-host",
+            "results": {"whatsapp": {"status": "error", "reason": "wacli not installed"}},
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", import_dir)
+
+        with caplog.at_level(logging.CRITICAL):
+            result = import_mod.check_manifest()
+
+        assert "my MacBook" in result["_staleness_critical_message"]
+        assert any(
+            "my MacBook" in r.message and "whatsapp" in r.message
+            for r in caplog.records
+        )
+
+    def test_default_setting_value_matches_current_hardcoded_wording_intent(self):
+        """Regression guard: the default must be the generic label, not
+        empty or a specific machine name — a fresh clone must see no
+        difference in *meaning*, only in no longer naming hardware."""
+        from config.settings import Settings
+
+        assert Settings().apple_export_agent_label == "the export agent"
 
 
 # ---------------------------------------------------------------------------
@@ -1642,6 +1931,65 @@ class TestPhoneImport:
         assert result["imported"] == 0
         assert result["unresolved"] == 1
         mock_resolver.resolve_by_phone.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# main() — missing import dir is a clean skip, not a hard failure (#698)
+# ---------------------------------------------------------------------------
+
+class TestMissingImportDirIsCleanSkip:
+    """A fresh install with no Apple Data Agent ever configured must skip
+    cleanly (exit 0, SYNC_SKIPPED marker) instead of failing loud every
+    night — the apple_import-shaped sibling of #687's clean-skip pattern."""
+
+    def test_missing_import_dir_does_not_raise_and_prints_sync_skipped(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        import scripts.apple_data_import as import_mod
+
+        missing_dir = tmp_path / "does-not-exist"
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", missing_dir)
+        monkeypatch.setattr(import_mod.sys, "argv", ["apple_data_import.py", "--execute"])
+
+        # main() must fall through cleanly (no SystemExit) — a hard
+        # sys.exit(1) here is exactly the regression this issue fixes.
+        import_mod.main()
+
+        printed = capsys.readouterr().out
+        assert "SYNC_SKIPPED:" in printed
+        assert "Apple Data Agent" in printed
+
+    def test_existing_import_dir_with_manifest_is_unaffected(self, tmp_path, monkeypatch):
+        """A configured install (dir exists) must not take the new skip
+        branch at all — #646 behavior (staleness, per-source errors) is
+        untouched."""
+        import scripts.apple_data_import as import_mod
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir()
+        fresh = datetime.now(timezone.utc) - timedelta(hours=1)
+        manifest = {
+            "exported_at": fresh.isoformat(),
+            "hostname": "test-host",
+            "results": {"contacts": {"status": "ok"}},
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", import_dir)
+
+        def _stub(dry_run=False, **kwargs):
+            return {"status": "ok", "created": 0}
+
+        for name in (
+            "import_contacts", "import_imessage", "import_phone_calls",
+            "import_photos_faces", "import_whatsapp", "import_health",
+        ):
+            monkeypatch.setattr(import_mod, name, _stub)
+        monkeypatch.setattr(import_mod.sys, "argv", ["apple_data_import.py", "--execute"])
+
+        # Falls through cleanly — no SYNC_SKIPPED, no exception.
+        import_mod.main()
 
 
 # ---------------------------------------------------------------------------

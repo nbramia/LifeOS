@@ -184,7 +184,13 @@ class Synthesizer:
                             "input_tokens": usage.input_tokens,
                             "output_tokens": usage.output_tokens,
                             "cost_usd": 0.0,  # Local model — no cost
-                            "model": "local"
+                            # #775: was a hardcoded "local" literal, same
+                            # drive-by hardcode as summarizer.py's request
+                            # body. Cosmetic (never sent to an LLM), so
+                            # fixed for consistency rather than because it
+                            # could break a request the way the
+                            # summarizer's did.
+                            "model": settings.summarizer_model,
                         }
                 break  # success
             except Exception as e:

@@ -396,7 +396,11 @@ class Settings(BaseSettings):
     # Search
     default_top_k: int = 20
 
-    # LLM Backend: "anthropic" (default) or "local"
+    # LLM Backend: "anthropic" (default), "local", or "remote" (#771 —
+    # makes the already-configured paid OpenAI-compatible provider below
+    # the standing default engine, not just a per-turn picker option; see
+    # ADR-024). See get_local_llm() in api/services/llm_client.py for the
+    # resolution logic and its no-key/not-configured error paths.
     llm_backend: str = Field(default="anthropic", alias="LIFEOS_LLM_BACKEND")
 
     # Anthropic model for orchestration
@@ -1008,6 +1012,14 @@ class Settings(BaseSettings):
         alias="LIFEOS_WORK_DOMAIN_2",
         description="Second work email domain (e.g., othercompany.com) for categorizing work contacts"
     )
+    work_email_domains_extra: str = Field(
+        default="",
+        alias="LIFEOS_WORK_DOMAINS_EXTRA",
+        description="Comma-separated list of additional work email domains, "
+                    "beyond LIFEOS_WORK_DOMAIN and LIFEOS_WORK_DOMAIN_2, for "
+                    "categorizing work contacts (e.g., 'thirdcompany.com,"
+                    "fourthcompany.com')."
+    )
     gmail_draft_send_cooldown_seconds: int = Field(
         default=300,
         alias="LIFEOS_GMAIL_DRAFT_SEND_COOLDOWN_SECONDS",
@@ -1104,8 +1116,13 @@ class Settings(BaseSettings):
 
     @property
     def work_email_domains(self) -> list[str]:
-        """All configured work email domains."""
-        return [d for d in [self.work_email_domain, self.work_email_domain_2] if d]
+        """All configured work email domains, first domain then second
+        domain then any additional domains from LIFEOS_WORK_DOMAINS_EXTRA."""
+        domains = [d for d in [self.work_email_domain, self.work_email_domain_2] if d]
+        domains.extend(
+            d.strip() for d in (self.work_email_domains_extra or "").split(",") if d.strip()
+        )
+        return domains
 
     def is_sync_enabled(self, account: str, service: str) -> bool:
         """Check if sync is enabled for account+service (gmail/calendar)."""
@@ -1190,6 +1207,14 @@ class Settings(BaseSettings):
                     "app's POST delivery mode). Empty disables the endpoint (503). "
                     "Generate with `openssl rand -hex 32`."
     )
+    apple_export_agent_label: str = Field(
+        default="the export agent",
+        alias="LIFEOS_APPLE_EXPORT_AGENT_LABEL",
+        description="Name for the Apple Data Agent machine used in staleness/failure "
+                    "alerts from scripts/apple_data_import.py (e.g. 'Mac Mini', "
+                    "'my MacBook'). Generic default since the export agent's hardware "
+                    "is installer-specific (#770)."
+    )
 
     # Journal ring ingest (#660) — a wearable (e.g. the Pebble Index ring) posts
     # transcribed fragments here from outside the tailnet.
@@ -1219,6 +1244,20 @@ class Settings(BaseSettings):
         description="Vault-relative directory where the Monarch Money monthly "
                     "summary (YYYY-MM.md) lands. Path is joined under "
                     "LIFEOS_VAULT_PATH, same convention as LIFEOS_AGENT_OUTPUT_DIR."
+    )
+
+    # Investments (Schwab pipeline snapshot, #767). A separate export pipeline
+    # (not part of this repo) writes summary.json/portfolio.json here; the API
+    # route and the search_finances "investments" tool both read from it.
+    # Defaults to the maintainer's existing Syncthing-synced folder so an
+    # unconfigured clone sees no data (clean "not synced" message) rather than
+    # an error, same convention as code_dir/monarch_vault_dir above.
+    investments_sync_dir: str = Field(
+        default="~/Code/Sync/investments",
+        alias="LIFEOS_INVESTMENTS_SYNC_DIR",
+        description="Directory summary.json/portfolio.json are read from for "
+                    "the investments API route and the search_finances "
+                    "'investments' chat tool action. Expanduser'd at read time."
     )
 
     # Backup directory

@@ -362,8 +362,19 @@ async def health_check():
     from config.settings import settings
 
     checks = {
-        "api_key_configured": bool(settings.local_llm_url and settings.local_llm_url.strip()),
+        # Literally "is ANTHROPIC_API_KEY set" (#697's acceptance criteria),
+        # not "is an LLM available" — an install running fully on
+        # LIFEOS_LLM_BACKEND=local with no Anthropic key at all is a
+        # supported configuration that will still report degraded here,
+        # since this field only ever meant the Anthropic key specifically.
+        "api_key_configured": bool(settings.anthropic_api_key and settings.anthropic_api_key.strip()),
         "reminder_scheduler": _reminder_scheduler.is_alive() if _reminder_scheduler else False,
+        # Distinct from reminder_scheduler (the delivery thread, gated on
+        # Telegram being configured): this is the file watcher that picks up
+        # vault edits (e.g. via Obsidian) and re-indexes them, starts
+        # unconditionally, and previously had no liveness signal of its own
+        # (#766).
+        "scheduler_watcher": _scheduler_watcher.is_alive() if _scheduler_watcher else False,
     }
 
     all_healthy = all(checks.values())
@@ -438,6 +449,48 @@ async def health_raw_state(clear: bool = False):
         ],
         "cleared": cleared,
     }
+
+
+def _check_vault_root_sanity(vault_search_check: "dict | None", vault_path) -> None:
+    """Additive sanity check for the `vault_search` row in `GET /health/full`
+    (#762). Sample a handful of indexed file paths and confirm they still
+    fall under the currently configured vault root, catching a moved/deleted
+    vault whose index keeps serving stale content from the old location — a
+    drift the base request/response probe (does search return results at
+    all) can't see, since it only confirms search returns *something*.
+
+    Mutates `vault_search_check` in place, downgrading an "ok" status to
+    "degraded" and adding a `vault_root_check` field explaining the mismatch
+    — the existing `detail` from the request/response probe (e.g. "1
+    results") is left untouched, since that check is preserved unchanged
+    and this is an additional signal, not a replacement. A no-op if the base
+    check isn't present or didn't itself report "ok" — this never turns a
+    failing check into a passing one, or vice versa, only adds a further
+    downgrade on top of an already-passing result.
+    """
+    if not vault_search_check or vault_search_check.get("status") != "ok":
+        return
+    try:
+        from api.services.vectorstore import get_vector_store, sample_paths_match_vault_root
+        sample = get_vector_store().sample_file_paths(limit=5)
+        all_match, mismatched = sample_paths_match_vault_root(sample, vault_path)
+        if not all_match:
+            vault_search_check["status"] = "degraded"
+            # Deliberately omit the mismatched paths and the configured root
+            # itself — this is an unauthenticated endpoint, a real indexed
+            # file path can reveal personal folder/file names, and the vault
+            # root is typically an absolute path under the user's home
+            # directory (#697 review). The counts alone are enough for an
+            # operator to act on.
+            vault_search_check["vault_root_check"] = (
+                f"{len(mismatched)}/{len(sample)} sampled indexed path(s) fall outside "
+                "the configured vault root"
+            )
+    except Exception as e:
+        # Never let this additive sanity check take down the primary
+        # vault_search result — a vector-store hiccup here is already
+        # visible via the chromadb_server check above.
+        logger.warning(f"vault-root sanity check failed: {e}")
 
 
 @app.get("/health/full")
@@ -523,12 +576,46 @@ async def full_health_check():
             results["errors"].append(f"{name}: {str(e)}")
             return False
 
-    # 1. Config check — local LLM URL
-    if settings.local_llm_url and settings.local_llm_url.strip():
-        results["checks"]["local_llm"] = {"status": "ok", "detail": f"configured ({settings.local_llm_url})"}
+    # 1. Local LLM — `local_llm_url` has a non-empty default regardless of
+    # whether the local backend is actually in use, so a bare "is the URL
+    # string set" check always said "ok" even on an install that talks only
+    # to Anthropic and has nothing listening on that port (#697). Report
+    # not-in-use when the backend isn't "local" (truthful and not a
+    # failure — excluded from the `failed` count below same as "ok"); only
+    # when the backend is "local" do we actually probe reachability.
+    backend = (settings.llm_backend or "anthropic").strip().lower()
+    if backend != "local":
+        results["checks"]["local_llm"] = {
+            "status": "not_in_use",
+            "detail": f"LIFEOS_LLM_BACKEND={backend!r}, local LLM not in use",
+        }
     else:
-        results["checks"]["local_llm"] = {"status": "error", "error": "not configured"}
-        results["errors"].append("local_llm_url: not configured")
+        start = time.time()
+        try:
+            from api.services.llm_client import LocalLLMClient
+            reachable = await LocalLLMClient().ais_available()
+        except Exception as e:
+            # ais_available() already catches its own network errors and
+            # returns False; this is belt-and-suspenders against anything
+            # else (e.g. client construction) so a local-LLM problem always
+            # surfaces as this row's error, never a 500 from the whole
+            # /health/full endpoint.
+            reachable = False
+            logger.warning(f"local_llm reachability probe raised unexpectedly: {e}")
+        elapsed = int((time.time() - start) * 1000)
+        if reachable:
+            results["checks"]["local_llm"] = {
+                "status": "ok",
+                "latency_ms": elapsed,
+                "detail": f"reachable ({settings.local_llm_url})",
+            }
+        else:
+            results["checks"]["local_llm"] = {
+                "status": "error",
+                "latency_ms": elapsed,
+                "error": f"unreachable ({settings.local_llm_url})",
+            }
+            results["errors"].append(f"local_llm: unreachable ({settings.local_llm_url})")
 
     # 2. ChromaDB Server (direct health check)
     start = time.time()
@@ -568,6 +655,13 @@ async def full_health_check():
         json_body={"query": "test", "top_k": 1}
     )
 
+    # 3b. Vault-root sanity check (#762) — the request/response check above
+    # only confirms search returns *something*, not that what it returns
+    # still lives where the vault is currently configured. A moved/deleted
+    # vault can leave the index serving stale content from the old location
+    # while that check keeps passing.
+    _check_vault_root_sanity(results["checks"].get("vault_search"), settings.vault_path)
+
     # 3. Calendar Upcoming (GET /api/calendar/upcoming)
     await test_endpoint(
         "calendar_upcoming",
@@ -582,12 +676,32 @@ async def full_health_check():
         params={"q": "meeting"}
     )
 
-    # 5. Gmail Search (GET /api/gmail/search)
-    await test_endpoint(
-        "gmail_search",
-        "GET", "/api/gmail/search",
-        params={"q": "in:inbox", "max_results": 1}
-    )
+    # 5. Gmail Search (GET /api/gmail/search) — GmailService.search() catches
+    # credential errors internally and returns an empty list (by design, so
+    # chat/agent callers degrade gracefully rather than raising), so hitting
+    # the endpoint directly always reports "ok, 0 emails" even with zero
+    # Google credentials configured — unlike calendar/drive below, whose
+    # routes let a missing-credentials FileNotFoundError surface as a 401.
+    # Preflight a plain file-existence check for the account this probe uses
+    # so all three Google rows report the same not-configured shape (#697).
+    from api.services.google_auth import get_google_auth, GoogleAccount
+    if not get_google_auth(GoogleAccount.PERSONAL).credentials_path.exists():
+        # Same shape as test_endpoint()'s error rows below (status/latency_ms/
+        # error) so a monitor parsing "error" rows doesn't need a special
+        # case for this one — latency_ms is 0 since this is a local
+        # filesystem check, not a network call.
+        results["checks"]["gmail_search"] = {
+            "status": "error",
+            "latency_ms": 0,
+            "error": "Google credentials not configured (personal account)",
+        }
+        results["errors"].append("gmail_search: Google credentials not configured (personal account)")
+    else:
+        await test_endpoint(
+            "gmail_search",
+            "GET", "/api/gmail/search",
+            params={"q": "in:inbox", "max_results": 1}
+        )
 
     # 6. Drive Search - Personal (GET /api/drive/search)
     await test_endpoint(

@@ -316,17 +316,22 @@ the repo's own source files. This checklist is that path.
    `config/family_members.example.json` — full list in
    [Configuration § Configuration Files](configuration.md#configuration-files)). You should never need
    to edit a tracked file in the repo itself to configure an instance.
+   After the first sync, `scripts/setup_identity.py` turns picking yourself,
+   your partner, and your family out of the indexed people into a guided
+   conversation instead of hand-editing those files — see
+   [First Run § After First Sync](first-run.md#after-first-sync-set-your-identity).
 2. **Connect an external Hermes.** Add `LIFEOS_HERMES_BACKEND_URL` (and
    `LIFEOS_HERMES_BACKEND_TOKEN` if Hermes requires one) directly to your
    `.env` — both are deliberately absent from `.env.example` since they're
    opt-in. Once set, `/chat` shows a **LifeOS | Agent | Hermes** backend
    selector and defaults new sessions to Hermes automatically. **The
-   fallback to plain LifeOS only fires when the URL is unset** — `GET
-   /api/hermes/status` reports "available" purely from whether
-   `LIFEOS_HERMES_BACKEND_URL` is configured, not from actually reaching
-   Hermes, so a configured-but-down Hermes still gets selected and every
-   turn on it fails until you fix Hermes or unset the URL (which reverts
-   `/chat` to plain LifeOS). See
+   fallback to plain LifeOS fires whenever Hermes isn't actually usable** —
+   `GET /api/hermes/status` probes reachability (cached, short-TTL), not
+   just whether `LIFEOS_HERMES_BACKEND_URL` is set, so a configured-but-down
+   Hermes defaults `/chat` to plain LifeOS instead of failing every turn.
+   The Hermes option stays visible but marked unavailable rather than
+   silently vanishing, and picks back up automatically once Hermes is
+   reachable again — no restart needed. See
    [client-surfaces.md](../specs/technical/client-surfaces.md) for the exact
    contract and [voice-setup.md § Optional Agent and Hermes text
    backends](voice-setup.md#optional-agent-and-hermes-text-backends) for the

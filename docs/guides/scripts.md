@@ -1,7 +1,7 @@
 # Scripts Reference
 
 > **Status:** Complete
-> **Last Updated:** 2026-07-09
+> **Last Updated:** 2026-08-27
 > **Audience:** Operators
 
 Reference for all LifeOS scripts with usage examples.
@@ -108,6 +108,26 @@ Orchestrate all data sync operations. On Linux the nightly run is driven by the 
 
 ---
 
+### first_backfill.py
+
+One-time deep backfill for a fresh install — run this once after initial
+setup. The nightly job above deliberately narrows Gmail/Calendar to a
+30-day window; this instead runs those sources (and everything else in
+Phases 1-4, in the same order) at their own full-history default, then
+prints a coverage report (count + earliest/latest date per source).
+
+```bash
+# Preview what would run
+~/.venvs/lifeos/bin/python scripts/first_backfill.py --dry-run
+
+# Run the backfill
+~/.venvs/lifeos/bin/python scripts/first_backfill.py --execute
+```
+
+Safe to re-run — see [data-and-sync.md](../specs/technical/data-and-sync.md#first-backfill-entry-point) for details.
+
+---
+
 ### Individual Sync Scripts
 
 All sync scripts follow the pattern:
@@ -181,9 +201,11 @@ Example:
 | `clear-caches.sh` | Clear embedding and search caches |
 | `network-watchdog.sh` | WiFi link health check and self-heal (re-activate → bounce radio → reload driver → restart NetworkManager) |
 | `auto-deploy.sh` | Poll `origin/main`; on a fast-forward advance, pull and restart the code services that changed. Pull-based, guarded (main branch + clean tree + `--ff-only`), opt-in via `LIFEOS_AUTODEPLOY_ENABLED`. Run by `lifeos-autodeploy.timer`. |
+| `auto-update-macos.sh` | The macOS analog of `auto-deploy.sh` for the launchd-managed API service. Same opt-in flag and guards; not installed as a timer by this repo — an operator adds their own cron/launchd entry. See [Auto-Deploy on macOS](operations.md#auto-deploy-on-macos-self-hosted-redeploy) in operations.md. |
 | `cleanup-worktrees.sh` | Idempotent git-worktree pruning plus targeted removal of a stale worktree/branch; safe to call pre-flight before `git worktree add`. |
 | `migrate_reminders_to_scheduler.py` | One-shot, idempotent migration of the legacy `~/.lifeos/reminders.json` store into the Scheduler's `Inbox.md` source of truth. Non-destructive (keeps the JSON as backup). |
 | `install_codex_skills.py` | Convert portable LifeOS skills from `.claude/skills/` into Codex's `SKILL.md` format into `~/.codex/skills/`. Re-run after editing source skills. |
+| `register_persona_bot.py` | Safely register a new persona Telegram bot: appends its token/chat-id env vars to `.env` (append-only — a symlinked `.env` stays a symlink) and adds it to `config/telegram_bots.local.json` (seeded from the template on first use). Does not register the bot with @BotFather or restart the service — see [personas.md](personas.md#create-your-own-persona). |
 | `create-lifeos-app.sh` | Create the `LifeOS.app` Full Disk Access wrapper bundle in `/Applications` (macOS only), the FDA container cron/launchd route through for protected databases. |
 | `preflight.sh` | Pre-flight checks (called by server.sh) |
 | `run_sync_wrapper.sh` | NVMe wake + pre-flight for nightly sync |
@@ -231,7 +253,11 @@ Installs and enables:
 
 ### setup-launchd.sh
 
-Configure launchd services from templates (macOS only). Interactive: prompts for the vault path (or accepts it as an optional argument), generates plist files from `config/launchd/` templates, and installs them to `~/Library/LaunchAgents/`. ChromaDB is intentionally skipped — use a cron watchdog for it (see [launchd-setup.md](launchd-setup.md)).
+Configure launchd services from templates (macOS only). Interactive: prompts for the vault path (or accepts it as an optional argument, or falls back to `LIFEOS_VAULT_PATH` in `.env` under `--yes`), generates plist files from `config/launchd/` templates, and installs them to `~/Library/LaunchAgents/`. ChromaDB is intentionally skipped — use a cron watchdog for it (see [launchd-setup.md](launchd-setup.md)).
+
+Installs, conditionally, the same two services `setup-systemd.sh` gates on Linux — **agent-worker** (only when `LIFEOS_AGENT_WORKER_AUTOSTART=true`) and **MCP HTTP** (only when `LIFEOS_MCP_BEARER_TOKEN` is set) — using the same env vars, so one `.env` controls both platforms identically (#774). Neither is generated-and-skipped like ChromaDB; with its flag unset, no plist for it is installed at all. The GPU and network watchdogs have no macOS equivalent (different hardware/driver entirely) — the run prints them as explicitly skipped, not silence, at the end.
+
+Re-running never silently replaces a differently-configured, already-installed plist: if the generated content differs from what's on disk, the existing file is backed up to `config/launchd/backups/` before being overwritten, with a `WARNING` line naming what happened.
 
 ```bash
 ./scripts/setup-launchd.sh                 # prompts for vault path
@@ -383,3 +409,5 @@ curl -X POST http://localhost:8000/api/admin/reindex/sync
 
 - [Launchd Setup](launchd-setup.md) -- Automated service management (macOS)
 - [Troubleshooting](troubleshooting.md) -- Common issues and solutions
+- [Personas](personas.md) -- `register_persona_bot.py`'s "Create your own persona" workflow
+- [Operations](operations.md) -- Auto-Deploy (Linux and macOS) drift detection, sync lock, and restart-sequence detail

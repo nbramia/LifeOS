@@ -280,7 +280,12 @@ class TestReservedJournalDir:
         assert not (vault / "Personal" / "Journal").exists()
         assert [p.name for p in (vault / "Personal").iterdir()] == ["Log"]
 
-    def test_vault_write_route_still_rejects_the_reserved_prefix(self, vault):
+    def test_vault_write_route_still_rejects_the_reserved_prefix(self, vault, monkeypatch):
+        # Since #769 the reservation only applies with the journal persona
+        # enabled; enable it so this regression guard still exercises the
+        # reserved path (an install running the journal persona, like this
+        # one, keeps today's behavior unchanged).
+        monkeypatch.setenv("TELEGRAM_JOURNAL_BOT_TOKEN", "test-token")
         app = FastAPI()
         app.include_router(vault_route.router)
         client = TestClient(app)

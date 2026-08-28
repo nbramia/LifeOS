@@ -14,7 +14,7 @@ import logging
 
 from api.services.indexer import IndexerService
 from api.services.vectorstore import VectorStore
-from api.services.job_queue import get_job_queue
+from api.services.job_queue import get_job_queue, is_stale_running_job
 from config.settings import settings
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -52,10 +52,23 @@ async def get_status() -> IndexStatus:
         logger.error(f"Error getting document count: {e}")
         count = 0
 
-    # Check if a reindex job is currently running
+    # Check if a reindex job is currently running. A "running" row left by a
+    # process that has since restarted (e.g. an unrelated auto-deploy mid-job)
+    # is stale, not actually in progress — exclude it (#768).
+    #
+    # limit=1 is safe even with a stale row present: this queue runs one job
+    # at a time on a single worker thread (JobQueue._worker_loop), and
+    # start_worker() reconciles any pre-existing RUNNING row before that
+    # thread starts, so there is never more than one RUNNING row queue-wide
+    # at a time in the single-process-per-database model this queue assumes
+    # (Codex review of #768 raised the two-rows case; it requires a second
+    # process concurrently claiming jobs against the same jobs.db, which
+    # this architecture doesn't support).
     queue = get_job_queue()
     running_jobs = queue.list_jobs(status="running", job_type="reindex_vault", limit=1)
-    reindex_in_progress = len(running_jobs) > 0
+    reindex_in_progress = any(
+        not is_stale_running_job(job, queue.process_start_time) for job in running_jobs
+    )
 
     # Get last completed reindex result
     completed_jobs = queue.list_jobs(status="completed", job_type="reindex_vault", limit=1)

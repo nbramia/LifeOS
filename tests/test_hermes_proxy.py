@@ -69,14 +69,109 @@ def proxy_client(monkeypatch):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy")
 
 
-async def test_status_reflects_configuration(monkeypatch):
+async def test_status_not_configured(monkeypatch):
     app = FastAPI()
     app.include_router(hp.router)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
-        monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
-        assert (await c.get("/api/hermes/status")).json()["available"] is True
         monkeypatch.setattr(hp.settings, "hermes_backend_url", "")
-        assert (await c.get("/api/hermes/status")).json()["available"] is False
+        assert (await c.get("/api/hermes/status")).json() == {
+            "available": False, "configured": False, "reachable": False,
+        }
+
+
+async def test_status_configured_and_reachable(monkeypatch):
+    """#688: unchanged shape for the case that matters most — a fully
+    configured, up Hermes still reports available."""
+    def _stub_client():
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=stub_hermes), base_url="http://hermes"
+        )
+    monkeypatch.setattr(hp, "_client", _stub_client)
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://reachable.example")
+
+    app = FastAPI()
+    app.include_router(hp.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        assert (await c.get("/api/hermes/status")).json() == {
+            "available": True, "configured": True, "reachable": True,
+        }
+
+
+async def test_status_configured_but_unreachable(monkeypatch):
+    """#688: the actual bug — a configured Hermes whose process is down must
+    not report available (that's what sent every chat turn to fail at send
+    time instead of falling back to lifeos), and must be distinguishable
+    from "not configured" via the configured/reachable fields."""
+    class _UnreachableClient:
+        async def get(self, *a, **kw):
+            raise httpx.ConnectError("connection refused")
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(hp, "_client", lambda: _UnreachableClient())
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://down.example")
+
+    app = FastAPI()
+    app.include_router(hp.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        assert (await c.get("/api/hermes/status")).json() == {
+            "available": False, "configured": True, "reachable": False,
+        }
+
+
+async def test_status_reachability_is_cached_within_ttl(monkeypatch):
+    """The probe must not run on every /status call — only the first one in
+    a TTL window — so the picker's page-load check never adds a real
+    round-trip per request, and a downed backend is never hammered."""
+    calls = {"count": 0}
+
+    class _CountingClient:
+        async def get(self, *a, **kw):
+            calls["count"] += 1
+            return None
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(hp, "_client", lambda: _CountingClient())
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://cached.example")
+
+    app = FastAPI()
+    app.include_router(hp.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        await c.get("/api/hermes/status")
+        await c.get("/api/hermes/status")
+
+    assert calls["count"] == 1
+
+
+async def test_status_reachability_probe_is_not_duplicated_under_concurrency(monkeypatch):
+    """Two /status calls landing concurrently in the same (empty) cache
+    window must share one in-flight probe, not each fire their own — the
+    cache-only guard above only proves this for sequential callers."""
+    calls = {"count": 0}
+
+    class _SlowClient:
+        async def get(self, *a, **kw):
+            calls["count"] += 1
+            await asyncio.sleep(0.05)
+            return None
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(hp, "_client", lambda: _SlowClient())
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://concurrent.example")
+
+    app = FastAPI()
+    app.include_router(hp.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        results = await asyncio.gather(
+            c.get("/api/hermes/status"),
+            c.get("/api/hermes/status"),
+        )
+
+    assert calls["count"] == 1
+    for resp in results:
+        assert resp.json()["reachable"] is True
 
 
 async def test_ask_stream_injects_bearer_and_streams(proxy_client):
@@ -2566,6 +2661,36 @@ async def test_raw_persona_preamble_journal_turn_still_captures(
         "path": log_path_for(date.today()),
         "created": True,
     }]
+
+
+# ---------------------------------------------------------------------------
+# #691: _build_envelope() used to resolve `parsed.persona_id or "primary"` —
+# ignoring a raw `persona` preamble entirely — while the #685 capture prelude
+# above already reverse-mapped it via resolve_effective_persona_id(). One
+# request, two different answers to "who is this persona": captured under
+# the reverse-mapped bot, but the envelope built (and forwarded to Hermes)
+# for "primary". Pin that both now agree.
+# ---------------------------------------------------------------------------
+
+async def test_raw_persona_envelope_matches_capture_persona(
+    proxy_client, journal_vault, journal_persona_registered,
+):
+    journal_preamble = journal_persona_registered
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": _JOURNAL_FRAGMENT, "persona": journal_preamble},
+    )
+    assert resp.status_code == 200
+
+    # Capture succeeded under "journal" (same proof as the test above).
+    written = (journal_vault / log_path_for(date.today())).read_text()
+    assert [b.split(" · ")[1] for b in _bullets(written)] == [_JOURNAL_FRAGMENT]
+
+    # The envelope actually forwarded to Hermes must resolve to the SAME
+    # persona — not silently "primary".
+    ctx = json.loads(_received["body"])["lifeos_context"]
+    assert ctx["persona"]["id"] == "journal"
+    assert ctx["persona"]["preamble"] == journal_preamble
 
 
 async def test_empty_persona_id_gets_native_400_on_proxy(proxy_client, journal_vault):

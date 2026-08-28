@@ -12,11 +12,8 @@ P3.2 Acceptance Criteria:
 - All-day events handled correctly
 """
 import pytest
-
-# All tests in this file use mocks (unit tests)
-pytestmark = pytest.mark.unit
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import patch, MagicMock
 
 from api.services.calendar import (
     CalendarService,
@@ -25,6 +22,9 @@ from api.services.calendar import (
     parse_attendees,
 )
 from api.services.google_auth import GoogleAccount
+
+# All tests in this file use mocks (unit tests)
+pytestmark = pytest.mark.unit
 
 
 class TestCalendarEvent:
@@ -237,6 +237,70 @@ class TestCalendarService:
 
         assert len(events) >= 1
         assert any("budget" in e.title.lower() or (e.description and "budget" in e.description.lower()) for e in events)
+
+    def test_get_events_in_range_follows_pagination(self, calendar_service):
+        """A range spanning more than one page (max_results=None) should
+        follow nextPageToken and return events from every page, not just
+        the first (#701 — a deep backfill used to silently cap at the first
+        page and leave the rest of the range empty)."""
+        page1 = {
+            "items": [
+                {
+                    "id": f"old-{i}",
+                    "summary": f"Old Event {i}",
+                    "start": {"dateTime": "2016-01-07T10:00:00-08:00"},
+                    "end": {"dateTime": "2016-01-07T11:00:00-08:00"},
+                }
+                for i in range(3)
+            ],
+            "nextPageToken": "page2-token",
+        }
+        page2 = {
+            "items": [
+                {
+                    "id": "recent-1",
+                    "summary": "Recent Event",
+                    "start": {"dateTime": "2026-01-07T10:00:00-08:00"},
+                    "end": {"dateTime": "2026-01-07T11:00:00-08:00"},
+                }
+            ]
+        }
+        list_mock = calendar_service._service.events.return_value.list
+        list_mock.return_value.execute.side_effect = [page1, page2]
+
+        start_date = datetime(2016, 1, 1, tzinfo=timezone.utc)
+        end_date = datetime(2026, 1, 8, tzinfo=timezone.utc)
+        events = calendar_service.get_events_in_range(start_date, end_date, max_results=None)
+
+        assert len(events) == 4
+        assert any(e.title == "Recent Event" for e in events)
+        assert list_mock.call_count == 2
+        # Second call must carry the page token from the first response.
+        assert list_mock.call_args_list[1].kwargs["pageToken"] == "page2-token"
+
+    def test_get_events_in_range_single_page_makes_one_call(self, calendar_service):
+        """A range that fits on one page (the nightly 30-day sync) must not
+        make any extra requests — no `nextPageToken` in the response means
+        exactly one API call, same as before pagination support existed."""
+        mock_events = {
+            "items": [
+                {
+                    "id": "event1",
+                    "summary": "Standup",
+                    "start": {"dateTime": "2026-01-07T10:00:00-08:00"},
+                    "end": {"dateTime": "2026-01-07T11:00:00-08:00"},
+                }
+            ]
+        }
+        list_mock = calendar_service._service.events.return_value.list
+        list_mock.return_value.execute.return_value = mock_events
+
+        start_date = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end_date = datetime(2026, 1, 31, tzinfo=timezone.utc)
+        events = calendar_service.get_events_in_range(start_date, end_date, max_results=None)
+
+        assert len(events) == 1
+        assert list_mock.call_count == 1
 
 
 class TestHelperFunctions:

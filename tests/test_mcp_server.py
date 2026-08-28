@@ -708,6 +708,79 @@ def test_sync_trigger_known_source_routes_to_the_right_endpoint():
 
 
 @pytest.mark.unit
+def test_sync_trigger_whatsapp_is_no_longer_invalid():
+    """WhatsApp has no dedicated route_map entry — it has no standalone
+    nightly sync of its own, its data arrives via the combined apple_import
+    step (#784) — so it must fall through to the same fallback-list
+    handling gmail/imessage/linkedin already get, not "Invalid source"."""
+    from unittest.mock import MagicMock
+    server = _fresh_server()
+    fake = MagicMock()
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.json.return_value = {"status": "queued"}
+    fake_response.raise_for_status = MagicMock()
+    fake.post.return_value = fake_response
+    server.client = fake
+
+    result = server._handle_sync_trigger({"source": "whatsapp"})
+    assert result == {"status": "queued"}
+    called_url = fake.post.call_args[0][0]
+    assert called_url.endswith("/api/crm/sources/whatsapp/sync")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "source,expected_url_suffix",
+    [
+        ("vault", "/api/admin/reindex"),
+        ("calendar", "/api/admin/calendar/sync"),
+        ("contacts", "/api/crm/contacts/sync"),
+        ("slack", "/api/crm/slack/sync"),
+        ("photos", "/api/photos/sync"),
+        ("gmail", "/api/crm/sources/gmail/sync"),
+        ("imessage", "/api/crm/sources/imessage/sync"),
+        ("phone", "/api/crm/sources/phone/sync"),
+        ("facetime", "/api/crm/sources/facetime/sync"),
+        ("linkedin", "/api/crm/sources/linkedin/sync"),
+        ("whatsapp", "/api/crm/sources/whatsapp/sync"),
+    ],
+)
+def test_sync_trigger_every_source_routes_as_expected(source, expected_url_suffix):
+    """Regression guard for #784: every pre-existing source must keep
+    routing exactly as it does today, with whatsapp now joining the
+    fallback list rather than replacing or shifting anything."""
+    from unittest.mock import MagicMock
+    server = _fresh_server()
+    fake = MagicMock()
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.json.return_value = {"status": "ok"}
+    fake_response.raise_for_status = MagicMock()
+    fake.post.return_value = fake_response
+    server.client = fake
+
+    server._handle_sync_trigger({"source": source})
+    called_url = fake.post.call_args[0][0]
+    assert called_url.endswith(expected_url_suffix)
+
+
+@pytest.mark.unit
+def test_sync_source_route_accepts_whatsapp():
+    """The MCP-level tests above only check the outgoing request URL
+    against a mocked client — they'd pass even if the underlying
+    `POST /api/crm/sources/{source_type}/sync` route (api/routes/crm.py)
+    still 400'd on "whatsapp". Exercise the real route directly (#784);
+    it does no DB access, so this is safe as a unit test."""
+    from fastapi.testclient import TestClient
+    from api.main import app
+
+    response = TestClient(app).post("/api/crm/sources/whatsapp/sync")
+    assert response.status_code == 200
+    assert response.json()["source_type"] == "whatsapp"
+
+
+@pytest.mark.unit
 def test_sync_trigger_downstream_non_2xx_is_an_error():
     """A downstream route that correctly raises on failure (the safe
     pattern every other curated write endpoint follows) must still surface
@@ -829,7 +902,7 @@ class TestWriteEndpointNeverReturnsSuccessShapedFailure:
         server = module.LifeOSMCPServer.__new__(module.LifeOSMCPServer)
         for source in (
             "vault", "calendar", "contacts", "slack", "photos",
-            "gmail", "imessage", "phone", "facetime", "linkedin",
+            "gmail", "imessage", "phone", "facetime", "linkedin", "whatsapp",
         ):
             fake_client = MagicMock()
             server.client = fake_client

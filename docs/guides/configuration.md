@@ -56,15 +56,15 @@ Optional pull-based deploy loop: `lifeos-autodeploy.timer` polls `origin/main` e
 
 ## LLM Backend — Synthesis and Orchestration
 
-Governs chat synthesis, intent classification, and agentic orchestration. The toggle decision is recorded in [ADR-009](../adr/009-llm-backend-toggle.md).
+Governs chat synthesis, intent classification, and agentic orchestration. The toggle decision is recorded in [ADR-009](../adr/009-llm-backend-toggle.md), extended to a third value by [ADR-024](../adr/024-remote-llm-backend.md).
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
-| `LIFEOS_LLM_BACKEND` | str | `anthropic` | `local` (llama-server on `LIFEOS_LOCAL_LLM_URL`) or `anthropic` (Claude API). Recorded in ADR-009. |
+| `LIFEOS_LLM_BACKEND` | str | `anthropic` | `anthropic` (Claude API), `local` (llama-server on `LIFEOS_LOCAL_LLM_URL`), or `remote` (the configured paid provider below, as the standing default rather than a per-turn pick — #771/ADR-024). `anthropic` with no `ANTHROPIC_API_KEY`, or `remote` without the provider fully configured, fails fast with a named error rather than silently falling back. |
 | `LIFEOS_ANTHROPIC_MODEL` | str | `claude-haiku-4-5` | **Base** Claude model for chat orchestration when `LIFEOS_LLM_BACKEND=anthropic`. Per-query escalation can override it for a turn (see below). |
 | `LIFEOS_AGENT_ESCALATION_MODEL` | str | — (off) | Switches per-query escalation **on**; empty disables it. Anthropic backend only. Despite the name it no longer names the rung an automatic escalation climbs to — that is limited to non-API engines (see below). A model named here is still what "escalate to opus"-style *user-directed* escalation resolves against. |
 | `LIFEOS_AGENT_ESCALATION_LADDER` | str | `claude_code,codex` | Comma-separated rungs climbed on each successive refusal+pushback. Rungs must cost nothing per token: `claude_code`, `codex` (subscription CLIs) or `local` (on-box Gemma). Anthropic model ids are accepted but **dropped from the climb** with a log line — LifeOS never puts a turn on the API unless you ask. Override e.g. `local,claude_code,codex`. |
-| `ANTHROPIC_API_KEY` | str | — | Required when `LIFEOS_LLM_BACKEND=anthropic`. Also used by specialized calls regardless of backend (relationship insights, fact extraction, web search). |
+| `ANTHROPIC_API_KEY` | str | — | Required when `LIFEOS_LLM_BACKEND=anthropic`. Also the preferred client for specialized calls (relationship insights, fact extraction, tone analysis — [ADR-025](../adr/025-specialist-call-fallback.md)) regardless of `LIFEOS_LLM_BACKEND`; when unset, those calls fall back to the local llama-server if reachable, else the remote provider below, instead of silently producing nothing (#772). Web search has no local equivalent and is unaffected — see below. |
 | `LIFEOS_LOCAL_LLM_URL` | str | `http://localhost:8080` | Local llama-server endpoint. |
 | `LIFEOS_LOCAL_LLM_TIMEOUT` | int | `90` | Local LLM HTTP request timeout, seconds. |
 | `LIFEOS_LLM_MODEL` | str | — | Optional override for the GGUF model the `lifeos-llm` systemd unit loads. When unset, the unit uses its bundled `-hf` default; when set, the setup script substitutes a `-m`/`--mmproj` form. |
@@ -74,7 +74,7 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 
 ### OpenAI-compatible Remote Provider
 
-An explicit, per-turn model pick (like `local`) backed by a paid OpenAI-compatible endpoint — e.g. Fireworks running DeepSeek or Qwen. Never a rung the escalation ladder can reach on its own (ADR-018); it only ever runs when named explicitly. Also what the agent worker's local route can fall back to when the local llama-server is unreachable — see [agent-worker.md § Local executor](../specs/technical/agent-worker.md#local-executor-gemma-path).
+A paid OpenAI-compatible endpoint — e.g. Fireworks running DeepSeek or Qwen. Reachable two ways: an explicit per-turn model pick from the chat model picker (`model_override="remote"`), or as the process-wide default via `LIFEOS_LLM_BACKEND=remote` above (#771). Never a rung the escalation ladder can reach on its own (ADR-018), regardless of which of those two ways selects it — it only ever runs when named explicitly, by an operator or by a user's per-turn pick. Also what the agent worker's local route can fall back to when the local llama-server is unreachable — see [agent-worker.md § Local executor](../specs/technical/agent-worker.md#local-executor-gemma-path).
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
@@ -88,9 +88,9 @@ An explicit, per-turn model pick (like `local`) backed by a paid OpenAI-compatib
 
 All three of URL, model, and API key must be set for the provider to be considered configured; pricing is independent and can be added later without affecting whether turns run.
 
-### Routing Target and Reasoning Control (#566)
+### Routing Target and Reasoning Control (#566/#773)
 
-Query routing, fact filtering, and entity-cleanup auto-hide decisions always go through the local llama-server (`_get_local_routing_client`), regardless of `LIFEOS_LLM_BACKEND`. These settings let that routing target — and whether it's asked to reason — be configured independently of the main local LLM used for chat synthesis.
+Query routing, conversation titling, agent-activity summaries, and person-fact filtering never use the Claude API, regardless of `LIFEOS_LLM_BACKEND` — these are cheap, auxiliary, non-user-facing calls that shouldn't carry API cost. The local llama-server (`_get_local_routing_client`) is the preferred target; when it's unreachable, these calls fall back to the configured remote provider (below) instead of silently doing nothing, still never to Anthropic (#773). These settings let the local routing target — and whether it's asked to reason — be configured independently of the main local LLM used for chat synthesis.
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
@@ -98,6 +98,15 @@ Query routing, fact filtering, and entity-cleanup auto-hide decisions always go 
 | `LIFEOS_ROUTER_ENABLE_THINKING` | bool | `true` | Whether `query_router`'s LLM routing call requests reasoning from the local model. Measured on the live host: 23-32s/call with thinking on vs. 2-9s with it off, with substantively identical routing decisions. Left `true` (unchanged behaviour) pending a broader correctness A/B — flipping to `false` is a one-line default change once confirmed. |
 
 `LocalLLMClient.create`/`acreate`/`astream` (and the `generate_text`/`generate_json` routing helpers) also accept per-request `enable_thinking` (bool) and `reasoning_effort` (str) keyword arguments, sent as `chat_template_kwargs: {"enable_thinking": ...}` and `reasoning_effort` on the request body. Leaving both unset adds no new keys to the request — existing callers are unaffected.
+
+### Document Summarization Target (#742/#775)
+
+The indexer's document-summary generation (`api/services/summarizer.py`) talks to an OpenAI-compatible endpoint directly, independent of `LIFEOS_LLM_BACKEND` and the routing target above. `llama-server` ignores the request's `model` field (one model per process); Ollama does not and rejects a request naming a model it isn't serving — this pair exists so an Ollama-only host (no `llama-server`) can still get document summaries.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_SUMMARIZER_LLM_URL` | str | — (falls back to `LIFEOS_LOCAL_LLM_URL`) | Dedicated endpoint for summarization requests. Point it at an Ollama server (e.g. `http://localhost:11434`) on a host with no `llama-server`. |
+| `LIFEOS_SUMMARIZER_MODEL` | str | `local` | Model name sent in the summarization request body. The default is a placeholder `llama-server` ignores; an Ollama endpoint requires a real tag (e.g. `qwen2.5:3b-instruct`). Also backs the chat-answer synthesizer's usage-event `model` label (`api/services/synthesizer.py`) — a cosmetic reuse for consistency, not a second wire-protocol call site. |
 
 ## Embedding & Search
 
@@ -235,6 +244,7 @@ Subprocess orchestration triggered from Telegram. See [claude-code-orchestration
 | `LIFEOS_MY_PERSON_ID` | str | — | Your CRM PersonEntity UUID. Set after first sync — find it via `curl "localhost:8000/api/crm/people?q=<your-name>" \| jq '.people[0].id'`. |
 | `LIFEOS_WORK_DOMAIN` | str | — | Your primary work email domain. |
 | `LIFEOS_WORK_DOMAIN_2` | str | — | Second work email domain if you have one. |
+| `LIFEOS_WORK_DOMAINS_EXTRA` | str | — | Comma-separated list of any further work email domains beyond the first two (e.g. `thirdco.com,fourthco.com`). |
 | `LIFEOS_TIMEZONE` | str | — | IANA timezone (e.g., `America/New_York`). |
 
 ## Relationships
@@ -365,6 +375,14 @@ Auth tokens are cached at `data/monarch_session.pickle` after first login. Re-au
 
 Both `MONARCH_EMAIL`/`MONARCH_PASSWORD` unset AND no cached session at `data/monarch_session.pickle` means Monarch isn't configured — the nightly sync records it as skipped rather than failed. Any other failure (bad session, wrong password, network) still fails the run.
 
+### Investments Snapshot
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_INVESTMENTS_SYNC_DIR` | path | `~/Code/Sync/investments` | Directory `summary.json`/`portfolio.json` are read from by the investments API route and the `search_finances` "investments" chat tool action. |
+
+This directory is populated by a separate Schwab export pipeline outside this repo, not by LifeOS itself. Without that pipeline (or with this unset and the default directory absent), the API route and chat tool both report a clean "not synced yet" — there is no error and nothing else to configure.
+
 ## Configuration Files
 
 A handful of operator-tunable files live alongside the env vars. All are gitignored.
@@ -433,6 +451,7 @@ LIFEOS_ALERT_EMAIL=you@example.com
 - [Journal Ring Ingest](journal-ring-ingest.md) — `LIFEOS_JOURNAL_INGEST_TOKEN` in operator-flow context.
 - [Doctor Bot](doctor-bot.md) — The self-repair orchestration bot; setup of its `TELEGRAM_DOCTOR_*` vars and the repair flow.
 - [ADR-009: LIFEOS_LLM_BACKEND toggle](../adr/009-llm-backend-toggle.md) — Why the synthesis backend is operator-configurable.
+- [ADR-024: Remote provider as a third backend value](../adr/024-remote-llm-backend.md) — Why `remote` can be the standing default, not just a per-turn pick.
 - [ADR-019: A Turn's Lifetime Is Owned by the Server](../adr/019-turn-owned-by-server.md) — Why `LIFEOS_DETACHED_TURN_TIMEOUT_SECONDS` exists.
 - [ADR-012: Embedding Pipeline](../adr/012-embedding-pipeline.md) — Why `LIFEOS_EMBEDDING_MODEL` is overridable; the OOM-protection knobs.
 - [API Reference](../specs/product/api-reference.md) — Gmail send endpoint behavior controlled by the draft send cooldown.
