@@ -199,9 +199,13 @@ class TestCaptureTarget:
         capture_fragment("should never land in the generated journal", now=datetime(2026, 8, 23, 9, 14))
         assert not (vault / "Personal" / "Journal").exists()
 
-    def test_vault_write_route_still_reserves_personal_journal(self, vault):
+    def test_vault_write_route_still_reserves_personal_journal(self, vault, monkeypatch):
         # The prompt-level "never write here" is backed by a route-level guard;
-        # #674 must not have weakened it.
+        # #674 must not have weakened it. Since #769 the guard only applies
+        # when the journal persona is enabled — enable it here (as this
+        # install, running the journal persona, would have it) so this stays
+        # a true regression guard rather than exercising the unenabled default.
+        monkeypatch.setenv("TELEGRAM_JOURNAL_BOT_TOKEN", "test-token")
         app = FastAPI()
         app.include_router(vault_route.router)
         c = TestClient(app)
