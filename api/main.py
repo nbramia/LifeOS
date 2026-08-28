@@ -467,12 +467,20 @@ def _check_vault_root_sanity(vault_search_check: "dict | None", vault_path) -> N
     check isn't present or didn't itself report "ok" — this never turns a
     failing check into a passing one, or vice versa, only adds a further
     downgrade on top of an already-passing result.
+
+    If the sample comes back empty (no vault documents were sampled — e.g.
+    a collection that is currently all non-vault content), that is absence
+    of signal, not evidence of a moved vault, so the check stays "ok" with a
+    neutral note instead of downgrading (#762 follow-up).
     """
     if not vault_search_check or vault_search_check.get("status") != "ok":
         return
     try:
         from api.services.vectorstore import get_vector_store, sample_paths_match_vault_root
         sample = get_vector_store().sample_file_paths(limit=5)
+        if not sample:
+            vault_search_check["vault_root_check"] = "no vault documents sampled"
+            return
         all_match, mismatched = sample_paths_match_vault_root(sample, vault_path)
         if not all_match:
             vault_search_check["status"] = "degraded"
