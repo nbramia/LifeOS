@@ -472,27 +472,43 @@ def _check_vault_root_sanity(vault_search_check: "dict | None", vault_path) -> N
     a collection that is currently all non-vault content), that is absence
     of signal, not evidence of a moved vault, so the check stays "ok" with a
     neutral note instead of downgrading (#762 follow-up).
+
+    Degrade rule (#762 second follow-up): the failure this check exists to
+    catch is a vault that *moved* — in that case NO sampled vault path is
+    under the configured root. A sample where some paths match and some
+    don't isn't that failure; it's more likely stray debris (e.g. a test
+    run that indexed documents straight into this collection, or a leftover
+    path from an old sync) sitting alongside otherwise-healthy content. So
+    this only downgrades to "degraded" when the sample contains at least one
+    vault path and *none* of them are under the root. A partial mismatch
+    stays "ok" but still surfaces a `vault_root_check` note (counts only)
+    so it's visible without being alarming.
     """
     if not vault_search_check or vault_search_check.get("status") != "ok":
         return
     try:
         from api.services.vectorstore import get_vector_store, sample_paths_match_vault_root
-        sample = get_vector_store().sample_file_paths(limit=5)
+        sample = get_vector_store().sample_file_paths(limit=50)
         if not sample:
             vault_search_check["vault_root_check"] = "no vault documents sampled"
             return
         all_match, mismatched = sample_paths_match_vault_root(sample, vault_path)
-        if not all_match:
+        matched = len(sample) - len(mismatched)
+        # Deliberately omit the mismatched paths and the configured root
+        # itself in both branches below — this is an unauthenticated
+        # endpoint, a real indexed file path can reveal personal
+        # folder/file names, and the vault root is typically an absolute
+        # path under the user's home directory (#697 review). The counts
+        # alone are enough for an operator to act on.
+        if matched == 0:
             vault_search_check["status"] = "degraded"
-            # Deliberately omit the mismatched paths and the configured root
-            # itself — this is an unauthenticated endpoint, a real indexed
-            # file path can reveal personal folder/file names, and the vault
-            # root is typically an absolute path under the user's home
-            # directory (#697 review). The counts alone are enough for an
-            # operator to act on.
             vault_search_check["vault_root_check"] = (
                 f"{len(mismatched)}/{len(sample)} sampled indexed path(s) fall outside "
                 "the configured vault root"
+            )
+        elif not all_match:
+            vault_search_check["vault_root_check"] = (
+                f"{matched}/{len(sample)} sampled vault paths under root"
             )
     except Exception as e:
         # Never let this additive sanity check take down the primary

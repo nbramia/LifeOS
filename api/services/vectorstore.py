@@ -346,11 +346,13 @@ class VectorStore:
         sharing one `file_path`), so a raw `limit`-sized fetch risks
         returning the same one or two files repeatedly. Over-fetch a bit
         and dedupe to `file_path` so the sample actually spans up to
-        `limit` distinct files — still a small, bounded read regardless of
-        collection size, not a scan.
+        `limit` distinct files. At the health check's default `limit=50`
+        this fetches at most 250 rows — still a small, bounded read
+        regardless of collection size (250 rows out of 45k+ on a real vault
+        is well under 1%), not a scan.
         """
         results = self._collection.get(
-            limit=limit * 4,
+            limit=limit * 5,
             where={"note_type": {"$nin": _NON_VAULT_NOTE_TYPES}},
             include=["metadatas"],
         )

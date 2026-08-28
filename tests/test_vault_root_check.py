@@ -253,6 +253,60 @@ class TestCheckVaultRootSanity:
         assert check["status"] == "ok"
         assert check["vault_root_check"] == "no vault documents sampled"
 
+    def test_partial_mismatch_stays_ok_with_a_counts_note(self, monkeypatch, tmp_path):
+        """The failure this check exists to catch is a vault that MOVED —
+        in that case NO sampled vault path is under the root. A sample with
+        some matches and some mismatches (e.g. debris from a test run that
+        indexed documents straight into this collection, or a stray path
+        from an old sync) isn't that failure and must not degrade — but the
+        partial mismatch is still surfaced as a counts-only note (#762
+        second follow-up)."""
+        import api.main as main
+        from api.services import vectorstore as vs
+
+        vault_root = tmp_path / "vault"
+        debris_root = tmp_path / "debris"
+        under_root = [str(vault_root / f"note{i}.md") for i in range(20)]
+        debris = [str(debris_root / f"stray{i}.md") for i in range(30)]
+
+        class _StubStore:
+            def sample_file_paths(self, limit=50):
+                return under_root + debris
+
+        monkeypatch.setattr(vs, "get_vector_store", lambda: _StubStore())
+
+        check = {"status": "ok", "detail": "1 results"}
+        main._check_vault_root_sanity(check, vault_root)
+
+        assert check["status"] == "ok"
+        assert check["vault_root_check"] == "20/50 sampled vault paths under root"
+
+    def test_all_mismatch_at_scale_still_degrades(self, monkeypatch, tmp_path):
+        """The real detection must survive the new partial-mismatch
+        tolerance: zero matches out of a larger sample is still the
+        moved-vault signal."""
+        import api.main as main
+        from api.services import vectorstore as vs
+
+        vault_root = tmp_path / "vault"
+        old_location = tmp_path / "old_vault_location"
+        mismatched = [str(old_location / f"note{i}.md") for i in range(50)]
+
+        class _StubStore:
+            def sample_file_paths(self, limit=50):
+                return mismatched
+
+        monkeypatch.setattr(vs, "get_vector_store", lambda: _StubStore())
+
+        check = {"status": "ok", "detail": "1 results"}
+        main._check_vault_root_sanity(check, vault_root)
+
+        assert check["status"] == "degraded"
+        assert (
+            check["vault_root_check"]
+            == "50/50 sampled indexed path(s) fall outside the configured vault root"
+        )
+
     def test_leaves_ok_unchanged_when_paths_match(self, monkeypatch, tmp_path):
         import api.main as main
         from api.services import vectorstore as vs
