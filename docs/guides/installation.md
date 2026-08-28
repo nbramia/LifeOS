@@ -58,11 +58,25 @@ The minimal setup (Steps 1–7 below) works identically on macOS and Linux —
 Anthropic API key, vault, ChromaDB, working `/chat`. Past that point, most of
 the packaged "keep itself healthy unattended" automation is Linux-only:
 **17 systemd units** ship for Linux (sync, three crash-restart watchdogs,
-autodeploy, agent worker, MCP-HTTP, local LLM) versus **3 launchd templates**
-for macOS (`com.lifeos.api`, `com.lifeos.crm-sync`, and an unused
-`com.lifeos.chromadb` — ChromaDB uses a cron watchdog instead, see Step 3).
-See [launchd-setup.md](launchd-setup.md) for why macOS-as-primary-server was
-superseded by the Linux migration and what's preserved from it.
+autodeploy, agent worker, MCP-HTTP, local LLM) versus **6 launchd templates**
+for macOS: `com.lifeos.api` and `com.lifeos.crm-sync` (always generated);
+`com.lifeos.agent-worker`, `com.lifeos.mcp-http`, and `com.lifeos.llm`
+(each installed only when its matching opt-in env var is set — the same
+env var that gates its systemd counterpart: `LIFEOS_AGENT_WORKER_AUTOSTART`,
+`LIFEOS_MCP_BEARER_TOKEN`, and `LIFEOS_LOCAL_LLM_AUTOSTART` respectively);
+and an unused `com.lifeos.chromadb` — ChromaDB uses a cron watchdog instead,
+see Step 3. See [launchd-setup.md](launchd-setup.md) for why
+macOS-as-primary-server was superseded by the Linux migration and what's
+preserved from it.
+
+**The local LLM is packaged for macOS too (#830).** Setting
+`LIFEOS_LOCAL_LLM_AUTOSTART=true` in `.env` before running
+`./scripts/setup-launchd.sh` installs `com.lifeos.llm`, running
+`llama-server` against the same `-hf <repo>` / `-m <gguf>` model-source
+config `LIFEOS_LLM_MODEL`/`LIFEOS_LLM_MODEL_PATH` drive on Linux — llama.cpp
+builds natively on Apple Silicon (Metal backend) so this is the same binary
+and flags, just supervised by launchd instead of systemd. See
+[Local LLM (optional)](#local-llm-optional) below.
 
 **Nightly sync does have a packaged macOS path.** `./scripts/setup-launchd.sh`
 (Phase 8 of [setup.md](setup.md)) installs `com.lifeos.crm-sync`, a launchd
@@ -84,10 +98,9 @@ ever):
 
 **What you're living without, either way:** if a sync run hangs or crashes,
 nothing restarts it until the next scheduled tick (no `lifeos-watchdog`
-equivalent); pushing to `main` doesn't auto-redeploy the running server (no
-`lifeos-autodeploy`); and the agent worker and MCP-HTTP bridge aren't
-packaged for launchd at all. None of that blocks chat, search, or manual
-sync runs — it's the unattended-operations layer, and it's Linux-only today.
+equivalent); and pushing to `main` doesn't auto-redeploy the running server
+(no `lifeos-autodeploy`). None of that blocks chat, search, or manual sync
+runs — it's the unattended-operations layer, and it's Linux-only today.
 
 ---
 
@@ -268,6 +281,10 @@ sudo systemctl restart lifeos-llm
 ```
 
 The first start with a new model downloads the GGUF file. Subsequent starts use the cached file in `~/.cache/llama.cpp/`.
+
+On macOS, reinstall and restart via launchd instead: re-run
+`./scripts/setup-launchd.sh <vault-path> --yes` (no `sudo`), then
+`launchctl unload ~/Library/LaunchAgents/com.lifeos.llm.plist && launchctl load ~/Library/LaunchAgents/com.lifeos.llm.plist`.
 
 ---
 

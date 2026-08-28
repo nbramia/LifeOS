@@ -13,9 +13,11 @@
 **If you're setting up LifeOS to run *on* a Mac** (not just for Apple Data
 Agent export), see [Installation § Running LifeOS on macOS as the
 Host](installation.md#running-lifeos-on-macos-as-the-host) for what's
-packaged today (`com.lifeos.api`, `com.lifeos.crm-sync`) versus what's
-Linux-only (crash-restart watchdogs, autodeploy, agent worker, MCP-HTTP) and
-a cron/launchd snippet for nightly sync.
+packaged today (`com.lifeos.api` and `com.lifeos.crm-sync` always;
+`com.lifeos.agent-worker`, `com.lifeos.mcp-http`, and `com.lifeos.llm` as
+opt-in launchd equivalents of their systemd units) versus what's still
+Linux-only (crash-restart watchdogs, autodeploy) and a cron/launchd snippet
+for nightly sync.
 
 ## If you have a Mac in the system today
 
