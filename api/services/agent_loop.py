@@ -442,8 +442,11 @@ def _select_client(model: str = "", force_local: bool = False, force_remote: boo
             timeout=settings.remote_llm_timeout,
         )
     if force_local:
-        if getattr(settings, "llm_backend", "anthropic").lower() != "anthropic":
+        if getattr(settings, "llm_backend", "anthropic").lower() == "local":
             return get_local_llm()  # already local — reuse the singleton
+        # Anthropic or remote backend: the picker's "Gemma" option always
+        # means the on-box llama-server specifically, never whatever the
+        # remote-backend singleton happens to point at (#771).
         from api.services.llm_client import LocalLLMClient
         return LocalLLMClient()
     if model and getattr(settings, "llm_backend", "anthropic").lower() == "anthropic":
@@ -719,10 +722,14 @@ async def run_agent_loop(
                         await asyncio.sleep(delay)
                         continue
                     print(f"[agent] Round {round_num} API error: {e}")
+                    # Deliberately not str(e) here (#787) -- this reaches the
+                    # user verbatim, and on a keyless/misconfigured install
+                    # it would otherwise be the provider SDK's raw internal
+                    # message. The full exception is still logged above.
                     if result.full_text:
-                        yield {"type": "text", "content": f"\n\n(Search interrupted: {e})"}
+                        yield {"type": "text", "content": "\n\n(Search interrupted: the request could not be completed.)"}
                     else:
-                        yield {"type": "text", "content": f"Sorry, I encountered an error: {e}"}
+                        yield {"type": "text", "content": "Sorry, I encountered an error and could not complete this request."}
                     api_error_fatal = True
                     break
         if api_error_fatal:
@@ -862,7 +869,10 @@ async def run_agent_loop(
         except Exception as e:
             error_msg = str(e) or f"{type(e).__name__} (no message)"
             print(f"[agent] Synthesis round error: {error_msg}")
-            yield {"type": "text", "content": f"\n\n(Error during synthesis: {error_msg})"}
+            # Deliberately not error_msg here (#787) -- see the matching
+            # comment in the tool-round loop above. Full detail is still
+            # logged on the line above.
+            yield {"type": "text", "content": "\n\n(Error during synthesis: the request could not be completed.)"}
 
     # If we ran tools but still ended up with no text, construct a fallback
     # from tool results so the user gets something useful.

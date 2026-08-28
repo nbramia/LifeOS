@@ -54,3 +54,47 @@ async def test_stream_response_tolerates_usage_update_event():
         "cost_usd": 0.0,
         "model": "local",
     }
+
+
+class _FakeClientDone:
+    """A single text chunk, then "done" — no usage_update, the simple case."""
+
+    async def astream(self, messages, *, system=None, max_tokens=4096,
+                      tools=None, temperature=None, timeout=None):
+        yield {"type": "text", "content": "42."}
+        yield {
+            "type": "done",
+            "usage": LLMUsage(input_tokens=5, output_tokens=2, total_tokens=7),
+            "finish_reason": "end_turn",
+        }
+
+
+@pytest.mark.asyncio
+async def test_usage_event_model_label_matches_summarizer_model_default(monkeypatch):
+    """#775: the usage event's "model" label was a hardcoded "local" literal
+    -- now it reads settings.summarizer_model, same as the summarizer's
+    outbound payload, for consistency. Default is unchanged."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "summarizer_model", "local", raising=False)
+
+    synth = Synthesizer()
+    synth._client = _FakeClientDone()
+    chunks = [c async for c in synth.stream_response("what is six times seven")]
+
+    usage_event = next(c for c in chunks if isinstance(c, dict))
+    assert usage_event["model"] == "local"
+
+
+@pytest.mark.asyncio
+async def test_usage_event_model_label_reflects_configured_override(monkeypatch):
+    """#775: an operator running Ollama (LIFEOS_SUMMARIZER_MODEL set) sees
+    that model name in the usage label instead of the misleading "local"."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "summarizer_model", "qwen2.5:3b-instruct", raising=False)
+
+    synth = Synthesizer()
+    synth._client = _FakeClientDone()
+    chunks = [c async for c in synth.stream_response("what is six times seven")]
+
+    usage_event = next(c for c in chunks if isinstance(c, dict))
+    assert usage_event["model"] == "qwen2.5:3b-instruct"

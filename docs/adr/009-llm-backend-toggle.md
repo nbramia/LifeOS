@@ -2,7 +2,9 @@
 
 **Status:** Complete
 **Last Updated:** 2026-05-27
-**Decision:** Accepted
+**Decision:** Superseded
+**Superseded By:** [ADR-024](024-remote-llm-backend.md) — a third `remote` backend value is added alongside `anthropic`/`local`; both original values are unchanged.
+**Amended by:** [ADR-025](025-specialist-call-fallback.md) — the "specialized calls retained on Anthropic regardless of toggle" clause no longer holds when no Anthropic key is configured.
 
 ## Context
 

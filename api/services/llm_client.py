@@ -1024,44 +1024,123 @@ class AnthropicLLMClient:
 _llm_client: LocalLLMClient | AnthropicLLMClient | None = None
 
 
+class LLMBackendNotConfiguredError(RuntimeError):
+    """Raised by get_local_llm() when LIFEOS_LLM_BACKEND selects a backend
+    that isn't actually usable yet (missing key / incomplete remote config).
+
+    Exists so a keyless or partially-configured install fails with a
+    human-readable reason naming exactly what's missing and which setting
+    fixes it, instead of the raw SDK/HTTP exception that would otherwise
+    surface later, at first use, from deep inside a chat turn (#771/#787).
+    """
+
+
 def get_local_llm() -> LocalLLMClient | AnthropicLLMClient:
     """Get or create the LLM client singleton.
 
-    Returns AnthropicLLMClient (default) or LocalLLMClient based on LIFEOS_LLM_BACKEND.
-    Set LIFEOS_LLM_BACKEND=local in .env to use a local llama-server instead.
+    Returns AnthropicLLMClient, LocalLLMClient (local llama-server), or
+    LocalLLMClient pointed at the configured paid remote provider (#771),
+    based on LIFEOS_LLM_BACKEND ("anthropic" default, "local", or "remote").
     """
     global _llm_client
     if _llm_client is None:
         backend = getattr(settings, "llm_backend", "anthropic").lower()
         if backend == "anthropic":
+            if not getattr(settings, "anthropic_api_key", ""):
+                raise LLMBackendNotConfiguredError(
+                    "LIFEOS_LLM_BACKEND is 'anthropic' (the default) but "
+                    "ANTHROPIC_API_KEY is not set. Set ANTHROPIC_API_KEY in "
+                    "your .env, or set LIFEOS_LLM_BACKEND=local (a local "
+                    "llama-server) or LIFEOS_LLM_BACKEND=remote (a "
+                    "configured OpenAI-compatible provider) instead."
+                )
             logger.info("Using Anthropic LLM backend")
             _llm_client = AnthropicLLMClient()
+        elif backend == "remote":
+            if not settings.remote_llm_configured:
+                raise LLMBackendNotConfiguredError(
+                    "LIFEOS_LLM_BACKEND is 'remote' but the remote provider "
+                    "isn't fully configured. Set LIFEOS_REMOTE_LLM_URL, "
+                    "LIFEOS_REMOTE_LLM_MODEL, and LIFEOS_REMOTE_LLM_API_KEY "
+                    "in your .env."
+                )
+            logger.info("Using remote LLM backend at %s", settings.remote_llm_base_url)
+            _llm_client = LocalLLMClient(
+                base_url=settings.remote_llm_base_url,
+                model=settings.remote_llm_model,
+                api_key=settings.remote_llm_api_key,
+                timeout=settings.remote_llm_timeout,
+            )
         else:
             logger.info("Using local LLM backend at %s", settings.local_llm_url)
             _llm_client = LocalLLMClient()
     return _llm_client
 
 
-_anthropic_client: AnthropicLLMClient | None = None
+_anthropic_client: "AnthropicLLMClient | LocalLLMClient | None" = None
 
 
-def get_anthropic_llm() -> AnthropicLLMClient:
-    """Get or create a dedicated Anthropic client for specialist calls.
+def get_anthropic_llm() -> "AnthropicLLMClient | LocalLLMClient":
+    """Get or create the specialist client for relationship insights, fact
+    extraction, and CRM tone analysis, where frontier model quality
+    provides clear value.
 
-    Used by relationship insights, fact extraction, tone analysis, and web search
-    where frontier model quality provides clear value. These always use the Claude
-    API regardless of the LIFEOS_LLM_BACKEND setting.
+    When ANTHROPIC_API_KEY is set: unchanged from before #772 — always the
+    Claude API, regardless of LIFEOS_LLM_BACKEND. Sonnet-tier for quality,
+    resolved from LIFEOS_ANTHROPIC_SPECIALIST_MODEL (default
+    claude-sonnet-5), independent of the orchestrator model
+    (LIFEOS_ANTHROPIC_MODEL). Was previously hardcoded to the dated
+    snapshot claude-sonnet-4-20250514, which retired and 404'd every
+    caller (#470).
 
-    Sonnet-tier for quality — resolved from LIFEOS_ANTHROPIC_SPECIALIST_MODEL
-    (default claude-sonnet-5), independent of the orchestrator model
-    (LIFEOS_ANTHROPIC_MODEL). Was previously hardcoded to the dated snapshot
-    claude-sonnet-4-20250514, which retired and 404'd every caller (#470).
+    When no key is set (#772): these calls used to silently produce
+    nothing on a keyless install (no insights, no facts, no tone scores),
+    because they always built an AnthropicLLMClient regardless of
+    LIFEOS_LLM_BACKEND. Falls back in the same priority order the agent
+    worker's preflight caller already uses
+    (agent_worker/preflight.py:_default_llm_caller): the local
+    llama-server if reachable, else the configured remote provider, else
+    the (unreachable) local client anyway — every existing caller already
+    wraps its `.create()` call in a broad try/except that degrades to its
+    current empty/no-op result, so this function itself never raises for
+    "nothing is configured." A single log line records which backend a
+    keyless install fell back to.
     """
     global _anthropic_client
     if _anthropic_client is None:
-        model = settings.anthropic_specialist_model
-        _anthropic_client = AnthropicLLMClient(model=model)
-        logger.info("Created Anthropic client for specialist calls (%s)", model)
+        if settings.anthropic_api_key:
+            model = settings.anthropic_specialist_model
+            _anthropic_client = AnthropicLLMClient(model=model)
+            logger.info("Created Anthropic client for specialist calls (%s)", model)
+        else:
+            local_client = LocalLLMClient()
+            if local_client.is_available():
+                _anthropic_client = local_client
+                logger.warning(
+                    "No ANTHROPIC_API_KEY set; specialist calls (relationship "
+                    "insights, fact extraction, tone analysis) falling back "
+                    "to the local llama-server at %s", settings.local_llm_url,
+                )
+            elif settings.remote_llm_configured:
+                _anthropic_client = LocalLLMClient(
+                    base_url=settings.remote_llm_base_url,
+                    model=settings.remote_llm_model,
+                    api_key=settings.remote_llm_api_key,
+                    timeout=settings.remote_llm_timeout,
+                )
+                logger.warning(
+                    "No ANTHROPIC_API_KEY set; specialist calls (relationship "
+                    "insights, fact extraction, tone analysis) falling back "
+                    "to the remote provider at %s", settings.remote_llm_base_url,
+                )
+            else:
+                _anthropic_client = local_client
+                logger.warning(
+                    "No ANTHROPIC_API_KEY set and neither a local llama-server "
+                    "nor a configured remote provider is available; specialist "
+                    "calls (relationship insights, fact extraction, tone "
+                    "analysis) will keep failing until one is configured."
+                )
     return _anthropic_client
 
 
@@ -1075,14 +1154,18 @@ def reset_local_llm() -> None:
 
 
 # ============================================================================
-# Routing / validation helpers — always go to the local llama-server.
+# Routing / validation helpers — never Anthropic, regardless of LIFEOS_LLM_BACKEND.
 #
-# Query routing, fact filtering, and entity-cleanup auto-hide decisions used
-# to call Ollama directly (separate runtime at :11434). They were never sent
-# to the cloud and they're cheap enough to keep local even when the main
-# orchestrator is on Anthropic. These helpers wrap LocalLLMClient with the
-# small text / JSON helpers those callers actually need so the rest of the
-# codebase doesn't need to think about Ollama vs llama-server.
+# Query routing, conversation titling, agent-activity summaries, and fact
+# filtering used to call Ollama directly (separate runtime at :11434). They
+# were never sent to the cloud and they're cheap enough to keep off the paid
+# API even when the main orchestrator is on Anthropic. These helpers wrap
+# LocalLLMClient with the small text / JSON helpers those callers actually
+# need so the rest of the codebase doesn't need to think about Ollama vs
+# llama-server. Since #773, "local" is the preferred target but not the only
+# one — generate_text()/generate_json() retry once against the configured
+# remote provider when the local call itself fails (never Anthropic either
+# way); see generate_text's docstring.
 # ============================================================================
 
 _routing_client: LocalLLMClient | None = None
@@ -1094,7 +1177,9 @@ def _get_local_routing_client() -> LocalLLMClient:
 
     Distinct from ``get_local_llm`` because that one switches to Anthropic
     when the backend is set to ``anthropic``; routing/validation should stay
-    local even then.
+    off the paid API even then. This is only the *local* candidate — see
+    ``generate_text`` (#773) for the try-local-then-remote fallback the
+    actual callers below go through.
 
     Cached per resolved URL rather than unconditionally: settings.routing_llm_url
     is configurable (#566), so if it changes after the first call — an operator
@@ -1108,6 +1193,19 @@ def _get_local_routing_client() -> LocalLLMClient:
         _routing_client = LocalLLMClient(base_url=url)
         _routing_client_url = url
     return _routing_client
+
+
+def _remote_routing_client(timeout: float | None = None) -> LocalLLMClient:
+    """Build the fallback client for a routing-tier call (#773): a
+    LocalLLMClient pointed at the configured remote provider. Callers must
+    check ``settings.remote_llm_configured`` first — this always
+    constructs a client, even against empty settings."""
+    return LocalLLMClient(
+        base_url=settings.remote_llm_base_url,
+        model=settings.remote_llm_model,
+        api_key=settings.remote_llm_api_key,
+        timeout=timeout or settings.remote_llm_timeout,
+    )
 
 
 def extract_json(text: str) -> dict:
@@ -1167,29 +1265,50 @@ async def generate_text(
     enable_thinking: bool | None = None,
     reasoning_effort: str | None = None,
 ) -> str:
-    """Generate raw text from the local LLM.
+    """Generate raw text from a routing-tier LLM.
 
     Replaces ``OllamaClient.generate(...)`` for routing / validation callers.
-    A per-call ``timeout`` uses a transient client (still pinned to
-    ``settings.routing_llm_url``, same as the cached singleton — a caller
-    passing ``timeout`` must not silently fall back to the main chat model's
-    URL) so concurrent default-timeout calls aren't affected.
+    Tries the local llama-server (``settings.routing_llm_url``, still the
+    #566 override point) first — on a reachable local server this is
+    byte-for-byte the same single request as before #773, no added probe or
+    round trip. Only if that call itself fails does it retry once against
+    the configured remote provider (#773); if remote isn't configured
+    either, the local failure propagates exactly as it did before this
+    fallback existed, so every existing caller's own no-op/default handling
+    (`route()`'s keyword fallback, the titler's `except Exception`, etc.)
+    still applies unchanged. Never Anthropic, regardless of
+    ``LIFEOS_LLM_BACKEND`` — same invariant ``_get_local_routing_client``
+    already documents for these calls.
+
+    A per-call ``timeout`` uses a transient local client so concurrent
+    default-timeout calls aren't affected — three of the four real callers
+    pass one today, so this branch is the common case, not an edge case.
     ``enable_thinking``/``reasoning_effort`` are forwarded to
     ``LocalLLMClient.acreate`` unchanged — see ``_reasoning_control_payload``;
     both default to ``None`` (unset).
     """
-    client = (
+    local_client = (
         LocalLLMClient(base_url=settings.routing_llm_url, timeout=timeout)
         if timeout is not None
         else _get_local_routing_client()
     )
-    response = await client.acreate(
+    kwargs = dict(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
         temperature=temperature,
         enable_thinking=enable_thinking,
         reasoning_effort=reasoning_effort,
     )
+    try:
+        response = await local_client.acreate(**kwargs)
+    except Exception:
+        if not settings.remote_llm_configured:
+            raise
+        logger.warning(
+            "Routing-tier local LLM call failed; falling back to the "
+            "configured remote provider at %s", settings.remote_llm_base_url,
+        )
+        response = await _remote_routing_client(timeout).acreate(**kwargs)
     if response.reasoning_starved:
         logger.warning(
             "LLM reasoning starved the response: spent the entire %d-token budget "
@@ -1228,16 +1347,29 @@ async def generate_json(
 
 
 def is_local_routing_llm_available() -> bool:
-    """Sync availability check for routing/validation callers."""
+    """Sync availability check for routing/validation callers.
+
+    True if either the local llama-server is reachable or the remote
+    provider is configured (#773), so a caller gating on this doesn't skip
+    straight to its no-op fallback while ``generate_text``'s own
+    local-then-remote retry has a working remote provider to fall back to.
+    Remote is checked by configuration, not a live probe — see
+    ``LocalLLMClient.is_available``'s own "remote is used unprobed, by
+    design" note.
+    """
     try:
-        return _get_local_routing_client().is_available()
+        if _get_local_routing_client().is_available():
+            return True
     except Exception:
-        return False
+        pass
+    return bool(settings.remote_llm_configured)
 
 
 async def ais_local_routing_llm_available() -> bool:
-    """Async availability check for routing/validation callers."""
+    """Async availability check — see ``is_local_routing_llm_available``."""
     try:
-        return await _get_local_routing_client().ais_available()
+        if await _get_local_routing_client().ais_available():
+            return True
     except Exception:
-        return False
+        pass
+    return bool(settings.remote_llm_configured)

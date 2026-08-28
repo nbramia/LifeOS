@@ -18,6 +18,11 @@ never by re-reading a config file:
   restarted against a different one without this setting changing (exactly
   the tracked-snapshot-vs-live mismatch hermes#49 hit), so it's confirmed
   with a live probe instead of trusted.
+- LifeOS native picker, remote backend (#771): `settings.remote_llm_model`
+  IS the live value, same reasoning as the Anthropic bullet above — it's
+  the exact model id `get_local_llm()` builds the singleton client with,
+  not a value that could drift out from under this process the way a
+  restarted external llama-server could.
 - Hermes chat: `LIFEOS_HERMES_BACKEND_URL` (confirmed live on the real host,
   #658 review) points at LifeOS's own hermes-lifeos-adapter, not the Hermes
   gateway itself — the adapter has no `/v1/models` (or any capability
@@ -109,6 +114,8 @@ async def get_lifeos_native_model() -> dict:
     actually runs on right now. See module docstring for the per-backend
     rationale."""
     backend = (settings.llm_backend or "anthropic").lower()
+    if backend == "remote":
+        return {"status": "ok", "backend": "remote", "model": settings.remote_llm_model}
     if backend != "local":
         return {"status": "ok", "backend": "anthropic", "model": settings.anthropic_model}
 

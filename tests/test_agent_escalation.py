@@ -621,6 +621,23 @@ def test_force_local_reuses_singleton_on_local_backend(monkeypatch):
     assert _select_client("", force_local=True) is sentinel
 
 
+def test_force_local_builds_local_client_on_remote_backend(monkeypatch):
+    """(#771) The "Gemma" picker option always means the on-box llama-server,
+    never whatever LIFEOS_LLM_BACKEND=remote's singleton happens to point
+    at -- reusing the singleton here (as a naive `!= "anthropic"` check
+    would) would silently hand a "local" pick to the remote provider."""
+    sentinel = object()  # would-be remote singleton -- must NOT be returned
+    monkeypatch.setattr("api.services.agent_loop.settings.llm_backend", "remote", raising=False)
+    monkeypatch.setattr("api.services.agent_loop.get_local_llm", lambda: sentinel)
+
+    client = _select_client("", force_local=True)
+
+    from api.services.llm_client import LocalLLMClient
+    assert isinstance(client, LocalLLMClient)
+    assert client is not sentinel
+    assert client.base_url == LocalLLMClient().base_url
+
+
 # ---------------------------------------------------------------------------
 # Model picker: per-turn remote provider ("Remote", #654)
 # ---------------------------------------------------------------------------
