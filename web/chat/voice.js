@@ -2495,6 +2495,10 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
   showThinking();
   activeTurnId = null;
   activeTurnAbort = new AbortController();
+  // Captured so the catch below (#827) can tell "this turn's own controller
+  // is still current" from "a newer turn already replaced it" -- distinct
+  // from activeTurnAbort itself, which a later submitTurn() call reassigns.
+  const ownAbortController = activeTurnAbort;
 
   // #801 -- hold the recording until the turn *definitively* completes (see
   // `heldRecording`'s own comment). Set here, unconditionally, so a fresh
@@ -2593,9 +2597,11 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
       // clobbering a next turn that started in the meantime. A turn
       // cancelled server-side (the 'cancelled' SSE branch above, reachable
       // with no local cancelActiveTurn() call -- see #827) never goes
-      // through that reset, and activeTurnAbort is still this turn's own
-      // controller in that case, so do it here instead.
-      if (activeTurnAbort) {
+      // through that reset, and activeTurnAbort is still THIS turn's own
+      // controller in that case -- checked by identity, not mere presence,
+      // so a stale turn settling after a newer one has already started
+      // can't stomp on the newer turn's UI either.
+      if (activeTurnAbort === ownAbortController) {
         clearThinking();
         showCancel(false);
         setStatus('', 'Ready');
