@@ -1,7 +1,7 @@
 # First Run Guide
 
 > **Status:** Complete
-> **Last Updated:** 2026-07-09
+> **Last Updated:** 2026-08-28
 > **Audience:** New users
 
 Post-installation guide for your first use of LifeOS.

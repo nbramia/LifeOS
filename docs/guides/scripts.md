@@ -1,10 +1,10 @@
 # Scripts Reference
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-27
+> **Last Updated:** 2026-08-28
 > **Audience:** Operators
 
-Reference for all LifeOS scripts with usage examples.
+Reference for the operator-facing scripts under `scripts/`, with usage examples. One-off CRM entity-repair scripts (`merge_people.py`, `split_person.py`, `fix_*`, etc.), git hooks, and Claude Code worktree/session-diagnostic helpers aren't covered here — they're self-documenting via `--help` or their own docstring.
 
 ---
 
@@ -74,6 +74,16 @@ Run test suites.
 ./scripts/test.sh smoke    # Unit + critical browser tests
 ./scripts/test.sh all      # Full test suite (slower)
 ```
+
+### remote-test.sh
+
+For a machine with no local venv (e.g. a MacBook that isn't the server): rsyncs your uncommitted working tree to an isolated branch-keyed directory on a remote test-runner host and runs the same `test.sh auto` scope there.
+
+```bash
+LIFEOS_REMOTE_HOST=<ssh-target> ./scripts/remote-test.sh
+```
+
+Set `LIFEOS_REMOTE_HOST` once in your shell profile — there is no default.
 
 ---
 
@@ -197,8 +207,11 @@ Example:
 | Script | Purpose |
 |--------|---------|
 | `backup.sh` | Backup data directory |
+| `setup_identity.py` | Guided first-run identity setup: search+pick yourself, your partner, and family in the vault; set work email domain(s); writes `LIFEOS_MY_PERSON_ID`/`LIFEOS_PARTNER_NAME`/`LIFEOS_WORK_DOMAIN*` to `.env` and merges `config/family_members.json`/`config/relationship_overrides.json`. Run once, after the first sync/index — requires the API server up. |
+| `monarch_reauth.py` | Non-interactive Monarch Money MFA re-auth (the interactive `interactive_login` flow needs a real TTY, which agent shells don't have) — see [operations.md](operations.md#monarch-money-financial-data). |
 | `chromadb-watchdog.sh` | ChromaDB health check and auto-restart |
-| `clear-caches.sh` | Clear embedding and search caches |
+| `gpu-watchdog.sh` | Alerts via Telegram when GPU VRAM usage crosses a threshold, to catch impending OOM lockups before an embedding-heavy sync triggers one. Linux only (AMDGPU sysfs). Installed as `lifeos-gpu-watchdog.timer` by `setup-systemd.sh`. |
+| `server-watchdog.sh` | Detects and restarts a stuck/duplicated API server (duplicate uvicorn processes, unresponsive after long syncs). Installed as `lifeos-server-watchdog.timer` by `setup-systemd.sh`; on macOS, run from a cron entry via the `LifeOS.app` FDA wrapper. |
 | `network-watchdog.sh` | WiFi link health check and self-heal (re-activate → bounce radio → reload driver → restart NetworkManager) |
 | `auto-deploy.sh` | Poll `origin/main`; on a fast-forward advance, pull and restart the code services that changed. Pull-based, guarded (main branch + clean tree + `--ff-only`), opt-in via `LIFEOS_AUTODEPLOY_ENABLED`. Run by `lifeos-autodeploy.timer`. |
 | `auto-update-macos.sh` | The macOS analog of `auto-deploy.sh` for the launchd-managed API service. Same opt-in flag and guards; not installed as a timer by this repo — an operator adds their own cron/launchd entry. See [Auto-Deploy on macOS](operations.md#auto-deploy-on-macos-self-hosted-redeploy) in operations.md. |
