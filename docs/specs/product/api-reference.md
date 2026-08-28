@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-08-19
+**Last Updated:** 2026-08-28
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two adjacent catalogs split out for size:
 
@@ -226,6 +226,8 @@ Spawn a CLI engine worker session when the orchestrator emits `claude_intent` on
 - `POST /api/hermes/ask/stream` — text turn for the "Hermes" backend; same SSE and proxy behavior as the Agent backend above (same factory, `LIFEOS_HERMES_BACKEND_URL`), but the persona picker stays visible client-side, and the route resolves the selected persona (with `surface="hermes"`, so a persona with a Hermes-specific body — e.g. `doctor` — gets that instead of its plain one) and per-turn context and attaches them to the forwarded body as a `lifeos_context` envelope (`{schema_version, modality, persona: {id, label, preamble, voice_rules, orchestrates}, turn: {...}}`, `turn` a sibling of `persona` per [`GET /api/chat/turn-context`](#get-apichatturn-context)) — a cross-repo contract with `nbramia/hermes` pinned on issue #590. Rejects with 400 (before forwarding) on malformed JSON or an unknown `persona_id`. An orchestrating persona (e.g. `doctor`) reaching this route used to be a third 400 case, backstopping a client-side diversion to [`POST /api/ask/stream`](#post-apiaskstream) (#596) — **as of #642 that diversion and backstop are both gone**: the persona reaches this route like any other, and `lifeos_context.persona.orchestrates` can now be `true` (a cross-repo contract change from its previous always-`false` guarantee — **this merge is gated on `nbramia/hermes#57`**, which stops Hermes from treating `true` as fatal; see client-surfaces.md for the full picture). `GET /api/hermes/status` → `{"available": bool, "configured": bool, "reachable": bool}` — `available` is true only when both `configured` (a URL is set) and `reachable` (a cached, short-timeout probe of that URL succeeded) hold, distinguishing "not set up" from "set up but down" (`GET /api/agent/status`'s `configured`/`reachable` fields, by contrast, both just mirror `available` — configuration alone, no reachability probe). See [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" for the full schema.
 - **Hermes turns are persisted** (#592) **and survive a client disconnect** (#611), unlike the Agent backend: the route tees the relayed SSE bytes to the browser unchanged and, in parallel, reconstructs the turn from the `conversation_id` and `content` events it already emits (same shapes the native `POST /api/ask/stream` uses) — adopting the id Hermes minted, creating the conversation row (tagged `persona_id` + `backend: "hermes"`) on first sight of it, and storing the user question and assembled assistant reply as two messages. Since #611 the upstream drain runs as a background pump independent of the browser connection, so a disconnect no longer cuts a Hermes turn short either — it persists the *complete* reply, not just whatever had streamed so far. A turn whose upstream connection genuinely ends before a `done` event ever arrived still gets a truncation marker + `routing.truncated` (see [client-surfaces.md](../technical/client-surfaces.md#turn-lifetime-and-cancellation-611)). A persistence failure is logged and never breaks the turn. This is why `GET /api/conversations?backend=hermes` and the sidebar now show Hermes history at all.
 - **Hermes usage is captured too** (#595), by the same tee: a relayed `usage` event (`input_tokens`, `output_tokens`, `cost_usd`, `model` — the same shape the native path emits) is recorded to the usage store on turn completion, tagged with the conversation id. The cost is recorded **verbatim** from that event, never recomputed — the cost calculator only knows Anthropic pricing and would misprice a non-Anthropic upstream model (Hermes runs DeepSeek via Fireworks). A `usage` event with no `cost_usd` records a zero cost rather than a guess; a turn with no `usage` event writes no row; a malformed one (missing/wrong-typed model or token counts) is ignored. Conversation persistence and usage persistence are independent — neither gates the other. Since this is the same event shape and client handler (`web/chat/ask-stream.js`'s `data.type === 'usage'` branch) the native path already uses, the browser's session-cost display updates with **no client change**. The Agent backend has no equivalent — it isn't tee'd at all, so its turns stay invisible to the usage store. See [client-surfaces.md](../technical/client-surfaces.md) § "Hermes turn persistence" for the observer internals.
+- `POST /api/hermes/resolve-persona` — **inbound**, called by Hermes's own Telegram front door (not by `/chat`), with the raw incoming text. Resolves `@tag` → persona, or inherits a persona from the message being replied to (via a persona-thread store), or resolves to nothing; returns `{persona_id, text, lifeos_context}` for Hermes to use when it makes its own upstream call. Requires the bearer configured as `LIFEOS_HERMES_BACKEND_TOKEN`; empty (unset) means the route always 503s.
+- `POST /api/hermes/register-persona-message` — **inbound**, same auth. Anchors a Hermes-authored reply's message id to the persona that produced it, so a later reply-to-that-message inherits the same persona in `resolve-persona` above.
 
 See [client-surfaces.md](../technical/client-surfaces.md) and [ADR-016](../../adr/016-voice-gateway-reverse-proxy.md).
 
@@ -725,7 +727,7 @@ Open a photo in Preview or Photos app. Tries the original file first, falls back
 
 ## Task Endpoints
 
-Tasks can also be created, completed, listed, and deleted via natural language through the chat interface (`POST /api/ask/stream`). See [Task Management Guide](../guides/TASK-MANAGEMENT.md).
+Tasks can also be created, completed, listed, and deleted via natural language through the chat interface (`POST /api/ask/stream`). See [Task Management](task-management.md).
 
 ### POST /api/tasks
 
@@ -774,7 +776,7 @@ Delete a task.
 
 ## Scheduler & Telegram Endpoints
 
-Schedules can also be created, edited, listed, and deleted via natural language through the chat interface (`POST /api/ask/stream`). See [Scheduler Guide](../guides/scheduler.md).
+Schedules can also be created, edited, listed, and deleted via natural language through the chat interface (`POST /api/ask/stream`). See [Scheduler Guide](../../guides/scheduler.md).
 
 > The legacy `/api/reminders*` endpoints remain mounted as deprecation-logged aliases over the same store.
 
@@ -814,11 +816,36 @@ Send an ad-hoc message via Telegram.
 
 Live financial data from Monarch Money. Monthly summaries are also synced to the vault.
 
+### GET /api/monarch/session_status
+
+Report cached Monarch session age and expiry-soon warnings, without making a network call — used by `/health/services` and dashboards to surface an impending re-auth requirement before the monthly sync hits a 401/525.
+
+**Response:** `{exists: bool, age_days: float | null, status: "missing" | "expired" | "expiring_soon" | "ok", message: str}`
+
 ### GET /api/monarch/accounts
 
 List all financial accounts with current balances.
 
 **Response:** Array of `{name, type, subtype, balance, institution, last_updated}`
+
+### GET /api/monarch/holdings
+
+Investment holdings for one account.
+
+**Query Parameters:**
+- `account_id` (string, required)
+
+**Response:** `{holdings: [...], count: int}` — empty list if the institution doesn't supply holdings through Plaid.
+
+### GET /api/monarch/history
+
+Daily balance snapshots for one account.
+
+**Query Parameters:**
+- `account_id` (string, required)
+- `start_date` (string, optional): YYYY-MM-DD; omit for full history.
+
+**Response:** `{history: [{date, balance}], count: int}`
 
 ### GET /api/monarch/transactions
 
@@ -881,11 +908,11 @@ Cancel a pending job. Only pending jobs can be cancelled.
 
 ### GET /health
 
-Basic health check. Verifies API key and scheduler status.
+Basic health check. Verifies API key and scheduler status. `api_key_configured` reports whether `ANTHROPIC_API_KEY` is set — a supported `LIFEOS_LLM_BACKEND=local` or `=remote` install with no Anthropic key still reports this as unset/degraded here; that's expected, not a sign the install is broken (#797).
 
 ### GET /health/full
 
-Comprehensive health check. Tests all services (ChromaDB, vault search, calendar, Gmail, Drive, people, conversations, memories, iMessage) with per-service latency.
+Comprehensive health check. Tests all services (ChromaDB, vault search, calendar, Gmail, Drive, people, conversations, memories, iMessage) with per-service latency. The `local_llm` check reports `{"status": "not_in_use", "detail": "LIFEOS_LLM_BACKEND=... not in use"}` rather than probing reachability when `LIFEOS_LLM_BACKEND` isn't `local` — an honest "not applicable" instead of a stale "ok" (#797).
 
 ### GET /health/services
 

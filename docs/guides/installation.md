@@ -1,7 +1,7 @@
 # Installation Guide
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-26
+> **Last Updated:** 2026-08-28
 > **Audience:** New users
 
 > **Quick start**: If you have Claude Code, run it in the project root and point it at
@@ -160,7 +160,9 @@ A minimal `.env` to boot:
 # Required
 LIFEOS_VAULT_PATH=/path/to/your/obsidian/vault
 
-# LLM backend: "anthropic" (default; requires ANTHROPIC_API_KEY) or "local" (requires llama-server on port 8080)
+# LLM backend: "anthropic" (default; requires ANTHROPIC_API_KEY), "local" (requires
+# llama-server on port 8080), or "remote" (any OpenAI-compatible hosted provider, e.g.
+# Fireworks — requires LIFEOS_REMOTE_LLM_URL/_MODEL/_API_KEY, see configuration.md)
 LIFEOS_LLM_BACKEND=anthropic
 ANTHROPIC_API_KEY=sk-ant-...
 
