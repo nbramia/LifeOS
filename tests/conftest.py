@@ -388,6 +388,39 @@ def _guard_live_vectorstore_collections(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_vectorstore_singletons(monkeypatch):
+    """Clear the process-wide VectorStore/HybridSearch singleton caches
+    around every test (#828 follow-up).
+
+    ``api.services.vectorstore.get_vector_store()`` and
+    ``api.routes.search``'s own separate ``get_vector_store()`` /
+    ``get_hybrid_search()`` each memoize a real instance in a module-level
+    global the first time they're called. A test marked
+    ``uses_live_vectorstore`` (e.g. ``test_search_api.py``) legitimately
+    populates one of these with a REAL, live-connected instance — and
+    because xdist reuses one process for many tests (``--dist loadscope``
+    groups by module, but a worker still runs many modules over its
+    lifetime), a *later*, unmarked test in the same worker that happens to
+    call the same getter would silently receive that already-constructed
+    live instance without ever calling ``VectorStore.__init__`` again —
+    completely bypassing the guard above, which can only see construction,
+    not reuse. Reset before and after every test so no test can ever
+    inherit another test's cached singleton, live or otherwise.
+    """
+    import api.routes.search as search_route_mod
+    import api.services.vectorstore as vectorstore_mod
+
+    def _clear():
+        monkeypatch.setattr(vectorstore_mod, "_vector_store", None)
+        monkeypatch.setattr(search_route_mod, "_vector_store", None)
+        monkeypatch.setattr(search_route_mod, "_hybrid_search", None)
+
+    _clear()
+    yield
+    _clear()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_telegram_state_file(tmp_path, monkeypatch):
     """Keep tests off the production Telegram offset file (#357).
 
