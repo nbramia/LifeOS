@@ -32,7 +32,7 @@ DEFAULT_PAGE_SIZE = 500
 DEFAULT_DELETE_BATCH_SIZE = 200
 
 
-def is_stray_tmp_row(file_path: str) -> bool:
+def is_stray_tmp_row(file_path: str, vault_root: "Path | None" = None) -> bool:
     """True only for an absolute file_path rooted at an OS temp directory.
 
     - Real vault documents always store an absolute, resolved path under
@@ -41,11 +41,27 @@ def is_stray_tmp_row(file_path: str) -> bool:
       pseudo-paths, which can't start with `/tmp/` either.
     - A prefix check (not a substring check) so a real document that merely
       *mentions* "/tmp/" somewhere in its path is never swept up.
+
+    `vault_root`, when given, is an extra belt-and-suspenders check: on the
+    off chance a real install's vault happens to live under `/tmp` (an
+    unusual but not impossible configuration), a path under the *actual
+    configured* vault root is never treated as stray even if it also
+    happens to start with `/tmp/`.
     """
-    return bool(file_path) and file_path.startswith("/tmp/")
+    if not file_path or not file_path.startswith("/tmp/"):
+        return False
+    if vault_root is not None:
+        try:
+            if Path(file_path).is_relative_to(vault_root):
+                return False
+        except (TypeError, ValueError):
+            pass
+    return True
 
 
-def find_stray_rows(collection, page_size: int = DEFAULT_PAGE_SIZE) -> list[tuple[str, str]]:
+def find_stray_rows(
+    collection, page_size: int = DEFAULT_PAGE_SIZE, vault_root: "Path | None" = None
+) -> list[tuple[str, str]]:
     """Page through `collection` and return (id, file_path) for every row
     whose file_path looks like tmp-vault test debris."""
     stray: list[tuple[str, str]] = []
@@ -58,7 +74,7 @@ def find_stray_rows(collection, page_size: int = DEFAULT_PAGE_SIZE) -> list[tupl
         metadatas = page.get("metadatas") or []
         for row_id, meta in zip(ids, metadatas):
             file_path = (meta or {}).get("file_path", "")
-            if is_stray_tmp_row(file_path):
+            if is_stray_tmp_row(file_path, vault_root=vault_root):
                 stray.append((row_id, file_path))
         offset += len(ids)
         if len(ids) < page_size:
@@ -75,12 +91,14 @@ def main():
     args = parser.parse_args()
 
     from api.services.vectorstore import VectorStore
+    from config.settings import settings
 
     store = VectorStore(collection_name=args.collection)
     total = store.get_document_count()
     print(f"Collection '{args.collection}': {total} total row(s)")
 
-    stray = find_stray_rows(store._collection, page_size=args.page_size)
+    vault_root = Path(settings.vault_path).resolve()
+    stray = find_stray_rows(store._collection, page_size=args.page_size, vault_root=vault_root)
     print(f"Found {len(stray)} stray row(s) with a file_path under /tmp/")
 
     preview_limit = 20

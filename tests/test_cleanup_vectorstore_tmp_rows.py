@@ -7,6 +7,8 @@ source" — so most of this file is about what the selector must *not*
 match, using the same fake-collection pattern as
 `test_vault_root_check.py::_StubCollection`.
 """
+from pathlib import Path
+
 import pytest
 
 from scripts.cleanup_vectorstore_tmp_rows import find_stray_rows, is_stray_tmp_row
@@ -51,6 +53,17 @@ class TestIsStrayTmpRow:
 
     def test_empty_path_does_not_match(self):
         assert not is_stray_tmp_row("")
+
+    def test_vault_root_check_wins_even_under_tmp(self):
+        """Belt-and-suspenders: if the *configured* vault root itself lives
+        under /tmp (an unusual but possible setup), a real document there
+        must never be treated as stray."""
+        vault_root = Path("/tmp/my-real-vault")
+        assert not is_stray_tmp_row("/tmp/my-real-vault/Personal/journal.md", vault_root=vault_root)
+
+    def test_a_sibling_tmp_dir_still_matches_with_vault_root_set(self):
+        vault_root = Path("/tmp/my-real-vault")
+        assert is_stray_tmp_row("/tmp/tmp8f2k3a9x/vault/note.md", vault_root=vault_root)
 
 
 class TestFindStrayRows:
