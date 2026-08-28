@@ -1105,6 +1105,29 @@ def main():
             existing_results = existing_manifest.get("results")
             if isinstance(existing_results, dict):
                 manifest_results = {**existing_results, **results}
+                # Issue #820: a preserved entry from before per-source
+                # timestamps existed has no exported_at of its own — this is
+                # the last point where the old top-level value (describing
+                # when that entry actually last ran) is still recoverable,
+                # since this same write is about to replace the top-level
+                # field with this run's timestamp. Without backfilling here,
+                # the very next partial run after upgrading would silently
+                # reproduce the original bug for every source this run
+                # didn't touch, just one generation later.
+                old_exported_at = existing_manifest.get("exported_at")
+                old_agent_sha = existing_manifest.get("agent_sha")
+                for name, entry in manifest_results.items():
+                    if name in results or not isinstance(entry, dict):
+                        continue  # freshly stamped above, or not a dict
+                    if not entry.get("exported_at") and old_exported_at:
+                        logger.info(
+                            f"Backfilling {name}'s manifest entry with the "
+                            f"previous top-level exported_at ({old_exported_at}) "
+                            "— legacy entry, no per-source timestamp of its own."
+                        )
+                        entry["exported_at"] = old_exported_at
+                    if not entry.get("agent_sha") and old_agent_sha:
+                        entry["agent_sha"] = old_agent_sha
             else:
                 logger.error(
                     f"Existing manifest at {manifest_path} has no usable "

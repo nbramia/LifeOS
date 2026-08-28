@@ -1097,10 +1097,13 @@ class TestPerSourceStaleness:
 
         assert exc_info.value.code == 1
 
-    def test_configured_working_source_produces_identical_result(self, tmp_path, monkeypatch):
+    def test_configured_working_source_produces_identical_result(
+        self, tmp_path, monkeypatch, capsys
+    ):
         """A source that is configured and healthy (fresh per-source
-        timestamp, no error) must produce an identical result dict after
-        this change — the staleness/error overrides must be true no-ops."""
+        timestamp, no error) must produce identical printed results and
+        SYNC_STATS after this change — the staleness/error overrides must be
+        true no-ops, not just "doesn't raise"."""
         import scripts.apple_data_import as import_mod
 
         import_dir = tmp_path / "apple-imports"
@@ -1126,6 +1129,26 @@ class TestPerSourceStaleness:
         ])
 
         import_mod.main()  # must not raise / exit
+
+        printed = capsys.readouterr().out
+        lines = printed.strip().splitlines()
+        sync_stats_line = next(line for line in lines if line.startswith("SYNC_STATS:"))
+        # Everything before the SYNC_STATS line is the pretty-printed
+        # {"results": {...}} block — untouched by either override, i.e.
+        # exactly what import_contacts itself returned.
+        results_block = printed[: printed.index(sync_stats_line)]
+        results_json = json.loads(results_block)
+        assert results_json == {
+            "results": {
+                "contacts": {"status": "ok", "created": 3, "updated": 1, "linked": 2},
+            }
+        }
+        # SYNC_STATS reflects that same untouched result, aggregated the
+        # same way it always has (created -> source_entities_created,
+        # linked -> people_updated).
+        stats = json.loads(sync_stats_line[len("SYNC_STATS:"):])
+        assert stats["source_entities_created"] == 3
+        assert stats["people_updated"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1265,11 +1288,62 @@ class TestManifestMergeOnPartialExport:
             "status": "ok", "count": 1, "path": "fake",
             "exported_at": manifest["exported_at"], "agent_sha": "newsha456",
         }
-        # ...and every other source's prior entry is untouched.
-        assert results["contacts"] == {"status": "ok", "count": 5}
-        assert results["imessage"] == {"status": "ok", "count": 10}
-        assert results["phone"] == {"status": "error", "error": "boom"}
-        assert results["photos"] == {"status": "ok", "count": 2}
+        # ...and every other source's prior entry is untouched, except for a
+        # backfilled exported_at/agent_sha (issue #820 follow-up): these
+        # entries predate per-source timestamps, and the old top-level
+        # values describing when they actually ran are only available right
+        # now, before this write replaces the top level with today's run.
+        assert results["contacts"] == {
+            "status": "ok", "count": 5,
+            "exported_at": "2026-01-01T00:00:00+00:00", "agent_sha": "oldsha123",
+        }
+        assert results["imessage"] == {
+            "status": "ok", "count": 10,
+            "exported_at": "2026-01-01T00:00:00+00:00", "agent_sha": "oldsha123",
+        }
+        assert results["phone"] == {
+            "status": "error", "error": "boom",
+            "exported_at": "2026-01-01T00:00:00+00:00", "agent_sha": "oldsha123",
+        }
+        assert results["photos"] == {
+            "status": "ok", "count": 2,
+            "exported_at": "2026-01-01T00:00:00+00:00", "agent_sha": "oldsha123",
+        }
+
+    def test_backfills_legacy_entry_exported_at_only_when_missing(self, tmp_path, monkeypatch):
+        """A preserved entry that already carries its own per-source
+        exported_at (written by this fixed exporter on some earlier run)
+        must NOT be clobbered by the backfill — only genuinely legacy
+        entries (no exported_at of their own) get the top-level fallback."""
+        import scripts.apple_data_export as export_mod
+
+        existing_manifest = {
+            "exported_at": "2026-01-01T00:00:00+00:00",
+            "hostname": "old-host",
+            "agent_sha": "oldsha123",
+            "results": {
+                "contacts": {
+                    "status": "ok", "count": 5,
+                    "exported_at": "2025-06-01T00:00:00+00:00", "agent_sha": "reallyoldsha",
+                },
+            },
+        }
+        (tmp_path / "manifest.json").write_text(json.dumps(existing_manifest))
+
+        monkeypatch.setattr(export_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(export_mod, "EXPORT_DIR", tmp_path)
+        monkeypatch.setattr(export_mod, "_get_agent_sha", lambda: "newsha456")
+        monkeypatch.setattr(
+            export_mod.sys, "argv",
+            ["apple_data_export.py", "--execute", "--source", "whatsapp"],
+        )
+        monkeypatch.setattr(export_mod, "export_whatsapp", self._fake_source)
+
+        export_mod.main()
+
+        manifest = json.loads((tmp_path / "manifest.json").read_text())
+        assert manifest["results"]["contacts"]["exported_at"] == "2025-06-01T00:00:00+00:00"
+        assert manifest["results"]["contacts"]["agent_sha"] == "reallyoldsha"
 
     def test_single_source_run_with_no_existing_manifest_writes_just_that_source(
         self, tmp_path, monkeypatch
