@@ -260,7 +260,7 @@ CURATED_ENDPOINTS = {
     },
     "/api/admin/sync:POST": {
         "name": "lifeos_sync_trigger",
-        "description": "Trigger a background data sync. source: vault, calendar, contacts, slack, photos, gmail, imessage, phone, facetime, linkedin.",
+        "description": "Trigger a background data sync. source: vault, calendar, contacts, slack, photos, gmail, imessage, phone, facetime, linkedin, whatsapp.",
         "method": "POST",
         "path": "/api/admin/sync",
         "custom_handler": True
@@ -862,7 +862,7 @@ class LifeOSMCPServer:
             "lifeos_sync_trigger": {
                 "type": "object",
                 "properties": {
-                    "source": {"type": "string", "description": "Sync source: vault, calendar, contacts, slack, photos, gmail, imessage, phone, facetime, linkedin"}
+                    "source": {"type": "string", "description": "Sync source: vault, calendar, contacts, slack, photos, gmail, imessage, phone, facetime, linkedin, whatsapp"}
                 },
                 "required": ["source"]
             },
@@ -1121,7 +1121,7 @@ class LifeOSMCPServer:
         }
 
         valid_sources = list(route_map.keys()) + [
-            "gmail", "imessage", "phone", "facetime", "linkedin"
+            "gmail", "imessage", "phone", "facetime", "linkedin", "whatsapp"
         ]
 
         if source in route_map:

@@ -331,6 +331,41 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 ~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --force
 ```
 
+### First-Backfill Entry Point
+
+The nightly window above is deliberately narrow — Gmail/Calendar look back
+only 30 days each night, to keep the nightly run fast. A fresh install
+therefore starts with an empty interaction history that the nightly job
+never fills in on its own. `scripts/first_backfill.py` is the one-time deep
+pass to run right after initial setup: it runs the same sources, in the
+same Phase 1-4 order (collection, entity processing, relationship
+building, indexing), but any source whose nightly invocation narrows its
+own lookback window (Gmail, Calendar) is instead run at that script's own
+full-history default (currently ten years) rather than the nightly window.
+Phase 5-7 (content sync, cleanup, consistency verification) and sources
+with no "full history" concept (`push_birthdays`) aren't part of it — see
+the script's own docstring for the exact exclusion list and reasoning.
+
+```bash
+# Preview what would run, without running anything
+~/.venvs/lifeos/bin/python scripts/first_backfill.py --dry-run
+
+# Run the one-time deep backfill
+~/.venvs/lifeos/bin/python scripts/first_backfill.py --execute
+```
+
+Safe to re-run: it reuses the same per-source scripts as the nightly job
+unmodified, and those are already idempotent (upsert by source ID, not
+append-only). An unconfigured source is reported as a clean skip, not a
+failure (#687's pattern), and one source failing doesn't stop the rest of
+the backfill from running. When it finishes, it prints a coverage report
+(record count and earliest/latest date per source) read from
+`data/interactions.db` — a quick way to confirm history actually arrived.
+This is a one-time pass, not part of nightly health monitoring: it does
+not touch `sync_health`'s run-history tables, so it can't skew the
+duration/yield-collapse baselines the nightly job's own anomaly detection
+is tuned against.
+
 ---
 
 ## Configuration
@@ -629,6 +664,7 @@ The scraping system uses Claude in Chrome MCP for browser automation. It require
 - [Entity Resolution](../product/entity-resolution.md) -- How source entities are linked to canonical records
 - [Search & Indexing](search-indexing.md) -- Hybrid search pipeline
 - [Installation](../../guides/installation.md) -- Config-only second-user setup checklist, which points here for the unconfigured-source clean-skip pattern
+- [First Run](../../guides/first-run.md) -- New-install walkthrough; Step 4 points here for the first-backfill entry point
 - [ADR-002: ChromaDB](../../adr/002-chromadb-vector-store.md) -- Why ChromaDB was chosen
 - [ADR-003: Two-Tier Data Model](../../adr/003-two-tier-data-model.md) -- Why SourceEntity and PersonEntity are separate
 - [ADR-012: Embedding Pipeline](../../adr/012-embedding-pipeline.md) -- Embedding model, GPU/CPU fallback, pre-flight RAM gate around phase 4

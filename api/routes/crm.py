@@ -2256,7 +2256,11 @@ async def sync_source(source_type: str):
     """
     Trigger a sync for a specific data source.
     """
-    valid_sources = {"gmail", "calendar", "slack", "contacts", "imessage", "linkedin", "vault"}
+    # WhatsApp has no standalone nightly sync of its own (issue #784) — its
+    # data is imported as part of the combined apple_import step, so a
+    # WhatsApp entry here belongs at the same (currently stub, see TODO
+    # below) parity level as gmail/imessage/linkedin, not below it.
+    valid_sources = {"gmail", "calendar", "slack", "contacts", "imessage", "linkedin", "vault", "whatsapp"}
     if source_type not in valid_sources:
         raise HTTPException(status_code=400, detail=f"Invalid source type: {source_type}")
 

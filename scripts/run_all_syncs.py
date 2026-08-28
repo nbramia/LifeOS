@@ -442,8 +442,8 @@ def log_sync_summary_to_markdown(result: dict, trigger: str = "unknown"):
                 lines.append(f"- {src}")
 
     # Apple Data Agent SHA drift (#646) — a silently-broken self-update on
-    # the Mac Mini export agent, surfaced here instead of a log line no
-    # batched report reads.
+    # the (installer-configurable) export agent, surfaced here instead of a
+    # log line no batched report reads.
     apple_agent_sha_drift = result.get("apple_agent_sha_drift")
     if apple_agent_sha_drift:
         lines.append("")
@@ -562,8 +562,8 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         lines.append(f"  {investments_stale}")
 
     # Apple Data Agent SHA drift (#646) — surface here so a silently-broken
-    # Mac Mini self-update reaches the operator (the bare log line does not
-    # feed any batched report).
+    # export agent's self-update reaches the operator (the bare log line
+    # does not feed any batched report).
     apple_agent_sha_drift = result.get("apple_agent_sha_drift")
     if apple_agent_sha_drift:
         lines.append("")
@@ -672,17 +672,18 @@ SYNC_ORDER = [
     "calendar_work",            # Work Google Calendar events
     "calendar_work2",           # Second work Google Calendar events
     "linkedin",                 # LinkedIn connections CSV
-    "contacts",                 # Apple Contacts (native via pyobjc, or imported from Mac Mini)
+    "contacts",                 # Apple Contacts (native via pyobjc, or imported from the export agent)
     # NOTE: phone and imessage are NOT in this list on macOS - they require Full Disk Access
     # which launchd doesn't have. They run via cron at 2:50 AM through Terminal.app:
     #   - scripts/run_sync_with_fda.sh (cron entry, opens Terminal)
     #   - scripts/run_fda_syncs.py (actual sync runner with health tracking)
     # Cron schedule: 50 2 * * * /path/to/run_sync_with_fda.sh
     #
-    # On Linux, Apple data is imported from Mac Mini exports.
-    # WhatsApp is also bundled into the apple_import step (the Mac Mini runs
-    # wacli and rsyncs whatsapp.json alongside the other exports).
-    "apple_import",             # Import Apple data + WhatsApp from Mac Mini (Linux only)
+    # On Linux, Apple data is imported from the (installer-configurable)
+    # export agent's exports. WhatsApp is also bundled into the apple_import
+    # step (the export agent runs wacli and rsyncs whatsapp.json alongside
+    # the other exports).
+    "apple_import",             # Import Apple data + WhatsApp from the export agent (Linux only)
     "slack",                    # Slack users + DM messages
 
     # === Phase 2: Entity Processing ===

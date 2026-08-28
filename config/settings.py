@@ -1170,6 +1170,14 @@ class Settings(BaseSettings):
                     "app's POST delivery mode). Empty disables the endpoint (503). "
                     "Generate with `openssl rand -hex 32`."
     )
+    apple_export_agent_label: str = Field(
+        default="the export agent",
+        alias="LIFEOS_APPLE_EXPORT_AGENT_LABEL",
+        description="Name for the Apple Data Agent machine used in staleness/failure "
+                    "alerts from scripts/apple_data_import.py (e.g. 'Mac Mini', "
+                    "'my MacBook'). Generic default since the export agent's hardware "
+                    "is installer-specific (#770)."
+    )
 
     # Journal ring ingest (#660) — a wearable (e.g. the Pebble Index ring) posts
     # transcribed fragments here from outside the tailnet.

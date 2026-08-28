@@ -99,6 +99,17 @@ If you've configured Google OAuth or Slack, run the initial data sync:
 
 **Note**: First sync may take 30+ minutes depending on data volume.
 
+**This is the nightly job, not a deep pass.** It deliberately looks back
+only a narrow window (30 days for Gmail/Calendar) to stay fast — a fresh
+install won't get older history from just this. Right after it completes,
+run the one-time backfill to pull each source's full history:
+
+```bash
+~/.venvs/lifeos/bin/python scripts/first_backfill.py --execute
+```
+
+See [data-and-sync.md](../specs/technical/data-and-sync.md#first-backfill-entry-point) for what it covers and how long it can take.
+
 ### After First Sync: Set Your Person ID
 
 After sync completes, find your person ID and add it to `.env`:
@@ -202,3 +213,4 @@ See [Troubleshooting](troubleshooting.md) for more.
 - [Installation](installation.md) -- Initial installation walkthrough
 - [Configuration](configuration.md) -- Environment variables and config files
 - [Setup](setup.md) -- Interactive Claude Code setup guide
+- [Data & Sync Architecture](../specs/technical/data-and-sync.md) -- Nightly sync schedule and the first-backfill entry point referenced in Step 4
