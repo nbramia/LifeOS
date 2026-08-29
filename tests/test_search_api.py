@@ -182,6 +182,13 @@ class TestSearchRequestValidation:
         )
         assert response.status_code in [400, 415, 422]
 
+    def test_whitespace_query_returns_validation_message(self, client):
+        response = client.post("/api/search", json={"query": "   "})
+
+        assert response.status_code == 400
+        assert response.json()["error"] == "Query cannot be empty"
+        assert "Query cannot be empty" in str(response.json()["detail"])
+
     def test_handles_extra_fields(self, client):
         """Should ignore extra fields gracefully."""
         response = client.post("/api/search", json={
