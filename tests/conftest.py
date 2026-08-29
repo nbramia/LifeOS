@@ -18,6 +18,7 @@ Run categories:
 """
 import gc
 import os
+import time
 
 import pytest
 
@@ -35,6 +36,24 @@ from api.services.slack_indexer import SLACK_COLLECTION
 # resolve via their own cwd.
 for _var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
     os.environ.pop(_var, None)
+
+
+def wait_for_condition(predicate, timeout: float, interval: float = 0.2):
+    """Poll ``predicate`` until it returns truthy, or ``timeout`` seconds pass.
+
+    Returns the last value ``predicate()`` produced (truthy on success, falsy
+    if the timeout was reached). Used by the file-watcher tests
+    (test_indexer.py, test_integration.py) to wait on the watcher's actual
+    observable output instead of a fixed ``time.sleep`` that can undershoot
+    ``VaultEventHandler``'s batch-processing delay (#839) — callers should
+    derive ``timeout`` from that delay rather than guessing a duration.
+    """
+    deadline = time.monotonic() + timeout
+    result = predicate()
+    while not result and time.monotonic() < deadline:
+        time.sleep(interval)
+        result = predicate()
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -10,17 +10,14 @@ P1.1 Acceptance Criteria:
 NOTE: Imports are deferred to avoid loading heavy dependencies (ChromaDB,
 sentence-transformers) during pytest collection, which would slow down unit tests.
 """
+import tempfile
+import time
+from pathlib import Path
+
 import pytest
 
 # These tests require ChromaDB and file watching (slow)
 pytestmark = pytest.mark.slow
-
-# Standard library imports are fine at module level (lightweight)
-import tempfile
-import time
-import os
-from pathlib import Path
-from datetime import datetime
 
 
 class TestIndexerService:
@@ -260,6 +257,9 @@ class TestFileWatcher:
 
     def test_detects_new_file_creation(self, indexer, temp_vault):
         """New file should be indexed automatically."""
+        from tests.conftest import wait_for_condition
+        from api.services.indexer import VaultEventHandler
+
         # Start watching
         indexer.start_watching()
         time.sleep(0.5)  # Let watcher initialize
@@ -271,8 +271,14 @@ class TestFileWatcher:
 This is freshly created content about testing.
 """)
 
-        # Wait for indexing (should be within 5 seconds)
-        time.sleep(3)
+        # Wait for the watcher's batch debounce to flush and index the file,
+        # rather than sleeping a fixed duration that can undershoot it (#839).
+        def _indexed():
+            return any(fp.endswith("new_note.md") for fp in indexer.vector_store.get_all_file_paths())
+
+        assert wait_for_condition(_indexed, timeout=VaultEventHandler._BATCH_DELAY + 30), (
+            "watcher did not index the new file within the timeout"
+        )
 
         # Search for the new content
         results = indexer.vector_store.search("freshly created testing")
@@ -304,6 +310,9 @@ This is freshly created content about testing.
 
     def test_detects_file_deletion(self, indexer, temp_vault):
         """Deleted file should be removed from index."""
+        from tests.conftest import wait_for_condition
+        from api.services.indexer import VaultEventHandler
+
         # Create and index file
         test_file = temp_vault / "to_delete.md"
         test_file.write_text("# To Delete\n\nThis will be deleted.")
@@ -320,8 +329,14 @@ This is freshly created content about testing.
         # Delete the file
         test_file.unlink()
 
-        # Wait for deletion to process (debounce + processing)
-        time.sleep(4)
+        # Wait for the watcher's batch debounce to flush and remove the file,
+        # rather than sleeping a fixed duration that can undershoot it (#839).
+        def _removed():
+            return not any(fp.endswith("to_delete.md") for fp in indexer.vector_store.get_all_file_paths())
+
+        assert wait_for_condition(_removed, timeout=VaultEventHandler._BATCH_DELAY + 30), (
+            "watcher did not remove the deleted file from the index within the timeout"
+        )
 
         # Search should not find the content
         results = indexer.vector_store.search("will be deleted")
