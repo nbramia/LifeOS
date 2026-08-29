@@ -41,6 +41,7 @@ class TestAskStreamEndpoint:
         """Should return 400 for whitespace-only question."""
         response = client.post("/api/ask/stream", json={"question": "   "})
         assert response.status_code == 400
+        assert "Question cannot be empty" in str(response.json()["detail"])
 
     def test_stream_returns_event_stream(self, client):
         """Response should be text/event-stream."""

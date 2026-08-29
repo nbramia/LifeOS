@@ -105,6 +105,21 @@ def pytest_configure(config):
     _install_anthropic_request_guard()
 
 
+@pytest.fixture(autouse=True)
+def isolate_agent_default_route(request, monkeypatch):
+    """Keep agent-worker tests independent from the developer's .env."""
+    agent_worker_tests = {
+        "test_agent_worker_preflight.py",
+        "test_agent_worker_clarifications.py",
+        "test_agent_worker_loop.py",
+        "test_operator_spawn.py",
+    }
+    if request.node.fspath.basename in agent_worker_tests:
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "agent_default_route", "")
+
+
 # ---------------------------------------------------------------------------
 # Unmarked-test guard (#682)
 #
