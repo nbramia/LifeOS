@@ -133,6 +133,8 @@ def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkey
     from api.routes.chat import (
         _close_chat_inbox_item,
         _capture_candidate,
+        _capture_source,
+        _explicit_memory_content,
         _life_model_candidate,
         _project_candidate,
         _conditional_followup_candidate,
@@ -142,9 +144,25 @@ def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkey
         _remove_capture_permission_prompt,
     )
 
-    assert _capture_candidate("[Voice message transcription]\nI want to build a cafe AI product")
-    assert _capture_candidate("I think I might want to learn Japanese")
-    assert _capture_candidate("Maybe I should start writing every morning")
+    assert _capture_candidate("remember that I prefer concise replies") == (
+        "I prefer concise replies"
+    )
+    assert _capture_candidate("I think I might want to learn Japanese") is None
+    assert _capture_candidate("Maybe I should start writing every morning") is None
+    assert _explicit_memory_content("Please remember: I prefer concise replies") == (
+        "I prefer concise replies"
+    )
+    assert _explicit_memory_content("Take a note of my peanut allergy") == (
+        "my peanut allergy"
+    )
+    assert _explicit_memory_content("Remember to call John") is None
+    assert _capture_source(
+        {"type": "chat"},
+        [{"filename": "receipt.pdf", "media_type": "application/pdf", "data": "SECRET"}],
+    ) == {
+        "type": "chat",
+        "attachments": [{"filename": "receipt.pdf", "media_type": "application/pdf"}],
+    }
     assert _life_model_candidate("I value having time for family") == (
         "values", "having time for family"
     )

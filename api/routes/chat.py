@@ -41,24 +41,14 @@ logger = logging.getLogger(__name__)
 
 
 _EXPLICIT_MEMORY_RE = re.compile(
-    r"^\s*(?:please\s+)?(?:remember\s+(?:that\s+)?|don't\s+forget\s+(?:that\s+)?|"
-    r"note\s+(?:that\s+)?|save\s+this\s+as\s+(?:a\s+)?memory\s*:\s*)(.+?)\s*$",
+    r"^\s*(?:please\s+)?(?:remember\s*(?::|\s+(?:that\s+)?)|"
+    r"don't\s+forget\s*(?::|\s+(?:that\s+)?)|"
+    r"take\s+(?:a\s+)?note\s+of\s+|make\s+(?:a\s+)?note\s+of\s+|"
+    r"note\s*(?::|\s+(?:that\s+)?)|"
+    r"save\s+(?:this\s+)?(?:as\s+(?:a\s+)?(?:memory|note)|this)?\s*(?::|\s+))"
+    r"(.+?)\s*$",
     re.IGNORECASE | re.DOTALL,
 )
-_IMPLICIT_CAPTURE_RE = re.compile(
-    r"^\s*(?:i\s+(?:want|would\s+like|plan|hope|intend|need|am\s+going)\s+to\b|"
-    r"i\s+(?:think\s+i\s+might|might|may|am\s+considering)\s+\b|"
-    r"maybe\s+i\s+should\s+\b|"
-    r"i(?:'m|\s+am)\s+(?:building|working\s+on|creating|developing)\b|"
-    r"(?:my\s+)?(?:goal|project|idea|plan|vision)\s*(?:is|:|-)\b)",
-    re.IGNORECASE,
-)
-_SIGNIFICANT_CAPTURE_RE = re.compile(
-    r"\b(?:top\s+priorit(?:y|ies)|working\s+on|had\s+an?\s+accident|my\s+car)\b",
-    re.IGNORECASE,
-)
-
-
 def _requested_model_profile(question: str, profiles: dict) -> str | None:
     """Resolve an explicit natural-language named profile for this turn."""
     text = (question or "").strip().lower()
@@ -81,34 +71,53 @@ def _explicit_memory_content(question: str) -> str | None:
     Deliberately excludes ``remember to`` so reminders are not saved as memories.
     """
     match = _EXPLICIT_MEMORY_RE.match(question or "")
-    return match.group(1).strip() if match else None
+    content = match.group(1).strip() if match else None
+    # "remember to ..." is an action/reminder, not a durable memory.
+    if content and re.match(r"to\b", content, re.IGNORECASE):
+        return None
+    return content or None
+
+
+def _capture_source(source: dict | None, attachments: list | None) -> dict:
+    """Return capture provenance without copying attachment payloads.
+
+    The raw message is already preserved in ``content``. Attachment bytes can
+    be large and are not safe to put in the JSON inbox, but their identity and
+    type must survive a failed model turn so a later review can explain what
+    was attached and, where a transport persisted it, find the file.
+    """
+    captured = dict(source) if isinstance(source, dict) else {"type": "chat"}
+    manifest = []
+    for attachment in attachments or []:
+        if isinstance(attachment, dict):
+            manifest.append({
+                key: attachment[key]
+                for key in ("filename", "media_type")
+                if attachment.get(key)
+            })
+        else:
+            filename = getattr(attachment, "filename", "")
+            media_type = getattr(attachment, "media_type", "")
+            manifest.append({
+                key: value for key, value in
+                (("filename", filename), ("media_type", media_type)) if value
+            })
+    if manifest:
+        captured["attachments"] = manifest
+    return captured
 
 
 def _capture_candidate(question: str) -> str | None:
-    """Return meaningful personal capture text without requiring a command.
+    """Return only an unambiguous, explicit memory command.
 
-    Explicit remember requests always qualify. Common first-person goal/idea
-    statements qualify as inbox captures; reminders (``remember to``) do not.
-    Other conversation remains conversational unless the model chooses a tool.
+    Implicit capture is intentionally *not* decided by string fragments here.
+    The agent receives the complete message and conversation context and can
+    judge whether a statement is durable, tentative, actionable, or transient.
+    The raw Life Inbox copy remains the recovery path when that judgment is
+    uncertain or a provider fails to call ``save_memory``.
     """
     explicit = _explicit_memory_content(question)
-    if explicit:
-        return explicit
-    text = (question or "").strip()
-    # Telegram voice/media transports add a descriptive preamble before the
-    # user's actual words. Do not let that wrapper prevent the deterministic
-    # fallback from recognizing a meaningful capture.
-    text = re.sub(
-        r"^\[(?:Voice message transcription|Telegram [^\]]+)\]\s*\n?",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    ).strip()
-    if text and "?" not in text and (
-        _IMPLICIT_CAPTURE_RE.search(text) or _SIGNIFICANT_CAPTURE_RE.search(text)
-    ):
-        return text
-    return None
+    return explicit
 
 
 def _life_model_candidate(question: str) -> tuple[str, str] | None:
@@ -1004,7 +1013,7 @@ async def ask_stream(request: AskStreamRequest):
             # prevents a weekly review from re-classifying its own prompt as a
             # new reminder. The resulting memories/actions still receive the
             # scheduler provenance through request.source.
-            _source = request.source or {"type": "chat"}
+            _source = _capture_source(request.source, request.attachments)
             _internal_prompt = isinstance(_source, dict) and _source.get("type") == "scheduler"
             inbox_item = (
                 {"id": ""}
@@ -1433,7 +1442,7 @@ async def ask_stream(request: AskStreamRequest):
             if _memory_content and not _memory_tool_succeeded:
                 from api.services.memory_store import get_memory_store
                 _saved_memory = get_memory_store().create_memory(
-                    _memory_content, source=request.source or {"type": "chat"}
+                    _memory_content, source=_source
                 )
                 agent_result.tool_calls_log.append({
                     "tool": "save_memory",
@@ -1478,7 +1487,7 @@ async def ask_stream(request: AskStreamRequest):
                 _life_model_item = record_life_model(
                     _life_model_section,
                     _life_model_content,
-                    source=request.source or {"type": "chat"},
+                    source=_source,
                     evidence_type="explicit",
                 )
                 agent_result.tool_calls_log.append({
@@ -1510,7 +1519,7 @@ async def ask_stream(request: AskStreamRequest):
                     _project_candidate_value["name"],
                     status=_project_candidate_value["status"],
                     summary=_project_candidate_value["summary"],
-                    source=request.source or {"type": "chat"},
+                    source=_source,
                     evidence_type="explicit",
                 )
                 agent_result.tool_calls_log.append({
@@ -1523,14 +1532,14 @@ async def ask_stream(request: AskStreamRequest):
                 agent_result.full_text += _notice
                 await _content(_notice)
 
-            _source_capture = _source_capture_candidate(request.question, request.source)
+            _source_capture = _source_capture_candidate(request.question, _source)
             if _source_capture and not _memory_tool_succeeded:
                 from api.services.memory_store import get_memory_store
                 _source_memory = get_memory_store().create_memory(
                     _source_capture,
                     category="context",
                     source={
-                        **(request.source or {}),
+                        **_source,
                         "content_type": "source_capture",
                     },
                 )
@@ -1558,7 +1567,7 @@ async def ask_stream(request: AskStreamRequest):
                     _commitment_candidate["content"],
                     direction=_commitment_candidate["direction"],
                     person_name=_commitment_candidate["person_name"],
-                    source=request.source or {"type": "chat"},
+                    source=_source,
                 )
                 agent_result.tool_calls_log.append({
                     "tool": "manage_commitments",
@@ -1582,7 +1591,7 @@ async def ask_stream(request: AskStreamRequest):
                 _followup_result = _tool_manage_followups({
                     "action": "create",
                     **_conditional_followup,
-                    "source": request.source or {"type": "chat"},
+                    "source": _source,
                 })
                 agent_result.tool_calls_log.append({
                     "tool": "manage_followups",
