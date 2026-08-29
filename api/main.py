@@ -37,6 +37,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
+import json
 import logging
 import socket
 from contextlib import asynccontextmanager
@@ -335,13 +336,20 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     """Convert validation errors to 400 with clear messages."""
     errors = exc.errors()
 
-    # Sanitize errors for JSON serialization (convert bytes to string)
-    sanitized_errors = []
-    for error in errors:
-        sanitized = dict(error)
-        if "input" in sanitized and isinstance(sanitized["input"], bytes):
-            sanitized["input"] = sanitized["input"].decode("utf-8", errors="replace")
-        sanitized_errors.append(sanitized)
+    def json_safe(value):
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        if isinstance(value, dict):
+            return {str(key): json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [json_safe(item) for item in value]
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError):
+            return str(value)
+        return value
+
+    sanitized_errors = [json_safe(error) for error in errors]
 
     # Check if this is an empty query error
     for error in errors:
