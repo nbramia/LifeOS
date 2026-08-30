@@ -20,6 +20,7 @@ from api.services.relationship_discovery import (
     discover_from_imessage_direct,
     discover_from_whatsapp_direct,
     discover_from_phone_calls,
+    _iter_chroma_metadatas,
     discover_linkedin_connections,
     run_full_discovery,
     get_suggested_connections,
@@ -461,3 +462,85 @@ class TestGetConnectionOverlap:
             # Relationship dict exists but shows no connection
             assert result.get('relationship') is not None
             assert result['relationship']['exists'] is False
+
+
+class TestChromaMetadataScan:
+    """
+    Tests for the paged ChromaDB metadata scan.
+
+    Regression cover for the nightly-sync outage where a single unbounded
+    get() over the Slack collection failed with "too many SQL variables"
+    once it grew past SQLite's bind-parameter ceiling, and for the
+    `$gte`-on-a-string date filter that had silently never worked.
+    """
+
+    @staticmethod
+    def _collection(metadatas):
+        """A fake ChromaDB collection that serves `metadatas` via limit/offset."""
+        collection = MagicMock()
+
+        def _get(include=None, limit=None, offset=0, **kwargs):
+            assert "where" not in kwargs, "date filter must not be pushed down to ChromaDB"
+            return {"metadatas": metadatas[offset:offset + limit]}
+
+        collection.get.side_effect = _get
+        return collection
+
+    def test_pages_through_collection_larger_than_page_size(self):
+        """All rows are returned even when the collection spans many pages."""
+        metadatas = [{"modified_date": "2026-01-01", "n": i} for i in range(250)]
+        collection = self._collection(metadatas)
+
+        result = list(_iter_chroma_metadatas(collection, "2020-01-01", page_size=100))
+
+        assert [m["n"] for m in result] == list(range(250))
+        assert collection.get.call_count == 3
+
+    def test_never_requests_more_than_page_size_at_once(self):
+        """No single get() may exceed the page size — that is what broke."""
+        metadatas = [{"modified_date": "2026-01-01"} for _ in range(40000)]
+        collection = self._collection(metadatas)
+
+        list(_iter_chroma_metadatas(collection, "2020-01-01", page_size=5000))
+
+        assert collection.get.call_count == 9
+        for call in collection.get.call_args_list:
+            assert call.kwargs["limit"] == 5000
+
+    def test_applies_cutoff_date_as_string_comparison(self):
+        """The cutoff filters rows, using lexicographic ISO date ordering."""
+        metadatas = [
+            {"modified_date": "2025-12-31", "n": 0},
+            {"modified_date": "2026-01-01", "n": 1},
+            {"modified_date": "2026-06-15", "n": 2},
+        ]
+        collection = self._collection(metadatas)
+
+        result = list(_iter_chroma_metadatas(collection, "2026-01-01", page_size=10))
+
+        assert [m["n"] for m in result] == [1, 2]
+
+    def test_row_missing_modified_date_is_excluded(self):
+        """A row with no usable date does not slip past the cutoff."""
+        collection = self._collection([{"n": 0}, {"modified_date": None, "n": 1}])
+
+        result = list(_iter_chroma_metadatas(collection, "2026-01-01", page_size=10))
+
+        assert result == []
+
+    def test_stops_when_collection_size_is_an_exact_page_multiple(self):
+        """A full final page is followed by one empty page, then termination."""
+        metadatas = [{"modified_date": "2026-01-01"} for _ in range(200)]
+        collection = self._collection(metadatas)
+
+        result = list(_iter_chroma_metadatas(collection, "2020-01-01", page_size=100))
+
+        assert len(result) == 200
+        assert collection.get.call_count == 3
+
+    def test_empty_collection_yields_nothing(self):
+        """An empty collection terminates after a single get()."""
+        collection = self._collection([])
+
+        assert list(_iter_chroma_metadatas(collection, "2020-01-01")) == []
+        assert collection.get.call_count == 1
