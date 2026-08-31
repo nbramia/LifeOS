@@ -21,6 +21,7 @@ from api.services.relationship import (
     TYPE_INFERRED,
 )
 from api.utils.datetime_utils import make_aware as _ensure_tz_aware
+from config.people_config import InteractionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,9 @@ def discover_from_calendar(
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
 
     # Get all calendar interactions with source_id containing participant AND timestamp
+    # Mass meetings are excluded: attending the same 90-person standing call is
+    # no evidence two people know each other, and each occurrence would otherwise
+    # contribute N*(N-1)/2 candidate pairs to the graph.
     query = """
         SELECT
             substr(source_id, 1, instr(source_id, ':') - 1) as event_id,
@@ -139,9 +143,13 @@ def discover_from_calendar(
         WHERE source_type = 'calendar'
           AND source_id LIKE '%:%'
           AND timestamp >= ?
+          AND COALESCE(attendee_count, 0) <= ?
     """
 
-    cursor = conn.execute(query, (cutoff.isoformat(),))
+    cursor = conn.execute(
+        query,
+        (cutoff.isoformat(), InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT),
+    )
 
     # Group by event, resolving participants to person IDs
     # Also track event timestamps

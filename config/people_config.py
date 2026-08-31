@@ -121,6 +121,17 @@ class InteractionConfig:
     # Snippet length for interaction preview
     SNIPPET_LENGTH: int = 100
 
+    # Mass meetings carry no relationship signal: sitting in the same 90-person
+    # standing call says nothing about whether two people know each other. They
+    # are also combinatorially expensive — a single occurrence with N attendees
+    # yields one interaction per attendee and N*(N-1)/2 candidate pairs for
+    # relationship discovery, so one weekly all-hands can dominate a whole
+    # calendar history.
+    #
+    # Counted in *other* attendees (self already excluded), so the default
+    # ignores any event with more than 50 people besides the owner.
+    MASS_MEETING_ATTENDEE_LIMIT: int = 50
+
 
 def get_vault_contexts_for_domain(domain: str) -> list[str]:
     """

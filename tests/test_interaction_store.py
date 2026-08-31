@@ -17,6 +17,7 @@ from api.services.interaction_store import (
     create_calendar_interaction,
     create_vault_interaction,
 )
+from config.people_config import InteractionConfig
 
 pytestmark = pytest.mark.unit
 
@@ -1062,3 +1063,94 @@ class TestBackupRetention:
         removed = _prune_backups(tmp_path, now=now)
         assert removed == []
         assert len(list(tmp_path.glob("*.backup"))) == 3
+
+
+class TestMassMeetingExclusion:
+    """
+    Mass meetings must not contribute to relationship scoring.
+
+    A 90-person standing call yields one interaction row per attendee, so a
+    single weekly series can dominate a whole calendar history and inflate
+    strength scores for people who have never actually spoken.
+    """
+
+    @pytest.fixture
+    def temp_store(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=False)
+            yield store
+            Path(f.name).unlink(missing_ok=True)
+
+    @staticmethod
+    def _calendar(store, person_id, attendee_count, title="Meeting"):
+        store.add(Interaction(
+            id=str(uuid.uuid4()),
+            person_id=person_id,
+            timestamp=datetime.now(),
+            source_type="calendar",
+            title=title,
+            attendee_count=attendee_count,
+        ))
+
+    def _subtypes(self, store, person_id):
+        return {
+            r["subtype"]: r["count"]
+            for r in store.get_interaction_counts_with_subtypes(person_id)
+        }
+
+    def test_meeting_over_limit_is_excluded(self, temp_store):
+        """An event above the attendee limit contributes nothing."""
+        self._calendar(temp_store, "p1", InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT + 1)
+
+        assert self._subtypes(temp_store, "p1") == {}
+
+    def test_meeting_at_limit_is_kept(self, temp_store):
+        """The limit is exclusive — exactly at the limit still counts."""
+        self._calendar(temp_store, "p1", InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT)
+
+        assert self._subtypes(temp_store, "p1") == {"calendar_large_meeting": 1}
+
+    def test_small_meetings_are_unaffected(self, temp_store):
+        """Ordinary meetings keep their existing subtype buckets."""
+        self._calendar(temp_store, "p1", 1)
+        self._calendar(temp_store, "p1", 3)
+        self._calendar(temp_store, "p1", 10)
+
+        assert self._subtypes(temp_store, "p1") == {
+            "calendar_1on1": 1,
+            "calendar_small_group": 1,
+            "calendar_large_meeting": 1,
+        }
+
+    def test_null_attendee_count_is_kept(self, temp_store):
+        """
+        Rows predating the attendee_count column must survive.
+
+        `NULL > 50` is NULL in SQL, so a naive NOT(...) filter would silently
+        drop every legacy row instead of keeping it.
+        """
+        self._calendar(temp_store, "p1", None)
+
+        counts = temp_store.get_interaction_counts_with_subtypes("p1")
+        assert sum(r["count"] for r in counts) == 1
+
+    def test_non_calendar_sources_are_never_filtered(self, temp_store):
+        """The limit applies only to calendar rows."""
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()),
+            person_id="p1",
+            timestamp=datetime.now(),
+            source_type="gmail",
+            title="→ Subject",
+        ))
+
+        counts = temp_store.get_interaction_counts_with_subtypes("p1")
+        assert sum(r["count"] for r in counts) == 1
+
+    def test_mass_meeting_does_not_drown_out_real_contact(self, temp_store):
+        """The regression this guards: one 1:1 must not be buried by a big series."""
+        for _ in range(100):
+            self._calendar(temp_store, "p1", 91, title="Rise Leadership Call")
+        self._calendar(temp_store, "p1", 1, title="Coffee")
+
+        assert self._subtypes(temp_store, "p1") == {"calendar_1on1": 1}
