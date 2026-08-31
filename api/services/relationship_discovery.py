@@ -12,7 +12,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from api.services.person_entity import PersonEntity, get_person_entity_store
+from api.services.person_entity import get_person_entity_store
 from api.services.interaction_store import get_interaction_store, get_interaction_db_path
 from api.services.relationship import (
     Relationship,
@@ -42,6 +42,41 @@ def _datetime_gt(a: datetime | None, b: datetime | None) -> bool:
 # Discovery window (days to look back)
 # Use a large number to process all available history
 DISCOVERY_WINDOW_DAYS = 3650  # ~10 years - effectively all available data
+
+# Page size for ChromaDB metadata scans. A single unbounded get() asks the
+# backing SQLite for one bind parameter per matched row, so anything at or
+# above SQLITE_MAX_VARIABLE_NUMBER (32766 by default) fails outright with
+# "too many SQL variables". Page well under that ceiling.
+CHROMA_SCAN_PAGE_SIZE = 5000
+
+
+def _iter_chroma_metadatas(collection, cutoff_date: str, page_size: int = CHROMA_SCAN_PAGE_SIZE):
+    """
+    Yield metadata dicts from a ChromaDB collection, newest-cutoff filtered.
+
+    The date filter is applied here rather than pushed down as a `where`
+    clause: LifeOS indexes `modified_date` as a "YYYY-MM-DD" string, and
+    ChromaDB's `$gte` operator only accepts ints and floats. Zero-padded
+    ISO dates compare correctly as strings, which is what the callers'
+    first/last-seen tracking already relies on.
+
+    Pages rather than fetching everything at once so the scan does not
+    break when the collection outgrows SQLite's bind-parameter ceiling.
+    """
+    offset = 0
+    while True:
+        page = collection.get(include=["metadatas"], limit=page_size, offset=offset)
+        metadatas = (page or {}).get("metadatas") or []
+        if not metadatas:
+            return
+
+        for meta in metadatas:
+            if (meta.get("modified_date") or "") >= cutoff_date:
+                yield meta
+
+        if len(metadatas) < page_size:
+            return
+        offset += len(metadatas)
 
 
 def discover_from_calendar(
@@ -1004,19 +1039,13 @@ def discover_from_slack_direct(
     # Get all Slack messages (limit to recent ones)
     cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime('%Y-%m-%d')
 
-    # Query messages with date filter
     try:
-        results = collection.get(
-            where={"modified_date": {"$gte": cutoff_date}},
-            include=["metadatas"],
-            limit=50000,  # Reasonable limit
-        )
+        metadatas = list(_iter_chroma_metadatas(collection, cutoff_date))
     except Exception as e:
-        # Fallback: get all and filter
-        logger.info(f"Date filter failed ({e}), getting all messages")
-        results = collection.get(include=["metadatas"], limit=50000)
+        logger.warning(f"Could not scan Slack messages in ChromaDB: {e}")
+        return []
 
-    if not results or not results.get('metadatas'):
+    if not metadatas:
         logger.info("No Slack messages found in ChromaDB")
         return []
 
@@ -1025,7 +1054,7 @@ def discover_from_slack_direct(
     person_first_seen: dict[str, str] = {}
     person_last_seen: dict[str, str] = {}
 
-    for meta in results['metadatas']:
+    for meta in metadatas:
         # Parse people field (JSON array of Slack user IDs)
         people_json = meta.get('people', '[]')
         try:
@@ -1362,7 +1391,6 @@ def get_suggested_connections(
     """
     person_store = get_person_entity_store()
     relationship_store = get_relationship_store()
-    interaction_store = get_interaction_store()
 
     person = person_store.get_by_id(person_id)
     if not person:
@@ -1426,7 +1454,6 @@ def get_connection_overlap(person_a_id: str, person_b_id: str) -> dict:
     """
     person_store = get_person_entity_store()
     relationship_store = get_relationship_store()
-    interaction_store = get_interaction_store()
 
     person_a = person_store.get_by_id(person_a_id)
     person_b = person_store.get_by_id(person_b_id)
