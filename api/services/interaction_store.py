@@ -413,8 +413,9 @@ class InteractionStore:
             cursor = conn.execute(
                 """
                 INSERT INTO interactions
-                (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at,
+                 source_account, attendee_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_type, source_id) DO UPDATE SET
                     timestamp = excluded.timestamp
                 WHERE interactions.timestamp = ? AND excluded.timestamp != ?
@@ -429,6 +430,8 @@ class InteractionStore:
                     interaction.source_link,
                     interaction.source_id,
                     interaction.created_at.isoformat(),
+                    interaction.source_account,
+                    interaction.attendee_count,
                     UNDATED_SENTINEL.isoformat(),
                     UNDATED_SENTINEL.isoformat(),
                 ),
@@ -504,6 +507,8 @@ class InteractionStore:
                 interaction.source_link,
                 interaction.source_id,
                 interaction.created_at.isoformat(),
+                interaction.source_account,
+                interaction.attendee_count,
             ))
             affected_person_ids.add(resolved_id)
 
@@ -540,8 +545,8 @@ class InteractionStore:
                 """
                 INSERT INTO interactions
                 (id, person_id, timestamp, source_type, title, snippet,
-                 source_link, source_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 source_link, source_id, created_at, source_account, attendee_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_type, source_id) DO NOTHING
                 """,
                 rows,
@@ -612,8 +617,8 @@ class InteractionStore:
                     """
                     INSERT INTO interactions
                     (id, person_id, timestamp, source_type, title, snippet,
-                     source_link, source_id, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     source_link, source_id, created_at, source_account, attendee_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(source_type, source_id) DO NOTHING
                     """,
                     rows,
@@ -834,9 +839,14 @@ class InteractionStore:
                     COUNT(*) as count
                 FROM interactions
                 WHERE person_id = ? AND timestamp > ?
+                  AND NOT (source_type = 'calendar' AND COALESCE(attendee_count, 0) > ?)
                 GROUP BY source_type, subtype, source_account
             """,
-                (person_id, cutoff.isoformat()),
+                (
+                    person_id,
+                    cutoff.isoformat(),
+                    InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT,
+                ),
             )
 
             results = []

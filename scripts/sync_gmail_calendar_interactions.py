@@ -31,6 +31,7 @@ from api.services.google_auth import GoogleAccount
 from api.services.entity_resolver import get_entity_resolver
 from api.services.person_entity import get_person_entity_store
 from api.services.interaction_store import get_interaction_db_path
+from config.people_config import InteractionConfig
 from api.services.gmail_skip_cache import get_gmail_skip_cache
 from api.services.source_entity import (
     get_source_entity_store,
@@ -551,6 +552,7 @@ def sync_calendar_interactions(
         'no_person': 0,
         'errors': 0,
         'source_entities_created': 0,
+        'mass_meeting_skipped': 0,
     }
 
     # Track affected person_ids for stats refresh
@@ -613,6 +615,12 @@ def sync_calendar_interactions(
             # Count other attendees (excluding self) for meeting size classification
             # This is used to determine calendar_1on1 vs calendar_small_group vs calendar_large_meeting
             other_attendee_count = len(attendees)  # All attendees here are "other" (self excluded by resolver)
+
+            # Mass meetings are not evidence of a relationship — drop the whole
+            # event rather than emit one interaction per attendee.
+            if other_attendee_count > InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT:
+                stats['mass_meeting_skipped'] += 1
+                continue
 
             for attendee in attendees:
                 # Create unique source_id per event+attendee
@@ -910,7 +918,7 @@ def main(argv=None):
                 dry_run=dry_run,
             )
             all_stats[f'calendar_{account.value}'] = stats
-            logger.info(f"Calendar {account.value}: events={stats['events_fetched']}, inserted={stats['interactions_inserted']}, source_entities={stats['source_entities_created']}, exists={stats['already_exists']}, errors={stats['errors']}")
+            logger.info(f"Calendar {account.value}: events={stats['events_fetched']}, inserted={stats['interactions_inserted']}, source_entities={stats['source_entities_created']}, exists={stats['already_exists']}, mass_meetings_skipped={stats['mass_meeting_skipped']}, errors={stats['errors']}")
 
     if dry_run:
         logger.info("\nDRY RUN - no changes made. Use --execute to apply.")
