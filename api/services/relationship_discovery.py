@@ -250,6 +250,10 @@ def discover_from_calendar_direct(
     This is MY calendar, so I am implicitly at every event.
     Creates relationships between ME and each attendee, with event count as shared_events_count.
 
+    Mass meetings are excluded on the same terms as discover_from_calendar:
+    being one of 90 people on a standing call is not a relationship with the
+    owner either.
+
     Args:
         days_back: Days to look back
         min_events: Minimum events to count (default 1 - any shared event counts)
@@ -286,11 +290,20 @@ def discover_from_calendar_direct(
           AND timestamp >= ?
           AND person_id IS NOT NULL
           AND person_id != ?
+          AND COALESCE(attendee_count, 0) <= ?
         GROUP BY person_id
         HAVING COUNT(DISTINCT substr(source_id, 1, instr(source_id, ':') - 1)) >= ?
     """
 
-    cursor = conn.execute(query, (cutoff.isoformat(), my_person_id, min_events))
+    cursor = conn.execute(
+        query,
+        (
+            cutoff.isoformat(),
+            my_person_id,
+            InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT,
+            min_events,
+        ),
+    )
 
     relationships = []
     for row in cursor:
