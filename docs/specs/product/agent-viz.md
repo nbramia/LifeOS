@@ -50,7 +50,7 @@ Assignee is a single tag, one of `#me`, `#claude`, `#codex`, `#hermes`, `#local`
 
 A card shows its title, assignee chip, model/effort chips when the task carries those fields, a host chip when a linked session is running on a known machine, its other tags, and a pulsing dot when a linked session is actively running.
 
-Clicking a card opens a drawer: an editable title and notes (notes save on blur, stored as indented `> ` lines beneath the task — see [task-management.md](task-management.md)), pickers for assignee, tags, and context, and — when the card has a linked session — that session's live transcript feed, the same panel the Graph tab uses. Drawer actions: **Focus** (jump to the session's terminal pane), **Kill** (stop a running session), **Answer** (reply to the agent's pending question), **Accept** (move a Review card to Done), and **Resolve** (mark a manually-filed Human queue card handled).
+Clicking a card opens a drawer: an editable title and notes (notes save on blur, stored as indented `> ` lines beneath the task — see [task-management.md](task-management.md)), pickers for assignee, tags, and context, and — below those — model, effort, and host pickers (model options come from the model catalog per engine; host is free text checked against the registered hosts when the card is opened) that write the fields the executors actually read. When the card has a linked session, the drawer also shows that session's live transcript feed, the same panel the Graph tab uses. Drawer actions: **Open** (an Assigned card tagged `#claude` or `#codex` spawns the CLI on the card), **Focus** (jump to the session's terminal pane), **Kill** (stop a running session), **Answer** (reply to the agent's pending question), **Accept** (move a Review card to Done), and **Resolve** (mark a manually-filed Human queue card handled).
 
 A **New card** button opens a composer — title, optional notes, and an assignee picker — that creates a task through `POST /api/tasks`.
 
@@ -68,7 +68,7 @@ Filters AND-compose: free-text search (title and notes), lane, assignee (includi
 
 ### Out of scope (for now)
 
-Card reordering within a lane — file order is lane order. Model/effort pickers that actually change how a task runs. Opening a session on a different machine than the one serving `/agents`. See the Kanban overhaul issue set for what's next.
+Card reordering within a lane — file order is lane order. Opening a session on a different machine than the one serving `/agents`. See the Kanban overhaul issue set for what's next.
 
 ---
 
