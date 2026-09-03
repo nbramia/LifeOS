@@ -59,6 +59,17 @@ class TestValidateDoneWhen:
                 {"type": "endpoint", "path": path, "pointer": "/status", "equals": "ok"}
             )
 
+    @pytest.mark.parametrize("path", ["/api/x?y=1", "/api/x#f"])
+    def test_endpoint_path_with_query_or_fragment_raises(self, path):
+        """A query string or fragment would let the filer smuggle request
+        parameters into the worker's poll GET — a query-driven
+        side-effecting local request reachable by any agent that can file
+        a card."""
+        with pytest.raises(human_queue.DoneWhenError):
+            human_queue.validate_done_when(
+                {"type": "endpoint", "path": path, "pointer": "/status", "equals": "ok"}
+            )
+
     def test_endpoint_non_string_path_raises(self):
         with pytest.raises(human_queue.DoneWhenError):
             human_queue.validate_done_when(
@@ -123,6 +134,22 @@ class TestAddCard:
     def test_colon_key_accepted(self, tm):
         task = human_queue.add_card(title="X", key="sync:gmail")
         assert tm.get(task.id).fields.get("key") == "sync:gmail"
+
+    def test_key_with_trailing_newline_raises(self, tm):
+        """`$` (unlike `\\Z`) matches just before a trailing newline, and
+        re.match doesn't require consuming the whole string — '^[\\w.:-]+$'
+        would accept 'abc\\n'."""
+        with pytest.raises(ValueError):
+            human_queue.add_card(title="X", key="abc\n")
+
+    @pytest.mark.parametrize("key", [".", ".."])
+    def test_dot_only_key_raises(self, tm, key):
+        """A key of only dots passes the character-class regex but is a
+        path segment URL clients normalize away (RFC 3986 dot-segment
+        resolution) before it reaches the resolve route, making the card
+        unresolvable by key."""
+        with pytest.raises(ValueError):
+            human_queue.add_card(title="X", key=key)
 
     def test_add_stores_source_and_key_fields(self, tm):
         task = human_queue.add_card(
@@ -259,3 +286,31 @@ class TestListOpenCards:
 
     def test_list_empty(self, tm):
         assert human_queue.list_open_cards() == []
+
+    def test_list_drops_ssrf_shaped_done_when_written_via_generic_task_api(self, tm):
+        """R2-1: validate_done_when only gated the human-queue write path
+        (add_card). The generic task-update API can write fields['done_when']
+        directly, so a card created (or edited) that way could carry an
+        unvalidated done_when straight through to the worker, which builds
+        a request URL from done_when.path — a stored-SSRF path around the
+        write-time guard. list_open_cards is the single read path the REST
+        route, the native tool, and the worker's poll all consume, so it
+        must re-validate on the way out."""
+        tm.create(
+            "Re-authenticate example service",
+            status="blocked",
+            tags=["human"],
+            fields={"done_when": '{"type":"endpoint","path":"@evil.example/x","pointer":"/a","equals":"ok"}'},
+        )
+        cards = human_queue.list_open_cards()
+        assert len(cards) == 1
+        assert cards[0]["done_when"] is None
+
+    def test_list_drops_done_when_with_non_string_file_exists_path(self, tm):
+        tm.create(
+            "X", status="blocked", tags=["human"],
+            fields={"done_when": '{"type":"file_exists","path":5}'},
+        )
+        cards = human_queue.list_open_cards()
+        assert len(cards) == 1
+        assert cards[0]["done_when"] is None

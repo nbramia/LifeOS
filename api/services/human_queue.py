@@ -39,8 +39,11 @@ _FILE_EXISTS_TYPE = "file_exists"
 # and the sync integration's `sync:<source>` keys); `/`, `?`, `#` would
 # split the path or start a query/fragment, making the card unresolvable
 # by key. Word characters plus `.`, `:`, `-` cover every key this codebase
-# files (`sync:gmail`, `monarch-reauth`) with room for more.
-_KEY_RE = re.compile(r"^[\w.:-]+$")
+# files (`sync:gmail`, `monarch-reauth`) with room for more. `\Z` (not `$`)
+# so a trailing newline can't sneak past the anchor — `$` matches just
+# before a final `\n`, `re.match` doesn't require consuming the whole
+# string, so `"abc\n"` would otherwise pass.
+_KEY_RE = re.compile(r"^[\w.:-]+\Z")
 
 # `equals` must be JSON-scalar — anything else can't round-trip through the
 # compact JSON stored in the `done_when` field, or through the worker's `==`
@@ -80,7 +83,11 @@ def validate_done_when(done_when: Optional[dict]) -> Optional[dict]:
     (`agent_worker/worker.py`), so an unvalidated `path` like `@host/x` or
     `//host/x` would re-parse the authority and make the worker's
     `done_when` poll an SSRF primitive reachable by any agent that can file
-    a card. `pointer` must be a string; `equals` must be a JSON scalar.
+    a card. For `endpoint`, `path` also may not contain `?` or `#` — a
+    query string would let the filer smuggle request parameters into the
+    worker's poll GET, a query-driven side-effecting local request
+    reachable the same way. `pointer` must be a string; `equals` must be a
+    JSON scalar.
     """
     if done_when is None:
         return None
@@ -96,6 +103,13 @@ def validate_done_when(done_when: Optional[dict]) -> Optional[dict]:
         path, pointer, equals = done_when["path"], done_when["pointer"], done_when["equals"]
         if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
             raise DoneWhenError("done_when.path must be a string starting with '/' (not '//')")
+        if "?" in path or "#" in path:
+            # A query string or fragment lets the filer smuggle arbitrary
+            # query parameters into the worker's poll GET — a query-driven
+            # side-effecting local request reachable by any agent that can
+            # file a card. `path` is meant to name a fixed status endpoint,
+            # not carry request parameters.
+            raise DoneWhenError("done_when.path must not contain '?' or '#'")
         if not isinstance(pointer, str):
             raise DoneWhenError("done_when.pointer must be a string")
         if not isinstance(equals, _SCALAR_TYPES):
@@ -177,6 +191,12 @@ def add_card(
     """
     if key and not _KEY_RE.match(key):
         raise ValueError(f"key {key!r} must match ^[\\w.:-]+$ (letters, digits, '.', ':', '-', '_')")
+    if key and not key.strip("."):
+        # A key of only dots ("." or "..") passes _KEY_RE but is a path
+        # segment that URL clients normalize away (dot-segment resolution,
+        # RFC 3986 §5.2.4) before it ever reaches the resolve route,
+        # making the card unresolvable by key.
+        raise ValueError(f"key {key!r} must match ^[\\w.:-]+$ (letters, digits, '.', ':', '-', '_')")
     validated_done_when = validate_done_when(done_when)
     fields: dict[str, str] = {}
     if key:
@@ -244,13 +264,28 @@ def _age_hours(task: Task, now: Optional[datetime] = None) -> Optional[float]:
 
 
 def _card_to_dict(task: Task, now: Optional[datetime] = None) -> dict:
+    """Build the dict shape returned by the REST list route, the native
+    chat tool, and (via the REST route) the worker's `done_when` poll —
+    this is the single read path all three share. `done_when` is re-run
+    through `validate_done_when` here, not just at write time
+    (`add_card`): the generic task-update API can write directly to a
+    task's `fields`, so a stored `done_when` isn't guaranteed to still be
+    the shape the write path validated. An invalid or malformed value
+    (including the SSRF-shaped paths `validate_done_when` rejects) is
+    dropped to `None` rather than handed to the worker, which builds a
+    request URL directly from `done_when.path`."""
     done_when = None
     raw = task.fields.get("done_when")
     if raw:
         try:
-            done_when = json.loads(raw)
+            parsed = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             logger.warning("human_queue: card %s has unparseable done_when field", task.id)
+        else:
+            try:
+                done_when = validate_done_when(parsed)
+            except DoneWhenError:
+                logger.warning("human_queue: card %s has invalid done_when field", task.id)
     return {
         "id": task.id,
         "title": task.description,

@@ -70,9 +70,11 @@ go back and close it. Two types only:
 ```json
 {"type": "endpoint", "path": "/api/example-service/status", "pointer": "/status", "equals": "ok"}
 ```
-`path` must start with `/` and not `//` (422 otherwise — a worker-side
-guard against a `path` like `@host/x` re-parsing the request's authority).
-The worker GETs `path` against the local API it talks to, extracts the
+`path` must start with `/` and not `//`, and must not contain `?` or `#`
+(422 otherwise — a worker-side guard against a `path` like `@host/x`
+re-parsing the request's authority, or a query string turning the poll
+into a query-driven local GET). The worker GETs `path` against the local
+API it talks to, extracts the
 value at the JSON Pointer (RFC 6901) `pointer`, and compares it to
 `equals`. `pointer` uses the standard `/a/b` syntax (`""` or `"/"` selects
 the whole response body).
@@ -93,7 +95,12 @@ observing the fix, or `/chat`/Hermes on request) resolves it by hand.
 command would be a remote-execution surface reachable by any agent that can
 file a card — deliberately excluded. `endpoint` and `file_exists` are
 enough to express "the service is healthy again" or "the flag file exists"
-without that risk.
+without that risk. They are still real capability handed to any agent that
+can file a card, not inert status reads: `endpoint` makes the agent worker
+issue a GET against the given local API path every poll, and `file_exists`
+answers whether a path exists on the worker host — so both should be
+treated as available to whatever can create a `#human` task, not just to
+whoever reads cards back.
 
 Either way the card is left untouched and tried again next poll, but
 logging differs: an **errored** check (endpoint unreachable, wrong shape)
@@ -143,9 +150,13 @@ The **Morning Briefing** proactive reminder's prompt
 24 or more, skipping the section when there are none.
 
 If your Morning Briefing scheduler entry was seeded before this section
-existed, it won't pick up the change on its own — either add a **Waiting on
-You** paragraph like the one above to that entry by hand, or re-run
-`scripts/seed_proactive_reminders.py --force` to reseed it from the current
+existed, it won't pick up the change on its own. Re-running
+`scripts/seed_proactive_reminders.py --force` does **not** update it —
+`--force` only skips the by-name existence check, and `SchedulerStore.create`
+always inserts a new entry, so it would leave you with two Morning Briefing
+schedules. Instead, either edit the existing entry's prompt by hand to add
+a **Waiting on You** paragraph like the one above, or delete that entry
+first and then re-run the seed script to recreate it from the current
 prompt.
 
 ## Related Documents
