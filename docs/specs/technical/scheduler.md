@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Scheduler
-> **Last Updated:** 2026-05-29
+> **Last Updated:** 2026-09-03
 
 Engineering view of the Scheduler — how a trigger bound to an action is stored,
 reindexed, and fired. For the trigger/action model, line schema, and operator
@@ -78,6 +78,7 @@ short snippet in `last_result` for the dashboard.
 ## Related Documents
 
 ### Specifications
+- [Task Management — Technical](task-management.md) — Task store that mirrors this store's id-addressed block rewrite, `>` body, and merge-forward patterns
 - [Scheduler Guide](../../guides/scheduler.md) — Operator how-to, line schema, trigger/action model (the consumer-facing counterpart to this spec)
 - [API Reference](../product/api-reference.md#scheduler--telegram-endpoints) — `/api/scheduler` contracts
 - [MCP Tools](../product/mcp-tools.md) — `lifeos_schedule_*` tool contracts

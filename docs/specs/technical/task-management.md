@@ -34,15 +34,15 @@ identity or content lives only in the cache except `reminder_id` (see
   an optional indented `> ` notes body directly beneath it, exactly like a
   scheduler entry's `message_content` body
   ([scheduler.md](scheduler.md#source-of-truth--cache)). `_format_task_line`/
-  `_parse_task_line` (`task_manager.py:898`, `:946`) are inverse for a task
+  `_parse_task_line` (`task_manager.py:1224`, `:1272`) are inverse for a task
   written by the API. A hand-authored line need not be — see "Parsing" below.
 - **Cache:** `data/task_index.json` — the full `Task` (dataclass at
-  `task_manager.py:76`), including fields with no markdown representation
-  (`reminder_id`). `rebuild_index` (`:507`) regenerates it from the vault.
+  `task_manager.py:129`), including fields with no markdown representation
+  (`reminder_id`). `rebuild_index` (`:671`) regenerates it from the vault.
 
 ## Parsing
 
-A task line is any `- [.] ...` checkbox line — `_CHECKBOX_RE` (`:892`) does
+A task line is any `- [.] ...` checkbox line — `_CHECKBOX_RE` (`:1188`) does
 **not** require the literal `TODO` keyword. This is deliberate: it lets a
 task typed by hand in Obsidian (`- [ ] Buy milk`) be recognized without the
 operator learning LifeOS's own convention. `_format_task_line` still always
@@ -56,7 +56,7 @@ every other `[key:: value]` — operator fields (`host`, `effort`, `model`,
 `key`) and anything a later feature invents — lands in `Task.fields` (a
 plain `dict[str, str]`) and round-trips through any rewrite untouched,
 because `_format_task_line` re-emits `Task.fields` verbatim in the order it
-holds them (`:898-934`). No parser change is needed to add a new field.
+holds them (`:1224-1258`). No parser change is needed to add a new field.
 
 A checkbox line inside a fenced (` ``` ` or `~~~`) code block is never
 parsed as a task, even though `_CHECKBOX_RE` would otherwise match it — a
@@ -89,7 +89,7 @@ cross-file duplicate for the next full rebuild to resolve.
 
 A checkbox line with no `<!-- id:xxxx -->` comment gets one minted
 (`uuid4().hex[:8]`, same scheme as before) the first time it's parsed. On the
-next reindex, `_reparse_lines` (`:533`) appends that id comment to the raw
+next reindex, `_reparse_lines` (`:713`) appends that id comment to the raw
 line — and changes nothing else about it: no reformatting, no inserted
 `TODO`, no field reordering. Every other line in the file, task or not, is
 copied through byte-for-byte. This matters because the parser no longer
@@ -138,20 +138,20 @@ the next reindex silently flipped it back to `todo`.
 ## Id-addressed, compare-and-swap writes
 
 Every write locates its task's line by id — `_find_task_block_span`
-(`:1030`) scans for the block whose id comment matches, the same mechanism
+(`:1356`) scans for the block whose id comment matches, the same mechanism
 `SchedulerStore._find_block_span` uses. A cached `line_number` is never used
 to address a write; it is refreshed after every write purely as read-side
-bookkeeping (`_reposition_file`, `:673`) so `GET` responses stay accurate.
+bookkeeping (`_reposition_file`, `:917`) so `GET` responses stay accurate.
 This is what lets a `PUT` succeed correctly even when an external edit (via
 Obsidian, delivered by Syncthing) has inserted lines above the task before
 the watcher's 2s debounce catches up.
 
-Each write goes through `_cas_rewrite` (`:597`) or `_cas_insert_at_top`
-(`:640`): read the file's mtime, read and locate the block, compute the new
+Each write goes through `_cas_rewrite` (`:802`) or `_cas_insert_at_top`
+(`:881`): read the file's mtime, read and locate the block, compute the new
 content, then re-check the mtime immediately before writing. A mismatch
 means a concurrent external writer touched the file in between, so the
 manager calls `reindex_file` (absorbing that change into `self._tasks`) and
-retries — up to `_CAS_MAX_RETRIES` (`:61`, currently 3) times — before
+retries — up to `_CAS_MAX_RETRIES` (`:70`, currently 3) times — before
 raising `TaskConflictError`, which `api/routes/tasks.py` maps to HTTP 409.
 The retry re-invokes the caller's `compute()` closure against the
 just-refreshed `self._tasks[task_id]`, so an `update()` retry re-applies the
@@ -221,7 +221,7 @@ these defaults don't change its behavior.
 
 `Task.notes` is a multi-line string stored as `_BODY_INDENT` (four spaces)
 plus `> ` per line, directly beneath the task's checkbox line —
-`_format_task_block` (`:935`) emits it, `_match_task_block` (`:1005`) parses
+`_format_task_block` (`:1261`) emits it, `_match_task_block` (`:1331`) parses
 it back, both mirroring the scheduler entry body pattern exactly
 (`scheduler.md`'s `_format_entry_block`/`_iter_entry_blocks`). Deleting or
 moving a task carries its body with it, because every write operates on the
@@ -304,9 +304,9 @@ for the sibling-line case this issue set out to fix.
 
 Syncthing conflict copies (`*.sync-conflict-YYYYMMDD-HHMMSS...`) and
 in-progress temp files (`.syncthing.*`) are recognized by `is_conflict_file`
-(`:135`) and skipped everywhere: `rebuild_index`'s glob, `reindex_file`
+(`:209`) and skipped everywhere: `rebuild_index`'s glob, `reindex_file`
 (early return, never indexed, never triggers a write), and `TaskWatcher`'s
-event handler. `TaskManager.list_conflicts` (`:435`) surfaces them (name +
+event handler. `TaskManager.list_conflicts` (`:555`) surfaces them (name +
 mtime) via `GET /api/tasks/conflicts`, registered before `GET
 /{task_id}` in `api/routes/tasks.py` so FastAPI doesn't capture `"conflicts"`
 as a task id. Resolving a conflict file is a manual, out-of-band operation
