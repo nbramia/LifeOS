@@ -94,10 +94,12 @@ A node's color is its status. The set is slightly different per source — same 
 | **running** | Currently executing tool calls or LLM turns. | A live `claude` / `codex` process is running with this jsonl's cwd, **or** the file was modified in the last 10 minutes. The first is authoritative; the second is inferred. |
 | **claimed** | Worker has picked up the task but hasn't fired the executor yet (preflight is in flight). | n/a |
 | **yielded** | Paused waiting for spawned children to finish. | n/a |
+| **idle** | n/a | Registered via the session hook (#849): open and waiting for input, after a `session_start` or `stop` event. Live, not finished. |
 | **inactive** | n/a | Modified within 24h but no live process — typically you closed the terminal mid-session. Resumable. |
 | **blocked** | Waiting on a Telegram clarification from you. | n/a |
 | **completed** | Task ran to completion successfully. | jsonl is >24h old, no error in the last event. |
 | **failed** | Executor crashed, preflight rejected, or runtime error. | Last event in the jsonl was an error/tool failure (and >24h old). |
+| **ended** | n/a | Registered via the session hook (#849): a `session_end` event was received — finished. Hidden by default like completed/failed; Resume available. |
 | **budget_exceeded** | Token / wall / dollar cap breached and the session was killed externally. | n/a |
 
 A small `(inferred)` hint appears next to the status on CLI sessions whenever the status came from mtime rather than from a confirmed live process — useful to know when reading "running" on a session you don't remember starting.

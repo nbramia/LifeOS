@@ -174,6 +174,11 @@ Subagent spawns are detected when an assistant message contains a `tool_use` blo
 | Older + last event was an error | `failed` | `True` |
 | Older + pending tool in flight | `inactive` | `True` |
 | Otherwise | `completed` | `True` |
+| `cli_sessions` row present, latest event `session_start` or `stop` | `idle` | `False` |
+| `cli_sessions` row present, latest event `user_prompt_submit` | `running` | `False` |
+| `cli_sessions` row present, latest event `session_end` | `ended` | `False` |
+
+When a session has a `cli_sessions` registration (see [Cross-machine CLI session registration](#cross-machine-cli-session-registration)), that row's event-driven status replaces this file-age inference entirely — `status_inferred` is `False` regardless of what the mtime-based signals above would have guessed.
 
 The 10-minute `running` window is wider than the wall-clock-precise definition because Claude Code appends in bursts during a single turn and a tight 60-second threshold flipped sessions to `inactive` mid-pause. The `(inferred)` hint in the side panel lets the operator distinguish authoritative from heuristic status reads.
 
@@ -435,5 +440,6 @@ Per-source guarantees:
 - [Agent Viz — Product](../product/agent-viz.md) — Consumer view: filters, chips, status semantics, operator controls
 - [Agent Worker — Technical](agent-worker.md) — Sessions, transcripts, kill primitives, inter-agent coordination
 - [Agent Worker — Product](../product/agent-worker.md) — `#agent` task lifecycle, Telegram interactions
+- [API Reference](../product/api-reference.md) — `POST /api/agents/cli-sessions/events` and other agent endpoint contracts
 - [Architecture](architecture.md) — Where the route + adapter fit in the broader code structure
 - [Observability](observability.md) — Adjacent traces / health surfaces

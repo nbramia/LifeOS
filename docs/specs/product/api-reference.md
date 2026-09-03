@@ -979,6 +979,7 @@ Get usage summary with stats for 24h, 7d, 30d, and all-time. Includes daily cost
 
 - [api-crm.md](api-crm.md) — `/api/crm/*` HTTP endpoints (split out from this file)
 - [mcp-tools.md](mcp-tools.md) — MCP tool catalog (the canonical home — was previously duplicated here)
+- [Agent Viz — Technical](../technical/agent-viz.md) — `/api/agents/*` endpoints in detail, including cross-machine CLI session registration
 - [Data & Sync](../technical/data-and-sync.md) — Data sources and sync pipeline
 - [Chat UI](chat-ui.md) — Chat interface product spec
 - [Client Surfaces](../technical/client-surfaces.md) — HTTP consumers and breaking-change policy
