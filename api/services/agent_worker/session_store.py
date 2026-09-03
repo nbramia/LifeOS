@@ -115,6 +115,52 @@ class Session:
     unpriced: bool = False
 
 
+# Engine -> storage id prefix for the `cli_sessions` table (#849). Matches
+# the `cc:` / `cx:` convention `CCWezTermStore` and the transcript-scan
+# snapshot already use, so a cli_sessions row and its transcript-derived
+# counterpart share one id in the /agents snapshot union.
+CLI_ENGINE_PREFIXES = {"claude_code": "cc", "codex": "cx"}
+
+# Lifecycle events the hook script posts. Anything else is a caller bug —
+# the route rejects it with 422 rather than silently no-op'ing.
+CLI_SESSION_EVENTS = frozenset({
+    "session_start", "user_prompt_submit", "stop", "session_end",
+})
+
+CLI_STATUS_IDLE = "idle"
+CLI_STATUS_RUNNING = "running"
+CLI_STATUS_ENDED = "ended"
+
+# Prompt previews are truncated to this many characters before storage
+# (issue #849 acceptance criteria).
+CLI_PROMPT_PREVIEW_MAX = 200
+
+
+@dataclass
+class CliSession:
+    """Mirrors one row in the `cli_sessions` table — a Claude Code or Codex
+    CLI session registered by `scripts/lifeos-agent-hook.sh`, from any
+    machine on the tailnet. Status is event-driven (set by the hook's
+    lifecycle posts), unlike the local transcript scan's file-age guess.
+    """
+
+    session_id: str  # cc:<uuid> or cx:<uuid> — shares the snapshot id space
+    engine: str  # "claude_code" | "codex"
+    host: str
+    status: str  # idle | running | ended
+    started_at: int
+    last_event_at: int
+    cwd: str | None = None
+    transcript_path: str | None = None
+    branch: str | None = None
+    model: str | None = None
+    prompt_preview: str | None = None
+    task_id: str | None = None
+    pane_id: int | None = None
+    wezterm_pid: int | None = None
+    ended_at: int | None = None
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     task_id                   TEXT PRIMARY KEY,
@@ -256,6 +302,29 @@ CREATE TABLE IF NOT EXISTS managed_cursor (
     tool_loop_signature              TEXT,
     tool_loop_count                  INTEGER NOT NULL DEFAULT 0,
     tool_calls_since_message         INTEGER NOT NULL DEFAULT 0
+);
+
+-- Cross-machine Claude Code / Codex CLI sessions (#849). One row per
+-- session, registered by scripts/lifeos-agent-hook.sh from any host on the
+-- tailnet via POST /api/agents/cli-sessions/events. `session_id` is the
+-- cc:/cx:-prefixed id (see CLI_ENGINE_PREFIXES) so it shares the id space
+-- the /agents snapshot union keys transcript-derived rows on.
+CREATE TABLE IF NOT EXISTS cli_sessions (
+    session_id       TEXT PRIMARY KEY,
+    engine           TEXT NOT NULL,
+    host             TEXT NOT NULL,
+    cwd              TEXT,
+    transcript_path  TEXT,
+    branch           TEXT,
+    model            TEXT,
+    status           TEXT NOT NULL,
+    prompt_preview   TEXT,
+    task_id          TEXT,
+    pane_id          INTEGER,
+    wezterm_pid      INTEGER,
+    started_at       INTEGER NOT NULL,
+    last_event_at    INTEGER NOT NULL,
+    ended_at         INTEGER
 );
 """
 
@@ -1367,6 +1436,158 @@ class SessionStore:
                 "UPDATE pending_questions SET timed_out = 1 WHERE id = ?",
                 (int(question_id),),
             )
+
+    # ------------------------------------------------------------------
+    # Cross-machine CLI sessions (#849)
+    # ------------------------------------------------------------------
+
+    def record_cli_session_event(
+        self,
+        *,
+        engine: str,
+        event: str,
+        session_id: str,
+        host: str,
+        cwd: str | None = None,
+        transcript_path: str | None = None,
+        branch: str | None = None,
+        model: str | None = None,
+        prompt: str | None = None,
+        task_id: str | None = None,
+        pane_id: int | None = None,
+        wezterm_pid: int | None = None,
+    ) -> CliSession:
+        """Apply one hook lifecycle event to the `cli_sessions` table.
+
+        Status machine: `session_start` -> `idle`; `user_prompt_submit` ->
+        `running` (and stores `prompt` truncated to CLI_PROMPT_PREVIEW_MAX
+        chars); `stop` -> `idle`; `session_end` -> `ended`. The row is
+        created on the first event seen for a session_id regardless of
+        which event that is — a hook installed mid-session, or one whose
+        session_start post was lost, still registers the session on its
+        next event rather than silently vanishing.
+
+        Fields present on the event (cwd, branch, model, task_id, pane_id,
+        wezterm_pid) overwrite the stored value; omitted (`None`) fields
+        leave whatever an earlier event already captured. `ended_at` is set
+        on `session_end` and cleared on `session_start` (a resumed session
+        sends session_start again, which un-ends it); `stop` and
+        `user_prompt_submit` leave it as-is.
+
+        Caller (the route) validates `engine` is a key of
+        CLI_ENGINE_PREFIXES and `event` is in CLI_SESSION_EVENTS — this
+        method assumes both are already valid.
+        """
+        storage_id = f"{CLI_ENGINE_PREFIXES[engine]}:{session_id}"
+        now = _now()
+
+        if event == "session_start":
+            status = CLI_STATUS_IDLE
+        elif event == "user_prompt_submit":
+            status = CLI_STATUS_RUNNING
+        elif event == "stop":
+            status = CLI_STATUS_IDLE
+        else:  # session_end — validated by the caller
+            status = CLI_STATUS_ENDED
+
+        prompt_preview = (
+            prompt[:CLI_PROMPT_PREVIEW_MAX]
+            if event == "user_prompt_submit" and prompt is not None
+            else None
+        )
+
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM cli_sessions WHERE session_id = ?", (storage_id,)
+            ).fetchone()
+
+            if event == "session_end":
+                ended_at = now
+            elif event == "session_start":
+                ended_at = None
+            else:
+                ended_at = existing["ended_at"] if existing is not None else None
+
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO cli_sessions (
+                        session_id, engine, host, cwd, transcript_path,
+                        branch, model, status, prompt_preview, task_id,
+                        pane_id, wezterm_pid, started_at, last_event_at,
+                        ended_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        storage_id, engine, host, cwd, transcript_path,
+                        branch, model, status, prompt_preview, task_id,
+                        pane_id, wezterm_pid, now, now, ended_at,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE cli_sessions SET
+                        engine = ?,
+                        host = ?,
+                        cwd = COALESCE(?, cwd),
+                        transcript_path = COALESCE(?, transcript_path),
+                        branch = COALESCE(?, branch),
+                        model = COALESCE(?, model),
+                        status = ?,
+                        prompt_preview = COALESCE(?, prompt_preview),
+                        task_id = COALESCE(?, task_id),
+                        pane_id = COALESCE(?, pane_id),
+                        wezterm_pid = COALESCE(?, wezterm_pid),
+                        last_event_at = ?,
+                        ended_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (
+                        engine, host, cwd, transcript_path, branch, model,
+                        status, prompt_preview, task_id, pane_id,
+                        wezterm_pid, now, ended_at, storage_id,
+                    ),
+                )
+            row = conn.execute(
+                "SELECT * FROM cli_sessions WHERE session_id = ?", (storage_id,)
+            ).fetchone()
+        return self._row_to_cli_session(row)
+
+    def get_cli_session(self, session_id: str) -> CliSession | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM cli_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return self._row_to_cli_session(row) if row else None
+
+    def list_cli_sessions(self, limit: int = 500) -> list[CliSession]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cli_sessions ORDER BY last_event_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._row_to_cli_session(r) for r in rows]
+
+    @staticmethod
+    def _row_to_cli_session(row: sqlite3.Row) -> CliSession:
+        return CliSession(
+            session_id=row["session_id"],
+            engine=row["engine"],
+            host=row["host"],
+            status=row["status"],
+            started_at=row["started_at"],
+            last_event_at=row["last_event_at"],
+            cwd=row["cwd"],
+            transcript_path=row["transcript_path"],
+            branch=row["branch"],
+            model=row["model"],
+            prompt_preview=row["prompt_preview"],
+            task_id=row["task_id"],
+            pane_id=row["pane_id"],
+            wezterm_pid=row["wezterm_pid"],
+            ended_at=row["ended_at"],
+        )
 
     @staticmethod
     def _row_to_session(row: sqlite3.Row) -> Session:

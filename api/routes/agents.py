@@ -7,8 +7,10 @@ agent worker sessions, plus per-session transcript tailing. See
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
+import socket
 import time
 from typing import Any
 
@@ -17,7 +19,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from api.services.agent_worker.session_store import (
+    CLI_ENGINE_PREFIXES,
+    CLI_SESSION_EVENTS,
     TERMINAL_STATUSES,
+    CliSession,
     Session,
     SessionStore,
 )
@@ -74,6 +79,21 @@ def _get_transcript_store() -> TranscriptStore:
     if _transcript_store is None:
         _transcript_store = TranscriptStore()
     return _transcript_store
+
+
+def api_host_name() -> str:
+    """Short hostname of the machine running this API process (#849).
+
+    Used to label every snapshot row with `host` — worker sessions and
+    local-transcript CLI sessions always ran here, so they get this value
+    directly; remote `cli_sessions` rows carry whatever host their own
+    hook posted. Strips any domain suffix the same way the hook script
+    does, so a row's `host` reads identically whether it came from this
+    function or from a remote hook post. A single function (rather than
+    inlining `socket.gethostname()` at each call site) so tests can
+    monkeypatch one target.
+    """
+    return socket.gethostname().split(".")[0]
 
 
 def _is_error_kind(kind: str) -> bool:
@@ -164,6 +184,9 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "session_id": s.session_id,
         "task_id": s.task_id,
         "status": s.status,
+        # Worker sessions only ever run on the machine hosting the API
+        # (#849) — no cross-host worker dispatch exists.
+        "host": api_host_name(),
         "routing": s.routing,
         "parent_session_id": s.parent_session_id,
         "root_session_id": s.root_session_id,
@@ -252,6 +275,69 @@ def _codex_snapshot() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         return [], []
 
 
+def _apply_cli_session_to_dict(sd: dict[str, Any], cli: CliSession) -> None:
+    """Merge an event-driven `cli_sessions` row onto a transcript-derived
+    snapshot dict for the same session (#849). Event status wins over the
+    transcript scan's file-age guess; token/cost fields stay
+    transcript-derived — the hook posts no usage data.
+    """
+    sd["status"] = cli.status
+    sd["status_inferred"] = False
+    sd["host"] = cli.host
+    sd["branch"] = cli.branch
+    sd["prompt_preview"] = cli.prompt_preview
+    if cli.task_id:
+        sd["task_id"] = cli.task_id
+
+
+def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
+    """Synthetic snapshot row for a `cli_sessions` row with no matching
+    local transcript — a session running on a different machine (#849).
+    No token or dollar detail (the hook posts none); `status_inferred` is
+    always False because the status here is event-driven by definition.
+    """
+    if cli.engine == "claude_code":
+        from api.services.claude_code import session_ingest as cc
+        model_lbl = cc.model_label(cli.model or "")
+    elif cli.engine == "codex":
+        from api.services.codex import session_ingest as cx
+        model_lbl = cx.model_label(cli.model or "")
+    else:
+        model_lbl = "Claude"
+    return {
+        "session_id": cli.session_id,
+        "task_id": cli.task_id,
+        "status": cli.status,
+        "routing": cli.engine,
+        "parent_session_id": None,
+        "root_session_id": cli.session_id,
+        "spawn_depth": 0,
+        "yield_waiting_for": [],
+        "managed_agent_session_id": None,
+        "started_at": cli.started_at,
+        "last_activity_at": cli.last_event_at,
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "total_cache_creation_tokens": 0,
+        "total_cache_read_tokens": 0,
+        "total_dollars": 0.0,
+        "total_active_seconds": 0.0,
+        "expected_output": None,
+        "label": cli.session_id,
+        "model_label": model_lbl,
+        "last_event_kind": "",
+        "tool_call_count": 0,
+        "error_count": 0,
+        "source": cli.engine,
+        "status_inferred": False,
+        "project_key": "",
+        "decoded_cwd": cli.cwd or "",
+        "host": cli.host,
+        "branch": cli.branch,
+        "prompt_preview": cli.prompt_preview,
+    }
+
+
 def _build_snapshot() -> dict[str, Any]:
     session_store = _get_session_store()
     transcript_store = _get_transcript_store()
@@ -268,6 +354,22 @@ def _build_snapshot() -> dict[str, Any]:
         if s.parent_session_id
     ]
 
+    # Cross-machine CLI sessions (#849): registered via the hook script's
+    # POST /api/agents/cli-sessions/events, keyed the same way
+    # transcript-derived rows are (cc:<uuid> / cx:<uuid>). Ids that also
+    # have a local transcript merge below (event status wins, tokens stay
+    # transcript-derived); whatever's left after both scans ran had no
+    # local transcript match — those become synthetic remote rows further
+    # down. Popped from this dict as each cc/cx row consumes its match, so
+    # what remains at the end is exactly the unmatched set.
+    try:
+        cli_by_id: dict[str, CliSession] = {
+            c.session_id: c for c in session_store.list_cli_sessions()
+        }
+    except Exception as exc:  # noqa: BLE001 — never break the snapshot on a store error
+        logger.warning("cli_sessions read failed: %s", exc)
+        cli_by_id = {}
+
     cc_sessions, cc_edges = _claude_code_snapshot()
     # CC session dicts come from claude_code/session_ingest.py and don't carry
     # the short_label field — attach it the same way (cached-only, no LLM in
@@ -283,6 +385,11 @@ def _build_snapshot() -> dict[str, Any]:
             ),
         )
         sd["custom_label"] = agent_viz_label_override.get_override(sid)
+        cli = cli_by_id.pop(sid, None)
+        if cli is not None:
+            _apply_cli_session_to_dict(sd, cli)
+        else:
+            sd["host"] = api_host_name()
     session_dicts.extend(cc_sessions)
     edges.extend(cc_edges)
 
@@ -298,8 +405,40 @@ def _build_snapshot() -> dict[str, Any]:
             ),
         )
         sd["custom_label"] = agent_viz_label_override.get_override(sid)
+        cli = cli_by_id.pop(sid, None)
+        if cli is not None:
+            _apply_cli_session_to_dict(sd, cli)
+        else:
+            sd["host"] = api_host_name()
     session_dicts.extend(cx_sessions)
     edges.extend(cx_edges)
+
+    # Whatever's left in cli_by_id had no local transcript — a remote host,
+    # or (rarely) a local hook post that raced ahead of the transcript
+    # scan's cache. Bound to the same recency window the transcript scan
+    # already applies per engine so a stale registration doesn't linger.
+    now = time.time()
+    try:
+        from config.settings import settings
+        cc_cutoff = now - int(getattr(settings, "claude_code_lookback_days", 7)) * 86400
+        cx_cutoff = now - int(getattr(settings, "codex_lookback_days", 7)) * 86400
+    except Exception:  # noqa: BLE001 — degrade to "no cutoff" if settings fail to load
+        cc_cutoff = cx_cutoff = 0.0
+    for cli in cli_by_id.values():
+        cutoff = cc_cutoff if cli.engine == "claude_code" else cx_cutoff
+        if cli.last_event_at < cutoff:
+            continue
+        sd = _cli_session_to_dict(cli)
+        sd.setdefault(
+            "short_label",
+            _short_label_for_snapshot(
+                cli.session_id,
+                sd.get("last_activity_at") or 0.0,
+                sd.get("status") or "",
+            ),
+        )
+        sd["custom_label"] = agent_viz_label_override.get_override(cli.session_id)
+        session_dicts.append(sd)
 
     return {
         "sessions": session_dicts,
@@ -927,6 +1066,113 @@ class CCPaneBindRequest(BaseModel):
     cwd: str = Field(default="", max_length=4096)
 
 
+class CliSessionEventRequest(BaseModel):
+    """Body for POST /api/agents/cli-sessions/events — posted by
+    `scripts/lifeos-agent-hook.sh` from any machine, on Claude Code /
+    Codex SessionStart, UserPromptSubmit, Stop, and SessionEnd (#849).
+
+    Unlike /cc-pane-bind and /cx-pane-bind, this endpoint is reachable over
+    the tailnet (bearer-token gated, not localhost-only) — it's what lets a
+    session on a laptop or another box register itself with /agents.
+    """
+    engine: str = Field(..., min_length=1, max_length=32)
+    event: str = Field(..., min_length=1, max_length=32)
+    session_id: str = Field(..., min_length=1, max_length=128)
+    host: str = Field(..., min_length=1, max_length=255)
+    cwd: str = Field(default="", max_length=4096)
+    transcript_path: str = Field(default="", max_length=4096)
+    branch: str = Field(default="", max_length=255)
+    model: str = Field(default="", max_length=128)
+    prompt_preview: str = Field(default="", max_length=4096)
+    task_id: str = Field(default="", max_length=128)
+    pane_id: int | None = Field(default=None, ge=0)
+    wezterm_pid: int | None = Field(default=None, ge=0)
+
+
+def _check_agent_hook_auth(request: Request) -> None:
+    """Bearer-token gate for POST /api/agents/cli-sessions/events (#849).
+
+    Mirrors `api/routes/hermes_proxy.py`'s `_check_hermes_inbound_auth`:
+    disabled (503) until an operator sets `LIFEOS_AGENT_HOOK_TOKEN`, since
+    an empty token here would mean "accept unauthenticated session data
+    from the tailnet" rather than "send no auth" (which is what an empty
+    *outbound* token means elsewhere in this codebase).
+    """
+    from config.settings import settings
+
+    expected = settings.agent_hook_token
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="CLI session registration disabled: set LIFEOS_AGENT_HOOK_TOKEN to enable.",
+        )
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    token = token.strip()
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    if not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="invalid bearer token")
+
+
+@router.post("/cli-sessions/events")
+async def cli_session_event(request: Request, body: CliSessionEventRequest) -> dict[str, Any]:
+    """Register one Claude Code / Codex CLI lifecycle event (#849).
+
+    Posted by `scripts/lifeos-agent-hook.sh` on SessionStart,
+    UserPromptSubmit, Stop, and SessionEnd, from any machine. Applies the
+    event to the `cli_sessions` table (see
+    `SessionStore.record_cli_session_event` for the status machine) so
+    `/agents` shows sessions from every machine, not just the one hosting
+    the API.
+
+    When the event carries `pane_id` AND its `host` matches this API's own
+    host, the pane mapping is also written into `cc_wezterm_store` — the
+    same store `/cc-pane-bind` and `/cx-pane-bind` write to — so Focus
+    keeps working for local sessions registered this way. Remote-host pane
+    ids have nowhere local to activate, so they're stored on the
+    `cli_sessions` row only.
+    """
+    _check_agent_hook_auth(request)
+
+    if body.engine not in CLI_ENGINE_PREFIXES:
+        raise HTTPException(status_code=422, detail=f"unknown engine: {body.engine!r}")
+    if body.event not in CLI_SESSION_EVENTS:
+        raise HTTPException(status_code=422, detail=f"unknown event: {body.event!r}")
+
+    store = _get_session_store()
+    cli = store.record_cli_session_event(
+        engine=body.engine,
+        event=body.event,
+        session_id=body.session_id,
+        host=body.host,
+        cwd=body.cwd or None,
+        transcript_path=body.transcript_path or None,
+        branch=body.branch or None,
+        model=body.model or None,
+        prompt=body.prompt_preview or None,
+        task_id=body.task_id or None,
+        pane_id=body.pane_id,
+        wezterm_pid=body.wezterm_pid,
+    )
+
+    if body.pane_id is not None and body.host == api_host_name():
+        try:
+            from api.services.cc_wezterm_store import get_default_store
+            get_default_store().upsert(
+                cli.session_id, int(body.pane_id), body.cwd or "",
+                wezterm_pid=body.wezterm_pid or 0,
+            )
+        except Exception as exc:  # noqa: BLE001 — pane mapping is a nice-to-have, never fail the event
+            logger.warning("cc_wezterm_store upsert failed for %s: %s", cli.session_id, exc)
+
+    return {
+        "registered": True,
+        "session_id": cli.session_id,
+        "status": cli.status,
+    }
+
+
 def _copy_to_clipboard(text: str, env: dict[str, str]) -> bool:
     """Push `text` to the system clipboard via `wl-copy` (Wayland) or
     `xclip` (X11). Returns True on success, False on any failure. Never
@@ -1235,6 +1481,28 @@ def _resume_env() -> dict[str, str]:
     return env
 
 
+def _check_session_host_or_409(session_id: str) -> None:
+    """Reject /focus and /resume for a session registered on a different
+    host than this API (#849). Remote resume/focus needs the ssh mechanism
+    from the assignment-and-execution issue and isn't implemented here.
+
+    A session_id with no `cli_sessions` row — never registered via the
+    hook, or registered before this feature existed — falls through
+    unchanged to the existing local-only resolution (cache / FD-probe).
+    """
+    try:
+        store = _get_session_store()
+        cli = store.get_cli_session(session_id)
+    except Exception as exc:  # noqa: BLE001 — never block a local resume/focus on a store error
+        logger.warning("cli_sessions lookup failed for %s: %s", session_id, exc)
+        return
+    if cli is not None and cli.host != api_host_name():
+        raise HTTPException(
+            status_code=409,
+            detail=f"session {session_id} is running on host {cli.host!r}, not this API host",
+        )
+
+
 async def _resume_codex_session(
     session_id: str,
     body: "CCResumeRequest | None",
@@ -1408,10 +1676,16 @@ async def resume_claude_code_session(
     import shlex
     import subprocess
 
+    if not session_id.startswith("cx:") and not session_id.startswith("cc:"):
+        raise HTTPException(status_code=400, detail="resume is only available for Claude Code or Codex sessions")
+
+    # #849: remote resume isn't implemented yet (needs the ssh mechanism
+    # from the assignment-and-execution issue) — a session registered on a
+    # different host than this API 409s instead of silently no-op'ing.
+    _check_session_host_or_409(session_id)
+
     if session_id.startswith("cx:"):
         return await _resume_codex_session(session_id, body)
-    if not session_id.startswith("cc:"):
-        raise HTTPException(status_code=400, detail="resume is only available for Claude Code or Codex sessions")
 
     try:
         from config.settings import settings
@@ -1825,6 +2099,12 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
     is_cx = session_id.startswith("cx:")
     if not session_id.startswith("cc:") and not is_cx:
         raise HTTPException(status_code=400, detail="focus is only available for Claude Code or Codex sessions")
+
+    # #849: remote focus isn't implemented yet (needs the ssh mechanism
+    # from the assignment-and-execution issue) — a session registered on a
+    # different host than this API 409s instead of trying (and failing) a
+    # local wezterm probe for a pane that doesn't exist here.
+    _check_session_host_or_409(session_id)
 
     try:
         from config.settings import settings

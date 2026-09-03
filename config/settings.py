@@ -282,6 +282,16 @@ class Settings(BaseSettings):
                     "POST /api/hermes/resolve-persona (#644) — empty disables that endpoint."
     )
 
+    agent_hook_token: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_HOOK_TOKEN",
+        description="Bearer token required from scripts/lifeos-agent-hook.sh on inbound calls "
+                    "to POST /api/agents/cli-sessions/events (#849) — the endpoint that lets a "
+                    "Claude Code or Codex session on any machine register itself with /agents. "
+                    "Empty disables the endpoint (503): a fresh clone doesn't accept "
+                    "unauthenticated session writes over the tailnet until an operator sets one."
+    )
+
     # Bounded lifetime for a chat turn that has detached from its client (#611):
     # a disconnect no longer stops generation, but an abandoned turn still needs
     # a ceiling so it can't run forever with nobody watching. Matches the read
