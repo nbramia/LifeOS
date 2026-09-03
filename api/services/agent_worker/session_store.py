@@ -1380,6 +1380,51 @@ class SessionStore:
             )
         return True
 
+    def deposit_answer_by_id(self, question_id: int, answer: str) -> bool:
+        """Record an answer for an open question by its own row id (#850).
+
+        Board-drawer sibling of `deposit_answer` (keyed by Telegram message
+        id) and `deposit_answer_by_session_id` (keyed by session): the
+        `/agents` board addresses one `pending_questions` row directly by the
+        id `list_open_questions` returned it under. Sets exactly the columns
+        `deposit_answer` sets, so `worker.py::_process_clarification_answers`
+        consumes it unchanged on its next tick — the same path a Telegram
+        reply takes. Returns True if a matching open (unanswered, not timed
+        out) question existed and was updated; False otherwise.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM pending_questions "
+                "WHERE id = ? AND answered_at IS NULL AND timed_out = 0 "
+                "AND kind != 'status_anchor'",
+                (int(question_id),),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute(
+                "UPDATE pending_questions "
+                "SET answer = ?, answered_at = ? WHERE id = ?",
+                (answer, _now(), row["id"]),
+            )
+        return True
+
+    def list_open_questions(self) -> list[dict]:
+        """List unanswered, unprocessed, not-timed-out questions (#850).
+
+        Powers `GET /api/agents/pending-questions` — the board's "waiting on
+        an answer" list. Excludes `status_anchor` rows (routing plumbing, not
+        a real question) the same way every other open-question lookup does.
+        Oldest first, so the board's list is stable as new questions arrive.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE answered_at IS NULL AND processed = 0 AND timed_out = 0 "
+                "AND kind != 'status_anchor' "
+                "ORDER BY id ASC",
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def delete_session(self, session_id: str) -> None:
         """Hard-delete a session and its queued messages/questions/turns.
 

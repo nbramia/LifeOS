@@ -4,28 +4,73 @@
 > **Owner:** Agent Worker
 > **Last Updated:** 2026-09-03
 
-LifeOS exposes a single live page at `/agents` that shows every agent session running for you — LifeOS agent worker tasks (`#agent`-tagged), local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`), and Claude Code / Codex sessions registered from **any other machine** on the tailnet via a lightweight hook script. The graph updates every 2 seconds, clicking a node opens that session's transcript in a resizable side panel, and the operator can kill any in-flight LifeOS agent or relaunch any local CLI session straight from the page.
+`/agents` is a Kanban board of the operator's work queue — vault tasks, agent questions, and scheduled work in one place, organized into lanes by status and tag. A **Graph** tab keeps the earlier force-directed session graph as a secondary, read-mostly view for watching what's actively running: every LifeOS agent worker task (`#agent`-tagged), local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`), and Claude Code / Codex sessions registered from **any other machine** on the tailnet via a lightweight hook script.
 
-The point is one place to see what your machine is doing on your behalf: whether the agent worker is making progress on the task you left in your vault, whether a Claude Code session you forgot about is still burning tokens, whether two parallel agents have collided on the same project.
+The point is one place to see what needs attention: what's waiting on an assignment, what an agent is stuck asking about, what's scheduled to run next, and — when you want to watch the machinery — what's actually executing right now.
 
 ---
 
 ## Table of Contents
 
-1. [What you see](#what-you-see)
-2. [Two sources, one graph](#two-sources-one-graph)
-3. [Status semantics](#status-semantics)
-4. [Filters and chips](#filters-and-chips)
-5. [Side panel](#side-panel)
-6. [Operator controls — kill](#operator-controls--kill)
-7. [Operator controls — resume](#operator-controls--resume)
-8. [Privacy and exposure](#privacy-and-exposure)
-9. [Configuration knobs](#configuration-knobs)
-10. [Related Documents](#related-documents)
+1. [Kanban board](#kanban-board)
+2. [Graph tab — what you see](#graph-tab--what-you-see)
+3. [Two sources, one graph](#two-sources-one-graph)
+4. [Status semantics](#status-semantics)
+5. [Filters and chips](#filters-and-chips)
+6. [Side panel](#side-panel)
+7. [Operator controls — kill](#operator-controls--kill)
+8. [Operator controls — resume](#operator-controls--resume)
+9. [Privacy and exposure](#privacy-and-exposure)
+10. [Configuration knobs](#configuration-knobs)
+11. [Related Documents](#related-documents)
 
 ---
 
-## What you see
+## Kanban board
+
+The board is backed by the vault task store (`LifeOS/Tasks/`) — every card is a task, plus one card per upcoming scheduler entry. There is no separate "board" data file: a card's lane is always derived fresh from the task's status and tags, so editing a task from Obsidian, `/chat`, or a Telegram reply moves its card exactly as if it had been dragged.
+
+### Lanes
+
+| Lane | What lands here |
+|---|---|
+| **Unassigned** | An open task with no assignee tag. |
+| **Assigned** | An assignee tag is set (including `#me`) but work hasn't started. |
+| **In progress** | Status `in_progress`, or the agent worker's own `#agent-running` tag. |
+| **Human queue** | An agent is blocked on a question, or a `#human` card was filed for the operator, or the task's status is `blocked`. |
+| **Scheduled** | A scheduler entry (`docs/guides/scheduler.md`) with at least one future fire. |
+| **Review** | The agent worker's `#agent-completed` tag is set and the card hasn't been accepted yet. |
+| **Done** | Status `done` or `cancelled` (cancelled cards are hidden behind the "include done/cancelled" filter by default), plus scheduler entries that have fired (one-off) or been disabled (recurring). |
+
+### Assignee
+
+Assignee is a single tag, one of `#me`, `#claude`, `#codex`, `#hermes`, `#local`. Dropping a card into Assigned sets that tag and clears any other assignee tag; dropping into Unassigned clears it. Setting an assignee here is a labeling action only — it does not dispatch the task to that engine. Wiring assignment to actual execution is a separate, later change (see the Kanban overhaul issue set); today the agent worker still only claims tasks carrying its own `#agent` tag, same as before this board existed.
+
+### Cards and the drawer
+
+A card shows its title, assignee chip, model/effort chips when the task carries those fields, a host chip when a linked session is running on a known machine, its other tags, and a pulsing dot when a linked session is actively running.
+
+Clicking a card opens a drawer: an editable title and notes (notes save on blur, stored as indented `> ` lines beneath the task — see [task-management.md](task-management.md)), pickers for assignee, tags, and context, and — when the card has a linked session — that session's live transcript feed, the same panel the Graph tab uses. Drawer actions: **Focus** (jump to the session's terminal pane), **Kill** (stop a running session), **Answer** (reply to the agent's pending question), **Accept** (move a Review card to Done), and **Resolve** (mark a manually-filed Human queue card handled).
+
+### Pending questions
+
+When an agent asks a clarifying question, the card carrying that session shows the question text and an **Answer** button in the drawer. Answering writes the reply through the same path a Telegram reply takes — the worker resumes the session on its next tick exactly as if you'd answered by text.
+
+### Scheduled column
+
+Each card shows the entry's next fire time, a recurring badge for cron entries, and — once it has fired at least once — the most recent run's outcome and a short result snippet. Editing a scheduled card edits the underlying schedule through the same API the `/api/scheduler` UI uses; there's no separate write path for the board.
+
+### Filters
+
+Filters AND-compose: free-text search (title and notes), lane, assignee (including "me" and "unassigned"), host, tag, context, recency, and whether to include done/cancelled cards. The board updates live — an edit made directly in the vault (or by the agent worker, or by the scheduler) shows up within a few seconds without a page reload.
+
+### Out of scope (for now)
+
+Card reordering within a lane — file order is lane order. Model/effort pickers that actually change how a task runs. Opening a session on a different machine than the one serving `/agents`. See the Kanban overhaul issue set for what's next.
+
+---
+
+## Graph tab — what you see
 
 The page is a force-directed graph of sessions, laid out left-to-right by recency. Each node is one session:
 
@@ -234,8 +279,11 @@ All in `.env`. None are required — the defaults work for the standard LifeOS i
 ## Related Documents
 
 - [ADR-011: External Agent Ingest](../../adr/011-external-agent-ingest.md) — Why Claude Code sessions surface read-only via a foreign-schema adapter
-- [Agent Viz — Technical](../technical/agent-viz.md) — Endpoint shapes, D3 force config, status inference rules, security boundaries
+- [Agent Viz — Technical](../technical/agent-viz.md) — Endpoint shapes, D3 force config, status inference rules, security boundaries, and the board's lane-derivation rules
 - [Agent Worker](agent-worker.md) — The other half of the picture: how `#agent` tasks get claimed and run
 - [Claude Code Orchestration (product)](claude-code-orchestration.md) — The orchestrator that spawns the Claude Code sessions surfaced here
 - [Agent Worker — Technical](../technical/agent-worker.md) — Sessions, transcripts, kill primitives
 - [Architecture](../technical/architecture.md) — Where the viz fits in the broader code structure
+- [Task Management](task-management.md) — The vault task store the board's cards are backed by
+- [Scheduler Guide](../../guides/scheduler.md) — How the Scheduled column's entries are created and edited
+- [API Reference](api-reference.md) — Board, pending-question, and lane-move endpoint shapes

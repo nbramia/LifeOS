@@ -461,6 +461,12 @@ def _model_label_for_routing(routing: str | None) -> str:
         # not an Anthropic model, so it must not fall into the Claude-model-
         # name guessing below.
         return "Remote"
+    from api.services.agent_worker.hermes_session import HERMES_ROUTING
+    if routing == HERMES_ROUTING:
+        # (#850) Hermes sessions used to fall through to the Claude-model-name
+        # guess below and get mislabeled "Claude" — Hermes runs its own
+        # DeepSeek-backed engine, not an Anthropic model.
+        return "Hermes"
     try:
         from config.settings import settings
         m = (settings.agent_managed_model or "").lower()
@@ -655,6 +661,262 @@ async def stream_snapshots() -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Kanban board (#850) — vault-task-backed view of /agents. Lane derivation
+# lives in api/services/agent_board.py; this section only reads the task,
+# scheduler, and session stores, calls into that pure module for the
+# decision, and performs the write. See docs/specs/technical/agent-viz.md.
+# ---------------------------------------------------------------------------
+
+# Board SSE tick interval. The task watcher's own debounce is 2.0s (see
+# api/services/task_watcher.py); ticking the board every 0.75s on top of that
+# keeps "reflects an external vault edit" comfortably under the 3s budget
+# without a heavier cross-thread push mechanism — both TaskManager and
+# SchedulerStore serve from in-memory indexes, so rebuilding the board every
+# tick is cheap. A tick only emits when the board actually changed (compared
+# by a cheap signature), so an idle board doesn't spam the client.
+_BOARD_STREAM_INTERVAL = 0.75
+
+
+def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
+                open_question_by_task: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    from api.services import agent_board
+
+    candidates = sessions_by_task.get(task.id) or []
+    session = max(candidates, key=lambda s: s.get("last_activity_at") or 0) if candidates else None
+    pq = open_question_by_task.get(task.id)
+    return {
+        "kind": "task",
+        "id": task.id,
+        "title": task.description,
+        "notes": task.notes,
+        "status": task.status,
+        "tags": list(task.tags),
+        "assignee": agent_board.derive_assignee(task.tags),
+        "fields": dict(task.fields),
+        "context": task.context,
+        "updated_at": task.updated_at,
+        "session": session,
+        "pending_question": (
+            {
+                "id": pq["id"],
+                "session_id": pq["session_id"],
+                "question": pq["question"],
+                "asked_at": pq["sent_at"],
+                "bot": pq.get("bot"),
+            }
+            if pq else None
+        ),
+    }
+
+
+def _schedule_card(entry) -> dict[str, Any]:
+    last_run = None
+    if entry.last_triggered_at:
+        last_run = {
+            "at": entry.last_triggered_at,
+            "outcome": entry.last_status or "",
+            "snippet": entry.last_result or "",
+        }
+    return {
+        "kind": "schedule",
+        "id": entry.id,
+        "name": entry.name,
+        "next_fire_at": entry.next_trigger_at,
+        "recurring": entry.schedule_type == "cron",
+        "last_run": last_run,
+    }
+
+
+def _build_board() -> dict[str, Any]:
+    from api.services import agent_board
+    from api.services.task_manager import get_task_manager
+    from api.services.scheduler_store import get_scheduler_store
+
+    task_manager = get_task_manager()
+    scheduler_store = get_scheduler_store()
+    session_store = _get_session_store()
+
+    tasks = task_manager.list_tasks()
+
+    sessions_by_task: dict[str, list[dict[str, Any]]] = {}
+    for sd in _build_snapshot()["sessions"]:
+        tid = sd.get("task_id")
+        if tid:
+            sessions_by_task.setdefault(tid, []).append(sd)
+
+    open_question_by_task: dict[str, dict[str, Any]] = {}
+    for q in session_store.list_open_questions():
+        open_question_by_task[q["task_id"]] = q
+
+    lanes: dict[str, list[dict[str, Any]]] = {lane: [] for lane in agent_board.LANES}
+    for task in tasks:
+        lane = agent_board.derive_lane(task.status, task.tags)
+        lanes[lane].append(_task_card(task, sessions_by_task, open_question_by_task))
+
+    for entry in scheduler_store.list_all():
+        bucket = "scheduled" if agent_board.is_schedule_active(entry.enabled, entry.next_trigger_at) else "done"
+        lanes[bucket].append(_schedule_card(entry))
+
+    return {"lanes": lanes, "generated_at": int(time.time())}
+
+
+@router.get("/board")
+async def get_board() -> dict[str, Any]:
+    """Full current board view model — see `_build_board`."""
+    return _build_board()
+
+
+@router.get("/board/stream")
+async def stream_board() -> StreamingResponse:
+    """SSE stream emitting the board whenever it changes.
+
+    Ticks every `_BOARD_STREAM_INTERVAL` seconds but only sends when the
+    lanes actually differ from the last-sent snapshot, so a page left open
+    doesn't re-render on every tick.
+    """
+
+    async def generate():
+        yield ": ok\n\n"
+        last_signature: str | None = None
+        while True:
+            try:
+                board = _build_board()
+                signature = json.dumps(board["lanes"], sort_keys=True, default=str)
+                if signature != last_signature:
+                    last_signature = signature
+                    yield f"event: board\ndata: {json.dumps(board)}\n\n"
+            except Exception as exc:  # noqa: BLE001 — keep the stream alive on errors
+                logger.warning("board stream tick failed: %s", exc)
+                yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+            await asyncio.sleep(_BOARD_STREAM_INTERVAL)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+class LaneMoveRequest(BaseModel):
+    """Body for PUT /api/agents/board/cards/{id}/lane."""
+    lane: str
+    assignee: str | None = None
+
+
+@router.put("/board/cards/{card_id}/lane")
+async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]:
+    """Move a task card to `lane`, writing the corresponding status/tag at
+    once. See `api.services.agent_board.plan_lane_move` for the rules.
+    """
+    from api.services import agent_board
+    from api.services.task_manager import get_task_manager, TaskConflictError
+
+    task_manager = get_task_manager()
+    task = task_manager.get(card_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="card not found")
+
+    plan = agent_board.plan_lane_move(task.status, task.tags, body.lane, body.assignee)
+    if plan.error is not None:
+        status_code, detail = plan.error
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    write_kwargs: dict[str, Any] = {}
+    if plan.status is not None:
+        write_kwargs["status"] = plan.status
+    if plan.tags is not None:
+        write_kwargs["tags"] = plan.tags
+
+    if write_kwargs:
+        try:
+            task = task_manager.update(card_id, **write_kwargs)
+        except TaskConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if task is None:
+            raise HTTPException(status_code=404, detail="card not found")
+
+    lane = agent_board.derive_lane(task.status, task.tags)
+    return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
+
+
+@router.post("/board/cards/{card_id}/accept")
+async def accept_board_card(card_id: str) -> dict[str, Any]:
+    """Move a Review card to Done by adding the `accepted` tag. Idempotent —
+    calling this on an already-accepted, already-done card is a no-op.
+    """
+    from api.services import agent_board
+    from api.services.task_manager import get_task_manager, TaskConflictError
+
+    task_manager = get_task_manager()
+    task = task_manager.get(card_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="card not found")
+
+    tags_norm = {t.lstrip("#").lower() for t in task.tags}
+    needs_tag = agent_board.ACCEPTED_TAG not in tags_norm
+    needs_status = task.status != "done"
+    if needs_tag or needs_status:
+        new_tags = list(task.tags) + ([agent_board.ACCEPTED_TAG] if needs_tag else [])
+        try:
+            task = task_manager.update(card_id, status="done", tags=new_tags)
+        except TaskConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if task is None:
+            raise HTTPException(status_code=404, detail="card not found")
+
+    lane = agent_board.derive_lane(task.status, task.tags)
+    return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
+
+
+@router.get("/pending-questions")
+async def list_pending_questions() -> dict[str, Any]:
+    """Unanswered agent questions across all sessions — the board's "waiting
+    on an answer" list. Same rows `worker.py::_process_clarification_answers`
+    will eventually drain, just read before they're answered.
+    """
+    session_store = _get_session_store()
+    rows = session_store.list_open_questions()
+    return {
+        "questions": [
+            {
+                "id": r["id"],
+                "task_id": r["task_id"],
+                "session_id": r["session_id"],
+                "question": r["question"],
+                "asked_at": r["sent_at"],
+                "bot": r.get("bot"),
+            }
+            for r in rows
+        ],
+    }
+
+
+class PendingQuestionAnswerRequest(BaseModel):
+    """Body for POST /api/agents/pending-questions/{id}/answer."""
+    answer: str
+
+
+@router.post("/pending-questions/{question_id}/answer")
+async def answer_pending_question(question_id: int, body: PendingQuestionAnswerRequest) -> dict[str, Any]:
+    """Answer a pending question from the board drawer.
+
+    Writes the same `answer`/`answered_at` columns a Telegram reply would via
+    `SessionStore.deposit_answer` — `worker.py::_process_clarification_answers`
+    picks the row up and resumes the session on its next tick, unchanged.
+    """
+    answer = (body.answer or "").strip()
+    if not answer:
+        raise HTTPException(status_code=400, detail="answer is required")
+    session_store = _get_session_store()
+    ok = session_store.deposit_answer_by_id(question_id, answer)
+    if not ok:
+        raise HTTPException(status_code=404, detail="question not found, already answered, or timed out")
+    return {"ok": True, "id": question_id}
 
 
 # ---------------------------------------------------------------------------
@@ -2406,6 +2668,54 @@ async def _stream_claude_code_session(session_id: str, backfill: int):
             return
 
 
+async def _stream_codex_session(session_id: str, backfill: int):
+    """Per-session SSE generator for Codex (cx:-prefixed) sessions.
+
+    Mirrors `_stream_claude_code_session` — Codex has no DB status either, so
+    it uses the same idle-close-after-5-minutes heuristic. (#850: previously
+    `/sessions/{id}/stream` only dispatched `cc:` here, so opening a Codex
+    session's panel fell through to the LifeOS transcript store and 400'd.)
+    """
+    from config.settings import settings
+    from api.services.codex import session_ingest as cx
+
+    yield ": ok\n\n"
+    try:
+        events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+    except Exception as exc:  # noqa: BLE001
+        yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+        return
+    tail = events[-backfill:] if backfill and len(events) > backfill else events
+    for ev in tail:
+        yield f"event: transcript_event\ndata: {json.dumps(ev)}\n\n"
+
+    line_count = len(events)
+    now0 = time.time()
+    last_new_event_at = now0
+    last_heartbeat_at = now0
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+        except Exception:
+            events = []
+        if len(events) > line_count:
+            for ev in events[line_count:]:
+                yield f"event: transcript_event\ndata: {json.dumps(ev)}\n\n"
+            line_count = len(events)
+            last_new_event_at = time.time()
+            last_heartbeat_at = last_new_event_at
+        elif time.time() - last_heartbeat_at >= 15.0:
+            yield ": heartbeat\n\n"
+            last_heartbeat_at = time.time()
+        if time.time() - last_new_event_at > 300.0:
+            yield (
+                "event: closed\n"
+                f"data: {json.dumps({'session_id': session_id, 'status': 'idle'})}\n\n"
+            )
+            return
+
+
 @router.get("/sessions/{session_id}/stream")
 async def stream_session_transcript(
     session_id: str,
@@ -2414,7 +2724,8 @@ async def stream_session_transcript(
     """Per-session SSE: backfill last N events, then live-tail the JSONL file.
 
     Closes cleanly when the session reaches a terminal status.
-    Dispatches by `cc:` prefix to the Claude Code ingest path.
+    Dispatches by `cc:` prefix to the Claude Code ingest path, `cx:` to the
+    Codex ingest path (#850).
     """
     if session_id.startswith("cc:"):
         if not _claude_code_enabled():
@@ -2426,6 +2737,20 @@ async def stream_session_transcript(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return StreamingResponse(
             _stream_claude_code_session(session_id, backfill),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    if session_id.startswith("cx:"):
+        if not _codex_enabled():
+            raise HTTPException(status_code=404, detail="codex viz disabled")
+        try:
+            from api.services.codex.session_ingest import validate_session_id as cx_validate
+            cx_validate(session_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return StreamingResponse(
+            _stream_codex_session(session_id, backfill),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )

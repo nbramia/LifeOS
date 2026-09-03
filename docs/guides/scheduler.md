@@ -198,3 +198,4 @@ See [API Reference § Scheduler & Telegram Endpoints](../specs/product/api-refer
 - [Agent Worker](../specs/product/agent-worker.md) — Runs `action:: agent` schedules
 - [API Reference](../specs/product/api-reference.md) — Scheduler API endpoint contracts
 - [MCP Tools](../specs/product/mcp-tools.md) — `lifeos_schedule_*` tool contracts
+- [Agent Viz](../specs/product/agent-viz.md) — The `/agents` board's Scheduled column shows entries edited here

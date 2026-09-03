@@ -26,13 +26,14 @@ Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Thr
 10. [People Endpoints](#people-endpoints)
 11. [Photos Endpoints](#photos-endpoints)
 12. [Task Endpoints](#task-endpoints)
-13. [Scheduler & Telegram Endpoints](#scheduler--telegram-endpoints)
-14. [Monarch Money Endpoints](#monarch-money-endpoints)
-15. [Job Queue Endpoints](#job-queue-endpoints)
-16. [Performance Trace Endpoints](#performance-trace-endpoints)
-17. [Admin Endpoints](#admin-endpoints)
-18. [Card Assignment Endpoints](#card-assignment-endpoints-851)
-19. [MCP Tools — see mcp-tools.md](mcp-tools.md)
+13. [Agent Board Endpoints](#agent-board-endpoints)
+14. [Scheduler & Telegram Endpoints](#scheduler--telegram-endpoints)
+15. [Monarch Money Endpoints](#monarch-money-endpoints)
+16. [Job Queue Endpoints](#job-queue-endpoints)
+17. [Performance Trace Endpoints](#performance-trace-endpoints)
+18. [Admin Endpoints](#admin-endpoints)
+19. [Card Assignment Endpoints](#card-assignment-endpoints-851)
+20. [MCP Tools — see mcp-tools.md](mcp-tools.md)
 
 ---
 
@@ -829,6 +830,55 @@ request.
 
 ---
 
+## Agent Board Endpoints
+
+The `/agents` Kanban board (see [Agent Viz](agent-viz.md)). Lanes are derived
+from task status/tags on every read — there is no stored lane field. See
+[Agent Viz — Technical](../technical/agent-viz.md) for the derivation rules
+and the SSE update cadence.
+
+### GET /api/agents/board
+
+Full board view model: `{lanes: {unassigned, assigned, in_progress,
+human_queue, scheduled, review, done}, generated_at}`. Each task card
+carries `id, title, notes, status, tags, assignee, fields, context,
+updated_at, session (nullable), pending_question (nullable)`. Each
+scheduled card carries `id, name, next_fire_at, recurring, last_run {at,
+outcome, snippet} (nullable)`.
+
+### GET /api/agents/board/stream
+
+SSE stream of the board view model — emits a full `board` event whenever
+the lanes change.
+
+### PUT /api/agents/board/cards/{id}/lane
+
+Move a task card to a lane, writing the corresponding status/tag at once.
+Body: `{lane, assignee?}`. `lane: "done"` marks the task done;
+`lane: "unassigned"` clears the assignee tag; `lane: "assigned"` requires
+`assignee` (one of `me`/`claude`/`codex`/`hermes`/`local`) and replaces any
+existing assignee tag. `lane: "in_progress"` on a task whose assignee is an
+agent engine returns **409** — only the agent worker claims agent-assigned
+tasks. `review` and `scheduled` can't be set directly (derived from a tag
+and the scheduler store, respectively) and return **400**.
+
+### POST /api/agents/board/cards/{id}/accept
+
+Move a Review card to Done by adding the `accepted` tag. Idempotent.
+
+### GET /api/agents/pending-questions
+
+List unanswered agent questions: `{questions: [{id, task_id, session_id,
+question, asked_at, bot}]}`.
+
+### POST /api/agents/pending-questions/{id}/answer
+
+Answer a pending question. Body: `{answer}`. Writes the same columns a
+Telegram reply would — the agent worker resumes the session on its next
+tick unchanged.
+
+---
+
 ## Scheduler & Telegram Endpoints
 
 Schedules can also be created, edited, listed, and deleted via natural language through the chat interface (`POST /api/ask/stream`). See [Scheduler Guide](../../guides/scheduler.md).
@@ -1054,3 +1104,4 @@ Open an Assigned card (`status == "todo"`, a recognized assignee tag, no session
 - [Client Surfaces](../technical/client-surfaces.md) — HTTP consumers and breaking-change policy
 - [CRM UI](crm-ui.md) — CRM index pointing at the four product sub-specs
 - [Configuration](../../guides/configuration.md) — Env vars referenced by several endpoints (LIFEOS_USER_NAME, LIFEOS_WORK_DOMAIN, etc.)
+- [Agent Viz](agent-viz.md) — The `/agents` Kanban board these endpoints back

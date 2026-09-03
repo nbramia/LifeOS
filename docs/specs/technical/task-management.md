@@ -349,6 +349,7 @@ contract and the `done_when` reference.
 - [Scheduler — Technical](scheduler.md) — The id-addressed block rewrite, notes-style body, and merge-forward patterns this store mirrors
 - [Agent Worker — Product](../product/agent-worker.md#tag-lifecycle) — `POST /{id}/swap-tag` contract this store preserves unchanged
 - [Architecture](architecture.md) — Where the task modules sit in the code structure
+- [Agent Viz — Technical](agent-viz.md) — The `/agents` board's `GET /board`, reading `list_tasks()` and writing via `update()`
 
 ### Code References
 - [task_manager.py](../../../api/services/task_manager.py) — Store, round-trip, CAS writes

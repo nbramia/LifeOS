@@ -85,6 +85,7 @@ short snippet in `last_result` for the dashboard.
 - [Architecture](architecture.md) — Where the scheduler modules sit in the code structure
 - [Agent Worker — Product](../product/agent-worker.md) — Runs the `#agent` tasks the `agent` action writes
 - [Data & Sync](data-and-sync.md) — Scheduler storage in the data-locations table
+- [Agent Viz — Technical](agent-viz.md) — The `/agents` board's Scheduled/Done split, reading `list_all()` via `agent_board.is_schedule_active`
 
 ### Code References
 - [scheduler_store.py](../../../api/services/scheduler_store.py) — Store, round-trip, scheduler
