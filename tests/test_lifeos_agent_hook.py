@@ -217,6 +217,28 @@ def test_pane_fields_present_only_when_wezterm_pane_set(stub_server, tmp_path):
 
 
 @pytest.mark.unit
+def test_non_numeric_wezterm_pane_omits_pane_fields_but_still_posts(stub_server, tmp_path):
+    # A non-numeric $WEZTERM_PANE must not make `jq --argjson pane_id` fail
+    # and empty the whole request body — it should just drop the pane
+    # fields and post everything else normally.
+    server, requests = stub_server
+    env = _base_env(
+        tmp_path,
+        LIFEOS_AGENT_HOOK_TOKEN="tok",
+        LIFEOS_API_URL=f"http://127.0.0.1:{server.server_port}",
+        WEZTERM_PANE="abc",
+    )
+    stdin = json.dumps({"session_id": "hook-sid-4b", "cwd": str(tmp_path)})
+    r = _run(["claude_code", "stop"], stdin, env)
+    assert r.returncode == 0, r.stderr.decode()
+    assert len(requests) == 1
+    body = requests[0]["body"]
+    assert body["session_id"] == "hook-sid-4b"
+    assert "pane_id" not in body
+    assert "wezterm_pid" not in body
+
+
+@pytest.mark.unit
 def test_exits_0_when_api_unreachable_within_two_seconds(tmp_path):
     env = _base_env(
         tmp_path,

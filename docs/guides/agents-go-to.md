@@ -105,6 +105,10 @@ The installer prints, but does not create, the two things registration needs:
    LIFEOS_AGENT_HOOK_TOKEN=<the same token>
    ```
 
+   `chmod 600` this file — it holds the bearer token in plaintext, and under a default `umask 022` a newly created file is world-readable to every other local account on the machine.
+
+   **On the API host itself**, keep `LIFEOS_API_URL=http://localhost:8000` (the default) rather than pointing it at the Tailscale hostname. The event endpoint only mirrors `pane_id`/`wezterm_pid` into the local WezTerm pane store — the table Go To reads — for requests that both name this host **and** arrive from loopback; posting to the Tailscale address instead of localhost means the request no longer looks like loopback to the API, so Go To stops working for sessions started on this machine.
+
 Until that file (or the equivalent environment variables) exists, `lifeos-agent-hook.sh` exits silently without posting anything — a machine you haven't set up yet just doesn't show up, it doesn't error.
 
 A session registered this way shows a `host` badge in the side panel, plus its git branch and last prompt preview when available. Its status is event-driven (accurate `running`/`idle`/`ended`), not inferred from file age. **Resume** and **Go To** only work for sessions on the machine hosting the API — clicking either on a remote-host session returns an error naming the host instead of trying (and failing) a local wezterm probe.

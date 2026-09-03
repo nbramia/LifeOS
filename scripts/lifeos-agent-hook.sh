@@ -128,7 +128,13 @@ JQ_ARGS=(
 )
 JQ_FILTER='{engine:$engine, event:$event, session_id:$session_id, host:$host, cwd:$cwd, transcript_path:$transcript_path, branch:$branch, model:$model, prompt_preview:$prompt_preview, task_id:$task_id}'
 
-if [[ -n "${WEZTERM_PANE:-}" ]]; then
+# A non-numeric $WEZTERM_PANE would make `jq --argjson pane_id` fail,
+# emptying $BODY and silently dropping the whole event below — not just
+# the pane fields. Guard it the same way $pid/$mtime are guarded so a
+# malformed value just omits the pane fields instead.
+case "${WEZTERM_PANE:-}" in
+    ''|*[!0-9]*) ;;
+    *)
     # Best-effort: the pid of the live wezterm-gui process this pane
     # belongs to, found the same way the API's own `_current_wezterm_pid`
     # does (newest live `gui-sock-*` socket under the wezterm runtime
@@ -163,7 +169,8 @@ if [[ -n "${WEZTERM_PANE:-}" ]]; then
     else
         JQ_FILTER="$JQ_FILTER"' + {pane_id:$pane_id}'
     fi
-fi
+    ;;
+esac
 
 BODY="$(jq -nc "${JQ_ARGS[@]}" "$JQ_FILTER" 2>/dev/null)"
 if [[ -z "$BODY" ]]; then

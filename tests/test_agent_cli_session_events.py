@@ -37,6 +37,16 @@ def client():
     return TestClient(api_main.app)
 
 
+@pytest.fixture
+def loopback_client():
+    # Pin the client host to loopback (default TestClient uses host=
+    # "testclient", which is NOT loopback) — same approach as
+    # tests/test_agent_cc_pane_bind.py's `client` fixture. Needed for the
+    # pane-store mirror, which requires the request itself to originate
+    # from loopback, not just a matching `host` field in the body.
+    return TestClient(api_main.app, client=("127.0.0.1", 50000))
+
+
 def _post(client, body, token=TOKEN):
     headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
     return client.post("/api/agents/cli-sessions/events", json=body, headers=headers)
@@ -181,10 +191,12 @@ def wezterm_store(tmp_path: Path, monkeypatch):
 
 
 @pytest.mark.unit
-def test_pane_id_from_api_host_written_to_pane_store(client, stores, wezterm_store, monkeypatch):
+def test_pane_id_from_api_host_written_to_pane_store(loopback_client, stores, wezterm_store, monkeypatch):
+    # Both conditions must hold: body.host matches this API's own host,
+    # AND the request itself arrived from loopback.
     monkeypatch.setattr(agents_route, "api_host_name", lambda: "this-api-host")
-    r = _post(client, _event(host="this-api-host", session_id="s6",
-                              pane_id=7, wezterm_pid=999))
+    r = _post(loopback_client, _event(host="this-api-host", session_id="s6",
+                                       pane_id=7, wezterm_pid=999))
     assert r.status_code == 200, r.text
     mapping = wezterm_store.get("cc:s6")
     assert mapping is not None
@@ -192,11 +204,33 @@ def test_pane_id_from_api_host_written_to_pane_store(client, stores, wezterm_sto
 
 
 @pytest.mark.unit
-def test_pane_id_from_remote_host_not_written_to_pane_store(client, stores, wezterm_store, monkeypatch):
+def test_pane_id_from_remote_host_not_written_to_pane_store(loopback_client, stores, wezterm_store, monkeypatch):
     monkeypatch.setattr(agents_route, "api_host_name", lambda: "this-api-host")
-    r = _post(client, _event(host="a-different-laptop", session_id="s7", pane_id=9))
+    r = _post(loopback_client, _event(host="a-different-laptop", session_id="s7", pane_id=9))
     assert r.status_code == 200, r.text
     assert wezterm_store.get("cc:s7") is None
     # Still stored on the cli_sessions row itself.
     cli = stores.get_cli_session("cc:s7")
     assert cli.pane_id == 9
+
+
+@pytest.mark.unit
+def test_pane_id_from_non_loopback_client_with_spoofed_host_not_written_to_pane_store(
+    client, stores, wezterm_store, monkeypatch,
+):
+    """A non-loopback, bearer-authenticated caller naming this API's own
+    hostname must NOT be able to write into the shared pane store — that
+    would let it redirect Go To for a real local session (#849 round-1
+    security finding). The default `client` fixture is non-loopback
+    (TestClient's default host is "testclient"), so this exercises exactly
+    that path: body.host matches api_host_name() but request.client.host
+    does not pass the loopback gate.
+    """
+    monkeypatch.setattr(agents_route, "api_host_name", lambda: "this-api-host")
+    r = _post(client, _event(host="this-api-host", session_id="s8", pane_id=13))
+    assert r.status_code == 200, r.text
+    assert wezterm_store.get("cc:s8") is None
+    # The event and pane id are still recorded on the cli_sessions row —
+    # only the shared pane-store mirror is withheld.
+    cli = stores.get_cli_session("cc:s8")
+    assert cli.pane_id == 13

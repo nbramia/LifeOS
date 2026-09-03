@@ -108,5 +108,10 @@ echo
 echo "  LIFEOS_API_URL=http://<api-host>:8000"
 echo "  LIFEOS_AGENT_HOOK_TOKEN=<the same token>"
 echo
+echo "This file holds the token in plaintext, so create its directory and"
+echo "lock it down to your own account, e.g.:"
+echo
+echo "  mkdir -p ~/.config/lifeos && chmod 600 ~/.config/lifeos/agent-hook.env"
+echo
 echo "Until that file (or the equivalent environment variables) exists,"
 echo "lifeos-agent-hook.sh exits silently without posting anything."

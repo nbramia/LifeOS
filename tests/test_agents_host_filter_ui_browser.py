@@ -91,6 +91,30 @@ SNAPSHOT = {
             "model_label": "Local",
             "decoded_cwd": "/home/synthetic/proj-b",
         },
+        # A cli_sessions row whose SessionEnd event already fired — must be
+        # treated as terminal (hidden by default, shown with "include
+        # finished" on) rather than staying in the live view forever (#849
+        # round-1 finding: 'ended' was missing from the frontend TERMINAL set).
+        {
+            "session_id": "cc:host-filter-ended",
+            "task_id": "t3",
+            "status": "ended",
+            "status_inferred": False,
+            "routing": "claude_code",
+            "source": "claude_code",
+            "host": "laptop-a",
+            "branch": "feat/synthetic-branch",
+            "prompt_preview": "wrap up the synthetic widget",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 10,
+            "total_output_tokens": 20,
+            "total_dollars": 0.01,
+            "spawn_depth": 0,
+            "label": "hosttest-gamma-session",
+            "model_label": "Sonnet",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
     ],
     "edges": [],
     "generated_at": 1234567890,
@@ -131,6 +155,26 @@ class TestHostFilter:
         page.wait_for_timeout(400)  # let the filtered re-render settle
         nodes = page.locator(".node")
         expect(nodes).to_have_count(1)
+
+
+class TestEndedStatus:
+    # The fixture has 3 sessions total: two 'running' and one 'ended'
+    # (cc:host-filter-ended). 'ended' must be treated as terminal — hidden
+    # by default and only shown once "include finished" is checked (#849
+    # round-1 finding: 'ended' was missing from the frontend TERMINAL set,
+    # so a closed CLI session stayed in the live view indefinitely).
+    def test_ended_session_hidden_by_default(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url)
+        page.select_option("#filter-recency", "all")
+        page.wait_for_timeout(400)
+        expect(page.locator(".node")).to_have_count(2)
+
+    def test_ended_session_shown_when_include_finished_is_checked(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url)
+        page.select_option("#filter-recency", "all")
+        page.locator("#filter-terminal").check()
+        page.wait_for_timeout(400)
+        expect(page.locator(".node")).to_have_count(3)
 
 
 class TestPanelFields:

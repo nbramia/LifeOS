@@ -361,8 +361,10 @@
   .badge.status-claimed { color: var(--claimed); border-color: var(--claimed); }
   .badge.status-yielded { color: var(--yielded); border-color: var(--yielded); }
   .badge.status-inactive { color: var(--yielded); border-color: var(--yielded); }
+  .badge.status-idle { color: var(--yielded); border-color: var(--yielded); }
   .badge.status-blocked { color: var(--blocked); border-color: var(--blocked); }
   .badge.status-completed { color: var(--completed); border-color: var(--completed); }
+  .badge.status-ended { color: var(--completed); border-color: var(--completed); }
   .badge.status-failed,
   .badge.status-budget_exceeded { color: var(--failed); border-color: var(--failed); }
   .panel-empty {
@@ -831,8 +833,10 @@
       <option value="claimed">claimed</option>
       <option value="yielded">yielded</option>
       <option value="inactive">inactive</option>
+      <option value="idle">idle</option>
       <option value="blocked">blocked</option>
       <option value="completed">completed</option>
+      <option value="ended">ended</option>
       <option value="failed">failed</option>
     </select>
   </label>
@@ -862,12 +866,16 @@
     claimed:   '#60a5fa',
     yielded:   '#fbbf24',  // agent worker — paused waiting on children
     inactive:  '#fbbf24',  // claude code — paused, resumable
+    idle:      '#fbbf24',  // cli session — event-driven, waiting for input (not terminal)
     blocked:   '#fb923c',
     completed: '#6b7280',
+    ended:     '#6b7280',  // cli session — event-driven, session ended
     failed:    '#f87171',
     budget_exceeded: '#f87171',
   };
-  const TERMINAL = new Set(['completed', 'failed', 'budget_exceeded']);
+  // NOTE: 'idle' is a live cli session waiting for input — it must NOT be
+  // treated as terminal. Only 'ended' (an explicit SessionEnd event) is.
+  const TERMINAL = new Set(['completed', 'failed', 'budget_exceeded', 'ended']);
 
   const filterTerminalEl = document.getElementById('filter-terminal');
   const filterRouteEl = document.getElementById('filter-route');

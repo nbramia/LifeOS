@@ -1127,11 +1127,16 @@ async def cli_session_event(request: Request, body: CliSessionEventRequest) -> d
     the API.
 
     When the event carries `pane_id` AND its `host` matches this API's own
-    host, the pane mapping is also written into `cc_wezterm_store` — the
-    same store `/cc-pane-bind` and `/cx-pane-bind` write to — so Focus
-    keeps working for local sessions registered this way. Remote-host pane
-    ids have nowhere local to activate, so they're stored on the
-    `cli_sessions` row only.
+    host AND the request itself arrived from loopback, the pane mapping is
+    also written into `cc_wezterm_store` — the same store `/cc-pane-bind`
+    and `/cx-pane-bind` write to — so Focus keeps working for local
+    sessions registered this way. The loopback check matters because
+    `host` is client-supplied and this endpoint is reachable off-host: a
+    remote, bearer-authenticated caller naming this API's hostname could
+    otherwise redirect Go To for a real local session by supplying an
+    arbitrary `pane_id`. Requests that aren't from loopback (or don't name
+    this host) still record the event and pane id on the `cli_sessions`
+    row — they just don't touch the shared pane store.
     """
     _check_agent_hook_auth(request)
 
@@ -1156,7 +1161,12 @@ async def cli_session_event(request: Request, body: CliSessionEventRequest) -> d
         wezterm_pid=body.wezterm_pid,
     )
 
-    if body.pane_id is not None and body.host == api_host_name():
+    client_host = request.client.host if request.client else ""
+    if (
+        body.pane_id is not None
+        and body.host == api_host_name()
+        and client_host in ("127.0.0.1", "::1")
+    ):
         try:
             from api.services.cc_wezterm_store import get_default_store
             get_default_store().upsert(
