@@ -680,6 +680,12 @@ class Worker:
 
     def tick(self) -> int:
         """Process one poll cycle. Returns the number of tasks handled (for tests)."""
+        # Resolve Human-queue cards whose done_when condition now passes.
+        # Runs before the spend-cap guard below: it never starts a new
+        # task or spends money, so it must not stop just because the
+        # worker is paused or near its daily cap (#852 R2).
+        self._process_human_queue()
+
         # Use the configured per-task default budget as the "can I afford to
         # start the cheapest task right now?" estimate. Calling with 0.0 would
         # let claims through even at cap=0 — see SpendTracker.can_start_task
@@ -705,8 +711,6 @@ class Worker:
         self._process_clarification_answers()
         # Timeout long-unanswered clarifications.
         self._timeout_stale_clarifications()
-        # Resolve Human-queue cards whose done_when condition now passes.
-        self._process_human_queue()
 
         candidates = self._list_agent_tasks()
         handled = 0

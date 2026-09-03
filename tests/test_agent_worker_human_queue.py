@@ -223,6 +223,24 @@ class TestTickInvokesHumanQueue:
         assert called == [True]
         assert result == 0
 
+    def test_tick_calls_process_human_queue_even_at_spend_cap(self, tmp_path, monkeypatch):
+        """R2-3: tick() used to return on the spend-cap guard before ever
+        reaching _process_human_queue(), so auto-resolve silently stopped
+        while the worker was paused or near its daily cap. done_when
+        resolution never starts a new task or spends money, so it must run
+        regardless of the cap."""
+        api = FakeHumanQueueApi(cards=[])
+        w = _make_worker(tmp_path, api)
+        monkeypatch.setattr(w.spend_tracker, "can_start_task", lambda estimate: False)
+
+        called = []
+        monkeypatch.setattr(w, "_process_human_queue", lambda: called.append(True))
+
+        result = w.tick()
+
+        assert called == [True]
+        assert result == 0
+
 
 class TestMultipleCards:
     def test_one_log_line_per_resolution(self, tmp_path, caplog):
