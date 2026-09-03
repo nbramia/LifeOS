@@ -202,6 +202,9 @@ it by hand.
 | PUT | `/api/tasks/{id}` | description, status, context, priority, due_date, tags, notes, fields | Update a task |
 | PUT | `/api/tasks/{id}/complete` | - | Mark as done |
 | DELETE | `/api/tasks/{id}` | - | Delete a task |
+| POST | `/api/tasks/human-queue` | title, notes, key, done_when, source_host, source_cwd, source_session | File (or dedupe-update) a Human-queue card |
+| GET | `/api/tasks/human-queue` | - | List open Human-queue cards |
+| PUT | `/api/tasks/human-queue/{id_or_key}/resolve` | note | Resolve a Human-queue card |
 
 A task response also includes `updated_at` (an ISO-8601 timestamp with a UTC
 offset, stamped on every create/update/complete/swap-tag) alongside the
@@ -225,3 +228,4 @@ id-addressed writes, the notes body, and conflict-file handling actually work.
 - [Task Management — Technical](../technical/task-management.md) -- Engineering internals: id-addressed CAS writes, notes body, external-edit detection, conflict files
 - [Scheduler Guide](../../guides/scheduler.md) -- Schedules; the `agent` action writes `#agent` tasks here
 - [Agent Worker](agent-worker.md) -- Tasks tagged `#agent` are picked up by the autonomous worker for hands-free completion
+- [Human Queue](../../guides/human-queue.md) -- Human-queue cards are tasks tagged `human` with status `blocked`

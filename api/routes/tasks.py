@@ -9,6 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from api.services import human_queue
 from api.services.task_manager import get_task_manager, Task, TaskConflictError, VALID_STATUSES
 
 logger = logging.getLogger(__name__)
@@ -374,6 +375,105 @@ async def list_conflicts():
     """
     manager = get_task_manager()
     return ConflictListResponse(conflicts=[ConflictFile(**c) for c in manager.list_conflicts()])
+
+
+# ---------------------------------------------------------------------------
+# Human queue (#852) — fire-and-forget cards any agent can file/resolve for
+# the operator. Business logic (dedupe, done_when validation, card shape)
+# lives in api/services/human_queue.py, shared with the native chat tool and
+# the briefing line. Registered before /{task_id} — see the module comment
+# above "Routes (static paths MUST come before {id})".
+# ---------------------------------------------------------------------------
+
+class HumanQueueAddRequest(BaseModel):
+    title: str = Field(..., min_length=1, description="Card title.")
+    notes: Optional[str] = Field(default=None, description="Notes body.")
+    key: Optional[str] = Field(
+        default=None,
+        description="Dedupe key. Filing with an existing OPEN card's key updates "
+                    "its notes instead of creating a duplicate.",
+    )
+    done_when: Optional[dict] = Field(
+        default=None,
+        description="Auto-resolve check: {type: 'endpoint', path, pointer, equals} "
+                    "or {type: 'file_exists', path}.",
+    )
+    source_host: Optional[str] = Field(default=None, description="Filing session's hostname.")
+    source_cwd: Optional[str] = Field(default=None, description="Filing session's working directory.")
+    source_session: Optional[str] = Field(default=None, description="Filing session's id, if any.")
+
+
+class HumanQueueAddResponse(BaseModel):
+    id: str
+
+
+class HumanQueueCard(BaseModel):
+    id: str
+    title: str
+    key: Optional[str] = None
+    notes: Optional[str] = None
+    age_hours: Optional[float] = None
+    source_host: Optional[str] = None
+    source_cwd: Optional[str] = None
+    source_session: Optional[str] = None
+    done_when: Optional[dict] = None
+
+
+class HumanQueueListResponse(BaseModel):
+    cards: list[HumanQueueCard]
+    total: int
+
+
+class HumanQueueResolveRequest(BaseModel):
+    note: Optional[str] = Field(default=None, description="Resolution note, appended to the card's notes.")
+
+
+class HumanQueueResolveResponse(BaseModel):
+    id: str
+    status: str = "done"
+
+
+@router.post("/human-queue", response_model=HumanQueueAddResponse)
+async def add_human_queue_card(request: HumanQueueAddRequest):
+    """File a human-queue card (status blocked, tag human). Filing with an
+    existing open `key` updates that card's notes instead of duplicating it.
+    """
+    try:
+        task = human_queue.add_card(
+            title=request.title,
+            notes=request.notes,
+            key=request.key,
+            done_when=request.done_when,
+            source_host=request.source_host,
+            source_cwd=request.source_cwd,
+            source_session=request.source_session,
+        )
+    except TaskConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except (human_queue.DoneWhenError, ValueError) as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return HumanQueueAddResponse(id=task.id)
+
+
+@router.get("/human-queue", response_model=HumanQueueListResponse)
+async def list_human_queue_cards():
+    """List open human-queue cards (status blocked, tag human)."""
+    cards = [HumanQueueCard(**c) for c in human_queue.list_open_cards()]
+    return HumanQueueListResponse(cards=cards, total=len(cards))
+
+
+@router.put("/human-queue/{id_or_key}/resolve", response_model=HumanQueueResolveResponse)
+async def resolve_human_queue_card(id_or_key: str, request: HumanQueueResolveRequest):
+    """Mark an open human-queue card done, by task id or dedupe key."""
+    try:
+        task = human_queue.resolve_card(id_or_key, note=request.note)
+    except TaskConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    if task is None:
+        raise HTTPException(status_code=404, detail="Human-queue card not found")
+    return HumanQueueResolveResponse(id=task.id)
 
 
 class SwapTagResponse(BaseModel):

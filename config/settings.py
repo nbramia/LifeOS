@@ -634,6 +634,12 @@ class Settings(BaseSettings):
         alias="LIFEOS_AGENT_WORKER_POLL_SECONDS",
         description="How often the agent worker polls for new #agent tasks."
     )
+    human_queue_poll_seconds: float = Field(
+        default=300.0,
+        alias="LIFEOS_HUMAN_QUEUE_POLL_SECONDS",
+        description="How often the agent worker checks Human-queue cards' "
+                    "done_when conditions (#852)."
+    )
     agent_worker_autostart: bool = Field(
         default=False,
         alias="LIFEOS_AGENT_WORKER_AUTOSTART",

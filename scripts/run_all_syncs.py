@@ -64,7 +64,11 @@ from api.services.sync_health import (
     reap_orphan_sync_runs,
     detect_silent_source_entity_drift,
 )
-from api.services.log_redaction import configure_telegram_log_redaction
+from api.services.log_redaction import (
+    REDACTED_TOKEN,
+    TELEGRAM_TOKEN_PATTERN,
+    configure_telegram_log_redaction,
+)
 from config.settings import settings
 
 # =============================================================================
@@ -580,6 +584,151 @@ def log_sync_summary_to_markdown(result: dict, trigger: str = "unknown"):
 
     entry = "\n" + "\n".join(lines) + "\n"
     _write_to_markdown_log(entry)
+
+
+# ---------------------------------------------------------------------------
+# Human queue integration (#852) — files/resolves operator-only-failure
+# cards through the local HTTP API, never the in-process TaskManager (this
+# script runs as a separate process from the API server — the same rule the
+# maintenance-mode toggle above follows). Every entry point below is wrapped
+# so a filing failure never raises into the sync run itself.
+# ---------------------------------------------------------------------------
+
+_HUMAN_QUEUE_API_BASE = "http://localhost:8000"
+
+
+def _human_queue_request(method: str, path: str, payload: dict | None = None) -> dict | None:
+    """Call a human-queue endpoint. Returns the parsed JSON body, or None on
+    any failure (network, non-2xx, bad JSON) — logged, never raised."""
+    logger = logging.getLogger(__name__)
+    try:
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(
+            f"{_HUMAN_QUEUE_API_BASE}{path}",
+            data=data,
+            headers={"Content-Type": "application/json"} if data is not None else {},
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read()
+            return json.loads(body) if body else {}
+    except Exception as e:
+        logger.warning(f"human-queue: {method} {path} failed: {e}")
+        return None
+
+
+def _human_queue_file_card(
+    title: str, notes: str = "", key: str | None = None, done_when: dict | None = None
+) -> None:
+    payload: dict = {"title": title, "notes": notes}
+    if key:
+        payload["key"] = key
+    if done_when:
+        payload["done_when"] = done_when
+    _human_queue_request("POST", "/api/tasks/human-queue", payload)
+
+
+def _human_queue_resolve_key(key: str, note: str = "") -> None:
+    _human_queue_request("PUT", f"/api/tasks/human-queue/{key}/resolve", {"note": note})
+
+
+def _human_queue_open_keys() -> set[str]:
+    body = _human_queue_request("GET", "/api/tasks/human-queue")
+    if not body:
+        return set()
+    return {c.get("key") for c in body.get("cards", []) if c.get("key")}
+
+
+def _sanitize_human_queue_error_text(error_text: str) -> str:
+    """Sanitize raw sync error text before it's filed as a Human-queue
+    card's notes body.
+
+    A literal `\\r` desyncs from the task store's `\\n`-joined notes body,
+    which silently drops the whole card (`task_manager._validate_text_
+    fields`) rather than raising anything this script would see; a literal
+    `<!--` could forge a new `<!-- id:.. -->` comment on the next reindex,
+    hijacking another task's id. Also redact any Telegram bot token that
+    leaked into the error text (the same pattern `api/services/
+    log_redaction` scrubs from httpx logs) before it's ever written to the
+    vault. Truncated to the same 2000 chars as before.
+    """
+    text = error_text.replace("\r\n", "\n").replace("\r", " ")
+    text = text.replace("<!--", "<! --")
+    text = TELEGRAM_TOKEN_PATTERN.sub(REDACTED_TOKEN, text)
+    return text[:2000]
+
+
+def file_human_queue_cards_for_sync(result: dict) -> None:
+    """File a keyed Human-queue card for each source this run's summary
+    classifies as a real failure (`result['failed_sources']` — a source
+    that's disabled/unconfigured, or skipped because a dependency failed,
+    never enters that list), and resolve any previously-filed `sync:<source>`
+    card for a source that succeeded this run (#852).
+
+    Hooked from the summary path (called once after the full run, alongside
+    `send_sync_summary_telegram`) rather than instrumented into
+    `sync_health.record_sync_complete`/`record_sync_error` at each of
+    `run_sync`'s many internal call sites (retries, duration-collapse,
+    yield-collapse, ...) — a single, easily-testable seam, and
+    `failed_sources` is already exactly the classification this issue asks
+    for (the same list the Telegram/markdown summaries report). Never raises
+    into the sync run.
+    """
+    logger = logging.getLogger(__name__)
+    try:
+        open_keys = _human_queue_open_keys()
+        failed_sources = set(result.get("failed_sources", []))
+
+        for source in failed_sources:
+            stats = result.get("results", {}).get(source) or {}
+            error_text = stats.get("error") or "sync failed"
+            _human_queue_file_card(
+                title=f"Sync source '{source}' needs attention",
+                notes=_sanitize_human_queue_error_text(error_text),
+                key=f"sync:{source}",
+            )
+
+        # Resolve only a source that actually ran and succeeded this run —
+        # a source that's skipped (disabled, not due, dependency-skipped,
+        # or a mid-run skip like missing credentials) never ran, so its
+        # open card (if any) must stay open, not get marked "sync
+        # succeeded". Also skip sources without an open card at all —
+        # avoids a resolve HTTP call (and its inevitable 404) for every
+        # healthy source on every run.
+        for source, stats in result.get("results", {}).items():
+            if source in failed_sources:
+                continue
+            if not stats or not stats.get("success") or stats.get("skipped") or stats.get("dry_run"):
+                continue
+            key = f"sync:{source}"
+            if key in open_keys:
+                _human_queue_resolve_key(key, note="sync succeeded")
+    except Exception as e:
+        logger.warning(f"human-queue: sync integration failed: {e}")
+
+
+def file_human_queue_card_for_monarch(mstatus: dict) -> None:
+    """File the `monarch-reauth` card when the Monarch session is expired or
+    missing, with a `done_when` endpoint check the worker's poll tick
+    resolves automatically once re-auth succeeds (#852). A no-op for any
+    other status. Never raises."""
+    logger = logging.getLogger(__name__)
+    try:
+        if mstatus.get("status") not in ("expired", "missing"):
+            return
+        _human_queue_file_card(
+            title="Monarch session needs re-authentication",
+            notes=mstatus.get("message", ""),
+            key="monarch-reauth",
+            done_when={
+                "type": "endpoint",
+                "path": "/api/monarch/session_status",
+                "pointer": "/status",
+                "equals": "ok",
+            },
+        )
+    except Exception as e:
+        logger.warning(f"human-queue: Monarch re-auth filing failed: {e}")
 
 
 def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
@@ -1981,6 +2130,9 @@ def run_all_syncs(
             mstatus = get_session_status()
             if mstatus["status"] in ("expiring_soon", "expired", "missing"):
                 logger.warning(f"Monarch session: {mstatus['message']}")
+            # File a Human-queue card for expired/missing (not expiring_soon
+            # — that's an early warning, not yet operator-actionable) (#852).
+            file_human_queue_card_for_monarch(mstatus)
         except Exception as e:
             logger.warning(f"Monarch session-status check failed: {e}")
 
@@ -2313,6 +2465,10 @@ def run_all_syncs(
     # Send Telegram notification (skip for dry run)
     if not dry_run:
         send_sync_summary_telegram(result, trigger=trigger)
+
+    # File/resolve Human-queue cards for sources needing operator action (#852).
+    if not dry_run:
+        file_human_queue_cards_for_sync(result)
 
     # Restart server to pick up any changes and clear stale state
     if not dry_run:

@@ -93,9 +93,9 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 **Pipeline routing (in order of priority):**
 1. **Ambiguous task/reminder** — asks user for clarification (task vs reminder vs both).
 2. **Claude intent** — terminal, filesystem, browser tasks. Yields `claude_intent` event for Telegram to spawn Claude Code.
-3. **Agentic loop** — everything else (including compose, tasks, reminders). Claude gets 21 tools and up to 5 rounds to fetch data and synthesize an answer. See `api/services/agent_tools.py::TOOL_DEFINITIONS` for the canonical list — count `len(TOOL_DEFINITIONS)` to re-derive this number.
+3. **Agentic loop** — everything else (including compose, tasks, reminders). Claude gets 22 tools and up to 5 rounds to fetch data and synthesize an answer. See `api/services/agent_tools.py::TOOL_DEFINITIONS` for the canonical list — count `len(TOOL_DEFINITIONS)` to re-derive this number.
 
-**Agentic loop tools (21):**
+**Agentic loop tools (22):**
 
 | Tool | Description |
 |------|-------------|
@@ -110,6 +110,7 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `person_info` | Lookup or briefing (action: lookup/briefing) |
 | `search_finances` | Monarch Money live data (action: accounts/transactions/cashflow/budgets) |
 | `manage_tasks` | Create, list, or complete tasks (action: create/list/complete) |
+| `manage_human_queue` | File, list, or resolve Human-queue cards — things only the operator can do (action: add/list/resolve) |
 | `manage_schedules` | Create or list schedules (action: create/list; schedule_action: notify/prompt/endpoint/agent). `manage_reminders` kept as a deprecated alias |
 | `create_email_draft` | Gmail draft (returns a draft_id; never sends) |
 | `send_email_draft` | Send an existing Gmail draft by draft_id (gated: only after the user confirms in a later turn — a draft created this turn cannot be sent) |
@@ -785,6 +786,41 @@ Mark a task as done (adds done date automatically).
 ### DELETE /api/tasks/{id}
 
 Delete a task.
+
+### POST /api/tasks/human-queue
+
+File a Human-queue card — a task with status `blocked` and tag `human` —
+for something only the operator can do. See the
+[Human Queue guide](../../guides/human-queue.md).
+
+**Request:**
+```json
+{
+  "title": "Re-authenticate the example-service session",
+  "notes": "Login expired; re-run the interactive login script.",
+  "key": "example-service-reauth",
+  "done_when": {"type": "endpoint", "path": "/api/example-service/status", "pointer": "/status", "equals": "ok"},
+  "source_host": "example-host",
+  "source_cwd": "/home/example/project"
+}
+```
+`notes`, `key`, `done_when`, `source_host`, `source_cwd`, and `source_session`
+are all optional. Filing again with an already-open `key` updates that
+card's notes instead of creating a duplicate. The request returns `422` for
+a malformed `key` or `done_when` — see the
+[Human Queue guide](../../guides/human-queue.md#done_when--auto-resolve-checks)
+for the exact rules.
+
+### GET /api/tasks/human-queue
+
+List open Human-queue cards. Returns `{"cards": [...], "total": N}`; each
+card carries `id`, `title`, `key`, `age_hours`,
+`source_host`/`source_cwd`/`source_session`, `notes`, `done_when`.
+
+### PUT /api/tasks/human-queue/{id_or_key}/resolve
+
+Mark a card done, by task id or dedupe key. `note` (optional) is appended to
+the card's notes. Returns `404` for an id or key with no open card.
 
 All task-mutating endpoints can return `409` if a concurrent external edit
 keeps winning a compare-and-swap race on the underlying file — retry the

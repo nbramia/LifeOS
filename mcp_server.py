@@ -330,6 +330,24 @@ CURATED_ENDPOINTS = {
         "method": "DELETE",
         "path": "/api/tasks/{task_id}"
     },
+    "/api/tasks/human-queue:POST": {
+        "name": "lifeos_human_queue_add",
+        "description": "File a card for something only the operator can do (e.g. re-authenticate an expired login). Fire-and-forget; dedupes on key (letters/digits/./:/- only). done_when path must start with '/'.",
+        "method": "POST",
+        "path": "/api/tasks/human-queue"
+    },
+    "/api/tasks/human-queue:GET": {
+        "name": "lifeos_human_queue_list",
+        "description": "List open Human-queue cards waiting on the operator, with id, title, key, age, source, and done_when.",
+        "method": "GET",
+        "path": "/api/tasks/human-queue"
+    },
+    "/api/tasks/human-queue/{id_or_key}/resolve:PUT": {
+        "name": "lifeos_human_queue_resolve",
+        "description": "Mark a Human-queue card done by id or dedupe key, appending a resolution note. Use once you've observed the thing is actually done.",
+        "method": "PUT",
+        "path": "/api/tasks/human-queue/{id_or_key}/resolve"
+    },
     "/api/calendar/events:POST": {
         "name": "lifeos_calendar_create",
         "description": "Create a Google Calendar event. Required: title, start_time, end_time (ISO). Optional: attendees, description, location, account. Invites are auto-sent. [CLARIFY] before adding attendees.",
@@ -989,6 +1007,31 @@ class LifeOSMCPServer:
                     "task_id": {"type": "string", "description": "Task ID to delete"}
                 },
                 "required": ["task_id"]
+            },
+            "lifeos_human_queue_add": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Card title, e.g. 'Re-authenticate the example-service session'."},
+                    "notes": {"type": "string", "description": "Notes body — what needs doing and why."},
+                    "key": {"type": "string", "description": "Dedupe key, e.g. 'example-service-reauth'. Letters, digits, '.', ':', '-', '_' only. Filing again with an existing open key updates its notes instead of duplicating it."},
+                    "done_when": {"type": "object", "description": "Optional auto-resolve check: {type: 'endpoint', path, pointer, equals} or {type: 'file_exists', path}. For 'endpoint', path must start with '/' (not '//')."},
+                    "source_host": {"type": "string", "description": "Filing session's hostname, if known."},
+                    "source_cwd": {"type": "string", "description": "Filing session's working directory, if known."},
+                    "source_session": {"type": "string", "description": "Filing session's id, if known."}
+                },
+                "required": ["title"]
+            },
+            "lifeos_human_queue_list": {
+                "type": "object",
+                "properties": {}
+            },
+            "lifeos_human_queue_resolve": {
+                "type": "object",
+                "properties": {
+                    "id_or_key": {"type": "string", "description": "Card id (from lifeos_human_queue_list) or dedupe key."},
+                    "note": {"type": "string", "description": "Resolution note, appended to the card's notes."}
+                },
+                "required": ["id_or_key"]
             },
             "lifeos_calendar_create": {
                 "type": "object",
@@ -1924,6 +1967,26 @@ class LifeOSMCPServer:
 
         elif tool_name == "lifeos_task_delete":
             return f"Task deleted (ID: {data.get('id', data.get('task_id', 'unknown'))})"
+
+        elif tool_name == "lifeos_human_queue_add":
+            return f"Human-queue card filed (ID: {data.get('id', 'unknown')})"
+
+        elif tool_name == "lifeos_human_queue_list":
+            cards = data.get("cards", [])
+            if not cards:
+                return "No open Human-queue cards."
+            text = f"Found {data.get('total', len(cards))} open Human-queue card(s):\n\n"
+            for c in cards:
+                age = c.get("age_hours")
+                age_str = f"{age:.1f}h old" if age is not None else "age unknown"
+                text += f"- **{c.get('title', '')}** ({age_str}) [id:{c.get('id', '')}]"
+                if c.get("key"):
+                    text += f" key:{c['key']}"
+                text += "\n"
+            return text
+
+        elif tool_name == "lifeos_human_queue_resolve":
+            return f"Human-queue card resolved (ID: {data.get('id', 'unknown')})"
 
         elif tool_name == "lifeos_workout_manage":
             # The endpoint already returns the same plain-text confirmation/

@@ -265,6 +265,25 @@ def _split_frontmatter(text: str) -> tuple[str, str]:
     return text[: m.end()], text[m.end():]
 
 
+def _resolve_json_pointer(doc: Any, pointer: str) -> Any:
+    """Minimal RFC 6901 JSON Pointer resolver — enough for `done_when`'s
+    `pointer` field (`/status`, `/nested/field`), no external dependency.
+    An empty pointer (or `/`) returns `doc` itself. Raises `KeyError`/
+    `IndexError`/`TypeError` for a pointer that doesn't resolve, same as
+    dict/list indexing would — the worker's tick treats that as a failed
+    check for this card, not a crash."""
+    if not pointer or pointer == "/":
+        return doc
+    cur = doc
+    for raw_part in pointer.lstrip("/").split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(cur, list):
+            cur = cur[int(part)]
+        else:
+            cur = cur[part]
+    return cur
+
+
 def _worker_label(routing: str | None, served_by: str = "") -> str:
     """Telegram-message prefix that names the route — operator wants to
     know at a glance whether a result came from local Gemma or cloud
@@ -440,6 +459,11 @@ class Worker:
         )
         self._owns_http_client = http_client is None
         self._http = http_client or httpx.Client(timeout=10.0)
+        # Human-queue done_when poll (#852) — throttled independently of the
+        # main tick interval, which runs far more often (60s) than the
+        # default human-queue poll (300s). 0.0 so the very first tick always
+        # checks.
+        self._last_human_queue_check = 0.0
         self._preflight_caller = preflight_caller  # None → use Anthropic SDK by default
         self._local_executor = local_executor  # lazily instantiated on first use
         self._remote_executor = remote_executor  # lazily instantiated on first #cloud task (#809)
@@ -656,6 +680,12 @@ class Worker:
 
     def tick(self) -> int:
         """Process one poll cycle. Returns the number of tasks handled (for tests)."""
+        # Resolve Human-queue cards whose done_when condition now passes.
+        # Runs before the spend-cap guard below: it never starts a new
+        # task or spends money, so it must not stop just because the
+        # worker is paused or near its daily cap (#852 R2).
+        self._process_human_queue()
+
         # Use the configured per-task default budget as the "can I afford to
         # start the cheapest task right now?" estimate. Calling with 0.0 would
         # let claims through even at cap=0 — see SpendTracker.can_start_task
@@ -1302,6 +1332,72 @@ class Worker:
                 f"(Task remains at #{BLOCKED_TAG}. Reply to the original "
                 f"question to unblock, or re-tag with #{AGENT_TAG} to retry.)"
             )
+
+    def _process_human_queue(self) -> None:
+        """Resolve open Human-queue cards whose `done_when` check now passes
+        (#852). Throttled to `settings.human_queue_poll_seconds` — `tick()`
+        itself may run far more often. Talks to the store through the HTTP
+        API, not the in-process TaskManager, matching every other cross-
+        process access in this worker (the worker and the API may run on
+        different hosts). Never raises: a listing failure, a single card's
+        check failure/error, or a resolve failure is logged and skipped —
+        the untouched card is picked up again next tick.
+        """
+        now = time.time()
+        if now - self._last_human_queue_check < settings.human_queue_poll_seconds:
+            return
+        self._last_human_queue_check = now
+
+        try:
+            resp = self._http.get(f"{self.api_base}/api/tasks/human-queue")
+            resp.raise_for_status()
+            cards = resp.json().get("cards", [])
+        except Exception as exc:
+            logger.warning("human-queue tick: failed to list cards: %s", exc)
+            return
+
+        for card in cards:
+            done_when = card.get("done_when")
+            if not done_when:
+                continue
+            try:
+                passed, check_desc = self._check_human_queue_done_when(done_when)
+            except Exception as exc:
+                logger.warning(
+                    "human-queue tick: done_when check errored for %s: %s", card.get("id"), exc
+                )
+                continue
+            if not passed:
+                continue
+            try:
+                resp = self._http.put(
+                    f"{self.api_base}/api/tasks/human-queue/{card['id']}/resolve",
+                    json={"note": f"Auto-resolved: {check_desc}"},
+                )
+                resp.raise_for_status()
+            except Exception as exc:
+                logger.warning("human-queue tick: failed to resolve %s: %s", card.get("id"), exc)
+                continue
+            logger.info("human-queue: resolved %s (%s)", card.get("id"), check_desc)
+
+    def _check_human_queue_done_when(self, done_when: dict) -> tuple[bool, str]:
+        """Evaluate one card's `done_when`. Returns `(passed, description)`;
+        raises on a malformed check or a request/IO error — the caller
+        treats that the same as a failed check (card left untouched)."""
+        dw_type = done_when.get("type")
+        if dw_type == "endpoint":
+            path = done_when["path"]
+            pointer = done_when.get("pointer", "")
+            equals = done_when.get("equals")
+            resp = self._http.get(f"{self.api_base}{path}", timeout=5.0)
+            resp.raise_for_status()
+            value = _resolve_json_pointer(resp.json(), pointer)
+            desc = f"endpoint {path}{pointer} == {equals!r}"
+            return value == equals, desc
+        if dw_type == "file_exists":
+            path = done_when["path"]
+            return os.path.exists(path), f"file_exists {path}"
+        raise ValueError(f"unsupported done_when type {dw_type!r}")
 
     def ask_user_via_telegram(
         self,

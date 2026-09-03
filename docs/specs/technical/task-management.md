@@ -330,11 +330,22 @@ delivery, that do). `data/task_index.json` and the vault markdown carry the
 same content — deleting one and rebuilding from the other never loses or
 duplicates personal data, by construction.
 
+## Human queue
+
+The Human queue (`api/services/human_queue.py`) is a thin layer on top of
+this store, not a separate one: a card is a task with tag `human` and status
+`blocked`, using the `fields` free-form dict (`key`, `source_host`,
+`source_cwd`, `source_session`, `done_when`) documented above — no new
+persistence, no schema change. See the
+[Human Queue guide](../../guides/human-queue.md) for the tool/endpoint
+contract and the `done_when` reference.
+
 ## Related Documents
 
 ### Specifications
 - [Task Management — Product](../product/task-management.md) — Feature description, statuses, API usage examples (the consumer-facing counterpart to this spec)
 - [API Reference](../product/api-reference.md#task-endpoints) — `/api/tasks` contracts
+- [Human Queue guide](../../guides/human-queue.md) — Fire-and-forget operator cards built on this store
 - [Scheduler — Technical](scheduler.md) — The id-addressed block rewrite, notes-style body, and merge-forward patterns this store mirrors
 - [Agent Worker — Product](../product/agent-worker.md#tag-lifecycle) — `POST /{id}/swap-tag` contract this store preserves unchanged
 - [Architecture](architecture.md) — Where the task modules sit in the code structure

@@ -19,6 +19,7 @@ This directory contains operational guides — how to set up, configure, and run
 - `troubleshooting.md` — Common issues and solutions
 - `claude-code-orchestration.md` — Claude Code multi-agent orchestration patterns
 - `doctor-bot.md` — Self-repair Telegram bot: report a problem → issue → implement → ship
+- `human-queue.md` — Human queue: fire-and-forget cards agents file for the operator, `done_when` auto-resolve
 - `agent-worker-setup.md` — External agent worker prerequisites (Gemma swap, MCP HTTP transport, Cloudflare Tunnel, bearer token)
 - `agents-go-to.md` — /agents "Go To" wezterm pane setup (SessionStart hook + FD probe)
 
