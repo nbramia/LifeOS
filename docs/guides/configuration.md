@@ -159,6 +159,7 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 |---|---|---|---|
 | `LIFEOS_AGENT_WORKER_AUTOSTART` | bool | `false` | When `true`, the worker starts on boot. Default off to require explicit opt-in. |
 | `LIFEOS_AGENT_WORKER_POLL_SECONDS` | float | `60` | Poll interval for new `#agent`-tagged tasks. |
+| `LIFEOS_HUMAN_QUEUE_POLL_SECONDS` | float | `300` | Poll interval for Human-queue `done_when` checks. See [human-queue.md](human-queue.md). |
 | `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | float | `5.00` | Per-task $-cap when the task title doesn't specify one. |
 | `LIFEOS_AGENT_DEFAULT_WALL_SECONDS` | int | `14400` (4 h) | Per-task wall-time cap when title doesn't specify. |
 | `LIFEOS_AGENT_DEFAULT_MAX_TOKENS` | int | `500000` | Per-task token cap when title doesn't specify. |

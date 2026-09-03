@@ -226,3 +226,4 @@ value dressed up as confirmed-live.
 - [Data & Sync](../specs/technical/data-and-sync.md) — Nightly sync pipeline phases
 - [Troubleshooting](troubleshooting.md) — General operational troubleshooting
 - [Scripts Reference](scripts.md) — `auto-deploy.sh` / `auto-update-macos.sh` / `setup-launchd.sh` usage and flags
+- [Human Queue](human-queue.md) — Auto-filed `monarch-reauth` card on an expired/missing session

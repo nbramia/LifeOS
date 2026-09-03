@@ -25,6 +25,8 @@ This is the operator's-eye summary; the exact contract the session runs lives in
    - **Multi-part goal:** an **integration branch** off `main`, each part landed as a sub-PR onto it (`/implement <issue> --base <integration-branch>`), then one PR integration→`main`, then cleanup.
 5. **Confirm.** It brings the canonical checkout to merged `main`, restarts (the right way — see Autonomy and safety), and confirms with the revert handle: _"Shipped: PR #N merged, server restarted. Revert with: gh pr revert N."_
 
+If a repair turns up something only you can do — re-authenticating a service, approving a credential, a decision the doctor can't make on its own — it files a [Human queue](human-queue.md) card instead of stalling, and resolves it once it observes the thing done.
+
 ## Setup
 
 1. **Create the bot.** In Telegram, message `@BotFather` → `/newbot`, name it (e.g. "LifeOS Doctor"), and copy the token.
@@ -64,6 +66,7 @@ The doctor's machinery is generic. To add another orchestration surface, add an 
 - [Configuration](configuration.md) — `TELEGRAM_DOCTOR_*` and the specialized-bot env vars.
 - [Claude Code Orchestration](claude-code-orchestration.md) — Claude Code install/auth on the server, shared by the doctor.
 - [Agent Worker Setup](agent-worker-setup.md) — The worker that runs the doctor's sessions.
+- [Human Queue](human-queue.md) — Where the doctor files what it can't do itself
 
 ### Code References
 - [`config/telegram_bots.json`](../../config/telegram_bots.json) — Bot registry (the `doctor` entry, `orchestrates: true`).

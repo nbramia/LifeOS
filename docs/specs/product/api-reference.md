@@ -790,6 +790,38 @@ All task-mutating endpoints can return `409` if a concurrent external edit
 keeps winning a compare-and-swap race on the underlying file — retry the
 request.
 
+### POST /api/tasks/human-queue
+
+File a Human-queue card — a task with status `blocked` and tag `human` —
+for something only the operator can do. See the
+[Human Queue guide](../../guides/human-queue.md).
+
+**Request:**
+```json
+{
+  "title": "Re-authenticate the example-service session",
+  "notes": "Login expired; re-run the interactive login script.",
+  "key": "example-service-reauth",
+  "done_when": {"type": "endpoint", "path": "/api/example-service/status", "pointer": "/status", "equals": "ok"},
+  "source_host": "example-host",
+  "source_cwd": "/home/example/project"
+}
+```
+`notes`, `key`, `done_when`, `source_host`, `source_cwd`, and `source_session`
+are all optional. Filing again with an already-open `key` updates that
+card's notes instead of creating a duplicate; `done_when` accepts `422` for
+any type other than `endpoint` or `file_exists`.
+
+### GET /api/tasks/human-queue
+
+List open Human-queue cards: `id`, `title`, `key`, `age_hours`,
+`source_host`/`source_cwd`/`source_session`, `notes`, `done_when`.
+
+### PUT /api/tasks/human-queue/{id_or_key}/resolve
+
+Mark a card done, by task id or dedupe key. `note` (optional) is appended to
+the card's notes. Returns `404` for an id or key with no open card.
+
 ---
 
 ## Scheduler & Telegram Endpoints

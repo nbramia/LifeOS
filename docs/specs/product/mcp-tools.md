@@ -91,6 +91,16 @@ Tasks can also be managed via natural language chat. See [Task Management spec](
 | `lifeos_task_complete` | Mark a task as done |
 | `lifeos_task_delete` | Delete a task |
 
+### Human Queue Tools
+
+Fire-and-forget cards for something only the operator can do. See the [Human Queue guide](../../guides/human-queue.md).
+
+| Tool | Description |
+|------|-------------|
+| `lifeos_human_queue_add` | File a card for the operator; dedupes on an optional key |
+| `lifeos_human_queue_list` | List open cards waiting on the operator |
+| `lifeos_human_queue_resolve` | Mark a card done by id or key, with a resolution note |
+
 ### Scheduler & Telegram Tools
 
 Schedules can also be managed via natural language chat. See [Scheduler Guide](../../guides/scheduler.md).
