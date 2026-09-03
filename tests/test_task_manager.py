@@ -2006,6 +2006,54 @@ class TestMoveTaskConflict:
         final_content = source_path.read_text(encoding="utf-8")
         assert "[priority:: high]" in final_content
 
+    def test_uncontended_move_does_not_reindex_or_extra_write(self, task_manager, monkeypatch):
+        """#853 round 3 finding #1: seeding `self._last_written_line[task.id]`
+        with the destination's just-written line unconditionally, right
+        after the destination insert (rather than only if the source-side
+        removal later raises), made the source removal's
+        `_external_edit_pending` check compare the still-on-disk source
+        line against that destination line. They always mismatch (fresh
+        `updated_at`), so an ordinary, uncontended move triggered a
+        spurious `reindex_file` call and an extra write, burning a CAS
+        retry for no reason. An uncontended move must write exactly twice
+        (once to each file) and never reindex."""
+        task = task_manager.create(
+            "Move me cleanly", context="MoveSrc3", notes="keep this body clean"
+        )
+
+        import api.services.task_manager as tm_mod
+
+        reindex_calls = []
+        monkeypatch.setattr(
+            tm_mod.TaskManager,
+            "reindex_file",
+            lambda self, file_path: reindex_calls.append(file_path),
+        )
+
+        write_calls = []
+        original_atomic_write_lines = tm_mod.atomic_write_lines
+
+        def recording_atomic_write_lines(path, *args, **kwargs):
+            write_calls.append(Path(path))
+            return original_atomic_write_lines(path, *args, **kwargs)
+
+        monkeypatch.setattr(tm_mod, "atomic_write_lines", recording_atomic_write_lines)
+
+        updated = task_manager.update(task.id, context="MoveDest3", priority="high")
+
+        assert reindex_calls == []
+        assert len(write_calls) == 2
+        assert {p.name for p in write_calls} == {"MoveDest3.md", "MoveSrc3.md"}
+
+        dest_content = (task_manager.tasks_dir / "MoveDest3.md").read_text(encoding="utf-8")
+        assert "[priority:: high]" in dest_content
+        assert "Move me cleanly" in dest_content
+
+        source_content = (task_manager.tasks_dir / "MoveSrc3.md").read_text(encoding="utf-8")
+        assert "Move me cleanly" not in source_content
+
+        assert updated.context == "MoveDest3"
+
 
 class TestFieldValidation:
     """#853 round 1 findings #2 and #3: description/notes/fields content

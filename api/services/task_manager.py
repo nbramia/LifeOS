@@ -969,11 +969,15 @@ class TaskManager:
         before re-raising, so the task isn't left duplicated in both files.
 
         `self._last_written_line[task.id]` is updated to the destination's
-        just-written line immediately after the insert succeeds, so that if
-        the best-effort rollback runs, its own `_external_edit_pending`
-        check compares against the destination content it should — not a
-        stale pointer at the source line — and never mistakes the freshly
-        inserted block for an unabsorbed external edit. If the rollback
+        just-written line only if the source-side removal raises (right
+        before the best-effort rollback), so that rollback's own
+        `_external_edit_pending` check compares against the destination
+        content it should — not a stale pointer at the source line — and
+        never mistakes the freshly inserted block for an unabsorbed
+        external edit. Leaving the pointer at the source line during the
+        ordinary (non-conflict) path avoids a spurious mismatch against the
+        untouched source line, which would otherwise trigger a needless
+        reindex and extra write on every ordinary move. If the rollback
         still can't restore clean state, `self._tasks`/`_last_written_line`
         are reset to their pre-move values before the original exception is
         re-raised, so the index is never left pointing at a file with no
@@ -990,11 +994,11 @@ class TaskManager:
         new_path = self._get_context_file(new_context)
         block = _format_task_block(task)
         start_line = self._cas_insert_at_top(new_path, block)
-        self._last_written_line[task.id] = block[0]
 
         try:
             self._cas_rewrite(old_path, task.id, lambda: None)
         except TaskConflictError:
+            self._last_written_line[task.id] = block[0]
             try:
                 self._cas_rewrite(new_path, task.id, lambda: None)
             except TaskConflictError:
