@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-08-21
+> **Last Updated:** 2026-09-03
 
 Codebase organization and module structure for efficient navigation.
 
@@ -111,6 +111,7 @@ Per-backend capabilities (personas, handoff, history ownership, usage capture) a
 
 **Task Management:**
 - `task_manager.py` - Task CRUD, markdown I/O, index persistence, fuzzy query
+- `atomic_write.py` - Shared temp-file + fsync + rename helper for atomic vault/index writes (task files, task index, scheduler store)
 
 **Background Jobs:**
 - `job_queue.py` - SQLite-backed job queue with worker thread (reindex, sync)

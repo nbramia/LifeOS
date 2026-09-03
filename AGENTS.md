@@ -65,6 +65,8 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | How is perf traced and monitored? | [specs/technical/observability.md](docs/specs/technical/observability.md) |
 | What does `#agent` do? | [specs/product/agent-worker.md](docs/specs/product/agent-worker.md) |
 | How does the agent worker work internally? | [specs/technical/agent-worker.md](docs/specs/technical/agent-worker.md) |
+| How does the task store work internally (id-addressed writes, notes body, conflict files)? | [specs/technical/task-management.md](docs/specs/technical/task-management.md) |
+| What can I do with tasks (statuses, API, chat)? | [specs/product/task-management.md](docs/specs/product/task-management.md) |
 | How do I set up the agent worker? | [guides/agent-worker-setup.md](docs/guides/agent-worker-setup.md) |
 | How does the doctor self-repair bot work? | [guides/doctor-bot.md](docs/guides/doctor-bot.md) |
 | How do schedules (triggers + actions) work? | [guides/scheduler.md](docs/guides/scheduler.md) |

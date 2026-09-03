@@ -9,11 +9,27 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from api.services.task_manager import get_task_manager, Task
+from api.services.task_manager import get_task_manager, Task, TaskConflictError, VALID_STATUSES
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+
+
+def _require_valid_status(status: Optional[str]) -> None:
+    """Raise 422 for an unrecognized status.
+
+    Deliberately a manual check + HTTPException rather than a pydantic
+    `field_validator` — the app's global `RequestValidationError` handler
+    (api/main.py) converts every pydantic validation failure to 400, and (as
+    a separate, pre-existing bug) can't JSON-serialize a validator's raised
+    exception object at all. Matches the pattern already used for schedules'
+    bot-name validation (api/routes/scheduler.py `_require_known_bot`)."""
+    if status is not None and status not in VALID_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid status '{status}'. Must be one of: {', '.join(sorted(VALID_STATUSES))}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -22,6 +38,14 @@ router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
 class CreateTaskRequest(BaseModel):
     description: str = Field(..., min_length=1, description="Task description")
+    context: Optional[str] = Field(default=None, description="Context/category; defaults to 'Inbox'.")
+    status: Optional[str] = Field(
+        default=None,
+        description=(
+            "Initial status; defaults to 'todo'. One of: todo, done, in_progress, "
+            "cancelled, deferred, blocked, urgent."
+        ),
+    )
     priority: Optional[str] = Field(default="", description="Priority: high, medium, low, or empty")
     due_date: Optional[str] = Field(default=None, description="Due date (YYYY-MM-DD)")
     tags: Optional[list[str]] = Field(
@@ -35,6 +59,16 @@ class CreateTaskRequest(BaseModel):
                     "precedence slot.",
     )
     reminder_id: Optional[str] = Field(default=None, description="Associated reminder ID")
+    notes: Optional[str] = Field(
+        default=None,
+        description="Multi-line notes body, stored as indented '> ' lines beneath the task line.",
+    )
+    fields: Optional[dict[str, Optional[str]]] = Field(
+        default=None,
+        description="Operator-editable inline fields (e.g. host, effort, model, "
+                    "key) plus any custom [key:: value] field. Round-trips "
+                    "untouched through any later rewrite of the task.",
+    )
     dry_run: Optional[bool] = Field(
         default=False,
         description="When true and the task carries the #agent tag, run the "
@@ -80,6 +114,16 @@ class UpdateTaskRequest(BaseModel):
                     "explicitly named that engine — these tags are operator-"
                     "authority and outrank every routing safeguard.",
     )
+    notes: Optional[str] = Field(
+        default=None,
+        description="Replaces the task's notes body (indented '> ' lines beneath the task line).",
+    )
+    fields: Optional[dict[str, Optional[str]]] = Field(
+        default=None,
+        description="Merged into the task's operator/unknown fields, not replaced: "
+                    "a string value sets that field, a null value removes it. "
+                    "Fields not mentioned are left alone.",
+    )
 
 
 class TaskResponse(BaseModel):
@@ -92,8 +136,11 @@ class TaskResponse(BaseModel):
     created_date: str
     done_date: Optional[str]
     cancelled_date: Optional[str]
+    updated_at: Optional[str]
     tags: list[str]
     reminder_id: Optional[str]
+    notes: Optional[str]
+    fields: dict[str, str]
     source_file: str
     line_number: int
 
@@ -109,8 +156,11 @@ class TaskResponse(BaseModel):
             created_date=t.created_date,
             done_date=t.done_date,
             cancelled_date=t.cancelled_date,
+            updated_at=t.updated_at,
             tags=t.tags,
             reminder_id=t.reminder_id,
+            notes=t.notes,
+            fields=t.fields,
             source_file=t.source_file,
             line_number=t.line_number,
         )
@@ -119,6 +169,15 @@ class TaskResponse(BaseModel):
 class TaskListResponse(BaseModel):
     tasks: list[TaskResponse]
     total: int
+
+
+class ConflictFile(BaseModel):
+    name: str
+    mtime: str
+
+
+class ConflictListResponse(BaseModel):
+    conflicts: list[ConflictFile]
 
 
 # ---------------------------------------------------------------------------
@@ -139,14 +198,25 @@ async def create_task(request: CreateTaskRequest):
     """
     if request.dry_run and _has_agent_tag(request.tags):
         return _build_preflight_preview(request)
+    _require_valid_status(request.status)
     manager = get_task_manager()
-    task = manager.create(
-        description=request.description,
-        priority=request.priority or "",
-        due_date=request.due_date,
-        tags=request.tags,
-        reminder_id=request.reminder_id,
-    )
+    fields = {k: v for k, v in (request.fields or {}).items() if v is not None}
+    try:
+        task = manager.create(
+            description=request.description,
+            context=request.context or "Inbox",
+            status=request.status or "todo",
+            priority=request.priority or "",
+            due_date=request.due_date,
+            tags=request.tags,
+            reminder_id=request.reminder_id,
+            notes=request.notes,
+            fields=fields,
+        )
+    except TaskConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     return TaskResponse.from_task(task)
 
 
@@ -292,6 +362,20 @@ async def list_tags():
     return TagListResponse(tags=[TagUsage(**t) for t in manager.list_tags()])
 
 
+@router.get("/conflicts", response_model=ConflictListResponse)
+async def list_conflicts():
+    """List Syncthing conflict copies / in-progress temp files sitting in the
+    tasks folder. These are never indexed as tasks and never reindexed —
+    surfaced here so a client (the board) can warn the operator to resolve
+    them by hand in Obsidian/Syncthing.
+
+    Registered before `/{task_id}` so FastAPI doesn't treat "conflicts" as
+    a task id.
+    """
+    manager = get_task_manager()
+    return ConflictListResponse(conflicts=[ConflictFile(**c) for c in manager.list_conflicts()])
+
+
 class SwapTagResponse(BaseModel):
     swapped: bool
     reason: Optional[str] = None
@@ -313,7 +397,10 @@ async def swap_tag(
     manager = get_task_manager()
     if manager.get(task_id) is None:
         return SwapTagResponse(swapped=False, reason="task not found")
-    ok = manager.swap_tag(task_id, from_tag, to_tag)
+    try:
+        ok = manager.swap_tag(task_id, from_tag, to_tag)
+    except TaskConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     return SwapTagResponse(swapped=ok, reason=None if ok else f"tag '{from_tag}' not present")
 
 
@@ -330,9 +417,15 @@ async def get_task(task_id: str):
 @router.put("/{task_id}", response_model=TaskResponse)
 async def update_task(task_id: str, request: UpdateTaskRequest):
     """Update an existing task."""
+    _require_valid_status(request.status)
     manager = get_task_manager()
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
-    task = manager.update(task_id, **updates)
+    try:
+        task = manager.update(task_id, **updates)
+    except TaskConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return TaskResponse.from_task(task)
@@ -342,7 +435,10 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
 async def complete_task(task_id: str):
     """Mark a task as done (shortcut endpoint)."""
     manager = get_task_manager()
-    task = manager.complete(task_id)
+    try:
+        task = manager.complete(task_id)
+    except TaskConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return TaskResponse.from_task(task)
@@ -352,7 +448,10 @@ async def complete_task(task_id: str):
 async def delete_task(task_id: str):
     """Delete a task."""
     manager = get_task_manager()
-    deleted = manager.delete(task_id)
+    try:
+        deleted = manager.delete(task_id)
+    except TaskConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     if not deleted:
         raise HTTPException(status_code=404, detail="Task not found")
     return {"status": "deleted", "id": task_id}

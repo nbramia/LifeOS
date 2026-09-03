@@ -358,9 +358,10 @@ TOOL_DEFINITIONS = [
         "name": "manage_tasks",
         "description": (
             "Manage Obsidian tasks. Actions: 'create' (new task — always lands in "
-            "Inbox; do not pass a context), 'list' (filter tasks; supports the "
-            "context filter for already-categorized tasks), 'complete' (mark task "
-            "done), 'update' (edit any field on an existing task, including tags or "
+            "Inbox; do not pass a context — status/notes/fields are accepted), "
+            "'list' (filter tasks; supports the context filter for already-"
+            "categorized tasks), 'complete' (mark task done), 'update' (edit any "
+            "field on an existing task, including tags, notes, operator fields, or "
             "moving the task to a different context), 'tags' (list every distinct "
             "tag across all tasks with usage counts — the same list is already in "
             "the system prompt; call this action only if the user explicitly asks "
@@ -429,13 +430,29 @@ TOOL_DEFINITIONS = [
                         "'urgent'. Omitting it returns tasks of EVERY status, and in an "
                         "established vault most tasks are done or cancelled — so pass "
                         "'todo' for open/outstanding work rather than listing unfiltered "
-                        "and sorting it out afterwards. Also accepted on update to change "
-                        "status."
+                        "and sorting it out afterwards. Also accepted on create (initial "
+                        "status; defaults to 'todo') and update (to change status)."
                     ),
                 },
                 "query": {
                     "type": "string",
                     "description": "Search within task descriptions (for list).",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": (
+                        "Multi-line notes body for the task (create or update). "
+                        "Stored beneath the task line; replaces the existing body on update."
+                    ),
+                },
+                "fields": {
+                    "type": "object",
+                    "additionalProperties": {"type": ["string", "null"]},
+                    "description": (
+                        "Operator-editable fields (e.g. host, effort, model, key) to set on "
+                        "the task (create or update). On update, a null value removes that "
+                        "field; other fields not mentioned are left alone."
+                    ),
                 },
             },
             "required": ["action"],
@@ -2133,11 +2150,15 @@ def _tool_person_info(inp: dict):
 def _task_create(inp: dict) -> str:
     from api.services.task_manager import get_task_manager
     tm = get_task_manager()
+    fields = {k: v for k, v in (inp.get("fields") or {}).items() if v is not None}
     task = tm.create(
         description=inp["description"],
+        status=inp.get("status") or "todo",
         priority=inp.get("priority", ""),
         due_date=inp.get("due_date"),
         tags=inp.get("tags"),
+        notes=inp.get("notes"),
+        fields=fields,
     )
     due = f", due {task.due_date}" if task.due_date else ""
     return f"Task created: \"{task.description}\" (id: {task.id}{due})"
@@ -2184,7 +2205,7 @@ def _task_complete(inp: dict) -> str:
     return f"Task completed: \"{task.description}\""
 
 
-_UPDATABLE_FIELDS = ("description", "status", "context", "priority", "due_date", "tags")
+_UPDATABLE_FIELDS = ("description", "status", "context", "priority", "due_date", "tags", "notes", "fields")
 
 
 def _task_update(inp: dict) -> str:
@@ -2195,7 +2216,10 @@ def _task_update(inp: dict) -> str:
     tm = get_task_manager()
     updates = {k: inp[k] for k in _UPDATABLE_FIELDS if k in inp and inp[k] is not None}
     if not updates:
-        return "Error: no updatable fields provided (description, status, context, priority, due_date, tags)."
+        return (
+            "Error: no updatable fields provided (description, status, context, "
+            "priority, due_date, tags, notes, fields)."
+        )
     task = tm.update(task_id, **updates)
     if not task:
         return f"Error: Task '{task_id}' not found."
