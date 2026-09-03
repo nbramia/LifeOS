@@ -289,6 +289,14 @@ export function initBoard() {
   }
 
   function render() {
+    // A drop's re-render replaces every card node, so the trailing click
+    // that `suppressNextClick` was set to swallow often never reaches a
+    // card's own click handler (mouseup can land on a different lane's
+    // element, whose click event never bubbles through the original card).
+    // Clear it here instead of waiting for a click that may not arrive —
+    // otherwise it lingers and eats the operator's next genuine click on
+    // that same card id (#850 verify-1 finding 3).
+    suppressNextClick = null;
     lanesEl.innerHTML = '';
     for (const lane of LANES) {
       const column = document.createElement('div');

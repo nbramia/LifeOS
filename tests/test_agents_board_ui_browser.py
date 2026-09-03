@@ -717,3 +717,63 @@ class TestFilters:
         page.locator("#board-filter-context").select_option("Work")
         expect(page.locator('[data-card-id="t2"]')).to_be_visible()
         expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
+
+
+class TestTabSwitching:
+    """#850 verify-1 findings 1 and 2: `#board-view { display: flex }`
+    (specificity 1-0-0) and `.chips { display: flex }` (0-1-0) each beat
+    the generic `[hidden]` rule they were relying on, so setting
+    `.hidden = true` on either element never actually hid it. Assert on
+    COMPUTED style, not element reachability — Playwright's own visibility
+    helpers auto-scroll to an element, which hid this bug from every prior
+    test."""
+
+    def _computed_display(self, page: Page, selector: str) -> str:
+        return page.evaluate(
+            "(sel) => getComputedStyle(document.querySelector(sel)).display", selector,
+        )
+
+    def test_graph_tab_hides_board_view_and_chips_and_back(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        assert self._computed_display(page, "#board-view") != "none"
+        assert self._computed_display(page, "#graph-chips") == "none"
+
+        page.locator("#tab-btn-graph").click()
+        expect(page.locator("#graph-view")).to_be_visible()
+        assert self._computed_display(page, "#board-view") == "none"
+        assert self._computed_display(page, "#graph-chips") != "none"
+
+        page.locator("#tab-btn-board").click()
+        expect(page.locator("#board-view")).to_be_visible()
+        assert self._computed_display(page, "#board-view") != "none"
+        assert self._computed_display(page, "#graph-chips") == "none"
+
+
+class TestDragThenClick:
+    """#850 verify-1 finding 3: `suppressNextClick` was cleared only inside
+    the card's own click handler, but a drop's re-render replaces every
+    card node and the drag's trailing click often lands on a different
+    element (the drop target lane), so it never reaches that handler — the
+    flag then lingers and swallows the operator's NEXT genuine click on the
+    same card id. Reproduced for both the success path and a rejected
+    (409) move, matching what the verify agent observed live."""
+
+    def test_click_after_successful_drag_opens_drawer(self, page: Page, agents_base_url):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, lane_status_code=[200])
+        _drag_card(page, "t1", "in_progress")
+        expect(page.locator('.board-lane[data-lane="in_progress"] [data-card-id="t1"]')).to_be_visible(timeout=5000)
+
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.locator(".drawer-title")).to_have_value("Investigate outage")
+
+    def test_click_after_rejected_drag_opens_drawer(self, page: Page, agents_base_url):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, lane_status_code=[409])
+        _drag_card(page, "t1", "in_progress")
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        # The rejected move re-renders in place — card never left "unassigned".
+        expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_be_visible()
+
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.locator(".drawer-title")).to_have_value("Investigate outage")
