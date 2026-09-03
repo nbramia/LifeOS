@@ -1039,6 +1039,8 @@ Per-engine model catalog for the board's assignment pickers: `{engines: {claude:
 
 Open an Assigned card (`status == "todo"`, a recognized assignee tag, no session already running against it) — `409` otherwise. `claude`/`codex` spawn the interactive CLI in a terminal (local, or over ssh for a registered `host` field), seeded with the card's title/notes and `LIFEOS_TASK_ID` in the environment; `hermes` returns `{open_url: "/chat?conversation=<id>"}` once the card has a Hermes conversation, else `409`.
 
+`409` also covers: a second open on the same card within a 30-second grace window after the first open claimed it but before its session has registered (`card open is already in progress` — guards a double-click racing the spawn, not a permanent lock); and a `host` field naming a value absent from `LIFEOS_AGENT_HOSTS` (`host '<name>' is not configured in LIFEOS_AGENT_HOSTS`).
+
 ---
 
 ## Related Documents
@@ -1046,6 +1048,7 @@ Open an Assigned card (`status == "todo"`, a recognized assignee tag, no session
 - [api-crm.md](api-crm.md) — `/api/crm/*` HTTP endpoints (split out from this file)
 - [mcp-tools.md](mcp-tools.md) — MCP tool catalog (the canonical home — was previously duplicated here)
 - [Agent Viz — Technical](../technical/agent-viz.md) — `/api/agents/*` endpoints in detail, including cross-machine CLI session registration
+- [Agent Worker — Technical](../technical/agent-worker.md) — Card assignment mechanism behind the Card Assignment Endpoints above
 - [Data & Sync](../technical/data-and-sync.md) — Data sources and sync pipeline
 - [Chat UI](chat-ui.md) — Chat interface product spec
 - [Client Surfaces](../technical/client-surfaces.md) — HTTP consumers and breaking-change policy

@@ -529,7 +529,12 @@ credentials out of a registered host's shell startup files.
 seconds) bounds how long ssh may spend establishing the connection before
 giving up — applies to remote spawn, remote kill, and remote resume/focus
 alike. An unreachable host fails within this window with the ssh error as
-the failure reason.
+the failure reason. A remote spawn's initial handshake read (waiting for
+the `PGID:` line that confirms the remote process actually started) is
+bounded separately, at this connect timeout plus 5 seconds — it covers an
+auth stall or a host that accepts the connection but never answers, and
+fails with its own distinct reason (`host <name> did not answer within
+<n>s`) rather than the ssh connection error above.
 
 **What doesn't work remotely:** Apple-data tasks (iMessage, Photos,
 Contacts) need Full Disk Access, which is granted per-launching-process

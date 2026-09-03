@@ -696,6 +696,9 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
       `#local`        → routing=local, model=local
       `#claude`       → routing=code   (Claude Code CLI, subscription-billed)
       `#codex`        → routing=codex  (Codex CLI, subscription-billed)
+      `#hermes`       → routing=hermes (Hermes conversation, #851; model is
+                         whatever Hermes reports per turn — nothing for
+                         preflight to select among ALLOWED_MODELS)
       `#cloud-haiku`  → routing=claude, model=claude-haiku-4-5   (Anthropic API, explicit)
       `#cloud-sonnet` → routing=claude, model=claude-sonnet-5    (Anthropic API, explicit)
       `#cloud`        → routing=remote, model=""  (#809: the configured remote
