@@ -5,6 +5,7 @@ and the unknown-host failure path (no ssh call).
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -249,6 +250,121 @@ def test_remote_host_unresponsive_pgid_read_fails_within_deadline(tmp_path, monk
     assert outcome.status == STATUS_FAILED
     assert "studio" in outcome.reason
     assert elapsed < 30  # well under the test-harness timeout; proves it didn't hang
+
+
+class _UnblockableStdout:
+    """`readline()` blocks on a `threading.Event` until the test releases
+    it, then returns `line` on the next call (and `""` after that). Unlike
+    `_HangingStdout` (blocks forever), this lets a test observe executor
+    state DURING the blocked read and then let it complete."""
+
+    def __init__(self, line: str):
+        self._line = line
+        self._released = threading.Event()
+        self._returned = False
+
+    def unblock(self) -> None:
+        self._released.set()
+
+    def readline(self) -> str:
+        self._released.wait()
+        if self._returned:
+            return ""
+        self._returned = True
+        return self._line
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if line == "":
+            raise StopIteration
+        return line
+
+
+class _UnblockableProc:
+    def __init__(self, stdout: "_UnblockableStdout", pid: int = 7777):
+        self.stdout = stdout
+        self.stderr = _FakeStderr()
+        self.pid = pid
+        self.returncode = 0
+        self._terminated = False
+
+    def poll(self):
+        return None if not self._terminated else self.returncode
+
+    def terminate(self):
+        self._terminated = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
+    def kill(self):
+        self._terminated = True
+
+
+def test_remote_pid_event_recorded_before_pgid_line_arrives(tmp_path, monkeypatch):
+    """Round 2, finding #2: the `claude_code_pid` transcript event must be
+    recorded IMMEDIATELY after `Popen` — before the deadline-bounded pgid
+    read — not only once (if) the pgid line arrives. Otherwise the
+    operator-kill fallback (`inter_agent._kill_local_subprocess`) finds no
+    pid event and silently no-ops for a local ssh client stuck mid-read,
+    until the much longer wall-clock watchdog eventually fires.
+
+    Runs the REAL executor on a background thread against a stdout whose
+    `readline()` blocks until released, polls the transcript store while
+    still blocked to prove the pid event already exists, then unblocks the
+    fake so the pgid line is read and the run completes normally."""
+    import time
+
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_ssh_connect_timeout", 5, raising=False)
+    monkeypatch.setattr(settings, "agent_hosts", {"studio": "user@studio.example"}, raising=False)
+
+    stdout = _UnblockableStdout("PGID:24680\n")
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+
+    def _spawn_fn(cmd, **kwargs):
+        return _UnblockableProc(stdout, pid=7777)
+
+    executor = ClaudeCodeExecutor(
+        session_store=store, transcript_store=transcripts, spawn_fn=_spawn_fn,
+    )
+    session = store.create(task_id="t1", routing="claude_code", host="studio")
+
+    thread = threading.Thread(target=executor.execute, args=(session, {"description": "do the thing"}))
+    thread.start()
+    try:
+        # Poll for the pid event to appear WHILE the pgid read is still
+        # blocked (well inside the 5s+5s deadline) — this is the assertion
+        # that would fail before the fix, since the event used to be
+        # appended only after this read returned.
+        deadline = time.monotonic() + 3.0
+        pid_events: list[dict] = []
+        while time.monotonic() < deadline:
+            pid_events = [e for e in transcripts.read(session.session_id) if e.get("kind") == "claude_code_pid"]
+            if pid_events:
+                break
+            time.sleep(0.02)
+        assert pid_events, "claude_code_pid event was not recorded before the pgid line arrived"
+        payload = pid_events[0]["payload"]
+        assert payload["pid"] == 7777
+        assert payload["pgid"] is None
+        assert payload["remote"] is True
+
+        # Now let the blocked read complete and the executor finish.
+        stdout.unblock()
+    finally:
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+
+    refreshed = store.get("t1")
+    assert refreshed.remote_pgid == 24680
+    all_pid_events = [e for e in transcripts.read(session.session_id) if e.get("kind") == "claude_code_pid"]
+    assert len(all_pid_events) == 2
+    assert all_pid_events[-1]["payload"]["pgid"] == 24680
 
 
 class _FakeStderrWithText:

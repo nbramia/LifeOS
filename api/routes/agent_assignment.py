@@ -16,6 +16,7 @@ import logging
 import shlex
 import subprocess
 import threading
+import time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -58,8 +59,19 @@ _ASSIGNEE_TAGS = ("claude", "codex", "hermes")
 # process has made stays 409'd regardless of what the vault/session_store
 # say, until an actual registered session (or a failed spawn, which frees
 # the card_id again) supersedes it.
+#
+# (round 2, finding #1) That gap is only ever a few seconds wide — the CLI
+# registers its own lifecycle event shortly after it starts. So the claim
+# doesn't need to live forever: `_opening_card_ids` maps card_id ->
+# `time.monotonic()` at claim time, and the membership check below only
+# honors it while younger than `_OPENING_GRACE_SECONDS`. Once expired, the
+# card is eligible to be claimed again — closing the gap without
+# permanently 409ing a card for the life of the process after a
+# successful open (a fresh claim overwrites the stale timestamp, which is
+# how an expired entry gets dropped — no separate removal pass needed).
 _open_lock = threading.Lock()
-_opening_card_ids: set[str] = set()
+_opening_card_ids: dict[str, float] = {}
+_OPENING_GRACE_SECONDS = 30
 
 _session_store: SessionStore | None = None
 
@@ -158,15 +170,16 @@ async def open_board_card(card_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=409, detail="card already has a running session")
         if _has_running_cli_session(card_id):
             raise HTTPException(status_code=409, detail="card already has a running interactive session")
-        if card_id in _opening_card_ids:
+        claimed_at = _opening_card_ids.get(card_id)
+        if claimed_at is not None and time.monotonic() - claimed_at < _OPENING_GRACE_SECONDS:
             raise HTTPException(status_code=409, detail="card open is already in progress")
-        _opening_card_ids.add(card_id)
+        _opening_card_ids[card_id] = time.monotonic()
         try:
             return _spawn_interactive_cli(card_id, task, assignee)
         except Exception:
             # Spawn failed (bad launcher config, missing binary, ...) — free
             # the card_id so a retry isn't permanently locked out.
-            _opening_card_ids.discard(card_id)
+            _opening_card_ids.pop(card_id, None)
             raise
 
 

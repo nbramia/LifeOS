@@ -414,6 +414,15 @@ class CodexExecutor:
             # (round 1, finding #3) Bounded wait: see ClaudeCodeExecutor._run
             # for why this read needs a deadline of its own, ahead of the
             # wall-clock watchdog below.
+            #
+            # (round 2, finding #2) Record the pid event immediately after
+            # Popen — BEFORE this deadline-bounded read — see
+            # ClaudeCodeExecutor._run for why: it's what lets the operator-
+            # kill fallback reach a stalled local ssh client during the
+            # read's own deadline window rather than finding no pid event.
+            self.transcript_store.append(sid, "codex_pid", {
+                "pid": proc.pid, "pgid": None, "remote": True, "host": host,
+            })
             pgid = None
             if proc.stdout is not None:
                 deadline = settings.agent_ssh_connect_timeout + 5
@@ -432,9 +441,9 @@ class CodexExecutor:
                 pgid = read_remote_pgid_line(first_line)
             if pgid is not None:
                 self.session_store.set_remote_pgid(session.task_id, pgid)
-            self.transcript_store.append(sid, "codex_pid", {
-                "pid": proc.pid, "pgid": pgid, "remote": True, "host": host,
-            })
+                self.transcript_store.append(sid, "codex_pid", {
+                    "pid": proc.pid, "pgid": pgid, "remote": True, "host": host,
+                })
         else:
             # #379: record the subprocess pid + pgid so the operator kill endpoint
             # (a separate process) can signal it via the transcript. Mirrors the

@@ -169,6 +169,52 @@ def test_open_card_double_click_is_serialized(client, manager, session_store, mo
     assert call_count["n"] == 1
 
 
+def test_open_card_reopens_after_grace_period_following_success(client, manager, session_store, monkeypatch):
+    """Round 2, finding #1: `_opening_card_ids` used to be discarded ONLY on
+    a spawn failure, so a card that opened successfully stayed 409'd for
+    the rest of the process lifetime even after the session reached a
+    terminal status and the task went back to `todo`. Advancing past
+    `_OPENING_GRACE_SECONDS` must let a second, genuinely new open through."""
+    task = manager.create(description="fix the printer", tags=["agent", "claude"])
+
+    proc = MagicMock()
+    proc.pid = 4242
+    popen_mock = MagicMock(return_value=proc)
+    monkeypatch.setattr("subprocess.Popen", popen_mock)
+
+    fake_time = {"t": 1_000.0}
+    monkeypatch.setattr(agent_assignment.time, "monotonic", lambda: fake_time["t"])
+
+    resp = client.post(f"/api/agents/board/cards/{task.id}/open")
+    assert resp.status_code == 200
+    assert popen_mock.call_count == 1
+
+    # A re-open immediately after (still within the grace window) stays
+    # 409'd — the card's just-claimed spot isn't cleared on success.
+    resp = client.post(f"/api/agents/board/cards/{task.id}/open")
+    assert resp.status_code == 409
+    assert popen_mock.call_count == 1
+
+    # The session the first spawn (eventually) registered reaches a
+    # terminal status, and the card goes back to `todo` for reassignment —
+    # mirroring what actually happens minutes later in production.
+    session_store.create(task_id=task.id, status="completed", routing="claude_code")
+    manager.update(task.id, status="todo")
+
+    # Still within the grace window: stays 409'd even though the task/
+    # session state now looks fully reopenable.
+    resp = client.post(f"/api/agents/board/cards/{task.id}/open")
+    assert resp.status_code == 409
+    assert popen_mock.call_count == 1
+
+    # Advance past the grace period — the stale claim expires and a fresh
+    # open is allowed to spawn again.
+    fake_time["t"] += agent_assignment._OPENING_GRACE_SECONDS + 1
+    resp = client.post(f"/api/agents/board/cards/{task.id}/open")
+    assert resp.status_code == 200
+    assert popen_mock.call_count == 2
+
+
 def test_open_card_remote_host_wraps_in_ssh(client, manager, session_store, monkeypatch):
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_hosts", {"studio": "user@studio.example"}, raising=False)

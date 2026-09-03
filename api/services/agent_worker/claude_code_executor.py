@@ -609,6 +609,20 @@ class ClaudeCodeExecutor:
             # auth, or a host that accepts the connection but never
             # answers, would otherwise hang this thread (and the worker's
             # `_cli_pool`) forever with no watchdog to rescue it.
+            #
+            # (round 2, finding #2) Record the pid event immediately after
+            # Popen — BEFORE this deadline-bounded read, not after — so the
+            # operator-kill fallback (`inter_agent._kill_local_subprocess`)
+            # can reach a stalled local ssh client during the read's own
+            # deadline window instead of finding no pid event and silently
+            # no-op'ing until the wall-clock watchdog eventually fires. A
+            # second event follows with the real pgid once (if) the line
+            # arrives; `_kill_local_subprocess` scans for the LATEST
+            # `claude_code_pid` event, so it picks up the real pgid once
+            # it's recorded and falls back to this one until then.
+            self.transcript_store.append(sid, "claude_code_pid", {
+                "pid": proc.pid, "pgid": None, "remote": True, "host": host,
+            })
             pgid = None
             if proc.stdout is not None:
                 deadline = settings.agent_ssh_connect_timeout + 5
@@ -626,9 +640,9 @@ class ClaudeCodeExecutor:
                 pgid = read_remote_pgid_line(first_line)
             if pgid is not None:
                 self.session_store.set_remote_pgid(session.task_id, pgid)
-            self.transcript_store.append(sid, "claude_code_pid", {
-                "pid": proc.pid, "pgid": pgid, "remote": True, "host": host,
-            })
+                self.transcript_store.append(sid, "claude_code_pid", {
+                    "pid": proc.pid, "pgid": pgid, "remote": True, "host": host,
+                })
         else:
             # #379: record the subprocess PID + process-group id so the operator
             # kill endpoint (a separate process) can signal it. `start_new_session`
