@@ -646,6 +646,15 @@ export function initBoard() {
       const value = assigneeEl.value;
       try {
         await moveCard(card.id, value ? 'assigned' : 'unassigned', value || undefined);
+        // moveCard already awaited fetchBoard(), so the board's own state is
+        // current — but updateOpenDrawer's `!focused` check skips the
+        // rebuild while the select (inside the drawer) still holds focus,
+        // which a native <select> keeps after a change event. Re-render
+        // explicitly so the model/effort/host pickers and the Open button
+        // reflect the new assignee immediately, not only once focus leaves
+        // the drawer (#859 review round 1 finding 1).
+        const fresh = findCard(card.id);
+        if (fresh) { renderDrawer(fresh); openCardSnapshot = fresh; }
       } catch (err) {
         // moveCard already toasted the failure and nothing was persisted —
         // re-render the drawer from the still-current card so the select

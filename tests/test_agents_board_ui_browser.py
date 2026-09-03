@@ -162,14 +162,14 @@ def _move_card_in_state(board_state: dict, card_id: str, target_lane: str) -> No
 def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: list, lane_status_code: list,
                   schedule_puts: list, board_stream_frames: list, stream_gate: "threading.Event | None" = None,
                   lane_response: "list | None" = None, open_calls: "list | None" = None,
-                  open_response: "dict | None" = None, models_catalog: "dict | None" = None):
+                  open_response: "dict | None" = None):
     """Stub d3 (offline CDN) + every /api/ call the page makes.
 
     `open_calls`: appended with each opened card id (POST
     /api/agents/board/cards/{id}/open). `open_response`, when given, is
     `{"status": <code>, "detail": <str>}` — the 409 failure path (#859);
-    omitted defaults to a 200 success. `models_catalog` overrides the
-    `GET /api/agents/models` body (defaults to `_MODEL_CATALOG`).
+    omitted defaults to a 200 success. `GET /api/agents/models` is served
+    from `_MODEL_CATALOG`.
 
     `board_stream_frames`: SSE frame strings (each a full
     "event: board\\ndata: {...}\\n\\n" block), delivered one per *reconnect*
@@ -207,7 +207,6 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
 
     if open_calls is None:
         open_calls = []
-    catalog = models_catalog if models_catalog is not None else _MODEL_CATALOG
 
     stream_attempt = [0]
 
@@ -239,7 +238,7 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             return
 
         if re.search(r"/api/agents/models$", url) and method == "GET":
-            route.fulfill(status=200, content_type="application/json", body=json.dumps(catalog))
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
             return
 
         lane_match = re.search(r"/api/agents/board/cards/([^/]+)/lane$", url)
@@ -319,7 +318,7 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
 
 def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_puts=None, lane_status_code=None,
                  schedule_puts=None, board_stream_frames=None, stream_gate=None, lane_response=None,
-                 open_calls=None, open_response=None, models_catalog=None):
+                 open_calls=None, open_response=None):
     _stub_routes(
         page,
         board_state if board_state is not None else _board_fixture(),
@@ -332,35 +331,30 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
         lane_response,
         open_calls,
         open_response,
-        models_catalog,
     )
     page.goto(f"{base_url}/agents")
     page.wait_for_selector('[data-card-id="t1"]')
 
 
-def _wait_for(predicate, timeout_ms=5000, interval_ms=25, page: "Page | None" = None):
+def _wait_for(predicate, page: Page, timeout_ms=5000, interval_ms=25):
     """Poll `predicate` until it's truthy or the timeout elapses — for
     asserting on a plain Python side effect (e.g. an appended stub call)
     that has no DOM signal Playwright's own `expect(...)` can wait on.
 
-    `page`, when given, is sent a trivial no-op evaluate() each iteration
-    (#859). Playwright Python's sync API delivers an already-arrived
-    intercepted request's route callback via a greenlet switch tied to the
-    calling thread's next Playwright call — a pure `time.sleep()` loop that
-    never calls back into Playwright can leave that callback undelivered
-    indefinitely while the board's SSE reconnect loop (`/board/stream`,
-    reconnecting every `retry: 20`ms per `_stub_routes`) keeps the driver
-    thread busy. Verified empirically against the assignment-picker save
-    tests, which hung the full timeout without this and passed reliably
-    with it; a bare predicate-only poll (no Playwright calls at all) did
-    not fix it."""
+    `page` is required: Playwright Python's sync API only advances its
+    internal event loop — and so only delivers an already-arrived
+    intercepted request's route callback — from inside a call back into
+    Playwright, via a greenlet switch tied to the calling thread. A pure
+    `time.sleep()` poll never makes such a call, so a route callback that
+    already landed can sit undelivered for the whole timeout regardless of
+    what else is happening on the page. `page.wait_for_timeout(...)` is
+    itself a Playwright call, so using it as the poll's sleep also serves
+    as the pump — no separate `evaluate()` + `time.sleep()` pair needed."""
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
-        if page is not None:
-            page.evaluate("1")
         if predicate():
             return
-        time.sleep(interval_ms / 1000)
+        page.wait_for_timeout(interval_ms)
     assert predicate(), f"condition not met within {timeout_ms}ms"
 
 
@@ -488,7 +482,7 @@ class TestScheduledCardDrawer:
         title.fill("Evening briefing")
         message.click()  # blur the title field
         expect(message).to_have_value("Good morning")
-        _wait_for(lambda: {"name": "Evening briefing"} in schedule_puts)
+        _wait_for(lambda: {"name": "Evening briefing"} in schedule_puts, page=page)
 
         # Blur message straight into the checkbox (never back through title —
         # title's own blur handler compares against the value captured when
@@ -498,8 +492,8 @@ class TestScheduledCardDrawer:
         message.fill("Good evening")
         expect(enabled).to_be_checked()
         enabled.uncheck()  # blurs message, then toggles enabled
-        _wait_for(lambda: {"message_content": "Good evening"} in schedule_puts)
-        _wait_for(lambda: {"enabled": False} in schedule_puts)
+        _wait_for(lambda: {"message_content": "Good evening"} in schedule_puts, page=page)
+        _wait_for(lambda: {"enabled": False} in schedule_puts, page=page)
 
         assert schedule_puts == [
             {"name": "Evening briefing"},
@@ -898,6 +892,18 @@ class TestAssignmentPickers:
         # resolves — default + 2 claude models from _MODEL_CATALOG.
         expect(assignment.locator("[data-field='model'] option")).to_have_count(3)
 
+    def test_pickers_hidden_for_me_assignee(self, page: Page, agents_base_url):
+        # t2 is assignee "me" — the module's ENGINES list (claude/codex/
+        # local/hermes) has no "me" entry, so its engine select falls back
+        # to no selection and none of model/effort/host accept it.
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        assignment = page.locator(".drawer-assignment")
+        expect(assignment).to_be_attached()
+        expect(assignment.locator('[data-row="model"]')).to_be_hidden()
+        expect(assignment.locator('[data-row="effort"]')).to_be_hidden()
+        expect(assignment.locator('[data-row="host"]')).to_be_hidden()
+
     def test_changing_model_writes_exactly_one_fields_put(self, page: Page, agents_base_url):
         task_puts = []
         _open_board(page, agents_base_url, task_puts=task_puts)
@@ -906,6 +912,7 @@ class TestAssignmentPickers:
         expect(model_select.locator("option")).to_have_count(3)
         model_select.select_option("claude-sonnet-5")
         _wait_for(lambda: any("fields" in p for p in task_puts), page=page)
+        page.wait_for_timeout(100)  # let any second, unwanted PUT land before counting
         fields_puts = [p for p in task_puts if "fields" in p]
         assert len(fields_puts) == 1, task_puts
         assert fields_puts[0] == {
@@ -920,6 +927,7 @@ class TestAssignmentPickers:
         expect(effort_select).to_be_visible()
         effort_select.select_option("high")
         _wait_for(lambda: any("fields" in p for p in task_puts), page=page)
+        page.wait_for_timeout(100)  # let any second, unwanted PUT land before counting
         fields_puts = [p for p in task_puts if "fields" in p]
         assert len(fields_puts) == 1, task_puts
         assert fields_puts[0] == {
@@ -932,13 +940,14 @@ class TestAssignmentPickers:
         page.locator('[data-card-id="t7"]').click()
         host_input = page.locator(".drawer-assignment [data-field='host']")
         expect(host_input).to_be_visible()
-        host_input.fill("mac-mini")
+        host_input.fill("build-box-2")
         host_input.press("Tab")  # text input needs an explicit blur to fire `change`
         _wait_for(lambda: any("fields" in p for p in task_puts), page=page)
+        page.wait_for_timeout(100)  # let any second, unwanted PUT land before counting
         fields_puts = [p for p in task_puts if "fields" in p]
         assert len(fields_puts) == 1, task_puts
         assert fields_puts[0] == {
-            "fields": {"model": None, "effort": None, "host": "mac-mini", "assigned_by": "board"}
+            "fields": {"model": None, "effort": None, "host": "build-box-2", "assigned_by": "board"}
         }
 
     def test_saved_model_reflected_on_reopen(self, page: Page, agents_base_url):
@@ -949,6 +958,7 @@ class TestAssignmentPickers:
         expect(model_select.locator("option")).to_have_count(3)
         model_select.select_option("claude-sonnet-5")
         _wait_for(lambda: any("fields" in p for p in task_puts), page=page)
+        page.wait_for_timeout(100)  # let any second, unwanted PUT land before reload
 
         # The stub mutates the fixture card synchronously before fulfilling
         # the PUT (mirrors a real save), so a fresh page load's initial
@@ -969,7 +979,7 @@ class TestAssignmentPickers:
         open_btn = page.get_by_role("button", name="Open")
         expect(open_btn).to_be_visible()
         open_btn.click()
-        expect(page.locator(".toast")).to_contain_text("Opened.", timeout=5000)
+        expect(page.locator(".toast:not(.error)")).to_contain_text("Opened.", timeout=5000)
         assert open_calls == ["t7"]
 
     def test_open_button_409_shows_detail_in_toast(self, page: Page, agents_base_url):
@@ -989,6 +999,7 @@ class TestAssignmentPickers:
         # t2 is Assigned but assignee "me" — Open is only for claude/codex.
         _open_board(page, agents_base_url)
         page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-title")).to_have_value("Ship the release")
         expect(page.get_by_role("button", name="Open")).to_have_count(0)
 
     def test_open_button_absent_when_not_in_assigned_lane(self, page: Page, agents_base_url):
@@ -996,11 +1007,13 @@ class TestAssignmentPickers:
         # Assigned — the Open action is scoped to the Assigned lane.
         _open_board(page, agents_base_url)
         page.locator('[data-card-id="t3"]').click()
+        expect(page.locator(".drawer-title")).to_have_value("Debug prod issue")
         expect(page.get_by_role("button", name="Open")).to_have_count(0)
 
     def test_scheduled_card_drawer_has_no_assignment_pickers(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
         page.locator('[data-card-id="s1"]').click()
+        expect(page.locator(".drawer-schedule-hint")).to_be_visible()
         expect(page.locator(".drawer-assignment")).to_have_count(0)
         expect(page.locator(".assignment-row")).to_have_count(0)
         expect(page.get_by_role("button", name="Open")).to_have_count(0)
