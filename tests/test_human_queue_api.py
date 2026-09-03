@@ -153,6 +153,17 @@ class TestResolveRoute:
         resp = client.put(f"/api/tasks/human-queue/{card['id']}/resolve", json={})
         assert resp.status_code == 200
 
+    def test_resolve_by_key_after_refile_succeeds(self, client, tm):
+        """Regression: file key -> resolve by key -> refile same key ->
+        resolve by key must succeed, not 404 against the now-done card."""
+        client.post("/api/tasks/human-queue", json={"title": "X", "key": "sync:gmail"})
+        assert client.put("/api/tasks/human-queue/sync:gmail/resolve", json={}).status_code == 200
+
+        second = client.post("/api/tasks/human-queue", json={"title": "X again", "key": "sync:gmail"}).json()
+        resp = client.put("/api/tasks/human-queue/sync:gmail/resolve", json={"note": "fixed again"})
+        assert resp.status_code == 200
+        assert resp.json()["id"] == second["id"]
+
 
 class TestRouteOrderingRegression:
     """`/human-queue` and `/human-queue/{id_or_key}/resolve` must be matched

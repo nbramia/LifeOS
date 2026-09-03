@@ -89,18 +89,22 @@ def _find_open_card_by_key(key: str) -> Optional[Task]:
 
 
 def _find_any_card(id_or_key: str) -> Optional[Task]:
-    """Find a human-queue (tag `human`) card of any status by task id or
-    dedupe key, for resolve — an id or key that only matches a non-human
-    task, or matches nothing, is "not found" from this queue's perspective.
+    """Find the human-queue (tag `human`) card matched by task id or dedupe
+    key, for resolve. The key lookup is OPEN-only (`_find_open_card_by_key`)
+    rather than an all-status scan: `resolve_card` only ever resolves an
+    open card anyway, and once a key has both a done card (from a prior
+    resolve) and a reopened open card, an all-status scan could return
+    either one depending on list order — sometimes the done card, which
+    `resolve_card` then rejects as not-open, turning a legitimate
+    resolve-by-key into a spurious 404. An id or key that only matches a
+    non-human task, or matches nothing, is "not found" from this queue's
+    perspective.
     """
     manager = get_task_manager()
     task = manager.get(id_or_key)
     if task is not None and _has_tag(task, TAG):
         return task
-    for t in manager.list_tasks(tag=TAG):
-        if t.fields.get("key") == id_or_key:
-            return t
-    return None
+    return _find_open_card_by_key(id_or_key)
 
 
 def add_card(

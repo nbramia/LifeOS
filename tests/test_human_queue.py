@@ -148,6 +148,21 @@ class TestResolveCard:
         assert resolved.status == "done"
         assert resolved.notes
 
+    def test_resolve_by_key_after_refile_succeeds(self, tm):
+        """Regression: once a key has both a done card (from the first
+        resolve) and a reopened open card (from refiling), resolve-by-key
+        must find the open one, not 404 against the done one."""
+        first = human_queue.add_card(title="X", key="svc-reauth")
+        assert human_queue.resolve_card("svc-reauth", note="fixed").id == first.id
+
+        second = human_queue.add_card(title="X again", key="svc-reauth")
+        assert second.id != first.id
+
+        resolved = human_queue.resolve_card("svc-reauth", note="fixed again")
+        assert resolved is not None
+        assert resolved.id == second.id
+        assert resolved.status == "done"
+
 
 class TestListOpenCards:
     def test_list_only_returns_open_human_cards(self, tm):
