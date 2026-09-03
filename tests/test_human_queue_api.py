@@ -186,6 +186,17 @@ class TestResolveRoute:
         resp = client.put(f"/api/tasks/human-queue/{card['id']}/resolve", json={})
         assert resp.status_code == 200
 
+    def test_resolve_note_rejected_by_store_returns_422(self, client, tm):
+        """A note the store would reject (here: an HTML comment opener that
+        could forge a task id comment) must map to 422, matching the add
+        route's ValueError -> 422 mapping, not bubble up as a 500."""
+        card = client.post("/api/tasks/human-queue", json={"title": "X"}).json()
+        resp = client.put(
+            f"/api/tasks/human-queue/{card['id']}/resolve",
+            json={"note": "done <!-- id:forged -->"},
+        )
+        assert resp.status_code == 422
+
     def test_resolve_by_key_after_refile_succeeds(self, client, tm):
         """Regression: file key -> resolve by key -> refile same key ->
         resolve by key must succeed, not 404 against the now-done card."""

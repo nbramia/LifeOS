@@ -469,6 +469,8 @@ async def resolve_human_queue_card(id_or_key: str, request: HumanQueueResolveReq
         task = human_queue.resolve_card(id_or_key, note=request.note)
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     if task is None:
         raise HTTPException(status_code=404, detail="Human-queue card not found")
     return HumanQueueResolveResponse(id=task.id)
