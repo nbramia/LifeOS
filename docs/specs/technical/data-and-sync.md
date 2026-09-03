@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Data Pipeline
-> **Last Updated:** 2026-08-26
+> **Last Updated:** 2026-09-03
 
 How LifeOS ingests and stores data from multiple sources.
 
@@ -170,6 +170,10 @@ The 7-phase structure ensures correct data flow:
 ### Failure Notifications
 
 Configure `LIFEOS_ALERT_EMAIL` in `.env` to receive notifications when sync steps fail.
+
+The run also files a [Human queue](../../guides/human-queue.md) card keyed
+`sync:<source>` for each genuinely failed source (not a clean skip),
+auto-resolved by the next successful run of that source.
 
 ---
 

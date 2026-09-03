@@ -1,7 +1,7 @@
 # Doctor Bot — Self-Repair Surface
 
 **Status:** Complete
-**Last Updated:** 2026-08-28
+**Last Updated:** 2026-09-03
 **Audience:** Operator
 
 The **doctor** bot's only job is fixing LifeOS itself. You message it when you notice LifeOS misbehaving or missing something; it converses with you to define the **goal**, locks that goal, then — on your approval — orchestrates the work end to end and reports back. It is a **goal-first orchestrator**: it supervises the implementation (subagents do the coding via `/implement`) rather than hand-coding inline, and every change lands through a reviewed, tested PR — never a direct push to `main`.
@@ -25,7 +25,7 @@ This is the operator's-eye summary; the exact contract the session runs lives in
    - **Multi-part goal:** an **integration branch** off `main`, each part landed as a sub-PR onto it (`/implement <issue> --base <integration-branch>`), then one PR integration→`main`, then cleanup.
 5. **Confirm.** It brings the canonical checkout to merged `main`, restarts (the right way — see Autonomy and safety), and confirms with the revert handle: _"Shipped: PR #N merged, server restarted. Revert with: gh pr revert N."_
 
-If a repair turns up something only you can do — re-authenticating a service, approving a credential, a decision the doctor can't make on its own — it files a [Human queue](human-queue.md) card instead of stalling, and resolves it once it observes the thing done.
+Once you install the [Human queue](human-queue.md) instruction paragraph in the doctor's instruction files, a repair that turns up something only you can do files a card instead of stalling, and resolves it once it observes the thing done.
 
 ## Setup
 

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Operations
-> **Last Updated:** 2026-08-27
+> **Last Updated:** 2026-09-03
 > **Audience:** Operators
 
 Operational procedures that don't belong in the day-to-day coding reference: the Apple Data Agent, Monarch Money auth, and quick observability commands. Moved here from `AGENTS.md` to keep the agent-facing file lean.
@@ -37,6 +37,10 @@ Auth uses a cached session token at `data/monarch_session.pickle`. Monthly sync 
 
 Re-authenticate when the token expires (401/525), or when the nightly sync warns
 that the session is old. Run from the project root — the session path is relative.
+
+An expired or missing session also files a [Human queue](human-queue.md)
+card keyed `monarch-reauth`; the worker's next poll resolves it
+automatically once re-auth succeeds.
 
 **Preferred (works in any shell, including agent/non-TTY sessions):** reads
 `MONARCH_EMAIL` / `MONARCH_PASSWORD` from `.env` and takes the MFA code as an

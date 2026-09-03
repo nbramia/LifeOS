@@ -666,5 +666,3 @@ def get_briefings_service() -> BriefingsService:
     if _briefings_service is None:
         _briefings_service = BriefingsService()
     return _briefings_service
-
-

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-08-26
+> **Last Updated:** 2026-09-03
 
 Engineering view of the agent worker — the stand-alone process that consumes `#agent`-tagged tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -204,7 +204,10 @@ One row per Claude Code / Codex CLI session registered from any host via `POST /
 ## Lifecycle of a task
 
 ```
-poll → spend tracker check (`can_start_task(default_budget)`)
+poll → resolve Human-queue cards whose done_when now passes (throttled by
+        LIFEOS_HUMAN_QUEUE_POLL_SECONDS; runs before the spend guard — it
+        never spends)
+     → spend tracker check (`can_start_task(default_budget)`)
      → wake sleeping sessions whose timer expired
      → poll managed sessions for state advancement
      → resume yielded-for-children sessions if children done
@@ -558,6 +561,7 @@ Full reference in [`agent-worker-setup.md`](../../guides/agent-worker-setup.md).
 - [Agent Worker — Setup](../../guides/agent-worker-setup.md) — Operator setup walkthrough
 - [Agent Viz — Technical](agent-viz.md) — `/agents` page that reads SessionStore + TranscriptStore here
 - [Task Management](../product/task-management.md) — How `#agent` tasks sit alongside regular tasks
+- [Human Queue](../../guides/human-queue.md) — Cards the worker's poll tick auto-resolves via `done_when`
 - [MCP Tools](../product/mcp-tools.md) — Standard MCP catalog including `lifeos_agent_*` family
 - [API Reference](../product/api-reference.md) — Task endpoints the worker uses (`/api/tasks/{id}/swap-tag`, `/api/tasks/{id}/complete`)
 - [Architecture](architecture.md) — Where the worker fits in the broader code structure

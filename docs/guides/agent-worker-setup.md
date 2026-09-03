@@ -1,7 +1,7 @@
 # Agent Worker Setup
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-18
+> **Last Updated:** 2026-09-03
 > **Audience:** Operators
 
 One-time setup for the external agent worker that picks up `#agent`-tagged tasks and executes them via Claude (Anthropic Managed Agents) or a local Gemma model.
@@ -527,4 +527,5 @@ suggestions to keep iteration cheap:
 - [Installation](installation.md) — base LifeOS setup
 - [Configuration](configuration.md) — environment variable reference
 - [Scripts](scripts.md) — `setup-systemd.sh` and other operational scripts
+- [Human Queue](human-queue.md) — `done_when` auto-resolve checks require this worker to be running
 - Epic [#98](https://github.com/nbramia/LifeOS/issues/98) — full agent-worker design

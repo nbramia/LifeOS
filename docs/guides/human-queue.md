@@ -12,9 +12,10 @@ worker, `/chat`, or Hermes — can file a card without stopping, and LifeOS
 itself files cards for known operator-only failures (sync errors, an
 expired Monarch session).
 
-A card is a task (`docs/specs/technical/task-management.md`) with tag
-`human` and status `blocked` — no new storage, no schema change. The board's
-Human queue lane is that filter, derived, not a separate list.
+A card is a task ([task-management](../specs/technical/task-management.md))
+with tag `human` and status `blocked` — no new storage, no schema change.
+A Human queue lane on the `/agents` board is that same filter — derived,
+not a separate list.
 
 ## The instruction paragraph
 
@@ -32,10 +33,7 @@ convention:
 > only what genuinely requires the operator.
 
 The repository ships this paragraph; installing it into an operator's own
-instruction files is a manual, per-install step (out of scope for this
-repo — see `docs/guides/doctor-bot.md` for the sibling pattern of an
-operator-owned instruction file `config/personas/doctor.md` that a guide
-merely documents).
+instruction files is a manual, per-install step.
 
 ## The three tools
 
@@ -62,6 +60,10 @@ Hermes) and as a native chat tool (`manage_human_queue`, actions
 
 ## `done_when` — auto-resolve checks
 
+The check runs only while the agent worker is running (off by default —
+see [Agent Worker Setup](agent-worker-setup.md)); with the worker stopped,
+a `done_when` card simply stays open until someone resolves it.
+
 An optional condition, checked by the agent worker's poll tick
 (`LIFEOS_HUMAN_QUEUE_POLL_SECONDS`, default 300s — see
 [Configuration](configuration.md)) so a card resolves itself the moment the
@@ -71,6 +73,9 @@ go back and close it. Two types only:
 ```json
 {"type": "endpoint", "path": "/api/example-service/status", "pointer": "/status", "equals": "ok"}
 ```
+All three of `path`, `pointer`, and `equals` are required; `equals` must be
+a JSON scalar (string, number, boolean, or null).
+
 `path` must start with `/` and not `//`, and must not contain `?` or `#`
 (422 otherwise — a worker-side guard against a `path` like `@host/x`
 re-parsing the request's authority, or a query string turning the poll
@@ -92,6 +97,13 @@ own filesystem, not the API server's.
 A card with no `done_when` just sits open until an agent (the filer, on
 observing the fix, or `/chat`/Hermes on request) resolves it by hand.
 
+A check that does not pass leaves the card untouched, retried next poll,
+but logging differs: an **errored** check (endpoint unreachable, wrong
+shape) logs a warning; a check that just evaluates **false** (the condition
+isn't true yet) logs nothing — that's the expected steady state while the
+operator hasn't acted yet. A passing check resolves the card with a note
+naming the check that passed.
+
 **Why no `shell` type.** A `done_when` check that could run an arbitrary
 command would be a remote-execution surface reachable by any agent that can
 file a card — deliberately excluded. `endpoint` and `file_exists` are
@@ -102,13 +114,6 @@ issue a GET against the given local API path every poll, and `file_exists`
 answers whether a path exists on the worker host — so both should be
 treated as available to whatever can create a `#human` task, not just to
 whoever reads cards back.
-
-Either way the card is left untouched and tried again next poll, but
-logging differs: an **errored** check (endpoint unreachable, wrong shape)
-logs a warning; a check that just evaluates **false** (the condition isn't
-true yet) logs nothing — that's the expected steady state while the
-operator hasn't acted yet. A passing check resolves the card with a note
-naming the check that passed.
 
 ## REST endpoints
 
@@ -164,7 +169,11 @@ prompt.
 
 ### Specifications
 - [Task Management — Technical](../specs/technical/task-management.md#human-queue) — The task store this queue is built on
+- [Task Management — Product](../specs/product/task-management.md) — Consumer-facing task endpoints, including the Human-queue rows
 - [API Reference](../specs/product/api-reference.md#task-endpoints) — REST contracts
+- [MCP Tools](../specs/product/mcp-tools.md) — The `lifeos_human_queue_*` tools in the full MCP catalog
+- [Agent Worker — Technical](../specs/technical/agent-worker.md) — The poll tick that resolves `done_when` cards
+- [Data & Sync — Technical](../specs/technical/data-and-sync.md#failure-notifications) — Sync failures file a card keyed `sync:<source>`
 
 ### Guides
 - [Configuration](configuration.md) — `LIFEOS_HUMAN_QUEUE_POLL_SECONDS`
