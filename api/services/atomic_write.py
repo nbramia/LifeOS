@@ -33,6 +33,22 @@ def atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
-def atomic_write_lines(path: Path, lines: list[str]) -> None:
-    """Atomically write ``lines`` to ``path``, one per line, with a trailing newline."""
-    atomic_write_text(path, "\n".join(lines) + "\n")
+def atomic_write_lines(
+    path: Path,
+    lines: list[str],
+    newline: str = "\n",
+    trailing_newline: bool = True,
+) -> None:
+    """Atomically write ``lines`` to ``path``, joined by ``newline``.
+
+    ``newline`` and ``trailing_newline`` let a caller preserve a file's
+    original line-terminator convention (e.g. CRLF) and whether it ended
+    with a trailing terminator, across a rewrite that only touches a few
+    lines. ``scheduler_store.py`` never calls this helper (it writes whole
+    files via ``atomic_write_text``), so its behavior is unaffected by
+    these defaults.
+    """
+    content = newline.join(lines)
+    if trailing_newline:
+        content += newline
+    atomic_write_text(path, content)

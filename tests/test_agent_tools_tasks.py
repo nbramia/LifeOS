@@ -124,6 +124,25 @@ class TestUnknownAction:
         assert out.startswith("Error:")
 
 
+class TestManageTasksCreateBadStatus:
+    """#853 round 1 finding #11: `TaskManager.create` now raises `ValueError`
+    for an unrecognized `status`. Through the chat tool boundary
+    (`execute_tool`, which wraps every handler in try/except and formats an
+    exception as an "Error: ..." string) that must come back as an error
+    string, not an unhandled exception, and nothing should be written."""
+
+    async def test_bad_status_returns_error_string_nothing_written(self, tm):
+        from api.services.agent_tools import execute_tool
+
+        out = await execute_tool("manage_tasks", {
+            "action": "create",
+            "description": "Bad status task",
+            "status": "Done",
+        })
+        assert out.startswith("Error:")
+        assert tm.list_tasks() == []
+
+
 class TestManageTasksFilterDocs:
     """The `manage_tasks` schema is what the orchestrator reads before calling the
     tool, and a bad filter hint fails silently — the call succeeds and returns the

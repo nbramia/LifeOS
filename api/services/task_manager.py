@@ -19,6 +19,7 @@ reindexes. ``line_number``/``source_file`` on ``Task`` remain informational
 
 See docs/specs/technical/task-management.md for the full design.
 """
+import copy
 import json
 import logging
 import re
@@ -56,9 +57,61 @@ VALID_STATUSES = set(STATUS_TO_SYMBOL.keys())
 # without parser changes.
 _KNOWN_FIELD_KEYS = {"due", "priority", "created", "done", "cancelled", "updated"}
 
+# Field keys that already address a dedicated Task attribute (or the id
+# comment itself) — accepting them through the free-form `fields` dict would
+# let a caller write a second, conflicting `[key:: value]` onto the line, or
+# forge `[id:: ...]`/`[updated:: ...]` outright. Rejected by
+# `_validate_text_fields`.
+_RESERVED_FIELD_KEYS = _KNOWN_FIELD_KEYS | {"id"}
+_FIELD_KEY_RE = re.compile(r"^\w+$")
+
 # Retries after an initial write attempt that loses a compare-and-swap race
 # against a concurrent external edit (see TaskManager._cas_rewrite).
 _CAS_MAX_RETRIES = 3
+
+
+def _validate_text_fields(
+    description: Optional[str] = None,
+    notes: Optional[str] = None,
+    fields: Optional[dict] = None,
+) -> None:
+    """Reject description/notes/fields content that would corrupt the task
+    line's format or hijack another task's id comment when written back.
+
+    A newline in `description` or a `fields` value would split the single
+    checkbox line; a `]` would truncate an inline field and leak the rest
+    into the description; an HTML comment opener (`<!--`) could forge a new
+    `<!-- id:.. -->`, hijacking another task's id on the next reindex. Notes
+    lines are allowed to be multi-line (that's their whole point) but not
+    `\\r` (would desync from the `\\n`-joined body) or `<!--`. A `fields` key
+    must be a bare word (`_format_task_line` interpolates it directly as
+    `[key:: value]`) and must not shadow a reserved key (see
+    `_RESERVED_FIELD_KEYS`).
+
+    Raises `ValueError` — never silently truncates or strips, since that
+    would surprise the caller by saving something other than what was sent.
+    The route layer maps `ValueError` to HTTP 422.
+    """
+    if description is not None:
+        for bad in ("\n", "\r", "]", "<!--"):
+            if bad in description:
+                raise ValueError(f"description must not contain {bad!r}")
+    if notes is not None:
+        for line in notes.split("\n"):
+            for bad in ("\r", "<!--"):
+                if bad in line:
+                    raise ValueError(f"notes must not contain {bad!r}")
+    if fields:
+        for key, value in fields.items():
+            if not _FIELD_KEY_RE.match(key):
+                raise ValueError(f"invalid fields key {key!r}: must match ^\\w+$")
+            if key in _RESERVED_FIELD_KEYS:
+                raise ValueError(f"'{key}' is a reserved field and cannot be set via fields")
+            if value is None:
+                continue
+            for bad in ("\n", "\r", "]", "<!--"):
+                if bad in value:
+                    raise ValueError(f"fields[{key!r}] must not contain {bad!r}")
 
 
 class TaskConflictError(Exception):
@@ -127,9 +180,30 @@ def _read_lines(path: Path) -> list[str]:
     return []
 
 
+def _read_lines_with_terminator(path: Path) -> tuple[list[str], str, bool]:
+    """Read `path` split into lines (terminators stripped) plus its detected
+    line terminator and whether it ended with a trailing terminator — both
+    needed to preserve a file's original formatting across a rewrite that
+    only touches a few lines. Reads raw bytes (not `Path.read_text`, whose
+    text-mode universal-newline translation would silently turn CRLF into
+    LF before we ever got a look at it). Missing/empty file → ([], "\n",
+    True), matching the append-a-trailing-newline default most vault files
+    already have."""
+    if not path.exists():
+        return [], "\n", True
+    raw = path.read_bytes()
+    if not raw:
+        return [], "\n", True
+    newline = "\r\n" if b"\r\n" in raw else "\n"
+    trailing_newline = raw.endswith(newline.encode("ascii"))
+    return raw.decode("utf-8").splitlines(), newline, trailing_newline
+
+
 # Syncthing conflict copies and temp files: never indexed as a task source,
 # never trigger or survive a reindex. Exposed read-only via list_conflicts().
-_CONFLICT_RE = re.compile(r"\.sync-conflict-\d{8}-\d{6}")
+# Matches the substring regardless of the timestamp/suffix that follows it,
+# per the criterion "*.sync-conflict-*" (not just Syncthing's own format).
+_CONFLICT_RE = re.compile(r"\.sync-conflict-")
 
 
 def is_conflict_file(path: Path) -> bool:
@@ -225,7 +299,18 @@ class TaskManager:
         notes: Optional[str] = None,
         fields: Optional[dict[str, str]] = None,
     ) -> Task:
-        """Create a new task at the top of its context file, update index."""
+        """Create a new task at the top of its context file, update index.
+
+        Raises `ValueError` (-> HTTP 422 at the route layer) for an
+        unrecognized `status`, or for `description`/`notes`/`fields` content
+        that would corrupt the task line or hijack another task's id — see
+        `_validate_text_fields`.
+        """
+        if status is not None and status not in VALID_STATUSES:
+            raise ValueError(
+                f"Invalid status '{status}'. Must be one of: {', '.join(sorted(VALID_STATUSES))}"
+            )
+        _validate_text_fields(description=description, notes=notes, fields=fields)
         with self._lock:
             task = Task(
                 id=uuid.uuid4().hex[:8],
@@ -272,8 +357,19 @@ class TaskManager:
         """Update a task. Supports: description, status, context, priority,
         due_date, tags, notes, fields. `fields={"k": None}` removes key `k`;
         `fields={"k": "v"}` sets it. Raises `TaskConflictError` (-> HTTP 409)
-        if the write keeps losing the CAS race against a concurrent edit."""
+        if the write keeps losing the CAS race against a concurrent edit;
+        `ValueError` (-> HTTP 422) for an unrecognized `status` or hostile
+        `description`/`notes`/`fields` content — see `_validate_text_fields`.
+        """
         fields_patch = kwargs.pop("fields", None)
+        if "status" in kwargs and kwargs["status"] is not None and kwargs["status"] not in VALID_STATUSES:
+            raise ValueError(
+                f"Invalid status '{kwargs['status']}'. "
+                f"Must be one of: {', '.join(sorted(VALID_STATUSES))}"
+            )
+        _validate_text_fields(
+            description=kwargs.get("description"), notes=kwargs.get("notes"), fields=fields_patch
+        )
         with self._lock:
             current = self._tasks.get(task_id)
             if not current:
@@ -283,6 +379,13 @@ class TaskManager:
             new_context = kwargs.get("context", old_context)
 
             def apply(t: Task) -> Task:
+                # Copy first — `t` is `self._tasks[task_id]` itself, and this
+                # closure is invoked fresh on every CAS retry via `compute()`
+                # (see `_cas_rewrite`). Mutating it in place would make a
+                # losing attempt's edits visible through `self.get(task_id)`
+                # immediately, even though nothing was ever persisted; only
+                # the CAS success branch below may rebind `self._tasks`.
+                t = copy.copy(t)
                 for key, value in kwargs.items():
                     if key == "status" and value == "done" and t.status != "done":
                         t.done_date = _today()
@@ -303,7 +406,17 @@ class TaskManager:
 
             if new_context != old_context:
                 task = apply(current)
-                self._move_task_between_files(task, old_context, new_context)
+                moved = self._move_task_between_files(task, old_context, new_context)
+                if not moved:
+                    # Task's block is no longer in its source file (an
+                    # external delete raced us) — reconcile like the
+                    # same-context branch does for `found=False` below,
+                    # rather than raising.
+                    self._tasks.pop(task_id, None)
+                    self._last_written_line.pop(task_id, None)
+                    self._save_index()
+                    self._write_dashboard()
+                    return None
                 self._tasks[task_id] = task
             else:
                 path = Path(current.source_file)
@@ -354,11 +467,16 @@ class TaskManager:
                     )
                 except StopIteration:
                     raise _TagAbsentError()
+                # Copy first, same reasoning as `update.apply` — `t` is
+                # `self._tasks[task_id]` itself, and this closure runs fresh
+                # on every CAS retry; only the success branch in
+                # `_cas_rewrite` may rebind `self._tasks`.
+                new_task = copy.copy(t)
                 new_tags = list(t.tags)
                 new_tags[idx] = to_norm
-                t.tags = new_tags
-                t.updated_at = _now_iso()
-                return t
+                new_task.tags = new_tags
+                new_task.updated_at = _now_iso()
+                return new_task
 
             try:
                 found, task = self._cas_rewrite(path, task_id, compute)
@@ -464,7 +582,12 @@ class TaskManager:
         gets one appended, minimally, with every other byte of the line and
         every non-task line untouched) and external-edit detection (a task
         line that no longer matches what the API last wrote gets a fresh
-        `[updated::]` stamp; every other line is left alone).
+        `[updated::]` stamp; every other line is left alone). The write-back
+        (if any) is itself CAS-protected on the file's mtime, bounded to
+        `_CAS_MAX_RETRIES` re-read-and-reparse attempts; on persistent
+        conflict it logs a warning and skips the write for this pass rather
+        than raising — the watcher will fire again for whatever caused the
+        conflict.
         """
         path = Path(file_path)
         # Dashboard.md is auto-generated; never index it as a task source.
@@ -480,24 +603,50 @@ class TaskManager:
                 to_remove = [tid for tid, t in self._tasks.items() if t.source_file == str(path)]
                 for tid in to_remove:
                     del self._tasks[tid]
+                    self._last_written_line.pop(tid, None)
                 if to_remove:
                     self._save_index()
                     self._write_dashboard()
             return
 
         with self._lock:
-            try:
-                lines = path.read_text(encoding="utf-8").splitlines()
-            except Exception as e:
-                logger.warning(f"Could not read {file_path}: {e}")
-                return
+            file_tasks: dict[str, Task] = {}
+            for attempt in range(_CAS_MAX_RETRIES + 1):
+                mtime_before = _mtime_or_none(path)
+                try:
+                    lines, newline, trailing_newline = _read_lines_with_terminator(path)
+                except Exception as e:
+                    logger.warning(f"Could not read {file_path}: {e}")
+                    return
 
-            new_lines, file_tasks, rewrite_needed = self._reparse_lines(lines, str(path), self._tasks)
+                new_lines, file_tasks, rewrite_needed = self._reparse_lines(
+                    lines, str(path), self._tasks
+                )
+                if not rewrite_needed:
+                    break
 
-            if rewrite_needed:
-                atomic_write_lines(path, new_lines)
+                mtime_now = _mtime_or_none(path)
+                if mtime_now == mtime_before:
+                    atomic_write_lines(path, new_lines, newline=newline, trailing_newline=trailing_newline)
+                    break
+                if attempt >= _CAS_MAX_RETRIES:
+                    logger.warning(
+                        f"reindex_file: persistent write conflict on {file_path}; "
+                        "skipping the id/restamp write-back this pass"
+                    )
+                    break
+                # Someone else wrote in between — re-read and re-parse
+                # against the freshest content on the next attempt.
 
-            to_remove = [tid for tid, t in self._tasks.items() if t.source_file == str(path)]
+            # Only tasks NOT present in this parse are gone from this file —
+            # everything `_reparse_lines` just repopulated must survive, or
+            # every reindex would immediately forget the external edit it
+            # was meant to detect (a task restamped this pass would vanish
+            # from the index a moment after being restamped).
+            to_remove = [
+                tid for tid, t in self._tasks.items()
+                if t.source_file == str(path) and tid not in file_tasks
+            ]
             for tid in to_remove:
                 del self._tasks[tid]
                 self._last_written_line.pop(tid, None)
@@ -515,13 +664,13 @@ class TaskManager:
                 if md_file.name == "Dashboard.md" or is_conflict_file(md_file):
                     continue
                 try:
-                    lines = md_file.read_text(encoding="utf-8").splitlines()
+                    lines, newline, trailing_newline = _read_lines_with_terminator(md_file)
                 except Exception as e:
                     logger.warning(f"Could not read {md_file}: {e}")
                     continue
                 new_lines, file_tasks, rewrite_needed = self._reparse_lines(lines, str(md_file), prior)
                 if rewrite_needed:
-                    atomic_write_lines(md_file, new_lines)
+                    atomic_write_lines(md_file, new_lines, newline=newline, trailing_newline=trailing_newline)
                 rebuilt.update(file_tasks)
 
         self._tasks = rebuilt
@@ -548,13 +697,24 @@ class TaskManager:
         stamp. A task id with no prior record at all (first time this
         process has seen it) is taken as-is, no restamp — there is nothing
         to compare against. Every other line — task or not — is copied
-        through byte-for-byte.
+        through byte-for-byte. A checkbox line inside a fenced (``` or ~~~)
+        code block is never a task line (see `_iter_lines_with_fence_state`).
+        A second block in this same file carrying an id already claimed
+        earlier in this parse is treated as if it had no id at all — its
+        stale/duplicated comment is replaced with a freshly minted one,
+        rather than left to fight the first occurrence for the same id on
+        every future parse.
         """
         out_lines: list[str] = []
         file_tasks: dict[str, Task] = {}
         rewrite_needed = False
+        fence = dict(_iter_lines_with_fence_state(lines))
         idx, n = 0, len(lines)
         while idx < n:
+            if fence.get(idx):
+                out_lines.append(lines[idx])
+                idx += 1
+                continue
             block = _match_task_block(lines, idx, file_path)
             if block is None:
                 out_lines.append(lines[idx])
@@ -563,6 +723,11 @@ class TaskManager:
             end, task, had_id = block
             raw_main_line = lines[idx]
             body_lines = lines[idx + 1:end]
+
+            if had_id and task.id in file_tasks:
+                had_id = False
+                task.id = uuid.uuid4().hex[:8]
+                raw_main_line = _ID_RE.sub("", raw_main_line).rstrip()
 
             if had_id:
                 prior_task = prior.get(task.id)
@@ -613,20 +778,38 @@ class TaskManager:
         Returns `(found, task_or_none)`. `found=False` means the task's block
         was not present in the file at all (e.g. externally deleted) — not a
         CAS conflict, so the caller should reconcile rather than retry.
+
+        Before computing the replacement, also checks whether the on-disk
+        block reflects an edit `reindex_file` hasn't absorbed yet — the raw
+        line differs from the last line the API wrote/saw, or the on-disk
+        notes body differs from the in-memory task's. Under the watcher's 2s
+        debounce this is the normal case for an edit that just landed, not a
+        rare race: without this check `compute()` would build its
+        replacement from stale in-memory state and silently overwrite the
+        edit. On either mismatch, absorb it via `reindex_file` and retry
+        (counts toward `_CAS_MAX_RETRIES`) instead of computing against
+        stale state.
         """
         for attempt in range(_CAS_MAX_RETRIES + 1):
             mtime_before = _mtime_or_none(path)
-            lines = _read_lines(path)
+            lines, newline, trailing_newline = _read_lines_with_terminator(path)
             span = _find_task_block_span(lines, task_id)
             if span is None:
                 return False, None
-            result = compute()
             start, end = span
+
+            if self._external_edit_pending(lines, start, task_id):
+                if attempt < _CAS_MAX_RETRIES:
+                    self.reindex_file(str(path))
+                    continue
+                raise TaskConflictError(f"Too many conflicting writes to {path}")
+
+            result = compute()
             new_block = _format_task_block(result) if result is not None else []
             new_lines = lines[:start] + new_block + lines[end:]
             mtime_now = _mtime_or_none(path)
             if mtime_now == mtime_before:
-                atomic_write_lines(path, new_lines)
+                atomic_write_lines(path, new_lines, newline=newline, trailing_newline=trailing_newline)
                 if result is not None:
                     self._tasks[task_id] = result
                     self._last_written_line[task_id] = new_block[0]
@@ -639,18 +822,39 @@ class TaskManager:
             raise TaskConflictError(f"Too many conflicting writes to {path}")
         raise TaskConflictError(f"Too many conflicting writes to {path}")
 
+    def _external_edit_pending(self, lines: list[str], start: int, task_id: str) -> bool:
+        """True if the on-disk block at `lines[start]` carries an edit
+        `_cas_rewrite` hasn't absorbed into `self._tasks` yet: the raw line
+        text no longer matches the last line the API wrote or saw for this
+        id, or the on-disk notes body no longer matches the in-memory
+        task's. Must be called with `self._lock` held."""
+        last_written = self._last_written_line.get(task_id)
+        if last_written is not None and lines[start] != last_written:
+            return True
+        in_memory = self._tasks.get(task_id)
+        if in_memory is not None:
+            on_disk_block = _match_task_block(lines, start)
+            if on_disk_block is not None:
+                _, on_disk_task, _ = on_disk_block
+                if on_disk_task.notes != in_memory.notes:
+                    return True
+        return False
+
     def _cas_insert_at_top(self, path: Path, block: list[str]) -> int:
         """Insert `block` above the first existing task block. Returns its
         1-indexed start line. CAS-protected: re-reads the file and retries
         on a concurrent external write, up to `_CAS_MAX_RETRIES` times."""
         for attempt in range(_CAS_MAX_RETRIES + 1):
             mtime_before = _mtime_or_none(path)
-            content = path.read_text(encoding="utf-8") if path.exists() else ""
-            lines = content.splitlines()
+            lines, newline, trailing_newline = _read_lines_with_terminator(path)
+            fence = dict(_iter_lines_with_fence_state(lines))
 
             first_idx = None
             idx, n = 0, len(lines)
             while idx < n:
+                if fence.get(idx):
+                    idx += 1
+                    continue
                 b = _match_task_block(lines, idx, str(path))
                 if b is not None:
                     first_idx = idx
@@ -666,7 +870,7 @@ class TaskManager:
 
             mtime_now = _mtime_or_none(path)
             if mtime_now == mtime_before:
-                atomic_write_lines(path, new_lines)
+                atomic_write_lines(path, new_lines, newline=newline, trailing_newline=trailing_newline)
                 return insert_at
             if attempt >= _CAS_MAX_RETRIES:
                 raise TaskConflictError(f"Too many conflicting writes to {path}")
@@ -679,8 +883,12 @@ class TaskManager:
         if not path.exists():
             return
         lines = _read_lines(path)
+        fence = dict(_iter_lines_with_fence_state(lines))
         idx, n = 0, len(lines)
         while idx < n:
+            if fence.get(idx):
+                idx += 1
+                continue
             block = _match_task_block(lines, idx, str(path))
             if block is None:
                 idx += 1
@@ -708,21 +916,45 @@ class TaskManager:
             atomic_write_text(file_path, template)
         return file_path
 
-    def _move_task_between_files(self, task: Task, old_context: str, new_context: str):
-        """Remove from old file, append (at top) to new file."""
+    def _move_task_between_files(self, task: Task, old_context: str, new_context: str) -> bool:
+        """Move `task`'s block from its old context file to `new_context`'s.
+
+        Returns False if the task's block is no longer present in the
+        source file (externally deleted) — the caller should reconcile like
+        `update` does for `found=False`, not treat it as a conflict.
+
+        Inserts into the destination BEFORE removing from the source, so a
+        destination-side conflict can never lose the task: if the insert
+        raises, the source is untouched. If the source removal itself then
+        raises (a source-side conflict, after the insert already
+        succeeded), best-effort removes the just-inserted destination block
+        before re-raising, so the task isn't left duplicated in both files.
+        """
         old_path = Path(task.source_file)
-        self._cas_rewrite(old_path, task.id, lambda: None)
-        self._reposition_file(old_path)
+        old_lines = _read_lines(old_path)
+        if _find_task_block_span(old_lines, task.id) is None:
+            return False
 
         new_path = self._get_context_file(new_context)
         block = _format_task_block(task)
         start_line = self._cas_insert_at_top(new_path, block)
+
+        try:
+            self._cas_rewrite(old_path, task.id, lambda: None)
+        except TaskConflictError:
+            try:
+                self._cas_rewrite(new_path, task.id, lambda: None)
+            except TaskConflictError:
+                pass
+            raise
+        self._reposition_file(old_path)
 
         task.source_file = str(new_path)
         task.line_number = start_line
         task.context = new_context
         self._last_written_line[task.id] = block[0]
         self._reposition_file(new_path)
+        return True
 
     def _write_dashboard(self):
         """Regenerate Dashboard.md from current task state.
@@ -896,6 +1128,35 @@ _CHECKBOX_RE = re.compile(r'^- \[(.)\]\s+(?:TODO\s+)?')
 _BODY_LINE_RE = re.compile(r'^\s+>\s?(.*)$')
 _BODY_INDENT = "    "
 
+_FENCE_RE = re.compile(r'^(```|~~~)')
+
+
+def _iter_lines_with_fence_state(lines: list[str]):
+    """Yield `(idx, in_fence)` for every line in `lines`. `in_fence` is True
+    for a line inside — or opening/closing — a ``` or ~~~ fenced code block.
+    A checkbox line inside a fence is documentation/example text, never a
+    real task: every scanner that walks task lines (`_reparse_lines`,
+    `_cas_insert_at_top`, `_find_task_block_span`, `_reposition_file`) skips
+    a line this marks `True` instead of handing it to `_match_task_block`.
+    """
+    in_fence = False
+    marker = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if in_fence:
+            yield idx, True
+            if stripped.startswith(marker):
+                in_fence = False
+                marker = None
+            continue
+        m = _FENCE_RE.match(stripped)
+        if m:
+            marker = m.group(1)
+            in_fence = True
+            yield idx, True
+        else:
+            yield idx, False
+
 
 def _format_task_line(task: Task) -> str:
     """Task → Dataview format markdown line."""
@@ -1031,9 +1292,14 @@ def _match_task_block(
 
 def _find_task_block_span(lines: list[str], task_id: str) -> Optional[tuple[int, int]]:
     """Return the `(start, end)` line span of the block carrying `task_id`'s
-    id comment, or None if not found."""
+    id comment, or None if not found. Skips lines inside a fenced code
+    block — an id comment there is example text, not a real task."""
+    fence = dict(_iter_lines_with_fence_state(lines))
     idx, n = 0, len(lines)
     while idx < n:
+        if fence.get(idx):
+            idx += 1
+            continue
         block = _match_task_block(lines, idx)
         if block is None:
             idx += 1

@@ -4,8 +4,6 @@ Tests for api/services/atomic_write.py
 The shared atomic-write helper used by both task_manager.py and
 scheduler_store.py: temp file in the same directory, fsync, os.replace.
 """
-import builtins
-import unittest.mock as mock
 import pytest
 from pathlib import Path
 
@@ -60,27 +58,30 @@ def test_atomic_write_uses_replace_with_temp_file_in_same_dir(tmp_path, monkeypa
     assert dst == str(target)
 
 
-def test_destination_is_never_opened_directly_for_writing(tmp_path):
-    """A reader opening `target` mid-write must see either the old content
-    in full or the new content in full — never a partial write. Proven here
-    by showing the destination path itself is never opened in a write mode;
-    only a temp file is, and the swap happens via a single os.replace."""
+def test_atomic_write_lines_leaves_destination_unchanged_on_replace_failure(tmp_path, monkeypatch):
+    """Same atomic-semantics proof as
+    `test_failed_replace_cleans_up_temp_file_and_leaves_original` below, for
+    `atomic_write_lines` specifically: if `os.replace` fails mid-write, the
+    destination keeps its old content in full and no temp file survives —
+    never a partial write. (The prior version of this test spied on
+    `builtins.open`, but `os.fdopen` routes through `io.open` regardless of
+    write path, so it passed even against a non-atomic `path.write_text` —
+    it proved nothing about atomicity.)"""
+    import api.services.atomic_write as aw
+
     target = tmp_path / "file.txt"
-    target.write_text("old", encoding="utf-8")
+    target.write_text("old\n", encoding="utf-8")
 
-    opened_for_write = []
-    original_open = builtins.open
+    def boom(src, dst):
+        raise OSError("simulated replace failure")
 
-    def spy_open(file, mode="r", *args, **kwargs):
-        if any(c in mode for c in ("w", "a", "x")):
-            opened_for_write.append(str(file))
-        return original_open(file, mode, *args, **kwargs)
+    monkeypatch.setattr(aw.os, "replace", boom)
 
-    with mock.patch("builtins.open", spy_open):
-        atomic_write_text(target, "new content")
+    with pytest.raises(OSError):
+        atomic_write_lines(target, ["new", "lines"])
 
-    assert str(target) not in opened_for_write
-    assert target.read_text(encoding="utf-8") == "new content"
+    assert target.read_text(encoding="utf-8") == "old\n"
+    assert list(tmp_path.glob(".*.tmp")) == []
 
 
 def test_failed_replace_cleans_up_temp_file_and_leaves_original(tmp_path, monkeypatch):

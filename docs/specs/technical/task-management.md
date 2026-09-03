@@ -58,6 +58,23 @@ plain `dict[str, str]`) and round-trips through any rewrite untouched,
 because `_format_task_line` re-emits `Task.fields` verbatim in the order it
 holds them (`:898-934`). No parser change is needed to add a new field.
 
+A checkbox line inside a fenced (` ``` ` or `~~~`) code block is never
+parsed as a task, even though `_CHECKBOX_RE` would otherwise match it — a
+line like `- [ ] example` in a documentation snippet is example text, not a
+real task. `_iter_lines_with_fence_state` toggles fence state on any line
+whose stripped text starts with a fence marker; every scanner that walks
+task lines (`_reparse_lines`, `_cas_insert_at_top`, `_find_task_block_span`,
+`_reposition_file`) skips a line it marks as fenced before handing it to
+`_match_task_block`.
+
+**Duplicate ids.** Two lines sharing the same `<!-- id:xxxx -->` comment
+(most often a hand-copied line) are not left to fight over that id forever.
+`_reparse_lines` keeps the first occurrence's id as-is; a later occurrence
+in the same file carrying an id already claimed earlier in the same parse
+is treated exactly like a line with no id comment at all — its
+stale/duplicated comment is replaced with a freshly minted one on that
+pass, and both lines are indexed under distinct ids from then on.
+
 ## Id write-back
 
 A checkbox line with no `<!-- id:xxxx -->` comment gets one minted
@@ -70,6 +87,43 @@ requires `TODO`: on the first reindex after this feature ships, every
 existing hand-written `- [ ]` checklist item in `LifeOS/Tasks/*.md` gets an
 id comment appended, once, and is indexed as a task from then on. That is
 the intended migration, not a bug.
+
+## Input validation
+
+`description`, `notes`, and `fields` are validated by
+`_validate_text_fields` before `create`/`update` do anything else, because
+they're interpolated directly into the checkbox line's text rather than
+going through a serializer that could escape them. Rejected (`ValueError`,
+mapped to HTTP 422 by `api/routes/tasks.py`) rather than silently
+sanitized, since truncating or stripping would save something other than
+what the caller sent:
+
+- A newline (`\n` or `\r`) in `description` or a `fields` value would split
+  the single checkbox line into two.
+- A `]` in `description` or a `fields` value would truncate an inline
+  field's closing bracket and leak the rest of the value into the
+  description (or the next field).
+- An HTML comment opener (`<!--`) anywhere in `description`, a `fields`
+  value, or a `notes` line could forge a new `<!-- id:.. -->`, hijacking
+  another task's id on the next reindex.
+- `notes` lines are allowed to be multi-line — that's their whole point —
+  but not `\r` (would desync the `\n`-joined body from what
+  `Task.notes.split("\n")` expects) or `<!--`.
+- A `fields` key must be a bare word (`^\w+$`), because `_format_task_line`
+  interpolates it directly as `[key:: value]`.
+- A `fields` key may not shadow a reserved key: any inline field with a
+  dedicated `Task` attribute (`due`, `priority`, `created`, `done`,
+  `cancelled`, `updated`) or `id` itself. Accepting one through the
+  free-form `fields` dict would let a caller write a second, conflicting
+  `[key:: value]` onto the line, or forge the id comment outright —
+  `fields={"updated": "SPOOFED"}` would otherwise write two `[updated::]`
+  fields and, after the next reindex re-parses the line, `updated_at` would
+  read back as `"SPOOFED"`.
+
+`status` is validated the same way, against `VALID_STATUSES` — an
+unrecognized status previously wrote a blank checkbox (the symbol lookup
+falls back to `todo`'s `" "`) and round-tripped as the invalid string until
+the next reindex silently flipped it back to `todo`.
 
 ## Id-addressed, compare-and-swap writes
 
@@ -93,11 +147,40 @@ The retry re-invokes the caller's `compute()` closure against the
 just-refreshed `self._tasks[task_id]`, so an `update()` retry re-applies the
 operator's requested changes on top of the latest known state rather than
 blindly overwriting it with stale data — the same "recompute, don't just
-retry the same bytes" discipline CAS requires anywhere.
+retry the same bytes" discipline CAS requires anywhere. `compute()` always
+builds a *new* `Task` from a copy of the current one rather than mutating it
+in place, so a losing attempt's edits are never visible through `get()` —
+`self._tasks[task_id]` is rebound only once a write actually succeeds.
+
+`_cas_rewrite` also checks, before calling `compute()`, whether the on-disk
+block already reflects an edit `reindex_file` hasn't absorbed yet — the raw
+line text no longer matches the last line the API wrote or saw for this id,
+or the on-disk notes body no longer matches the in-memory task's. This is
+the *normal* case for an edit that just landed, not a rare race: the
+watcher's 2s debounce means a `PUT` can easily arrive after an external
+edit has hit disk but before `reindex_file` has run. Without this check,
+`compute()` would build its replacement from the stale in-memory task and
+silently revert the edit — an operator retitling a task and adding a body
+line, followed a moment later by an unrelated `PUT` that only changes
+`priority`, would otherwise lose the retitle and the added line. On a
+mismatch the manager absorbs it via `reindex_file` and retries (counting
+toward `_CAS_MAX_RETRIES`), the same as an mtime conflict.
 
 `self._lock` is a `threading.RLock`, not a plain `Lock`: a CAS retry inside
 a lock-held mutating call re-enters `reindex_file`, which also takes the
 lock. A plain `Lock` would self-deadlock on the very first retry.
+
+**Context-change moves.** `update(..., context=...)` moves a task's block
+between files via `_move_task_between_files`. The destination insert
+happens *before* the source removal: if the destination's CAS insert
+raises, the source is untouched — the task never disappears. If the source
+removal then fails (a conflict there, after the destination insert already
+succeeded), the manager best-effort removes the just-inserted destination
+block before re-raising, rather than leaving the task duplicated in both
+files. If the task's block is no longer present in the source at all (an
+external delete raced the move), the move is treated like any other
+externally-deleted task — reconciled out of the index — rather than raising
+a conflict.
 
 ## Atomic writes
 
@@ -110,6 +193,19 @@ writing directly — only the temp file is, and the swap is one atomic
 rename. `scheduler_store.py` shares this same helper (its own writes had the
 same non-atomic gap; fixing it was a trivial swap with no behavior change,
 verified by the unchanged scheduler test suite).
+
+A task-file rewrite preserves the file's original line terminator (`\r\n`
+vs. `\n`) and whether it ended with a trailing terminator, rather than
+normalizing wholesale to `\n`-joined-plus-trailing-newline. Every call site
+that reads a task file for a possible rewrite (`reindex_file`,
+`rebuild_index`, `_cas_rewrite`, `_cas_insert_at_top`) uses
+`_read_lines_with_terminator`, which reads raw bytes (not `Path.read_text`,
+whose universal-newline translation would silently turn CRLF into LF before
+the terminator could even be inspected) and detects both properties; the
+matching write passes them through as `atomic_write_lines`'s `newline=`/
+`trailing_newline=` keyword arguments. `scheduler_store.py` never calls
+`atomic_write_lines` (it writes whole files via `atomic_write_text`), so
+these defaults don't change its behavior.
 
 ## Notes body
 
@@ -159,9 +255,26 @@ merge-forward already works from the existing JSON-cache-backed
 single running process — after a restart, whatever's on disk simply becomes
 the new baseline for comparison, and the in-memory `Task` always reflects
 the file's actual current content regardless of whether that reset happened.
-The cost of not persisting is purely cosmetic (one skipped `[updated::]`
+The cost of not persisting is usually cosmetic: one skipped `[updated::]`
 restamp immediately after a restart, for a task that was genuinely edited
-while the server was down) — never a correctness gap.
+while the server was down. It is a correctness gap in one specific,
+narrow case — a task's block is inside a fenced code block, or shares a
+duplicate id with another block, at the moment of a restart — where the
+in-memory bookkeeping that would otherwise have resolved it cleanly is
+reset along with everything else in `self._tasks`; the next parse simply
+treats it as a fresh id with no history, same as it would for any other
+process-lifetime-only piece of state. That's an accepted, bounded cost, not
+a claim that no correctness gap exists at all.
+
+`reindex_file`'s own write-back (minting an id, restamping an external
+edit) is itself CAS-protected on the file's mtime, the same discipline as
+`_cas_rewrite`: it re-reads and re-parses (bounded to `_CAS_MAX_RETRIES`
+attempts) if the file changed between its read and its write, rather than
+blindly overwriting whatever landed in between. On persistent conflict it
+logs a warning and skips the write for that pass instead of raising —
+`reindex_file` has no caller to hand a `TaskConflictError` to that would do
+anything useful with it, and the watcher will fire again for whatever
+caused the conflict.
 
 ## Compare-and-swap retry vs. field-level merge
 

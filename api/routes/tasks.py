@@ -215,6 +215,8 @@ async def create_task(request: CreateTaskRequest):
         )
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     return TaskResponse.from_task(task)
 
 
@@ -422,6 +424,8 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
         task = manager.update(task_id, **updates)
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return TaskResponse.from_task(task)

@@ -1093,6 +1093,82 @@ class TestReindexFile:
         retrieved = task_manager.get(task.id)
         assert retrieved is None
 
+    def test_external_edit_detection_survives_repeated_reindexes(self, task_manager):
+        """#853 round 1 finding #1: `reindex_file` used to pop
+        `_last_written_line` for every task whose `source_file` matched —
+        exactly the set it had just repopulated — which erased the record
+        `reindex_file` itself needs to detect the NEXT external edit. A
+        second consecutive external edit would then go undetected."""
+        task = task_manager.create("Edit twice", context="RepeatEdit")
+        file_path = task_manager.tasks_dir / "RepeatEdit.md"
+
+        content = file_path.read_text(encoding="utf-8")
+        file_path.write_text(content.replace("Edit twice", "First edit"), encoding="utf-8")
+        task_manager.reindex_file(str(file_path))
+        first = task_manager.get(task.id)
+        assert first.description == "First edit"
+        first_stamp = first.updated_at
+
+        content = file_path.read_text(encoding="utf-8")
+        file_path.write_text(content.replace("First edit", "Second edit"), encoding="utf-8")
+        task_manager.reindex_file(str(file_path))
+        second = task_manager.get(task.id)
+
+        assert second.description == "Second edit"
+        assert second.updated_at != first_stamp
+        assert f"[updated:: {second.updated_at}]" in file_path.read_text(encoding="utf-8")
+
+
+class TestReindexWriteBackCas:
+    """#853 round 1 finding #14: `reindex_file`'s own write-back (minting an
+    id, restamping an external edit) had no compare-and-swap check against a
+    write landing between its read and its write — a concurrent writer's
+    change could be silently lost."""
+
+    def test_single_mismatch_then_writes_id_back_on_retry(self, task_manager, monkeypatch):
+        file_path = task_manager.tasks_dir / "ReindexCas.md"
+        file_path.write_text("- [ ] TODO Buy milk\n", encoding="utf-8")
+
+        import api.services.task_manager as tm_mod
+        original_mtime = tm_mod._mtime_or_none
+        calls = {"n": 0}
+
+        def mismatch_once_then_real(path):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return 111  # first attempt's mtime_before
+            if calls["n"] == 2:
+                return 222  # first attempt's mtime_now -> forces a mismatch/retry
+            return original_mtime(path)  # every later call: the real, stable value
+
+        monkeypatch.setattr(tm_mod, "_mtime_or_none", mismatch_once_then_real)
+
+        task_manager.reindex_file(str(file_path))
+
+        content = file_path.read_text(encoding="utf-8")
+        assert re.search(r"<!-- id:\w+ -->", content), "id was never written back after the retry"
+
+    def test_persistent_mismatch_skips_write_logs_warning_no_exception(
+        self, task_manager, monkeypatch, caplog
+    ):
+        file_path = task_manager.tasks_dir / "ReindexCasPersistent.md"
+        original_content = "- [ ] TODO Buy milk\n"
+        file_path.write_text(original_content, encoding="utf-8")
+
+        import itertools
+        counter = itertools.count()
+        monkeypatch.setattr(
+            "api.services.task_manager._mtime_or_none",
+            lambda path: next(counter),
+        )
+
+        import logging
+        with caplog.at_level(logging.WARNING, logger="api.services.task_manager"):
+            task_manager.reindex_file(str(file_path))  # must not raise
+
+        assert file_path.read_text(encoding="utf-8") == original_content
+        assert any("conflict" in r.message.lower() for r in caplog.records)
+
 
 class TestRebuildIndex:
     """Tests for rebuild_index method."""
@@ -1386,13 +1462,21 @@ class TestIdWriteBack:
             "- [ ] Another hand-written item, no TODO keyword",
             "",
             "## Section 2",
+            "",
+            "Example syntax for the docs:",
+            "```markdown",
+            "- [ ] example checkbox inside a fence, not a real task",
+            "```",
+            "",
         ]
         file_path = task_manager.tasks_dir / "Mixed.md"
-        file_path.write_text("\n".join(lines_in) + "\n", encoding="utf-8")
+        original_bytes = ("\n".join(lines_in) + "\n").encode("utf-8")
+        file_path.write_bytes(original_bytes)
 
         task_manager.reindex_file(str(file_path))
 
-        lines_out = file_path.read_text(encoding="utf-8").splitlines()
+        out_bytes = file_path.read_bytes()
+        lines_out = out_bytes.decode("utf-8").splitlines()
         assert len(lines_out) == len(lines_in)
 
         task_line_idx = {10, 11, 12}
@@ -1400,6 +1484,11 @@ class TestIdWriteBack:
             if i in task_line_idx:
                 continue
             assert lines_out[i] == original, f"non-task line {i} changed: {lines_out[i]!r}"
+
+        # The fenced checkbox line (idx 18) is untouched byte-for-byte and
+        # never indexed as a task — #853 round 1 finding #7.
+        assert lines_out[18] == lines_in[18]
+        assert task_manager.list_tasks(query="example checkbox") == []
 
         # Already-id'd line: fully untouched.
         assert lines_out[11] == lines_in[11]
@@ -1411,9 +1500,112 @@ class TestIdWriteBack:
             suffix = lines_out[i][len(lines_in[i]):]
             assert re.fullmatch(r" <!-- id:\w+ -->", suffix), f"line {i} suffix: {suffix!r}"
 
-        # Idempotent — a second reindex makes no further change.
+        # Idempotent — a second reindex makes no further change, down to the
+        # raw bytes (trailing newline / line endings included).
         task_manager.reindex_file(str(file_path))
-        assert file_path.read_text(encoding="utf-8").splitlines() == lines_out
+        assert file_path.read_bytes() == out_bytes
+
+    def test_reindex_preserves_crlf_line_endings(self, task_manager):
+        """#853 round 1 finding #9: a CRLF file must not become LF wholesale
+        when an id gets written back."""
+        file_path = task_manager.tasks_dir / "Crlf.md"
+        original_bytes = b"# CRLF Tasks\r\n\r\n- [ ] TODO Buy milk\r\n"
+        file_path.write_bytes(original_bytes)
+
+        task_manager.reindex_file(str(file_path))
+
+        out_bytes = file_path.read_bytes()
+        assert out_bytes.endswith(b"\r\n")
+        # No bare LF was introduced — every newline is part of a CRLF pair.
+        assert out_bytes.count(b"\n") == out_bytes.count(b"\r\n")
+        lines_out = out_bytes.decode("utf-8").split("\r\n")
+        assert lines_out[0] == "# CRLF Tasks"
+        assert lines_out[1] == ""
+        assert re.fullmatch(r"- \[ \] TODO Buy milk <!-- id:\w+ -->", lines_out[2])
+        assert lines_out[3] == ""  # trailing terminator preserved
+
+    def test_reindex_preserves_missing_trailing_newline(self, task_manager):
+        """#853 round 1 finding #9: a file with no final newline must not
+        gain one just because an id got written back to one of its lines."""
+        file_path = task_manager.tasks_dir / "NoTrailingNewline.md"
+        content = "# No Trailing Newline\n\n- [ ] TODO Buy milk"
+        file_path.write_bytes(content.encode("utf-8"))
+        assert not file_path.read_bytes().endswith(b"\n")
+
+        task_manager.reindex_file(str(file_path))
+
+        out_bytes = file_path.read_bytes()
+        assert not out_bytes.endswith(b"\n")
+        out_text = out_bytes.decode("utf-8")
+        assert out_text.startswith("# No Trailing Newline\n\n- [ ] TODO Buy milk <!-- id:")
+
+
+class TestFencedCodeBlocks:
+    """#853 round 1 finding #7: a checkbox line inside a fenced (``` or
+    ~~~) code block is documentation/example text, never a real task."""
+
+    def test_create_inserts_above_first_real_task_not_inside_fence(self, task_manager):
+        file_path = task_manager.tasks_dir / "FenceInsert.md"
+        file_path.write_text(
+            "# Fence Insert\n\n"
+            "```markdown\n"
+            "- [ ] example, not a real task\n"
+            "```\n\n"
+            "- [ ] TODO Real task <!-- id:realtask1 -->\n",
+            encoding="utf-8",
+        )
+        task_manager.reindex_file(str(file_path))
+
+        task = task_manager.create("New task", context="FenceInsert")
+
+        content = file_path.read_text(encoding="utf-8")
+        lines = content.splitlines()
+        # The example checkbox inside the fence is unchanged and comes
+        # before the newly created task's line, which comes before "Real
+        # task" — the new task must not land inside the fence.
+        fence_idx = next(i for i, ln in enumerate(lines) if "example, not a real task" in ln)
+        new_task_idx = next(i for i, ln in enumerate(lines) if f"<!-- id:{task.id} -->" in ln)
+        real_task_idx = next(i for i, ln in enumerate(lines) if "realtask1" in ln)
+        assert fence_idx < new_task_idx < real_task_idx
+        assert lines[fence_idx] == "- [ ] example, not a real task"
+        assert task_manager.get("realtask1") is not None
+
+
+class TestDuplicateIds:
+    """#853 round 1 finding #8: two task lines sharing the same id comment
+    (e.g. a hand-copied line) must not fight over it forever."""
+
+    def test_duplicate_id_gets_a_fresh_id_and_both_are_indexed(self, task_manager):
+        file_path = task_manager.tasks_dir / "Dupes.md"
+        file_path.write_text(
+            "- [ ] TODO First copy <!-- id:dupe0001 -->\n"
+            "- [ ] TODO Second copy <!-- id:dupe0001 -->\n",
+            encoding="utf-8",
+        )
+
+        task_manager.reindex_file(str(file_path))
+
+        first = task_manager.get("dupe0001")
+        assert first is not None
+        assert first.description == "First copy"
+
+        content = file_path.read_text(encoding="utf-8")
+        lines = content.splitlines()
+        second_line = next(ln for ln in lines if "Second copy" in ln)
+        m = re.search(r"<!-- id:(\w+) -->", second_line)
+        assert m
+        second_id = m.group(1)
+        assert second_id != "dupe0001"
+        second = task_manager.get(second_id)
+        assert second is not None
+        assert second.description == "Second copy"
+        # Only one id comment on the rewritten line.
+        assert second_line.count("<!-- id:") == 1
+
+        # A second reindex makes no further change — bytes identical.
+        before = file_path.read_bytes()
+        task_manager.reindex_file(str(file_path))
+        assert file_path.read_bytes() == before
 
 
 class TestIdAddressedWrites:
@@ -1428,14 +1620,22 @@ class TestIdAddressedWrites:
         # Simulate an external edit landing before the watcher reindexes.
         content = file_path.read_text(encoding="utf-8")
         file_path.write_text("New line one\nNew line two\n" + content, encoding="utf-8")
+        before_lines = file_path.read_text(encoding="utf-8").splitlines()
+        task_a_idx = next(i for i, ln in enumerate(before_lines) if f"<!-- id:{task_a.id} -->" in ln)
 
         updated = task_manager.update(task_a.id, description="Task A updated")
 
         assert updated.description == "Task A updated"
-        final_content = file_path.read_text(encoding="utf-8")
-        assert "New line one" in final_content
-        assert "New line two" in final_content
-        assert re.search(r"- \[ \] TODO Task B \[", final_content), "task B's line was disturbed"
+        # #853 round 1 finding #16: every line except task A's own must be
+        # byte-identical before and after — not just spot-checked strings.
+        after_lines = file_path.read_text(encoding="utf-8").splitlines()
+        assert len(after_lines) == len(before_lines)
+        for i, before_line in enumerate(before_lines):
+            if i == task_a_idx:
+                continue
+            assert after_lines[i] == before_line, f"line {i} changed unexpectedly: {after_lines[i]!r}"
+        assert after_lines[task_a_idx] != before_lines[task_a_idx]
+        assert "Task A updated" in after_lines[task_a_idx]
 
 
 class TestNotesBody:
@@ -1449,13 +1649,22 @@ class TestNotesBody:
     def test_delete_removes_task_line_and_body(self, task_manager):
         task = task_manager.create("Delete with notes", context="NotesTest", notes="body line")
         file_path = task_manager.tasks_dir / "NotesTest.md"
+        before_lines = file_path.read_text(encoding="utf-8").splitlines()
         assert "body line" in file_path.read_text(encoding="utf-8")
+
+        task_line_idx = next(i for i, ln in enumerate(before_lines) if f"<!-- id:{task.id} -->" in ln)
+        body_end = task_line_idx + 1
+        while body_end < len(before_lines) and before_lines[body_end].lstrip().startswith(">"):
+            body_end += 1
+        # #853 round 1 finding #16: the remaining file must equal the
+        # fixture minus exactly the task's line and its body lines — not
+        # just "the description string is gone somewhere."
+        expected_lines = before_lines[:task_line_idx] + before_lines[body_end:]
 
         task_manager.delete(task.id)
 
-        content = file_path.read_text(encoding="utf-8")
-        assert "Delete with notes" not in content
-        assert "body line" not in content
+        after_lines = file_path.read_text(encoding="utf-8").splitlines()
+        assert after_lines == expected_lines
 
     def test_context_change_moves_notes_body_too(self, task_manager):
         task = task_manager.create("Move with notes", context="NotesA", notes="keep me")
@@ -1569,6 +1778,178 @@ class TestExternalEditWins:
         assert b_after.updated_at == b_stamp_before
 
 
+class TestCasRewriteAbsorbsUnreindexedExternalEdit:
+    """#853 round 1 finding #5: `_cas_rewrite` used to build its replacement
+    purely from `self._tasks`, so an external edit that had landed on disk
+    but not yet been through `reindex_file` (the normal case under the
+    watcher's 2s debounce, not a rare race) was silently reverted by an
+    unrelated field update."""
+
+    def test_update_preserves_unreindexed_external_retitle_and_body(self, task_manager):
+        task = task_manager.create("Original title", context="Absorb", notes="original body")
+        file_path = task_manager.tasks_dir / "Absorb.md"
+
+        content = file_path.read_text(encoding="utf-8")
+        content = content.replace("Original title", "Externally retitled")
+        content = content.replace(
+            "    > original body", "    > original body\n    > added externally"
+        )
+        file_path.write_text(content, encoding="utf-8")
+
+        updated = task_manager.update(task.id, priority="high")
+
+        assert updated.description == "Externally retitled"
+        assert updated.notes == "original body\nadded externally"
+        assert updated.priority == "high"
+        final_content = file_path.read_text(encoding="utf-8")
+        assert "Externally retitled" in final_content
+        assert "added externally" in final_content
+        assert "[priority:: high]" in final_content
+
+    def test_swap_tag_preserves_unreindexed_external_retitle(self, task_manager):
+        task = task_manager.create("Claim me", context="Absorb2", tags=["agent"])
+        file_path = task_manager.tasks_dir / "Absorb2.md"
+
+        content = file_path.read_text(encoding="utf-8")
+        file_path.write_text(content.replace("Claim me", "Retitled before claim"), encoding="utf-8")
+
+        ok = task_manager.swap_tag(task.id, "agent", "agent-running")
+
+        assert ok is True
+        refreshed = task_manager.get(task.id)
+        assert refreshed.description == "Retitled before claim"
+        assert refreshed.tags == ["agent-running"]
+        final_content = file_path.read_text(encoding="utf-8")
+        assert "Retitled before claim" in final_content
+        assert "#agent-running" in final_content
+
+
+class TestMoveTaskConflict:
+    """#853 round 1 finding #6: a context-change move used to remove the
+    block from the source file BEFORE inserting into the destination — if
+    the destination insert then raised, the task was in neither file while
+    the index still pointed at the source."""
+
+    def test_destination_conflict_leaves_task_in_source_only(self, task_manager, monkeypatch):
+        task = task_manager.create("Move me", context="MoveSrc", notes="keep this body")
+        source_path = task_manager.tasks_dir / "MoveSrc.md"
+        dest_path = task_manager.tasks_dir / "MoveDest.md"
+
+        import api.services.task_manager as tm_mod
+        original_mtime = tm_mod._mtime_or_none
+        dest_counter = {"n": 0}
+
+        def flaky_for_dest(path):
+            if Path(path) == dest_path:
+                dest_counter["n"] += 1
+                return dest_counter["n"]  # always different -> destination CAS never matches
+            return original_mtime(path)
+
+        monkeypatch.setattr(tm_mod, "_mtime_or_none", flaky_for_dest)
+
+        with pytest.raises(TaskConflictError):
+            task_manager.update(task.id, context="MoveDest")
+
+        source_content = source_path.read_text(encoding="utf-8")
+        assert "Move me" in source_content
+        assert "keep this body" in source_content
+        dest_content = dest_path.read_text(encoding="utf-8") if dest_path.exists() else ""
+        assert "Move me" not in dest_content
+        # Index still points at the source — not left dangling.
+        assert task_manager.get(task.id).context == "MoveSrc"
+
+
+class TestFieldValidation:
+    """#853 round 1 findings #2 and #3: description/notes/fields content
+    that would corrupt the task line's format, or a `fields` key that
+    shadows a reserved attribute (or the id comment), is rejected with
+    `ValueError` rather than silently corrupting the line or hijacking
+    another task's id."""
+
+    def test_create_rejects_newline_in_description(self, task_manager):
+        with pytest.raises(ValueError):
+            task_manager.create("Two\nlines", context="Validate")
+        assert task_manager.list_tasks(context="Validate") == []
+
+    def test_create_rejects_bracket_in_description(self, task_manager):
+        with pytest.raises(ValueError):
+            task_manager.create("Truncate me]", context="Validate")
+
+    def test_create_rejects_html_comment_opener_in_description(self, task_manager):
+        with pytest.raises(ValueError):
+            task_manager.create("Hijack <!-- id:other -->", context="Validate")
+
+    def test_create_rejects_newline_in_fields_value(self, task_manager):
+        with pytest.raises(ValueError):
+            task_manager.create("Field newline", context="Validate", fields={"host": "a\nb"})
+
+    def test_create_rejects_bracket_in_fields_value(self, task_manager):
+        with pytest.raises(ValueError):
+            task_manager.create("Field bracket", context="Validate", fields={"host": "a]b"})
+
+    def test_create_rejects_html_comment_in_fields_value(self, task_manager):
+        with pytest.raises(ValueError):
+            task_manager.create(
+                "Field hijack", context="Validate", fields={"host": "<!-- id:x -->"}
+            )
+
+    def test_create_rejects_spaced_fields_key(self, task_manager):
+        with pytest.raises(ValueError):
+            task_manager.create("Bad key", context="Validate", fields={"my key": "v"})
+
+    def test_create_rejects_reserved_fields_key(self, task_manager):
+        with pytest.raises(ValueError):
+            task_manager.create("Spoof updated", context="Validate", fields={"updated": "SPOOFED"})
+
+    def test_create_rejects_id_as_fields_key(self, task_manager):
+        with pytest.raises(ValueError):
+            task_manager.create("Spoof id", context="Validate", fields={"id": "hijacked"})
+
+    def test_create_rejects_carriage_return_in_notes(self, task_manager):
+        with pytest.raises(ValueError):
+            task_manager.create("Notes CR", context="Validate", notes="line\rbreak")
+
+    def test_create_rejects_html_comment_in_notes(self, task_manager):
+        with pytest.raises(ValueError):
+            task_manager.create("Notes hijack", context="Validate", notes="<!-- id:x -->")
+
+    def test_create_allows_multiline_notes(self, task_manager):
+        # Sanity: multi-line notes are the whole point of the field and
+        # must not be rejected by the same newline check used for description.
+        task = task_manager.create("Notes ok", context="Validate", notes="line one\nline two")
+        assert task.notes == "line one\nline two"
+
+    def test_update_rejects_hostile_fields_value(self, task_manager):
+        task = task_manager.create("To update", context="Validate")
+        with pytest.raises(ValueError):
+            task_manager.update(task.id, fields={"host": "bad]value"})
+        assert task_manager.get(task.id).fields == {}
+
+    def test_update_rejects_reserved_fields_key(self, task_manager):
+        task = task_manager.create("To update 2", context="Validate")
+        with pytest.raises(ValueError):
+            task_manager.update(task.id, fields={"priority": "spoofed"})
+        assert "priority" not in task_manager.get(task.id).fields
+
+
+class TestStatusValidation:
+    """#853 round 1 finding #11: `status` was accepted unchecked by the
+    manager — `status="Done"` silently wrote a `[ ]` (unrecognized symbol
+    falls back to a blank checkbox) and round-tripped as `Done` until the
+    next reindex flipped it back to `todo`."""
+
+    def test_create_rejects_unrecognized_status(self, task_manager):
+        with pytest.raises(ValueError):
+            task_manager.create("Bad status", status="Done")
+        assert task_manager.list_tasks(query="Bad status") == []
+
+    def test_update_rejects_unrecognized_status(self, task_manager):
+        task = task_manager.create("To update", context="StatusValidate")
+        with pytest.raises(ValueError):
+            task_manager.update(task.id, status="Done")
+        assert task_manager.get(task.id).status == "todo"
+
+
 class TestCasRetryAndConflict:
     def test_retries_three_times_then_raises_conflict(self, task_manager, monkeypatch):
         task = task_manager.create("CAS test", context="CasTest")
@@ -1594,10 +1975,85 @@ class TestCasRetryAndConflict:
 
         assert len(reindex_calls) == 3
 
+    def test_update_conflict_leaves_in_memory_task_unchanged(self, task_manager, monkeypatch):
+        """#853 round 1 finding #4: `update.apply()` used to mutate
+        `self._tasks[task_id]` in place via `setattr`, so even a losing CAS
+        attempt's edits were visible through `get()` — the file kept the old
+        description but memory had the new one. `compute()` must build a
+        new `Task` from a copy and `_cas_rewrite` must rebind
+        `self._tasks[task_id]` only on the success branch."""
+        task = task_manager.create("Original description", context="CasTest3")
+        file_path = task_manager.tasks_dir / "CasTest3.md"
+        before_content = file_path.read_text(encoding="utf-8")
+
+        import itertools
+        counter = itertools.count()
+        monkeypatch.setattr(
+            "api.services.task_manager._mtime_or_none",
+            lambda path: next(counter),
+        )
+
+        with pytest.raises(TaskConflictError):
+            task_manager.update(task.id, description="conflicting description")
+
+        assert task_manager.get(task.id).description == "Original description"
+        assert file_path.read_text(encoding="utf-8") == before_content
+
+    def test_swap_tag_conflict_leaves_in_memory_task_unchanged(self, task_manager, monkeypatch):
+        """#853 round 1 finding #4, swap_tag half: same in-place-mutation
+        bug in swap_tag's `compute()` closure — the index would show the new
+        tag while the vault still had the old one."""
+        task = task_manager.create("Swap conflict", context="CasTest4", tags=["agent"])
+        file_path = task_manager.tasks_dir / "CasTest4.md"
+        before_content = file_path.read_text(encoding="utf-8")
+
+        import itertools
+        counter = itertools.count()
+        monkeypatch.setattr(
+            "api.services.task_manager._mtime_or_none",
+            lambda path: next(counter),
+        )
+
+        with pytest.raises(TaskConflictError):
+            task_manager.swap_tag(task.id, "agent", "agent-running")
+
+        assert task_manager.get(task.id).tags == ["agent"]
+        assert file_path.read_text(encoding="utf-8") == before_content
+
     def test_no_retry_needed_in_the_normal_case(self, task_manager):
         task = task_manager.create("No conflict", context="CasTest2")
         updated = task_manager.update(task.id, description="updated fine")
         assert updated.description == "updated fine"
+
+
+class TestCreateCasRetryAndConflict:
+    """#853 round 1 finding #15: `_cas_insert_at_top` (the create path) had
+    no manager-level retry/conflict test — only a mocked-manager route test
+    (`test_create_task_conflict_is_409`)."""
+
+    def test_create_retries_three_times_then_raises_conflict(self, task_manager, monkeypatch):
+        import api.services.task_manager as tm_mod
+
+        call_count = {"n": 0}
+
+        def flaky_mtime(path):
+            call_count["n"] += 1
+            return call_count["n"]  # always different from the previous call
+
+        monkeypatch.setattr(tm_mod, "_mtime_or_none", flaky_mtime)
+
+        with pytest.raises(TaskConflictError):
+            task_manager.create("Conflict test", context="CreateCasTest")
+
+        # `_cas_insert_at_top` calls `_mtime_or_none` twice per attempt
+        # (before + now); `_CAS_MAX_RETRIES` retries means
+        # `_CAS_MAX_RETRIES + 1` attempts.
+        assert call_count["n"] == 2 * (tm_mod._CAS_MAX_RETRIES + 1)
+
+        file_path = task_manager.tasks_dir / "CreateCasTest.md"
+        content = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
+        assert "Conflict test" not in content
+        assert task_manager.list_tasks(query="Conflict test") == []
 
 
 class TestConflictFiles:
@@ -1640,6 +2096,12 @@ class TestConflictFiles:
         assert is_conflict_file(Path("Inbox.sync-conflict-20260101-120000-ABCDEFG.md"))
         assert is_conflict_file(Path(".syncthing.Inbox.md.tmp"))
         assert not is_conflict_file(Path("Inbox.md"))
+
+    def test_is_conflict_file_matches_any_suffix_after_the_marker(self):
+        """#853 round 1 finding #10: the criterion is `*.sync-conflict-*`,
+        not Syncthing's own `-YYYYMMDD-HHMMSS-DEVICEID` timestamp format —
+        match the substring regardless of what follows it."""
+        assert is_conflict_file(Path("Inbox.sync-conflict-foo.md"))
 
 
 class TestUpdatedStamp:
@@ -1685,6 +2147,12 @@ class TestAtomicWriteIntegration:
         assert len(calls) >= 1
         for src, dst in calls:
             assert Path(src).parent == Path(dst).parent
+        # #853 round 1 finding #16: the task markdown file itself must be
+        # among the atomically-written destinations, not just "some file
+        # was written via os.replace" (the index write alone satisfies the
+        # old assertion).
+        task_file = str(task_manager.tasks_dir / "Atomic.md")
+        assert task_file in [dst for _, dst in calls], "task markdown file was never atomically written"
 
     def test_no_leftover_temp_files_after_write(self, task_manager):
         task_manager.create("No leftovers", context="Atomic2")

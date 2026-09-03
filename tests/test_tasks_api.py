@@ -134,6 +134,28 @@ class TestTasksAPI:
         response = client.post("/api/tasks", json={"description": "Pull 1099 from Schwab"})
         assert response.status_code == 409
 
+    def test_create_task_hostile_field_value_is_422(self, client, mock_task_manager):
+        """#853 round 1 finding #2: a `ValueError` from `TaskManager.create`
+        (hostile description/notes/fields content) maps to 422, not an
+        unhandled 500."""
+        mock_task_manager.create.side_effect = ValueError("description must not contain '\\n'")
+        response = client.post("/api/tasks", json={"description": "Pull 1099 from Schwab"})
+        assert response.status_code == 422
+        assert "must not contain" in response.json()["detail"]
+
+    def test_create_task_reserved_field_key_is_422(self, client, mock_task_manager):
+        """#853 round 1 finding #3: a reserved `fields` key (e.g. `updated`)
+        maps to 422."""
+        mock_task_manager.create.side_effect = ValueError(
+            "'updated' is a reserved field and cannot be set via fields"
+        )
+        response = client.post("/api/tasks", json={
+            "description": "Pull 1099 from Schwab",
+            "fields": {"updated": "SPOOFED"},
+        })
+        assert response.status_code == 422
+        assert "reserved" in response.json()["detail"]
+
     # --- DRY RUN (#138) ---
 
     def test_dry_run_with_agent_tag_returns_preflight_preview(self, client, mock_task_manager):
@@ -350,6 +372,14 @@ class TestTasksAPI:
         mock_task_manager.update.side_effect = TaskConflictError("too many conflicting writes")
         response = client.put("/api/tasks/abc12345", json={"priority": "high"})
         assert response.status_code == 409
+
+    def test_update_task_hostile_field_value_is_422(self, client, mock_task_manager):
+        """#853 round 1 finding #2: a `ValueError` from `TaskManager.update`
+        maps to 422, not an unhandled 500."""
+        mock_task_manager.update.side_effect = ValueError("fields['x'] must not contain ']'")
+        response = client.put("/api/tasks/abc12345", json={"fields": {"x": "bad]value"}})
+        assert response.status_code == 422
+        assert "must not contain" in response.json()["detail"]
 
     # --- COMPLETE ---
 
