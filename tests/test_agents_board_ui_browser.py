@@ -45,6 +45,12 @@ _MODEL_CATALOG = {
     "stale": False,
 }
 
+# Assignee-name tags board.js's own drawer strips/re-adds on an assignee
+# change (web/agents/board.js ASSIGNEES) — used by the lane stub below to
+# mirror plan_lane_move's tag bookkeeping on a drawer-driven assign (#859
+# review round 2 finding 1).
+_ASSIGNEE_TAGS = {"me", "claude", "codex", "hermes", "local"}
+
 
 class _AgentsHandler(http.server.SimpleHTTPRequestHandler):
     """Serves the agents board the way api/main.py does: `/agents` is
@@ -257,6 +263,20 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                 # round-3 finding 2a).
                 landed = lane_response.pop(0) if lane_response else body.get("lane")
                 _move_card_in_state(board_state, lane_match.group(1), landed)
+                # Mirror plan_lane_move's assignee bookkeeping: the drawer's
+                # assignee select PUTs `assignee` alongside `lane` (#859
+                # review round 2 finding 1) — a drag move omits the key
+                # entirely, so key on `"assignee" in body`, not truthiness,
+                # and also clear on an explicit move to unassigned.
+                if "assignee" in body or body.get("lane") == "unassigned":
+                    assignee = body.get("assignee")
+                    for cards in board_state["lanes"].values():
+                        for card in cards:
+                            if card["id"] != lane_match.group(1):
+                                continue
+                            others = [t for t in card.get("tags", []) if t.lower() not in _ASSIGNEE_TAGS]
+                            card["assignee"] = assignee or None
+                            card["tags"] = ([assignee] if assignee else []) + others
                 route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": lane_match.group(1), "lane": landed}))
             else:
                 route.fulfill(status=code, content_type="application/json", body=json.dumps({"detail": "boom"}))
@@ -903,6 +923,27 @@ class TestAssignmentPickers:
         expect(assignment.locator('[data-row="model"]')).to_be_hidden()
         expect(assignment.locator('[data-row="effort"]')).to_be_hidden()
         expect(assignment.locator('[data-row="host"]')).to_be_hidden()
+
+    def test_assignee_change_with_focus_held_remounts_pickers_and_open(self, page: Page, agents_base_url):
+        """#859 review round 1 finding 1: a native <select> keeps focus
+        after firing `change`, so `updateOpenDrawer`'s `!focused` check
+        would otherwise skip the rebuild and leave the pickers/Open button
+        hidden until focus later left the drawer. board.js's assignee
+        handler must re-render explicitly on its success path
+        (web/agents/board.js ~L649-657) — drive the select directly (no
+        `select_option`, which itself blurs) and assert with no click
+        outside the drawer."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.locator(".drawer-title")).to_have_value("Investigate outage")
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'claude'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        expect(page.locator(".drawer-assignment [data-row='model']")).to_be_visible()
+        expect(page.locator(".drawer-assignment [data-row='model']")).to_have_count(1)
+        expect(page.get_by_role("button", name="Open")).to_be_visible()
+        expect(page.get_by_role("button", name="Open")).to_have_count(1)
 
     def test_changing_model_writes_exactly_one_fields_put(self, page: Page, agents_base_url):
         task_puts = []
