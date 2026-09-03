@@ -134,6 +134,20 @@ Asked "what's waiting on me", the orchestrator lists open cards with
 conversation, subject to the same "never file work you can do yourself"
 rule as every other agent.
 
+## In the morning briefing
+
+The **Morning Briefing** proactive reminder's prompt
+(`scripts/seed_proactive_reminders.py`'s `MORNING_BRIEFING_PROMPT`) has a
+**Waiting on You** section instructing the orchestrator to call
+`manage_human_queue` (action `list`) and report cards with `age_hours` of
+24 or more, skipping the section when there are none.
+
+If your Morning Briefing scheduler entry was seeded before this section
+existed, it won't pick up the change on its own — either add a **Waiting on
+You** paragraph like the one above to that entry by hand, or re-run
+`scripts/seed_proactive_reminders.py --force` to reseed it from the current
+prompt.
+
 ## Related Documents
 
 ### Specifications

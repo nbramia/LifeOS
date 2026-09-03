@@ -259,22 +259,3 @@ class TestListOpenCards:
 
     def test_list_empty(self, tm):
         assert human_queue.list_open_cards() == []
-
-
-class TestOpenCardsOlderThan:
-    def test_fresh_card_not_older_than_24h(self, tm):
-        human_queue.add_card(title="Fresh")
-        assert human_queue.open_cards_older_than(24) == []
-
-    def test_backdated_card_is_older_than_threshold(self, tm):
-        task = human_queue.add_card(title="Old")
-        from datetime import datetime, timedelta, timezone
-        backdated = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
-        # Directly backdate updated_at via the manager's in-memory state to
-        # simulate a card that's been open for two days — TaskManager always
-        # stamps `updated_at` to "now" on create/update, so there's no public
-        # API to file a pre-aged card.
-        tm._tasks[task.id].updated_at = backdated
-        old = human_queue.open_cards_older_than(24)
-        assert len(old) == 1
-        assert old[0]["id"] == task.id

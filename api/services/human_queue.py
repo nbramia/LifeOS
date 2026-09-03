@@ -4,11 +4,12 @@ A human-queue card is a task (`api/services/task_manager.py`) with tag
 `human` and status `blocked` ("open"). This module is the single place that
 knows the card shape (`fields`: `key`, `source_host`, `source_cwd`,
 `source_session`, `done_when`) and its dedupe/resolve rules, so the REST
-routes (`api/routes/tasks.py`), the native chat tool (`api/services/
-agent_tools.py`), and the morning-briefing line (`api/services/briefings.py`)
-all agree on it. The worker's `done_when` poll tick
-(`api/services/agent_worker/worker.py`) talks to this queue over the HTTP
-API instead — see that module for why.
+routes (`api/routes/tasks.py`) and the native chat tool (`api/services/
+agent_tools.py`) both agree on it. The morning briefing surfaces open cards
+by calling the native chat tool's `list` action directly, the same way
+`/chat` does, rather than through a helper here. The worker's `done_when`
+poll tick (`api/services/agent_worker/worker.py`) talks to this queue over
+the HTTP API instead — see that module for why.
 
 `done_when` is stored as a compact JSON string in the `done_when` field
 (fields values may not contain a newline or `<!--`, but JSON free of those
@@ -269,8 +270,3 @@ def list_open_cards() -> list[dict]:
     manager = get_task_manager()
     now = datetime.now(timezone.utc)
     return [_card_to_dict(t, now) for t in manager.list_tasks(tag=TAG, status=STATUS_OPEN)]
-
-
-def open_cards_older_than(hours: float = 24) -> list[dict]:
-    """Open cards whose age (see `_age_hours`) is at least `hours`."""
-    return [c for c in list_open_cards() if c["age_hours"] is not None and c["age_hours"] >= hours]
