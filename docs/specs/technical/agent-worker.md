@@ -18,15 +18,16 @@ Engineering view of the agent worker — the stand-alone process that consumes `
 6. [Preflight](#preflight)
 7. [Local executor (Gemma path)](#local-executor-gemma-path)
 8. [Managed executor (Claude path)](#managed-executor-claude-path)
-9. [System prompts](#system-prompts)
-10. [Inter-agent coordination](#inter-agent-coordination)
-11. [Budget enforcement](#budget-enforcement)
-12. [Restart resumability](#restart-resumability)
-13. [Telegram clarification flow](#telegram-clarification-flow)
-14. [Transcripts](#transcripts)
-15. [Agent Output notes](#agent-output-notes)
-16. [Configuration surface](#configuration-surface)
-17. [Related Documents](#related-documents)
+9. [Card assignment (#851)](#card-assignment-851)
+10. [System prompts](#system-prompts)
+11. [Inter-agent coordination](#inter-agent-coordination)
+12. [Budget enforcement](#budget-enforcement)
+13. [Restart resumability](#restart-resumability)
+14. [Telegram clarification flow](#telegram-clarification-flow)
+15. [Transcripts](#transcripts)
+16. [Agent Output notes](#agent-output-notes)
+17. [Configuration surface](#configuration-surface)
+18. [Related Documents](#related-documents)
 
 ---
 
@@ -102,7 +103,7 @@ One row per agent session (1:1 with a claimed task, or a root-spawned operator s
 | `task_id` (PK) | The `#agent` task this session was claimed from (or a synthetic id for operator sessions). |
 | `session_id` (UNIQUE) | Internal session identifier used for inter-agent addressing, transcripts, etc. |
 | `status` | One of `claimed`, `running`, `yielded`, `completed`, `failed`, `budget_exceeded`, `blocked`. |
-| `routing` | `local`, `claude`, `claude_code`, `codex`, or `ask` — which executor runs the session. |
+| `routing` | `local`, `claude`, `claude_code`, `codex`, `hermes`, or `ask` — which executor runs the session. |
 | `budget_json` | JSON-encoded budget (dollars / wall-clock / tokens) set at preflight. |
 | `started_at`, `last_activity_at` | Unix epoch seconds. |
 | `total_input_tokens`, `total_output_tokens` | Accumulated token counts. |
@@ -119,6 +120,10 @@ One row per agent session (1:1 with a claimed task, or a root-spawned operator s
 | `claude_code_model` | Claude tier for `routing="claude_code"` (`haiku`/`sonnet`/`opus`); NULL falls back to the CLI's own default (`opus`). |
 | `bot` | Telegram bot that owns this session's notices; NULL = primary bot (#348). |
 | `unpriced` | Sticky flag: set once any turn was priced against a model `pricing.py` doesn't recognize, so a reader can tell "$0.00 total" apart from "some turns couldn't be priced" (#669). |
+| `host` | Board-assigned host name from `settings.agent_hosts` (#851); NULL/`""` = this API host. Read by the `claude_code`/`codex` executors to decide whether to spawn locally or wrap the argv in `ssh`. |
+| `model`, `effort` | Board-assigned model id and effort level (`low`/`medium`/`high`/`max`, #851), threaded into the executor's argv — see [Card assignment](#card-assignment-851) below. Distinct from `claude_code_model`, which predates this and is set by `lifeos_agent_spawn`'s `tier` argument, not the board. |
+| `conversation_id` | Hermes conversation id (#851, `routing="hermes"` only) — set by `HermesExecutor` once the turn's `conversation_id` SSE event arrives, and what a card's `session.open_url` points `/chat?conversation=` at. |
+| `remote_pgid` | Process-group id a remote-spawned subprocess echoed back on its first stdout line (#851) — see [Host registry and ssh spawn](#host-registry-and-ssh-spawn-851). Used by the operator kill endpoint to reach the process over ssh; NULL for a local session. |
 
 Indexed on `status`, `parent_session_id`, `root_session_id`, and (partial index) `status = 'yielded'`.
 
@@ -375,6 +380,50 @@ The Managed Agents API emits `session.error` events at session-start for any MCP
 
 ---
 
+## Card assignment (#851)
+
+A Kanban card assigns a task to an engine (an assignee tag — `#claude`, `#codex`, `#local`, `#hermes`), a model, an effort level, and a host, written as `[key:: value]` inline fields (`model`, `effort`, `host`, `assigned_by` — round-tripped verbatim by `Task.fields`, see [task-management.md](task-management.md)). `assignment.py`'s `extract_assignment()` reads those four fields; `worker.py`'s `_dispatch()` calls it right after preflight and records `host`/`model`/`effort` onto the session row before any executor runs (`SessionStore.set_assignment`) — the same place `claude_code_model` has always been set.
+
+### Effort mapping
+
+The board's own effort vocabulary is exactly `low | medium | high | max`. Each engine speaks a different vocabulary — `assignment.py`'s `map_effort_for_engine()` translates once, in one place:
+
+| Board effort | Claude Code (`--effort`) | Codex (`-c model_reasoning_effort=`) | Local Gemma | Hermes |
+|---|---|---|---|---|
+| `low` | `low` | `low` | thinking off | no override |
+| `medium` | `medium` | `medium` | thinking off | no override |
+| `high` | `high` | `high` | thinking on | no override |
+| `max` | `max` | `xhigh` | thinking on | no override |
+| unset | CLI default | CLI's own config | `settings.local_agent_enable_thinking` | Hermes reports its own model |
+
+Local Gemma's thinking toggle is a per-SESSION override (`local_executor.py`'s `_call_llm(session_id, effort=...)`), not a mutation of the global `settings.local_agent_enable_thinking` — concurrent sessions with different assigned efforts would otherwise race each other over one process-wide flag. It only ever reaches a real `LocalLLMClient` on the local (not #809 remote-forced) route, mirroring `run_agent_loop`'s identical `isinstance(...) and not force_remote` gate — the remote OpenAI-compatible provider doesn't understand llama-server's `chat_template_kwargs` switch.
+
+### Host registry and ssh spawn (#851)
+
+`LIFEOS_AGENT_HOSTS` (`{name: ssh_target}`, e.g. `{"laptop": "user@laptop.example"}`) maps a board-facing host name to an ssh target. `remote_spawn.py` is the shared mechanism:
+
+- `resolve_host_target(host, api_host_name)` — empty/unset `host`, or a match on this API's own hostname, means local (returns `None`, the existing `spawn_fn` seam runs unchanged). Anything else must be a registry key or `resolve_host_target` raises `HostResolutionError` — the executor fails the task closed (`#agent-failed`, reason naming the host) **without ever calling `spawn_fn`**.
+- `build_remote_argv(argv, target, unset_env_names)` — wraps the exact local argv into `ssh -o BatchMode=yes -o ConnectTimeout=<setting> <target> -- <remote command>`. The remote command unsets every credential name `_clean_env` strips locally (mirrored via `env_names_matching_prefixes`, applied to the remote command's `env -u` prefix instead of the local Popen `env=` kwarg), then wraps the whole thing in `setsid bash -c 'echo "PGID:$$"; exec "$@"' _ …` so the remote process group id is captured as the very first stdout line. The executor strips that line (`read_remote_pgid_line`) before the normal event-stream parsing begins, and persists it via `SessionStore.set_remote_pgid`.
+- The Popen call site itself is untouched by any of this — only `cmd` (built beforehand) and the local `_clean_env()`-sourced `env=` differ between the local and remote branches, which is what keeps the injection seam (`spawn_fn`/`binary_resolver`) a pure test seam rather than something remote spawn has to special-case.
+- Kill: `POST /sessions/{id}/kill` on a session whose `host` is set runs `ssh <target> kill -- -<pgid>` through an injectable runner (`remote_spawn.kill_remote_process_group`) instead of the local `os.killpg` — see `inter_agent.py`'s `_kill_remote_subprocess`. An unregistered host degrades to a DB-only kill, the same way a missing local pid event does.
+- Resume/focus (`api/routes/agents.py`): a session whose `cli_sessions.host` names a registered host runs the same rendered launcher template over ssh (`remote_spawn.build_remote_launcher_argv` — no pgid capture, no credential stripping; a launcher is a short-lived terminal spawner, not the long-running CLI session). Its cwd comes from the `cli_sessions` row (populated by the remote host's own hook post, #849) rather than a local transcript-file scan, which a remote session's files were never going to satisfy. `/focus` has no cross-host pane registry to activate an existing pane against (the `cc_wezterm_store` mapping is only ever written for a session that ran on THIS API host), so for a remote session it runs the same launcher `/resume` does and returns `/focus`'s response shape.
+
+**macOS FDA limitation (documented, not solved):** Apple-data tasks (iMessage, Photos, Contacts) require Full Disk Access, which is granted per-app to the process that launched a session — not something an ssh-spawned remote process can inherit. Assigning an Apple-data task to a remote macOS host over this mechanism will not have FDA; the Apple Data Agent's own export/import pipeline ([operations.md](../../guides/operations.md)) remains the supported path for cross-machine Apple data.
+
+### Hermes route
+
+`ROUTE_HERMES = "hermes"` (`preflight.py`) is a new tag-only route — like `claude_code`/`codex`, preflight's own classifier JSON schema never emits it; `#hermes` in `_apply_tag_overrides` sets it. `HermesExecutor` (`hermes_executor.py`) reuses `hermes_proxy._build_envelope` (persona/turn-context resolution) and `_HermesTurnPersister` (conversation + usage persistence) so a board-assigned Hermes turn's rows are indistinguishable from one that came through `/chat` — three small read accessors (`conversation_id`, `content_text`, `done_seen`) were added to that class for this reuse. Runs synchronously on the worker's tick thread (a bounded HTTP round trip, not a long-lived subprocess — unlike the CLI routes, which run off-tick through the CLI dispatch pool). The card's prompt is `task["description"]` plus `task["notes"]`, if any. On completion the session row stores `conversation_id`; the card's `session.open_url` becomes `/chat?conversation=<id>` — `web/chat/main.js` reads that query param on boot (after the backend restore settles) and opens the thread, purely additive to the SSE contract in [client-surfaces.md](client-surfaces.md).
+
+### Board open (#851)
+
+`POST /api/agents/board/cards/{id}/open` (`api/routes/agent_assignment.py` — a new router sharing the `/api/agents` prefix with `agents.py` rather than appending to that file, so this issue and the concurrent Kanban board UI issue touch different files) requires the card to be in Assigned state: `status == "todo"`, a recognized assignee tag, and no running session (worker-dispatched or a prior interactive open) already against it. `claude`/`codex` spawn the interactive CLI in a terminal — reusing the `cc_resume_cmd`/`codex_resume_cmd` launcher templates, with `{inner_command}` rendered as a fresh `env LIFEOS_TASK_ID=<id> claude|codex "<prompt>"` invocation rather than a `--resume <id>`. `scripts/lifeos-agent-hook.sh` already forwards `$LIFEOS_TASK_ID` as `task_id` on every lifecycle event it posts (#849); `POST /cli-sessions/events` now moves a `task_id`-bearing `session_start`'s card from `todo` to `in_progress` — the one piece #849 didn't need, since nothing produced a task-linked interactive session until this endpoint did. `hermes` has no terminal to spawn — returns `{open_url: "/chat?conversation=<id>"}` once the card has one, else 409.
+
+### Model catalog (#851)
+
+`GET /api/agents/models` (`model_catalog.py`) returns `{engines: {claude, codex, local, hermes}, refreshed_at, stale}`, each engine's list merged with `pricing.PRICING`. Sources: Anthropic via the SDK's own `models.list()` (never a hand-maintained table — that's exactly what went stale in `pricing.py` before #655/#656); Codex via its own `~/.codex/models_cache.json`, falling back to a live OpenAI models list only when `LIFEOS_OPENAI_API_KEY` is set; local via the running llama-server's `/v1/models` (`model_readout._probe_live_model`); Hermes via the last observed turn's model (`model_readout.get_hermes_models`) — never probed, since Hermes can serve a different model per turn. Cached for `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` (default 24h); a refresh failure (any single engine's fetch raising) falls back to the last successful catalog with `stale: true` rather than 500ing the picker.
+
+---
+
 ## System prompts
 
 All four model-facing prompts are structured per [Anthropic's Claude 4.6/4.7 prompt-engineering best practices](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices) — XML section tags, positive framing, explicit final-summary requirement after tool use.
@@ -550,6 +599,7 @@ Full reference in [`agent-worker-setup.md`](../../guides/agent-worker-setup.md).
 | MCP HTTP transport | `LIFEOS_MCP_HTTP_URL`, `LIFEOS_MCP_BEARER_TOKEN`, `LIFEOS_MCP_HTTP_HOST`, `LIFEOS_MCP_HTTP_PORT` |
 | Inter-agent caps | `LIFEOS_AGENT_MAX_SPAWN_DEPTH`, `LIFEOS_AGENT_MAX_DESCENDANTS_PER_ROOT`, `LIFEOS_AGENT_MAX_CONCURRENT_LOCAL`, `LIFEOS_AGENT_MAX_CONCURRENT_MANAGED` |
 | Telegram clarifications | `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` |
+| Card assignment (#851) | `LIFEOS_AGENT_HOSTS`, `LIFEOS_AGENT_SSH_CONNECT_TIMEOUT`, `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS`, `LIFEOS_CODEX_MODELS_CACHE_PATH`, `LIFEOS_OPENAI_API_KEY` |
 
 ---
 
@@ -566,3 +616,4 @@ Full reference in [`agent-worker-setup.md`](../../guides/agent-worker-setup.md).
 - [API Reference](../product/api-reference.md) — Task endpoints the worker uses (`/api/tasks/{id}/swap-tag`, `/api/tasks/{id}/complete`)
 - [Architecture](architecture.md) — Where the worker fits in the broader code structure
 - [Observability](observability.md) — Tracing, perf, and logging patterns the worker uses
+- [Client Surfaces](client-surfaces.md) — The `/chat` SSE contract the `?conversation=` deep link (#851) is additive to

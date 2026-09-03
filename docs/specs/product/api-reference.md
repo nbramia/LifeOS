@@ -31,7 +31,8 @@ Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Thr
 15. [Job Queue Endpoints](#job-queue-endpoints)
 16. [Performance Trace Endpoints](#performance-trace-endpoints)
 17. [Admin Endpoints](#admin-endpoints)
-18. [MCP Tools — see mcp-tools.md](mcp-tools.md)
+18. [Card Assignment Endpoints](#card-assignment-endpoints-851)
+19. [MCP Tools — see mcp-tools.md](mcp-tools.md)
 
 ---
 
@@ -1026,6 +1027,19 @@ Get usage summary with stats for 24h, 7d, 30d, and all-time. Includes daily cost
 
 ---
 
+## Card Assignment Endpoints (#851)
+
+Card kill/resume/focus/registration endpoints are documented in [agent-viz.md § Endpoints](../technical/agent-viz.md#endpoints) alongside the rest of the `/agents` operator-control surface, per item 6 of this file's Table of Contents. These two are new to this issue and don't fit that page's visualization framing, so they're listed here instead — full mechanism in [agent-worker.md § Card assignment](../technical/agent-worker.md#card-assignment-851).
+
+### GET /api/agents/models
+
+Per-engine model catalog for the board's assignment pickers: `{engines: {claude: [...], codex: [...], local: [...], hermes: [...]}, refreshed_at, stale}`, each entry `{id, label, pricing}`. Cached for `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` (default 24h); `stale: true` means the last successful refresh, not this one, is being served.
+
+### POST /api/agents/board/cards/{id}/open
+
+Open an Assigned card (`status == "todo"`, a recognized assignee tag, no session already running against it) — `409` otherwise. `claude`/`codex` spawn the interactive CLI in a terminal (local, or over ssh for a registered `host` field), seeded with the card's title/notes and `LIFEOS_TASK_ID` in the environment; `hermes` returns `{open_url: "/chat?conversation=<id>"}` once the card has a Hermes conversation, else `409`.
+
+---
 
 ## Related Documents
 

@@ -231,3 +231,4 @@ value dressed up as confirmed-live.
 - [Troubleshooting](troubleshooting.md) — General operational troubleshooting
 - [Scripts Reference](scripts.md) — `auto-deploy.sh` / `auto-update-macos.sh` / `setup-launchd.sh` usage and flags
 - [Human Queue](human-queue.md) — Auto-filed `monarch-reauth` card on an expired/missing session
+- [Agent Worker Setup](agent-worker-setup.md#card-assignment-running-a-card-on-another-machine-851) — Remote-host card assignment over ssh, and why it can't reach Apple-data tasks (the FDA limitation this doc's section above documents)
