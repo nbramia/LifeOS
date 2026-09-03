@@ -87,6 +87,36 @@ class TestManageTasksCreate:
         assert len(tasks) == 1
         assert tasks[0].context == "Inbox"
 
+    def test_create_forwards_status_notes_fields(self, tm):
+        """#853: status/notes/fields are threaded through the chat tool too."""
+        _tool_manage_tasks({
+            "action": "create",
+            "description": "Waiting on legal",
+            "status": "blocked",
+            "notes": "chased on Monday",
+            "fields": {"host": "laptop"},
+        })
+        tasks = tm.list_tasks()
+        assert len(tasks) == 1
+        assert tasks[0].status == "blocked"
+        assert tasks[0].notes == "chased on Monday"
+        assert tasks[0].fields == {"host": "laptop"}
+
+
+class TestManageTasksUpdateNotesAndFields:
+    def test_update_notes(self, tm):
+        task = tm.create("Plan launch")
+        _tool_manage_tasks({"action": "update", "task_id": task.id, "notes": "draft outline"})
+        assert tm.get(task.id).notes == "draft outline"
+
+    def test_update_fields_merges_and_removes(self, tm):
+        task = tm.create("Plan launch", fields={"host": "laptop"})
+        _tool_manage_tasks({
+            "action": "update", "task_id": task.id,
+            "fields": {"host": None, "effort": "high"},
+        })
+        assert tm.get(task.id).fields == {"effort": "high"}
+
 
 class TestUnknownAction:
     def test_unknown_action(self, tm):

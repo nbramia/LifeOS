@@ -13,6 +13,7 @@ This directory contains technical specifications — how the system is built fro
 - `scheduler.md` — Scheduler internals (markdown source of truth + index cache, round-trip, watcher reindex, firing/dispatch)
 - `search-indexing.md` — Hybrid search internals (vector + BM25 fusion, embedding pipeline integration)
 - `security-privacy.md` — Auth, network exposure, data-at-rest, privacy invariants
+- `task-management.md` — Task store internals (id-addressed CAS writes, notes body, external-edit detection, conflict-file handling)
 
 ## Key Principles
 

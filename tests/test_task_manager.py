@@ -5,6 +5,7 @@ Tests task CRUD operations, status transitions, context changes, fuzzy search,
 parse/format round-trip, reindexing, and persistence.
 """
 import json
+import re
 import pytest
 from datetime import date
 from pathlib import Path
@@ -12,12 +13,15 @@ from pathlib import Path
 from api.services.task_manager import (
     Task,
     TaskManager,
+    TaskConflictError,
     STATUS_TO_SYMBOL,
     SYMBOL_TO_STATUS,
     VALID_STATUSES,
     _format_task_line,
+    _format_task_block,
     _parse_task_line,
     _fuzzy_filter,
+    is_conflict_file,
 )
 
 pytestmark = pytest.mark.unit
@@ -799,13 +803,28 @@ class TestParseTaskLine:
 
         assert task is None
 
-    def test_parse_checkbox_without_todo_keyword_returns_none(self):
-        """Test that checkbox without TODO keyword returns None."""
+    def test_parse_checkbox_without_todo_keyword_still_parses(self):
+        """#853: the literal TODO keyword is no longer required to parse a
+        checkbox line as a task — any `- [.] ...` line counts, so a hand-
+        written checklist item gets an id comment written back on reindex
+        instead of being silently ignored forever. (This intentionally
+        replaces the old test_parse_checkbox_without_todo_keyword_returns_none,
+        which pinned the opposite behavior.)"""
         line = "- [ ] Regular checklist item"
 
         task = _parse_task_line(line, "/path/to/Inbox.md", 1)
 
-        assert task is None
+        assert task is not None
+        assert task.description == "Regular checklist item"
+        assert task.status == "todo"
+
+    def test_parse_non_checkbox_line_returns_none(self):
+        """A line that isn't a checkbox at all (heading, blank, prose,
+        non-checkbox bullet) is never mistaken for a task."""
+        assert _parse_task_line("## A heading", "/path/to/Inbox.md", 1) is None
+        assert _parse_task_line("", "/path/to/Inbox.md", 1) is None
+        assert _parse_task_line("- a plain bullet, no checkbox", "/path/to/Inbox.md", 1) is None
+        assert _parse_task_line("Just a sentence.", "/path/to/Inbox.md", 1) is None
 
 
 class TestParseFormatRoundTrip:
@@ -1320,3 +1339,377 @@ class TestListFilterSemanticsMatchDocs:
         # Fixture has 5 tasks, only 2 with due dates.
         assert len(populated_manager.list_tasks(due_before="2099-01-01")) == 2
         assert all(t.due_date is not None for t in populated_manager.list_tasks(due_before="2099-01-01"))
+
+
+# =============================================================================
+# #853 — Task store hardening: id write-back, atomic writes, id-addressed
+# writes, notes body, unknown-field round-trip, cache-field merge-forward,
+# external-edit-wins, CAS retry + conflict, and Syncthing conflict-file skip.
+# =============================================================================
+
+class TestIdWriteBack:
+    """Reindexing mints and writes back a stable id for any hand-authored
+    checkbox line that lacks one, without disturbing anything else."""
+
+    def test_reindex_mints_and_writes_back_id(self, task_manager):
+        file_path = task_manager.tasks_dir / "Handwritten.md"
+        file_path.write_text("- [ ] TODO Buy milk\n", encoding="utf-8")
+
+        task_manager.reindex_file(str(file_path))
+
+        content = file_path.read_text(encoding="utf-8")
+        assert content.startswith("- [ ] TODO Buy milk <!-- id:")
+        m = re.search(r"<!-- id:(\w+) -->", content)
+        assert m
+        minted_id = m.group(1)
+        assert task_manager.get(minted_id).description == "Buy milk"
+
+        # Stable + idempotent on a second reindex.
+        task_manager.reindex_file(str(file_path))
+        assert file_path.read_text(encoding="utf-8") == content
+        assert task_manager.get(minted_id) is not None
+
+    def test_reindex_preserves_mixed_content_byte_for_byte(self, task_manager):
+        lines_in = [
+            "---",
+            "type: tasks",
+            "---",
+            "# Mixed Tasks",
+            "",
+            "Some prose note that isn't a task at all.",
+            "",
+            "- A plain bullet, not a checkbox",
+            "  - nested content under it",
+            "",
+            "- [ ] TODO Buy milk",
+            "- [x] TODO Already has an id <!-- id:existing1 -->",
+            "- [ ] Another hand-written item, no TODO keyword",
+            "",
+            "## Section 2",
+        ]
+        file_path = task_manager.tasks_dir / "Mixed.md"
+        file_path.write_text("\n".join(lines_in) + "\n", encoding="utf-8")
+
+        task_manager.reindex_file(str(file_path))
+
+        lines_out = file_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines_out) == len(lines_in)
+
+        task_line_idx = {10, 11, 12}
+        for i, original in enumerate(lines_in):
+            if i in task_line_idx:
+                continue
+            assert lines_out[i] == original, f"non-task line {i} changed: {lines_out[i]!r}"
+
+        # Already-id'd line: fully untouched.
+        assert lines_out[11] == lines_in[11]
+
+        # Id-less task lines: original text preserved, exactly one id
+        # comment appended.
+        for i in (10, 12):
+            assert lines_out[i].startswith(lines_in[i])
+            suffix = lines_out[i][len(lines_in[i]):]
+            assert re.fullmatch(r" <!-- id:\w+ -->", suffix), f"line {i} suffix: {suffix!r}"
+
+        # Idempotent — a second reindex makes no further change.
+        task_manager.reindex_file(str(file_path))
+        assert file_path.read_text(encoding="utf-8").splitlines() == lines_out
+
+
+class TestIdAddressedWrites:
+    """Writes locate their task by id, not by cached line number, so an
+    external insert above a task doesn't misdirect the next write."""
+
+    def test_update_targets_correct_line_after_external_insert_above(self, task_manager):
+        task_a = task_manager.create("Task A", context="AddressTest")
+        task_manager.create("Task B", context="AddressTest")
+        file_path = task_manager.tasks_dir / "AddressTest.md"
+
+        # Simulate an external edit landing before the watcher reindexes.
+        content = file_path.read_text(encoding="utf-8")
+        file_path.write_text("New line one\nNew line two\n" + content, encoding="utf-8")
+
+        updated = task_manager.update(task_a.id, description="Task A updated")
+
+        assert updated.description == "Task A updated"
+        final_content = file_path.read_text(encoding="utf-8")
+        assert "New line one" in final_content
+        assert "New line two" in final_content
+        assert re.search(r"- \[ \] TODO Task B \[", final_content), "task B's line was disturbed"
+
+
+class TestNotesBody:
+    def test_create_with_notes_writes_indented_body(self, task_manager):
+        task = task_manager.create("Notes test", context="NotesTest", notes="line one\nline two")
+        content = (task_manager.tasks_dir / "NotesTest.md").read_text(encoding="utf-8")
+        assert "    > line one" in content
+        assert "    > line two" in content
+        assert task_manager.get(task.id).notes == "line one\nline two"
+
+    def test_delete_removes_task_line_and_body(self, task_manager):
+        task = task_manager.create("Delete with notes", context="NotesTest", notes="body line")
+        file_path = task_manager.tasks_dir / "NotesTest.md"
+        assert "body line" in file_path.read_text(encoding="utf-8")
+
+        task_manager.delete(task.id)
+
+        content = file_path.read_text(encoding="utf-8")
+        assert "Delete with notes" not in content
+        assert "body line" not in content
+
+    def test_context_change_moves_notes_body_too(self, task_manager):
+        task = task_manager.create("Move with notes", context="NotesA", notes="keep me")
+        task_manager.update(task.id, context="NotesB")
+
+        old_content = (task_manager.tasks_dir / "NotesA.md").read_text(encoding="utf-8")
+        new_content = (task_manager.tasks_dir / "NotesB.md").read_text(encoding="utf-8")
+        assert "keep me" not in old_content
+        assert "keep me" in new_content
+        assert task_manager.get(task.id).notes == "keep me"
+
+    def test_update_notes_rewrites_body(self, task_manager):
+        task = task_manager.create("Update notes", context="NotesTest", notes="old body")
+        task_manager.update(task.id, notes="new body")
+        content = (task_manager.tasks_dir / "NotesTest.md").read_text(encoding="utf-8")
+        assert "old body" not in content
+        assert "new body" in content
+
+
+class TestUnknownFieldRoundTrip:
+    def test_unknown_field_survives_reindex_and_rewrite(self, task_manager):
+        file_path = task_manager.tasks_dir / "Unknown.md"
+        file_path.write_text(
+            "- [ ] TODO Custom field task [foo:: bar] <!-- id:custom01 -->\n",
+            encoding="utf-8",
+        )
+        task_manager.reindex_file(str(file_path))
+
+        task = task_manager.get("custom01")
+        assert task is not None
+        assert task.fields == {"foo": "bar"}
+
+        # Any API rewrite of the task must not drop the unknown field.
+        task_manager.update("custom01", priority="high")
+        content = file_path.read_text(encoding="utf-8")
+        assert "[foo:: bar]" in content
+        assert task_manager.get("custom01").fields == {"foo": "bar"}
+
+
+class TestOperatorFields:
+    def test_create_with_fields_writes_inline(self, task_manager):
+        task = task_manager.create(
+            "Field test", context="Fields", fields={"host": "laptop", "effort": "high"}
+        )
+        content = (task_manager.tasks_dir / "Fields.md").read_text(encoding="utf-8")
+        assert "[host:: laptop]" in content
+        assert "[effort:: high]" in content
+        assert task.fields == {"host": "laptop", "effort": "high"}
+
+    def test_update_fields_null_removes_field(self, task_manager):
+        task = task_manager.create("Remove field", context="Fields", fields={"host": "laptop"})
+        updated = task_manager.update(task.id, fields={"host": None})
+
+        assert "host" not in updated.fields
+        content = (task_manager.tasks_dir / "Fields.md").read_text(encoding="utf-8")
+        assert "[host::" not in content
+
+    def test_update_fields_merges_not_replaces(self, task_manager):
+        task = task_manager.create("Merge fields", context="Fields", fields={"host": "laptop"})
+        updated = task_manager.update(task.id, fields={"effort": "high"})
+        assert updated.fields == {"host": "laptop", "effort": "high"}
+
+
+class TestMergeForwardCacheFields:
+    def test_reminder_id_survives_reindex_after_external_touch(self, task_manager):
+        task = task_manager.create("Linked task", context="Reminder", reminder_id="rem-123")
+        file_path = task_manager.tasks_dir / "Reminder.md"
+
+        # reminder_id has no markdown representation at all — an unrelated
+        # external touch must not lose it on reindex.
+        content = file_path.read_text(encoding="utf-8")
+        file_path.write_text(content + "\n", encoding="utf-8")
+
+        task_manager.reindex_file(str(file_path))
+
+        assert task_manager.get(task.id).reminder_id == "rem-123"
+
+
+class TestExternalEditWins:
+    def test_external_edit_reflected_and_restamped(self, task_manager):
+        task = task_manager.create("Original", context="ExtEdit")
+        file_path = task_manager.tasks_dir / "ExtEdit.md"
+        first_stamp = task_manager.get(task.id).updated_at
+
+        content = file_path.read_text(encoding="utf-8")
+        file_path.write_text(content.replace("Original", "Externally renamed"), encoding="utf-8")
+
+        task_manager.reindex_file(str(file_path))
+
+        refreshed = task_manager.get(task.id)
+        assert refreshed.description == "Externally renamed"
+        assert refreshed.updated_at != first_stamp
+        final_content = file_path.read_text(encoding="utf-8")
+        assert f"[updated:: {refreshed.updated_at}]" in final_content
+
+    def test_unrelated_task_untouched_when_only_one_task_edited(self, task_manager):
+        task_a = task_manager.create("Task A", context="ExtEdit2")
+        task_b = task_manager.create("Task B", context="ExtEdit2")
+        file_path = task_manager.tasks_dir / "ExtEdit2.md"
+
+        content = file_path.read_text(encoding="utf-8")
+        file_path.write_text(content.replace("Task A", "Task A renamed"), encoding="utf-8")
+
+        b_stamp_before = task_manager.get(task_b.id).updated_at
+
+        task_manager.reindex_file(str(file_path))
+
+        assert task_manager.get(task_a.id).description == "Task A renamed"
+        b_after = task_manager.get(task_b.id)
+        assert b_after.description == "Task B"
+        assert b_after.updated_at == b_stamp_before
+
+
+class TestCasRetryAndConflict:
+    def test_retries_three_times_then_raises_conflict(self, task_manager, monkeypatch):
+        task = task_manager.create("CAS test", context="CasTest")
+
+        import itertools
+        counter = itertools.count()
+        monkeypatch.setattr(
+            "api.services.task_manager._mtime_or_none",
+            lambda path: next(counter),
+        )
+
+        reindex_calls = []
+        original_reindex = task_manager.reindex_file
+
+        def spy_reindex(path):
+            reindex_calls.append(path)
+            return original_reindex(path)
+
+        monkeypatch.setattr(task_manager, "reindex_file", spy_reindex)
+
+        with pytest.raises(TaskConflictError):
+            task_manager.update(task.id, description="new desc")
+
+        assert len(reindex_calls) == 3
+
+    def test_no_retry_needed_in_the_normal_case(self, task_manager):
+        task = task_manager.create("No conflict", context="CasTest2")
+        updated = task_manager.update(task.id, description="updated fine")
+        assert updated.description == "updated fine"
+
+
+class TestConflictFiles:
+    def test_conflict_files_never_indexed(self, task_manager):
+        task_manager.create("Real task", context="ConflictTest")
+        conflict_path = (
+            task_manager.tasks_dir / "ConflictTest.sync-conflict-20260101-120000-ABCDEFG.md"
+        )
+        conflict_path.write_text("- [ ] TODO Ghost task <!-- id:ghost001 -->\n", encoding="utf-8")
+        temp_path = task_manager.tasks_dir / ".syncthing.ConflictTest.md.tmp"
+        temp_path.write_text("- [ ] TODO Temp ghost <!-- id:ghost002 -->\n", encoding="utf-8")
+
+        task_manager.rebuild_index()
+
+        assert task_manager.get("ghost001") is None
+        assert task_manager.get("ghost002") is None
+
+    def test_reindex_file_is_noop_for_conflict_file(self, task_manager):
+        conflict_path = task_manager.tasks_dir / "X.sync-conflict-20260101-120000-ABCDEFG.md"
+        conflict_path.write_text("- [ ] TODO Ghost <!-- id:ghost003 -->\n", encoding="utf-8")
+
+        task_manager.reindex_file(str(conflict_path))
+
+        assert task_manager.get("ghost003") is None
+
+    def test_list_conflicts_reports_name_and_mtime(self, task_manager):
+        conflict_path = task_manager.tasks_dir / "Y.sync-conflict-20260101-120000-ABCDEFG.md"
+        conflict_path.write_text("stub", encoding="utf-8")
+        temp_path = task_manager.tasks_dir / ".syncthing.Y.md.tmp"
+        temp_path.write_text("stub", encoding="utf-8")
+
+        conflicts = task_manager.list_conflicts()
+        names = {c["name"] for c in conflicts}
+        assert conflict_path.name in names
+        assert temp_path.name in names
+        for c in conflicts:
+            assert c["mtime"]
+
+    def test_is_conflict_file_helper(self):
+        assert is_conflict_file(Path("Inbox.sync-conflict-20260101-120000-ABCDEFG.md"))
+        assert is_conflict_file(Path(".syncthing.Inbox.md.tmp"))
+        assert not is_conflict_file(Path("Inbox.md"))
+
+
+class TestUpdatedStamp:
+    def test_create_stamps_updated_with_utc_offset(self, task_manager):
+        task = task_manager.create("Stamped", context="Stamp")
+        assert task.updated_at is not None
+        assert re.search(r"[+-]\d{2}:\d{2}$", task.updated_at)
+        content = (task_manager.tasks_dir / "Stamp.md").read_text(encoding="utf-8")
+        assert f"[updated:: {task.updated_at}]" in content
+
+    def test_update_bumps_updated_stamp(self, task_manager):
+        task = task_manager.create("Stamped2", context="Stamp")
+        updated = task_manager.update(task.id, priority="high")
+        assert updated.updated_at is not None
+        assert re.search(r"[+-]\d{2}:\d{2}$", updated.updated_at)
+
+    def test_complete_stamps_updated(self, task_manager):
+        task = task_manager.create("Stamped3", context="Stamp")
+        completed = task_manager.complete(task.id)
+        assert completed.updated_at is not None
+
+    def test_swap_tag_stamps_updated(self, task_manager):
+        task = task_manager.create("Stamped4", context="Stamp", tags=["agent"])
+        task_manager.swap_tag(task.id, "agent", "agent-running")
+        assert task_manager.get(task.id).updated_at is not None
+
+
+class TestAtomicWriteIntegration:
+    def test_writes_go_through_os_replace(self, task_manager, monkeypatch):
+        import api.services.atomic_write as aw
+
+        calls = []
+        original_replace = aw.os.replace
+
+        def spy_replace(src, dst):
+            calls.append((src, dst))
+            return original_replace(src, dst)
+
+        monkeypatch.setattr(aw.os, "replace", spy_replace)
+
+        task_manager.create("Atomic test", context="Atomic")
+
+        assert len(calls) >= 1
+        for src, dst in calls:
+            assert Path(src).parent == Path(dst).parent
+
+    def test_no_leftover_temp_files_after_write(self, task_manager):
+        task_manager.create("No leftovers", context="Atomic2")
+        assert list(task_manager.tasks_dir.glob(".*.tmp")) == []
+
+
+class TestBlockedStatus:
+    def test_blocked_status_formats_as_question_mark(self, task_manager):
+        task = task_manager.create("Waiting on X", context="StatusTest", status="blocked")
+        assert task.status == "blocked"
+        content = (task_manager.tasks_dir / "StatusTest.md").read_text(encoding="utf-8")
+        assert "- [?] TODO Waiting on X" in content
+
+
+class TestFormatTaskBlock:
+    def test_format_task_block_no_notes_is_single_line(self):
+        task = Task(id="t1", description="No notes", status="todo", context="Inbox", created_date="2025-02-08")
+        assert _format_task_block(task) == [_format_task_line(task)]
+
+    def test_format_task_block_with_notes_appends_indented_lines(self):
+        task = Task(
+            id="t1", description="Has notes", status="todo", context="Inbox",
+            created_date="2025-02-08", notes="line one\nline two",
+        )
+        block = _format_task_block(task)
+        assert block[0] == _format_task_line(task)
+        assert block[1] == "    > line one"
+        assert block[2] == "    > line two"

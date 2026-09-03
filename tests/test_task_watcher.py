@@ -78,6 +78,22 @@ class TestHandlerScheduling:
         time.sleep(0.2)
         assert calls == []
 
+    def test_skips_sync_conflict_file(self):
+        """#853: a Syncthing conflict copy is never a reindex source."""
+        calls = []
+        handler = _TaskFileHandler(lambda p: calls.append(p))
+        handler.on_modified(_FakeEvent("/x/Tasks/Inbox.sync-conflict-20260101-120000-ABCDEFG.md"))
+        time.sleep(0.2)
+        assert calls == []
+
+    def test_skips_syncthing_temp_file(self):
+        """#853: a Syncthing in-progress temp file is never a reindex source."""
+        calls = []
+        handler = _TaskFileHandler(lambda p: calls.append(p))
+        handler.on_modified(_FakeEvent("/x/Tasks/.syncthing.Inbox.md.tmp"))
+        time.sleep(0.2)
+        assert calls == []
+
     def test_move_event_fires_for_both_paths(self):
         calls = []
         done = threading.Event()

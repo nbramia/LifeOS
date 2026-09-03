@@ -57,20 +57,45 @@ class TestTasksAPI:
         data = response.json()
         assert data["description"] == "Pull 1099 from Schwab"
         assert data["id"] == "abc12345"
-        # context comes from the fixture's sample_task; the API itself no
-        # longer accepts a context on create — everything lands in Inbox.
+        # No context in the request -> defaults to Inbox.
         _, kwargs = mock_task_manager.create.call_args
-        assert "context" not in kwargs
+        assert kwargs["context"] == "Inbox"
 
-    def test_create_task_ignores_context_input(self, client, mock_task_manager):
-        """Stray 'context' in the request body is dropped, not forwarded."""
+    def test_create_task_forwards_context(self, client, mock_task_manager):
+        """#853: unlike the chat `manage_tasks` tool (which always lands in
+        Inbox to avoid an LLM guessing a wrong context), the raw HTTP API
+        honors an explicit context on create — a direct API client (the
+        Kanban board) knows exactly where it wants the task filed. This
+        intentionally replaces the old test_create_task_ignores_context_input,
+        which pinned the opposite behavior at this layer."""
         response = client.post("/api/tasks", json={
             "description": "Quick task",
-            "context": "Work",  # silently dropped by Pydantic
+            "context": "Work",
         })
         assert response.status_code == 200
         _, kwargs = mock_task_manager.create.call_args
-        assert "context" not in kwargs
+        assert kwargs["context"] == "Work"
+
+    def test_create_task_forwards_status_notes_fields(self, client, mock_task_manager):
+        response = client.post("/api/tasks", json={
+            "description": "Rich task",
+            "status": "blocked",
+            "notes": "line one\nline two",
+            "fields": {"host": "laptop", "effort": "high"},
+        })
+        assert response.status_code == 200
+        _, kwargs = mock_task_manager.create.call_args
+        assert kwargs["status"] == "blocked"
+        assert kwargs["notes"] == "line one\nline two"
+        assert kwargs["fields"] == {"host": "laptop", "effort": "high"}
+
+    def test_create_task_invalid_status_is_422(self, client, mock_task_manager):
+        response = client.post("/api/tasks", json={
+            "description": "Bad status",
+            "status": "not_a_real_status",
+        })
+        assert response.status_code == 422
+        mock_task_manager.create.assert_not_called()
 
     def test_create_task_minimal(self, client, mock_task_manager):
         response = client.post("/api/tasks", json={
@@ -102,6 +127,12 @@ class TestTasksAPI:
         client = TestClient(app, raise_server_exceptions=False)
         response = client.post("/api/tasks", json={"description": "Pull 1099 from Schwab"})
         assert not (200 <= response.status_code < 300)
+
+    def test_create_task_conflict_is_409(self, client, mock_task_manager):
+        from api.services.task_manager import TaskConflictError
+        mock_task_manager.create.side_effect = TaskConflictError("too many conflicting writes")
+        response = client.post("/api/tasks", json={"description": "Pull 1099 from Schwab"})
+        assert response.status_code == 409
 
     # --- DRY RUN (#138) ---
 
@@ -297,6 +328,29 @@ class TestTasksAPI:
         })
         assert response.status_code == 404
 
+    def test_update_task_invalid_status_is_422(self, client, mock_task_manager):
+        response = client.put("/api/tasks/abc12345", json={
+            "status": "not_a_real_status",
+        })
+        assert response.status_code == 422
+        mock_task_manager.update.assert_not_called()
+
+    def test_update_task_forwards_notes_and_fields(self, client, mock_task_manager):
+        response = client.put("/api/tasks/abc12345", json={
+            "notes": "new notes",
+            "fields": {"host": "laptop", "effort": None},
+        })
+        assert response.status_code == 200
+        _, kwargs = mock_task_manager.update.call_args
+        assert kwargs["notes"] == "new notes"
+        assert kwargs["fields"] == {"host": "laptop", "effort": None}
+
+    def test_update_task_conflict_is_409(self, client, mock_task_manager):
+        from api.services.task_manager import TaskConflictError
+        mock_task_manager.update.side_effect = TaskConflictError("too many conflicting writes")
+        response = client.put("/api/tasks/abc12345", json={"priority": "high"})
+        assert response.status_code == 409
+
     # --- COMPLETE ---
 
     def test_complete_task(self, client, mock_task_manager):
@@ -308,6 +362,12 @@ class TestTasksAPI:
         mock_task_manager.complete.return_value = None
         response = client.put("/api/tasks/nonexistent/complete")
         assert response.status_code == 404
+
+    def test_complete_task_conflict_is_409(self, client, mock_task_manager):
+        from api.services.task_manager import TaskConflictError
+        mock_task_manager.complete.side_effect = TaskConflictError("too many conflicting writes")
+        response = client.put("/api/tasks/abc12345/complete")
+        assert response.status_code == 409
 
     # --- TAGS ---
 
@@ -345,6 +405,12 @@ class TestTasksAPI:
         response = client.delete("/api/tasks/nonexistent")
         assert response.status_code == 404
 
+    def test_delete_task_conflict_is_409(self, client, mock_task_manager):
+        from api.services.task_manager import TaskConflictError
+        mock_task_manager.delete.side_effect = TaskConflictError("too many conflicting writes")
+        response = client.delete("/api/tasks/abc12345")
+        assert response.status_code == 409
+
     # --- RESPONSE SHAPE ---
 
     def test_task_response_shape(self, client, mock_task_manager):
@@ -354,10 +420,45 @@ class TestTasksAPI:
         expected_fields = [
             "id", "description", "status", "context", "priority",
             "due_date", "created_date", "done_date", "cancelled_date",
-            "tags", "reminder_id", "source_file", "line_number",
+            "updated_at", "tags", "reminder_id", "notes", "fields",
+            "source_file", "line_number",
         ]
         for f in expected_fields:
             assert f in data, f"Missing field: {f}"
+
+    # --- CONFLICTS ---
+
+    def test_list_conflicts(self, client, mock_task_manager):
+        mock_task_manager.list_conflicts.return_value = [
+            {"name": "Inbox.sync-conflict-20260101-120000-ABCDEFG.md", "mtime": "2026-01-01T12:00:00+00:00"},
+        ]
+        response = client.get("/api/tasks/conflicts")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["conflicts"]) == 1
+        assert data["conflicts"][0]["name"] == "Inbox.sync-conflict-20260101-120000-ABCDEFG.md"
+
+    def test_list_conflicts_empty(self, client, mock_task_manager):
+        mock_task_manager.list_conflicts.return_value = []
+        response = client.get("/api/tasks/conflicts")
+        assert response.status_code == 200
+        assert response.json() == {"conflicts": []}
+
+    def test_conflicts_route_not_captured_by_task_id(self, client, mock_task_manager):
+        """'conflicts' must never be treated as a task id — regression guard
+        for route registration order."""
+        mock_task_manager.list_conflicts.return_value = []
+        response = client.get("/api/tasks/conflicts")
+        assert response.status_code == 200
+        mock_task_manager.get.assert_not_called()
+
+    # --- SWAP-TAG ---
+
+    def test_swap_tag_conflict_is_409(self, client, mock_task_manager):
+        from api.services.task_manager import TaskConflictError
+        mock_task_manager.swap_tag.side_effect = TaskConflictError("too many conflicting writes")
+        response = client.post("/api/tasks/abc12345/swap-tag?from=agent&to=agent-running")
+        assert response.status_code == 409
 
 
 class TestListTasksParameterDocs:

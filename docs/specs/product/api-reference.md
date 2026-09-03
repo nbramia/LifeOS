@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-08-28
+**Last Updated:** 2026-09-03
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two adjacent catalogs split out for size:
 
@@ -738,12 +738,16 @@ Create a task. Stored as an Obsidian Tasks-compatible markdown checkbox in the v
 {
   "description": "Call dentist",
   "context": "Personal",
+  "status": "todo",
   "priority": "high",
   "due_date": "2025-02-10",
   "tags": ["health"],
-  "reminder_id": "optional-linked-reminder-uuid"
+  "reminder_id": "optional-linked-reminder-uuid",
+  "notes": "Ask about the Tuesday afternoon slot",
+  "fields": {"host": "laptop"}
 }
 ```
+`context`, `status`, `notes`, `fields`, and `reminder_id` are all optional.
 
 ### GET /api/tasks
 
@@ -756,13 +760,21 @@ List/filter tasks.
 - `due_before` (string): YYYY-MM-DD, tasks due before this date
 - `query` (string): Fuzzy text search across task descriptions
 
+### GET /api/tasks/conflicts
+
+List Syncthing conflict copies / in-progress temp files sitting in the tasks
+folder (`name`, `mtime` each) — never indexed as tasks, surfaced so a client
+can prompt the operator to resolve them by hand.
+
 ### GET /api/tasks/{id}
 
 Get a specific task.
 
 ### PUT /api/tasks/{id}
 
-Update a task (description, status, context, priority, due_date, tags).
+Update a task (description, status, context, priority, due_date, tags,
+notes, fields). `fields` merges into the task's operator/unknown fields — a
+string value sets a field, a `null` value removes it.
 
 ### PUT /api/tasks/{id}/complete
 
@@ -771,6 +783,10 @@ Mark a task as done (adds done date automatically).
 ### DELETE /api/tasks/{id}
 
 Delete a task.
+
+All task-mutating endpoints can return `409` if a concurrent external edit
+keeps winning a compare-and-swap race on the underlying file — retry the
+request.
 
 ---
 

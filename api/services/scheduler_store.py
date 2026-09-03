@@ -46,6 +46,7 @@ from croniter import croniter
 from zoneinfo import ZoneInfo
 
 from config.settings import settings
+from api.services.atomic_write import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -398,7 +399,7 @@ class SchedulerStore:
             "last_updated": datetime.now(timezone.utc).isoformat(),
             "schedules": [e.to_dict() for e in self._entries.values()],
         }
-        self.index_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        atomic_write_text(self.index_path, json.dumps(data, indent=2, default=str))
         self._write_dashboard()
 
     # ------------------------------------------------------------------
@@ -411,12 +412,12 @@ class SchedulerStore:
         return []
 
     def _write_inbox_lines(self, lines: list[str]):
-        self.inbox_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        atomic_write_text(self.inbox_path, "\n".join(lines) + "\n")
 
     def _ensure_inbox(self):
         if not self.inbox_path.exists():
-            self.inbox_path.write_text(
-                "---\ntype: scheduler\n---\n# Scheduler Inbox\n\n", encoding="utf-8"
+            atomic_write_text(
+                self.inbox_path, "---\ntype: scheduler\n---\n# Scheduler Inbox\n\n"
             )
 
     def _insert_block_at_top(self, block: list[str]):
@@ -662,7 +663,7 @@ class SchedulerStore:
                 return  # no-op write avoids triggering the watcher
         except Exception:
             pass
-        dashboard.write_text(content, encoding="utf-8")
+        atomic_write_text(dashboard, content)
 
     def _build_dashboard_content(self) -> str:
         now = datetime.now(timezone.utc)
