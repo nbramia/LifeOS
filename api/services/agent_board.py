@@ -164,12 +164,34 @@ def plan_lane_move(
         # progress would desync the tag from the actual claim state.
         if current_assignee in AGENT_ASSIGNEES:
             return LaneMovePlan(error=(409, "only the worker claims agent-assigned tasks"))
+        # A card can arrive here from Human queue (#human or agent-blocked) —
+        # strip those so it actually leaves Human queue instead of derive_lane
+        # immediately pulling it back (Human queue outranks In progress).
+        strip = {HUMAN_TAG, BLOCKED_TAG}
+        tset_lower = {t.lstrip("#").lower() for t in tags_list}
+        if tset_lower & strip:
+            new_tags = [t for t in tags_list if t.lstrip("#").lower() not in strip]
+            return LaneMovePlan(status="in_progress", tags=new_tags)
         return LaneMovePlan(status="in_progress")
 
     if target_lane == "human_queue":
         return LaneMovePlan(status="blocked")
 
     if target_lane == "done":
+        # A card can arrive here from Human queue, agent-blocked, or with a
+        # stale agent-running tag — strip those so it actually leaves those
+        # lanes (both outrank Done in derive_lane). A pending agent-completed
+        # review also needs the `accepted` tag or Review would keep claiming
+        # it (Review outranks Done too).
+        strip = {HUMAN_TAG, BLOCKED_TAG, RUNNING_TAG}
+        tset_lower = {t.lstrip("#").lower() for t in tags_list}
+        needs_strip = bool(tset_lower & strip)
+        needs_accept = COMPLETED_TAG in tset_lower and ACCEPTED_TAG not in tset_lower
+        if needs_strip or needs_accept:
+            new_tags = [t for t in tags_list if t.lstrip("#").lower() not in strip]
+            if needs_accept:
+                new_tags.append(ACCEPTED_TAG)
+            return LaneMovePlan(status="done", tags=new_tags)
         return LaneMovePlan(status="done")
 
     # Review and Scheduled are derived — Review from the worker's

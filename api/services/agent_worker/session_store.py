@@ -1412,15 +1412,19 @@ class SessionStore:
         """List unanswered, unprocessed, not-timed-out questions (#850).
 
         Powers `GET /api/agents/pending-questions` — the board's "waiting on
-        an answer" list. Excludes `status_anchor` rows (routing plumbing, not
-        a real question) the same way every other open-question lookup does.
-        Oldest first, so the board's list is stable as new questions arrive.
+        an answer" list. Scoped to `kind IN ('clarification', 'goal_approval')`
+        — the two kinds `worker.py::_process_clarification_answers` treats as
+        real questions awaiting a reply. `status_anchor` rows are routing
+        plumbing, and `followup` rows are completion notices (see
+        `notify_task_completed`), not questions — a Review card should not
+        render a fake pending-question badge for one. Oldest first, so the
+        board's list is stable as new questions arrive.
         """
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM pending_questions "
                 "WHERE answered_at IS NULL AND processed = 0 AND timed_out = 0 "
-                "AND kind != 'status_anchor' "
+                "AND kind IN ('clarification', 'goal_approval') "
                 "ORDER BY id ASC",
             ).fetchall()
         return [dict(r) for r in rows]

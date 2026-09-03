@@ -8,6 +8,7 @@ monkeypatch so the real vault/data directories are never touched.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,9 @@ def stores(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(agents_route, "_session_store", session_store)
     monkeypatch.setattr(agents_route, "_transcript_store", transcript_store)
     agents_route._label_cache.clear()
+    # The board cache (finding #5) is module-level and TTL'd — reset it per
+    # test so a prior test's cached board can't leak into this one's stores.
+    monkeypatch.setattr(agents_route, "_board_cache", None)
     monkeypatch.setattr(agents_route, "_claude_code_snapshot", lambda: ([], []))
     monkeypatch.setattr(agents_route, "_codex_snapshot", lambda: ([], []))
 
@@ -107,6 +111,46 @@ class TestGetBoard:
         assert pq["question"] == "Which environment — staging or prod?"
         assert pq["session_id"] == session.session_id
 
+    def test_card_carries_its_linked_session(self, client, stores):
+        """Round-1 finding 13: `_task_card`'s session join was untested —
+        every prior fixture card had `session: None`."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Draft the memo", tags=["codex"])
+        session = session_store.create(task_id=task.id, status="running", routing="claude")
+        r = client.get("/api/agents/board")
+        card = r.json()["lanes"]["assigned"][0]
+        assert card["session"] is not None
+        assert card["session"]["session_id"] == session.session_id
+
+    def test_card_session_picks_most_recently_active_of_several(self, client, stores, monkeypatch):
+        """Round-1 finding 13: with two sessions on the same task, the card
+        must carry the one with the latest `last_activity_at`, not just
+        whichever the store happened to return first. `sessions` PRIMARY
+        KEYs on `task_id` (at most one LifeOS-worker session per task at a
+        time), so the second session here models the realistic case of a
+        task later resumed via a Claude Code CLI session — the union
+        `_task_card` actually has to pick between."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Draft the memo", tags=["codex"])
+        older = session_store.create(task_id=task.id, status="completed", routing="claude")
+        with session_store._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET last_activity_at = ? WHERE session_id = ?",
+                (100, older.session_id),
+            )
+        newer_session_id = "cc:newer-session"
+        monkeypatch.setattr(
+            agents_route, "_claude_code_snapshot",
+            lambda: ([{
+                "session_id": newer_session_id, "task_id": task.id,
+                "status": "running", "last_activity_at": 200,
+            }], []),
+        )
+
+        r = client.get("/api/agents/board")
+        card = r.json()["lanes"]["assigned"][0]
+        assert card["session"]["session_id"] == newer_session_id
+
     def test_review_lane_agent_completed_not_accepted(self, client, stores):
         task_manager, *_ = stores
         task_manager.create("Draft the memo", tags=["agent-completed"], status="done")
@@ -129,6 +173,27 @@ class TestGetBoard:
         assert card["next_fire_at"] is not None
         assert card["last_run"] is None
         assert lanes["done"] == []
+
+    def test_scheduled_cron_entry_carries_last_run_after_it_fires(self, client, stores):
+        """Round-1 finding 16: a recurring entry that has already fired once
+        but is still enabled with a future next trigger stays in Scheduled —
+        its `last_run` must still be populated from the prior fire."""
+        _tm, scheduler_store, *_ = stores
+        entry = scheduler_store.create(
+            name="Morning briefing", schedule_type="cron", schedule_value="0 9 * * *",
+            message_type="static", message_content="Good morning",
+        )
+        scheduler_store.mark_triggered(entry.id)
+        scheduler_store.record_run(entry.id, "sent", "delivered the briefing")
+
+        r = client.get("/api/agents/board")
+        lanes = r.json()["lanes"]
+        assert lanes["done"] == []
+        assert len(lanes["scheduled"]) == 1
+        card = lanes["scheduled"][0]
+        assert card["last_run"] is not None
+        assert card["last_run"]["outcome"] == "sent"
+        assert card["last_run"]["snippet"] == "delivered the briefing"
 
     def test_disabled_recurring_schedule_shows_in_done(self, client, stores):
         _tm, scheduler_store, *_ = stores
@@ -156,6 +221,47 @@ class TestGetBoard:
         assert lanes["scheduled"] == []
         assert len(lanes["done"]) == 1
         assert lanes["done"][0]["last_run"]["outcome"] == "sent"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/agents/board/stream
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestBoardStream:
+    async def test_stream_emits_a_second_frame_after_a_task_mutation(self, stores):
+        """Round-1 finding 12(a): the SSE path itself (GET
+        /api/agents/board/stream) was never opened by any test — only
+        _build_board() was called directly. Drive the real generator
+        directly rather than through TestClient — its `_TestClientTransport`
+        fully drains an ASGI call before returning a response, and this
+        generator never completes on its own — and prove a task mutation
+        produces a second, different frame on the path the page actually
+        uses ("The board updates within three seconds of an external vault
+        edit without a page reload.")."""
+        task_manager, *_ = stores
+        task = task_manager.create("Ping the vendor")
+
+        resp = await agents_route.stream_board()
+        gen = resp.body_iterator
+        try:
+            first = await gen.__anext__()
+            assert first == ": ok\n\n"
+
+            second = await gen.__anext__()
+            assert second.startswith("event: board\n")
+            first_board = json.loads(second.split("data: ", 1)[1])
+            assert task.id in [c["id"] for c in first_board["lanes"]["unassigned"]]
+
+            task_manager.update(task.id, tags=["me"])
+
+            third = await gen.__anext__()
+            assert third.startswith("event: board\n")
+            second_board = json.loads(third.split("data: ", 1)[1])
+            assert task.id in [c["id"] for c in second_board["lanes"]["assigned"]]
+            assert task.id not in [c["id"] for c in second_board["lanes"]["unassigned"]]
+        finally:
+            await gen.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +322,25 @@ class TestMoveBoardCard:
         r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "review"})
         assert r.status_code == 400
 
+    def test_human_queue_card_dropped_into_done_lands_in_done(self, client, stores):
+        """Round-1 finding 1: a #human + blocked card dropped into Done must
+        actually leave Human queue — the stale `human` tag used to keep it
+        there even after `status` was written to `done`."""
+        task_manager, *_ = stores
+        task = task_manager.create("Escalated to the operator", tags=["human"], status="blocked")
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "done"})
+        assert r.status_code == 200
+        assert r.json()["lane"] == "done"
+        updated = task_manager.get(task.id)
+        assert updated.status == "done"
+        assert "human" not in updated.tags
+
+        board = client.get("/api/agents/board").json()
+        done_ids = [c["id"] for c in board["lanes"]["done"]]
+        human_queue_ids = [c["id"] for c in board["lanes"]["human_queue"]]
+        assert task.id in done_ids
+        assert task.id not in human_queue_ids
+
 
 # ---------------------------------------------------------------------------
 # POST /api/agents/board/cards/{id}/accept
@@ -249,6 +374,17 @@ class TestAcceptBoardCard:
     def test_accept_missing_card_is_404(self, client, stores):
         r = client.post("/api/agents/board/cards/nope/accept")
         assert r.status_code == 404
+
+    def test_accept_on_non_review_card_is_409(self, client, stores):
+        """Round-1 finding 6: /accept had no Review-lane guard — it would
+        happily mark any todo card done."""
+        task_manager, *_ = stores
+        task = task_manager.create("A plain todo, never touched by the worker")
+        r = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert r.status_code == 409
+        updated = task_manager.get(task.id)
+        assert updated.status == "todo"
+        assert "accepted" not in updated.tags
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +469,73 @@ class TestPendingQuestions:
         r = client.post("/api/agents/pending-questions/999999/answer", json={"answer": "x"})
         assert r.status_code == 404
 
+    def test_answer_bare_empty_string_is_400_via_min_length(self, client, stores):
+        """Round-1 finding 10: `answer` now has a min_length, so a bare empty
+        string is rejected by Pydantic validation (whitespace still 400s via
+        the handler's own strip check — see test_answer_empty_string_is_400
+        above). This app's `RequestValidationError` handler (api/main.py)
+        converts every validation failure to 400, not FastAPI's default 422
+        — matching every other `min_length` field in this codebase — so both
+        paths land on the same status code."""
+        _tm, _sched, session_store, _transcript = stores
+        session = session_store.create(task_id="t1", status=STATUS_BLOCKED)
+        qid = session_store.create_pending_question(
+            session_id=session.session_id, task_id="t1", question="Q", sent_message_id=1,
+        )
+        r = client.post(f"/api/agents/pending-questions/{qid}/answer", json={"answer": ""})
+        assert r.status_code == 400
+
+    def test_status_anchor_row_excluded_from_pending_questions(self, client, stores):
+        """Round-1 finding 14: `status_anchor` rows are routing plumbing (see
+        `add_reply_anchors`), never a real question."""
+        _tm, _sched, session_store, _transcript = stores
+        session = session_store.create(task_id="t1", status=STATUS_BLOCKED)
+        session_store.add_reply_anchors(
+            session_id=session.session_id, task_id="t1", message_ids=[5],
+        )
+        r = client.get("/api/agents/pending-questions")
+        assert r.json()["questions"] == []
+
+    def test_answering_already_answered_question_is_404(self, client, stores):
+        """Round-1 finding 14: the second answer attempt on the same
+        question must 404, not silently overwrite the first answer."""
+        _tm, _sched, session_store, _transcript = stores
+        session = session_store.create(task_id="t1", status=STATUS_BLOCKED)
+        qid = session_store.create_pending_question(
+            session_id=session.session_id, task_id="t1", question="Q", sent_message_id=1,
+        )
+        r1 = client.post(f"/api/agents/pending-questions/{qid}/answer", json={"answer": "first"})
+        assert r1.status_code == 200
+        r2 = client.post(f"/api/agents/pending-questions/{qid}/answer", json={"answer": "second"})
+        assert r2.status_code == 404
+        with session_store._connect() as conn:
+            row = dict(conn.execute(
+                "SELECT answer FROM pending_questions WHERE id = ?", (qid,),
+            ).fetchone())
+        assert row["answer"] == "first"
+
+    def test_followup_row_excluded_from_pending_questions(self, client, stores):
+        """Round-1 finding 7: `kind='followup'` rows are completion notices,
+        not real questions — they must not render a fake pending-question
+        badge on a Review card."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create(
+            "Draft the memo", tags=["codex", "agent-completed"], status="done",
+        )
+        session = session_store.create(task_id=task.id, status="completed")
+        session_store.register_completion_followup(
+            session_id=session.session_id, task_id=task.id,
+            sent_message_ids=[7], label="Draft the memo",
+        )
+
+        r = client.get("/api/agents/pending-questions")
+        assert r.json()["questions"] == []
+
+        board = client.get("/api/agents/board").json()
+        review_cards = board["lanes"]["review"]
+        assert len(review_cards) == 1
+        assert review_cards[0]["pending_question"] is None
+
 
 # ---------------------------------------------------------------------------
 # Hermes label fix + Codex stream dispatch (#850)
@@ -376,3 +579,33 @@ class TestHermesLabelAndCodexStream:
         monkeypatch.setattr(agents_route, "_codex_enabled", lambda: False)
         r = client.get("/api/agents/sessions/cx:abc123/stream")
         assert r.status_code == 404
+
+    async def test_stream_codex_session_actually_reads_a_rollout_file(self, stores, monkeypatch, tmp_path):
+        """Round-1 finding 17: `_stream_codex_session` itself was never
+        executed — the dispatch test above monkeypatches the whole generator
+        away. Point `settings.codex_sessions_dir` at a synthetic rollout and
+        drive the real generator directly (not through TestClient — its
+        `_TestClientTransport` fully drains an ASGI call before returning a
+        response, and this generator only ends on a 300s idle timeout, so a
+        real HTTP round trip through it can't complete inside a unit test);
+        it should backfill the file's events unchanged."""
+        from tests.test_codex_ingest import _write_rollout, _session_meta, _agent_event_msg
+        from config.settings import settings
+
+        sessions_dir = tmp_path / "codex_sessions"
+        _write_rollout(sessions_dir, "cafe1234", [
+            _session_meta(),
+            _agent_event_msg(text="hello from a synthetic codex rollout"),
+        ])
+        monkeypatch.setattr(settings, "codex_sessions_dir", str(sessions_dir))
+
+        gen = agents_route._stream_codex_session("cx:cafe1234", 50)
+        chunks = [await gen.__anext__() for _ in range(3)]
+        await gen.aclose()
+
+        body = "".join(chunks)
+        assert chunks[0] == ": ok\n\n"
+        assert body.count("event: transcript_event") == 2
+        assert '"kind": "system_session_meta"' in body
+        assert '"kind": "assistant_message"' in body
+        assert "hello from a synthetic codex rollout" in body

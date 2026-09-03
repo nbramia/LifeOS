@@ -58,7 +58,7 @@ When an agent asks a clarifying question, the card carrying that session shows t
 
 ### Scheduled column
 
-Each card shows the entry's next fire time, a recurring badge for cron entries, and — once it has fired at least once — the most recent run's outcome and a short result snippet. Editing a scheduled card edits the underlying schedule through the same API the `/api/scheduler` UI uses; there's no separate write path for the board.
+Each card shows the entry's next fire time, a recurring badge for cron entries, and — once it has fired at least once — the most recent run's outcome and a short result snippet. The drawer's title, message, and an enabled checkbox are editable and save on blur/change through the same `PUT /api/scheduler/{id}` the `/api/scheduler` UI uses — there's no separate write path for the board. Schedule type, timing, and executor are not editable from the board; use the existing scheduler UI for those.
 
 ### Filters
 

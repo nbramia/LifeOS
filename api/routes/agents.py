@@ -15,6 +15,7 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -724,6 +725,8 @@ def _schedule_card(entry) -> dict[str, Any]:
         "kind": "schedule",
         "id": entry.id,
         "name": entry.name,
+        "message_content": entry.message_content,
+        "enabled": entry.enabled,
         "next_fire_at": entry.next_trigger_at,
         "recurring": entry.schedule_type == "cron",
         "last_run": last_run,
@@ -763,10 +766,39 @@ def _build_board() -> dict[str, Any]:
     return {"lanes": lanes, "generated_at": int(time.time())}
 
 
+# Module-level (built_at, board) cache, TTL == _BOARD_STREAM_INTERVAL.
+# `_build_board` reads every task, every schedule entry, and up to 200
+# session transcript files — cheap once, but every open board tab (GET
+# /board or /board/stream) calling it independently on every tick would
+# multiply that cost by the number of open tabs. Sharing one build per
+# tick keeps GET /board and the stream reading identical data too.
+_board_cache: tuple[float, dict[str, Any]] | None = None
+
+
+async def _get_board_cached() -> dict[str, Any]:
+    global _board_cache
+    now = time.monotonic()
+    if _board_cache is not None and now - _board_cache[0] < _BOARD_STREAM_INTERVAL:
+        return _board_cache[1]
+    board = await run_in_threadpool(_build_board)
+    _board_cache = (now, board)
+    return board
+
+
+def _invalidate_board_cache() -> None:
+    """Drop the cached board so the next GET/stream tick rebuilds it.
+
+    Called after a lane-move write so a GET /board immediately following a
+    PUT/accept always reflects it, instead of waiting out the TTL.
+    """
+    global _board_cache
+    _board_cache = None
+
+
 @router.get("/board")
 async def get_board() -> dict[str, Any]:
     """Full current board view model — see `_build_board`."""
-    return _build_board()
+    return await _get_board_cached()
 
 
 @router.get("/board/stream")
@@ -783,11 +815,11 @@ async def stream_board() -> StreamingResponse:
         last_signature: str | None = None
         while True:
             try:
-                board = _build_board()
+                board = await _get_board_cached()
                 signature = json.dumps(board["lanes"], sort_keys=True, default=str)
                 if signature != last_signature:
                     last_signature = signature
-                    yield f"event: board\ndata: {json.dumps(board)}\n\n"
+                    yield f"event: board\ndata: {json.dumps(board, default=str)}\n\n"
             except Exception as exc:  # noqa: BLE001 — keep the stream alive on errors
                 logger.warning("board stream tick failed: %s", exc)
                 yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
@@ -839,6 +871,7 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if task is None:
             raise HTTPException(status_code=404, detail="card not found")
+        _invalidate_board_cache()
 
     lane = agent_board.derive_lane(task.status, task.tags)
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
@@ -858,7 +891,11 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="card not found")
 
     tags_norm = {t.lstrip("#").lower() for t in task.tags}
-    needs_tag = agent_board.ACCEPTED_TAG not in tags_norm
+    already_accepted = agent_board.ACCEPTED_TAG in tags_norm
+    if agent_board.derive_lane(task.status, task.tags) != "review" and not already_accepted:
+        raise HTTPException(status_code=409, detail="card is not in the Review lane")
+
+    needs_tag = not already_accepted
     needs_status = task.status != "done"
     if needs_tag or needs_status:
         new_tags = list(task.tags) + ([agent_board.ACCEPTED_TAG] if needs_tag else [])
@@ -868,6 +905,7 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if task is None:
             raise HTTPException(status_code=404, detail="card not found")
+        _invalidate_board_cache()
 
     lane = agent_board.derive_lane(task.status, task.tags)
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
@@ -898,7 +936,9 @@ async def list_pending_questions() -> dict[str, Any]:
 
 class PendingQuestionAnswerRequest(BaseModel):
     """Body for POST /api/agents/pending-questions/{id}/answer."""
-    answer: str
+    # 4096 mirrors Telegram's message cap — the answer becomes the agent's
+    # next turn via the same path a Telegram reply takes (see the handler).
+    answer: str = Field(..., min_length=1, max_length=4096)
 
 
 @router.post("/pending-questions/{question_id}/answer")

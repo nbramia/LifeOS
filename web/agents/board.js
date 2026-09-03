@@ -24,6 +24,14 @@ const LANES = [
 
 const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local'];
 
+// Card fields the drawer renders as editable inputs — used to decide
+// whether an SSE tick needs to rebuild the drawer at all (#850 finding 2).
+const DRAWER_EDITABLE_FIELDS = [
+  'title', 'notes', 'tags', 'context', 'assignee', 'lane',
+  // Scheduled-card fields, editable in the drawer since #850 finding 4.
+  'name', 'message_content', 'enabled',
+];
+
 export function initBoard() {
   const lanesEl = document.getElementById('board-lanes');
   const searchEl = document.getElementById('board-search');
@@ -42,6 +50,7 @@ export function initBoard() {
   let board = { lanes: Object.fromEntries(LANES.map(l => [l.id, []])) };
   let openCardId = null;
   let openCardLane = null;
+  let openCardSnapshot = null;  // last card object the drawer was fully rendered from
   let panel = null;  // SessionPanel for the drawer's linked-session transcript
 
   // ------------------------------------------------------------------
@@ -66,9 +75,37 @@ export function initBoard() {
     render();
     if (openCardId) {
       const fresh = findCard(openCardId);
-      if (fresh) renderDrawer(fresh);
-      else closeDrawer();
+      if (!fresh) { closeDrawer(); return; }
+      updateOpenDrawer(fresh);
     }
+  }
+
+  // A board tick (SSE, ~every 0.75s) reaches here even when nothing about
+  // the open card changed. Rebuilding the drawer via innerHTML every time
+  // drops unsaved edits mid-keystroke, re-opens the linked session's
+  // transcript EventSource, and re-fires GET /sessions/{id}/summary (an LLM
+  // call) on every tick (#850 finding 2). So: refresh the linked session in
+  // place via panel.updateMeta when its id hasn't changed, and only rebuild
+  // the editable field block when a field actually changed and the operator
+  // isn't mid-edit in the drawer.
+  function updateOpenDrawer(fresh) {
+    const prev = openCardSnapshot;
+    const prevSessionId = (prev && prev.session && prev.session.session_id) || null;
+    const freshSessionId = (fresh.session && fresh.session.session_id) || null;
+    const sessionUnchanged = prevSessionId === freshSessionId;
+
+    if (sessionUnchanged && panel && freshSessionId) {
+      panel.updateMeta(fresh.session);
+    }
+
+    const fieldsChanged = !prev || DRAWER_EDITABLE_FIELDS.some(
+      f => JSON.stringify(prev[f]) !== JSON.stringify(fresh[f])
+    );
+    const focused = !!(drawerEl && drawerEl.contains(document.activeElement));
+    if ((fieldsChanged || !sessionUnchanged) && !focused) {
+      renderDrawer(fresh);
+    }
+    openCardSnapshot = fresh;
   }
 
   function fetchBoard() {
@@ -169,7 +206,10 @@ export function initBoard() {
       }
     }
 
-    if (!includeDoneEl?.checked && card.lane === 'done') return false;
+    // Only cancelled task cards are behind this filter — the Done lane
+    // itself (finished tasks, retired/fired schedules) always stays visible
+    // (#850 finding 3).
+    if (!includeDoneEl?.checked && card.kind === 'task' && card.status === 'cancelled') return false;
 
     return true;
   }
@@ -213,6 +253,8 @@ export function initBoard() {
   function renderScheduleCard(card) {
     const div = document.createElement('div');
     div.className = 'board-card board-card-schedule';
+    div.dataset.cardId = card.id;
+    div.dataset.lane = card.lane;
     const nextFire = card.next_fire_at ? new Date(card.next_fire_at).toLocaleString() : '—';
     div.innerHTML = `
       <div class="board-card-title">${escapeHtml(card.name || '(schedule)')}</div>
@@ -222,8 +264,11 @@ export function initBoard() {
       </div>
       ${card.last_run ? `<div class="board-card-lastrun">${escapeHtml(card.last_run.outcome || '')} · ${escapeHtml(card.last_run.snippet || '')}</div>` : ''}
     `;
-    // Scheduled/schedule-history cards edit through the existing scheduler
-    // UI/API, not this board — no drawer, no drag.
+    // Scheduled cards open the drawer (name/message/enabled are editable
+    // there — #850 finding 4) but never drag between lanes: their lane is
+    // derived from the scheduler entry's own enabled/next-fire state, not
+    // settable by dropping a card.
+    div.addEventListener('click', () => openDrawer(card.id));
     return div;
   }
 
@@ -326,7 +371,9 @@ export function initBoard() {
       // when we pass it through explicitly.
       assignee = card.assignee || 'me';
     }
-    moveCard(cardId, targetLane, assignee);
+    // moveCard already toasts and re-renders on failure — nothing more to
+    // do here, just avoid an unhandled rejection now that it re-throws.
+    moveCard(cardId, targetLane, assignee).catch(() => {});
   }
 
   function moveCard(cardId, targetLane, assignee) {
@@ -353,6 +400,10 @@ export function initBoard() {
         // the card is already still in its original lane — just re-render
         // in case a stray class (drag-over) was left behind.
         render();
+        // Re-throw so a caller mid-edit (e.g. the drawer's assignee select)
+        // can revert its own unsaved UI state instead of leaving a value
+        // that was never actually persisted (#850 finding 9).
+        throw err;
       });
   }
 
@@ -426,6 +477,7 @@ export function initBoard() {
   function closeDrawer() {
     openCardId = null;
     openCardLane = null;
+    openCardSnapshot = null;
     if (panel) { panel.close(); panel = null; }
     if (drawerBackdrop) drawerBackdrop.hidden = true;
     if (drawerEl) drawerEl.innerHTML = '';
@@ -436,6 +488,7 @@ export function initBoard() {
     if (!card) return;
     openCardId = cardId;
     openCardLane = card.lane;
+    openCardSnapshot = card;
     if (drawerBackdrop) drawerBackdrop.hidden = false;
     renderDrawer(card);
   }
@@ -455,14 +508,30 @@ export function initBoard() {
     return r.json();
   }
 
+  async function putSchedule(scheduleId, patch) {
+    const r = await fetch(`/api/scheduler/${encodeURIComponent(scheduleId)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    return r.json();
+  }
+
   function renderDrawer(card) {
     if (!drawerEl) return;
     const isTask = card.kind === 'task';
     const nonAssigneeTags = (card.tags || []).filter(t => !ASSIGNEES.includes(t.toLowerCase()));
+    const titleValue = isTask ? (card.title || '') : (card.name || '');
     drawerEl.innerHTML = `
       <div class="drawer-header">
         <button class="panel-close" data-action="drawer-close">×</button>
-        <input class="drawer-title" data-field="title" value="${escapeHtml(card.title || '')}" ${isTask ? '' : 'disabled'} />
+        <input class="drawer-title" data-field="title" value="${escapeHtml(titleValue)}" />
       </div>
       ${isTask ? `
       <label class="drawer-label">Notes</label>
@@ -484,19 +553,44 @@ export function initBoard() {
       <input class="drawer-tags" data-field="tags" value="${escapeHtml(nonAssigneeTags.join(' '))}" placeholder="space-separated tags" />
       <div class="drawer-actions" data-field="actions"></div>
       <div class="drawer-session" data-field="session-panel"></div>
-      ` : `<div class="drawer-schedule-hint">Scheduled entries are edited from the existing scheduler UI/API.</div>`}
+      ` : `
+      <label class="drawer-label">Message</label>
+      <textarea class="drawer-notes" data-field="message-content" placeholder="Message…">${escapeHtml(card.message_content || '')}</textarea>
+      <label class="drawer-label"><input type="checkbox" data-field="enabled" ${card.enabled ? 'checked' : ''} /> Enabled</label>
+      <div class="drawer-schedule-hint">Name, message, and enabled save here through the scheduler API — for schedule type, timing, or executor, use the existing scheduler UI.</div>
+      `}
     `;
     drawerEl.querySelector('[data-action="drawer-close"]').onclick = closeDrawer;
-
-    if (!isTask) return;
 
     const titleEl = drawerEl.querySelector('[data-field="title"]');
     titleEl.addEventListener('blur', async () => {
       const value = titleEl.value.trim();
-      if (!value || value === card.title) return;
-      try { await putTask(card.id, { description: value }); await fetchBoard(); }
-      catch (err) { showToast(`Couldn't save title: ${err.message}`, true); titleEl.value = card.title || ''; }
+      if (!value || value === titleValue) return;
+      try {
+        if (isTask) await putTask(card.id, { description: value });
+        else await putSchedule(card.id, { name: value });
+        await fetchBoard();
+      } catch (err) {
+        showToast(`Couldn't save title: ${err.message}`, true);
+        titleEl.value = titleValue;
+      }
     });
+
+    if (!isTask) {
+      const msgEl = drawerEl.querySelector('[data-field="message-content"]');
+      msgEl.addEventListener('blur', async () => {
+        const value = msgEl.value;
+        if (value === (card.message_content || '')) return;
+        try { await putSchedule(card.id, { message_content: value }); await fetchBoard(); }
+        catch (err) { showToast(`Couldn't save message: ${err.message}`, true); msgEl.value = card.message_content || ''; }
+      });
+      const enabledEl = drawerEl.querySelector('[data-field="enabled"]');
+      enabledEl.addEventListener('change', async () => {
+        try { await putSchedule(card.id, { enabled: enabledEl.checked }); await fetchBoard(); }
+        catch (err) { showToast(`Couldn't update enabled: ${err.message}`, true); enabledEl.checked = !!card.enabled; }
+      });
+      return;
+    }
 
     const notesEl = drawerEl.querySelector('[data-field="notes"]');
     notesEl.addEventListener('blur', async () => {
@@ -512,7 +606,12 @@ export function initBoard() {
       try {
         await moveCard(card.id, value ? 'assigned' : 'unassigned', value || undefined);
       } catch (err) {
-        showToast(`Couldn't set assignee: ${err.message}`, true);
+        // moveCard already toasted the failure and nothing was persisted —
+        // re-render the drawer from the still-current card so the select
+        // snaps back to the actual assignee instead of showing the
+        // rejected choice (#850 finding 9).
+        const fresh = findCard(card.id);
+        if (fresh) renderDrawer(fresh);
       }
     });
 
@@ -525,8 +624,25 @@ export function initBoard() {
     });
 
     const tagsEl = drawerEl.querySelector('[data-field="tags"]');
+    const VALID_TAG = /^[\w-]+$/;
     tagsEl.addEventListener('blur', async () => {
-      const parsed = tagsEl.value.split(/\s+/).map(t => t.replace(/^#/, '')).filter(Boolean);
+      const tokens = tagsEl.value.split(/\s+/).map(t => t.replace(/^#/, '')).filter(Boolean);
+      // Free text here writes straight to the task store — reject anything
+      // that isn't a plain word/hyphen token (blocks a vault-comment
+      // injection like `<!--id:...-->` stealing another task's id) and drop
+      // any assignee-name token (the assignee comes from the select above,
+      // not this field) rather than letting it silently double up as a tag
+      // (#850 finding 8).
+      const parsed = [];
+      const rejected = [];
+      for (const t of tokens) {
+        if (VALID_TAG.test(t) && !ASSIGNEES.includes(t.toLowerCase())) parsed.push(t);
+        else rejected.push(t);
+      }
+      if (rejected.length) {
+        showToast(`Ignored invalid tag${rejected.length > 1 ? 's' : ''}: ${rejected.join(', ')}`, true);
+      }
+      tagsEl.value = parsed.join(' ');
       const assigneeTag = card.assignee ? [card.assignee] : [];
       try { await putTask(card.id, { tags: [...assigneeTag, ...parsed] }); await fetchBoard(); }
       catch (err) { showToast(`Couldn't save tags: ${err.message}`, true); tagsEl.value = nonAssigneeTags.join(' '); }
@@ -578,7 +694,7 @@ export function initBoard() {
     if (card.lane === 'human_queue' && !card.pending_question) {
       // A manually-filed #human card with no agent question behind it —
       // "Resolve" is the operator saying they've handled it by hand.
-      buttons.push(['Resolve', async () => { await moveCard(card.id, 'done'); }]);
+      buttons.push(['Resolve', async () => { await moveCard(card.id, 'done').catch(() => {}); }]);
     }
 
     for (const [label, handler] of buttons) {

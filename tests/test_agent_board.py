@@ -30,6 +30,11 @@ class TestDeriveAssignee:
     def test_empty_tags(self):
         assert agent_board.derive_assignee([]) is None
 
+    def test_multiple_assignee_tags_precedence_is_ASSIGNEE_TAGS_order(self):
+        # Round-1 finding 15: precedence follows ASSIGNEE_TAGS order
+        # ("me" first), not the order the tags happen to appear in the list.
+        assert agent_board.derive_assignee(["codex", "me"]) == "me"
+
 
 # ---------------------------------------------------------------------------
 # derive_lane — one test per row of the issue's lane table
@@ -150,6 +155,14 @@ class TestPlanLaneMove:
         assert plan.error is None
         assert plan.status == "in_progress"
 
+    def test_in_progress_multiple_assignee_tags_uses_precedence(self):
+        # Round-1 finding 15: with both "me" and "codex" tags present,
+        # derive_assignee resolves "me" (ASSIGNEE_TAGS precedence) — since
+        # "me" isn't in AGENT_ASSIGNEES, the move succeeds instead of 409ing.
+        plan = agent_board.plan_lane_move("todo", ["me", "codex"], "in_progress", None)
+        assert plan.error is None
+        assert plan.status == "in_progress"
+
     def test_in_progress_no_assignee_sets_status(self):
         plan = agent_board.plan_lane_move("todo", [], "in_progress", None)
         assert plan.error is None
@@ -169,6 +182,80 @@ class TestPlanLaneMove:
         plan = agent_board.plan_lane_move("todo", [], "scheduled", None)
         assert plan.error is not None
         assert plan.error[0] == 400
+
+
+# ---------------------------------------------------------------------------
+# plan_lane_move — landing lane invariant (#850 round-1 finding 1)
+#
+# Dropping a card into Done or In progress must actually land it there — a
+# leftover Human queue / Review / agent-running tag must not pull it back to
+# its old lane once `derive_lane` re-runs. One case per lane-table starting
+# lane, crossed with each of the two target lanes this finding fixed.
+# assigned/unassigned are deliberately excluded: those targets are tags-only
+# by design (an assignee change must not pull a card out of Human queue —
+# the lane table says Human queue beats Assigned), so asserting
+# landed-lane == target for them would fight that intended behavior.
+# ---------------------------------------------------------------------------
+
+class TestPlanLaneMoveLandsInTargetLane:
+    STARTING_STATES = {
+        "unassigned": ("todo", []),
+        "assigned": ("todo", ["codex"]),
+        "in_progress": ("in_progress", ["codex", "agent", "agent-running"]),
+        "human_queue_human_tag": ("todo", ["human"]),
+        "human_queue_agent_blocked": ("todo", ["agent-blocked"]),
+        "human_queue_blocked_status": ("blocked", []),
+        "review": ("done", ["codex", "agent-completed"]),
+        "done": ("done", ["codex", "accepted"]),
+    }
+
+    @pytest.mark.parametrize("target_lane", ["in_progress", "done"])
+    @pytest.mark.parametrize("start_name,start", list(STARTING_STATES.items()))
+    def test_lands_in_target_or_is_rejected(self, start_name, start, target_lane):
+        current_status, current_tags = start
+        plan = agent_board.plan_lane_move(current_status, current_tags, target_lane, "me")
+        if plan.error is not None:
+            # Only a legitimate rejection: the worker owns agent-assigned
+            # cards, so those can't be dragged straight to In progress.
+            assert plan.error[0] == 409, (start_name, target_lane, plan.error)
+            return
+        final_status = plan.status if plan.status is not None else current_status
+        final_tags = plan.tags if plan.tags is not None else list(current_tags)
+        assert agent_board.derive_lane(final_status, final_tags) == target_lane, (
+            start_name, target_lane, final_status, final_tags,
+        )
+
+    def test_done_strips_human_tag(self):
+        plan = agent_board.plan_lane_move("todo", ["human"], "done", None)
+        assert plan.status == "done"
+        assert "human" not in plan.tags
+
+    def test_done_strips_agent_blocked_and_agent_running(self):
+        plan = agent_board.plan_lane_move(
+            "blocked", ["codex", "agent", "agent-blocked", "agent-running"], "done", None,
+        )
+        assert plan.status == "done"
+        assert set(plan.tags) == {"codex", "agent"}
+
+    def test_done_appends_accepted_when_agent_completed_present(self):
+        plan = agent_board.plan_lane_move("done", ["codex", "agent-completed"], "done", None)
+        assert plan.status == "done"
+        assert set(plan.tags) == {"codex", "agent-completed", "accepted"}
+
+    def test_done_does_not_double_append_accepted(self):
+        plan = agent_board.plan_lane_move(
+            "done", ["codex", "agent-completed", "accepted"], "done", None,
+        )
+        assert plan.tags is None or plan.tags.count("accepted") == 1
+
+    def test_in_progress_strips_human_and_agent_blocked(self):
+        plan = agent_board.plan_lane_move("todo", ["human"], "in_progress", None)
+        assert plan.status == "in_progress"
+        assert "human" not in plan.tags
+
+        plan2 = agent_board.plan_lane_move("todo", ["agent-blocked"], "in_progress", None)
+        assert plan2.status == "in_progress"
+        assert "agent-blocked" not in plan2.tags
 
 
 # ---------------------------------------------------------------------------
