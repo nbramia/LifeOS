@@ -666,3 +666,20 @@ def get_briefings_service() -> BriefingsService:
     if _briefings_service is None:
         _briefings_service = BriefingsService()
     return _briefings_service
+
+
+def human_queue_briefing_line(hours: int = 24) -> Optional[str]:
+    """One-line summary of Human-queue cards open `hours`+ (default 24), for
+    a morning briefing/digest (#852). None when there's nothing to surface —
+    a briefing shouldn't announce an empty queue every day."""
+    from api.services import human_queue
+
+    old = human_queue.open_cards_older_than(hours)
+    if not old:
+        return None
+    max_titles = 5
+    titles = ", ".join(c["title"] for c in old[:max_titles])
+    if len(old) > max_titles:
+        titles += ", …"
+    plural = "s" if len(old) != 1 else ""
+    return f"Human queue: {len(old)} card{plural} waiting {hours}h+ — {titles}"

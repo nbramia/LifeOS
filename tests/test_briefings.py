@@ -284,3 +284,56 @@ class TestBriefingsAPI:
             assert response.status_code == 200
             data = response.json()
             assert data["status"] == "not_found"
+
+
+@pytest.mark.unit
+class TestHumanQueueBriefingLine:
+    """#852: a morning briefing surfaces open Human-queue cards older than
+    a day."""
+
+    @pytest.fixture
+    def tm(self, tmp_path, monkeypatch):
+        from api.services.task_manager import TaskManager
+        from api.services import human_queue
+
+        manager = TaskManager(vault_path=tmp_path / "vault", index_path=tmp_path / "task_index.json")
+        monkeypatch.setattr(human_queue, "get_task_manager", lambda: manager)
+        return manager
+
+    def test_none_when_no_open_cards(self, tm):
+        from api.services.briefings import human_queue_briefing_line
+        assert human_queue_briefing_line() is None
+
+    def test_none_when_only_fresh_cards(self, tm):
+        from api.services import human_queue
+        from api.services.briefings import human_queue_briefing_line
+
+        human_queue.add_card(title="Fresh card")
+        assert human_queue_briefing_line() is None
+
+    def test_line_for_card_older_than_default_threshold(self, tm):
+        from datetime import datetime, timedelta, timezone
+        from api.services import human_queue
+        from api.services.briefings import human_queue_briefing_line
+
+        task = human_queue.add_card(title="Re-authenticate example service")
+        backdated = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+        tm._tasks[task.id].updated_at = backdated
+
+        line = human_queue_briefing_line()
+        assert line is not None
+        assert "Human queue" in line
+        assert "1" in line
+        assert "Re-authenticate example service" in line
+
+    def test_respects_custom_hours_threshold(self, tm):
+        from datetime import datetime, timedelta, timezone
+        from api.services import human_queue
+        from api.services.briefings import human_queue_briefing_line
+
+        task = human_queue.add_card(title="X")
+        backdated = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        tm._tasks[task.id].updated_at = backdated
+
+        assert human_queue_briefing_line(hours=24) is None
+        assert human_queue_briefing_line(hours=1) is not None

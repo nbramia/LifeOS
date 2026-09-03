@@ -459,6 +459,43 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "manage_human_queue",
+        "description": (
+            "File, list, or resolve Human-queue cards — things only the operator "
+            "can do (e.g. re-authenticate an expired login), which the conversation "
+            "itself can't finish. Actions: 'add' (file a card; never file work you "
+            "can do yourself), 'list' (open cards — use for 'what's waiting on "
+            "me'), 'resolve' (mark a card done once you've observed the thing is "
+            "actually done)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "list", "resolve"],
+                    "description": "Action to perform.",
+                },
+                "title": {"type": "string", "description": "Card title (for add)."},
+                "notes": {"type": "string", "description": "What needs doing and why (for add)."},
+                "key": {
+                    "type": "string",
+                    "description": "Dedupe key (for add). Filing again with an already-open "
+                                   "key updates that card's notes instead of duplicating it.",
+                },
+                "done_when": {
+                    "type": "object",
+                    "description": "Optional auto-resolve check (for add): "
+                                   "{type: 'endpoint', path, pointer, equals} or "
+                                   "{type: 'file_exists', path}.",
+                },
+                "id_or_key": {"type": "string", "description": "Card id or dedupe key (for resolve)."},
+                "note": {"type": "string", "description": "Resolution note (for resolve)."},
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "manage_reminders",
         "description": "DEPRECATED — use manage_schedules. Manage timed reminders: create or list.",
         "input_schema": {
@@ -917,7 +954,7 @@ async def execute_tool(name: str, tool_input: dict) -> str:
 
 
 # Sync handlers to wrap in to_thread for parallel execution
-_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_reminders", "manage_schedules", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
+_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_human_queue", "manage_reminders", "manage_schedules", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
 
 
 async def execute_tool_parallel(name: str, tool_input: dict) -> str:
@@ -2250,6 +2287,61 @@ def _tool_manage_tasks(inp: dict):
     return f"Error: Unknown manage_tasks action '{action}'"
 
 
+# -- Human queue helpers (#852) --
+
+def _human_queue_add(inp: dict) -> str:
+    from api.services import human_queue
+    title = inp.get("title")
+    if not title:
+        return "Error: 'title' is required for add."
+    try:
+        task = human_queue.add_card(
+            title=title,
+            notes=inp.get("notes"),
+            key=inp.get("key"),
+            done_when=inp.get("done_when"),
+        )
+    except (human_queue.DoneWhenError, ValueError) as e:
+        return f"Error: {e}"
+    return f"Human-queue card filed: \"{task.description}\" (id: {task.id})"
+
+
+def _human_queue_list(_inp: dict) -> str:
+    from api.services import human_queue
+    cards = human_queue.list_open_cards()
+    if not cards:
+        return "No open Human-queue cards."
+    lines = []
+    for c in cards:
+        age = c.get("age_hours")
+        age_str = f"{age:.1f}h old" if age is not None else "age unknown"
+        key = f" key:{c['key']}" if c.get("key") else ""
+        lines.append(f"- {c['title']} ({age_str}) [id:{c['id']}]{key}")
+    return "\n".join(lines)
+
+
+def _human_queue_resolve(inp: dict) -> str:
+    from api.services import human_queue
+    id_or_key = inp.get("id_or_key")
+    if not id_or_key:
+        return "Error: 'id_or_key' is required for resolve."
+    task = human_queue.resolve_card(id_or_key, note=inp.get("note"))
+    if not task:
+        return f"Error: no open Human-queue card matching '{id_or_key}'."
+    return f"Human-queue card resolved: \"{task.description}\" (id: {task.id})"
+
+
+def _tool_manage_human_queue(inp: dict) -> str:
+    action = inp["action"]
+    if action == "add":
+        return _human_queue_add(inp)
+    elif action == "list":
+        return _human_queue_list(inp)
+    elif action == "resolve":
+        return _human_queue_resolve(inp)
+    return f"Error: Unknown manage_human_queue action '{action}'"
+
+
 # -- Reminder helpers --
 
 def _reminder_create(inp: dict) -> str:
@@ -3492,6 +3584,7 @@ _TOOL_HANDLERS = {
     "get_message_history": _tool_get_message_history,
     "person_info": _tool_person_info,
     "manage_tasks": _tool_manage_tasks,
+    "manage_human_queue": _tool_manage_human_queue,
     "manage_reminders": _tool_manage_reminders,
     "manage_schedules": _tool_manage_schedules,
     "manage_workouts": _tool_manage_workouts,
@@ -3524,6 +3617,10 @@ TOOL_STATUS_MESSAGES = {
     "manage_tasks.complete": "Completing task...",
     "manage_tasks.update": "Updating task...",
     "manage_tasks.tags": "Loading tag list...",
+    "manage_human_queue": "Managing Human queue...",
+    "manage_human_queue.add": "Filing Human-queue card...",
+    "manage_human_queue.list": "Loading Human queue...",
+    "manage_human_queue.resolve": "Resolving Human-queue card...",
     "manage_reminders": "Managing reminders...",
     "manage_reminders.create": "Setting reminder...",
     "manage_reminders.list": "Loading reminders...",
