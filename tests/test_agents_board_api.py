@@ -262,6 +262,7 @@ class TestBoardStream:
 
         resp = await agents_route.stream_board()
         gen = resp.body_iterator
+        next_task = None
         try:
             first = await gen.__anext__()
             assert first == ": ok\n\n"
@@ -294,6 +295,15 @@ class TestBoardStream:
             assert task.id in [c["id"] for c in second_board["lanes"]["assigned"]]
             assert task.id not in [c["id"] for c in second_board["lanes"]["unassigned"]]
         finally:
+            # If anything between asyncio.wait and `await next_task` raises,
+            # next_task is still pending — closing the generator while its
+            # own __anext__() is still outstanding raises "aclose(): asynchronous
+            # generator is already running" and masks the real error
+            # (#850 round-3 finding 4). Cancel it first so aclose() sees a
+            # generator that isn't mid-iteration.
+            if next_task is not None and not next_task.done():
+                next_task.cancel()
+                await asyncio.gather(next_task, return_exceptions=True)
             await gen.aclose()
 
 

@@ -797,7 +797,15 @@ export function initBoard() {
   // leaves the field, using the latest board already applied by applyBoard
   // (#850 round-2 finding 4).
   if (drawerEl) {
-    drawerEl.addEventListener('focusout', () => {
+    drawerEl.addEventListener('focusout', (e) => {
+      // focusout fires before focus lands on the next element, so a move
+      // WITHIN the drawer (e.g. Tab between fields, or a mousedown on an
+      // action button before its mouseup) still sees `activeElement` as
+      // <body> for an instant. relatedTarget is the element receiving
+      // focus — populated for an intra-drawer move, null when blur() sends
+      // focus to <body> — so only flush once focus has actually left the
+      // drawer (#850 round-3 finding 1).
+      if (e.relatedTarget && drawerEl.contains(e.relatedTarget)) return;
       if (!openCardId) return;
       const fresh = findCard(openCardId);
       if (fresh) updateOpenDrawer(fresh);

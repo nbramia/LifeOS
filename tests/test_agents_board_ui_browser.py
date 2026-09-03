@@ -134,7 +134,8 @@ def _move_card_in_state(board_state: dict, card_id: str, target_lane: str) -> No
 
 
 def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: list, lane_status_code: list,
-                  schedule_puts: list, board_stream_frames: list, stream_gate: "threading.Event | None" = None):
+                  schedule_puts: list, board_stream_frames: list, stream_gate: "threading.Event | None" = None,
+                  lane_response: "list | None" = None):
     """Stub d3 (offline CDN) + every /api/ call the page makes.
 
     `board_stream_frames`: SSE frame strings (each a full
@@ -196,9 +197,14 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             lane_calls.append(body)
             code = lane_status_code[0]
             if code == 200:
-                target_lane = body.get("lane")
-                _move_card_in_state(board_state, lane_match.group(1), target_lane)
-                route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": lane_match.group(1), "lane": target_lane}))
+                # `lane_response`, when given, lets a test simulate the
+                # server landing a card somewhere other than the requested
+                # lane (e.g. a human_queue card that stays put on an
+                # assign) — one popped entry per successful PUT (#850
+                # round-3 finding 2a).
+                landed = lane_response.pop(0) if lane_response else body.get("lane")
+                _move_card_in_state(board_state, lane_match.group(1), landed)
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": lane_match.group(1), "lane": landed}))
             else:
                 route.fulfill(status=code, content_type="application/json", body=json.dumps({"detail": "boom"}))
             return
@@ -233,7 +239,7 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
 
 
 def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_puts=None, lane_status_code=None,
-                 schedule_puts=None, board_stream_frames=None, stream_gate=None):
+                 schedule_puts=None, board_stream_frames=None, stream_gate=None, lane_response=None):
     _stub_routes(
         page,
         board_state if board_state is not None else _board_fixture(),
@@ -243,6 +249,7 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
         schedule_puts if schedule_puts is not None else [],
         board_stream_frames if board_stream_frames is not None else [],
         stream_gate,
+        lane_response,
     )
     page.goto(f"{base_url}/agents")
     page.wait_for_selector('[data-card-id="t1"]')
@@ -432,9 +439,11 @@ class TestLiveUpdates:
         passed even with that check deleted.
 
         This version withholds every `/board/stream` response behind a
-        Python-side `threading.Event` the route handler blocks on
-        (`stream_gate`), so the frame provably cannot arrive until the test
-        releases it — after the drawer is open and mid-edit. It also
+        Python-side `threading.Event` the route handler polls non-blockingly
+        (`stream_gate` — see `_stub_routes`'s docstring for why an actual
+        block would deadlock Playwright's driver thread), so the frame
+        provably cannot arrive until the test releases it — after the
+        drawer is open and mid-edit. It also
         changes a field on a DIFFERENT card (t1) so there's an unambiguous,
         drawer-independent signal that the frame was actually applied."""
         stream_gate = threading.Event()
@@ -480,6 +489,136 @@ class TestLiveUpdates:
         # must actually leave drawerEl) flushes the deferred change.
         page.evaluate("() => document.activeElement.blur()")
         expect(title).to_have_value("Ship the release (renamed in the vault)")
+
+    def test_deferred_frame_flushes_when_focus_leaves_drawer_without_an_edit(self, page: Page, agents_base_url):
+        """#850 round-3 finding 1: the drawerEl `focusout` listener itself
+        must flush a deferred render once focus actually leaves the drawer
+        (blur() to <body>), independent of any field edit. Clicking into
+        notes WITHOUT typing means the notes blur handler's own
+        short-circuit (`value === card.notes`) never fires a PUT or
+        fetchBoard() — the ONLY path left that can flush the deferred
+        frame is the focusout listener. This isolates that listener from
+        the sibling test above, which types text and so is flushed by the
+        notes PUT's own fetchBoard(), never by the listener (verified by
+        temporarily deleting the listener: this test fails, the sibling
+        test above still passes)."""
+        stream_gate = threading.Event()
+        board_state = _board_fixture()
+        board_stream_frames: list[str] = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        title = page.locator(".drawer-title")
+        expect(notes).to_be_visible()
+        expect(title).to_have_value("Ship the release")
+        notes.click()  # focus only, no typing
+
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t2":
+                card["title"] = "Ship the release (renamed in the vault)"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        # Proof the frame was actually applied: an unrelated card (t1)
+        # picks up its new tag chip in the lane view.
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text(
+            "urgent", timeout=5000,
+        )
+        # Still deferred: the open card's drawer hasn't rebuilt yet.
+        expect(title).to_have_value("Ship the release")
+
+        page.evaluate("() => document.activeElement.blur()")
+        expect(title).to_have_value("Ship the release (renamed in the vault)")
+
+    def test_action_button_click_survives_a_deferred_frame(self, page: Page, agents_base_url):
+        """#850 round-3 finding 1: without a `relatedTarget` guard on the
+        focusout listener, mousedown on a drawer action button fires
+        focusout while `document.activeElement` is briefly <body> (focus
+        hasn't landed on the button yet). If a deferred frame is pending at
+        that instant, the drawer gets rebuilt via innerHTML between
+        mousedown and mouseup — the click lands on a now-detached node and
+        the Answer composer never opens."""
+        stream_gate = threading.Event()
+        board_state = _board_fixture()
+        board_stream_frames: list[str] = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t3"]').click()  # t3: pending_question id 1
+        notes = page.locator(".drawer-notes")
+        answer_btn = page.get_by_role("button", name="Answer")
+        expect(notes).to_be_visible()
+        expect(answer_btn).to_be_visible()
+        notes.click()  # focus only, no typing
+
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["human_queue"]:
+            if card["id"] == "t3":
+                card["title"] = "Debug prod issue (renamed)"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        # Proof the frame landed (drawer-independent signal).
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text(
+            "urgent", timeout=5000,
+        )
+
+        answer_btn.click()
+        expect(page.locator("#answer-title")).to_be_visible(timeout=3000)
+
+    def test_lane_mismatch_toast_shows_landed_lane(self, page: Page, agents_base_url):
+        """#850 round-2 finding 2b, untested until now: when the server
+        lands a card in a different lane than requested (e.g. a
+        human_queue card that stays put on an assign attempt), the client
+        must toast the actual landed lane instead of leaving the operator
+        to notice the card "snapped back" on its own."""
+        lane_calls = []
+        _open_board(
+            page, agents_base_url, lane_calls=lane_calls,
+            lane_response=["human_queue"],
+        )
+        _drag_card(page, "t4", "assigned")
+        expect(page.locator(".toast")).to_contain_text("landed in Human queue", timeout=5000)
+        assert lane_calls == [{"lane": "assigned", "assignee": "me"}]
+        expect(page.locator('.board-lane[data-lane="human_queue"] [data-card-id="t4"]')).to_be_visible()
+
+    def test_stale_answer_button_cleared_when_pending_question_resolves(self, page: Page, agents_base_url):
+        """#850 round-2 finding 3, untested until now: when a card's
+        pending_question is cleared elsewhere (the agent gets an answer
+        via another channel), the open drawer must swap out the stale
+        Answer button rather than leaving it behind for a second click
+        that would 404."""
+        stream_gate = threading.Event()
+        board_state = _board_fixture()
+        board_stream_frames: list[str] = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t3"]').click()  # t3: pending_question id 1, human_queue
+        expect(page.get_by_role("button", name="Answer")).to_be_visible()
+        expect(page.get_by_role("button", name="Resolve")).to_have_count(0)
+
+        for card in board_state["lanes"]["human_queue"]:
+            if card["id"] == "t3":
+                card["pending_question"] = None
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        expect(page.get_by_role("button", name="Answer")).to_have_count(0, timeout=5000)
+        expect(page.get_by_role("button", name="Resolve")).to_be_visible()
 
 
 class TestFilters:
