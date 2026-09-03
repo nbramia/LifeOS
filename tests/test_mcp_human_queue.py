@@ -5,7 +5,7 @@ count (67 = 59 CURATED_ENDPOINTS + 8 lifeos_agent_*) matches AGENTS.md.
 """
 import importlib.util
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -60,10 +60,76 @@ class TestCuratedEndpointsRegistration:
 
     def test_tools_do_not_require_worker_handle(self):
         """Unlike lifeos_agent_user_ask, these are plain CURATED_ENDPOINTS
-        REST-mapped tools — dispatched via _call_api, never
-        _handle_inter_agent, so they never touch ctx.worker_handle."""
-        for name in _HUMAN_QUEUE_TOOL_NAMES:
-            assert not name.startswith("lifeos_agent_")
+        REST-mapped tools — dispatched via _call_api's HTTP path, never
+        _handle_inter_agent (the only path that touches ctx.worker_handle).
+        A real dispatch, not just a name-prefix check: patch _handle_inter_
+        agent and assert it's never reached for any of the three tools."""
+        module = _load_mcp_module()
+        server = module.LifeOSMCPServer()
+        fake = MagicMock()
+        fake_response = MagicMock()
+        fake_response.status_code = 200
+        fake_response.json.return_value = {"id": "task-1", "cards": [], "total": 0}
+        fake_response.raise_for_status = MagicMock()
+        fake.get.return_value = fake_response
+        fake.post.return_value = fake_response
+        fake.request.return_value = fake_response
+        server.client = fake
+
+        with patch.object(module.LifeOSMCPServer, "_handle_inter_agent") as mock_inter_agent:
+            server._call_api("lifeos_human_queue_add", {"title": "X"})
+            server._call_api("lifeos_human_queue_list", {})
+            server._call_api("lifeos_human_queue_resolve", {"id_or_key": "x", "note": "done"})
+            mock_inter_agent.assert_not_called()
+
+
+class TestCallApiDispatch:
+    """Real `_call_api` dispatch coverage (#852 review): the tool-count and
+    schema tests above never actually invoke the dispatcher against a
+    mocked HTTP client."""
+
+    def _server_with_mock_client(self, module, response_json):
+        server = module.LifeOSMCPServer()
+        fake = MagicMock()
+        fake_response = MagicMock()
+        fake_response.status_code = 200
+        fake_response.json.return_value = response_json
+        fake_response.raise_for_status = MagicMock()
+        fake.get.return_value = fake_response
+        fake.post.return_value = fake_response
+        fake.request.return_value = fake_response
+        server.client = fake
+        return server, fake
+
+    def test_resolve_dispatches_put_with_key_in_url_and_note_in_body(self):
+        module = _load_mcp_module()
+        server, fake = self._server_with_mock_client(module, {"id": "task-1", "status": "done"})
+
+        server._call_api(
+            "lifeos_human_queue_resolve", {"id_or_key": "sync:gmail", "note": "done"}
+        )
+
+        assert fake.request.call_count == 1
+        method, url = fake.request.call_args.args
+        assert method == "PUT"
+        assert url.endswith("/api/tasks/human-queue/sync:gmail/resolve")
+        assert fake.request.call_args.kwargs["json"] == {"note": "done"}
+
+    def test_format_response_list_includes_both_cards_titles_and_keys(self):
+        module = _load_mcp_module()
+        server = module.LifeOSMCPServer()
+        payload = {
+            "total": 2,
+            "cards": [
+                {"id": "t1", "title": "Re-authenticate example service", "key": "example-reauth", "age_hours": 5.2},
+                {"id": "t2", "title": "Sync source 'gmail' needs attention", "key": "sync:gmail", "age_hours": 30.0},
+            ],
+        }
+        formatted = server._format_response("lifeos_human_queue_list", payload)
+        assert "Re-authenticate example service" in formatted
+        assert "example-reauth" in formatted
+        assert "Sync source 'gmail' needs attention" in formatted
+        assert "sync:gmail" in formatted
 
 
 class TestHttpTransportRegistration:
@@ -126,3 +192,15 @@ class TestStdioTransportRegistration:
         schema = tools["lifeos_human_queue_add"]["inputSchema"]
         assert "title" in schema["properties"]
         assert "title" in schema.get("required", [])
+
+    def test_resolve_tool_input_schema_requires_id_or_key(self):
+        module = _load_mcp_module()
+        server = _server_built_from_fallback(module)
+        response = module.dispatch(
+            server,
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        )
+        tools = {t["name"]: t for t in response["result"]["tools"]}
+        schema = tools["lifeos_human_queue_resolve"]["inputSchema"]
+        assert "id_or_key" in schema["properties"]
+        assert "id_or_key" in schema.get("required", [])

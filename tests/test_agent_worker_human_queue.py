@@ -88,7 +88,10 @@ class TestEndpointDoneWhen:
         w._process_human_queue()
         assert len(api.resolved) == 1
         assert api.resolved[0][0] == "c1"
-        assert "endpoint" in api.resolved[0][1]
+        # Tightened: the resolution note must name the exact path+pointer
+        # checked and the value it matched, not just contain the word
+        # "endpoint" (which every endpoint-type note would trivially do).
+        assert api.resolved[0][1] == "Auto-resolved: endpoint /api/example/status/status == 'ok'"
 
     def test_failing_check_leaves_card_untouched(self, tmp_path):
         api = FakeHumanQueueApi(
@@ -138,7 +141,11 @@ class TestNoDoneWhen:
 class TestPollThrottle:
     def test_second_call_within_interval_is_a_no_op(self, tmp_path, monkeypatch):
         from config.settings import settings
-        monkeypatch.setattr(settings, "human_queue_poll_seconds", 300.0)
+        # A non-default value (production default is 300) — proves
+        # _process_human_queue actually reads settings.human_queue_poll_
+        # seconds rather than a hardcoded 300 that would happen to pass
+        # the old version of this test too.
+        monkeypatch.setattr(settings, "human_queue_poll_seconds", 9999.0)
         flag = tmp_path / "flag"
         flag.write_text("x")
         api = FakeHumanQueueApi(cards=[_card(id="c1", done_when={"type": "file_exists", "path": str(flag)})])
@@ -155,7 +162,7 @@ class TestPollThrottle:
 
     def test_call_after_interval_elapses_runs_again(self, tmp_path, monkeypatch):
         from config.settings import settings
-        monkeypatch.setattr(settings, "human_queue_poll_seconds", 300.0)
+        monkeypatch.setattr(settings, "human_queue_poll_seconds", 9999.0)
         flag = tmp_path / "flag"
         flag.write_text("x")
         api = FakeHumanQueueApi(cards=[_card(id="c1", done_when={"type": "file_exists", "path": str(flag)})])
@@ -164,10 +171,57 @@ class TestPollThrottle:
         assert len(api.resolved) == 1
 
         # Force the throttle clock back so the interval has "elapsed".
-        w._last_human_queue_check -= 400
+        w._last_human_queue_check -= 10000
         api.cards = [_card(id="c2", done_when={"type": "file_exists", "path": str(flag)})]
         w._process_human_queue()
         assert len(api.resolved) == 2
+
+    def test_zero_interval_never_throttles(self, tmp_path, monkeypatch):
+        """poll_seconds=0.0 means every call is past the interval — two
+        back-to-back calls must both actually list/check cards, not just
+        the first."""
+        from config.settings import settings
+        monkeypatch.setattr(settings, "human_queue_poll_seconds", 0.0)
+        flag = tmp_path / "flag"
+        flag.write_text("x")
+        api = FakeHumanQueueApi(cards=[_card(id="c1", done_when={"type": "file_exists", "path": str(flag)})])
+        w = _make_worker(tmp_path, api)
+
+        w._process_human_queue()
+        assert len(api.resolved) == 1
+
+        api.cards = [_card(id="c2", done_when={"type": "file_exists", "path": str(flag)})]
+        w._process_human_queue()
+        assert len(api.resolved) == 2
+
+
+class TestTickInvokesHumanQueue:
+    def test_tick_calls_process_human_queue(self, tmp_path, monkeypatch):
+        """Worker.tick() must actually invoke _process_human_queue — the
+        throttle tests above call _process_human_queue directly and would
+        pass even if tick() never wired it in. Every other step tick()
+        takes is stubbed to a no-op so this test isolates just that wiring,
+        not the rest of the poll cycle."""
+        api = FakeHumanQueueApi(cards=[])
+        w = _make_worker(tmp_path, api)
+        for step in (
+            "_wake_sleeping_sessions",
+            "_poll_managed_sessions",
+            "_resume_yielded_for_children",
+            "_dispatch_spawned_sessions",
+            "_process_clarification_answers",
+            "_timeout_stale_clarifications",
+        ):
+            monkeypatch.setattr(w, step, lambda: None)
+        monkeypatch.setattr(w, "_list_agent_tasks", lambda: [])
+
+        called = []
+        monkeypatch.setattr(w, "_process_human_queue", lambda: called.append(True))
+
+        result = w.tick()
+
+        assert called == [True]
+        assert result == 0
 
 
 class TestMultipleCards:

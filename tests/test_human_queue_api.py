@@ -172,8 +172,8 @@ class TestResolveRoute:
         assert "fixed" in tm.get(card["id"]).notes
 
     def test_resolve_by_key(self, client, tm):
-        card = client.post("/api/tasks/human-queue", json={"title": "X", "key": "my-key"}).json()
-        resp = client.put("/api/tasks/human-queue/my-key/resolve", json={"note": "fixed"})
+        card = client.post("/api/tasks/human-queue", json={"title": "X", "key": "sync:gmail"}).json()
+        resp = client.put("/api/tasks/human-queue/sync:gmail/resolve", json={"note": "fixed"})
         assert resp.status_code == 200
         assert resp.json()["id"] == card["id"]
 
