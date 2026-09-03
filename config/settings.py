@@ -11,7 +11,7 @@ from pathlib import Path
 import frontmatter
 from dotenv import dotenv_values
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -855,6 +855,56 @@ class Settings(BaseSettings):
         description="Command run *inside* the spawned terminal — the actual "
                     "`codex resume` invocation. Substitutions: `{session_id}`, "
                     "`{cwd}`. Set to empty to skip the inner command."
+    )
+    # #851: card assignment to a host other than the API host, over ssh.
+    agent_hosts: dict[str, str] = Field(
+        default_factory=dict,
+        alias="LIFEOS_AGENT_HOSTS",
+        description="JSON object mapping a board-facing host name (e.g. "
+                    "\"studio\") to the ssh target the worker/API should "
+                    "connect to for it (e.g. \"user@studio.example\", or a "
+                    "name from ~/.ssh/config). Operator configuration — never "
+                    "committed with real values. Default {} disables every "
+                    "remote host: a task naming a host not in this map lands "
+                    "at #agent-failed rather than running anywhere. Invalid "
+                    "JSON logs a warning and is treated as {}."
+    )
+
+    @field_validator("agent_hosts", mode="before")
+    @classmethod
+    def _parse_agent_hosts(cls, value):
+        if isinstance(value, dict):
+            return value
+        if value in (None, ""):
+            return {}
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                logger.warning("LIFEOS_AGENT_HOSTS is not valid JSON — ignoring, no remote hosts configured")
+                return {}
+            if not isinstance(parsed, dict):
+                logger.warning("LIFEOS_AGENT_HOSTS must be a JSON object — ignoring, no remote hosts configured")
+                return {}
+            return parsed
+        return {}
+
+    agent_ssh_connect_timeout: int = Field(
+        default=10,
+        alias="LIFEOS_AGENT_SSH_CONNECT_TIMEOUT",
+        description="Seconds ssh may spend establishing a connection to a "
+                    "board-assigned remote host before giving up (`ssh -o "
+                    "ConnectTimeout=<this>`). Applies to remote spawn, remote "
+                    "kill, and remote resume/focus alike."
+    )
+    agent_model_catalog_ttl_seconds: int = Field(
+        default=86400,
+        alias="LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS",
+        description="How long GET /api/agents/models caches each engine's "
+                    "model list before re-querying providers. Default 24h — "
+                    "model catalogs change rarely and every provider call "
+                    "costs a round trip (Anthropic) or a filesystem read "
+                    "(Codex's models_cache.json)."
     )
     cc_resume_enabled: bool = Field(
         default=False,
