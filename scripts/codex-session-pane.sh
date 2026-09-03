@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Codex SessionStart hook → bind session_id → wezterm pane_id.
 #
+# Superseded by scripts/lifeos-agent-hook.sh (#849), which registers a
+# session from ANY machine (not just the one hosting the API) and covers
+# every hook event, not just SessionStart. Kept here unchanged for
+# existing operator configs that still point at it; new installs should
+# use scripts/install-agent-hooks.sh instead.
+#
 # Sibling of claude-session-pane.sh. Install by adding this file as a
 # SessionStart hook in ~/.codex/hooks.json:
 #
