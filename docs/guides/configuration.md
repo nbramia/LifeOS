@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-08-28
+**Last Updated:** 2026-09-03
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -231,6 +231,20 @@ Mirror of the Claude Code resume controls for Codex sessions. Drives `POST /api/
 | `LIFEOS_CODEX_RESUME_ENABLED` | bool | `false` | Gates the resume UI and route for `cx:` sessions. |
 | `LIFEOS_CODEX_RESUME_CMD` | str | `wezterm cli spawn --cwd {cwd} -- {inner_command}` | Outer launcher template. Same substitution surface as `LIFEOS_CC_RESUME_CMD`. |
 | `LIFEOS_CODEX_RESUME_INNER_CMD` | str | `codex resume {session_id}` | Inner command run inside the spawned terminal. |
+
+## Cross-Machine CLI Session Registration (`/agents` from any host)
+
+Lets a Claude Code or Codex session running on any machine — not just the one hosting the API — register itself with `/agents`. See [agent-viz technical spec § Cross-machine CLI session registration](../specs/technical/agent-viz.md#cross-machine-cli-session-registration) and [guides/agents-go-to.md § 4](agents-go-to.md#4-cross-machine-session-registration) for setup.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_AGENT_HOOK_TOKEN` | str | *(empty)* | Bearer token required from `scripts/lifeos-agent-hook.sh` on `POST /api/agents/cli-sessions/events`. Empty disables the endpoint (503). |
+
+The token above is set on the machine hosting the API. Each machine *posting* session events (the API host included, if you want its own sessions to carry a `host`) additionally needs a local env file the hook script reads — not a LifeOS setting, since it's per-machine and lives outside `.env`:
+
+| File | Purpose |
+|---|---|
+| `~/.config/lifeos/agent-hook.env` (override path via `$LIFEOS_AGENT_HOOK_ENV`) | Contains `LIFEOS_API_URL` and `LIFEOS_AGENT_HOOK_TOKEN` (the same token as above). Values already set in the environment take precedence over this file. Absent → the hook exits silently without posting. |
 
 ## Claude Code Orchestration (`/claude` Telegram command)
 

@@ -2,12 +2,13 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-08-28
+**Last Updated:** 2026-09-03
 
-Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two adjacent catalogs split out for size:
+Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Three adjacent catalogs split out for size:
 
 - **CRM endpoints** (`/api/crm/*`) → [api-crm.md](api-crm.md)
 - **MCP tool catalog** (Claude Code / Managed Agents tools) → [mcp-tools.md](mcp-tools.md)
+- **Agent activity endpoints** (`/api/agents/*` — snapshot, kill, resume, cross-machine CLI session registration) → [Agent Viz — Technical](../technical/agent-viz.md#endpoints)
 
 ---
 
@@ -18,18 +19,19 @@ Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two
 3. [Google Integration](#google-integration)
 4. [Messaging Endpoints](#messaging-endpoints)
 5. [CRM Endpoints — see api-crm.md](api-crm.md)
-6. [Memories Endpoints](#memories-endpoints)
-7. [Conversations Endpoints](#conversations-endpoints)
-8. [Briefing Endpoints](#briefing-endpoints)
-9. [People Endpoints](#people-endpoints)
-10. [Photos Endpoints](#photos-endpoints)
-11. [Task Endpoints](#task-endpoints)
-12. [Scheduler & Telegram Endpoints](#scheduler--telegram-endpoints)
-13. [Monarch Money Endpoints](#monarch-money-endpoints)
-14. [Job Queue Endpoints](#job-queue-endpoints)
-15. [Performance Trace Endpoints](#performance-trace-endpoints)
-16. [Admin Endpoints](#admin-endpoints)
-17. [MCP Tools — see mcp-tools.md](mcp-tools.md)
+6. [Agent Activity Endpoints — see agent-viz.md](../technical/agent-viz.md#endpoints)
+7. [Memories Endpoints](#memories-endpoints)
+8. [Conversations Endpoints](#conversations-endpoints)
+9. [Briefing Endpoints](#briefing-endpoints)
+10. [People Endpoints](#people-endpoints)
+11. [Photos Endpoints](#photos-endpoints)
+12. [Task Endpoints](#task-endpoints)
+13. [Scheduler & Telegram Endpoints](#scheduler--telegram-endpoints)
+14. [Monarch Money Endpoints](#monarch-money-endpoints)
+15. [Job Queue Endpoints](#job-queue-endpoints)
+16. [Performance Trace Endpoints](#performance-trace-endpoints)
+17. [Admin Endpoints](#admin-endpoints)
+18. [MCP Tools — see mcp-tools.md](mcp-tools.md)
 
 ---
 

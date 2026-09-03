@@ -1,7 +1,7 @@
 # Scripts Reference
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-28
+> **Last Updated:** 2026-09-03
 > **Audience:** Operators
 
 Reference for the operator-facing scripts under `scripts/`, with usage examples. One-off CRM entity-repair scripts (`merge_people.py`, `split_person.py`, `fix_*`, etc.), git hooks, and Claude Code worktree/session-diagnostic helpers aren't covered here — they're self-documenting via `--help` or their own docstring.
@@ -220,6 +220,8 @@ Example:
 | `install_codex_skills.py` | Convert portable LifeOS skills from `.claude/skills/` into Codex's `SKILL.md` format into `~/.codex/skills/`. Re-run after editing source skills. |
 | `register_persona_bot.py` | Safely register a new persona Telegram bot: appends its token/chat-id env vars to `.env` (append-only — a symlinked `.env` stays a symlink) and adds it to `config/telegram_bots.local.json` (seeded from the template on first use). Does not register the bot with @BotFather or restart the service — see [personas.md](personas.md#create-your-own-persona). |
 | `create-lifeos-app.sh` | Create the `LifeOS.app` Full Disk Access wrapper bundle in `/Applications` (macOS only), the FDA container cron/launchd route through for protected databases. |
+| `lifeos-agent-hook.sh` | Claude Code / Codex session-lifecycle hook — posts session_start/user_prompt_submit/stop/session_end to `POST /api/agents/cli-sessions/events` from any machine, so `/agents` shows sessions from every machine, not just this one. Installed by `install-agent-hooks.sh`; see [agents-go-to.md § 4](agents-go-to.md#4-cross-machine-session-registration). |
+| `install-agent-hooks.sh` | Idempotently installs `lifeos-agent-hook.sh` into `~/.claude/settings.json` and `~/.codex/hooks.json`. Run once per machine; safe to re-run. |
 | `preflight.sh` | Pre-flight checks (called by server.sh) |
 | `run_sync_wrapper.sh` | NVMe wake + pre-flight for nightly sync |
 | `run_sync_with_fda.sh` | FDA wrapper for phone/iMessage sync (macOS) |

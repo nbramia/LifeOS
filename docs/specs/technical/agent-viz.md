@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-05-29
+> **Last Updated:** 2026-09-03
 
 Engineering view of the `/agents` page — endpoint shapes, ingest paths, status inference, layout, and security boundaries. For the consumer view see [product/agent-viz.md](../product/agent-viz.md).
 
@@ -17,14 +17,15 @@ Engineering view of the `/agents` page — endpoint shapes, ingest paths, status
 5. [Claude Code ingest](#claude-code-ingest)
 6. [Status inference (Claude Code)](#status-inference-claude-code)
 7. [Live process detection](#live-process-detection)
-8. [Snapshot caching](#snapshot-caching)
-9. [D3 force-graph](#d3-force-graph)
-10. [Side-panel SSE](#side-panel-sse)
-11. [Operator kill](#operator-kill)
-12. [Claude Code resume](#claude-code-resume)
-13. [Worker resilience](#worker-resilience)
-14. [Security boundaries](#security-boundaries)
-15. [Related Documents](#related-documents)
+8. [Cross-machine CLI session registration](#cross-machine-cli-session-registration)
+9. [Snapshot caching](#snapshot-caching)
+10. [D3 force-graph](#d3-force-graph)
+11. [Side-panel SSE](#side-panel-sse)
+12. [Operator kill](#operator-kill)
+13. [Claude Code resume](#claude-code-resume)
+14. [Worker resilience](#worker-resilience)
+15. [Security boundaries](#security-boundaries)
+16. [Related Documents](#related-documents)
 
 ---
 
@@ -60,7 +61,7 @@ The route file imports the worker's `SessionStore` and `TranscriptStore` directl
 
 ## Endpoints
 
-All under `/api/agents`. Local-network only — the kill and resume endpoints must not be exposed via the public MCP HTTP transport.
+All under `/api/agents`. Local-network only, with one deliberate exception: `POST /cli-sessions/events` (#849) is meant to be reachable over Tailscale, gated by a bearer token instead of an IP check — see [Security boundaries](#security-boundaries). The kill, resume, focus, and pane-bind endpoints must not be exposed via the public MCP HTTP transport.
 
 | Method + Path | Purpose |
 |---|---|
@@ -70,9 +71,11 @@ All under `/api/agents`. Local-network only — the kill and resume endpoints mu
 | `GET /sessions/{id}/stream?backfill=N` | Per-session SSE: backfill last N events (default 50, max 500), then live-tail. Closes cleanly when the session reaches terminal status (LifeOS) or after 5 min idle (Claude Code). |
 | `POST /sessions/{id}/kill` | Operator kill — body `{reason: ""}`. LifeOS sessions only. Cascades to descendants in the subtree. |
 | `PUT /sessions/{id}/label` | Set or clear an operator-pinned manual label — body `{label: ""}`. Non-empty pins a custom node name that overrides the auto-derived label and AI summary label everywhere it's shown; empty clears it. Durable in `data/agent_viz_label_overrides.db` (in-process cache, lazy-loaded). Works for both LifeOS and `cc:` sessions. |
-| `POST /sessions/{id}/resume` | Resume a Claude Code session — body `{extra_env: {}}`. `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. Spawns a WezTerm tab via `wezterm cli spawn`, captures the pane id from stdout, and stores `session_id → pane_id` in `data/cc_wezterm.db` so Focus can target it later. |
-| `POST /sessions/{id}/focus` | Activate the WezTerm pane for this session (Go To). `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. Resolves the pane id from the cached mapping first, then falls back to an FD probe (lsof + /proc + wezterm cli list) so it works for sessions never opened via Resume. 404 only when both the cache *and* the probe come up empty; 410 when the pane existed but is gone and no replacement is found. |
+| `POST /sessions/{id}/resume` | Resume a Claude Code session — body `{extra_env: {}}`. `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. Spawns a WezTerm tab via `wezterm cli spawn`, captures the pane id from stdout, and stores `session_id → pane_id` in `data/cc_wezterm.db` so Focus can target it later. 409 if the `cli_sessions` row for this id records a `host` other than this API's own (see [Cross-machine CLI session registration](#cross-machine-cli-session-registration)). |
+| `POST /sessions/{id}/focus` | Activate the WezTerm pane for this session (Go To). `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. Resolves the pane id from the cached mapping first, then falls back to an FD probe (lsof + /proc + wezterm cli list) so it works for sessions never opened via Resume. 404 only when both the cache *and* the probe come up empty; 410 when the pane existed but is gone and no replacement is found. Same 409-for-remote-host rule as `/resume`. |
 | `POST /cc-pane-bind` | Localhost-only endpoint called by the Claude Code SessionStart hook. Body `{session_id, pane_id, cwd}`. Upserts the mapping in `cc_wezterm.db` so Go To can target newly-started `claude` invocations without a probe. 403 from non-loopback callers. |
+| `POST /cx-pane-bind` | Codex sibling of `/cc-pane-bind`. Same body shape and localhost-only gate; keys `cx:`-prefixed rows in the same store. |
+| `POST /cli-sessions/events` | Cross-machine session registration (#849) — see [Cross-machine CLI session registration](#cross-machine-cli-session-registration). Bearer-token gated, reachable from any host. Body `{engine, event, session_id, host, cwd?, transcript_path?, branch?, model?, prompt_preview?, task_id?, pane_id?, wezterm_pid?}`. |
 
 Heartbeats: per-session SSE emits a `:heartbeat\n\n` comment every 15s when there's no new event, so dropped connections surface quickly through the browser's `EventSource` retry.
 
@@ -112,10 +115,13 @@ One session row, unified shape (both sources):
 | `model_label` | str | Short badge — `Local` / `Haiku` / `Sonnet` / `Opus` / `Claude Code`. |
 | `last_event_kind` | str | Most recent transcript event kind — drives the side-panel "last" tooltip. |
 | `tool_call_count`, `error_count` | int | Summed across the transcript tail (last 100 events). |
-| `source` | str | `lifeos_agent` or `claude_code`. Frontend uses this to pick the shape. |
-| `status_inferred` | bool | Claude Code only. `false` means status came from a confirmed live process. |
+| `source` | str | `lifeos_agent`, `claude_code`, or `codex`. Frontend uses this to pick the shape. |
+| `status_inferred` | bool | `false` means status came from a confirmed live process or from a `cli_sessions` registration event; `true` means it was guessed from transcript mtime. |
 | `project_key`, `decoded_cwd` | str | Claude Code only. `project_key` is the dir name under `~/.claude/projects/`; `decoded_cwd` is the original cwd. |
 | `is_subagent` | bool | True for synthetic Task/Agent tool-use children. |
+| `host` | str | The machine this session is running on (#849). Always present — LifeOS and locally-scanned CLI rows get the API's own host (`api_host_name()`); a row that also has (or only has) a `cli_sessions` registration gets that row's `host` instead. |
+| `branch` | str \| null | Git branch of the session's cwd, from the most recent registration event. Only present on a session with at least one `cli_sessions` row. |
+| `prompt_preview` | str \| null | Most recent user prompt, truncated to 200 chars, from the most recent `user_prompt_submit` registration event. Only present on a session with at least one `cli_sessions` row. |
 
 ---
 
@@ -186,6 +192,57 @@ Failure modes degrade gracefully — `psutil` missing or a transient `AccessDeni
 The scan result is cached per-process for 5 seconds so one snapshot tick across many sessions enumerates `/proc` once, not once per session.
 
 In `build_snapshot`, the second pass uses this map to **per-cwd promote the top-N most-recently-modified sessions to authoritative `running`** — where N is the live process count for that cwd. This is the key fix for the earlier bug where one live session in a project flipped every historical jsonl in that project to `running`.
+
+---
+
+## Cross-machine CLI session registration
+
+Local process detection and the transcript scan both stop at this machine's filesystem — they cannot see a Claude Code or Codex session running on a laptop or a second box. Issue #849 adds an independent, push-based path for that: `scripts/lifeos-agent-hook.sh` posts a lifecycle event from wherever the CLI is running to `POST /api/agents/cli-sessions/events`, and the API keeps a small per-session record that the snapshot builder unions onto whatever the transcript scan already found.
+
+### Storage: `cli_sessions`
+
+Table lives in the same SQLite file `SessionStore` already owns (`api/services/agent_worker/session_store.py`, `CREATE TABLE IF NOT EXISTS` — no migration needed, it's a new table). One row per session, keyed the same way the snapshot union already keys transcript-derived rows:
+
+| Column | Notes |
+|---|---|
+| `session_id` | PK. `cc:<uuid>` or `cx:<uuid>` — `CLI_ENGINE_PREFIXES = {"claude_code": "cc", "codex": "cx"}` maps the event's `engine` field to the prefix. |
+| `engine` | `claude_code` or `codex`. |
+| `host` | Hostname the hook posted from, verbatim (no validation against a known-hosts list). |
+| `cwd`, `transcript_path`, `branch`, `model` | Optional; a `None` on an incoming event leaves the stored value alone rather than blanking it — a `stop` event with no `branch` field doesn't erase what `session_start` recorded. |
+| `status` | `idle` \| `running` \| `ended` — see the status machine below. |
+| `prompt_preview` | Truncated to `CLI_PROMPT_PREVIEW_MAX = 200` chars, set only by `user_prompt_submit` events. |
+| `task_id` | Opaque string from the CLI's `$LIFEOS_TASK_ID` env var. Stored and exposed verbatim — **never validated against the task store** (issue #853, built in parallel; this issue takes no dependency on its schema or code). |
+| `pane_id`, `wezterm_pid` | Only meaningful when the hook ran inside a WezTerm pane; `None` otherwise. |
+| `started_at`, `last_event_at`, `ended_at` | Unix epoch seconds. `ended_at` is set on `session_end` and cleared on a subsequent `session_start` (a resumed session sends `session_start` again — see below). |
+
+`SessionStore.record_cli_session_event(engine, event, session_id, host, ...)` applies one event: **status machine** — `session_start` → `idle`, `user_prompt_submit` → `running` (+ prompt preview), `stop` → `idle`, `session_end` → `ended`. A row is created on whichever event is first seen for a session id — not necessarily `session_start` — so a hook installed mid-session, or a lost `session_start` post, still registers the session rather than silently never appearing.
+
+### Endpoint: `POST /cli-sessions/events`
+
+`_check_agent_hook_auth(request)` mirrors `hermes_proxy._check_hermes_inbound_auth`: empty `LIFEOS_AGENT_HOOK_TOKEN` → 503 (endpoint disabled by default — a fresh clone accepts no unauthenticated writes from the tailnet); missing/wrong bearer → 401; `hmac.compare_digest` for the comparison. `engine` not in `CLI_ENGINE_PREFIXES` or `event` not in `CLI_SESSION_EVENTS` → 422.
+
+On a successful call, if the event's `host` equals this API's own host (`api_host_name()`) **and** it carries a `pane_id`, the handler also upserts into `CCWezTermStore` — the same table `/cc-pane-bind` and `/cx-pane-bind` write to — so Go To keeps working for a session registered this way instead of via the pane-bind hook specifically. A remote host's `pane_id` has nowhere local to activate, so it's stored on the `cli_sessions` row only, never mirrored into the pane store.
+
+### Snapshot union
+
+`_build_snapshot()` reads every `cli_sessions` row into a dict keyed by `session_id` before running the Claude Code and Codex transcript scans. Each transcript-derived row `.pop()`s its match out of that dict:
+
+- **Match found** (`_apply_cli_session_to_dict`) — the transcript row's `status`/`status_inferred` are overwritten from the registration (event-driven status always wins over the transcript's file-age guess); `host`, `branch`, `prompt_preview` are copied in; `task_id` is copied in only if the event supplied one. Token/dollar fields are left as the transcript computed them — the hook posts no usage data.
+- **No match** (`_cli_session_to_dict`) — a fully synthetic row: `host`/`branch`/`prompt_preview`/`task_id` from the `cli_sessions` row, `source` = the engine name, `status_inferred = False` always (there's no inference here, only events), zero token/dollar fields, `decoded_cwd` from the row's `cwd`.
+
+Whatever's left in the dict after both scans ran — a remote host, or (rarely) a local hook post that raced ahead of the transcript scan's 30s cache — is bounded to the same recency window each engine's transcript scan already applies (`claude_code_lookback_days` / `codex_lookback_days`) before becoming a synthetic row, so a stale registration doesn't linger in the snapshot forever.
+
+Worker (`lifeos_agent`) rows always get `host = api_host_name()` directly in `_session_to_dict` — there's no cross-host worker dispatch, so they never need a `cli_sessions` lookup.
+
+### Focus / Resume and remote hosts
+
+`_check_session_host_or_409(session_id)` looks up the id's `cli_sessions` row; if one exists and its `host` differs from `api_host_name()`, both `/focus` and `/resume` (checked before any local wezterm work) return 409 with the recorded host in `detail`. A session with no `cli_sessions` row at all (never registered, or registered before this feature existed) is unaffected — it falls through to the pre-existing cache/probe resolution unchanged. Remote resume and focus themselves aren't implemented — that needs the ssh mechanism from the assignment-and-execution issue; 409 is the honest answer in the meantime, not a silent no-op or a misleading 404.
+
+### Hook script and installer
+
+`scripts/lifeos-agent-hook.sh` is a single portable script (bash 3.2-compatible for macOS) that serves every hook event — engine and event name are passed as argv (`lifeos-agent-hook.sh claude_code session_start`). It reads the hook's JSON stdin payload via `jq`, adds the hostname (`hostname` with any domain suffix stripped), the cwd's git branch (`git -C "$cwd" rev-parse --abbrev-ref HEAD`), and `$LIFEOS_TASK_ID`, and POSTs to `/cli-sessions/events` with `curl --max-time 2`. It sources a small env file (`~/.config/lifeos/agent-hook.env`, override via `$LIFEOS_AGENT_HOOK_ENV`) for `LIFEOS_API_URL` / `LIFEOS_AGENT_HOOK_TOKEN` — values already in the environment take precedence over the file. Every non-fatal condition (missing `jq`/`curl`, empty stdin, no token configured, API unreachable) exits 0 silently and writes nothing to stdout, so it can never block or corrupt the CLI's own hook processing. Pane fields are included only when `$WEZTERM_PANE` is set — unlike `claude-session-pane.sh`, running outside WezTerm is a normal case, not a silent no-op, since registration doesn't depend on a pane to exist.
+
+`scripts/install-agent-hooks.sh` appends one entry per event to `~/.claude/settings.json` and `~/.codex/hooks.json` (overridable via `LIFEOS_CLAUDE_SETTINGS` / `LIFEOS_CODEX_HOOKS` for testing), identifying a prior install by the substring `lifeos-agent-hook.sh` in an existing entry's `command` so re-running it is a no-op. Every other tool's entries — Orca, atuin, a legacy `claude-session-pane.sh` / `codex-session-pane.sh` entry — are left untouched. Writes via temp file + `mv`. The installed command wraps the absolute path of the script in *this* checkout so a moved or deleted checkout degrades to a no-op instead of an error: `bash -c 's="<path>"; [ -x "$s" ] && exec "$s" <engine> <event>; exit 0'`. It never writes the token itself — it prints setup instructions for the operator.
 
 ---
 
@@ -286,7 +343,7 @@ POST /api/agents/sessions/{id}/focus    body: (none)
 POST /api/agents/cc-pane-bind           body: {session_id, pane_id, cwd}   (localhost only)
 ```
 
-All three opt-in via `LIFEOS_CC_RESUME_ENABLED` (except `/cc-pane-bind`, which is gated by client IP only — `127.0.0.1` / `::1`). Resume spawns a new WezTerm tab and records the new pane id; Go To (`/focus`) revisits the pane for a session, falling back to an FD probe when no mapping is cached; `/cc-pane-bind` is the SessionStart hook entry point that pre-populates the mapping at `claude` startup.
+All three opt-in via `LIFEOS_CC_RESUME_ENABLED` (except `/cc-pane-bind`, which is gated by client IP only — `127.0.0.1` / `::1`). Resume spawns a new WezTerm tab and records the new pane id; Go To (`/focus`) revisits the pane for a session, falling back to an FD probe when no mapping is cached; `/cc-pane-bind` is the SessionStart hook entry point that pre-populates the mapping at `claude` startup. Both Resume and Go To also check `_check_session_host_or_409` first (#849) — a session whose `cli_sessions` row names a different host than this API's own 409s immediately, before any local wezterm work runs; see [Cross-machine CLI session registration](#cross-machine-cli-session-registration).
 
 ### Resume
 
@@ -355,7 +412,7 @@ RestartSec=10
 
 ## Security boundaries
 
-The threat model: the LifeOS MCP HTTP transport is publicly accessible via Tailscale Funnel and is the obvious place an external agent or compromised credential could hit LifeOS endpoints. `/kill`, `/resume`, and `/focus`:
+The threat model: the LifeOS MCP HTTP transport is publicly accessible via Tailscale Funnel and is the obvious place an external agent or compromised credential could hit LifeOS endpoints. `/cli-sessions/events` is the one endpoint in this file deliberately reachable over Tailscale rather than local-network-only — it's gated by `LIFEOS_AGENT_HOOK_TOKEN` instead of an IP check, disabled entirely (503) until an operator sets one, and `hmac.compare_digest` avoids a timing side-channel on the comparison. It carries no more authority than "register a session and its metadata" — it cannot kill, resume, or focus anything, and a registered `host` is trusted as-given rather than verified (the worst a spoofed host can do is make a fabricated session appear to run somewhere it doesn't; it can't act on any real session). `/kill`, `/resume`, and `/focus`:
 
 - Live under `/api/agents/*` — the MCP transport never proxies this prefix.
 - Are not registered as MCP tools — so they cannot be invoked through the MCP layer even if an attacker has a bearer token.
