@@ -48,6 +48,58 @@ class TestValidateDoneWhen:
         with pytest.raises(human_queue.DoneWhenError):
             human_queue.validate_done_when("endpoint")
 
+    @pytest.mark.parametrize("path", ["@host/x", "//host/x", "http://host/x", "host/x"])
+    def test_endpoint_path_must_start_with_single_slash(self, path):
+        """A path that doesn't start with exactly one '/' could re-parse
+        the URL's authority when the worker builds f"{api_base}{path}"
+        (e.g. '@evil/x' -> 'http://localhost:8000@evil/x') — a blind SSRF
+        primitive reachable by any agent that can file a card."""
+        with pytest.raises(human_queue.DoneWhenError):
+            human_queue.validate_done_when(
+                {"type": "endpoint", "path": path, "pointer": "/status", "equals": "ok"}
+            )
+
+    def test_endpoint_non_string_path_raises(self):
+        with pytest.raises(human_queue.DoneWhenError):
+            human_queue.validate_done_when(
+                {"type": "endpoint", "path": ["/x"], "pointer": "/status", "equals": "ok"}
+            )
+
+    def test_endpoint_list_equals_raises(self):
+        with pytest.raises(human_queue.DoneWhenError):
+            human_queue.validate_done_when(
+                {"type": "endpoint", "path": "/x", "pointer": "/status", "equals": ["ok"]}
+            )
+
+    def test_endpoint_bracket_in_pointer_raises(self):
+        with pytest.raises(human_queue.DoneWhenError):
+            human_queue.validate_done_when(
+                {"type": "endpoint", "path": "/x", "pointer": "/a]b", "equals": "ok"}
+            )
+
+    def test_endpoint_bracket_in_string_equals_raises(self):
+        with pytest.raises(human_queue.DoneWhenError):
+            human_queue.validate_done_when(
+                {"type": "endpoint", "path": "/x", "pointer": "/status", "equals": "a]b"}
+            )
+
+    def test_endpoint_scalar_equals_types_accepted(self):
+        for equals in (1, 1.5, True, None):
+            dw = {"type": "endpoint", "path": "/x", "pointer": "/status", "equals": equals}
+            assert human_queue.validate_done_when(dw) == dw
+
+    def test_file_exists_non_string_path_raises(self):
+        with pytest.raises(human_queue.DoneWhenError):
+            human_queue.validate_done_when({"type": "file_exists", "path": 5})
+
+    def test_file_exists_empty_path_raises(self):
+        with pytest.raises(human_queue.DoneWhenError):
+            human_queue.validate_done_when({"type": "file_exists", "path": ""})
+
+    def test_file_exists_bracket_in_path_raises(self):
+        with pytest.raises(human_queue.DoneWhenError):
+            human_queue.validate_done_when({"type": "file_exists", "path": "/tmp/a]b"})
+
 
 class TestAddCard:
     def test_add_creates_blocked_human_task(self, tm):
@@ -60,6 +112,17 @@ class TestAddCard:
         other = tm.create("Unrelated todo")
         human_queue.add_card(title="Something for the operator")
         assert tm.get(other.id).status == "todo"
+
+    def test_key_with_slash_raises(self, tm):
+        """A key is interpolated unescaped into the resolve route's URL
+        path segment — '/', '?', '#' would split the path or start a
+        query/fragment, making the card unresolvable by key."""
+        with pytest.raises(ValueError):
+            human_queue.add_card(title="X", key="a/b")
+
+    def test_colon_key_accepted(self, tm):
+        task = human_queue.add_card(title="X", key="sync:gmail")
+        assert tm.get(task.id).fields.get("key") == "sync:gmail"
 
     def test_add_stores_source_and_key_fields(self, tm):
         task = human_queue.add_card(

@@ -100,6 +100,39 @@ class TestAddRoute:
         resp = client.post("/api/tasks/human-queue", json={})
         assert resp.status_code == 400
 
+    @pytest.mark.parametrize("path", ["@host/x", "//host/x", "http://host/x"])
+    def test_done_when_path_authority_injection_returns_422(self, client, tm, path):
+        resp = client.post("/api/tasks/human-queue", json={
+            "title": "X",
+            "done_when": {"type": "endpoint", "path": path, "pointer": "/status", "equals": "ok"},
+        })
+        assert resp.status_code == 422
+
+    def test_done_when_non_string_path_returns_422(self, client, tm):
+        resp = client.post("/api/tasks/human-queue", json={
+            "title": "X",
+            "done_when": {"type": "endpoint", "path": 5, "pointer": "/status", "equals": "ok"},
+        })
+        assert resp.status_code == 422
+
+    def test_done_when_list_equals_returns_422(self, client, tm):
+        resp = client.post("/api/tasks/human-queue", json={
+            "title": "X",
+            "done_when": {"type": "endpoint", "path": "/x", "pointer": "/status", "equals": ["ok"]},
+        })
+        assert resp.status_code == 422
+
+    def test_done_when_bracket_in_pointer_returns_422(self, client, tm):
+        resp = client.post("/api/tasks/human-queue", json={
+            "title": "X",
+            "done_when": {"type": "endpoint", "path": "/x", "pointer": "/a]b", "equals": "ok"},
+        })
+        assert resp.status_code == 422
+
+    def test_key_with_slash_returns_422(self, client, tm):
+        resp = client.post("/api/tasks/human-queue", json={"title": "X", "key": "a/b"})
+        assert resp.status_code == 422
+
 
 class TestListRoute:
     def test_list_returns_open_cards(self, client, tm):

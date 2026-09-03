@@ -480,14 +480,16 @@ TOOL_DEFINITIONS = [
                 "notes": {"type": "string", "description": "What needs doing and why (for add)."},
                 "key": {
                     "type": "string",
-                    "description": "Dedupe key (for add). Filing again with an already-open "
-                                   "key updates that card's notes instead of duplicating it.",
+                    "description": "Dedupe key (for add). Letters, digits, '.', ':', '-', '_' "
+                                   "only. Filing again with an already-open key updates that "
+                                   "card's notes instead of duplicating it.",
                 },
                 "done_when": {
                     "type": "object",
                     "description": "Optional auto-resolve check (for add): "
                                    "{type: 'endpoint', path, pointer, equals} or "
-                                   "{type: 'file_exists', path}.",
+                                   "{type: 'file_exists', path}. For 'endpoint', path must "
+                                   "start with '/' (not '//').",
                 },
                 "id_or_key": {"type": "string", "description": "Card id or dedupe key (for resolve)."},
                 "note": {"type": "string", "description": "Resolution note (for resolve)."},

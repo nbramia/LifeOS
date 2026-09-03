@@ -17,6 +17,7 @@ round-trips cleanly through the markdown task line — see
 """
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -32,10 +33,33 @@ STATUS_OPEN = "blocked"
 _ENDPOINT_TYPE = "endpoint"
 _FILE_EXISTS_TYPE = "file_exists"
 
+# Dedupe key shape — kept narrow because a key is interpolated unescaped
+# into a URL path segment (`PUT /api/tasks/human-queue/{id_or_key}/resolve`
+# and the sync integration's `sync:<source>` keys); `/`, `?`, `#` would
+# split the path or start a query/fragment, making the card unresolvable
+# by key. Word characters plus `.`, `:`, `-` cover every key this codebase
+# files (`sync:gmail`, `monarch-reauth`) with room for more.
+_KEY_RE = re.compile(r"^[\w.:-]+$")
+
+# `equals` must be JSON-scalar — anything else can't round-trip through the
+# compact JSON stored in the `done_when` field, or through the worker's `==`
+# comparison against a JSON-Pointer-extracted value.
+_SCALAR_TYPES = (str, int, float, bool, type(None))
+
 
 class DoneWhenError(ValueError):
     """Raised for a malformed `done_when`. The route layer maps this to
     HTTP 422, same as `task_manager.TaskManager`'s own `ValueError`s."""
+
+
+def _reject_bracket(name: str, value: str) -> None:
+    """`task_manager._validate_text_fields` rejects a `]` anywhere in a
+    `fields` value (done_when is stored as one compact-JSON fields value),
+    which would otherwise surface as an opaque `fields['done_when'] must
+    not contain ']'` error with no hint of which done_when key was at
+    fault. Check each string sub-value up front so the error names it."""
+    if "]" in value:
+        raise DoneWhenError(f"done_when.{name} must not contain ']'")
 
 
 def validate_done_when(done_when: Optional[dict]) -> Optional[dict]:
@@ -49,6 +73,13 @@ def validate_done_when(done_when: Optional[dict]) -> Optional[dict]:
     an invalid `done_when` — so this is a manual check the route layer
     catches and maps to 422 itself, matching the existing
     `_require_valid_status` pattern in `api/routes/tasks.py`.
+
+    `path` (both types) must be a string starting with `/` and not `//` —
+    the worker builds the request URL as `f"{api_base}{path}"`
+    (`agent_worker/worker.py`), so an unvalidated `path` like `@host/x` or
+    `//host/x` would re-parse the authority and make the worker's
+    `done_when` poll an SSRF primitive reachable by any agent that can file
+    a card. `pointer` must be a string; `equals` must be a JSON scalar.
     """
     if done_when is None:
         return None
@@ -61,16 +92,31 @@ def validate_done_when(done_when: Optional[dict]) -> Optional[dict]:
             raise DoneWhenError(
                 f"done_when type 'endpoint' missing required key(s): {', '.join(missing)}"
             )
+        path, pointer, equals = done_when["path"], done_when["pointer"], done_when["equals"]
+        if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+            raise DoneWhenError("done_when.path must be a string starting with '/' (not '//')")
+        if not isinstance(pointer, str):
+            raise DoneWhenError("done_when.pointer must be a string")
+        if not isinstance(equals, _SCALAR_TYPES):
+            raise DoneWhenError("done_when.equals must be a string, number, boolean, or null")
+        _reject_bracket("path", path)
+        _reject_bracket("pointer", pointer)
+        if isinstance(equals, str):
+            _reject_bracket("equals", equals)
         return {
             "type": _ENDPOINT_TYPE,
-            "path": done_when["path"],
-            "pointer": done_when["pointer"],
-            "equals": done_when["equals"],
+            "path": path,
+            "pointer": pointer,
+            "equals": equals,
         }
     if dw_type == _FILE_EXISTS_TYPE:
         if "path" not in done_when:
             raise DoneWhenError("done_when type 'file_exists' missing required key: path")
-        return {"type": _FILE_EXISTS_TYPE, "path": done_when["path"]}
+        path = done_when["path"]
+        if not isinstance(path, str) or not path:
+            raise DoneWhenError("done_when.path must be a non-empty string")
+        _reject_bracket("path", path)
+        return {"type": _FILE_EXISTS_TYPE, "path": path}
     raise DoneWhenError(
         f"invalid done_when type {dw_type!r}; must be 'endpoint' or 'file_exists'"
     )
@@ -122,11 +168,14 @@ def add_card(
     DONE card is treated as unclaimed: a fresh open card is created.
 
     Raises `DoneWhenError` (422) for a malformed `done_when`, or `ValueError`
-    (422) for `title`/`notes`/field content that would corrupt the task line
-    — see `task_manager._validate_text_fields`. Never touches the calling
+    (422) for `title`/`notes`/field content that would corrupt the task line,
+    or a `key` that doesn't match `^[\\w.:-]+$` — see
+    `task_manager._validate_text_fields`. Never touches the calling
     session's own status; this is fire-and-forget, unlike the worker's
     blocking `lifeos_agent_user_ask`.
     """
+    if key and not _KEY_RE.match(key):
+        raise ValueError(f"key {key!r} must match ^[\\w.:-]+$ (letters, digits, '.', ':', '-', '_')")
     validated_done_when = validate_done_when(done_when)
     fields: dict[str, str] = {}
     if key:

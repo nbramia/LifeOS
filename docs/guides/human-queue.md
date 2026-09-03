@@ -46,10 +46,12 @@ Hermes) and as a native chat tool (`manage_human_queue`, actions
 - **`lifeos_human_queue_add(title, notes?, key?, done_when?, source_host?, source_cwd?, source_session?)`**
   Files a card. Never blocks or changes the calling session's own status —
   purely fire-and-forget, unlike the worker's blocking
-  `lifeos_agent_user_ask`. Filing again with an already-**open** card's `key`
-  replaces that card's notes instead of creating a duplicate (`updated_at`
-  advances). A `key` whose only match is a **done** card is unclaimed — filing
-  opens a fresh card.
+  `lifeos_agent_user_ask`. `key` must match `^[\w.:-]+$` (letters, digits,
+  `.`, `:`, `-`, `_`) — it's interpolated unescaped into the resolve route's
+  URL path segment, so `/`, `?`, `#` are rejected (422). Filing again with
+  an already-**open** card's `key` replaces that card's notes instead of
+  creating a duplicate (`updated_at` advances). A `key` whose only match is
+  a **done** card is unclaimed — filing opens a fresh card.
 - **`lifeos_human_queue_resolve(id_or_key, note?)`**
   Marks the matching open card done, appending `note` to its notes body.
   404 for an id or key with no open card.
@@ -68,16 +70,21 @@ go back and close it. Two types only:
 ```json
 {"type": "endpoint", "path": "/api/example-service/status", "pointer": "/status", "equals": "ok"}
 ```
-GETs `path` on the local API, extracts the value at the JSON Pointer
-(RFC 6901) `pointer`, and compares it to `equals`. `pointer` uses the
-standard `/a/b` syntax (`""` or `"/"` selects the whole response body).
+`path` must start with `/` and not `//` (422 otherwise — a worker-side
+guard against a `path` like `@host/x` re-parsing the request's authority).
+The worker GETs `path` against the local API it talks to, extracts the
+value at the JSON Pointer (RFC 6901) `pointer`, and compares it to
+`equals`. `pointer` uses the standard `/a/b` syntax (`""` or `"/"` selects
+the whole response body).
 
 ```json
-{"type": "file_exists", "path": "/absolute/path/on/the/api/host"}
+{"type": "file_exists", "path": "/absolute/path"}
 ```
-Checked with a plain filesystem `exists()` call — **on the API host only**,
-which matters when the filing agent and the worker run on different
-machines.
+Checked with a plain filesystem `exists()` call, run **in the agent-worker
+process, on the worker's host** — not the API host. Those are usually the
+same machine, but when `LIFEOS_API_URL` points the worker at a remote API
+(see [Configuration](configuration.md)), `path` must exist on the worker's
+own filesystem, not the API server's.
 
 A card with no `done_when` just sits open until an agent (the filer, on
 observing the fix, or `/chat`/Hermes on request) resolves it by hand.
@@ -88,10 +95,12 @@ file a card — deliberately excluded. `endpoint` and `file_exists` are
 enough to express "the service is healthy again" or "the flag file exists"
 without that risk.
 
-When the check fails or errors (endpoint unreachable, wrong shape, path
-missing), the tick logs nothing and leaves the card untouched — it tries
-again next poll. A passing check resolves the card with a note naming the
-check that passed.
+Either way the card is left untouched and tried again next poll, but
+logging differs: an **errored** check (endpoint unreachable, wrong shape)
+logs a warning; a check that just evaluates **false** (the condition isn't
+true yet) logs nothing — that's the expected steady state while the
+operator hasn't acted yet. A passing check resolves the card with a note
+naming the check that passed.
 
 ## REST endpoints
 

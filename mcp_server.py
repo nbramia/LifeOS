@@ -332,7 +332,7 @@ CURATED_ENDPOINTS = {
     },
     "/api/tasks/human-queue:POST": {
         "name": "lifeos_human_queue_add",
-        "description": "File a card for something only the operator can do (e.g. re-authenticate an expired login). Fire-and-forget — never blocks the caller. Dedupes on key.",
+        "description": "File a card for something only the operator can do (e.g. re-authenticate an expired login). Fire-and-forget; dedupes on key (letters/digits/./:/- only). done_when path must start with '/'.",
         "method": "POST",
         "path": "/api/tasks/human-queue"
     },
@@ -1013,8 +1013,8 @@ class LifeOSMCPServer:
                 "properties": {
                     "title": {"type": "string", "description": "Card title, e.g. 'Re-authenticate the example-service session'."},
                     "notes": {"type": "string", "description": "Notes body — what needs doing and why."},
-                    "key": {"type": "string", "description": "Dedupe key, e.g. 'example-service-reauth'. Filing again with an existing open key updates its notes instead of duplicating it."},
-                    "done_when": {"type": "object", "description": "Optional auto-resolve check: {type: 'endpoint', path, pointer, equals} or {type: 'file_exists', path}."},
+                    "key": {"type": "string", "description": "Dedupe key, e.g. 'example-service-reauth'. Letters, digits, '.', ':', '-', '_' only. Filing again with an existing open key updates its notes instead of duplicating it."},
+                    "done_when": {"type": "object", "description": "Optional auto-resolve check: {type: 'endpoint', path, pointer, equals} or {type: 'file_exists', path}. For 'endpoint', path must start with '/' (not '//')."},
                     "source_host": {"type": "string", "description": "Filing session's hostname, if known."},
                     "source_cwd": {"type": "string", "description": "Filing session's working directory, if known."},
                     "source_session": {"type": "string", "description": "Filing session's id, if known."}
