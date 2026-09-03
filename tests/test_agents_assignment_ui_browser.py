@@ -175,6 +175,54 @@ def test_shows_what_actually_ran_from_session(page: Page, web_base_url):
     assert "studio" in ran_text
 
 
+def test_effort_change_before_catalog_resolves_does_not_clear_model(page: Page, web_base_url):
+    """#861 regression: changing effort/host before GET /api/agents/models
+    resolves must not send `model: null` and clear a previously saved model
+    field — the model select's options (and thus its value) don't exist yet
+    on the first drawer open of a page load, so `save()` must omit the
+    `model` key entirely until the catalog has populated the select."""
+    pending = []
+
+    def api_handler(route):
+        if "/api/agents/models" in route.request.url:
+            pending.append(route)  # stashed — fulfilled later in the test
+        elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
+            body = json.loads(route.request.post_data or "{}")
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": "t1", **body}))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    _render(page, {
+        "id": "t8", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude",
+        "fields": {"model": "claude-sonnet-5", "effort": "medium"},
+    })
+
+    # Catalog hasn't resolved yet (its route is stashed) — change effort now.
+    page.locator("[data-field='effort']").select_option("high")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 1
+    fields = calls[0]["patch"]["fields"]
+    assert fields["effort"] == "high"
+    assert fields["assigned_by"] == "board"
+    assert "model" not in fields  # omitted, not nulled — must not clear the saved model
+
+    # Now let the catalog resolve (fulfill every stashed models route).
+    for route in pending:
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+    pending.clear()
+
+    container = page.locator("#test-assignment-container")
+    expect(container.locator("[data-field='model'] option")).to_have_count(3)  # default + 2 claude models
+
+    # Once the catalog is ready, effort changes carry the saved model along.
+    page.locator("[data-field='effort']").select_option("low")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 2
+    fields2 = calls[1]["patch"]["fields"]
+    assert fields2["model"] == "claude-sonnet-5"
+
+
 def test_put_failure_surfaces_error_without_crashing(page: Page, web_base_url):
     _load_module(page, web_base_url)
     page.evaluate(
