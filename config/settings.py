@@ -832,6 +832,25 @@ class Settings(BaseSettings):
                     "days. Older transcripts can still be opened on demand by "
                     "direct id via the events endpoint."
     )
+    codex_models_cache_path: str = Field(
+        default="~/.codex/models_cache.json",
+        alias="LIFEOS_CODEX_MODELS_CACHE_PATH",
+        description="Path to the Codex CLI's own model-catalog cache "
+                    "(`{\"fetched_at\", \"models\": [...]}`), read by "
+                    "GET /api/agents/models for the codex engine's picker "
+                    "list. Missing/unreadable/empty falls back to a live "
+                    "OpenAI models list call when LIFEOS_OPENAI_API_KEY is "
+                    "set, else an empty list (not an error)."
+    )
+    openai_api_key: str = Field(
+        default="",
+        alias="LIFEOS_OPENAI_API_KEY",
+        description="Optional OpenAI API key, used ONLY as the model-catalog "
+                    "fallback (GET /api/agents/models) when the Codex CLI's "
+                    "own models_cache.json is missing or unreadable. Never "
+                    "used to run turns — Codex sessions are subscription-"
+                    "billed through the CLI itself, never the API."
+    )
     codex_resume_enabled: bool = Field(
         default=False,
         alias="LIFEOS_CODEX_RESUME_ENABLED",

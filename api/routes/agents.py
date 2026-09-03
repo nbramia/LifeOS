@@ -1183,6 +1183,24 @@ async def cli_session_event(request: Request, body: CliSessionEventRequest) -> d
         except Exception as exc:  # noqa: BLE001 — pane mapping is a nice-to-have, never fail the event
             logger.warning("cc_wezterm_store upsert failed for %s: %s", cli.session_id, exc)
 
+    # (#851) A `session_start` naming a task links this CLI session to its
+    # board card and moves the card to In progress — the interactive
+    # terminal `POST /board/cards/{id}/open` (api/routes/agent_assignment.py)
+    # spawns sets `LIFEOS_TASK_ID`, the hook script already forwards it as
+    # `task_id` on every event (scripts/lifeos-agent-hook.sh), so this is
+    # the one piece #849 didn't need: turning a task_id-bearing session_start
+    # into a lane move. Best-effort — a task lookup/update failure must
+    # never break the registration event itself.
+    if body.event == "session_start" and body.task_id:
+        try:
+            from api.services.task_manager import get_task_manager
+            manager = get_task_manager()
+            task = manager.get(body.task_id)
+            if task is not None and task.status == "todo":
+                manager.update(body.task_id, status="in_progress")
+        except Exception as exc:  # noqa: BLE001 — never fail the registration event
+            logger.warning("task status update for %s failed: %s", body.task_id, exc)
+
     return {
         "registered": True,
         "session_id": cli.session_id,
