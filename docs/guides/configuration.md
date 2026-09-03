@@ -204,7 +204,7 @@ Read-only ingest of Claude Code's per-session JSONL transcripts. Decision: [ADR-
 
 ## Claude Code Resume (`/agents` operator-controlled re-launch)
 
-Operator-side controls for re-opening a Claude Code session from the `/agents` UI. Used in [agent-viz product spec § Operator controls — resume](../specs/product/agent-viz.md#operator-controls--resume).
+Operator-side controls for re-opening a Claude Code session from the `/agents` UI. Used in [agent-viz product spec § Operator controls — resume and Go To](../specs/product/agent-viz.md#graph-tab--operator-controls--resume-and-go-to).
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|

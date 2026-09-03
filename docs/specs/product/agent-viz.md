@@ -19,7 +19,7 @@ The point is one place to see what needs attention: what's waiting on an assignm
 5. [Graph tab — Filters and chips](#graph-tab--filters-and-chips)
 6. [Graph tab — Side panel](#graph-tab--side-panel)
 7. [Graph tab — Operator controls — kill](#graph-tab--operator-controls--kill)
-8. [Graph tab — Operator controls — resume](#graph-tab--operator-controls--resume)
+8. [Graph tab — Operator controls — resume and Go To](#graph-tab--operator-controls--resume-and-go-to)
 9. [Privacy and exposure](#privacy-and-exposure)
 10. [Configuration knobs](#configuration-knobs)
 11. [Related Documents](#related-documents)
@@ -287,5 +287,6 @@ All in `.env`. None are required — the defaults work for the standard LifeOS i
 - [Agent Worker — Technical](../technical/agent-worker.md) — Sessions, transcripts, kill primitives
 - [Architecture](../technical/architecture.md) — Where the viz fits in the broader code structure
 - [Task Management](task-management.md) — The vault task store the board's cards are backed by
+- [Human Queue](../../guides/human-queue.md) — How `#human` cards are filed and auto-resolved by agents and the nightly sync
 - [Scheduler Guide](../../guides/scheduler.md) — How the Scheduled column's entries are created and edited
 - [API Reference](api-reference.md) — Board, pending-question, and lane-move endpoint shapes

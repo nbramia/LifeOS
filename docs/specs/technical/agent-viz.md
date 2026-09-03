@@ -23,7 +23,7 @@ Engineering view of the `/agents` page — endpoint shapes, ingest paths, status
 11. [D3 force-graph](#d3-force-graph)
 12. [Side-panel SSE](#side-panel-sse)
 13. [Operator kill](#operator-kill)
-14. [Claude Code resume](#claude-code-resume)
+14. [Claude Code resume + Go To](#claude-code-resume--go-to)
 15. [Worker resilience](#worker-resilience)
 16. [Security boundaries](#security-boundaries)
 17. [Related Documents](#related-documents)

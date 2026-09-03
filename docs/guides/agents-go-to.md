@@ -118,7 +118,7 @@ A session registered this way shows a `host` badge in the side panel, plus its g
 ## Related Documents
 
 ### Specifications
-- [Agent Viz — Product](../specs/product/agent-viz.md#operator-controls--resume-and-go-to) — Operator-facing controls overview
+- [Agent Viz — Product](../specs/product/agent-viz.md#graph-tab--operator-controls--resume-and-go-to) — Operator-facing controls overview
 - [Agent Viz — Technical](../specs/technical/agent-viz.md#claude-code-resume--go-to) — Endpoint shapes, probe algorithm, security boundaries
 
 ### Code References
