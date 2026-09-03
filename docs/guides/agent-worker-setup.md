@@ -518,6 +518,13 @@ without ever attempting a connection; leaving `LIFEOS_AGENT_HOSTS` unset
   side, so the remote machine's own login-shell environment has to
   already make `wezterm cli spawn` work unassisted.
 
+The remote spawn always unsets a small canonical list of provider
+credential names (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
+`OPENAI_API_KEY`, and a few others) regardless of what this API host's own
+environment contains, but names beyond that list exported by a registered
+host's own non-interactive shell are not stripped — keep provider
+credentials out of a registered host's shell startup files.
+
 **Connect timeout.** `LIFEOS_AGENT_SSH_CONNECT_TIMEOUT` (default 10
 seconds) bounds how long ssh may spend establishing the connection before
 giving up — applies to remote spawn, remote kill, and remote resume/focus

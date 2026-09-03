@@ -25,6 +25,18 @@ def client():
 
 
 @pytest.fixture
+def wezterm_store(tmp_path: Path, monkeypatch):
+    """Swap the default cc_wezterm store for a tmp-path-backed one so tests
+    can introspect what got persisted without touching the real DB — same
+    pattern as tests/test_agent_resume_api.py."""
+    from api.services import cc_wezterm_store as mod
+    store = mod.CCWezTermStore(db_path=tmp_path / "cc_wezterm.db")
+    monkeypatch.setattr(mod, "_default_store", store)
+    yield store
+    store.close()
+
+
+@pytest.fixture
 def remote_cc_session(tmp_path: Path, monkeypatch):
     """Register a `cc:`-prefixed session on a remote host via the same
     `cli_sessions` path `scripts/lifeos-agent-hook.sh` uses (#849), and
@@ -74,6 +86,14 @@ def test_remote_resume_wraps_launcher_in_ssh(client, remote_cc_session, monkeypa
     # The LOCAL ssh client must not cwd= into a path that only exists remotely.
     assert popen_mock.call_args.kwargs["cwd"] is None
 
+    # Round 1, finding #7: an ssh round trip routinely exceeds the 1.5s
+    # local budget — the remote branch must pass the larger, connect-
+    # timeout-derived value to communicate(), not the local one.
+    from config.settings import settings
+    communicate_timeout = proc.communicate.call_args.kwargs["timeout"]
+    assert communicate_timeout == settings.agent_ssh_connect_timeout + 1.5
+    assert communicate_timeout != 1.5
+
 
 def test_remote_codex_resume_wraps_launcher_in_ssh(client, remote_cc_session, monkeypatch):
     from api.routes import agents as agents_route
@@ -99,6 +119,60 @@ def test_remote_codex_resume_wraps_launcher_in_ssh(client, remote_cc_session, mo
     argv = popen_mock.call_args.args[0]
     assert argv[0] == "ssh"
     assert "user@laptop.example" in argv
+
+    # Round 1, finding #7 (codex sibling).
+    from config.settings import settings
+    communicate_timeout = proc.communicate.call_args.kwargs["timeout"]
+    assert communicate_timeout == settings.agent_ssh_connect_timeout + 1.5
+    assert communicate_timeout != 1.5
+
+
+def test_remote_resume_does_not_upsert_local_wezterm_store(
+    client, remote_cc_session, wezterm_store, monkeypatch,
+):
+    """Round 1, finding #10: a remote resume's pane and wezterm process
+    live on the REMOTE host — upserting the parsed pane id into the LOCAL
+    `cc_wezterm_store` (keyed by `wezterm_pid` from THIS host's own
+    `_current_wezterm_pid`) would record a host-mismatched mapping that a
+    later local `/focus` could act on against the wrong machine."""
+    proc = MagicMock()
+    proc.communicate.return_value = (b"42\n", b"")  # a parseable pane id
+    proc.returncode = 0
+    proc.pid = 9999
+    popen_mock = MagicMock(return_value=proc)
+    monkeypatch.setattr("subprocess.Popen", popen_mock)
+
+    resp = client.post(f"/api/agents/sessions/{remote_cc_session}/resume")
+    assert resp.status_code == 200
+    assert resp.json()["pane_id"] == 42  # pane id WAS parsed...
+
+    assert wezterm_store.get(remote_cc_session) is None  # ...but never upserted locally
+
+
+def test_remote_codex_resume_does_not_upsert_local_wezterm_store(
+    client, remote_cc_session, wezterm_store, monkeypatch,
+):
+    """Round 1, finding #10 (codex sibling)."""
+    from api.routes import agents as agents_route
+
+    store = agents_route._get_session_store()
+    cli = store.record_cli_session_event(
+        engine="codex", event="session_start", session_id="cx-uuid-on-laptop-2",
+        host="laptop", cwd="/home/user/Code/other-project",
+    )
+
+    proc = MagicMock()
+    proc.communicate.return_value = (b"7\n", b"")
+    proc.returncode = 0
+    proc.pid = 8888
+    popen_mock = MagicMock(return_value=proc)
+    monkeypatch.setattr("subprocess.Popen", popen_mock)
+
+    resp = client.post(f"/api/agents/sessions/{cli.session_id}/resume")
+    assert resp.status_code == 200
+    assert resp.json()["pane_id"] == 7
+
+    assert wezterm_store.get(cli.session_id) is None
 
 
 def test_unregistered_host_still_409s(client, remote_cc_session, monkeypatch):

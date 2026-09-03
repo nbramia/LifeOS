@@ -111,6 +111,28 @@ def test_model_and_effort_flags_in_argv(tmp_path, monkeypatch):
     assert "--effort" in cmd and cmd[cmd.index("--effort") + 1] == "high"
 
 
+def test_board_assigned_model_reaches_argv_via_set_assignment(tmp_path, monkeypatch):
+    """Round 1, finding #1: the board-assignment `model` field — written by
+    the real dispatch path (`SessionStore.create` then
+    `SessionStore.set_assignment`, exactly like `worker._dispatch` does),
+    NOT `claude_code_model` (the unrelated child-spawn escalation tier) —
+    must reach `--model`. Uses a non-"opus" value so the executor's
+    hardcoded `"opus"` fallback can't mask a regression back to reading
+    only `claude_code_model`."""
+    spawn_calls: list = []
+    lines = _lines_for([_INIT_EVENT, _RESULT_EVENT])
+    store, executor = _build(tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines)
+    store.create(task_id="t1", routing="claude_code")
+    store.set_assignment("t1", model="sonnet", effort="high")
+    session = store.get("t1")
+    assert session.model == "sonnet"  # sanity: the write path actually landed
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status != STATUS_FAILED
+    cmd = spawn_calls[0][0]
+    assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "sonnet"
+    assert "--effort" in cmd and cmd[cmd.index("--effort") + 1] == "high"
+
+
 def test_no_effort_field_omits_flag(tmp_path, monkeypatch):
     spawn_calls: list = []
     lines = _lines_for([_INIT_EVENT, _RESULT_EVENT])
@@ -134,6 +156,10 @@ def test_remote_host_wraps_argv_in_ssh_and_captures_pgid(tmp_path, monkeypatch):
     session = store.create(task_id="t1", routing="claude_code", host="studio", claude_code_model="opus")
     outcome = executor.execute(session, {"description": "do the thing"})
     assert outcome.status != STATUS_FAILED
+    # Round 1, finding #9: prove the pgid-line strip leaves the JSON stream
+    # aligned — the `_RESULT_EVENT`'s own text must still reach `final_text`
+    # unscathed, not just status/argv/pgid.
+    assert outcome.final_text == "done"
     cmd = spawn_calls[0][0]
     assert cmd[0] == "ssh"
     assert "user@studio.example" in cmd
@@ -160,6 +186,126 @@ def test_unknown_host_fails_without_ssh_call(tmp_path, monkeypatch):
     assert outcome.status == STATUS_FAILED
     assert "nonexistent-box" in outcome.reason
     assert spawn_calls == []
+
+
+class _HangingStdout:
+    """`readline()` never returns — simulates an ssh client stuck past TCP
+    connect (auth stall, or a host that accepts the connection and then
+    never answers). `ConnectTimeout` doesn't bound this."""
+
+    def readline(self) -> str:
+        import threading
+        threading.Event().wait()  # blocks forever; the test's deadline is what ends it
+        return ""  # pragma: no cover — unreachable
+
+
+class _HangingProc:
+    def __init__(self, pid: int = 9999):
+        self.stdout = _HangingStdout()
+        self.stderr = _FakeStderr()
+        self.pid = pid
+        self.returncode = None
+        self._terminated = False
+
+    def poll(self):
+        return None if not self._terminated else -15
+
+    def terminate(self):
+        self._terminated = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        return -15
+
+    def kill(self):
+        self._terminated = True
+
+
+def test_remote_host_unresponsive_pgid_read_fails_within_deadline(tmp_path, monkeypatch):
+    """Round 1, finding #3: a remote ssh client whose `PGID:` line never
+    arrives (hung post-TCP-connect) must not block forever — the executor
+    fails within the configured connect-timeout-derived deadline instead."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_ssh_connect_timeout", 0, raising=False)
+
+    spawn_calls: list = []
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    monkeypatch.setattr(settings, "agent_hosts", {"studio": "user@studio.example"}, raising=False)
+
+    def _spawn_fn(cmd, **kwargs):
+        spawn_calls.append((cmd, kwargs))
+        return _HangingProc()
+
+    executor = ClaudeCodeExecutor(
+        session_store=store, transcript_store=transcripts, spawn_fn=_spawn_fn,
+    )
+    session = store.create(task_id="t1", routing="claude_code", host="studio")
+
+    import time
+    start = time.monotonic()
+    outcome = executor.execute(session, {"description": "do the thing"})
+    elapsed = time.monotonic() - start
+
+    assert outcome.status == STATUS_FAILED
+    assert "studio" in outcome.reason
+    assert elapsed < 30  # well under the test-harness timeout; proves it didn't hang
+
+
+class _FakeStderrWithText:
+    def __init__(self, text: str):
+        self._text = text
+
+    def read(self) -> str:
+        return self._text
+
+
+class _FailingSshProc:
+    """A fast ssh connection failure — stdout is empty (ssh never even ran
+    the remote wrapper), stderr carries ssh's own error text, non-zero
+    returncode."""
+
+    def __init__(self, stderr_text: str, returncode: int = 255, pid: int = 6060):
+        self.stdout = _FakeStdout([])
+        self.stderr = _FakeStderrWithText(stderr_text)
+        self.pid = pid
+        self.returncode = returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+def test_remote_ssh_failure_reason_includes_stderr(tmp_path, monkeypatch):
+    """Round 1, finding #4: an unreachable-host ssh failure's stderr must
+    land in `outcome.reason` (what `worker.py` uses verbatim for the
+    #agent-failed card), not just the transcript's `stderr_tail`."""
+    spawn_calls: list = []
+    ssh_stderr = "ssh: connect to host studio port 22: Connection refused\n"
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {"studio": "user@studio.example"}, raising=False)
+
+    def _spawn_fn(cmd, **kwargs):
+        spawn_calls.append((cmd, kwargs))
+        return _FailingSshProc(ssh_stderr)
+
+    executor = ClaudeCodeExecutor(
+        session_store=store, transcript_store=transcripts, spawn_fn=_spawn_fn,
+    )
+    session = store.create(task_id="t1", routing="claude_code", host="studio")
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status == STATUS_FAILED
+    assert "studio" in outcome.reason
+    assert "Connection refused" in outcome.reason
 
 
 def test_local_host_name_matches_api_host_runs_locally(tmp_path, monkeypatch):

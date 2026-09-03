@@ -606,7 +606,17 @@ def _kill_local_subprocess(
     A session whose `host` names a machine other than the API host never
     ran a local subprocess at all — its argv was wrapped in `ssh` instead
     (see `remote_spawn.build_remote_argv`), so it's dispatched to
-    `_kill_remote_subprocess` instead of the local killpg path below.
+    `_kill_remote_subprocess` instead of the local killpg path below —
+    UNLESS no `remote_pgid` was ever recorded (round 1, finding #3): the
+    executor's pgid read can itself hang (a stalled ssh client that
+    connected but never answered), in which case there's no remote process
+    to signal yet and the only thing this operator kill CAN reach is the
+    hung LOCAL `ssh` client process — the same `claude_code_pid`/`codex_pid`
+    transcript event below already recorded its pid (see
+    `ClaudeCodeExecutor._run`/`CodexExecutor._run`, the "remote": True
+    branch, which appends that event with the local ssh client's own
+    `proc.pid` regardless of whether the pgid line ever arrived). Falling
+    through to the local pid path is what makes that hang killable.
 
     Best-effort by contract: a missing pid event, a stale pid (process already
     gone), or a signalling error must NOT break teardown — the managed kill, DB
@@ -619,8 +629,11 @@ def _kill_local_subprocess(
     if host:
         from api.services.agent_worker.remote_spawn import api_host_name as _api_host_name
         if host != _api_host_name():
-            _kill_remote_subprocess(transcript_store, target, remote_kill_runner=remote_kill_runner)
-            return
+            if getattr(target, "remote_pgid", None) is not None:
+                _kill_remote_subprocess(transcript_store, target, remote_kill_runner=remote_kill_runner)
+                return
+            # No remote_pgid recorded — fall through to the local pid path
+            # below, which can still reach the hung local ssh client.
 
     # Find the most recent pid event in the transcript. Codex records `codex_pid`;
     # claude_code records `claude_code_pid`. The latest wins (a resumed session

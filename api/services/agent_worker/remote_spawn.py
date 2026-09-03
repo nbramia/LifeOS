@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import shlex
 import socket
 import subprocess
+import threading
 from typing import Callable, Optional
 
 from config.settings import settings
@@ -48,12 +50,40 @@ def api_host_name() -> str:
     return socket.gethostname().split(".")[0]
 
 
+# (round 1, finding #2) A small static list of concrete credential env-var
+# names, unioned into every `env_names_matching_prefixes()` result below —
+# NOT filtered to just what THIS process's own environment happens to
+# contain. `env_names_matching_prefixes` alone enumerates names present in
+# the worker's own `os.environ`; a worker installed with no
+# ANTHROPIC_*/CLAUDE*/OPENAI_ vars set at all (a subscription/OAuth
+# install, the common case) would otherwise unset nothing on the remote
+# host, silently inheriting whatever a registered host's own non-
+# interactive shell exports — the exact API-billing leak `_clean_env`'s
+# local strip exists to prevent (see its docstring), just on the remote
+# side. `env -u` on a name that was never set is a no-op, so unconditionally
+# including these costs nothing.
+CANONICAL_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset({
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDECODE",
+    # Codex/OpenAI equivalent of ANTHROPIC_API_KEY — the credential name a
+    # remote host's shell would export to make Codex API-billed instead of
+    # subscription-billed through the CLI.
+    "OPENAI_API_KEY",
+})
+
+
 def env_names_matching_prefixes(prefixes: tuple[str, ...], keep: frozenset[str] = frozenset()) -> list[str]:
-    """Names in the CURRENT process's environment matching any of `prefixes`,
-    minus `keep`. Used to build a remote `env -u ...` unset list that mirrors
-    an executor's local `_clean_env` — same prefixes, same exceptions, just
-    applied to the remote subprocess's env instead of the local one."""
-    return sorted(k for k in os.environ if k.startswith(prefixes) and k not in keep)
+    """Names to `env -u` on a remote spawn: every name in the CURRENT
+    process's environment matching any of `prefixes`, UNIONED with
+    `CANONICAL_CREDENTIAL_ENV_NAMES` (both minus `keep`) — see that
+    constant's docstring for why the union, not just the local scan, is
+    required for the "must NOT inherit" guarantee to hold on a clean
+    worker install."""
+    local_matches = {k for k in os.environ if k.startswith(prefixes)}
+    return sorted((local_matches | CANONICAL_CREDENTIAL_ENV_NAMES) - keep)
 
 
 class HostResolutionError(Exception):
@@ -160,6 +190,52 @@ def read_remote_pgid_line(line: str) -> Optional[int]:
         return int(line[len(PGID_LINE_PREFIX):].strip())
     except ValueError:
         return None
+
+
+def read_line_with_deadline(stream, timeout: float) -> tuple[str, bool]:
+    """Read one line from `stream` with a bounded wait (round 1, finding
+    #3). Both executors block on `stream.readline()` for the `PGID:` line
+    BEFORE their own wall-clock watchdog starts — `ssh -o ConnectTimeout`
+    bounds only the TCP handshake, not a stall during auth or a host that
+    accepts the connection but never answers, so an unbounded `readline()`
+    here can hang the caller's thread forever.
+
+    Runs the read on a daemon thread rather than `select.select` so this
+    works uniformly whether `stream` is a real OS pipe or a test double
+    (fakes generally have no `fileno()`). Returns `(line, timed_out)`:
+    `timed_out` is True and `line` is `""` when nothing arrived within
+    `timeout` seconds — the reader thread is left running (daemon, so it
+    exits with the process) rather than joined, since a genuinely hung
+    stream has no clean way to unblock `readline()` from here; callers
+    that hit `timed_out` are expected to terminate the owning subprocess,
+    which closes the pipe's write end and unblocks the reader.
+    """
+    result: "queue.Queue[str]" = queue.Queue(maxsize=1)
+
+    def _reader() -> None:
+        try:
+            result.put(stream.readline())
+        except Exception:  # noqa: BLE001 — surface as empty/no-line, not a crash
+            result.put("")
+
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+    try:
+        return result.get(timeout=timeout), False
+    except queue.Empty:
+        return "", True
+
+
+def last_nonempty_line(text: str) -> str:
+    """Last non-blank line of `text` (round 1, finding #4) — used to fold
+    an ssh failure's stderr (e.g. `ssh: connect to host studio port 22:
+    Connection refused`) into an executor's failure reason instead of
+    leaving it reachable only via the transcript's `stderr_tail`."""
+    for line in reversed((text or "").splitlines()):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
 
 
 KillRunner = Callable[[list[str]], "subprocess.CompletedProcess"]

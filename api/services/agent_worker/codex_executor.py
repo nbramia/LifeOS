@@ -42,6 +42,8 @@ from api.services.agent_worker.remote_spawn import (
     HostResolutionError,
     build_remote_argv,
     env_names_matching_prefixes,
+    last_nonempty_line,
+    read_line_with_deadline,
     read_remote_pgid_line,
     resolve_host_target,
 )
@@ -408,9 +410,25 @@ class CodexExecutor:
         if is_remote:
             # (#851) Strip the remote wrapper's `PGID:<n>` first stdout line
             # — see ClaudeCodeExecutor._run for the identical mechanism.
+            #
+            # (round 1, finding #3) Bounded wait: see ClaudeCodeExecutor._run
+            # for why this read needs a deadline of its own, ahead of the
+            # wall-clock watchdog below.
             pgid = None
             if proc.stdout is not None:
-                first_line = proc.stdout.readline()
+                deadline = settings.agent_ssh_connect_timeout + 5
+                first_line, timed_out_reading_pgid = read_line_with_deadline(proc.stdout, deadline)
+                if timed_out_reading_pgid:
+                    self._terminate_unresponsive(proc)
+                    self.transcript_store.append(sid, "codex_remote_unresponsive", {
+                        "host": host, "deadline_seconds": deadline,
+                    })
+                    self.session_store.update_status(session.task_id, STATUS_FAILED)
+                    self._cleanup_tempfile(last_msg_path)
+                    return ExecutorOutcome(
+                        status=STATUS_FAILED,
+                        reason=f"host {host} did not answer within {deadline}s",
+                    )
                 pgid = read_remote_pgid_line(first_line)
             if pgid is not None:
                 self.session_store.set_remote_pgid(session.task_id, pgid)
@@ -528,9 +546,16 @@ class CodexExecutor:
             "returncode": proc.returncode,
             "stderr_tail": stderr_tail[-500:],
         })
+        # (round 1, finding #4) Fold the ssh failure's stderr into the
+        # reason on the remote path — see ClaudeCodeExecutor._run for why.
+        reason = f"codex exited with code {proc.returncode}"
+        if is_remote:
+            last_line = last_nonempty_line(stderr_tail)
+            if last_line:
+                reason = f"ssh to {host} failed (exit {proc.returncode}): {last_line}"
         return ExecutorOutcome(
             status=STATUS_FAILED,
-            reason=f"codex exited with code {proc.returncode}",
+            reason=reason,
         )
 
     @staticmethod
@@ -650,6 +675,24 @@ class CodexExecutor:
     # ------------------------------------------------------------------
     # Watchdog + heartbeat
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _terminate_unresponsive(proc) -> None:
+        """Best-effort terminate an ssh client that never answered the
+        `PGID:` read within its deadline (round 1, finding #3). Mirrors
+        `_on_timeout`'s terminate/wait/kill sequence minus the timed_out
+        flag (there is no watchdog running yet at this point — this read
+        happens BEFORE it starts). Mirrors ClaudeCodeExecutor's identical
+        helper."""
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning("remote pgid-wait terminate failed: %s", exc)
 
     @staticmethod
     def _on_timeout(proc, timed_out: threading.Event) -> None:

@@ -90,6 +90,45 @@ def test_kill_remote_session_unregistered_host_is_best_effort_noop(client, store
     assert refreshed.status == "failed"
 
 
+def test_kill_remote_host_with_no_remote_pgid_falls_back_to_local_pid(client, stores, monkeypatch):
+    """Round 1, finding #3: if the executor's `PGID:` read never completed
+    (a hung ssh client stuck past TCP connect), no `remote_pgid` was ever
+    recorded — the operator kill must fall through to signalling the LOCAL
+    ssh client's own pid (from the `claude_code_pid` transcript event)
+    rather than silently no-op'ing via the remote path, which is the only
+    way a hung ssh client can ever be killed."""
+    from api.services.agent_worker import inter_agent
+
+    session_store, transcript_store = stores
+    session = session_store.create(
+        task_id="remote-task-3", status=STATUS_RUNNING, routing="claude_code", host="studio",
+    )
+    # No set_remote_pgid call — mirrors the hung-ssh-client scenario where
+    # the pgid line never arrived. The local ssh client's own pid/pgid was
+    # still recorded (ClaudeCodeExecutor._run appends this event
+    # unconditionally in the "remote": True branch, before/regardless of
+    # whether the pgid read itself succeeds).
+    transcript_store.append(session.session_id, "claude_code_pid", {
+        "pid": 7171, "pgid": 7171, "remote": True, "host": "studio",
+    })
+
+    ssh_calls = []
+    monkeypatch.setattr(agents_route, "_remote_kill_runner", lambda argv: ssh_calls.append(argv))
+
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(inter_agent.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(inter_agent.os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+    monkeypatch.setattr(inter_agent, "_LOCAL_KILL_GRACE_S", 0.0)
+
+    resp = client.post(f"/api/agents/sessions/{session.session_id}/kill", json={"reason": "test"})
+    assert resp.status_code == 200
+    assert resp.json()["killed"] == [session.session_id]
+
+    assert ssh_calls == []  # never reached the remote ssh path — no remote_pgid to target
+    signalled_pgids = {pgid for pgid, _sig in killpg_calls}
+    assert signalled_pgids == {7171}  # the local ssh client's own pgid was signalled instead
+
+
 def test_kill_local_session_unaffected_by_remote_path(client, stores, monkeypatch):
     """A session with no host still goes through the local killpg path,
     never the ssh runner."""

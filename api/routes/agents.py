@@ -1676,8 +1676,15 @@ async def _resume_codex_session(
     pane_id: int | None = None
     stdout_bytes = b""
     stderr_bytes = b""
+    # (round 1, finding #7) An ssh round trip routinely exceeds the local
+    # 1.5s budget — use the connect-timeout-derived value on the remote
+    # branch so a remote launcher doesn't spuriously degrade to
+    # `pane_id: None` before the real ssh response even arrives.
+    communicate_timeout = 1.5
+    if remote_ssh_target:
+        communicate_timeout = settings.agent_ssh_connect_timeout + 1.5
     try:
-        stdout_bytes, stderr_bytes = proc.communicate(timeout=1.5)
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=communicate_timeout)
     except subprocess.TimeoutExpired:
         return {
             "spawned": True,
@@ -1702,7 +1709,11 @@ async def _resume_codex_session(
         except ValueError:
             pane_id = None
 
-    if pane_id is not None:
+    # (round 1, finding #10) `wezterm_pid` comes from THIS host's own
+    # `_current_wezterm_pid` — on a remote resume the pane and its wezterm
+    # process live on `remote_ssh_target`, not here, so upserting would
+    # record a host-mismatched pid/pane into the LOCAL store.
+    if pane_id is not None and not remote_ssh_target:
         try:
             from api.services.cc_wezterm_store import get_default_store
             wezterm_pid = _current_wezterm_pid(env.get("XDG_RUNTIME_DIR"))
@@ -1918,12 +1929,17 @@ async def _resume_claude_code_launcher(
     #   (b) The launcher BECOMES the terminal (rare; not the default) —
     #       communicate() times out, no pane id available, return spawned=True.
     # A 1.5s timeout is plenty for (a) and short enough that the API stays
-    # snappy for (b).
+    # snappy for (b) — LOCALLY. (round 1, finding #7) An ssh round trip
+    # routinely exceeds 1.5s, so the remote branch uses the connect-
+    # timeout-derived value instead, leaving the local value untouched.
     pane_id: int | None = None
     stdout_bytes = b""
     stderr_bytes = b""
+    communicate_timeout = 1.5
+    if remote_ssh_target:
+        communicate_timeout = settings.agent_ssh_connect_timeout + 1.5
     try:
-        stdout_bytes, stderr_bytes = proc.communicate(timeout=1.5)
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=communicate_timeout)
     except subprocess.TimeoutExpired:
         # Long-running launcher — no pane id this turn, but the spawn is
         # in progress; surface what we have.
@@ -1954,7 +1970,9 @@ async def _resume_claude_code_launcher(
         except ValueError:
             pane_id = None
 
-    if pane_id is not None:
+    # (round 1, finding #10) See the codex sibling above — a remote resume's
+    # pane and wezterm process live on `remote_ssh_target`, not here.
+    if pane_id is not None and not remote_ssh_target:
         try:
             from api.services.cc_wezterm_store import get_default_store
             wezterm_pid = _current_wezterm_pid(env.get("XDG_RUNTIME_DIR"))

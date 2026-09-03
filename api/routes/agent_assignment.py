@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import shlex
 import subprocess
+import threading
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -36,6 +37,29 @@ router = APIRouter(prefix="/api/agents", tags=["agents"])
 # excluded here because Local Gemma runs headless (no interactive
 # terminal to open).
 _ASSIGNEE_TAGS = ("claude", "codex", "hermes")
+
+# (round 1, finding #6) Serializes the todo/running-session checks and the
+# actual spawn in `open_board_card` — without it, two concurrent requests
+# (a double-click) can both pass the checks before either has spawned,
+# opening two terminals onto the same card. A single process-wide lock is
+# enough: this is a single API process (see module docstring), and the
+# critical section is a few dict/DB reads plus a subprocess spawn, never
+# a network call.
+#
+# The lock alone isn't sufficient by itself, though: neither `task.status`
+# (the vault task doesn't flip to `in_progress` until the spawned CLI
+# registers itself over its OWN lifecycle hook, seconds later — not
+# synchronously within this request) nor `session_store` (nothing here
+# writes to it; that also only happens on registration) changes as a
+# result of a spawn, so a call that lands right after another one's spawn
+# would see the exact same "nothing running yet" state and spawn again —
+# lock-serialized, but still two spawns. `_opening_card_ids` closes that
+# gap: a card_id already claimed by an in-flight-or-completed spawn this
+# process has made stays 409'd regardless of what the vault/session_store
+# say, until an actual registered session (or a failed spawn, which frees
+# the card_id again) supersedes it.
+_open_lock = threading.Lock()
+_opening_card_ids: set[str] = set()
 
 _session_store: SessionStore | None = None
 
@@ -120,18 +144,30 @@ async def open_board_card(card_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=409, detail="no Hermes conversation yet for this card")
         return {"open_url": f"/chat?conversation={session.conversation_id}"}
 
-    if task.status != "todo":
-        raise HTTPException(
-            status_code=409,
-            detail=f"card is not in Assigned state (status={task.status!r})",
-        )
-    existing = session_store.get(card_id)
-    if existing is not None and existing.status not in TERMINAL_STATUSES:
-        raise HTTPException(status_code=409, detail="card already has a running session")
-    if _has_running_cli_session(card_id):
-        raise HTTPException(status_code=409, detail="card already has a running interactive session")
-
-    return _spawn_interactive_cli(card_id, task, assignee)
+    # (round 1, finding #6) Hold the lock across the checks AND the spawn —
+    # not just the spawn — so a double-click can't have both requests pass
+    # the checks before either has actually spawned anything.
+    with _open_lock:
+        if task.status != "todo":
+            raise HTTPException(
+                status_code=409,
+                detail=f"card is not in Assigned state (status={task.status!r})",
+            )
+        existing = session_store.get(card_id)
+        if existing is not None and existing.status not in TERMINAL_STATUSES:
+            raise HTTPException(status_code=409, detail="card already has a running session")
+        if _has_running_cli_session(card_id):
+            raise HTTPException(status_code=409, detail="card already has a running interactive session")
+        if card_id in _opening_card_ids:
+            raise HTTPException(status_code=409, detail="card open is already in progress")
+        _opening_card_ids.add(card_id)
+        try:
+            return _spawn_interactive_cli(card_id, task, assignee)
+        except Exception:
+            # Spawn failed (bad launcher config, missing binary, ...) — free
+            # the card_id so a retry isn't permanently locked out.
+            _opening_card_ids.discard(card_id)
+            raise
 
 
 def _spawn_interactive_cli(card_id: str, task, assignee: str) -> dict[str, Any]:

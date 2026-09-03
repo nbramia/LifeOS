@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from api.services.agent_worker.remote_spawn import (
+    CANONICAL_CREDENTIAL_ENV_NAMES,
     HostResolutionError,
     build_remote_argv,
     env_names_matching_prefixes,
@@ -120,3 +121,31 @@ def test_env_names_matching_prefixes_respects_keep(monkeypatch):
     names = env_names_matching_prefixes(("CODEX_",), keep=frozenset({"CODEX_HOME"}))
     assert "CODEX_HOME" not in names
     assert "CODEX_TEST_851" in names
+
+
+def test_env_names_matching_prefixes_unsets_canonical_names_on_clean_local_env(monkeypatch):
+    """Round 1, finding #2: a worker whose OWN process env has none of the
+    provider-credential vars set (subscription/OAuth install — the common
+    case) must still unset them remotely, since a registered host's own
+    non-interactive shell may export one. `env_names_matching_prefixes`
+    must not rely solely on scanning the local process's environment."""
+    for name in CANONICAL_CREDENTIAL_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    names = env_names_matching_prefixes(("ANTHROPIC_", "CLAUDE"))
+    assert set(CANONICAL_CREDENTIAL_ENV_NAMES).issubset(set(names))
+
+
+def test_remote_command_carries_env_unset_on_clean_local_env(monkeypatch):
+    """End-to-end version of the above: even on a clean local env, the
+    fully-built remote command (what actually reaches ssh) carries
+    `env -u ANTHROPIC_API_KEY` for the credential the AC is about."""
+    for name in CANONICAL_CREDENTIAL_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    names = env_names_matching_prefixes(("ANTHROPIC_", "CLAUDE"))
+    argv = build_remote_argv(
+        ["claude", "-p", "hello"],
+        target="user@laptop.example",
+        unset_env_names=names,
+    )
+    remote_command = argv[-1]
+    assert "-u ANTHROPIC_API_KEY" in remote_command

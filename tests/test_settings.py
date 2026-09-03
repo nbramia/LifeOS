@@ -182,3 +182,30 @@ def test_investments_sync_dir_from_env(monkeypatch):
 
     s = Settings()
     assert s.investments_sync_dir == "/tmp/some/other/investments"
+
+
+@pytest.mark.parametrize(
+    "raw_value, expected",
+    [
+        ("", {}),
+        ("{{bad", {}),
+        ('["a"]', {}),
+        ('{"studio": "user@studio.example"}', {"studio": "user@studio.example"}),
+    ],
+)
+def test_agent_hosts_validator_receives_raw_string(monkeypatch, raw_value, expected):
+    """Round 1, finding #8: `LIFEOS_AGENT_HOSTS` is a plain `dict[str, str]`
+    field, so pydantic-settings' own complex-field JSON pre-decode used to
+    run BEFORE `_parse_agent_hosts` (a `mode="before"` validator) — an
+    empty string or malformed JSON raised `SettingsError` straight out of
+    `Settings()`, before the validator's empty/invalid branches (which
+    promise `{}`, not a crash) ever ran. `NoDecode` on the field makes the
+    validator receive the raw env string in every case, including empty.
+
+    `_env_file=None` so a real `.env`'s own `LIFEOS_AGENT_HOSTS` (if any)
+    can't leak into this test."""
+    monkeypatch.setenv("LIFEOS_AGENT_HOSTS", raw_value)
+    from config.settings import Settings
+
+    s = Settings(_env_file=None)
+    assert s.agent_hosts == expected

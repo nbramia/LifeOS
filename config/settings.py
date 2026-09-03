@@ -7,10 +7,11 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Annotated
 
 import frontmatter
 from dotenv import dotenv_values
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic import Field, field_validator
 
 logger = logging.getLogger(__name__)
@@ -876,7 +877,16 @@ class Settings(BaseSettings):
                     "`{cwd}`. Set to empty to skip the inner command."
     )
     # #851: card assignment to a host other than the API host, over ssh.
-    agent_hosts: dict[str, str] = Field(
+    #
+    # `NoDecode` (round-1 review, finding #8): pydantic-settings' own
+    # complex-field JSON pre-decode runs BEFORE `mode="before"` validators —
+    # for a plain `dict[str, str]` field that pre-decode raises straight out
+    # of `Settings()` on an empty string or malformed JSON, so
+    # `_parse_agent_hosts` below never even ran for those cases despite the
+    # docstring's promise. `NoDecode` opts this field out of that pre-decode
+    # so the validator receives the raw env string and its empty/invalid
+    # branches actually execute.
+    agent_hosts: Annotated[dict[str, str], NoDecode] = Field(
         default_factory=dict,
         alias="LIFEOS_AGENT_HOSTS",
         description="JSON object mapping a board-facing host name (e.g. "

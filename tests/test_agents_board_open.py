@@ -39,6 +39,16 @@ def session_store(tmp_path: Path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _clear_opening_guard():
+    """`agent_assignment._opening_card_ids` (round 1, finding #6) is
+    module-level, process-lifetime state — clear it around every test so
+    one test's card_id can't spuriously 409 a later test that reuses it."""
+    agent_assignment._opening_card_ids.clear()
+    yield
+    agent_assignment._opening_card_ids.clear()
+
+
+@pytest.fixture(autouse=True)
 def _disable_launcher_prereqs(monkeypatch):
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
@@ -113,6 +123,50 @@ def test_open_card_with_running_session_is_409(client, manager, session_store):
     resp = client.post(f"/api/agents/board/cards/{task.id}/open")
     assert resp.status_code == 409
     assert "running session" in resp.json()["detail"]
+
+
+def test_open_card_double_click_is_serialized(client, manager, session_store, monkeypatch):
+    """Round 1, finding #6: a genuine double-click — two OS threads racing
+    the SAME check-then-spawn window — must produce exactly one spawn and
+    one 409, not two terminals opened onto the same card. A `threading.Lock`
+    alone doesn't guarantee this (neither `task.status` nor `session_store`
+    change as a side effect of a spawn, so a naive lock would just
+    serialize two SUCCESSFUL spawns) — this proves the `_opening_card_ids`
+    guard actually closes that gap."""
+    import threading as _threading
+    import time as _time
+
+    task = manager.create(description="fix the printer", tags=["agent", "claude"])
+
+    start_barrier = _threading.Barrier(2)
+    call_count = {"n": 0}
+    call_lock = _threading.Lock()
+
+    def _popen_mock(*args, **kwargs):
+        with call_lock:
+            call_count["n"] += 1
+        _time.sleep(0.1)  # widen the race window so an unlocked version would double-spawn
+        proc = MagicMock()
+        proc.pid = 4242
+        return proc
+
+    monkeypatch.setattr("subprocess.Popen", _popen_mock)
+
+    results = []
+
+    def _call():
+        start_barrier.wait()
+        resp = client.post(f"/api/agents/board/cards/{task.id}/open")
+        results.append(resp.status_code)
+
+    threads = [_threading.Thread(target=_call) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert sorted(results) == [200, 409]
+    assert call_count["n"] == 1
 
 
 def test_open_card_remote_host_wraps_in_ssh(client, manager, session_store, monkeypatch):
