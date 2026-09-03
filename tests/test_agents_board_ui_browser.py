@@ -620,6 +620,41 @@ class TestLiveUpdates:
         expect(page.get_by_role("button", name="Answer")).to_have_count(0, timeout=5000)
         expect(page.get_by_role("button", name="Resolve")).to_be_visible()
 
+    def test_kill_button_cleared_when_linked_session_reaches_terminal_status(self, page: Page, agents_base_url):
+        """#850 round-2 finding 3's other half (round-4 finding 1): when the
+        card's linked session reaches a terminal status elsewhere (e.g. the
+        CLI process exits on its own), the open drawer must drop the stale
+        Kill button rather than leaving it behind for a click that would
+        404. Every card in _board_fixture() has session: None, so this half
+        of updateOpenDrawer's `prevSessionStatus !== freshSessionStatus`
+        clause (web/agents/board.js) was never exercised by any test."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_stream_frames: list[str] = []
+
+        for card in board_state["lanes"]["human_queue"]:
+            if card["id"] == "t3":
+                card["session"] = {
+                    "session_id": "s-t3", "status": "running",
+                    "host": "test-host", "routing": "claude_code",
+                    "model_label": "Sonnet", "source": "claude_code",
+                }
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t3"]').click()  # t3: pending_question id 1, human_queue
+        expect(page.get_by_role("button", name="Kill")).to_be_visible()
+
+        for card in board_state["lanes"]["human_queue"]:
+            if card["id"] == "t3":
+                card["session"]["status"] = "ended"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        expect(page.get_by_role("button", name="Kill")).to_have_count(0, timeout=5000)
+
 
 class TestFilters:
     def test_assignee_me_shows_only_me_cards(self, page: Page, agents_base_url):
