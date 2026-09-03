@@ -554,10 +554,47 @@ _LOCAL_KILL_GRACE_S = 2.0
 _LOCAL_KILL_POLL_S = 0.1
 
 
-def _kill_local_subprocess(
-    transcript_store: TranscriptStore, target: Session,
+def _kill_remote_subprocess(
+    transcript_store: TranscriptStore, target: Session, *, remote_kill_runner=None,
 ) -> None:
-    """Best-effort terminate the local CLI subprocess owned by a LOCAL session.
+    """(#851) Best-effort terminate a CLI subprocess a `claude_code`/`codex`
+    executor spawned on a board-assigned HOST other than the API host.
+
+    Signalling a local pid/pgid (as `_kill_local_subprocess` does) can't
+    reach a remote process — the executor recorded the REMOTE process
+    group id instead (`session.remote_pgid`, echoed by the ssh wrapper's
+    first stdout line; see `remote_spawn.build_remote_argv`). This runs
+    `ssh <target> kill -- -<pgid>` through an injectable runner (production
+    default: a real `subprocess.run`; tests inject a fake) — see
+    `remote_spawn.kill_remote_process_group`.
+
+    Best-effort by contract, same as `_kill_local_subprocess`: a missing
+    pgid, an unregistered host, or an ssh failure must never break teardown.
+    """
+    from api.services.agent_worker.remote_spawn import kill_remote_process_group
+    from config.settings import settings
+
+    pgid = getattr(target, "remote_pgid", None)
+    if pgid is None:
+        return  # no remote_pgid recorded yet (subprocess never spawned, or crashed pre-spawn)
+    ssh_target = settings.agent_hosts.get(target.host or "")
+    if not ssh_target:
+        logger.warning(
+            "remote kill: host %r for session %s is not in agent_hosts — nothing to signal",
+            target.host, target.session_id,
+        )
+        return
+    ok = kill_remote_process_group(target=ssh_target, pgid=pgid, runner=remote_kill_runner)
+    transcript_store.append(target.session_id, "remote_subprocess_kill_attempted", {
+        "host": target.host, "pgid": pgid, "ok": ok,
+    })
+
+
+def _kill_local_subprocess(
+    transcript_store: TranscriptStore, target: Session, *, remote_kill_runner=None,
+) -> None:
+    """Best-effort terminate the CLI subprocess owned by a LOCAL or
+    (#851) REMOTE session.
 
     The `claude_code` / `codex` executors run a `subprocess.Popen` in the
     *worker* process and record its pid/process-group id via a `claude_code_pid`
@@ -566,12 +603,24 @@ def _kill_local_subprocess(
     can only reach that subprocess by signalling the recorded pgid. Same-user
     `killpg` is permitted; the worker's `proc.wait()` reaps the dead child.
 
+    A session whose `host` names a machine other than the API host never
+    ran a local subprocess at all — its argv was wrapped in `ssh` instead
+    (see `remote_spawn.build_remote_argv`), so it's dispatched to
+    `_kill_remote_subprocess` instead of the local killpg path below.
+
     Best-effort by contract: a missing pid event, a stale pid (process already
     gone), or a signalling error must NOT break teardown — the managed kill, DB
     flip, and transcript event have already run by the time this is called.
     """
     if target.routing not in CLI_ROUTINGS:
         return  # pure managed/cloud sessions own no local subprocess
+
+    host = (getattr(target, "host", None) or "").strip()
+    if host:
+        from api.services.agent_worker.remote_spawn import api_host_name as _api_host_name
+        if host != _api_host_name():
+            _kill_remote_subprocess(transcript_store, target, remote_kill_runner=remote_kill_runner)
+            return
 
     # Find the most recent pid event in the transcript. Codex records `codex_pid`;
     # claude_code records `claude_code_pid`. The latest wins (a resumed session
@@ -647,14 +696,21 @@ def teardown_session(
     transcript_kind: str,
     transcript_payload: dict,
     managed_driver: Any | None = None,
+    remote_kill_runner=None,
 ) -> dict[str, Any]:
     """Tear down a single session: kill the managed remote (best-effort),
     flip the local DB status to FAILED, append a transcript event, and
-    (for local CLI sessions) terminate the worker-owned subprocess.
+    (for local or #851 remote-host CLI sessions) terminate the worker-owned
+    subprocess.
 
     Shared between agent-initiated `kill()` (this module) and the operator
     HTTP kill endpoint (`api/routes/agents.py`). Authorization is the
     caller's responsibility — this helper just runs the mechanics.
+
+    `remote_kill_runner` (#851) is a test seam forwarded to
+    `_kill_remote_subprocess`/`remote_spawn.kill_remote_process_group` for a
+    session whose `host` names a machine other than the API host — None
+    (the default) uses a real `subprocess.run` over ssh.
 
     Returns `{"managed_failure": <reason or None>}` so the caller can
     surface partial-success in its response.
@@ -679,7 +735,7 @@ def teardown_session(
     # alone doesn't stop the OS process (the worker's `claude -p` keeps running
     # until the next poll) — this reaps it promptly so an operator kill actually
     # stops compute within seconds.
-    _kill_local_subprocess(transcript_store, target)
+    _kill_local_subprocess(transcript_store, target, remote_kill_runner=remote_kill_runner)
     return {"managed_failure": managed_failure}
 
 

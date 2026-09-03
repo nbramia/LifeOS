@@ -128,6 +128,27 @@ def build_remote_argv(
     ]
 
 
+def build_remote_launcher_argv(
+    argv: list[str], *, target: str, connect_timeout: Optional[int] = None,
+) -> list[str]:
+    """Wrap a launcher command (the `/resume`/`/focus` WezTerm invocation)
+    into an ssh call to `target`, with no pgid capture and no credential
+    stripping — unlike `build_remote_argv` (the executor spawn path), a
+    launcher doesn't need a kill target (it's a short-lived terminal
+    spawner, not the long-running CLI session itself) and inherits no
+    provider credentials in the first place.
+    """
+    timeout = connect_timeout if connect_timeout is not None else settings.agent_ssh_connect_timeout
+    return [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", f"ConnectTimeout={timeout}",
+        target,
+        "--",
+        shlex.join(argv),
+    ]
+
+
 def read_remote_pgid_line(line: str) -> Optional[int]:
     """Parse the `PGID:<n>` line a remote-wrapped subprocess echoes first.
     Returns None if `line` isn't that line (caller then treats it as real
