@@ -140,6 +140,39 @@ class TestFileHumanQueueCardsForSync:
         ras.file_human_queue_cards_for_sync(result)
         assert [c for c in calls if c[0] == "PUT"] == []
 
+    def test_skipped_source_with_open_card_is_not_resolved(self, monkeypatch):
+        """A pre-run skip (recently_synced, disabled, monthly-not-due, ...)
+        never ran, so its open card must stay open, not be marked 'sync
+        succeeded' just because the source isn't in failed_sources."""
+        calls = []
+        _install_fake_urlopen(monkeypatch, calls, responses={
+            ("GET", "/api/tasks/human-queue"): {"cards": [{"key": "sync:gmail"}]},
+        })
+        result = {
+            "failed_sources": [],
+            "results": {"gmail": {"skipped": True, "reason": "recently_synced"}},
+        }
+        ras.file_human_queue_cards_for_sync(result)
+        assert [c for c in calls if c[0] == "PUT"] == []
+
+    def test_dependency_skipped_source_with_open_card_is_not_resolved(self, monkeypatch):
+        calls = []
+        _install_fake_urlopen(monkeypatch, calls, responses={
+            ("GET", "/api/tasks/human-queue"): {"cards": [{"key": "sync:calendar"}]},
+        })
+        result = {
+            "failed_sources": [],
+            "results": {
+                "calendar": {
+                    "skipped": True,
+                    "reason": "dependency_failed",
+                    "failed_dependencies": ["gmail"],
+                }
+            },
+        }
+        ras.file_human_queue_cards_for_sync(result)
+        assert [c for c in calls if c[0] == "PUT"] == []
+
     def test_never_raises_even_if_every_call_fails(self, monkeypatch):
         calls = []
         _install_fake_urlopen(

@@ -665,11 +665,17 @@ def file_human_queue_cards_for_sync(result: dict) -> None:
                 key=f"sync:{source}",
             )
 
-        # Resolve only sources that actually have an open card — avoids a
-        # resolve HTTP call (and its inevitable 404) for every healthy
-        # source on every run.
-        for source in result.get("results", {}).keys():
+        # Resolve only a source that actually ran and succeeded this run —
+        # a source that's skipped (disabled, not due, dependency-skipped,
+        # or a mid-run skip like missing credentials) never ran, so its
+        # open card (if any) must stay open, not get marked "sync
+        # succeeded". Also skip sources without an open card at all —
+        # avoids a resolve HTTP call (and its inevitable 404) for every
+        # healthy source on every run.
+        for source, stats in result.get("results", {}).items():
             if source in failed_sources:
+                continue
+            if not stats or not stats.get("success") or stats.get("skipped") or stats.get("dry_run"):
                 continue
             key = f"sync:{source}"
             if key in open_keys:
