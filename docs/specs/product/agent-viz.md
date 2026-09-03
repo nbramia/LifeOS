@@ -40,7 +40,7 @@ The board is backed by the vault task store (`LifeOS/Tasks/`) — every card is 
 | **Human queue** | An agent is blocked on a question, or a `#human` card was filed for the operator, or the task's status is `blocked`. |
 | **Scheduled** | A scheduler entry (`docs/guides/scheduler.md`) with at least one future fire. |
 | **Review** | The agent worker's `#agent-completed` tag is set and the card hasn't been accepted yet. |
-| **Done** | Status `done` or `cancelled` (cancelled cards are hidden behind the "include done/cancelled" filter by default), plus scheduler entries that have fired (one-off) or been disabled (recurring). |
+| **Done** | Status `done` or `cancelled` (cancelled cards are hidden behind the "include cancelled" filter by default — the Done lane itself is always shown), plus scheduler entries that have fired (one-off) or been disabled (recurring). |
 
 ### Assignee
 
@@ -62,7 +62,7 @@ Each card shows the entry's next fire time, a recurring badge for cron entries, 
 
 ### Filters
 
-Filters AND-compose: free-text search (title and notes), lane, assignee (including "me" and "unassigned"), host, tag, context, recency, and whether to include done/cancelled cards. The board updates live — an edit made directly in the vault (or by the agent worker, or by the scheduler) shows up within a few seconds without a page reload.
+Filters AND-compose: free-text search (title and notes), lane, assignee (including "me" and "unassigned"), host, tag, context, recency, and whether to include cancelled cards. The board updates live — an edit made directly in the vault (or by the agent worker, or by the scheduler) shows up within a few seconds without a page reload.
 
 ### Out of scope (for now)
 

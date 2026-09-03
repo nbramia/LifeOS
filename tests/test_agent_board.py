@@ -185,40 +185,94 @@ class TestPlanLaneMove:
 
 
 # ---------------------------------------------------------------------------
-# plan_lane_move — landing lane invariant (#850 round-1 finding 1)
+# plan_lane_move — landing lane invariant (#850 round-1 finding 1, sharpened
+# by round-2 findings 1 and 2)
 #
-# Dropping a card into Done or In progress must actually land it there — a
-# leftover Human queue / Review / agent-running tag must not pull it back to
-# its old lane once `derive_lane` re-runs. One case per lane-table starting
-# lane, crossed with each of the two target lanes this finding fixed.
-# assigned/unassigned are deliberately excluded: those targets are tags-only
-# by design (an assignee change must not pull a card out of Human queue —
-# the lane table says Human queue beats Assigned), so asserting
-# landed-lane == target for them would fight that intended behavior.
+# Dropping a card on a settable lane must either land it there, or be
+# rejected for one of exactly three reasons derived straight from the
+# starting tags — never "any 409 passes" (round-2 finding 12/2c):
+#   * the worker owns the card (agent-running / agent-blocked present) and
+#     the target is In progress or Done (round-2 finding 1)
+#   * an agent-engine assignee tag is present (not yet claimed by the
+#     worker) and the target is In progress (round-1 finding, unchanged)
+#   * the card is a pending review (agent-completed, not yet accepted) and
+#     the target is In progress or Human queue — Done still doubles as the
+#     accept path (round-2 finding 2a)
+# Assigned/unassigned are tags-only by design (an assignee change must not
+# pull a card out of Human queue — the lane table says Human queue beats
+# Assigned), so for those two targets this only checks the assignee-tag
+# outcome and that `status` is left untouched, never landed-lane == target.
 # ---------------------------------------------------------------------------
 
 class TestPlanLaneMoveLandsInTargetLane:
     STARTING_STATES = {
         "unassigned": ("todo", []),
-        "assigned": ("todo", ["codex"]),
-        "in_progress": ("in_progress", ["codex", "agent", "agent-running"]),
+        "assigned_me": ("todo", ["me"]),
+        "assigned_codex": ("todo", ["codex"]),
+        "in_progress_status": ("in_progress", []),
+        "in_progress_worker_running": ("todo", ["agent", "agent-running"]),
         "human_queue_human_tag": ("todo", ["human"]),
-        "human_queue_agent_blocked": ("todo", ["agent-blocked"]),
+        "human_queue_human_tag_and_blocked_status": ("blocked", ["human"]),
+        "human_queue_agent_blocked": ("todo", ["agent", "agent-blocked"]),
         "human_queue_blocked_status": ("blocked", []),
-        "review": ("done", ["codex", "agent-completed"]),
-        "done": ("done", ["codex", "accepted"]),
+        "review_agent_completed_status_todo": ("todo", ["agent-completed"]),
+        "review_agent_completed_status_done": ("done", ["agent-completed"]),
+        "review_assignee_me": ("done", ["me", "agent-completed"]),
+        "done_plain": ("done", []),
+        "done_accepted": ("done", ["codex", "accepted"]),
+        "cancelled": ("cancelled", []),
     }
 
-    @pytest.mark.parametrize("target_lane", ["in_progress", "done"])
+    SETTABLE_TARGETS = ["unassigned", "assigned", "in_progress", "human_queue", "done"]
+
+    WORKER_OWNED_ERROR = (
+        409,
+        "the worker owns this task while it is running or waiting on an "
+        "answer — answer or kill the session first",
+    )
+    AGENT_ASSIGNEE_ERROR = (409, "only the worker claims agent-assigned tasks")
+    REVIEW_ERROR = (409, "accept the review first")
+
+    @classmethod
+    def _expected_error(cls, current_status, current_tags, target_lane):
+        """The one legitimate rejection reason for this (state, target)
+        pair, or None if the move must succeed. Derived independently of
+        `plan_lane_move` so the test can't just echo the implementation."""
+        tags_lower = {t.lstrip("#").lower() for t in current_tags}
+        worker_owned = bool(tags_lower & {"agent-running", "agent-blocked"})
+        current_assignee = agent_board.derive_assignee(current_tags)
+        is_review = "agent-completed" in tags_lower and "accepted" not in tags_lower
+
+        if target_lane in ("in_progress", "done") and worker_owned:
+            return cls.WORKER_OWNED_ERROR
+        if target_lane == "in_progress" and current_assignee in agent_board.AGENT_ASSIGNEES:
+            return cls.AGENT_ASSIGNEE_ERROR
+        if target_lane in ("in_progress", "human_queue") and is_review:
+            return cls.REVIEW_ERROR
+        return None
+
+    @pytest.mark.parametrize("target_lane", SETTABLE_TARGETS)
     @pytest.mark.parametrize("start_name,start", list(STARTING_STATES.items()))
-    def test_lands_in_target_or_is_rejected(self, start_name, start, target_lane):
+    def test_matrix(self, start_name, start, target_lane):
         current_status, current_tags = start
         plan = agent_board.plan_lane_move(current_status, current_tags, target_lane, "me")
-        if plan.error is not None:
-            # Only a legitimate rejection: the worker owns agent-assigned
-            # cards, so those can't be dragged straight to In progress.
-            assert plan.error[0] == 409, (start_name, target_lane, plan.error)
+        expected_error = self._expected_error(current_status, current_tags, target_lane)
+
+        if expected_error is not None:
+            assert plan.error == expected_error, (start_name, target_lane, plan.error)
+            assert plan.status is None and plan.tags is None, (start_name, target_lane)
             return
+
+        assert plan.error is None, (start_name, target_lane, plan.error)
+
+        if target_lane in ("assigned", "unassigned"):
+            assert plan.status is None, (start_name, target_lane, plan.status)
+            landed_tags = plan.tags if plan.tags is not None else list(current_tags)
+            new_assignee = agent_board.derive_assignee(landed_tags)
+            expected_assignee = "me" if target_lane == "assigned" else None
+            assert new_assignee == expected_assignee, (start_name, target_lane, landed_tags)
+            return
+
         final_status = plan.status if plan.status is not None else current_status
         final_tags = plan.tags if plan.tags is not None else list(current_tags)
         assert agent_board.derive_lane(final_status, final_tags) == target_lane, (
@@ -230,12 +284,20 @@ class TestPlanLaneMoveLandsInTargetLane:
         assert plan.status == "done"
         assert "human" not in plan.tags
 
-    def test_done_strips_agent_blocked_and_agent_running(self):
+    def test_done_rejects_worker_owned_agent_blocked_and_agent_running(self):
+        # Round-2 finding 1: the worker owns a card carrying agent-running or
+        # agent-blocked — dropping it on Done must 409 and write nothing,
+        # not silently strip the tag out from under a live worker task.
         plan = agent_board.plan_lane_move(
             "blocked", ["codex", "agent", "agent-blocked", "agent-running"], "done", None,
         )
-        assert plan.status == "done"
-        assert set(plan.tags) == {"codex", "agent"}
+        assert plan.error == (
+            409,
+            "the worker owns this task while it is running or waiting on an "
+            "answer — answer or kill the session first",
+        )
+        assert plan.status is None
+        assert plan.tags is None
 
     def test_done_appends_accepted_when_agent_completed_present(self):
         plan = agent_board.plan_lane_move("done", ["codex", "agent-completed"], "done", None)
@@ -248,14 +310,22 @@ class TestPlanLaneMoveLandsInTargetLane:
         )
         assert plan.tags is None or plan.tags.count("accepted") == 1
 
-    def test_in_progress_strips_human_and_agent_blocked(self):
+    def test_in_progress_strips_human(self):
         plan = agent_board.plan_lane_move("todo", ["human"], "in_progress", None)
         assert plan.status == "in_progress"
         assert "human" not in plan.tags
 
-        plan2 = agent_board.plan_lane_move("todo", ["agent-blocked"], "in_progress", None)
-        assert plan2.status == "in_progress"
-        assert "agent-blocked" not in plan2.tags
+    def test_in_progress_rejects_worker_owned_agent_blocked(self):
+        # Round-2 finding 1: agent-blocked means the worker owns this card
+        # (it's waiting on an answer) — 409, not a silent strip.
+        plan = agent_board.plan_lane_move("todo", ["agent-blocked"], "in_progress", None)
+        assert plan.error == (
+            409,
+            "the worker owns this task while it is running or waiting on an "
+            "answer — answer or kill the session first",
+        )
+        assert plan.status is None
+        assert plan.tags is None
 
 
 # ---------------------------------------------------------------------------

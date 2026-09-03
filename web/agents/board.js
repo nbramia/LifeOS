@@ -98,14 +98,30 @@ export function initBoard() {
       panel.updateMeta(fresh.session);
     }
 
+    // Beyond the editable fields, also watch pending_question and the
+    // linked session's status — neither drives an input, but both drive
+    // which action buttons the drawer shows (Answer, Kill). Without this,
+    // answering from the drawer or a session reaching a terminal state
+    // leaves a stale button behind: a second "Answer" click 404s, and
+    // "Kill" survives a session that already exited (#850 round-2 finding 3).
+    const prevPendingId = (prev && prev.pending_question && prev.pending_question.id) ?? null;
+    const freshPendingId = (fresh.pending_question && fresh.pending_question.id) ?? null;
+    const prevSessionStatus = (prev && prev.session && prev.session.status) ?? null;
+    const freshSessionStatus = (fresh.session && fresh.session.status) ?? null;
+
     const fieldsChanged = !prev || DRAWER_EDITABLE_FIELDS.some(
       f => JSON.stringify(prev[f]) !== JSON.stringify(fresh[f])
-    );
+    ) || prevPendingId !== freshPendingId || prevSessionStatus !== freshSessionStatus;
     const focused = !!(drawerEl && drawerEl.contains(document.activeElement));
     if ((fieldsChanged || !sessionUnchanged) && !focused) {
       renderDrawer(fresh);
+      // Only advance the snapshot on the branch that actually rendered —
+      // otherwise a frame skipped because the drawer had focus is treated
+      // as "no change" forever, and a later change gets silently dropped
+      // too because it's diffed against this stale snapshot instead of the
+      // last card the drawer actually shows (#850 round-2 finding 4).
+      openCardSnapshot = fresh;
     }
-    openCardSnapshot = fresh;
   }
 
   function fetchBoard() {
@@ -376,6 +392,11 @@ export function initBoard() {
     moveCard(cardId, targetLane, assignee).catch(() => {});
   }
 
+  function laneLabel(laneId) {
+    const lane = LANES.find(l => l.id === laneId);
+    return lane ? lane.label : laneId;
+  }
+
   function moveCard(cardId, targetLane, assignee) {
     const body = { lane: targetLane };
     if (assignee) body.assignee = assignee;
@@ -393,7 +414,17 @@ export function initBoard() {
         }
         return r.json();
       })
-      .then(() => fetchBoard())
+      .then((data) => {
+        // The server-landed lane can differ from what was requested for the
+        // tags-only assigned/unassigned moves (e.g. a Human-queue card
+        // assigned to someone stays in Human queue) — surface that instead
+        // of leaving the operator to notice the card "snapped back" on its
+        // own (#850 round-2 finding 2b).
+        if (data && data.lane && data.lane !== targetLane) {
+          showToast(`Card landed in ${laneLabel(data.lane)}, not ${laneLabel(targetLane)}.`, false);
+        }
+        return fetchBoard();
+      })
       .catch(err => {
         showToast(`Couldn't move card: ${err.message}`, true);
         // Nothing was mutated client-side before the request resolved, so
@@ -759,6 +790,18 @@ export function initBoard() {
     }
     panel = new SessionPanel({ container: sessionWrap });
     panel.open(card.session);
+  }
+
+  // A change that arrived while the drawer had focus is deferred by
+  // updateOpenDrawer's `!focused` check — flush it as soon as the operator
+  // leaves the field, using the latest board already applied by applyBoard
+  // (#850 round-2 finding 4).
+  if (drawerEl) {
+    drawerEl.addEventListener('focusout', () => {
+      if (!openCardId) return;
+      const fresh = findCard(openCardId);
+      if (fresh) updateOpenDrawer(fresh);
+    });
   }
 
   // ------------------------------------------------------------------

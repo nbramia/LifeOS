@@ -839,32 +839,55 @@ and the SSE update cadence.
 
 ### GET /api/agents/board
 
-Full board view model: `{lanes: {unassigned, assigned, in_progress,
-human_queue, scheduled, review, done}, generated_at}`. Each task card
-carries `id, title, notes, status, tags, assignee, fields, context,
-updated_at, session (nullable), pending_question (nullable)`. Each
-scheduled card carries `id, name, next_fire_at, recurring, last_run {at,
-outcome, snippet} (nullable)`.
+Full board view model, always built fresh (never cached): `{lanes:
+{unassigned, assigned, in_progress, human_queue, scheduled, review, done},
+generated_at}`. Each task card carries `id, title, notes, status, tags,
+assignee, fields, context, updated_at, session (nullable), pending_question
+(nullable)`. Each scheduled card carries `id, name, message_content,
+enabled, next_fire_at, recurring, last_run {at, outcome, snippet}
+(nullable)`.
 
 ### GET /api/agents/board/stream
 
 SSE stream of the board view model — emits a full `board` event whenever
-the lanes change.
+the lanes change. Reads through a short-lived shared cache (see
+[Agent Viz — Technical](../technical/agent-viz.md#board-cache)); `GET
+/api/agents/board` above never does.
 
 ### PUT /api/agents/board/cards/{id}/lane
 
-Move a task card to a lane, writing the corresponding status/tag at once.
-Body: `{lane, assignee?}`. `lane: "done"` marks the task done;
-`lane: "unassigned"` clears the assignee tag; `lane: "assigned"` requires
-`assignee` (one of `me`/`claude`/`codex`/`hermes`/`local`) and replaces any
-existing assignee tag. `lane: "in_progress"` on a task whose assignee is an
-agent engine returns **409** — only the agent worker claims agent-assigned
-tasks. `review` and `scheduled` can't be set directly (derived from a tag
+Move a task card to a lane, writing the corresponding status/tag at once —
+or writing nothing and returning an error. Body: `{lane, assignee?}`.
+`lane: "done"` marks the task done; `lane: "unassigned"` clears the
+assignee tag; `lane: "assigned"` requires `assignee` (one of
+`me`/`claude`/`codex`/`hermes`/`local`) and replaces any existing assignee
+tag. `review` and `scheduled` can't be set directly (derived from a tag
 and the scheduler store, respectively) and return **400**.
+
+Three **409** cases, no write in any of them:
+- The card is worker-owned (`agent-running` or `agent-blocked` tag
+  present) and `lane` is `in_progress` or `done` — the worker owns this
+  card while it's running or waiting on an answer; answer the question or
+  kill the session first.
+- The card's assignee is an agent engine that hasn't been claimed by the
+  worker yet and `lane` is `in_progress` — only the agent worker claims
+  agent-assigned tasks.
+- The card is a pending review (`agent-completed` tag without `accepted`)
+  and `lane` is `in_progress` or `human_queue` — accept or reject the
+  review first. `lane: "done"` on a pending review still succeeds and acts
+  as accept (adds `accepted`), same as `POST .../accept`.
+
+On success, the response's `lane` is the card's actual landed lane, which
+for `lane: "assigned"`/`"unassigned"` (tags-only writes) can differ from
+the requested lane if a higher-priority signal still applies — e.g. a
+Human-queue card assigned to someone stays in Human queue. The web board
+toasts when this happens.
 
 ### POST /api/agents/board/cards/{id}/accept
 
 Move a Review card to Done by adding the `accepted` tag. Idempotent.
+Returns **409** if the card isn't in the Review lane and isn't already
+accepted.
 
 ### GET /api/agents/pending-questions
 
@@ -873,9 +896,10 @@ question, asked_at, bot}]}`.
 
 ### POST /api/agents/pending-questions/{id}/answer
 
-Answer a pending question. Body: `{answer}`. Writes the same columns a
-Telegram reply would — the agent worker resumes the session on its next
-tick unchanged.
+Answer a pending question. Body: `{answer}`, 1-4096 characters — an empty,
+whitespace-only, or over-length answer returns **400**. Writes the same
+columns a Telegram reply would — the agent worker resumes the session on
+its next tick unchanged.
 
 ---
 

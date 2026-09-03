@@ -137,7 +137,23 @@ def plan_lane_move(
     vault or scheduler directly.
     """
     tags_list = [str(t) for t in (current_tags or [])]
+    tset_lower = {t.lstrip("#").lower() for t in tags_list}
     current_assignee = derive_assignee(tags_list)
+    # The worker owns this card while it's actively running or waiting on an
+    # answer — dropping it on In progress or Done would desync the tag from
+    # the worker's own claim state (round-2 finding 1: the round-1 strip of
+    # these tags let a card silently detach from a live worker task).
+    worker_owned = bool(tset_lower & {RUNNING_TAG, BLOCKED_TAG})
+    worker_owned_error = (
+        409,
+        "the worker owns this task while it is running or waiting on an "
+        "answer — answer or kill the session first",
+    )
+    # A pending review (agent-completed, not yet accepted) must be accepted
+    # or rejected before it can be reassigned to work or handed to a human —
+    # only Done (the accept path) may act on it directly (round-2 finding 2a).
+    is_review = COMPLETED_TAG in tset_lower and ACCEPTED_TAG not in tset_lower
+    review_error = (409, "accept the review first")
 
     if target_lane not in LANES:
         return LaneMovePlan(error=(400, f"unknown lane '{target_lane}'"))
@@ -159,34 +175,40 @@ def plan_lane_move(
         return LaneMovePlan(tags=new_tags)
 
     if target_lane == "in_progress":
+        if worker_owned:
+            return LaneMovePlan(error=worker_owned_error)
         # Only the worker claims agent-assigned tasks (swaps #agent ->
         # #agent-running itself); a human dragging such a card to In
         # progress would desync the tag from the actual claim state.
         if current_assignee in AGENT_ASSIGNEES:
             return LaneMovePlan(error=(409, "only the worker claims agent-assigned tasks"))
-        # A card can arrive here from Human queue (#human or agent-blocked) —
-        # strip those so it actually leaves Human queue instead of derive_lane
-        # immediately pulling it back (Human queue outranks In progress).
-        strip = {HUMAN_TAG, BLOCKED_TAG}
-        tset_lower = {t.lstrip("#").lower() for t in tags_list}
+        if is_review:
+            return LaneMovePlan(error=review_error)
+        # A card can arrive here from Human queue (#human) — strip it so it
+        # actually leaves Human queue instead of derive_lane immediately
+        # pulling it back (Human queue outranks In progress).
+        strip = {HUMAN_TAG}
         if tset_lower & strip:
             new_tags = [t for t in tags_list if t.lstrip("#").lower() not in strip]
             return LaneMovePlan(status="in_progress", tags=new_tags)
         return LaneMovePlan(status="in_progress")
 
     if target_lane == "human_queue":
+        if is_review:
+            return LaneMovePlan(error=review_error)
         return LaneMovePlan(status="blocked")
 
     if target_lane == "done":
-        # A card can arrive here from Human queue, agent-blocked, or with a
-        # stale agent-running tag — strip those so it actually leaves those
-        # lanes (both outrank Done in derive_lane). A pending agent-completed
-        # review also needs the `accepted` tag or Review would keep claiming
-        # it (Review outranks Done too).
-        strip = {HUMAN_TAG, BLOCKED_TAG, RUNNING_TAG}
-        tset_lower = {t.lstrip("#").lower() for t in tags_list}
+        if worker_owned:
+            return LaneMovePlan(error=worker_owned_error)
+        # A card can arrive here from Human queue — strip `human` so it
+        # actually leaves that lane (it outranks Done in derive_lane). A
+        # pending agent-completed review also needs the `accepted` tag or
+        # Review would keep claiming it (Review outranks Done too) — this is
+        # the one case dragging to Done still doubles as an accept.
+        strip = {HUMAN_TAG}
         needs_strip = bool(tset_lower & strip)
-        needs_accept = COMPLETED_TAG in tset_lower and ACCEPTED_TAG not in tset_lower
+        needs_accept = is_review
         if needs_strip or needs_accept:
             new_tags = [t for t in tags_list if t.lstrip("#").lower() not in strip]
             if needs_accept:

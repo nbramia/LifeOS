@@ -672,13 +672,15 @@ async def stream_snapshots() -> StreamingResponse:
 # ---------------------------------------------------------------------------
 
 # Board SSE tick interval. The task watcher's own debounce is 2.0s (see
-# api/services/task_watcher.py); ticking the board every 0.75s on top of that
-# keeps "reflects an external vault edit" comfortably under the 3s budget
-# without a heavier cross-thread push mechanism — both TaskManager and
-# SchedulerStore serve from in-memory indexes, so rebuilding the board every
-# tick is cheap. A tick only emits when the board actually changed (compared
-# by a cheap signature), so an idle board doesn't spam the client.
-_BOARD_STREAM_INTERVAL = 0.75
+# api/services/task_watcher.py); ticking the board every 0.5s on top of that
+# (plus the shared cache's 0.25s TTL, see _BOARD_CACHE_TTL below) keeps
+# "reflects an external vault edit" comfortably under the 3s budget without a
+# heavier cross-thread push mechanism — both TaskManager and SchedulerStore
+# serve from in-memory indexes, so rebuilding the board is cheap. A tick only
+# emits when the board actually changed (compared by a cheap signature), so
+# an idle board doesn't spam the client. See docs/specs/technical/agent-viz.md
+# for the full worst-case arithmetic.
+_BOARD_STREAM_INTERVAL = 0.5
 
 
 def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
@@ -766,19 +768,24 @@ def _build_board() -> dict[str, Any]:
     return {"lanes": lanes, "generated_at": int(time.time())}
 
 
-# Module-level (built_at, board) cache, TTL == _BOARD_STREAM_INTERVAL.
-# `_build_board` reads every task, every schedule entry, and up to 200
-# session transcript files — cheap once, but every open board tab (GET
-# /board or /board/stream) calling it independently on every tick would
-# multiply that cost by the number of open tabs. Sharing one build per
-# tick keeps GET /board and the stream reading identical data too.
+# Module-level (built_at, board) cache used ONLY by the stream's own tick —
+# NOT by GET /board (round-2 finding 6). `_build_board` reads every task,
+# every schedule entry, and up to 200 session transcript files — cheap once,
+# but every open board tab's stream connection rebuilding independently on
+# every tick would multiply that cost by the number of open tabs. Sharing
+# one build per short window keeps concurrent stream connections reading
+# identical data without adding this TTL's staleness to a direct GET.
+# TTL is intentionally much shorter than the tick interval — it only exists
+# to de-duplicate simultaneous stream connections within the same instant,
+# not to skip rebuilds between ticks.
+_BOARD_CACHE_TTL = 0.25
 _board_cache: tuple[float, dict[str, Any]] | None = None
 
 
 async def _get_board_cached() -> dict[str, Any]:
     global _board_cache
     now = time.monotonic()
-    if _board_cache is not None and now - _board_cache[0] < _BOARD_STREAM_INTERVAL:
+    if _board_cache is not None and now - _board_cache[0] < _BOARD_CACHE_TTL:
         return _board_cache[1]
     board = await run_in_threadpool(_build_board)
     _board_cache = (now, board)
@@ -786,10 +793,9 @@ async def _get_board_cached() -> dict[str, Any]:
 
 
 def _invalidate_board_cache() -> None:
-    """Drop the cached board so the next GET/stream tick rebuilds it.
-
-    Called after a lane-move write so a GET /board immediately following a
-    PUT/accept always reflects it, instead of waiting out the TTL.
+    """Drop the cached board so the next stream tick rebuilds it immediately
+    instead of possibly serving a pre-write board for up to `_BOARD_CACHE_TTL`
+    more seconds. Called after every board write (lane-move, accept, answer).
     """
     global _board_cache
     _board_cache = None
@@ -797,8 +803,14 @@ def _invalidate_board_cache() -> None:
 
 @router.get("/board")
 async def get_board() -> dict[str, Any]:
-    """Full current board view model — see `_build_board`."""
-    return await _get_board_cached()
+    """Full current board view model — see `_build_board`.
+
+    Always built fresh, never served from `_board_cache` — an explicit GET
+    is a direct client request (e.g. the drawer's own `await putTask();
+    await fetchBoard()` after a save) and must reflect the write that just
+    happened, not a cache built before it (round-2 finding 6).
+    """
+    return await run_in_threadpool(_build_board)
 
 
 @router.get("/board/stream")
@@ -956,6 +968,7 @@ async def answer_pending_question(question_id: int, body: PendingQuestionAnswerR
     ok = session_store.deposit_answer_by_id(question_id, answer)
     if not ok:
         raise HTTPException(status_code=404, detail="question not found, already answered, or timed out")
+    _invalidate_board_cache()
     return {"ok": True, "id": question_id}
 
 

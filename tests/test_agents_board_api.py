@@ -8,7 +8,9 @@ monkeypatch so the real vault/data directories are never touched.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -74,6 +76,22 @@ class TestGetBoard:
             "scheduled", "review", "done",
         }
         assert "generated_at" in body
+
+    def test_get_board_never_served_from_stream_cache(self, client, stores):
+        """Round-2 finding 6(a): GET /board must always build fresh — it
+        must never read the TTL'd cache the stream's own tick uses.
+        Poisons the cache with a snapshot missing the task and proves GET
+        ignores it rather than serving pre-write data (reproduces the
+        drawer's own `await putTask(); await fetchBoard()` staleness)."""
+        task_manager, *_ = stores
+        task = task_manager.create("Notes card", tags=["me"])
+        empty_lanes = {lane: [] for lane in (
+            "unassigned", "assigned", "in_progress", "human_queue",
+            "scheduled", "review", "done",
+        )}
+        agents_route._board_cache = (time.monotonic(), {"lanes": empty_lanes, "generated_at": 0})
+        body = client.get("/api/agents/board").json()
+        assert task.id in [c["id"] for c in body["lanes"]["assigned"]]
 
     def test_task_lands_in_derived_lane_with_full_card_shape(self, client, stores):
         task_manager, *_ = stores
@@ -253,9 +271,24 @@ class TestBoardStream:
             first_board = json.loads(second.split("data: ", 1)[1])
             assert task.id in [c["id"] for c in first_board["lanes"]["unassigned"]]
 
+            # Round-2 finding 10: without a mutation, ticks must not emit —
+            # the signature-diff suppression, not "any frame that shows up".
+            # Use asyncio.wait (not wait_for) so a timeout leaves the pending
+            # __anext__() task running rather than cancelling it — cancelling
+            # an async generator's __anext__() closes the generator, which
+            # would make every subsequent __anext__() raise StopAsyncIteration.
+            next_task = asyncio.ensure_future(gen.__anext__())
+            done, _pending = await asyncio.wait(
+                {next_task}, timeout=2 * agents_route._BOARD_STREAM_INTERVAL,
+            )
+            assert next_task not in done, (
+                "stream emitted a frame despite no board mutation "
+                "(signature-diff suppression broken)"
+            )
+
             task_manager.update(task.id, tags=["me"])
 
-            third = await gen.__anext__()
+            third = await next_task
             assert third.startswith("event: board\n")
             second_board = json.loads(third.split("data: ", 1)[1])
             assert task.id in [c["id"] for c in second_board["lanes"]["assigned"]]
@@ -341,6 +374,63 @@ class TestMoveBoardCard:
         assert task.id in done_ids
         assert task.id not in human_queue_ids
 
+    @pytest.mark.parametrize("worker_tag", ["agent-running", "agent-blocked"])
+    @pytest.mark.parametrize("target_lane", ["in_progress", "done"])
+    def test_worker_owned_card_cannot_be_dropped_on_in_progress_or_done(
+        self, client, stores, worker_tag, target_lane,
+    ):
+        """Round-2 finding 1: a worker-owned card (agent-running or
+        agent-blocked) must 409 for In progress and Done, with NO write at
+        all — round-1's tag-strip silently detached these from a live
+        worker task instead."""
+        task_manager, *_ = stores
+        task = task_manager.create("Being worked by the agent", tags=["agent", worker_tag])
+        inbox = task_manager.tasks_dir / "Inbox.md"
+        before = inbox.read_bytes()
+
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": target_lane})
+        assert r.status_code == 409
+        assert r.json()["detail"] == (
+            "the worker owns this task while it is running or waiting on an "
+            "answer — answer or kill the session first"
+        )
+        # No write at all — the vault file is byte-for-byte unchanged.
+        assert inbox.read_bytes() == before
+        updated = task_manager.get(task.id)
+        assert sorted(updated.tags) == sorted(["agent", worker_tag])
+
+    @pytest.mark.parametrize("target_lane", ["in_progress", "human_queue"])
+    def test_review_card_cannot_be_moved_to_in_progress_or_human_queue(
+        self, client, stores, target_lane,
+    ):
+        """Round-2 finding 2(a): a pending review (agent-completed, not yet
+        accepted) must 409 rather than silently writing status/tags while
+        the card stays in Review — only Done still doubles as accept."""
+        task_manager, *_ = stores
+        task = task_manager.create("Reviewed by the operator", tags=["me", "agent-completed"], status="done")
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": target_lane})
+        assert r.status_code == 409
+        assert r.json()["detail"] == "accept the review first"
+        updated = task_manager.get(task.id)
+        assert updated.status == "done"
+        assert sorted(updated.tags) == ["agent-completed", "me"]
+
+        board = client.get("/api/agents/board").json()
+        review_ids = [c["id"] for c in board["lanes"]["review"]]
+        assert task.id in review_ids
+
+    def test_review_card_dropped_on_done_still_accepts(self, client, stores):
+        """Done keeps acting as the accept path for a Review card — only
+        In progress and Human queue were narrowed to 409 (round-2 finding 2a)."""
+        task_manager, *_ = stores
+        task = task_manager.create("Reviewed by the operator", tags=["me", "agent-completed"], status="done")
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "done"})
+        assert r.status_code == 200
+        assert r.json()["lane"] == "done"
+        updated = task_manager.get(task.id)
+        assert "accepted" in updated.tags
+        assert updated.status == "done"
+
 
 # ---------------------------------------------------------------------------
 # POST /api/agents/board/cards/{id}/accept
@@ -393,6 +483,23 @@ class TestAcceptBoardCard:
 
 @pytest.mark.unit
 class TestPendingQuestions:
+    def test_answer_invalidates_the_stream_cache(self, client, stores):
+        """Round-2 finding 6(c): answering a question must invalidate
+        `_board_cache` like a lane-move/accept write does, so the stream's
+        next tick doesn't keep serving a pre-answer board for the rest of
+        the TTL."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Investigate the outage", tags=["agent-blocked"], status="blocked")
+        session = session_store.create(task_id=task.id, status=STATUS_BLOCKED)
+        qid = session_store.create_pending_question(
+            session_id=session.session_id, task_id=task.id, question="Staging or prod?",
+            sent_message_id=1,
+        )
+        agents_route._board_cache = (time.monotonic(), {"stale": True})
+        r = client.post(f"/api/agents/pending-questions/{qid}/answer", json={"answer": "staging"})
+        assert r.status_code == 200
+        assert agents_route._board_cache is None
+
     def test_list_and_answer_matches_deposit_answer_columns(self, client, stores):
         _tm, _sched, session_store, _transcript = stores
         session = session_store.create(task_id="t1", status=STATUS_BLOCKED)

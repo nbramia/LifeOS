@@ -17,6 +17,7 @@ import http.server
 import json
 import re
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -133,7 +134,7 @@ def _move_card_in_state(board_state: dict, card_id: str, target_lane: str) -> No
 
 
 def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: list, lane_status_code: list,
-                  schedule_puts: list, board_stream_frames: list):
+                  schedule_puts: list, board_stream_frames: list, stream_gate: "threading.Event | None" = None):
     """Stub d3 (offline CDN) + every /api/ call the page makes.
 
     `board_stream_frames`: SSE frame strings (each a full
@@ -143,6 +144,26 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
     body, so it always closes the EventSource immediately after delivery;
     Chromium auto-reconnects per the SSE spec, and the `retry: 20` directive
     below makes that reconnect fast enough for a test to wait on.
+
+    `stream_gate`: when given, every `/board/stream` connection is answered
+    with an empty keep-alive (and a short `retry:` so the client polls back
+    soon) for as long as `not stream_gate.is_set()`, checked fresh on each
+    connection — never any real frame. Once the test calls
+    `stream_gate.set()`, the next connection (at most one retry interval
+    later) gets the real frame-delivery behavior. This check is a plain
+    non-blocking `Event.is_set()`, called synchronously inside the route
+    callback: Playwright Python's sync API dispatches every route callback
+    on its one internal driver thread via a greenlet switch, so an actual
+    *block* here (`stream_gate.wait()`) — or fulfilling from a separate
+    thread to work around that — either freezes every other Playwright call
+    the test makes or raises `greenlet.error: Cannot switch to a different
+    thread` from `route.fulfill()`. Polling `is_set()` avoids both. Used to
+    prove a frame provably arrives only after a specific point in the test
+    (e.g. once a drawer is open and mid-edit) instead of racing page load on
+    a fixed timer (#850 round-2 finding 5). `board_stream_frames` (and
+    `board_state`, if the test wants the two to stay consistent) may be
+    mutated by the caller any time before calling `stream_gate.set()` — the
+    handler reads them fresh on the connection that delivers them.
     """
 
     def d3_handler(route):
@@ -157,7 +178,10 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
         method = route.request.method
 
         if "/api/agents/board/stream" in url:
-            frame_idx = stream_attempt[0] - 1  # frames start on the 2nd connection
+            if stream_gate is not None and not stream_gate.is_set():
+                route.fulfill(status=200, content_type="text/event-stream", body="retry: 50\n: ok\n\n")
+                return
+            frame_idx = stream_attempt[0] - 1  # frames start on the 2nd post-gate connection
             frame = board_stream_frames[frame_idx] if 0 <= frame_idx < len(board_stream_frames) else ""
             stream_attempt[0] += 1
             route.fulfill(status=200, content_type="text/event-stream", body=f"retry: 20\n: ok\n\n{frame}")
@@ -209,7 +233,7 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
 
 
 def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_puts=None, lane_status_code=None,
-                 schedule_puts=None, board_stream_frames=None):
+                 schedule_puts=None, board_stream_frames=None, stream_gate=None):
     _stub_routes(
         page,
         board_state if board_state is not None else _board_fixture(),
@@ -218,9 +242,22 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
         lane_status_code if lane_status_code is not None else [200],
         schedule_puts if schedule_puts is not None else [],
         board_stream_frames if board_stream_frames is not None else [],
+        stream_gate,
     )
     page.goto(f"{base_url}/agents")
     page.wait_for_selector('[data-card-id="t1"]')
+
+
+def _wait_for(predicate, timeout_ms=5000, interval_ms=25):
+    """Poll `predicate` until it's truthy or the timeout elapses — for
+    asserting on a plain Python side effect (e.g. an appended stub call)
+    that has no DOM signal Playwright's own `expect(...)` can wait on."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(interval_ms / 1000)
+    assert predicate(), f"condition not met within {timeout_ms}ms"
 
 
 def _drag_card(page: Page, card_id: str, target_lane: str):
@@ -330,19 +367,41 @@ class TestDrawerAssigneeRevert:
 
 
 class TestScheduledCardDrawer:
-    def test_editing_title_saves_through_scheduler_api(self, page: Page, agents_base_url):
+    def test_editing_title_message_and_enabled_all_save_through_scheduler_api(self, page: Page, agents_base_url):
         """Round-1 finding 4: the scheduled card's title, message, and
         enabled checkbox save through PUT /api/scheduler/{id}, not a new
-        board write path."""
+        board write path. Round-2 finding 9: the docstring claimed all
+        three but only title was ever exercised — the message textarea's
+        blur handler and the enabled checkbox's change handler
+        (web/agents/board.js) were untested."""
         schedule_puts = []
         _open_board(page, agents_base_url, schedule_puts=schedule_puts)
         page.locator('[data-card-id="s1"]').click()
         title = page.locator(".drawer-title")
+        message = page.locator(".drawer-notes")
+        enabled = page.locator('[data-field="enabled"]')
         expect(title).to_have_value("Morning briefing")
         title.fill("Evening briefing")
-        page.locator(".drawer-notes").click()  # blur the title field
-        expect(page.locator(".drawer-notes")).to_have_value("Good morning")
-        assert schedule_puts == [{"name": "Evening briefing"}]
+        message.click()  # blur the title field
+        expect(message).to_have_value("Good morning")
+        _wait_for(lambda: {"name": "Evening briefing"} in schedule_puts)
+
+        # Blur message straight into the checkbox (never back through title —
+        # title's own blur handler compares against the value captured when
+        # its DOM node was created, and staying focused inside the drawer
+        # deliberately skips re-rendering it (#850 round-2 finding 4), so a
+        # second title blur here would re-save the same unchanged value).
+        message.fill("Good evening")
+        expect(enabled).to_be_checked()
+        enabled.uncheck()  # blurs message, then toggles enabled
+        _wait_for(lambda: {"message_content": "Good evening"} in schedule_puts)
+        _wait_for(lambda: {"enabled": False} in schedule_puts)
+
+        assert schedule_puts == [
+            {"name": "Evening briefing"},
+            {"message_content": "Good evening"},
+            {"enabled": False},
+        ]
 
 
 class TestLiveUpdates:
@@ -363,27 +422,64 @@ class TestLiveUpdates:
         expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_have_count(0)
         assert page.url == url_before  # no page reload/navigation happened
 
-    def test_drawer_notes_survive_a_board_frame_while_typing(self, page: Page, agents_base_url):
-        # Change a different editable field (tags) on the open card (t2) so
-        # the incoming frame is a real, would-otherwise-trigger-a-rebuild
-        # change — proving the focus guard, not just an unchanged-fields
-        # no-op, is what protects the in-progress edit (covers finding 2).
-        changed_board = copy.deepcopy(_board_fixture())
-        for card in changed_board["lanes"]["assigned"]:
-            if card["id"] == "t2":
-                card["tags"] = ["me", "urgent"]
-        frame = f"event: board\ndata: {json.dumps(changed_board)}\n\n"
+    def test_drawer_notes_survive_a_board_frame_while_typing_and_flushes_on_blur(self, page: Page, agents_base_url):
+        """Round-2 finding 5 (reworks round-1 finding 12(b)'s test, which was
+        a false positive): the prior version delivered its frame on the
+        stub's *second* SSE connection, which — thanks to the `retry: 20`
+        reconnect — landed ~20ms after page load, before the drawer was
+        even opened. The guarded path (updateOpenDrawer's `!focused` check,
+        #850 round-2 finding 4) was therefore never entered; the test
+        passed even with that check deleted.
 
-        _open_board(page, agents_base_url, board_stream_frames=[frame])
+        This version withholds every `/board/stream` response behind a
+        Python-side `threading.Event` the route handler blocks on
+        (`stream_gate`), so the frame provably cannot arrive until the test
+        releases it — after the drawer is open and mid-edit. It also
+        changes a field on a DIFFERENT card (t1) so there's an unambiguous,
+        drawer-independent signal that the frame was actually applied."""
+        stream_gate = threading.Event()
+        board_state = _board_fixture()
+        board_stream_frames: list[str] = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
         page.locator('[data-card-id="t2"]').click()
         notes = page.locator(".drawer-notes")
+        title = page.locator(".drawer-title")
         expect(notes).to_be_visible()
-        notes.fill("typed while a tick arrives")
+        expect(title).to_have_value("Ship the release")
+        notes.fill("typed while a tick arrives")  # focus stays in the notes field
 
-        # Give the reconnect (retry: 20ms) time to deliver the changed frame.
-        page.wait_for_timeout(500)
+        # Mutate the board (a tag on a DIFFERENT card, t1; a title change on
+        # the OPEN card, t2) and only now let the withheld stream connection
+        # respond — proving the frame arrives after this point, not before.
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t2":
+                card["title"] = "Ship the release (renamed in the vault)"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
 
+        # Proof the frame was actually applied: an unrelated card (t1, not
+        # open in the drawer) picks up its new tag chip in the lane view,
+        # which render() always rebuilds regardless of drawer focus.
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text(
+            "urgent", timeout=5000,
+        )
+
+        # The open card's drawer must NOT have rebuilt while notes had focus
+        # — the typed text survived, and the title hasn't flushed yet.
         expect(notes).to_have_value("typed while a tick arrives")
+        expect(title).to_have_value("Ship the release")
+
+        # Leaving the field (not just moving within the drawer — activeElement
+        # must actually leave drawerEl) flushes the deferred change.
+        page.evaluate("() => document.activeElement.blur()")
+        expect(title).to_have_value("Ship the release (renamed in the vault)")
 
 
 class TestFilters:
@@ -416,8 +512,8 @@ class TestFilters:
         expect(page.locator('[data-card-id="t2"]')).to_have_count(0)
 
     def test_done_lane_visible_by_default_only_cancelled_behind_filter(self, page: Page, agents_base_url):
-        """Round-1 finding 3: the "include done/cancelled" checkbox only
-        hides cancelled cards — the Done lane itself (finished tasks) stays
+        """Round-1 finding 3: the "include cancelled" checkbox only hides
+        cancelled cards — the Done lane itself (finished tasks) stays
         visible whether it's checked or not."""
         _open_board(page, agents_base_url)
         expect(page.locator('[data-card-id="t5"]')).to_be_visible()
