@@ -809,6 +809,11 @@
       <option value="all">all</option>
     </select>
   </label>
+  <label title="Limit to sessions running on a specific machine.">host
+    <select id="filter-host">
+      <option value="all">all</option>
+    </select>
+  </label>
   <label>route
     <select id="filter-route">
       <option value="all">all</option>
@@ -869,6 +874,7 @@
   const filterStatusEl = document.getElementById('filter-status');
   const filterRecencyEl = document.getElementById('filter-recency');
   const filterCwdEl = document.getElementById('filter-cwd');
+  const filterHostEl = document.getElementById('filter-host');
   const connStateEl = document.getElementById('connection-state');
   const emptyStateEl = document.getElementById('empty-state');
   const panelEl = document.getElementById('panel');
@@ -996,6 +1002,7 @@
   // Re-populate the cwd dropdown with unique decoded_cwd values from the
   // snapshot. Preserves operator selection if the chosen cwd still exists.
   let _lastCwdOptionKey = '';
+  let _lastHostOptionKey = '';
   function updateCwdOptions(sessions) {
     if (!filterCwdEl) return;
     const cwds = [...new Set(sessions.map(s => s.decoded_cwd).filter(Boolean))].sort();
@@ -1012,6 +1019,26 @@
     if (wrap) wrap.style.display = cwds.length > 0 ? '' : 'none';
   }
 
+  // Host filter (#849) — same pattern as cwd above: options derive from
+  // whatever hosts are present in the current snapshot (local + any
+  // cross-machine cli_sessions rows), hidden entirely on a single-host
+  // deployment where the filter has nothing to distinguish.
+  function updateHostOptions(sessions) {
+    if (!filterHostEl) return;
+    const hosts = [...new Set(sessions.map(s => s.host).filter(Boolean))].sort();
+    const key = hosts.join('|');
+    if (key === _lastHostOptionKey) return;
+    _lastHostOptionKey = key;
+    const current = filterHostEl.value;
+    filterHostEl.innerHTML = '<option value="all">all</option>'
+      + hosts.map(h => `<option value="${escapeHtml(h)}">${escapeHtml(h)}</option>`).join('');
+    if (current && (current === 'all' || hosts.includes(current))) {
+      filterHostEl.value = current;
+    }
+    const wrap = filterHostEl.closest('label');
+    if (wrap) wrap.style.display = hosts.length > 1 ? '' : 'none';
+  }
+
   function applyFilters(sessions) {
     const showTerm = filterTerminalEl.checked;
     const route = filterRouteEl.value;
@@ -1019,6 +1046,7 @@
     const recencyRaw = filterRecencyEl ? filterRecencyEl.value : 'all';
     const recencySec = (recencyRaw === 'all') ? null : Number(recencyRaw);
     const cwdSel = filterCwdEl ? filterCwdEl.value : 'all';
+    const hostSel = filterHostEl ? filterHostEl.value : 'all';
     const nowSec = Date.now() / 1000;
     return sessions.filter(s => {
       if (!showTerm && TERMINAL.has(s.status)) return false;
@@ -1027,6 +1055,7 @@
         return false;
       }
       if (cwdSel !== 'all' && s.decoded_cwd !== cwdSel) return false;
+      if (hostSel !== 'all' && s.host !== hostSel) return false;
       if (route !== 'all') {
         const r = s.routing || 'local';
         if (r !== route) return false;
@@ -1366,6 +1395,7 @@
     emptyStateEl.style.display = visible.length === 0 ? '' : 'none';
     updateChips(visible);
     updateCwdOptions(allSessions);
+    updateHostOptions(allSessions);
     applySelectionStyles();
   }
 
@@ -1486,15 +1516,18 @@
         ${showGoTo ? '<button class="panel-focus" id="panel-focus" title="Jump to the existing wezterm pane for this session (or run Resume if there isn\'t one). Double-clicking the node does the same. Wayland disallows cross-app window raise — click the wezterm dock icon to bring it forward; it will already be on the right pane.">Go To</button>' : ''}
         <div class="label" data-field="label" title="Click to rename this session">${escapeHtml(s.custom_label || s.label || s.session_id)}</div>
         <div class="cwd-hint" data-field="cwd-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-all">${s.decoded_cwd ? escapeHtml(s.decoded_cwd) : ''}</div>
+        ${s.branch ? `<div class="branch-hint" data-field="branch-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.1rem">branch: ${escapeHtml(s.branch)}</div>` : ''}
         <div class="meta" data-field="meta">
           <span data-field="live-dot">${live ? '<span class="live-dot" title="live"></span>' : ''}</span>
           <span class="badge status-${safeStatus}" data-field="status">${escapeHtml(s.status + inferredHint)}</span>
           <span class="badge" data-field="source">${escapeHtml(sourceLabel)}</span>
+          ${s.host ? `<span class="badge" data-field="host" title="Machine this session is running on">${escapeHtml(s.host)}</span>` : ''}
           <span class="badge" data-field="routing">${escapeHtml(routingLabel(s.routing))}</span>
           <span class="badge" data-field="cost">$${(s.total_dollars || 0).toFixed(4)}</span>
           <span class="badge" data-field="tokens">${s.total_input_tokens}↓ / ${s.total_output_tokens}↑</span>
           <span data-field="depth">${s.spawn_depth ? `<span class="badge">depth ${s.spawn_depth}</span>` : ''}</span>
         </div>
+        ${s.prompt_preview ? `<div class="prompt-preview-hint" data-field="prompt-preview-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-word">“${escapeHtml(s.prompt_preview)}”</div>` : ''}
       </div>
       <div class="session-summary loading" id="session-summary">
         <div class="ss-label">Summary</div>
@@ -2294,7 +2327,7 @@
       onFilterChange();
     });
   }
-  [filterRouteEl, filterStatusEl, filterCwdEl].filter(Boolean).forEach(el =>
+  [filterRouteEl, filterStatusEl, filterCwdEl, filterHostEl].filter(Boolean).forEach(el =>
     el.addEventListener('change', onFilterChange)
   );
 
