@@ -528,14 +528,22 @@ class TestLiveUpdates:
     comment. These deliver a real "event: board" frame on a reconnect."""
 
     def test_board_frame_moves_a_card_with_no_navigation(self, page: Page, agents_base_url):
+        """#862: withhold the frame behind `stream_gate` (see the sibling
+        drawer tests below) so the "still in unassigned" assertion can't
+        lose a race with the stub's `retry: 20` reconnect on a slow first
+        paint — previously flaky (measured 6/30 and 3/30 in #860's
+        verification) because that frame could already have landed by the
+        time the first assertion polled."""
+        stream_gate = threading.Event()
         moved_board = copy.deepcopy(_board_fixture())
         _move_card_in_state(moved_board, "t1", "in_progress")
         frame = f"event: board\ndata: {json.dumps(moved_board)}\n\n"
 
-        _open_board(page, agents_base_url, board_stream_frames=[frame])
+        _open_board(page, agents_base_url, board_stream_frames=[frame], stream_gate=stream_gate)
         expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_be_visible()
 
         url_before = page.url
+        stream_gate.set()
         expect(page.locator('.board-lane[data-lane="in_progress"] [data-card-id="t1"]')).to_be_visible(timeout=8000)
         expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_have_count(0)
         assert page.url == url_before  # no page reload/navigation happened
