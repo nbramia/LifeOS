@@ -34,11 +34,13 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from api.services.agent_worker.completion_signal import has_positive_completion_signal
+from api.services.agent_worker.assignment import extract_assignment
 from api.services.agent_worker.preflight import (
     ROUTE_ASK,
     ROUTE_CLAUDE,
     ROUTE_CLAUDE_CODE,
     ROUTE_CODEX,
+    ROUTE_HERMES,
     ROUTE_LOCAL,
     ROUTE_REMOTE,
     PreflightResult,
@@ -308,6 +310,8 @@ def _worker_label(routing: str | None, served_by: str = "") -> str:
         return label
     if routing == ROUTE_CLAUDE:
         return "Cloud agent worker"
+    if routing == ROUTE_HERMES:
+        return "Hermes agent worker"
     return "Agent worker"
 
 
@@ -319,6 +323,7 @@ _ENGINE_LABELS = {
     "claude": "cloud Claude",
     "local": "local Gemma",
     "remote": "remote provider",
+    "hermes": "Hermes",
 }
 
 
@@ -430,6 +435,7 @@ class Worker:
         managed_executor=None,    # injectable ManagedExecutor for tests
         claude_code_executor=None,  # injectable ClaudeCodeExecutor for tests
         codex_executor=None,        # injectable CodexExecutor for tests
+        hermes_executor=None,       # injectable HermesExecutor for tests (#851)
         cli_pool=None,              # injectable dispatch pool; tests pass _SynchronousPool
     ) -> None:
         self.api_base = (api_base or os.environ.get("LIFEOS_API_URL", "http://localhost:8000")).rstrip("/")
@@ -475,6 +481,7 @@ class Worker:
         # bot. Bypassed entirely when a test injects `_claude_code_executor`.
         self._claude_code_executors: dict[str, object] = {}
         self._codex_executor = codex_executor  # lazily instantiated on first /codex task
+        self._hermes_executor = hermes_executor  # lazily instantiated on first hermes task (#851)
         # CLI dispatches (claude_code/codex) are long-running subprocesses — both
         # spawned children/operator root-spawns AND top-level #agent tasks routed
         # to a CLI engine (#753) go through this pool via _submit_cli_dispatch.
@@ -2514,6 +2521,18 @@ class Worker:
         )
         return self._codex_executor
 
+    def _get_hermes_executor(self):
+        """Lazy-construct the HermesExecutor for board-assigned #hermes
+        sessions (#851)."""
+        if self._hermes_executor is not None:
+            return self._hermes_executor
+        from api.services.agent_worker.hermes_executor import HermesExecutor
+        self._hermes_executor = HermesExecutor(
+            session_store=self.session_store,
+            transcript_store=self.transcript_store,
+        )
+        return self._hermes_executor
+
     def _fetch_task(self, task_id: str) -> dict[str, Any] | None:
         try:
             resp = self._http.get(f"{self.api_base}/api/tasks/{task_id}")
@@ -2590,6 +2609,17 @@ class Worker:
             budget=budget_json,
             expected_output=pre.expected_output,
             preset_class=pre.preset_class,
+        )
+        # (#851) Board-assignment fields — model/effort/host, plus
+        # assigned_by (bookkeeping only; routing itself already comes from
+        # the assignee tag, see assignment.py's module docstring and
+        # preflight's `_apply_route_corroboration`, which never
+        # second-guesses a tagged route). Set unconditionally: an
+        # untagged/non-board task's fields are simply empty, so this is a
+        # no-op write of NULLs for every pre-#851 task shape.
+        assignment = extract_assignment(task.get("fields"))
+        self.session_store.set_assignment(
+            task_id, host=assignment.host, model=assignment.model, effort=assignment.effort,
         )
         session = self.session_store.get(task_id)  # refresh
 
@@ -2704,6 +2734,22 @@ class Worker:
             # `_poll_managed_sessions` in the next tick will pick it up.
             if outcome.status == STATUS_FAILED:
                 self._handle_outcome(session, task, outcome)
+            return
+
+        # (#851) Hermes route: open a Hermes conversation with the card's
+        # title/notes as the opening turn. A single HTTP round trip to the
+        # configured backend — short enough (unlike the CLI routes below)
+        # to run inline on the tick thread rather than through the CLI
+        # dispatch pool.
+        if pre.routing == ROUTE_HERMES:
+            hermes = self._get_hermes_executor()
+            try:
+                outcome = hermes.execute(session, task)
+            except Exception as exc:
+                logger.exception("hermes executor crashed for %s: %s", task_id, exc)
+                self._mark_failed(session, task, f"executor crashed: {exc}")
+                return
+            self._handle_outcome(session, task, outcome)
             return
 
         # CLI routes (#claude → Claude Code, #codex → Codex). Synthesize the

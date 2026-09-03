@@ -50,6 +50,12 @@ ROUTE_CODEX = "codex"
 # (the `routing not in KNOWN_ROUTES` check below), not be treated as a
 # legitimate model-chosen route needing its own corroboration carve-out.
 ROUTE_REMOTE = "remote"
+# `hermes` is the #851 route for the `#hermes` tag (or a board card
+# assigned to the Hermes engine): the turn opens a Hermes conversation via
+# `HermesExecutor` instead of running a local CLI. Like ROUTE_CLAUDE_CODE/
+# ROUTE_CODEX, preflight's own JSON schema never emits this directly — it's
+# set exclusively by `_apply_tag_overrides` from the `#hermes` tag.
+ROUTE_HERMES = "hermes"
 
 # All routing destinations `parse_preflight_response` accepts from the model,
 # and the same set `settings.agent_default_route` (#707) is validated
@@ -61,7 +67,7 @@ ROUTE_REMOTE = "remote"
 # `ROUTE_CLAUDE` (which is also excluded from default-route substitution by
 # `_apply_default_route`'s `original_routing` guard, just via a different
 # mechanism — see that function's docstring, point 3a).
-KNOWN_ROUTES = (ROUTE_LOCAL, ROUTE_CLAUDE, ROUTE_CLAUDE_CODE, ROUTE_CODEX, ROUTE_ASK)
+KNOWN_ROUTES = (ROUTE_LOCAL, ROUTE_CLAUDE, ROUTE_CLAUDE_CODE, ROUTE_CODEX, ROUTE_HERMES, ROUTE_ASK)
 
 # Allowed expected-output shapes. Used to phrase the final Telegram summary.
 OUTPUT_KINDS = ("text", "file", "external_action", "structured")
@@ -675,7 +681,7 @@ _ROUTE_TITLE_CORROBORATION: dict[str, re.Pattern[str]] = {
 # of these means `_apply_route_corroboration` must not second-guess the
 # result with a title-cue check: a tag IS the operator naming the engine.
 _ROUTE_OVERRIDE_TAG_NAMES = frozenset(
-    {"local", "claude", "codex", "cloud", "cloud-haiku", "cloud-sonnet"}
+    {"local", "claude", "codex", "hermes", "cloud", "cloud-haiku", "cloud-sonnet"}
 )
 
 
@@ -726,6 +732,16 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
         result.routing_reason = "#codex tag present"
         result.routing_explicit = True
         result.model = ""  # CLI picks its own model from ~/.codex/config.toml
+        return result
+    if "hermes" in normalized:
+        # (#851) Hermes route — dispatched through HermesExecutor, which
+        # opens a Hermes conversation instead of running a local CLI.
+        # Hermes reports its own model per turn (model_readout.py); nothing
+        # for preflight to select among ALLOWED_MODELS.
+        result.routing = ROUTE_HERMES
+        result.routing_reason = "#hermes tag present"
+        result.routing_explicit = True
+        result.model = ""
         return result
     if "cloud-haiku" in normalized:
         result.routing = ROUTE_CLAUDE
