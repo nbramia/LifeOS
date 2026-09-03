@@ -1,12 +1,14 @@
 # /agents "Go To" — WezTerm setup
 
 > **Status:** Complete
-> **Last Updated:** 2026-05-28
+> **Last Updated:** 2026-09-03
 > **Audience:** Operators
 
 The /agents page's **Go To** button (and double-clicking an active node) jumps wezterm focus to the pane running the selected Claude Code session — even when several panes are working in the same project directory at once.
 
 Setup is one block in `~/.claude/settings.json` plus making sure `lsof` is installed.
+
+`scripts/install-agent-hooks.sh` + `scripts/lifeos-agent-hook.sh` (below, [§4](#4-cross-machine-session-registration)) supersede the manual hook-config steps below and also register sessions from other machines with `/agents` — not just WezTerm pane binding on this one. `claude-session-pane.sh` / `codex-session-pane.sh` and the manual `~/.claude/settings.json` block in step 2 still work unchanged for an existing install; run the installer once to get both pane binding and cross-machine registration from a single hook going forward.
 
 ---
 
@@ -83,6 +85,36 @@ If the toast says "Couldn't locate pane" — meaning the session isn't running w
 
 ---
 
+## 4. Cross-machine session registration
+
+`/agents` can also show Claude Code and Codex sessions running on a laptop, a second desktop — any machine that can reach the API over Tailscale. This uses a different, newer script that installs itself for both CLIs at once:
+
+```bash
+./scripts/install-agent-hooks.sh
+```
+
+Run once **on each machine** you want registered (including the one hosting the API, if you want its own CLI sessions to report a `host` too). It's idempotent — safe to re-run after an update, it only adds what's missing and never touches an existing entry from Orca, atuin, or anything else already in your hook config.
+
+The installer prints, but does not create, the two things registration needs:
+
+1. **On the API host:** set `LIFEOS_AGENT_HOOK_TOKEN` in `.env` (e.g. `openssl rand -hex 32`) and restart the API. Empty (the default) disables the endpoint entirely.
+2. **On every machine posting events** (the API host included, if you want its own sessions to carry `host`): create `~/.config/lifeos/agent-hook.env` (override the path with `$LIFEOS_AGENT_HOOK_ENV`):
+
+   ```
+   LIFEOS_API_URL=http://<api-host>:8000
+   LIFEOS_AGENT_HOOK_TOKEN=<the same token>
+   ```
+
+   `chmod 600` this file — it holds the bearer token in plaintext, and under a default `umask 022` a newly created file is world-readable to every other local account on the machine.
+
+   **On the API host itself**, keep `LIFEOS_API_URL=http://localhost:8000` (the default) rather than pointing it at the Tailscale hostname. The event endpoint only mirrors `pane_id`/`wezterm_pid` into the local WezTerm pane store — the table Go To reads — for requests that both name this host **and** arrive from loopback; posting to the Tailscale address instead of localhost means the request no longer looks like loopback to the API, so Go To stops working for sessions started on this machine.
+
+Until that file (or the equivalent environment variables) exists, `lifeos-agent-hook.sh` exits silently without posting anything — a machine you haven't set up yet just doesn't show up, it doesn't error.
+
+A session registered this way shows a `host` badge in the side panel, plus its git branch and last prompt preview when available. Its status is event-driven (accurate `running`/`idle`/`ended`), not inferred from file age. **Resume** and **Go To** only work for sessions on the machine hosting the API — clicking either on a remote-host session returns an error naming the host instead of trying (and failing) a local wezterm probe.
+
+---
+
 ## Related Documents
 
 ### Specifications
@@ -91,4 +123,6 @@ If the toast says "Couldn't locate pane" — meaning the session isn't running w
 
 ### Code References
 - [`api/services/cc_pane_locate.py`](../../api/services/cc_pane_locate.py) — Probe implementation
-- [`scripts/claude-session-pane.sh`](../../scripts/claude-session-pane.sh) — Hook script
+- [`scripts/claude-session-pane.sh`](../../scripts/claude-session-pane.sh) — Legacy WezTerm-only hook script (this machine only)
+- [`scripts/lifeos-agent-hook.sh`](../../scripts/lifeos-agent-hook.sh) — Cross-machine session registration hook (§4)
+- [`scripts/install-agent-hooks.sh`](../../scripts/install-agent-hooks.sh) — Idempotent installer for the hook above

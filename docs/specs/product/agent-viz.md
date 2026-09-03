@@ -2,9 +2,9 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-05-29
+> **Last Updated:** 2026-09-03
 
-LifeOS exposes a single live page at `/agents` that shows every agent session running on the box — LifeOS agent worker tasks (`#agent`-tagged), plus local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`). The graph updates every 2 seconds, clicking a node opens that session's transcript in a resizable side panel, and the operator can kill any in-flight LifeOS agent or relaunch any CLI session straight from the page.
+LifeOS exposes a single live page at `/agents` that shows every agent session running for you — LifeOS agent worker tasks (`#agent`-tagged), local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`), and Claude Code / Codex sessions registered from **any other machine** on the tailnet via a lightweight hook script. The graph updates every 2 seconds, clicking a node opens that session's transcript in a resizable side panel, and the operator can kill any in-flight LifeOS agent or relaunch any local CLI session straight from the page.
 
 The point is one place to see what your machine is doing on your behalf: whether the agent worker is making progress on the task you left in your vault, whether a Claude Code session you forgot about is still burning tokens, whether two parallel agents have collided on the same project.
 
@@ -72,6 +72,17 @@ The page unions three ingest paths into one rendered surface:
 
 All three sources are normalized to the same shape before rendering, so filters, chips, and the side panel work identically on each kind of session. Disable an ingest path with `LIFEOS_CLAUDE_CODE_VIZ_ENABLED=false` or `LIFEOS_CODEX_VIZ_ENABLED=false` if you only want a subset.
 
+Every session, from every source, now carries a `host` field — the machine it's running on. LifeOS agent worker sessions and locally-scanned CLI transcripts always report the machine hosting the API; a session registered from elsewhere (see below) reports its own hostname.
+
+### Cross-machine CLI session registration
+
+A Claude Code or Codex session doesn't have to run on the machine hosting the API to show up here. `scripts/lifeos-agent-hook.sh`, installed for both CLIs by `scripts/install-agent-hooks.sh`, posts a lifecycle event on session start, prompt submit, stop, and session end to `POST /api/agents/cli-sessions/events` — from any machine on the tailnet, bearer-token authenticated. The API keeps a small `cli_sessions` record per session (host, cwd, branch, model, status, last prompt preview, and an optional task id read from `$LIFEOS_TASK_ID`) and merges it into the snapshot:
+
+- A session with both a registration and a local transcript (the common case on the API host itself) collapses into **one row** — status comes from the registration events (accurate: `running` right after a prompt, `idle` after Stop, `ended` after SessionEnd), while token counts and dollar cost still come from the transcript.
+- A session registered from a machine with no local transcript (every other machine) appears as its own row with `host` set to that machine's name, no token/cost detail (the hook doesn't read usage data), and status directly from the event stream — never inferred from file age.
+
+This is opt-in: the endpoint is disabled (503) until an operator sets `LIFEOS_AGENT_HOOK_TOKEN`, and each machine needs the installer run once plus a small local env file with the API URL and that same token. See [guides/agents-go-to.md](../../guides/agents-go-to.md) for setup.
+
 ---
 
 ## Status semantics
@@ -83,10 +94,12 @@ A node's color is its status. The set is slightly different per source — same 
 | **running** | Currently executing tool calls or LLM turns. | A live `claude` / `codex` process is running with this jsonl's cwd, **or** the file was modified in the last 10 minutes. The first is authoritative; the second is inferred. |
 | **claimed** | Worker has picked up the task but hasn't fired the executor yet (preflight is in flight). | n/a |
 | **yielded** | Paused waiting for spawned children to finish. | n/a |
+| **idle** | n/a | Registered via the session hook (#849): open and waiting for input, after a `session_start` or `stop` event. Live, not finished. |
 | **inactive** | n/a | Modified within 24h but no live process — typically you closed the terminal mid-session. Resumable. |
 | **blocked** | Waiting on a Telegram clarification from you. | n/a |
 | **completed** | Task ran to completion successfully. | jsonl is >24h old, no error in the last event. |
 | **failed** | Executor crashed, preflight rejected, or runtime error. | Last event in the jsonl was an error/tool failure (and >24h old). |
+| **ended** | n/a | Registered via the session hook (#849): a `session_end` event was received — finished. Hidden by default like completed/failed; Resume available. |
 | **budget_exceeded** | Token / wall / dollar cap breached and the session was killed externally. | n/a |
 
 A small `(inferred)` hint appears next to the status on CLI sessions whenever the status came from mtime rather than from a confirmed live process — useful to know when reading "running" on a session you don't remember starting.
@@ -104,6 +117,7 @@ The top toolbar has five filter controls and four count chips. **Filters are AND
 | `include finished` checkbox | off | Off → completed / failed / budget_exceeded are hidden. On → everything shows, and the default recency window widens from 30 min to 7 days. |
 | `recency` dropdown | last 30 min (60 min, 6h, 24h, 7d, all) | Filters by `last_activity_at`. Re-defaults to a wider window when `include finished` is enabled, unless the operator has set it manually. |
 | `cwd` dropdown | all | Only Claude Code sessions are scoped to a cwd. Dropdown lists every unique cwd present in the current snapshot; auto-hides when empty (no Claude Code sessions visible). |
+| `host` dropdown | all | Limit to sessions running on a specific machine. Dropdown lists every unique `host` present in the current snapshot; auto-hides on a single-host deployment (nothing to distinguish). |
 | `route` dropdown | all (local / claude / claude_code / codex) | Filters by where the session ran — operator's local LLM, Managed Agents cloud, Claude Code CLI, or Codex CLI. |
 | `status` dropdown | all | Hard-filter by the status column from the table above. |
 
@@ -127,12 +141,15 @@ Clicking any node opens a panel on the right with that session's metadata header
 
 - **Label** — derived from the task description (LifeOS), or the first non-empty user message (Claude Code), or the session id as a fallback. **Click it to rename:** the title becomes a text box prepopulated with the current name; Enter (or clicking away) saves, Escape cancels. A manual name is pinned durably and overrides the auto-derived label and the AI summary label everywhere the node is named (graph node, panel, search). Saving an empty value clears the override and reverts to auto-naming.
 - **cwd** — Claude Code only; the project directory the session was opened in.
+- **Branch** — the git branch of that cwd, when a registration event supplied one. Blank for sessions with no cross-machine registration (e.g. a local Claude Code transcript with no hook installed).
 - **Status badge** — same status the node is colored by, with `(inferred)` if applicable.
 - **Source** — `LifeOS agent` or `Claude Code`.
+- **Host badge** — the machine the session is running on.
 - **Routing** — `Local`, `Claude`, or `Claude Code`.
 - **Cost** — `total_dollars` to 4 decimals. For Claude Code, this is cache-aware accounting (separately tracking input, output, cache_creation @ 1.25× and cache_read @ 0.10×).
 - **Tokens** — `input↓ / output↑`.
 - **Depth badge** — if the session is a child, shows spawn depth.
+- **Last prompt preview** — the most recent prompt submitted, truncated to 200 characters, when a registration event supplied one.
 
 The event feed is newest-on-top. Backfill arrives first (the last 50 events by default), then live updates stream in via SSE. Each event has:
 
@@ -177,13 +194,16 @@ If a cached pane has gone stale (typical: user closed the tab), the activate-pan
 
 Resume + Go To are **off by default** because spawning GUI terminals from a systemd service depends on the operator's desktop environment. Enable with `LIFEOS_CC_RESUME_ENABLED=true` for Claude Code sessions and `LIFEOS_CODEX_RESUME_ENABLED=true` for Codex; each flag also gates Go To for its respective source. Customize launchers via `LIFEOS_CC_RESUME_CMD` / `LIFEOS_CODEX_RESUME_CMD` if you don't use WezTerm — substitutions `{cwd}`, `{cwd_url}`, `{session_id}`, `{session_id_url}`, and `{inner_command}` are available. The probe-based Go To is WezTerm-specific (it reads `wezterm cli list`'s `tty_name`); non-WezTerm launchers can still use Resume but Go To will respond 404.
 
+Both endpoints only ever act **locally** — spawning a terminal or activating a pane on a different machine isn't possible over HTTP. A session registered from another host (see "Cross-machine CLI session registration" above) 409s instead: the error names the host the session actually runs on, so the operator knows to go there instead of getting a silent no-op or a misleading 404.
+
 ---
 
 ## Privacy and exposure
 
-- The page only displays sessions running on **this** machine. No cross-host federation.
-- Transcript payloads are truncated to 240 chars in the feed previews — click an event to see the full payload only on demand.
-- The kill and resume endpoints are **local-network only**. They must not be exposed via Tailscale Funnel or the public MCP HTTP transport (the gates live in [api/routes/agents.py](../../../api/routes/agents.py); see the technical spec for the threat model).
+- The transcript scan and Resume/Go To/kill primitives only ever touch **this** machine. Cross-machine visibility is opt-in and one-directional: another machine's hook posts a small lifecycle event (host, cwd, branch, status, a truncated prompt preview) to this API — this API never reaches out to, or reads files from, another machine.
+- The registration endpoint (`POST /api/agents/cli-sessions/events`) is bearer-token gated and disabled by default (503 until `LIFEOS_AGENT_HOOK_TOKEN` is set) — unlike the kill/resume endpoints below, it's meant to be reachable over Tailscale, since that's the whole point.
+- Transcript payloads are truncated to 240 chars in the feed previews — click an event to see the full payload only on demand. A registered session's prompt preview is truncated to 200 characters at the source.
+- The kill, resume, and pane-bind (`/cc-pane-bind`, `/cx-pane-bind`) endpoints are **local-network only**. They must not be exposed via Tailscale Funnel or the public MCP HTTP transport (the gates live in [api/routes/agents.py](../../../api/routes/agents.py); see the technical spec for the threat model). Resume and Go To only act on sessions recorded as running on this API's own host — a session registered from elsewhere returns an error naming that host instead.
 - Claude Code ingest is strictly read-only — LifeOS opens jsonl files for reading and never writes back.
 
 ---
@@ -207,6 +227,7 @@ All in `.env`. None are required — the defaults work for the standard LifeOS i
 | `LIFEOS_CODEX_RESUME_ENABLED` | Enable Resume + Go To for `cx:` sessions. | `false` |
 | `LIFEOS_CODEX_RESUME_CMD` | Codex launcher template. Same substitution surface as `LIFEOS_CC_RESUME_CMD`. | `wezterm cli spawn --cwd {cwd} -- {inner_command}` |
 | `LIFEOS_CODEX_RESUME_INNER_CMD` | Inner command inside the spawned terminal — the actual `codex resume` invocation. | `codex resume {session_id}` |
+| `LIFEOS_AGENT_HOOK_TOKEN` | Bearer token required from `scripts/lifeos-agent-hook.sh` on `POST /api/agents/cli-sessions/events`. Empty (default) disables the endpoint (503) — a fresh clone accepts no cross-machine session data until this is set. | `` |
 
 ---
 

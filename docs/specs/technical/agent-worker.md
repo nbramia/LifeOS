@@ -91,7 +91,7 @@ External boundaries:
 
 ## Session store schema
 
-`session_store.py` creates seven tables (SQLite, `data/agent_sessions.db` by default). The schema is deliberately permissive — new columns and tables have been added issue-by-issue rather than designed up front — so this list is read directly off the table-creation code (`_SCHEMA` in `session_store.py`) rather than written from memory; re-check the source if it looks stale.
+`session_store.py` creates eight tables (SQLite, `data/agent_sessions.db` by default). The schema is deliberately permissive — new columns and tables have been added issue-by-issue rather than designed up front — so this list is read directly off the table-creation code (`_SCHEMA` in `session_store.py`) rather than written from memory; re-check the source if it looks stale.
 
 ### `sessions`
 
@@ -194,6 +194,10 @@ Polling bookkeeping for Managed Agents sessions, one row per `task_id`.
 | `accrued_session_hour_dollars` | Cumulative session-hour overhead already booked into the session's `total_dollars`. |
 | `final_text` | Most recent `agent.message` text seen across polls — cached because the final message and the terminal `session.status_idle` event can land on different polls, and a Telegram completion summary would otherwise have no text to show. |
 | `tool_loop_signature`, `tool_loop_count`, `tool_calls_since_message` | Runaway-loop detection counters (#139 §5), persisted so cross-poll signals survive worker restarts mid-session. |
+
+### `cli_sessions`
+
+One row per Claude Code / Codex CLI session registered from any host via `POST /api/agents/cli-sessions/events` (#849), keyed `cc:<uuid>` / `cx:<uuid>` and carrying event-driven status (`idle` / `running` / `ended`) instead of a file-age guess. See [Cross-machine CLI session registration](agent-viz.md#cross-machine-cli-session-registration) for the column table and status machine.
 
 ---
 
