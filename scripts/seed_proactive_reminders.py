@@ -66,8 +66,8 @@ List tasks that are due today or overdue. For each, include the task description
 If there are no due/overdue tasks, say "No urgent tasks today."
 
 **Waiting on You**
-Call manage_human_queue with action "list" to check the Human queue — things only you can do that \
-an agent has filed and is waiting on. Report only cards with age_hours of 24 or more, one line each \
+Call manage_human_queue with action "list" to check the Human queue — things only I can do that \
+an agent has filed and is waiting on. Report only cards shown as 24h old or older, one line each \
 with the title and how long it's been waiting. Skip this section entirely if there are none.
 
 **Overnight Emails**
