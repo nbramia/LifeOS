@@ -15,11 +15,11 @@ The point is one place to see what needs attention: what's waiting on an assignm
 1. [Kanban board](#kanban-board)
 2. [Graph tab — what you see](#graph-tab--what-you-see)
 3. [Two sources, one graph](#two-sources-one-graph)
-4. [Status semantics](#status-semantics)
-5. [Filters and chips](#filters-and-chips)
-6. [Side panel](#side-panel)
-7. [Operator controls — kill](#operator-controls--kill)
-8. [Operator controls — resume](#operator-controls--resume)
+4. [Graph tab — Status semantics](#graph-tab--status-semantics)
+5. [Graph tab — Filters and chips](#graph-tab--filters-and-chips)
+6. [Graph tab — Side panel](#graph-tab--side-panel)
+7. [Graph tab — Operator controls — kill](#graph-tab--operator-controls--kill)
+8. [Graph tab — Operator controls — resume](#graph-tab--operator-controls--resume)
 9. [Privacy and exposure](#privacy-and-exposure)
 10. [Configuration knobs](#configuration-knobs)
 11. [Related Documents](#related-documents)
@@ -52,6 +52,8 @@ A card shows its title, assignee chip, model/effort chips when the task carries 
 
 Clicking a card opens a drawer: an editable title and notes (notes save on blur, stored as indented `> ` lines beneath the task — see [task-management.md](task-management.md)), pickers for assignee, tags, and context, and — when the card has a linked session — that session's live transcript feed, the same panel the Graph tab uses. Drawer actions: **Focus** (jump to the session's terminal pane), **Kill** (stop a running session), **Answer** (reply to the agent's pending question), **Accept** (move a Review card to Done), and **Resolve** (mark a manually-filed Human queue card handled).
 
+A **New card** button opens a composer — title, optional notes, and an assignee picker — that creates a task through `POST /api/tasks`.
+
 ### Pending questions
 
 When an agent asks a clarifying question, the card carrying that session shows the question text and an **Answer** button in the drawer. Answering writes the reply through the same path a Telegram reply takes — the worker resumes the session on its next tick exactly as if you'd answered by text.
@@ -72,7 +74,7 @@ Card reordering within a lane — file order is lane order. Model/effort pickers
 
 ## Graph tab — what you see
 
-The page is a force-directed graph of sessions, laid out left-to-right by recency. Each node is one session:
+The Graph tab is a force-directed graph of sessions, laid out left-to-right by recency. Each node is one session:
 
 | Encoding | Meaning |
 |---|---|
@@ -107,7 +109,7 @@ Between filter operations the simulation **freezes after settling** (~6s). Snaps
 
 ## Two sources, one graph
 
-The page unions three ingest paths into one rendered surface:
+The Graph tab unions three ingest paths into one rendered surface:
 
 1. **LifeOS agent worker** — every `#agent` task the worker has claimed, plus its sleeps, yields, terminal outcomes, and any spawned children. This is the same data covered by [product/agent-worker.md](agent-worker.md); the viz is the read-side view of it.
 
@@ -130,7 +132,7 @@ This is opt-in: the endpoint is disabled (503) until an operator sets `LIFEOS_AG
 
 ---
 
-## Status semantics
+## Graph tab — Status semantics
 
 A node's color is its status. The set is slightly different per source — same broad categories, different precise meaning:
 
@@ -151,9 +153,9 @@ A small `(inferred)` hint appears next to the status on CLI sessions whenever th
 
 ---
 
-## Filters and chips
+## Graph tab — Filters and chips
 
-The top toolbar has five filter controls and four count chips. **Filters are AND-composed**; the chips reflect *what's currently visible* after the filter, not the full snapshot.
+The top toolbar has six filter controls and five count chips. **Filters are AND-composed**; the chips reflect *what's currently visible* after the filter, not the full snapshot.
 
 ### Filters
 
@@ -180,7 +182,7 @@ Chips re-compute after every snapshot tick, so toggling `include finished` immed
 
 ---
 
-## Side panel
+## Graph tab — Side panel
 
 Clicking any node opens a panel on the right with that session's metadata header and a live-tailing event feed. The panel header carries:
 
@@ -190,7 +192,7 @@ Clicking any node opens a panel on the right with that session's metadata header
 - **Status badge** — same status the node is colored by, with `(inferred)` if applicable.
 - **Source** — `LifeOS agent` or `Claude Code`.
 - **Host badge** — the machine the session is running on.
-- **Routing** — `Local`, `Claude`, or `Claude Code`.
+- **Routing** — `Local`, `Claude Code`, `Codex`, `Remote`, `Hermes`, or `Claude`.
 - **Cost** — `total_dollars` to 4 decimals. For Claude Code, this is cache-aware accounting (separately tracking input, output, cache_creation @ 1.25× and cache_read @ 0.10×).
 - **Tokens** — `input↓ / output↑`.
 - **Depth badge** — if the session is a child, shows spawn depth.
@@ -208,7 +210,7 @@ Clicking the same node again, the `×` button, or empty background area closes t
 
 ---
 
-## Operator controls — kill
+## Graph tab — Operator controls — kill
 
 LifeOS agent sessions in non-terminal states get a red **Kill** button in the panel header. Clicking it opens a confirmation modal asking for an optional reason (logged to the transcript) before firing the request.
 
@@ -223,7 +225,7 @@ CLI sessions (Claude Code and Codex) do not get a Kill button — the page has n
 
 ---
 
-## Operator controls — resume and Go To
+## Graph tab — Operator controls — resume and Go To
 
 CLI sessions (Claude Code AND Codex) get up to two buttons:
 

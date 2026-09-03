@@ -841,11 +841,13 @@ and the SSE update cadence.
 
 Full board view model, always built fresh (never cached): `{lanes:
 {unassigned, assigned, in_progress, human_queue, scheduled, review, done},
-generated_at}`. Each task card carries `id, title, notes, status, tags,
-assignee, fields, context, updated_at, session (nullable), pending_question
-(nullable)`. Each scheduled card carries `id, name, message_content,
-enabled, next_fire_at, recurring, last_run {at, outcome, snippet}
-(nullable)`.
+generated_at}`. `kind` (`"task"` | `"schedule"`) is the first field of every
+card and the only discriminator between the two shapes below — both kinds
+can land in the `done` lane. Each task card carries `kind: "task"`, `id,
+title, notes, status, tags, assignee, fields, context, updated_at, session
+(nullable), pending_question (nullable)`. Each scheduled card carries `kind:
+"schedule"`, `id, name, message_content, enabled, next_fire_at, recurring,
+last_run {at, outcome, snippet} (nullable)`.
 
 ### GET /api/agents/board/stream
 
