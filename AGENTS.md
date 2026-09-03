@@ -2,7 +2,7 @@
 
 > **Audience:** All AI coding agents (Claude Code, Cursor, Copilot, etc.)
 > **Status:** Complete
-> **Last Updated:** 2026-08-19
+> **Last Updated:** 2026-09-03
 
 LifeOS is a self-hosted personal AI assistant with two halves:
 

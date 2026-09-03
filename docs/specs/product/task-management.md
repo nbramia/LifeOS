@@ -202,7 +202,7 @@ it by hand.
 | PUT | `/api/tasks/{id}` | description, status, context, priority, due_date, tags, notes, fields | Update a task |
 | PUT | `/api/tasks/{id}/complete` | - | Mark as done |
 | DELETE | `/api/tasks/{id}` | - | Delete a task |
-| POST | `/api/tasks/human-queue` | title, notes, key, done_when, source_host, source_cwd | File (or dedupe-update) a Human-queue card |
+| POST | `/api/tasks/human-queue` | title, notes, key, done_when, source_host, source_cwd, source_session | File (or dedupe-update) a Human-queue card |
 | GET | `/api/tasks/human-queue` | - | List open Human-queue cards |
 | PUT | `/api/tasks/human-queue/{id_or_key}/resolve` | note | Resolve a Human-queue card |
 
