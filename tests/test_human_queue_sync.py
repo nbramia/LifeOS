@@ -99,6 +99,36 @@ class TestFileHumanQueueCardsForSync:
         assert payload["key"] == "sync:gmail"
         assert "401 Unauthorized" in payload["notes"]
 
+    def test_error_text_with_carriage_return_is_sanitized(self, monkeypatch):
+        """A raw \\r desyncs the store's \\n-joined notes body and silently
+        drops the whole card — the filed notes must contain no \\r."""
+        calls = []
+        _install_fake_urlopen(monkeypatch, calls, responses={
+            ("GET", "/api/tasks/human-queue"): {"cards": []},
+        })
+        result = {
+            "failed_sources": ["gmail"],
+            "results": {"gmail": {"success": False, "error": "line one\r\nline two\rline three"}},
+        }
+        ras.file_human_queue_cards_for_sync(result)
+        payload = next(c[2] for c in calls if c[0] == "POST")
+        assert "\r" not in payload["notes"]
+        assert "line one" in payload["notes"] and "line two" in payload["notes"]
+
+    def test_error_text_with_token_is_redacted(self, monkeypatch):
+        calls = []
+        _install_fake_urlopen(monkeypatch, calls, responses={
+            ("GET", "/api/tasks/human-queue"): {"cards": []},
+        })
+        result = {
+            "failed_sources": ["telegram"],
+            "results": {"telegram": {"success": False, "error": "failed for bot123456:ABCdefGHIjkl"}},
+        }
+        ras.file_human_queue_cards_for_sync(result)
+        payload = next(c[2] for c in calls if c[0] == "POST")
+        assert "bot123456:ABCdefGHIjkl" not in payload["notes"]
+        assert "bot<REDACTED>" in payload["notes"]
+
     def test_missing_error_text_defaults_to_generic_message(self, monkeypatch):
         calls = []
         _install_fake_urlopen(monkeypatch, calls, responses={

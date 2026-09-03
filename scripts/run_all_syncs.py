@@ -64,7 +64,11 @@ from api.services.sync_health import (
     reap_orphan_sync_runs,
     detect_silent_source_entity_drift,
 )
-from api.services.log_redaction import configure_telegram_log_redaction
+from api.services.log_redaction import (
+    REDACTED_TOKEN,
+    TELEGRAM_TOKEN_PATTERN,
+    configure_telegram_log_redaction,
+)
 from config.settings import settings
 
 # =============================================================================
@@ -635,6 +639,25 @@ def _human_queue_open_keys() -> set[str]:
     return {c.get("key") for c in body.get("cards", []) if c.get("key")}
 
 
+def _sanitize_human_queue_error_text(error_text: str) -> str:
+    """Sanitize raw sync error text before it's filed as a Human-queue
+    card's notes body.
+
+    A literal `\\r` desyncs from the task store's `\\n`-joined notes body,
+    which silently drops the whole card (`task_manager._validate_text_
+    fields`) rather than raising anything this script would see; a literal
+    `<!--` could forge a new `<!-- id:.. -->` comment on the next reindex,
+    hijacking another task's id. Also redact any Telegram bot token that
+    leaked into the error text (the same pattern `api/services/
+    log_redaction` scrubs from httpx logs) before it's ever written to the
+    vault. Truncated to the same 2000 chars as before.
+    """
+    text = error_text.replace("\r\n", "\n").replace("\r", " ")
+    text = text.replace("<!--", "<! --")
+    text = TELEGRAM_TOKEN_PATTERN.sub(REDACTED_TOKEN, text)
+    return text[:2000]
+
+
 def file_human_queue_cards_for_sync(result: dict) -> None:
     """File a keyed Human-queue card for each source this run's summary
     classifies as a real failure (`result['failed_sources']` — a source
@@ -661,7 +684,7 @@ def file_human_queue_cards_for_sync(result: dict) -> None:
             error_text = stats.get("error") or "sync failed"
             _human_queue_file_card(
                 title=f"Sync source '{source}' needs attention",
-                notes=error_text[:2000],
+                notes=_sanitize_human_queue_error_text(error_text),
                 key=f"sync:{source}",
             )
 
