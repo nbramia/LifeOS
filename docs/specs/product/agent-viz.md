@@ -264,14 +264,14 @@ All in `.env`. None are required — the defaults work for the standard LifeOS i
 | `LIFEOS_CLAUDE_CODE_VIZ_ENABLED` | Surface Claude Code CLI sessions alongside agent worker sessions. Set false to scope the viz to LifeOS sessions only. | `true` |
 | `LIFEOS_CLAUDE_CODE_PROJECTS_DIR` | Where to find Claude Code transcripts. | `~/.claude/projects` |
 | `LIFEOS_CLAUDE_CODE_LOOKBACK_DAYS` | Discovery window — older jsonl files are excluded from the snapshot (they can still be loaded by direct session id). | `7` |
-| `LIFEOS_CC_RESUME_ENABLED` | Enable the Resume and Focus buttons. | `false` |
+| `LIFEOS_CC_RESUME_ENABLED` | Enable the Resume and Focus buttons, and the board drawer's **Open** action for `#claude` cards. | `false` |
 | `LIFEOS_CC_RESUME_CMD` | Launcher command. Substitutions: `{session_id}`, `{cwd}`, `{session_id_url}`, `{cwd_url}`, `{inner_command}`. The default uses WezTerm's CLI to open a tab AND run the resume in one shot. | `wezterm cli spawn --cwd {cwd} -- {inner_command}` |
 | `LIFEOS_CC_RESUME_INNER_CMD` | The command run *inside* the spawned terminal — the actual `claude --resume` invocation. Substituted into `{inner_command}` of the launcher template. | `claude --dangerously-skip-permissions --resume {session_id}` |
 | `LIFEOS_CC_RESUME_ENV_FILE` | Optional `key=value` file pinning `DISPLAY` / `XAUTHORITY` / `WAYLAND_DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` for the spawned terminal. | `` (inherit systemd env) |
 | `LIFEOS_CODEX_VIZ_ENABLED` | Surface Codex CLI sessions alongside the other sources. | `true` |
 | `LIFEOS_CODEX_SESSIONS_DIR` | Where to find Codex rollout JSONLs. | `~/.codex/sessions` |
 | `LIFEOS_CODEX_LOOKBACK_DAYS` | Discovery window for Codex rollouts. | `7` |
-| `LIFEOS_CODEX_RESUME_ENABLED` | Enable Resume + Go To for `cx:` sessions. | `false` |
+| `LIFEOS_CODEX_RESUME_ENABLED` | Enable Resume + Go To for `cx:` sessions, and the board drawer's **Open** action for `#codex` cards. | `false` |
 | `LIFEOS_CODEX_RESUME_CMD` | Codex launcher template. Same substitution surface as `LIFEOS_CC_RESUME_CMD`. | `wezterm cli spawn --cwd {cwd} -- {inner_command}` |
 | `LIFEOS_CODEX_RESUME_INNER_CMD` | Inner command inside the spawned terminal — the actual `codex resume` invocation. | `codex resume {session_id}` |
 | `LIFEOS_AGENT_HOOK_TOKEN` | Bearer token required from `scripts/lifeos-agent-hook.sh` on `POST /api/agents/cli-sessions/events`. Empty (default) disables the endpoint (503) — a fresh clone accepts no cross-machine session data until this is set. | `` |
