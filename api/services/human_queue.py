@@ -78,7 +78,7 @@ def validate_done_when(done_when: Optional[dict]) -> Optional[dict]:
     catches and maps to 422 itself, matching the existing
     `_require_valid_status` pattern in `api/routes/tasks.py`.
 
-    `path` (both types) must be a string starting with `/` and not `//` —
+    `path` (`endpoint`) must be a string starting with `/` and not `//` —
     the worker builds the request URL as `f"{api_base}{path}"`
     (`agent_worker/worker.py`), so an unvalidated `path` like `@host/x` or
     `//host/x` would re-parse the authority and make the worker's
@@ -86,8 +86,8 @@ def validate_done_when(done_when: Optional[dict]) -> Optional[dict]:
     a card. For `endpoint`, `path` also may not contain `?` or `#` — a
     query string would let the filer smuggle request parameters into the
     worker's poll GET, a query-driven side-effecting local request
-    reachable the same way. `pointer` must be a string; `equals` must be a
-    JSON scalar.
+    reachable the same way; `file_exists` `path` must be a non-empty
+    string. `pointer` must be a string; `equals` must be a JSON scalar.
     """
     if done_when is None:
         return None
@@ -190,13 +190,13 @@ def add_card(
     blocking `lifeos_agent_user_ask`.
     """
     if key and not _KEY_RE.match(key):
-        raise ValueError(f"key {key!r} must match ^[\\w.:-]+$ (letters, digits, '.', ':', '-', '_')")
+        raise ValueError(f"key {key!r} must match ^[\\w.:-]+\\Z (letters, digits, '.', ':', '-', '_')")
     if key and not key.strip("."):
         # A key of only dots ("." or "..") passes _KEY_RE but is a path
         # segment that URL clients normalize away (dot-segment resolution,
         # RFC 3986 §5.2.4) before it ever reaches the resolve route,
         # making the card unresolvable by key.
-        raise ValueError(f"key {key!r} must match ^[\\w.:-]+$ (letters, digits, '.', ':', '-', '_')")
+        raise ValueError(f"key {key!r} must contain at least one character other than '.'")
     validated_done_when = validate_done_when(done_when)
     fields: dict[str, str] = {}
     if key:

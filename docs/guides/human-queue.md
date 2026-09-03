@@ -46,9 +46,10 @@ Hermes) and as a native chat tool (`manage_human_queue`, actions
 - **`lifeos_human_queue_add(title, notes?, key?, done_when?, source_host?, source_cwd?, source_session?)`**
   Files a card. Never blocks or changes the calling session's own status —
   purely fire-and-forget, unlike the worker's blocking
-  `lifeos_agent_user_ask`. `key` must match `^[\w.:-]+$` (letters, digits,
-  `.`, `:`, `-`, `_`) — it's interpolated unescaped into the resolve route's
-  URL path segment, so `/`, `?`, `#` are rejected (422). Filing again with
+  `lifeos_agent_user_ask`. `key` must match `^[\w.:-]+\Z` (letters, digits,
+  `.`, `:`, `-`, `_`) and must contain at least one character other than
+  `.` — it's interpolated unescaped into the resolve route's URL path
+  segment, so `/`, `?`, `#` are rejected (422). Filing again with
   an already-**open** card's `key` replaces that card's notes instead of
   creating a duplicate (`updated_at` advances). A `key` whose only match is
   a **done** card is unclaimed — filing opens a fresh card.
@@ -146,8 +147,8 @@ rule as every other agent.
 The **Morning Briefing** proactive reminder's prompt
 (`scripts/seed_proactive_reminders.py`'s `MORNING_BRIEFING_PROMPT`) has a
 **Waiting on You** section instructing the orchestrator to call
-`manage_human_queue` (action `list`) and report cards with `age_hours` of
-24 or more, skipping the section when there are none.
+`manage_human_queue` (action `list`) and report cards shown as 24h old or
+older, skipping the section when there are none.
 
 If your Morning Briefing scheduler entry was seeded before this section
 existed, it won't pick up the change on its own. Re-running
