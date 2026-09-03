@@ -1169,6 +1169,35 @@ class TestReindexWriteBackCas:
         assert file_path.read_text(encoding="utf-8") == original_content
         assert any("conflict" in r.message.lower() for r in caplog.records)
 
+    def test_persistent_mismatch_does_not_merge_unwritten_parse_into_index(
+        self, task_manager, monkeypatch
+    ):
+        """#853 round 2 finding #2: on a persistent conflict the write-back
+        is correctly skipped, but `self._tasks` used to be updated anyway
+        from a parse that never reached disk — seeding a "ghost" id (minted
+        while appending a missing id comment) that nothing on disk carries —
+        and every abandoned attempt's `_reparse_lines` mutations to
+        `self._last_written_line` leaked through, not just the final one."""
+        file_path = task_manager.tasks_dir / "ReindexCasGhost.md"
+        original_content = "- [ ] TODO Buy milk\n"
+        file_path.write_text(original_content, encoding="utf-8")
+
+        tasks_before = dict(task_manager._tasks)
+        last_written_before = dict(task_manager._last_written_line)
+
+        import itertools
+        counter = itertools.count()
+        monkeypatch.setattr(
+            "api.services.task_manager._mtime_or_none",
+            lambda path: next(counter),
+        )
+
+        task_manager.reindex_file(str(file_path))  # must not raise
+
+        assert file_path.read_text(encoding="utf-8") == original_content
+        assert task_manager._tasks == tasks_before
+        assert task_manager._last_written_line == last_written_before
+
 
 class TestRebuildIndex:
     """Tests for rebuild_index method."""
@@ -1607,6 +1636,47 @@ class TestDuplicateIds:
         task_manager.reindex_file(str(file_path))
         assert file_path.read_bytes() == before
 
+    def test_cross_file_duplicate_id_resolved_on_rebuild(self, task_manager):
+        """#853 round 2 finding #3: a same-file duplicate id is deduplicated
+        by `_reparse_lines` already, but two DIFFERENT files each carrying
+        `<!-- id:dupe0001 -->` were never deduplicated — `rebuild_index`
+        just let whichever file was parsed last silently win in
+        `self._tasks`, with the losing file's on-disk id now pointing at
+        the wrong task."""
+        inbox_path = task_manager.tasks_dir / "Inbox.md"
+        work_path = task_manager.tasks_dir / "Work.md"
+        inbox_path.write_text("- [ ] TODO Inbox copy <!-- id:dupe0001 -->\n", encoding="utf-8")
+        work_path.write_text("- [ ] TODO Work copy <!-- id:dupe0001 -->\n", encoding="utf-8")
+
+        task_manager.rebuild_index()
+
+        inbox_content = inbox_path.read_text(encoding="utf-8")
+        work_content = work_path.read_text(encoding="utf-8")
+        kept_original = [c for c in (inbox_content, work_content) if "dupe0001" in c]
+        assert len(kept_original) == 1, "exactly one file should keep the original id"
+
+        original = task_manager.get("dupe0001")
+        assert original is not None
+
+        other_content = work_content if "dupe0001" in inbox_content else inbox_content
+        m = re.search(r"<!-- id:(\w+) -->", other_content)
+        assert m
+        fresh_id = m.group(1)
+        assert fresh_id != "dupe0001"
+        fresh = task_manager.get(fresh_id)
+        assert fresh is not None
+        assert fresh.id != original.id
+
+        # Two distinct tasks are indexed, not one clobbering the other.
+        assert {original.description, fresh.description} == {"Inbox copy", "Work copy"}
+
+        # A second rebuild makes no further change — both files byte-identical.
+        inbox_before = inbox_path.read_bytes()
+        work_before = work_path.read_bytes()
+        task_manager.rebuild_index()
+        assert inbox_path.read_bytes() == inbox_before
+        assert work_path.read_bytes() == work_before
+
 
 class TestIdAddressedWrites:
     """Writes locate their task by id, not by cached line number, so an
@@ -1823,6 +1893,30 @@ class TestCasRewriteAbsorbsUnreindexedExternalEdit:
         assert "Retitled before claim" in final_content
         assert "#agent-running" in final_content
 
+    def test_update_preserves_unreindexed_external_body_only_edit(self, task_manager):
+        """#853 round 2 finding #4: `test_update_preserves_unreindexed_
+        external_retitle_and_body` changes the task LINE (a retitle) and the
+        body together, so it stays green even if `_external_edit_pending`'s
+        notes-comparison branch is deleted — the raw-line comparison alone
+        still catches it. This test changes ONLY the body, leaving the task
+        line byte-identical, so it isolates that branch: it fails if the
+        notes comparison is removed."""
+        task = task_manager.create("Body only", context="Absorb3", notes="original body")
+        file_path = task_manager.tasks_dir / "Absorb3.md"
+
+        content = file_path.read_text(encoding="utf-8")
+        content = content.replace(
+            "    > original body", "    > original body\n    > added externally"
+        )
+        file_path.write_text(content, encoding="utf-8")
+
+        updated = task_manager.update(task.id, priority="high")
+
+        assert updated.notes == "original body\nadded externally"
+        final_content = file_path.read_text(encoding="utf-8")
+        assert "added externally" in final_content
+        assert "[priority:: high]" in final_content
+
 
 class TestMoveTaskConflict:
     """#853 round 1 finding #6: a context-change move used to remove the
@@ -1857,6 +1951,60 @@ class TestMoveTaskConflict:
         assert "Move me" not in dest_content
         # Index still points at the source — not left dangling.
         assert task_manager.get(task.id).context == "MoveSrc"
+
+    def test_source_conflict_rollback_leaves_index_pointing_at_intact_source(
+        self, task_manager, monkeypatch
+    ):
+        """#853 round 2 finding #1: when the destination insert succeeds and
+        the SOURCE removal then raises `TaskConflictError`, the best-effort
+        rollback used to run `_external_edit_pending` against a stale
+        (still-the-source) `self._last_written_line`, treat the freshly
+        inserted destination block as an unabsorbed external edit, restamp
+        and absorb it into `self._tasks` via `reindex_file` (context/
+        source_file now pointing at the destination), and then delete that
+        same block from the destination on retry — leaving the index
+        pointing at a file with no block for this id, even though the
+        source file still held the task byte for byte, untouched."""
+        task = task_manager.create("Move me too", context="MoveSrc2", notes="keep this body too")
+        source_path = task_manager.tasks_dir / "MoveSrc2.md"
+        dest_path = task_manager.tasks_dir / "MoveDest2.md"
+        source_content_before = source_path.read_text(encoding="utf-8")
+
+        import api.services.task_manager as tm_mod
+        original_mtime = tm_mod._mtime_or_none
+        state = {"flaky": True, "n": 0}
+
+        def flaky_for_source(path):
+            if state["flaky"] and Path(path) == source_path:
+                state["n"] += 1
+                return state["n"]  # always different -> source CAS never matches
+            return original_mtime(path)
+
+        monkeypatch.setattr(tm_mod, "_mtime_or_none", flaky_for_source)
+
+        with pytest.raises(TaskConflictError):
+            task_manager.update(task.id, context="MoveDest2")
+
+        # Destination has no block for the id — the rollback did its job.
+        dest_content = dest_path.read_text(encoding="utf-8") if dest_path.exists() else ""
+        assert "Move me too" not in dest_content
+        # Source is completely untouched, byte for byte.
+        source_content = source_path.read_text(encoding="utf-8")
+        assert source_content == source_content_before
+        assert "keep this body too" in source_content
+
+        indexed = task_manager.get(task.id)
+        assert indexed is not None
+        assert indexed.source_file.endswith("MoveSrc2.md")
+        assert indexed.context == "MoveSrc2"
+
+        # A subsequent, unmocked update must still succeed against the
+        # (correctly indexed) source file.
+        state["flaky"] = False
+        updated = task_manager.update(task.id, priority="high")
+        assert updated is not None
+        final_content = source_path.read_text(encoding="utf-8")
+        assert "[priority:: high]" in final_content
 
 
 class TestFieldValidation:

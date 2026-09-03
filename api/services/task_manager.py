@@ -619,6 +619,13 @@ class TaskManager:
                     logger.warning(f"Could not read {file_path}: {e}")
                     return
 
+                # Snapshot before this attempt's parse so an abandoned
+                # attempt (retry or final skip below) can't leave behind
+                # `_last_written_line` entries seeded from a parse that
+                # never reached disk — those would let a later CAS check
+                # believe an unwritten (possibly re-minted) id's line is
+                # the last-known-good one.
+                last_written_snapshot = dict(self._last_written_line)
                 new_lines, file_tasks, rewrite_needed = self._reparse_lines(
                     lines, str(path), self._tasks
                 )
@@ -629,12 +636,18 @@ class TaskManager:
                 if mtime_now == mtime_before:
                     atomic_write_lines(path, new_lines, newline=newline, trailing_newline=trailing_newline)
                     break
+                self._last_written_line = last_written_snapshot
                 if attempt >= _CAS_MAX_RETRIES:
                     logger.warning(
                         f"reindex_file: persistent write conflict on {file_path}; "
                         "skipping the id/restamp write-back this pass"
                     )
-                    break
+                    # Abandon entirely — do not merge this parse's tasks
+                    # (some ids may have been freshly minted and never
+                    # written to disk) into the index, and do not touch
+                    # the index file or dashboard. The watcher will fire
+                    # again for whatever caused the conflict.
+                    return
                 # Someone else wrote in between — re-read and re-parse
                 # against the freshest content on the next attempt.
 
@@ -656,9 +669,22 @@ class TaskManager:
             self._write_dashboard()
 
     def rebuild_index(self):
-        """Full re-parse of all LifeOS/Tasks/*.md files."""
+        """Full re-parse of all LifeOS/Tasks/*.md files.
+
+        Ids are deduplicated across the whole rebuild, not just within a
+        single file: `seen_ids` threads forward so a task carrying an id
+        already claimed by an earlier file in this same pass is treated
+        exactly like a same-file duplicate (fresh id minted, old comment
+        stripped) rather than letting the last file parsed silently win in
+        `self._tasks`. A single-file `reindex_file` cannot make this call —
+        it has no way to tell a genuine cross-file duplicate from an
+        operator cutting a task line out of one file and pasting it into
+        another — so it always passes no `seen_ids` and keeps its existing
+        single-file semantics.
+        """
         prior = self._tasks
         rebuilt: dict[str, Task] = {}
+        seen_ids: set[str] = set()
         if self.tasks_dir.exists():
             for md_file in sorted(self.tasks_dir.glob("*.md")):
                 if md_file.name == "Dashboard.md" or is_conflict_file(md_file):
@@ -668,10 +694,13 @@ class TaskManager:
                 except Exception as e:
                     logger.warning(f"Could not read {md_file}: {e}")
                     continue
-                new_lines, file_tasks, rewrite_needed = self._reparse_lines(lines, str(md_file), prior)
+                new_lines, file_tasks, rewrite_needed = self._reparse_lines(
+                    lines, str(md_file), prior, seen_ids
+                )
                 if rewrite_needed:
                     atomic_write_lines(md_file, new_lines, newline=newline, trailing_newline=trailing_newline)
                 rebuilt.update(file_tasks)
+                seen_ids.update(file_tasks.keys())
 
         self._tasks = rebuilt
         self._last_written_line = {
@@ -682,7 +711,11 @@ class TaskManager:
         logger.info(f"Rebuilt task index: {len(self._tasks)} tasks")
 
     def _reparse_lines(
-        self, lines: list[str], file_path: str, prior: dict[str, Task]
+        self,
+        lines: list[str],
+        file_path: str,
+        prior: dict[str, Task],
+        seen_ids: Optional[set[str]] = None,
     ) -> tuple[list[str], dict[str, Task], bool]:
         """Parse `lines` (belonging to `file_path`) into fresh tasks.
 
@@ -699,10 +732,13 @@ class TaskManager:
         to compare against. Every other line — task or not — is copied
         through byte-for-byte. A checkbox line inside a fenced (``` or ~~~)
         code block is never a task line (see `_iter_lines_with_fence_state`).
-        A second block in this same file carrying an id already claimed
-        earlier in this parse is treated as if it had no id at all — its
+        A second block carrying an id already claimed earlier in this parse
+        (same-file duplicate), or already present in the caller-supplied
+        `seen_ids` (a cross-file duplicate from an earlier file in the same
+        `rebuild_index` pass — `None` when called from `reindex_file`, which
+        only ever sees one file), is treated as if it had no id at all — its
         stale/duplicated comment is replaced with a freshly minted one,
-        rather than left to fight the first occurrence for the same id on
+        rather than left to fight the earlier occurrence for the same id on
         every future parse.
         """
         out_lines: list[str] = []
@@ -724,7 +760,9 @@ class TaskManager:
             raw_main_line = lines[idx]
             body_lines = lines[idx + 1:end]
 
-            if had_id and task.id in file_tasks:
+            if had_id and (
+                task.id in file_tasks or (seen_ids is not None and task.id in seen_ids)
+            ):
                 had_id = False
                 task.id = uuid.uuid4().hex[:8]
                 raw_main_line = _ID_RE.sub("", raw_main_line).rstrip()
@@ -929,15 +967,30 @@ class TaskManager:
         raises (a source-side conflict, after the insert already
         succeeded), best-effort removes the just-inserted destination block
         before re-raising, so the task isn't left duplicated in both files.
+
+        `self._last_written_line[task.id]` is updated to the destination's
+        just-written line immediately after the insert succeeds, so that if
+        the best-effort rollback runs, its own `_external_edit_pending`
+        check compares against the destination content it should — not a
+        stale pointer at the source line — and never mistakes the freshly
+        inserted block for an unabsorbed external edit. If the rollback
+        still can't restore clean state, `self._tasks`/`_last_written_line`
+        are reset to their pre-move values before the original exception is
+        re-raised, so the index is never left pointing at a file with no
+        block for this id while the block survives intact elsewhere.
         """
         old_path = Path(task.source_file)
         old_lines = _read_lines(old_path)
         if _find_task_block_span(old_lines, task.id) is None:
             return False
 
+        prev_task = self._tasks.get(task.id)
+        prev_line = self._last_written_line.get(task.id)
+
         new_path = self._get_context_file(new_context)
         block = _format_task_block(task)
         start_line = self._cas_insert_at_top(new_path, block)
+        self._last_written_line[task.id] = block[0]
 
         try:
             self._cas_rewrite(old_path, task.id, lambda: None)
@@ -946,6 +999,12 @@ class TaskManager:
                 self._cas_rewrite(new_path, task.id, lambda: None)
             except TaskConflictError:
                 pass
+            if prev_task is not None:
+                self._tasks[task.id] = prev_task
+            if prev_line is not None:
+                self._last_written_line[task.id] = prev_line
+            else:
+                self._last_written_line.pop(task.id, None)
             raise
         self._reposition_file(old_path)
 

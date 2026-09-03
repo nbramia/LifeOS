@@ -75,6 +75,16 @@ is treated exactly like a line with no id comment at all — its
 stale/duplicated comment is replaced with a freshly minted one on that
 pass, and both lines are indexed under distinct ids from then on.
 
+A duplicate that spans two *different* files is resolved only on the next
+full `rebuild_index`, not by a single-file `reindex_file` call: `rebuild_index`
+threads one `seen_ids` set across every file it parses, so a task whose id
+was already claimed by an earlier file in the same rebuild is treated the
+same way as a same-file duplicate. `reindex_file` deliberately does not do
+this — it has no way to distinguish a genuine cross-file duplicate from an
+operator cutting a task line out of one file and pasting it into another,
+so it keeps ids intact on an external cross-file move and leaves any true
+cross-file duplicate for the next full rebuild to resolve.
+
 ## Id write-back
 
 A checkbox line with no `<!-- id:xxxx -->` comment gets one minted
@@ -274,7 +284,10 @@ blindly overwriting whatever landed in between. On persistent conflict it
 logs a warning and skips the write for that pass instead of raising —
 `reindex_file` has no caller to hand a `TaskConflictError` to that would do
 anything useful with it, and the watcher will fire again for whatever
-caused the conflict.
+caused the conflict. That skip is total, not partial: on a persistent
+conflict `reindex_file` returns without merging the abandoned attempt's
+parse into `self._tasks` or touching the index file or dashboard, since
+that parse may have minted ids that never reached disk.
 
 ## Compare-and-swap retry vs. field-level merge
 
