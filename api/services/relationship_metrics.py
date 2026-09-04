@@ -420,9 +420,11 @@ def update_all_strengths() -> dict:
 
     for cached_person in people:
         try:
-            person = store.get_by_id(cached_person.id)
-            if not person:
-                continue
+            # Deep-copy rather than store.get_by_id(): every iteration ends in
+            # an unconditional store.update(), so a private copy of the
+            # cached entity gives the same mutation-safety without an extra
+            # per-person SQL round trip across this full-list, sync-scale loop.
+            person = PersonEntity.from_dict(cached_person.to_dict())
             strength = compute_strength_for_person(person)
             # Apply manual override if defined
             override = STRENGTH_OVERRIDES_BY_ID.get(person.id)
