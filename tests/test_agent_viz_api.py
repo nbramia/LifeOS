@@ -1263,22 +1263,21 @@ def test_put_label_sets_and_clears(client, stores, label_override_db):
 
 
 # ---------------------------------------------------------------------------
-# _cache_put _CACHE_MAX enforcement (DS-902). Every in-process cache write
-# must funnel through _cache_put so the cap is enforced uniformly — a stray
-# direct assignment (disk-hit promotions, terminal/ttl caching) must not
-# grow the cache unbounded. When at capacity, the oldest-inserted entry
-# (dict insertion order) is evicted and the new one stored.
+# _cache_put _CACHE_MAX enforcement. Every in-process cache write funnels
+# through _cache_put so the cap is enforced uniformly — a stray direct
+# assignment (disk-hit promotions, terminal/ttl caching) must not grow the
+# cache unbounded. When at capacity, the oldest-inserted entry (dict
+# insertion order) is evicted and the new one stored.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_cache_put_enforces_cache_max(summary_db):
+def test_cache_put_enforces_cache_max(summary_db, monkeypatch):
     from api.services import agent_viz_summary as avs
 
     avs._cache.clear()
-    old_max = avs._CACHE_MAX
     small_max = 3
-    avs._CACHE_MAX = small_max
+    monkeypatch.setattr(avs, "_CACHE_MAX", small_max)
     try:
         for i in range(small_max + 5):
             avs._cache_put(
@@ -1295,18 +1294,16 @@ def test_cache_put_enforces_cache_max(summary_db):
         assert "sid-0" not in avs._cache
     finally:
         avs._cache.clear()
-        avs._CACHE_MAX = old_max
 
 
 @pytest.mark.unit
-def test_cache_if_terminal_evicts_at_capacity(summary_db):
+def test_cache_if_terminal_evicts_at_capacity(summary_db, monkeypatch):
     """Sanity that _cache_if_terminal (a _cache_put caller) also stays capped."""
     from api.services import agent_viz_summary as avs
 
     avs._cache.clear()
-    old_max = avs._CACHE_MAX
     small_max = 3
-    avs._CACHE_MAX = small_max
+    monkeypatch.setattr(avs, "_CACHE_MAX", small_max)
     try:
         for i in range(small_max + 3):
             avs._cache_if_terminal(
@@ -1321,4 +1318,33 @@ def test_cache_if_terminal_evicts_at_capacity(summary_db):
             assert f"t-{i}" in avs._cache
     finally:
         avs._cache.clear()
-        avs._CACHE_MAX = old_max
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("entry_point", ["get_cached_summary", "summarize_session"])
+def test_disk_hit_promotion_respects_cache_max(summary_db, monkeypatch, entry_point):
+    """Both the synchronous and async disk-hit promotion sites bound the
+    in-process cache at `_CACHE_MAX`, evicting the oldest entry first — a
+    stray direct `_cache[...] = ...` at either site would let the cache
+    grow past the cap on a disk-hit-heavy workload."""
+    import asyncio
+
+    from api.services import agent_viz_summary as avs
+
+    small_max = 5
+    monkeypatch.setattr(avs, "_CACHE_MAX", small_max)
+    sids = [f"disk-hit-{i}" for i in range(small_max + 3)]
+    for sid in sids:
+        summary_db(sid, f"Label {sid}", f"Summary for {sid}")  # seeds disk only
+        if entry_point == "get_cached_summary":
+            promoted = avs.get_cached_summary(sid, 1_000_000.0, status=STATUS_COMPLETED)
+        else:
+            promoted = asyncio.run(avs.summarize_session(
+                sid, label=f"Label {sid}", last_activity_at=1_000_000.0,
+                events=[], status=STATUS_COMPLETED,
+            ))
+        assert promoted is not None
+        assert len(avs._cache) <= small_max
+
+    assert len(avs._cache) == small_max
+    assert list(avs._cache) == sids[3:]
