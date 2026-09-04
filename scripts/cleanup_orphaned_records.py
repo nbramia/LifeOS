@@ -83,7 +83,7 @@ def cleanup_orphaned_records(dry_run: bool = True) -> dict:
         print(f"  Deleted: {cursor.rowcount}")
         stats['deleted_facts'] = cursor.rowcount
 
-    # 2b. Count orphaned tone_analysis_results (#910). Unlike the other
+    # 2b. Count orphaned tone_analysis_results. Unlike the other
     # tables here, this one is created lazily by ToneAnalysisStore on its
     # first use (api/services/tone_analysis_store.py), so it may not exist
     # yet on an install where tone analysis has never run -- guarded,

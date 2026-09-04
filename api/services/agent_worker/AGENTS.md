@@ -12,7 +12,7 @@ External long-running worker that picks up `#agent`-tagged tasks, executes them 
 | `spend_tracker.py` | Daily $-cap ledger (inclusive ceiling; cap ≤ 0 pauses claims) |
 | `preflight.py` | Haiku preflight call: budget, routing (`local` / `claude` / `ask`), ambiguity, sanity |
 | `router.py` | Thin dispatch helper used by the preflight-driven path |
-| `local_executor.py` | Local-Gemma agent loop (synchronous, single in-process LLM client) |
+| `local_executor.py` | Local-Gemma agent loop (synchronous, single in-process LLM client); also serves the `#cloud` remote route. Validates a task's optional `working_dir` field before any model call and threads it into every tool dispatch (#925) |
 | `managed_executor.py` | Anthropic Managed Agents driver — `start()` + `poll()` for remote sessions |
 | `managed_driver.py` | HTTP client for the Managed Agents API |
 | `claude_code_executor.py` | Claude Code CLI driver (subprocess spawn, stream-json parse, `[NOTIFY]`/`[CLARIFY]` extraction) for `routing='claude_code'` sessions |
@@ -22,7 +22,7 @@ External long-running worker that picks up `#agent`-tagged tasks, executes them 
 | `operator_spawn.py` | Same pattern for non-code operator-initiated agent spawns from Telegram or `/chat` |
 | `inter_agent.py` | Tool surface that lets agents spawn / message / yield-until peers in the same lineage. `lifeos_agent_spawn` accepts `claude`/`local`/`claude_code`/`codex` — the CLI routes enable cross-engine capability fallback (e.g. delegate browser work to a `claude_code` child) |
 | `codex_skill_sync.py` | Converts engine-agnostic `.claude/skills/` into Codex's `SKILL.md` format; installed into `~/.codex/skills/` by `scripts/install_codex_skills.py` |
-| `tools.py`, `tool_filter.py`, `tool_result_cache.py` | LifeOS-MCP tool catalog, per-preset filtering, repeat-call de-duplication |
+| `tools.py`, `tool_filter.py`, `tool_result_cache.py` | LifeOS-MCP tool catalog, per-preset filtering, repeat-call de-duplication. Read/Write/Edit/Bash accept an optional `base_dir` (#925) — a path escaping it via `..` or a symlink is rejected |
 | `pricing.py` | Per-model token rates + session-hour overhead for cost accounting |
 | `capabilities_preamble.py` | Static LifeOS capabilities briefing prepended to the opening user turn on the managed, local, and `codex` routes (Claude Code gets the equivalent via `--append-system-prompt`) |
 
@@ -33,7 +33,8 @@ The `sessions.routing` column drives dispatch. Values come from preflight (for `
 | `routing` | Executor | How sessions are created |
 |-----------|----------|--------------------------|
 | `local` | `LocalExecutor` | Preflight or `#local` tag |
-| `claude` | `ManagedExecutor` | Preflight or `#cloud[-haiku\|-sonnet]` tag (Anthropic API, per-token) |
+| `remote` | `LocalExecutor` | Preflight or bare `#cloud` tag (configured remote provider, e.g. Fireworks) |
+| `claude` | `ManagedExecutor` | Preflight or `#cloud-haiku`/`#cloud-sonnet` tag (Anthropic API, per-token) |
 | `claude_code` | `ClaudeCodeExecutor` | `claude_code_spawn.spawn_claude_code_session()` (`/claude`) or `#claude` tag (Claude Code CLI, subscription-billed) |
 | `codex` | `CodexExecutor` | `codex_spawn.spawn_codex_session()` (`/codex`) or `#codex` tag (Codex CLI, subscription-billed) |
 | `ask` | — | Preflight couldn't decide; worker blocks the session and asks the operator |

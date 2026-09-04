@@ -1,5 +1,5 @@
 """
-Tests for the `scripts/pre-push` SSH push-URL warning (#886).
+Tests for the `scripts/pre-push` SSH push-URL warning.
 
 The hook is invoked by git as `pre-push <remote name> <remote url>`. GitHub
 closes an idle SSH session after ~6 minutes, and the gate's test run takes

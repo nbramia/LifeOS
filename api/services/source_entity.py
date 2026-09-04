@@ -1359,9 +1359,9 @@ class SourceEntityStore:
 
 # Singleton instance
 _source_entity_store: Optional[SourceEntityStore] = None
-# #868 moved CRM/people/photos handlers off the event loop and onto worker
-# threads, so two first-requests after a restart can now race this
-# check-and-set. Double-checked locking: the lock is only taken while
+# CRM/people/photos handlers run on worker threads (not the event loop),
+# so two first-requests after a restart can race this check-and-set.
+# Double-checked locking: the lock is only taken while
 # _source_entity_store is still None, so it costs nothing once constructed.
 _source_entity_store_lock = threading.Lock()
 

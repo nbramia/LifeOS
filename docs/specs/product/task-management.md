@@ -19,7 +19,8 @@ Example task line:
 
 A task can also carry a multi-line notes body, stored as indented `> ` lines
 beneath the task line, and operator fields (`host`, `effort`, `model`, `key`,
-or any custom `[key:: value]`) that round-trip through any edit unchanged:
+`working_dir`, or any custom `[key:: value]`) that round-trip through any edit
+unchanged:
 
 ```
 - [ ] TODO Call dentist [due:: 2025-02-10] [created:: 2025-02-07] [host:: laptop] #health <!-- id:abc123 -->

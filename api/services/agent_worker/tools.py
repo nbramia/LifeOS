@@ -13,6 +13,15 @@ agent can pivot rather than hang.
 No sandboxing per the user's design decision: the worker runs with the
 operator's full filesystem and shell access. This is intentional and is
 called out in `AGENTS.md` and the setup guide.
+
+When a task names a working directory, Read/Write/Edit resolve
+`file_path` against it and reject anything that escapes via `..`
+traversal or a symlink (`_resolve_within_base`), and Bash runs with it as
+`cwd`. That's a path-resolution guard, not a sandbox: a Bash command can
+still `cd` elsewhere or pass an absolute path outside the working
+directory and LifeOS won't stop it — only Read/Write/Edit's own path
+argument is checked. See `local_executor._resolve_task_working_dir` for
+where the directory itself is validated before any of this runs.
 """
 from __future__ import annotations
 
@@ -136,11 +145,36 @@ class ToolResult:
 # Standard tool handlers
 # ---------------------------------------------------------------------------
 
-def _tool_read(args: dict) -> ToolResult:
+def _resolve_within_base(file_path: str, base_dir: str | None) -> tuple[Path | None, str | None]:
+    """Resolve `file_path` against `base_dir`, when one is named, and
+    reject anything that escapes it via `..` traversal or a symlink.
+
+    A relative `file_path` is joined onto `base_dir`; an absolute one is
+    accepted only when its resolved form still falls inside `base_dir`.
+    Resolution is realpath-based (`Path.resolve()` follows symlinks and
+    collapses `..`), so a path that only *looks* contained is caught here.
+
+    `base_dir=None` (no working directory named on the task) is a no-op —
+    `file_path` resolves exactly as passed in.
+    """
+    p = Path(file_path)
+    if base_dir is None:
+        return p, None
+    base = Path(base_dir).resolve()
+    candidate = p if p.is_absolute() else (base / p)
+    resolved = candidate.resolve()
+    if resolved != base and base not in resolved.parents:
+        return None, f"path escapes working directory {base_dir}: {file_path}"
+    return resolved, None
+
+
+def _tool_read(args: dict, base_dir: str | None = None) -> ToolResult:
     file_path = args.get("file_path", "")
     if not file_path:
         return ToolResult("Read requires file_path", is_error=True)
-    p = Path(file_path)
+    p, escape_error = _resolve_within_base(file_path, base_dir)
+    if escape_error:
+        return ToolResult(escape_error, is_error=True)
     if not p.exists():
         return ToolResult(f"file not found: {file_path}", is_error=True)
     if not p.is_file():
@@ -156,12 +190,14 @@ def _tool_read(args: dict) -> ToolResult:
     return ToolResult(data.decode("utf-8", errors="replace"))
 
 
-def _tool_write(args: dict) -> ToolResult:
+def _tool_write(args: dict, base_dir: str | None = None) -> ToolResult:
     file_path = args.get("file_path", "")
     content = args.get("content", "")
     if not file_path:
         return ToolResult("Write requires file_path", is_error=True)
-    p = Path(file_path)
+    p, escape_error = _resolve_within_base(file_path, base_dir)
+    if escape_error:
+        return ToolResult(escape_error, is_error=True)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -170,13 +206,15 @@ def _tool_write(args: dict) -> ToolResult:
     return ToolResult(f"wrote {len(content)} bytes to {file_path}")
 
 
-def _tool_edit(args: dict) -> ToolResult:
+def _tool_edit(args: dict, base_dir: str | None = None) -> ToolResult:
     file_path = args.get("file_path", "")
     old = args.get("old_string", "")
     new = args.get("new_string", "")
     if not file_path or not old:
         return ToolResult("Edit requires file_path and a non-empty old_string", is_error=True)
-    p = Path(file_path)
+    p, escape_error = _resolve_within_base(file_path, base_dir)
+    if escape_error:
+        return ToolResult(escape_error, is_error=True)
     if not p.exists():
         return ToolResult(f"file not found: {file_path}", is_error=True)
     try:
@@ -198,7 +236,7 @@ def _tool_edit(args: dict) -> ToolResult:
     return ToolResult(f"replaced 1 occurrence in {file_path}")
 
 
-def _tool_bash(args: dict) -> ToolResult:
+def _tool_bash(args: dict, base_dir: str | None = None) -> ToolResult:
     command = args.get("command", "")
     timeout = int(args.get("timeout_seconds", 60))
     if not command:
@@ -210,6 +248,11 @@ def _tool_bash(args: dict) -> ToolResult:
             capture_output=True,
             text=True,
             timeout=timeout,
+            # None (no working directory named) is subprocess.run's own
+            # default. A named `cwd` only bounds the command's *starting*
+            # directory; the command itself can still `cd` elsewhere or
+            # touch an absolute path outside it (see module docstring).
+            cwd=base_dir,
         )
     except subprocess.TimeoutExpired:
         return ToolResult(f"command timed out after {timeout}s", is_error=True)
@@ -227,7 +270,8 @@ def _tool_bash(args: dict) -> ToolResult:
     return ToolResult(combined or "(no output)")
 
 
-def _tool_webfetch(args: dict) -> ToolResult:
+def _tool_webfetch(args: dict, base_dir: str | None = None) -> ToolResult:
+    del base_dir  # unused — WebFetch doesn't touch the local filesystem
     url = args.get("url", "")
     if not url:
         return ToolResult("WebFetch requires url", is_error=True)
@@ -242,10 +286,11 @@ def _tool_webfetch(args: dict) -> ToolResult:
     return ToolResult(text)
 
 
-def _tool_websearch(args: dict) -> ToolResult:
+def _tool_websearch(args: dict, base_dir: str | None = None) -> ToolResult:
     # Search backend is intentionally not configured in Issue C. We surface
     # the tool so the agent can plan around it, but calling it returns a
     # structured "not configured" message rather than failing silently.
+    del base_dir  # unused — WebSearch doesn't touch the local filesystem
     return ToolResult(
         "WebSearch is not configured on this LifeOS install. "
         "Use WebFetch with a specific URL, or pivot to a different approach.",
@@ -253,7 +298,7 @@ def _tool_websearch(args: dict) -> ToolResult:
     )
 
 
-STANDARD_HANDLERS: dict[str, Callable[[dict], ToolResult]] = {
+STANDARD_HANDLERS: dict[str, Callable[..., ToolResult]] = {
     "Read": _tool_read,
     "Write": _tool_write,
     "Edit": _tool_edit,
@@ -296,8 +341,16 @@ class ToolRegistry:
             return STANDARD_TOOLS + list(INTER_AGENT_TOOL_SCHEMAS) + list(self._mcp.tools)
         return STANDARD_TOOLS + list(self._mcp.tools)
 
-    def dispatch(self, name: str, arguments: dict) -> ToolResult:
-        """Run one tool call. Returns a ToolResult."""
+    def dispatch(self, name: str, arguments: dict, base_dir: str | None = None) -> ToolResult:
+        """Run one tool call. Returns a ToolResult.
+
+        `base_dir` is the task's named working directory, if any —
+        forwarded only to the standard Read/Write/Edit/Bash/WebFetch/
+        WebSearch handlers (see their signatures); MCP and inter-agent
+        tools reach the filesystem only through `settings.vault_path` via
+        the HTTP API, never through caller-supplied paths, so `base_dir`
+        doesn't apply and is ignored.
+        """
         # `sleep` is special: tell the executor to yield rather than producing
         # immediate output.
         if name == "sleep":
@@ -336,7 +389,7 @@ class ToolRegistry:
         handler = STANDARD_HANDLERS.get(name)
         if handler is not None:
             try:
-                return handler(arguments)
+                return handler(arguments, base_dir=base_dir)
             except Exception as e:  # pragma: no cover — defensive
                 logger.exception("tool %s raised: %s", name, e)
                 return ToolResult(f"tool {name} crashed: {e}", is_error=True)

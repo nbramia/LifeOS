@@ -353,21 +353,20 @@ class TestMergeOperationDetails:
 
 
 class TestMergePeopleToneAnalysisResults:
-    """Real, end-to-end coverage of the #910 addition: merging a person
-    must remove tone_analysis_results rows for the absorbed (secondary)
-    person, and must leave the primary's own rows alone (see the code
-    comment in scripts/merge_people.py for why: unlike person_facts, a
-    stale primary row self-heals via the existing interaction-count
-    freshness check the next time tone analysis runs).
+    """Merging a person must remove tone_analysis_results rows for the
+    absorbed (secondary) person, and must leave the primary's own rows
+    alone (see the code comment in scripts/merge_people.py for why: unlike
+    person_facts, a stale primary row self-heals via the existing
+    interaction-count freshness check the next time tone analysis runs).
 
     Unlike TestMergePeople above (which mocks sqlite3.connect entirely),
     this exercises the real SQL against real temporary SQLite files, using
     the actual store classes to create schema so it can't drift from
     production. person_entity, relationship, and post-merge stats/strength
-    refresh dependencies are stubbed since they're unrelated to what #910
-    changed and would otherwise require substantially more fixture work
-    to run for real (e.g. person_entities/person_emails/person_phones
-    lookup-table upkeep, real interaction-derived stats)."""
+    refresh dependencies are stubbed since tone_analysis_results cleanup
+    doesn't touch them and would otherwise require substantially more
+    fixture work to run for real (e.g. person_entities/person_emails/
+    person_phones lookup-table upkeep, real interaction-derived stats)."""
 
     @pytest.fixture
     def merge_env(self, tmp_path, monkeypatch):
@@ -421,7 +420,7 @@ class TestMergePeopleToneAnalysisResults:
         monkeypatch.setattr("scripts.merge_people.get_interaction_db_path", lambda: interactions_db_path)
         monkeypatch.setattr("scripts.merge_people.MERGED_IDS_FILE", tmp_path / "merged_ids.json")
         monkeypatch.setattr("scripts.merge_people.MERGE_LOG_FILE", tmp_path / "merge_log.json")
-        # Unrelated post-merge side effects (#910 doesn't touch either) --
+        # Post-merge side effects unrelated to tone_analysis_results cleanup --
         # stubbed rather than wired up for real to keep this fixture from
         # growing into a second copy of person_entity/interaction fixtures.
         monkeypatch.setattr("api.services.person_stats.refresh_person_stats", lambda *a, **k: {})
@@ -452,10 +451,9 @@ class TestMergePeopleToneAnalysisResults:
         assert len(tone_store.get_for_person("secondary-person")) == 2  # untouched by dry run
 
     def test_merge_still_clears_facts_for_both_ids(self, merge_env):
-        """Regression guard: the pre-existing facts-cleared-for-both-ids
-        behavior (person_facts, above the new tone_analysis_results step
-        in scripts/merge_people.py) must be unaffected by #910's addition
-        right after it."""
+        """The facts-cleared-for-both-ids behavior (person_facts, above the
+        tone_analysis_results step in scripts/merge_people.py) must be
+        unaffected by that step."""
         from scripts.merge_people import merge_people
 
         stats = merge_people("primary-person", "secondary-person", dry_run=False)
@@ -469,11 +467,9 @@ class TestMergePeopleToneAnalysisResults:
     def merge_env_without_tone_table(self, tmp_path, monkeypatch):
         """Same as merge_env, but the tone_analysis_results table is never
         created -- reproducing a crm.db from an install where tone
-        analysis has never run (the table is created lazily). Regression
-        coverage for a real bug this addition introduced and fixed in the
-        same round: tests/test_merge_crash_safety.py's fixture builds its
-        own crm.db without this table, and the first version of this
-        change 500'd on it with `no such table: tone_analysis_results`."""
+        analysis has never run (the table is created lazily). Covers
+        tests/test_merge_crash_safety.py's fixture, whose crm.db is built
+        without this table."""
         from api.services.person_entity import PersonEntity, PersonEntityStore
         from api.services.relationship import RelationshipStore
         from api.services.source_entity import SourceEntityStore

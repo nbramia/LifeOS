@@ -291,7 +291,7 @@ Taking Alice to the park. Jane is making dinner.
 
 
 # ---------------------------------------------------------------------------
-# #872: bound GET /api/people/search results and batch the recency lookup.
+# GET /api/people/search bounds its results and batches the recency lookup.
 #
 # These tests build isolated PersonEntityStore/InteractionStore instances
 # (temp SQLite files, no dependency on data/crm.db) and monkeypatch the
@@ -355,9 +355,9 @@ class TestSearchPeopleEndpoint:
             person_store.add(entity)
 
         # One of the four has a real interaction; the other three have none
-        # at all -- exercising both branches of the batched-recency fix
-        # (#872 review finding 1): "absent from the batch map" must mean
-        # "no interactions", not "go run a per-person fallback query".
+        # at all -- exercising both branches of the batched recency lookup:
+        # "absent from the batch map" must mean "no interactions", not
+        # "go run a per-person fallback query".
         self._insert_raw_interaction(interaction_store, "partial-recent", "gmail", days_ago=1)
 
         monkeypatch.setattr(people_routes, "get_person_entity_store", lambda: person_store)
@@ -434,12 +434,12 @@ class TestSearchPeopleEndpoint:
         assert data["total"] == 3
 
     def test_recency_lookup_is_batched_once(self, client, stores, monkeypatch):
-        """The N+1 per-person recency query must become exactly one batched
-        call for the whole page, no matter how many results are returned --
-        and the per-person fallback (get_last_interaction_by_source) must
-        never run, including for the three people in this fixture with zero
-        interactions (#872 review finding 1: an id absent from the batch
-        result means "no interactions", not "go run the fallback query")."""
+        """The recency query must run as exactly one batched call for the
+        whole page, no matter how many results are returned -- and the
+        per-person fallback (get_last_interaction_by_source) must never
+        run, including for the three people in this fixture with zero
+        interactions: an id absent from the batch result means "no
+        interactions", not "go run the fallback query"."""
         _, interaction_store = stores
         batch_calls = []
         original_batch = interaction_store.get_last_interaction_by_source_batch
@@ -477,12 +477,12 @@ class TestSearchPeopleEndpoint:
 
 
 class TestExactMatchOutsideCandidateWindow:
-    """#872 review finding 2: a query with far more matches than the
-    internal candidate cap (`limit * 5`, minimum 200) must still surface the
-    exact canonical-name match. The store's candidate window is ordered by
-    recency, so the exact match -- the single oldest of hundreds of
-    substring matches here -- would otherwise be excluded from the window
-    entirely and never returned at all, not just reordered."""
+    """A query with far more matches than the internal candidate cap
+    (`limit * 5`, minimum 200) must still surface the exact canonical-name
+    match. The store's candidate window is ordered by recency, so the
+    exact match -- the single oldest of hundreds of substring matches here
+    -- would otherwise be excluded from the window entirely and never
+    returned at all, not just reordered."""
 
     @pytest.fixture
     def client(self, tmp_path, monkeypatch):
@@ -537,9 +537,9 @@ class TestExactMatchOutsideCandidateWindow:
 
 
 class TestSearchPeopleLikeEscaping:
-    """#872 review finding 5: `%` and `_` in a search query must match
-    literally, not act as SQL LIKE wildcards, now that matching runs in SQL
-    instead of a Python substring scan."""
+    """`%` and `_` in a search query must match literally, not act as SQL
+    LIKE wildcards, since matching runs in SQL rather than a Python
+    substring scan."""
 
     @pytest.fixture
     def client(self, tmp_path, monkeypatch):
@@ -645,9 +645,8 @@ class TestListPeopleEndpoint:
         assert data["people"][0]["canonical_name"] == "Erin New"
 
     def test_recency_lookup_is_batched_once(self, client, stores, monkeypatch):
-        """#872 review finding 6: /api/people/list must use the same batched
-        recency lookup as /api/people/search instead of one query per
-        returned person."""
+        """/api/people/list must use the same batched recency lookup as
+        /api/people/search instead of one query per returned person."""
         _, interaction_store = stores
         batch_calls = []
         original_batch = interaction_store.get_last_interaction_by_source_batch
@@ -677,7 +676,7 @@ class TestListPeopleEndpoint:
 
 
 class TestInteractionStoreBatchRecency:
-    """InteractionStore.get_last_interaction_by_source_batch (#872)."""
+    """InteractionStore.get_last_interaction_by_source_batch."""
 
     @pytest.fixture
     def store(self, tmp_path):
@@ -729,7 +728,7 @@ class TestInteractionStoreBatchRecency:
 
 
 class TestPersonEntityStoreSearchHelpers:
-    """PersonEntityStore.count_search / list_recent (#872)."""
+    """PersonEntityStore.count_search / list_recent."""
 
     @pytest.fixture
     def store(self, tmp_path):
@@ -749,11 +748,10 @@ class TestPersonEntityStoreSearchHelpers:
         assert len(store.search("ada", limit=2)) == 2
 
     def test_count_search_excludes_merged_people(self, store):
-        """#872 review nit 1: count_search()'s merged-row exclusion had no
-        test -- mutating it away (`merged_ids = []`) let the whole suite
-        keep passing. Simulate a merge the same way a real merge operation's
-        durable record (merged_person_ids.json) would represent it: a
-        secondary id mapped to the primary it was merged into."""
+        """count_search() must exclude merged rows by default. Simulate a
+        merge the same way a real merge operation's durable record
+        (merged_person_ids.json) would represent it: a secondary id mapped
+        to the primary it was merged into."""
         now = datetime.now(timezone.utc)
         store.add(_make_person(id="primary", canonical_name="Ada Merged Primary",
                                 emails=[], last_seen=now))
@@ -792,7 +790,7 @@ class TestPersonEntityStoreSearchHelpers:
 @pytest.mark.slow
 @pytest.mark.integration
 class TestSearchPeopleLatency:
-    """#872: GET /api/people/search must stay fast against the production
+    """GET /api/people/search must stay fast against the production
     dataset. Skips cleanly on a fresh clone with no data/crm.db.
 
     Also marked `slow` (alongside `integration`, matching the pattern in
@@ -831,7 +829,7 @@ class TestSearchPeopleLatency:
         # Best of several samples (same approach as test_crm_api.py's
         # _warm_latency_ms) rather than a single call: this host runs many
         # concurrent agent sessions, and one unlucky sample sharing a CPU
-        # quantum with unrelated work isn't a real regression.
+        # quantum with unrelated work shouldn't fail this check.
         samples = []
         for _ in range(5):
             start = time.perf_counter()

@@ -1,12 +1,10 @@
-"""Browser test for the Me dashboard's span-driven heatmap window (#871).
+"""Browser test for the Me dashboard's span-driven heatmap window.
 
-The Me page used to always request a fixed 10 years of interaction history
-(`days_back=3657`) before shrinking the displayed heatmap to the actual data
-afterward — the exact "fetch-then-shrink" flow #871 replaces with a cheap
-`/api/crm/me/interactions/span` call made first. This pins that the page
-actually does that: it calls the span endpoint, then derives the
-`/me/interactions` request's `days_back` from the returned `years` instead of
-a hardcoded 10.
+The Me page calls a cheap `/api/crm/me/interactions/span` endpoint first,
+then derives the `/me/interactions` request's `days_back` from the
+returned `years`, rather than always requesting a fixed 10 years of
+interaction history (`days_back=3657`) and shrinking the displayed heatmap
+to the actual data afterward. This pins that the page actually does that.
 
 Unlike most of the browser suite this serves `web/crm.html` itself from an
 ephemeral port rather than pointing at a running API, and stubs every
@@ -14,7 +12,7 @@ ephemeral port rather than pointing at a running API, and stubs every
 network request `web/crm.html`'s own JS makes, not server behavior. That is
 why it carries no `requires_server` marker, and so runs at pre-push
 (`browser and not requires_server`). Keep it that way — reaching for a live
-server here would silently drop this regression from the push gate.
+server here would silently drop this case from the push gate.
 """
 import http.server
 import json
@@ -194,8 +192,7 @@ def test_me_page_sizes_heatmap_from_span(page: Page, crm_base_url):
 
     # renderMeDashboard() and loadMeHeatMap() both route through
     # loadMeInteractions() on the same tick; it must memoize the in-flight
-    # request so they share one, not fire the full-window fetch twice
-    # (#897 review finding 2).
+    # request so they share one, not fire the full-window fetch twice.
     assert len(me_interactions_requests) == 1, (
         f"Expected exactly one /me/interactions request (in-flight requests "
         f"should be shared across callers), got {len(me_interactions_requests)}: "

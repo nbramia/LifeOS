@@ -627,8 +627,8 @@ class PersonEntityStore:
         statement ever executed on it) and every call site
         (_current_data_version) is reached only while holding
         _get_all_cache_lock, so cross-thread use is serialized. That is
-        what makes check_same_thread=False safe here despite the
-        threadpool dispatch these routers now use.
+        what makes check_same_thread=False safe here despite these
+        routers' threadpool dispatch.
         """
         if self._data_version_conn is None:
             self._data_version_conn = sqlite3.connect(
@@ -1105,10 +1105,10 @@ class PersonEntityStore:
         All ids that were merged into another (surviving) person — the keys
         of the durable merged-id mapping. In practice every one of these is
         already hidden too (merge_people.py sets hidden=1 on the secondary),
-        so this is mostly a defensive belt-and-suspenders exclusion for
-        anywhere that can't otherwise rely on get_all()'s own merged-id
-        filtering (e.g. a caller building an exclude list without a full
-        get_all() call, like the /me/interactions/span endpoint).
+        so this mostly duplicates get_all()'s own merged-id filtering for a
+        caller that can't rely on it directly (e.g. one building an exclude
+        list without a full get_all() call, like the /me/interactions/span
+        endpoint).
         """
         return set(self._merged_ids.keys())
 
@@ -1192,8 +1192,7 @@ class PersonEntityStore:
         `%` and `_` in `query` are escaped so they match literally rather
         than as SQL LIKE wildcards.
 
-        Known limitation (pre-existing, not introduced by the LIKE-based
-        matching added in #872): `emails` and `aliases` are stored as JSON
+        Known limitation: `emails` and `aliases` are stored as JSON
         text, so a non-ASCII character inside one of those lists is stored
         as a `\\uXXXX` escape sequence and a LIKE against the raw column
         cannot match the literal character a caller types. `canonical_name`
@@ -1462,10 +1461,10 @@ class PersonEntityStore:
 
 # Singleton instance
 _entity_store: Optional[PersonEntityStore] = None
-# #868 moved CRM/people/photos handlers off the event loop and onto worker
-# threads, so two first-requests after a restart can now race this
-# check-and-set. Double-checked locking: the lock is only taken while
-# _entity_store is still None, so it costs nothing once constructed.
+# CRM/people/photos handlers run on worker threads, not the event loop, so
+# two first-requests after a restart can race this check-and-set.
+# Double-checked locking: the lock is only taken while _entity_store is
+# still None, so it costs nothing once constructed.
 _entity_store_lock = threading.Lock()
 
 

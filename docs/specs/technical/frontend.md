@@ -262,6 +262,14 @@ function showError(message) {
 }
 ```
 
+### Comments
+
+`//` and `/* */` comments across all of `web/` (the inline scripts in `web/*.html` and
+every `.js` file, including `web/chat/` and `web/agents/`) follow the same rule as
+Python: see [python-conventions.md § Comments and
+Docstrings](../standards/python-conventions.md#comments-and-docstrings) for the rule
+and examples.
+
 ### Mobile Responsiveness
 
 ```css
@@ -304,3 +312,4 @@ function showError(message) {
 - [Chat UI](../product/chat-ui.md) -- Chat interface product spec
 - [CRM UI](../product/crm-ui.md) -- CRM interface product spec
 - [API Reference](../product/api-reference.md) -- API endpoint contracts
+- [Python Conventions](../standards/python-conventions.md) -- comment/docstring rule this doc's § Comments points to

@@ -16,7 +16,7 @@ shape). `interaction_count` is the number of interactions that went into
 computing the result -- the caller uses it, together with `updated_at`, to
 decide whether a stored month is still fresh.
 
-Rows for a merged-away or deleted person don't orphan (#910): when two
+Rows for a merged-away or deleted person don't orphan: when two
 people are merged, `scripts/merge_people.py` deletes the absorbed
 person's rows here in the same crm.db transaction it clears
 `person_facts` in -- deliberately *not* re-keyed onto the survivor (a
@@ -27,7 +27,7 @@ survivor's stale row self-heals via the ordinary interaction-count
 freshness check in `api/routes/crm.py`'s
 `analyze_relationship_tone_detailed` the next time tone analysis runs for
 it, so there's nothing here that needs forcing). `scripts/cleanup_orphaned_records.py`
-separately reports and removes any row whose person id no longer exists
+separately reports and removes any row whose person id doesn't exist
 at all, guarded for installs where this table hasn't been created yet.
 """
 import json

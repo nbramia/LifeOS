@@ -28,3 +28,4 @@ The operational and documentation mistake lists live in AGENTS.md (§ Common Mis
 1. **Creating monolithic docs** → Split by concern. Target line counts are in `docs/AGENTS.md`.
 2. **Creating a `backlog.md` (or `todo.md`, `ideas.md`)** → Backlog lives in GitHub issues. Plan files are only for time-bounded execution notes for a specific in-flight effort.
 3. **Over-documenting routine changes** → Not every change needs a docs update. Write what helps the next reader understand current state.
+4. **Narrating changes in comments or docs** → describe current behavior; history lives in git.

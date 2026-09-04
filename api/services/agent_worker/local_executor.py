@@ -313,6 +313,62 @@ def _output_dir() -> str:
     return str(Path(vault) / _settings.agent_output_dir)
 
 
+def _worker_repo_root():
+    """Repository root containing the `api/` package this worker process
+    is running from — derived from this file's own location, never a
+    configured or hardcoded path, so it tracks wherever the install
+    actually lives (dev worktree, canonical checkout, etc.). Consulted to
+    refuse a named working directory that resolves to, lives inside, or
+    would contain the worker's own checkout. Module-level for test
+    override, same idiom as `_today()`."""
+    from pathlib import Path
+    return Path(__file__).resolve().parents[3]
+
+
+def _resolve_task_working_dir(task: dict) -> tuple[str | None, str | None]:
+    """Extract and validate `task["fields"]["working_dir"]` — the
+    same `[key:: value]` inline-field convention `assignment.py` uses for
+    `host`/`model`/`effort`. Shared by both routes this executor serves
+    (`local` and the remote-forced route): neither guesses a
+    directory from the task title the way the CLI routes'
+    `directory_resolver` does — unset stays unset.
+
+    Returns `(resolved_dir, None)` when no directory is named (→ `None`,
+    unchanged behavior) or when the named one passes every guard.
+    Returns `(None, reason)` when the task must be refused before any
+    model call: the path doesn't exist, isn't a directory, resolves to
+    (or inside) the worker's own checkout, or is an ancestor that would
+    *contain* the checkout — naming a parent directory would let
+    `tools._resolve_within_base` approve reads/writes anywhere under it,
+    including the checkout, which is the same hazard the direct case
+    guards against, just approached from the other direction. Resolution
+    is realpath-based (`Path.resolve()` follows symlinks and collapses
+    `..`), so a directory that only *looks* safe is caught here, not at
+    first tool use — `tools._resolve_within_base` re-checks every
+    individual file path against this same resolved base for the same
+    reason.
+    """
+    from pathlib import Path
+
+    fields = task.get("fields") or {}
+    raw = fields.get("working_dir")
+    if not isinstance(raw, str) or not raw.strip():
+        return None, None
+    raw = raw.strip()
+    candidate = Path(raw).expanduser()
+    if not candidate.exists():
+        return None, f"working directory does not exist: {raw}"
+    if not candidate.is_dir():
+        return None, f"working directory is not a directory: {raw}"
+    resolved = candidate.resolve()
+    worker_root = _worker_repo_root()
+    if resolved == worker_root or worker_root in resolved.parents:
+        return None, f"working directory refuses the worker's own checkout: {raw}"
+    if resolved in worker_root.parents:
+        return None, f"working directory would contain the worker's own checkout: {raw}"
+    return str(resolved), None
+
+
 def _user_message_for(task: dict) -> str:
     """Build the opening user turn from the task description.
 
@@ -464,6 +520,18 @@ class LocalExecutor:
         budget = session.budget or {}
         self.session_store.update_status(session.task_id, STATUS_RUNNING)
 
+        # Working-directory guard — runs before any conversation seeding
+        # or LLM call, so a refused directory never reaches the model.
+        working_dir, wd_error = _resolve_task_working_dir(task)
+        if wd_error:
+            return self._finalize_failed(session, wd_error)
+        # Forwarded to every tool dispatch this call makes. Built once as a
+        # kwargs dict (rather than always passing `base_dir=working_dir`)
+        # so the no-directory case calls `dispatch(name, args)` exactly as
+        # it always has — byte-identical, including to a test double that
+        # only accepts the two positional args.
+        dispatch_kwargs = {"base_dir": working_dir} if working_dir else {}
+
         existing = self.session_store.get_messages(sid)
         has_system = any(m.get("role") == "system" for m in existing)
         if not has_system:
@@ -545,7 +613,7 @@ class LocalExecutor:
                 name = call["name"]
                 args = call["input"]
                 call_id = call["id"]
-                result: ToolResult = self.tools.dispatch(name, args)
+                result: ToolResult = self.tools.dispatch(name, args, **dispatch_kwargs)
                 self.transcript_store.append(
                     sid,
                     "tool_call",

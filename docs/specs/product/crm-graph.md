@@ -151,7 +151,7 @@ cheaper per-person category check with no batched fetch. Every node's
 same computation for that node (either the batched one during selection, or
 the cheap one otherwise) — an id is never selected under one category
 decision and then dropped, or kept, under a different one. `min_strength` is
-applied to already-selected nodes exactly as it always was, against
+applied to already-selected nodes against
 `relationship_strength` on its 0–100 scale — since the parameter itself is
 only accepted up to 1.0, the only nodes it can drop are those with a
 `relationship_strength` below 1.0 (in practice, strength-0 nodes).
@@ -184,12 +184,10 @@ The Graph tab sends only `center_on` and `depth`, leaving the caps above at
 their server defaults so a future default change reaches the tab without a
 frontend edit.
 
-`allow_full_graph=true` combined with `category` now filters every person by
+`allow_full_graph=true` combined with `category` filters every person by
 the same dynamically-computed category the response displays for them,
-rather than their raw stored `category` field — more self-consistent than before (a person's displayed
-category and whether a category filter kept them can no longer disagree),
-and the only externally-visible change to the full-graph path from this
-issue's otherwise-untouched behavior.
+rather than their raw stored `category` field, so a person's displayed
+category and whether a category filter kept them always agree.
 
 **Graph enhancements:**
 

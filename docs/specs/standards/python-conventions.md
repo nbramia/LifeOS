@@ -93,7 +93,7 @@ Key patterns:
 - Request/response Pydantic models are defined at the top of the route file.
 - 404s use `raise HTTPException(status_code=404, detail="...")`.
 - No try/except in routes -- services handle errors internally.
-- `async def` only if the handler's own body actually `await`s something; otherwise plain `def` (#868). LifeOS runs a single uvicorn event loop shared by every client surface, so a coroutine handler with no `await` still runs inline on that loop instead of FastAPI's worker threadpool -- one slow handler then blocks everyone else's requests. A handler that keeps `async def` pushes its blocking store/LLM calls onto a thread with `await asyncio.to_thread(...)` rather than calling them inline. Applied and enforced (`tests/test_route_handlers_sync.py`) for `api/routes/crm.py`, `api/routes/people.py`, and `api/routes/photos.py` as of #868 -- the rest of `api/routes/` has not been converted yet, so `async def` with no `await` elsewhere is pre-existing, not an exception to this rule.
+- `async def` only if the handler's own body actually `await`s something; otherwise plain `def`. LifeOS runs a single uvicorn event loop shared by every client surface, so a coroutine handler with no `await` still runs inline on that loop instead of FastAPI's worker threadpool -- one slow handler then blocks everyone else's requests. A handler that keeps `async def` pushes its blocking store/LLM calls onto a thread with `await asyncio.to_thread(...)` rather than calling them inline. Applied and enforced (`tests/test_route_handlers_sync.py`) for `api/routes/crm.py`, `api/routes/people.py`, and `api/routes/photos.py`; the rest of `api/routes/` has not been converted, so `async def` with no `await` elsewhere is not an exception to this rule.
 
 ## Service / Store Pattern
 
@@ -209,6 +209,31 @@ logger.info(f"Indexed person {person_id}, {len(sources)} source entities")
 logger.info(f"Indexed {person.display_name}: {person.email}, {person.phone}")
 ```
 
+## Comments and Docstrings
+
+Comments and docstrings describe current behavior only: what the code does and, where
+it's non-obvious, why — never how it got there. No "used to"/"previously"/"now"/"no
+longer", no "this change"/"this fix", no review rounds, findings, reviewers, or
+issue/PR numbers cited as history. Git history is where that narrative belongs. A
+comment earns its place only by stating an invariant or a non-obvious present-tense
+reason.
+
+```python
+# BAD — narrates history instead of describing current behavior
+# This used to fetch every relationship row per call; now caches results
+# per person (review finding 6) because that was measured at ~40ms per row
+# on the full table.
+def get_all_for_person(self, person_id: str) -> list[Relationship]:
+    ...
+
+# GOOD — states the invariant a maintainer needs
+# Caches per person_id: relationship rows are read far more often than
+# written, and a full-table scan per call doesn't stay flat under production
+# row counts.
+def get_all_for_person(self, person_id: str) -> list[Relationship]:
+    ...
+```
+
 ## Data Classes
 
 Domain objects use `@dataclass` with `to_dict()` / `from_dict()` classmethods for serialization. Pydantic is reserved for API request/response shapes.
@@ -244,3 +269,4 @@ class Task:
 - [specs/technical/architecture.md](../technical/architecture.md) -- system architecture and code structure
 - [AGENTS.md](../../../AGENTS.md) -- development workflow and agent instructions
 - [Testing Standards](testing-standards.md) -- test patterns and conventions
+- [Frontend](../technical/frontend.md) -- applies this doc's § Comments and Docstrings rule to `web/`'s JavaScript

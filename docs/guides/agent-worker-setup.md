@@ -554,6 +554,46 @@ The Apple Data Agent's own export/import pipeline
 ([operations.md](operations.md)) is the supported path for cross-machine
 Apple data, not this mechanism.
 
+## Working directory: run a local or cloud card in an isolated checkout
+
+By default the local (`#local`) and remote (`#cloud`) routes run wherever
+the worker process itself lives — on a normal install, the canonical
+checkout that serves the live API. A card that edits files therefore
+edits the running service's own source tree, which makes both routes
+unusable for code work. Naming a working directory on the card fixes
+that: a `working_dir` field pins the card's file reads, writes, and shell
+commands to an isolated checkout instead.
+
+**Set the field** the same way you'd set `host`/`model`/`effort` — an
+inline `[key:: value]` field on the task line:
+
+```
+- [ ] Fix the off-by-one in the paginator #agent #cloud [working_dir:: /srv/checkouts/example]
+```
+
+**Guardrails, checked before the model ever runs:**
+
+- No `working_dir` named → the executor runs in the worker
+  process's own working directory.
+- A path that doesn't exist, or isn't a directory, fails the card closed
+  (`#agent-failed`, reason naming the path) — no model call is made.
+- A path that resolves to the worker's own checkout, or anywhere inside
+  it, is refused the same way — the live service's tree can never be a
+  card's target, so there's no way to point `working_dir` back at the
+  install this worker is itself running from.
+- A path one or more levels *above* the checkout is refused too — naming
+  a parent directory would let file operations inside it reach the
+  checkout's own files just as surely as naming the checkout directly.
+
+**What this is and isn't.** It's a path-resolution guard, not a sandbox:
+Read/Write/Edit are confined to the named directory (a `..` or symlink
+escape is rejected), and Bash starts there, but a shell command can still
+`cd` elsewhere or touch an absolute path outside it — exactly as an
+ungoverned shell always could. Point `working_dir` at a scratch worktree
+you're comfortable with the agent having full shell access inside, the
+same trust model the worker already has everywhere else (see
+[Security model](#security-model)).
+
 ## Cost-aware iteration
 
 Iterating on cloud `#agent` prompts has a hidden tax: every fresh managed
@@ -607,5 +647,6 @@ suggestions to keep iteration cheap:
 - [Scripts](scripts.md) — `setup-systemd.sh` and other operational scripts
 - [Human Queue](human-queue.md) — `done_when` auto-resolve checks require this worker to be running
 - [Agent Worker — Technical](../specs/technical/agent-worker.md#card-assignment-851) — Host registry and ssh spawn mechanism this guide's setup section covers operationally
+- [Agent Worker — Technical § Working directory](../specs/technical/agent-worker.md#working-directory-925) — Guard implementation this guide's working-directory section covers operationally
 - [Operations](operations.md) — Apple Data Agent export/import, the supported path for cross-machine Apple data this guide's remote-host section can't reach
 - Epic [#98](https://github.com/nbramia/LifeOS/issues/98) — full agent-worker design

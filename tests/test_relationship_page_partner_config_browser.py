@@ -1,8 +1,8 @@
-"""Browser test for the Relationship page's no-partner-configured guard (#891).
+"""Browser test for the Relationship page's no-partner-configured guard.
 
-Before this fix, opening /relationship with no `partner_person_id` in the CRM
-config fired requests with an empty id segment (`/api/crm/people//timeline`)
-and left the tone/photo/timeline sections to fail silently. The fix checks
+Opening /relationship with no `partner_person_id` in the CRM config must not
+fire requests with an empty id segment (`/api/crm/people//timeline`) or leave
+the tone/photo/timeline sections to fail silently: the page checks
 `partner_person_id` before issuing any partner-scoped request and renders an
 empty state instead.
 
@@ -91,7 +91,7 @@ class TestNoPartnerConfigured:
     def test_no_request_has_an_empty_id_segment(self, page: Page, crm_base_url):
         requests, _ = _open_relationship_page(page, crm_base_url, partner_person_id="")
 
-        # The specific regression: a timeline request with a missing id segment.
+        # No timeline request may carry a missing id segment.
         assert not any("/people//timeline" in url for url in requests), (
             f"found a timeline request with an empty id segment: {requests}"
         )
@@ -116,9 +116,9 @@ class TestNoPartnerConfigured:
         expect(page.locator("#relationshipDashboard")).to_be_hidden()
 
     def test_navigating_to_a_person_hides_the_empty_state(self, page: Page, crm_base_url):
-        """#899 review finding 2 (BLOCKER): the empty state was never hidden
-        by the person-detail render path, so it kept rendering inside an
-        unrelated person's page after navigating away from /relationship."""
+        """The person-detail render path must hide the empty state, or it
+        keeps rendering inside an unrelated person's page after navigating
+        away from /relationship."""
         _open_relationship_page(page, crm_base_url, partner_person_id="")
         expect(page.locator("#relationshipEmptyState")).to_be_visible()
 
@@ -168,10 +168,10 @@ _TONE_RESPONSE_WITH_ERROR_MONTH = {
 
 
 class TestToneChartErrorMonth:
-    """#899 review finding 3 (MAJOR): a status="error" month used to be
-    plotted as a fabricated score of 50, indistinguishable from a genuinely
-    neutral month, and disagreeing with the summary average (which already
-    excluded it server-side)."""
+    """A status="error" month must render with a distinct marker, not a
+    fabricated score of 50 that would be indistinguishable from a
+    genuinely neutral month and would disagree with the summary average
+    (which already excludes it server-side)."""
 
     def test_error_month_gets_a_distinct_marker_not_a_fabricated_point(self, page: Page, crm_base_url):
         _open_relationship_page(
@@ -203,9 +203,8 @@ class TestToneChartErrorMonth:
         assert any("2026-07" in t for t in titles)
 
 
-# A tone-analysis-detailed response with one stale month (a real, previously
-# -stored score the server couldn't refresh this load) between two fresh
-# ones -- #899 review finding N2.
+# A tone-analysis-detailed response with one stale month (a real, stored
+# score the server couldn't refresh this load) between two fresh ones.
 _TONE_RESPONSE_WITH_STALE_MONTH = {
     "monthly_tones": [
         {"month": "2026-05", "user_score": 80.0, "partner_score": 80.0,
@@ -224,10 +223,10 @@ _TONE_RESPONSE_WITH_STALE_MONTH = {
 
 
 class TestToneChartStaleMonth:
-    """#899 review finding N2 (MAJOR): a stale month whose recompute failed
-    must still be plotted with its real, previously-stored score (never
-    discarded), but rendered distinctly from a fresh month -- dimmed,
-    rather than indistinguishable from current data."""
+    """A stale month whose recompute failed must still be plotted with its
+    real, stored score (never discarded), but rendered distinctly from a
+    fresh month -- dimmed, rather than indistinguishable from current
+    data."""
 
     def test_stale_month_is_plotted_with_its_real_score_dimmed(self, page: Page, crm_base_url):
         _open_relationship_page(
@@ -261,13 +260,13 @@ class TestToneChartStaleMonth:
 
 
 class TestToneChartMonthLabel:
-    """Pre-existing bug, fixed while in this code per the #899 review:
-    `new Date(t.month + '-01')` parses "YYYY-MM-01" as UTC midnight, and
+    """`new Date(t.month + '-01')` parses "YYYY-MM-01" as UTC midnight, and
     `toLocaleDateString` then renders in the browser's local timezone --
     west of UTC that rolls back to the last day of the *previous* month
-    (e.g. "2026-04" rendered as "Mar"). Verified with an explicit
-    negative-UTC-offset timezone so the test actually exercises the bug
-    rather than happening to pass under a UTC host."""
+    (e.g. "2026-04" rendered as "Mar"), so the month label must compensate.
+    Verified with an explicit negative-UTC-offset timezone so the test
+    actually exercises this instead of happening to pass under a UTC
+    host."""
 
     def test_month_label_matches_the_month_key_in_a_negative_utc_offset_timezone(
         self, browser: Browser, crm_base_url,

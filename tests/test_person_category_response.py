@@ -1,14 +1,12 @@
 """
-Regression test for PR #880 review finding 1 (issue #869).
-
 `_person_to_detail_response()` must pass `None` (not `[]`) to
 `compute_person_category()` when `include_related=False`.
 `compute_person_category()` treats the two very differently: `None` means "no
 source entities were supplied, do your own internal fetch"; `[]` means
 "here are the source entities -- there are none, don't fetch any". The default
 list path (`GET /api/crm/people`, `GET /birthdays/today`) calls with
-`include_related=False` and must keep the old fallback-fetch behavior, or
-work-vs-personal category computation silently regresses for anyone whose
+`include_related=False` and must keep the fallback-fetch behavior, so
+work-vs-personal category computation stays correct for anyone whose
 category depends on source entities (e.g. Slack membership) rather than their
 own email domain.
 """

@@ -243,8 +243,8 @@ db_path = get_crm_db_path()  # Returns "data/crm.db"
 ## CRM Models Package (api/routes/crm_models/)
 
 **Not currently wired into the running API.** The Pydantic models the CRM API
-actually serves — `PersonDetailResponse` (including `has_profile_photo`,
-added in #875), `PersonListResponse`, `TimelineItem`, and the rest — are
+actually serves — `PersonDetailResponse` (including `has_profile_photo`),
+`PersonListResponse`, `TimelineItem`, and the rest — are
 defined directly inside `api/routes/crm.py`, alongside the route handlers
 that use them; `api/main.py` mounts only `crm.router`. `crm_models/` is a
 separate, parallel module tree (`models.py`, `_utils.py`, `__init__.py`)
@@ -335,7 +335,7 @@ def endpoint_handler(
     return ResponseModel(...)
 ```
 
-**`def` vs. `async def` (#868).** LifeOS runs one uvicorn process with a
+**`def` vs. `async def`.** LifeOS runs one uvicorn process with a
 single event loop; every client surface (chat, Telegram, voice, MCP, the
 agent worker, and the CRM/people UI) shares it. A handler declared `async
 def` with nothing to `await` still runs inline on that loop, so its
@@ -344,18 +344,18 @@ returns. A handler declared plain `def` is dispatched by FastAPI to the
 worker threadpool (via Starlette's `run_in_threadpool`, anyio's default
 capacity of 40) automatically, which restores fairness between requests.
 The CRM, people, and photos routers (`api/routes/crm.py`, `api/routes/people.py`,
-`api/routes/photos.py`) follow this rule as of #868: a handler is `async def`
+`api/routes/photos.py`) follow this rule: a handler is `async def`
 only if its own body actually awaits something (an LLM call, `await
 file.read()`); otherwise it is `def`. A handler that keeps `async def`
 pushes its blocking store or LLM calls onto a thread explicitly with `await
 asyncio.to_thread(...)` (e.g. `api/routes/investments.py`, `api/routes/crm.py`'s
 fact-extraction and source-import endpoints) rather than doing them inline.
 This is a fairness fix, not a throughput one — CPU-bound work still holds
-the GIL while it runs; per-endpoint throughput is tracked separately
-(issues #869-#874). **Scope:** this is the rule for these three routers
+the GIL while it runs; per-endpoint throughput is tracked separately.
+**Scope:** this is the rule for these three routers
 specifically, enforced by `tests/test_route_handlers_sync.py`; the rest of
-`api/routes/` still has `async def` handlers with no `await` that #868 did
-not touch — converting them is a separate, unstarted effort, not a silent
+`api/routes/` still has `async def` handlers with no `await` —
+converting them is a separate, unstarted effort, not a silent
 exception to the rule above.
 Moving these handlers off the loop also removed the implicit serialization
 an inline `async def` gave every request against every other one. Handlers

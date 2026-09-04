@@ -85,7 +85,7 @@ Aggregate performance stats: avg/p50/p95/max per stage across recent traces.
 
 ### GET /api/perf/routes
 
-Rolling per-route request timing summary (#877) -- every HTTP request, not just chat turns. Backed by an in-memory rolling window (last 200 samples per route), process-local, reset on restart. See [Observability](../technical/observability.md#route-timing).
+Rolling per-route request timing summary -- every HTTP request, not just chat turns. Backed by an in-memory rolling window (last 200 samples per route), process-local, reset on restart. See [Observability](../technical/observability.md#route-timing).
 
 Returns `{"routes": [...], "count": N, "streams": [...], "stream_count": M}`. Each `routes` row: `method`, `route` (route template, e.g. `/api/crm/people/{person_id}`, never the raw path), `count`, `p50_ms`, `p95_ms`, `max_ms`, `slow_count`, `last_slow_at`. Sorted by `p95_ms` descending.
 

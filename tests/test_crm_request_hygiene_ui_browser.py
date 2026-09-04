@@ -1,11 +1,10 @@
 """Browser tests for CRM search cancellation and single-fetch person
-selection (#874).
+selection.
 
-Two request-hygiene habits used to add avoidable round trips on every CRM
-interaction: typing in the people search box fired a request per pause but
-never cancelled the previous one, so a slower earlier response could
-overwrite newer results; and selecting a person issued two back-to-back
-`GET /people/{id}` requests (one plain, one with `include_related=true`).
+Typing in the people search box must cancel the previous in-flight request
+when it fires a new one, so a slower earlier response can't overwrite newer
+results; and selecting a person must issue a single `GET /people/{id}`
+request (with `include_related=true`), not two back-to-back requests.
 
 Unlike most of the browser suite this serves `web/` itself from an ephemeral
 port rather than pointing at a running API. Rather than intercepting network
@@ -53,9 +52,8 @@ PERSON_CLICKABLE = {
 PERSON_DETAIL = {
     **PERSON_CLICKABLE,
     "emails": [], "phone_numbers": [], "vault_contexts": [], "sources": [],
-    # source_entity_count > 0 while source_entities is empty is the exact
-    # mismatch that used to hang the panel on "Loading source entities..."
-    # forever (nothing re-rendered it after loadRelatedData() was removed).
+    # source_entity_count > 0 while source_entities is empty must not hang
+    # the panel on "Loading source entities..." forever.
     "source_entities": [], "source_entity_count": 3, "relationships": [],
 }
 
@@ -219,21 +217,20 @@ class TestSearchCancellation:
 
         The fills below are spaced > 300ms apart (matching the sibling
         tests above) so each one's own debounce actually fires its own
-        request — closer spacing (as an earlier version of this test had
-        it, all 100ms apart) means only the *last* fill's debounce ever
-        fires at all, so nothing is ever superseded or aborted and this
-        assertion would hold trivially, proving nothing. "one" and "two"
-        are given a long artificial delay so they are still genuinely
-        in-flight (and therefore actually get aborted, not just rendered
-        over) when the next fill starts.
+        request — closer spacing means only the *last* fill's debounce
+        ever fires at all, so nothing is ever superseded or aborted and
+        this assertion would hold trivially, proving nothing. "one" and
+        "two" are given a long artificial delay so they are still
+        genuinely in-flight (and therefore actually get aborted, not just
+        rendered over) when the next fill starts.
 
         The failure-panel check happens between the "two" and "three"
         fills — i.e. right when "two"'s loadPeople() call aborts "one" —
         not after "three" has already resolved. Checking only at the end
-        (an earlier version of this test did) is not a real assertion of
-        the `AbortError` guard at all: "three"'s own successful render
-        happens after, and overwrites, anything the (correctly or
-        incorrectly handled) abort of "one"/"two" painted in between, so a
+        is not a real assertion of the `AbortError` guard at all: "three"'s
+        own successful render happens after, and overwrites, anything the
+        (correctly or incorrectly handled) abort of "one"/"two" painted in
+        between, so a
         version of this file with the guard deleted still passes the
         final-state check. Checking mid-race, while "two" is still
         in-flight and nothing has resolved yet to paper over it, is what
@@ -270,7 +267,7 @@ class TestSearchCancellation:
         # Prove something was actually superseded/aborted before checking
         # that it didn't surface as a failure — otherwise a version of this
         # test that never exercises cancellation at all would pass
-        # trivially (this is exactly what #895's review caught).
+        # trivially.
         aborted_urls = page.evaluate("window.__abortedUrls")
         assert any("q=one" in u for u in aborted_urls), (
             f"expected the superseded 'one' request to be aborted, got: {aborted_urls}"
@@ -309,8 +306,7 @@ class TestSinglePersonFetch:
         # PERSON_DETAIL carries source_entities: [] (present but empty) —
         # renderPersonDetail() must treat that as "no source entities" and
         # never leave the panel on the "Loading source entities..."
-        # placeholder, which nothing re-renders once loadRelatedData() (the
-        # only thing that used to settle it) was removed.
+        # placeholder.
         source_entities_text = page.locator("#sourceEntitiesList").inner_text()
         assert "Loading source entities" not in source_entities_text
         assert "No source entities" in source_entities_text

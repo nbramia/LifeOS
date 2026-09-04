@@ -336,6 +336,21 @@ Per-turn flow:
 
 Cost: `$0` when served by the local llama-server (`local` maps to `$0` in `pricing.py`). A session served by the remote fallback above is priced from `LIFEOS_REMOTE_LLM_INPUT_PRICE_PER_MTOK`/`_OUTPUT_PRICE_PER_MTOK` when configured, else recorded as real unpriced spend rather than $0 — the same convention every `unpriced` usage row uses. Wall-time enforcement still applies either way.
 
+### Working directory
+
+Both `ROUTE_LOCAL` and `ROUTE_REMOTE` share this one executor, so a single guard covers a task pinned to either. A card names a directory with the same `[key:: value]` inline-field convention `assignment.py` reads `host`/`model`/`effort` from: `[working_dir:: /srv/checkouts/example]`. Unlike the CLI routes' `directory_resolver.resolve_working_directory` (a keyword guess off the task title), this field is never inferred — unset means the executor runs in the worker process's own working directory.
+
+`local_executor._resolve_task_working_dir(task)` runs before conversation seeding or any LLM call, so a refused directory never reaches the model:
+
+1. Unset or blank `working_dir` → `(None, None)` — unchanged behavior.
+2. Path doesn't exist, or exists but isn't a directory → refused, naming the path.
+3. Path resolves (`Path.resolve()`, so symlinks and `..` are collapsed first) to the worker's own checkout — the repository root containing the running `api/` package, computed from `local_executor.py`'s own file location, never a configured or hardcoded path — or to anything inside it → refused. The live service's source tree can never be a task's target, even one directory level down.
+4. Path is an ancestor that would *contain* the checkout (naming a parent directory, however many levels up) → refused with a distinct reason. `tools._resolve_within_base` approves any path under the named base, so a directory one level above the checkout would let Read/Write/Edit reach the checkout's own files just as surely as naming it directly — the guard checks both directions.
+
+A refusal returns `ExecutorOutcome(status=STATUS_FAILED, reason=...)` from `execute()` before the loop starts, which flows through the worker's ordinary `_handle_outcome` → `STATUS_FAILED` path: same vault tag swap and Telegram notify every other executor failure gets, naming the refused path in the reason. No separate failure channel exists for this guard.
+
+Once validated, the resolved directory is threaded through `ToolRegistry.dispatch(name, args, base_dir=...)` for the rest of that `execute()` call — not stored on the (potentially test-injected, longer-lived) `ToolRegistry`/`LocalExecutor` instance, so a working directory from one task can never leak into another dispatched through the same executor object. `tools._resolve_within_base` re-resolves every Read/Write/Edit `file_path` against it (relative paths join onto the base; absolute paths are accepted only if their resolved form still falls inside it) and rejects a `..`/symlink escape the same way the task-level guard does; Bash gets it as `cwd`. This is a path-resolution guard, not a sandbox — a Bash command can still `cd` elsewhere or read/write an absolute path outside the working directory, exactly as an ungoverned shell always could (out of scope for this guard; see the module docstring in `tools.py`). The LifeOS MCP tool surface and the `lifeos_agent_*` inter-agent tools are unaffected by `working_dir` — they reach the filesystem only through the configured `settings.vault_path` over HTTP, never through `base_dir`, and were never part of this threat model.
+
 ---
 
 ## Managed executor (Claude path)
@@ -633,6 +648,7 @@ Full reference in [`agent-worker-setup.md`](../../guides/agent-worker-setup.md).
 - [ADR-018: API Spend Requires Operator Consent](../../adr/018-api-spend-requires-consent.md) — Why an inferred cloud route asks, and why the CLI subprocess carries no API credential
 - [Agent Worker — Product](../product/agent-worker.md) — What `#agent` does, consumer view
 - [Agent Worker — Setup](../../guides/agent-worker-setup.md) — Operator setup walkthrough
+- [Agent Worker — Setup § Working directory](../../guides/agent-worker-setup.md#working-directory-run-a-local-or-cloud-card-in-an-isolated-checkout-925) — Operator-facing walkthrough for the guard described here
 - [Agent Viz — Technical](agent-viz.md) — `/agents` page that reads SessionStore + TranscriptStore here
 - [Agent Viz — Product](../product/agent-viz.md) — Board drawer pickers and Open action that write the card-assignment fields read here
 - [Task Management](../product/task-management.md) — How `#agent` tasks sit alongside regular tasks
