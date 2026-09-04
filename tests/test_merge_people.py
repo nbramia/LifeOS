@@ -350,3 +350,117 @@ class TestMergeOperationDetails:
         assert "gmail" in combined_sources
         assert "calendar" in combined_sources
         assert "slack" in combined_sources
+
+
+class TestMergePeopleToneAnalysisResults:
+    """Real, end-to-end coverage of the #910 addition: merging a person
+    must remove tone_analysis_results rows for the absorbed (secondary)
+    person, and must leave the primary's own rows alone (see the code
+    comment in scripts/merge_people.py for why: unlike person_facts, a
+    stale primary row self-heals via the existing interaction-count
+    freshness check the next time tone analysis runs).
+
+    Unlike TestMergePeople above (which mocks sqlite3.connect entirely),
+    this exercises the real SQL against real temporary SQLite files, using
+    the actual store classes to create schema so it can't drift from
+    production. person_entity, relationship, and post-merge stats/strength
+    refresh dependencies are stubbed since they're unrelated to what #910
+    changed and would otherwise require substantially more fixture work
+    to run for real (e.g. person_entities/person_emails/person_phones
+    lookup-table upkeep, real interaction-derived stats)."""
+
+    @pytest.fixture
+    def merge_env(self, tmp_path, monkeypatch):
+        from api.services.person_entity import PersonEntity, PersonEntityStore
+        from api.services.relationship import RelationshipStore
+        from api.services.source_entity import SourceEntityStore
+        from api.services.person_facts import PersonFactStore, PersonFact
+        from api.services.tone_analysis_store import ToneAnalysisStore
+        from api.services.interaction_store import InteractionStore, Interaction
+        from datetime import datetime, timezone
+
+        crm_db_path = str(tmp_path / "crm.db")
+        interactions_db_path = str(tmp_path / "interactions.db")
+
+        person_store = PersonEntityStore(crm_db_path)
+        RelationshipStore(crm_db_path)  # table only -- no rows needed
+        SourceEntityStore(crm_db_path)  # table only -- no rows needed
+        fact_store = PersonFactStore(crm_db_path)
+        tone_store = ToneAnalysisStore(crm_db_path)
+        interaction_store = InteractionStore(interactions_db_path, strict=False)
+
+        primary = PersonEntity(id="primary-person", canonical_name="Primary Person")
+        secondary = PersonEntity(id="secondary-person", canonical_name="Secondary Person")
+        person_store.add(primary)
+        person_store.add(secondary)
+
+        fact_store.add(PersonFact(person_id="primary-person", category="work", key="k1", value="v1"))
+        fact_store.add(PersonFact(person_id="secondary-person", category="work", key="k2", value="v2"))
+
+        tone_store.upsert("primary-person", "2026-01", 2, {
+            "user_score": 70.0, "partner_score": 70.0, "combined_score": 70.0,
+            "user_sample_count": 1, "partner_sample_count": 1,
+        })
+        tone_store.upsert("secondary-person", "2026-01", 2, {
+            "user_score": 40.0, "partner_score": 40.0, "combined_score": 40.0,
+            "user_sample_count": 1, "partner_sample_count": 1,
+        })
+        tone_store.upsert("secondary-person", "2026-02", 3, {
+            "user_score": 35.0, "partner_score": 35.0, "combined_score": 35.0,
+            "user_sample_count": 1, "partner_sample_count": 1,
+        })
+
+        interaction_store.add(Interaction(
+            id="synthetic-1", person_id="secondary-person",
+            timestamp=datetime.now(timezone.utc), source_type="imessage",
+            title="synthetic message",
+        ))
+
+        monkeypatch.setattr("scripts.merge_people.get_person_entity_store", lambda: person_store)
+        monkeypatch.setattr("scripts.merge_people.get_crm_db_path", lambda: crm_db_path)
+        monkeypatch.setattr("scripts.merge_people.get_interaction_db_path", lambda: interactions_db_path)
+        monkeypatch.setattr("scripts.merge_people.MERGED_IDS_FILE", tmp_path / "merged_ids.json")
+        monkeypatch.setattr("scripts.merge_people.MERGE_LOG_FILE", tmp_path / "merge_log.json")
+        # Unrelated post-merge side effects (#910 doesn't touch either) --
+        # stubbed rather than wired up for real to keep this fixture from
+        # growing into a second copy of person_entity/interaction fixtures.
+        monkeypatch.setattr("api.services.person_stats.refresh_person_stats", lambda *a, **k: {})
+        monkeypatch.setattr("api.services.relationship_metrics.update_strength_for_person", lambda *a, **k: None)
+
+        return {"tone_store": tone_store, "fact_store": fact_store}
+
+    def test_merge_removes_absorbed_persons_tone_rows_but_keeps_primarys(self, merge_env):
+        from scripts.merge_people import merge_people
+
+        stats = merge_people("primary-person", "secondary-person", dry_run=False)
+
+        assert stats["tone_rows_cleared"] == 2
+
+        tone_store = merge_env["tone_store"]
+        assert tone_store.get_for_person("secondary-person") == []
+        primary_rows = tone_store.get_for_person("primary-person")
+        assert len(primary_rows) == 1
+        assert primary_rows[0].result["user_score"] == 70.0  # untouched
+
+    def test_dry_run_reports_the_count_without_deleting_anything(self, merge_env):
+        from scripts.merge_people import merge_people
+
+        stats = merge_people("primary-person", "secondary-person", dry_run=True)
+
+        assert stats["tone_rows_cleared"] == 2
+        tone_store = merge_env["tone_store"]
+        assert len(tone_store.get_for_person("secondary-person")) == 2  # untouched by dry run
+
+    def test_merge_still_clears_facts_for_both_ids(self, merge_env):
+        """Regression guard: the pre-existing facts-cleared-for-both-ids
+        behavior (person_facts, above the new tone_analysis_results step
+        in scripts/merge_people.py) must be unaffected by #910's addition
+        right after it."""
+        from scripts.merge_people import merge_people
+
+        stats = merge_people("primary-person", "secondary-person", dry_run=False)
+
+        assert stats["facts_cleared"] == 2  # one from each id
+        fact_store = merge_env["fact_store"]
+        assert fact_store.get_for_person("primary-person") == []
+        assert fact_store.get_for_person("secondary-person") == []
