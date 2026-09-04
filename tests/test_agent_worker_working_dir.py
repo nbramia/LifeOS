@@ -1,4 +1,4 @@
-"""Tests for #925 — working-directory support on the local and remote
+"""Tests working-directory support on the local and remote
 (#cloud) agent-worker routes, which both run through `LocalExecutor`.
 
 Two layers are covered:
@@ -373,7 +373,8 @@ def test_execute_no_working_dir_named_is_unchanged(tmp_path: Path, fake_session)
     the tool registry is still called with exactly the two positional
     args it always was (no base_dir kwarg). If the executor started
     always forwarding `base_dir` this test double — which only accepts
-    `(name, args)`, mirroring a pre-#925 caller — would raise TypeError."""
+    `(name, args)`, mirroring a caller that never supplies one — would
+    raise TypeError."""
     store, session = fake_session
     llm = _ScriptedLLM([
         _FakeResponse(
