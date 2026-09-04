@@ -112,10 +112,16 @@ function loadHostCatalog(fetchImpl = fetch) {
       // CURRENT entry — a slow fetch that fails after the TTL rolled and a
       // newer fetch already cached a success must not clobber that newer
       // entry.
-      if (_hostsCache === mine) _hostsCache = null;
-      _hostsConsecutiveFailures += 1;
-      if (_hostsConsecutiveFailures >= 2) {
-        _hostsCooldownUntil = Date.now() + _HOSTS_FAILURE_COOLDOWN_MS;
+      // (#901 round 3, finding M13) Guard the failure counter the same
+      // way the cache clear above is guarded — a fetch that's no longer
+      // the CURRENT entry (a newer one already succeeded and replaced it)
+      // must not arm the cooldown against a healthy endpoint either.
+      if (_hostsCache === mine) {
+        _hostsCache = null;
+        _hostsConsecutiveFailures += 1;
+        if (_hostsConsecutiveFailures >= 2) {
+          _hostsCooldownUntil = Date.now() + _HOSTS_FAILURE_COOLDOWN_MS;
+        }
       }
       return null;
     });
@@ -164,6 +170,15 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   // tags, the Assignee select in board.js) already snaps back on failure
   // — so a host/effort/model change the server REJECTS can never ride
   // along, silently, on the next unrelated save.
+  //
+  // (#901 round 3, finding A5/M11) These are set from exactly what the
+  // succeeding save SENT (captured before its `await`), never re-read
+  // from the live controls at some other save's resolution time — with
+  // two saves in flight, the live controls can already reflect a THIRD,
+  // still-pending change, which would make an unrelated revert clobber a
+  // committed value or leave a rejected one in place. See save()'s
+  // serialization below for how "two saves in flight" is made impossible
+  // in the first place.
   let lastSavedEffort = currentEffort;
   let lastSavedHost = currentHost;
   let lastSavedModel = currentModel;
@@ -314,6 +329,27 @@ export function renderAssignmentPickers(container, card, opts = {}) {
     errorEl.textContent = '';
   }
 
+  // (#901 round 3, finding R9) Assign `value` to `el`, and if the option
+  // that held it has since been removed from the DOM — the DOM silently
+  // sets `selectedIndex = -1` and `value = ""`, which for host/effort/
+  // model is a REAL, different value ("this machine" / "default" /
+  // "engine default"), not "unset" — re-append it as a flagged-unknown
+  // option and assign again. Reachable for the host select in particular:
+  // round 1's A1 live-value read rebuilds the option list around
+  // whatever is currently selected, which can drop the very option a
+  // later revert wants to restore.
+  function restoreSelect(el, value) {
+    el.value = value;
+    if (value && el.value !== value) {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.dataset.unknown = 'true';
+      opt.textContent = `${value} (unknown)`;
+      el.appendChild(opt);
+      el.value = value;
+    }
+  }
+
   // Every picker writes the SAME shape: the assignee tag (if it's the
   // engine picker changing) plus the three inline fields, always stamping
   // `assigned_by: "board"` — that's what keeps preflight's routing
@@ -325,24 +361,45 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   // regardless of what the card has saved — so sending `model: null` would
   // wipe a previously saved model on the very first effort/host change of
   // a page load, before `GET /api/agents/models` has resolved (#861).
-  async function save(extra = {}) {
+  //
+  // (#901 round 3, finding A5) Saves are serialized through a single
+  // in-flight chain (`saveChain` below) rather than fired independently:
+  // with two saves in flight, whichever finished LAST used to decide what
+  // "last known good" meant for BOTH, so an accepted change could be
+  // reverted by an unrelated later rejection, and a rejected change could
+  // be "confirmed" by an unrelated earlier acceptance — both silent, no
+  // toast. Chaining each save onto the previous one's settlement means at
+  // most one PUT is ever outstanding, so there is no "other save's
+  // resolution time" left to read from: `runSave` reads the controls
+  // fresh, at the moment it actually starts, and every `lastSaved*`
+  // update reflects exactly what THAT save sent.
+  async function runSave(extra) {
     const { tags, ...extraFields } = extra;  // `tags` is a top-level PUT key, not a field
+    // Capture what's actually being sent BEFORE the await (#901 round 3,
+    // finding M11) — `lastSaved*` must reflect the payload this save
+    // sent, not whatever the controls happen to hold once the PUT
+    // resolves (a later change may already have moved them, even with
+    // saves serialized — the operator can still edit while a PUT is in
+    // flight).
+    const sentEffort = effortEl.value;
+    const sentHost = hostEl.value.trim();
+    const sentModel = modelEl.value;
     const fields = {
-      effort: effortEl.value || null,
-      host: hostEl.value.trim() || null,
+      effort: sentEffort || null,
+      host: sentHost || null,
       assigned_by: 'board',
       ...extraFields,
     };
-    if (catalogReady) fields.model = modelEl.value || null;
+    if (catalogReady) fields.model = sentModel || null;
     const patch = { fields };
     if (tags) patch.tags = tags;
     try {
       await putTask(card.id, patch);
       // (#901 round 2, finding A3) Record what actually stuck, so a LATER
       // failed save has something correct to revert to.
-      lastSavedEffort = effortEl.value;
-      lastSavedHost = hostEl.value.trim();
-      if (catalogReady) lastSavedModel = modelEl.value;
+      lastSavedEffort = sentEffort;
+      lastSavedHost = sentHost;
+      if (catalogReady) lastSavedModel = sentModel;
       clearError();
       onSaved();
     } catch (err) {
@@ -352,12 +409,30 @@ export function renderAssignmentPickers(container, card, opts = {}) {
       // the next unrelated save with no toast at all. Every other drawer
       // control already does this on failure (board.js's title/notes/
       // context/tags fields and the Assignee select); the assignment
-      // pickers didn't, until now.
-      effortEl.value = lastSavedEffort;
-      hostEl.value = lastSavedHost;
-      if (catalogReady) modelEl.value = lastSavedModel;
+      // pickers didn't, until now. The engine select is deliberately NOT
+      // reverted here (#901 round 3, finding M12) — board.js owns the
+      // Assignee select and hides this module's engine row, so there's
+      // no user-reachable path that leaves it stale.
+      restoreSelect(effortEl, lastSavedEffort);
+      restoreSelect(hostEl, lastSavedHost);
+      if (catalogReady) restoreSelect(modelEl, lastSavedModel);
       showError(err && err.message ? err.message : String(err));
     }
+  }
+
+  // A promise chain, not a boolean flag — each call appends its
+  // `runSave` onto whatever the previous call is still doing, so calls
+  // made back-to-back (a rapid succession of picker changes) run their
+  // PUTs one at a time, in order, and `saveChain` always represents "the
+  // most recent save, whether or not it has settled yet." `runSave`
+  // never rethrows (matching the original, unserialized behavior), so
+  // the chain itself never rejects and a failed save can't break saving
+  // for subsequent changes.
+  let saveChain = Promise.resolve();
+  function save(extra = {}) {
+    const task = saveChain.then(() => runSave(extra));
+    saveChain = task;
+    return task;
   }
 
   engineEl.addEventListener('change', () => {

@@ -537,6 +537,32 @@ def test_get_hosts_endpoint_degrades_instead_of_500(client, monkeypatch):
     assert body["hosts"] == [{"name": "desktop-box", "ssh_target": None, "online": True, "is_api_host": True}]
 
 
+def test_get_hosts_endpoint_falls_back_to_bare_api_host_when_degraded_also_raises(client, monkeypatch):
+    """(#901 round 3, finding M15) `test_get_hosts_endpoint_degrades_instead_of_500`
+    above only exercises the OUTER `try` (`HostCatalog.get()` raising,
+    `degraded()` succeeding) -- its assertion is satisfied by `degraded()`
+    on an empty registry either way. This pins the route's INNERMOST
+    fallback: `degraded()` itself raising too, which the route must still
+    turn into a 200 with a single API-host row rather than a 500."""
+    async def _raise(self, ttl_seconds=None):
+        raise RuntimeError("catalog build blew up")
+
+    def _raise_degraded(self):
+        raise RuntimeError("degraded build blew up too")
+
+    monkeypatch.setattr(host_catalog_module.HostCatalog, "get", _raise)
+    monkeypatch.setattr(host_catalog_module.HostCatalog, "degraded", _raise_degraded)
+    monkeypatch.setattr(host_catalog_module, "_catalog", None)
+
+    from api.services.agent_worker import remote_spawn
+    monkeypatch.setattr(remote_spawn, "api_host_name", lambda: "desktop-box")
+
+    resp = client.get("/api/agents/hosts")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["hosts"] == [{"name": "desktop-box", "ssh_target": None, "online": True, "is_api_host": True}]
+
+
 def test_get_hosts_route_times_out_and_degrades_with_registry_intact(client, monkeypatch):
     """(#901 round 2, finding R5) The route's "hard 2-second ceiling" was
     only ever an inference from the tailscale probe's own 1.5s timeout,
@@ -568,7 +594,13 @@ def test_get_hosts_route_times_out_and_degrades_with_registry_intact(client, mon
     elapsed = time.monotonic() - start
 
     assert resp.status_code == 200
-    assert elapsed < 2.0  # the route's own ceiling, not the 10s hang
+    # (#901 round 3, finding R10) No bare wall-clock ceiling here — a
+    # concurrent `-n 4` run measured this at 1.81s, only 0.19s under a
+    # `< 2.0` assertion that would have been the only claim it made. The
+    # `+ 0.5` assertion below already pins the MECHANISM (wait_for is
+    # wired, not bypassed) with real slack; the product budget itself is
+    # asserted separately as a timing-free constant check.
+    assert agent_assignment_module._HOSTS_ROUTE_TIMEOUT_SECONDS < 2.0
     assert elapsed < agent_assignment_module._HOSTS_ROUTE_TIMEOUT_SECONDS + 0.5
     body = resp.json()
     names = {h["name"] for h in body["hosts"]}

@@ -40,7 +40,10 @@ each spawning their own `tailscale status`; the cache timestamp is
 stamped only after the build completes, so a slow build never shortens
 the effective TTL.
 
-The probe itself is bounded well under the endpoint's 2-second budget:
+The probe itself is bounded well inside the route's 1.8s ceiling
+(`_HOSTS_ROUTE_TIMEOUT_SECONDS` in `agent_assignment.py` — see that
+constant's own comment for why the older "2-second budget" phrasing was
+only ever an inference, not a real mechanism):
 `_TAILSCALE_TIMEOUT_SECONDS` (1.5s) is passed straight to
 `subprocess.run(..., timeout=...)`, and `subprocess.TimeoutExpired` is
 caught alongside every other probe failure — a hung or missing
@@ -280,9 +283,14 @@ class HostCatalog:
             return []
         stdout = getattr(result, "stdout", "") or ""
         if isinstance(stdout, bytes):
-            # errors="replace" so malformed bytes never raise here either —
-            # they just fail JSON parsing below and degrade to `[]`, same
-            # as any other unparseable payload.
+            # (#901 round 3, finding M10) Belt-and-braces over the
+            # `ValueError` catch just below: `json.loads` already accepts
+            # `bytes` directly, and malformed bytes would raise
+            # `UnicodeDecodeError` (a `ValueError`) from inside it, caught
+            # by the very same except tuple. Decoding defensively here
+            # first means a bad payload always fails at the same,
+            # documented "unparseable JSON" step rather than depending on
+            # `json.loads`'s own bytes-decoding behavior.
             stdout = stdout.decode("utf-8", errors="replace")
         try:
             data = json.loads(stdout)
