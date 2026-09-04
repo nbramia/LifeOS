@@ -86,8 +86,11 @@ def refresh_person_stats(person_ids: Optional[list[str]] = None, save: bool = Tr
 
         # Zero out people with no interactions (they may have had interactions
         # deleted). They may still have source_entity timestamps worth updating.
-        for entity in store.get_all():
-            if entity.id not in canonical_counts:
+        for cached_entity in store.get_all():
+            if cached_entity.id not in canonical_counts:
+                entity = store.get_by_id(cached_entity.id)
+                if not entity:
+                    continue
                 modified = False
                 if entity.email_count or entity.meeting_count or entity.message_count or entity.mention_count or entity.photo_count:
                     entity.email_count = 0
@@ -344,6 +347,9 @@ def verify_person_stats(fix: bool = False) -> dict:
             }
 
             if fix:
+                entity = store.get_by_id(entity.id)
+                if not entity:
+                    continue
                 _apply_counts_to_entity(entity, counts)
                 store.update(entity)
 

@@ -8,6 +8,10 @@ Tests are organized by endpoint group:
 - Sync health and status
 - Statistics
 """
+import sqlite3
+import time
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -88,6 +92,34 @@ class TestPersonEndpoints:
             "/api/crm/people/invalid-id-12345", json={"notes": "test"}
         )
         assert response.status_code == 404
+
+    def test_get_people_list_warm_latency_large_db(self, client):
+        """Warm GET /people stays under the large-database latency target."""
+        db_path = Path("data/crm.db")
+        if not db_path.exists():
+            pytest.skip("data/crm.db not present")
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            people_count = conn.execute("SELECT COUNT(*) FROM person_entities").fetchone()[0]
+        finally:
+            conn.close()
+
+        if people_count <= 5000:
+            pytest.skip("large CRM database not present")
+
+        path = "/api/crm/people?limit=50&sort=strength"
+        warm = client.get(path)
+        assert warm.status_code == 200
+
+        elapsed_samples = []
+        for _ in range(5):
+            start = time.perf_counter()
+            response = client.get(path)
+            elapsed_samples.append((time.perf_counter() - start) * 1000)
+            assert response.status_code == 200
+
+        assert min(elapsed_samples) < 150
 
 
 class TestPersonTimeline:

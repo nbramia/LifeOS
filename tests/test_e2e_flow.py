@@ -87,7 +87,7 @@ class TestUIErrorDisplay:
         """API errors or success should be displayed to the user, not silently fail."""
 
         page.set_viewport_size({"width": 1280, "height": 800})
-        page.goto("http://localhost:8000")
+        page.goto("http://localhost:8000/chat?mode=text")
         page.wait_for_selector(".welcome")
 
         # Send a message
@@ -115,7 +115,7 @@ class TestUIErrorDisplay:
         """Loading indicator should clear when response completes."""
 
         page.set_viewport_size({"width": 1280, "height": 800})
-        page.goto("http://localhost:8000")
+        page.goto("http://localhost:8000/chat?mode=text")
         page.wait_for_selector(".welcome")
 
         # Send a message
@@ -296,20 +296,24 @@ class TestRealUserFlow:
 
         # Setup
         page.set_viewport_size({"width": 1280, "height": 800})
-        page.goto("http://localhost:8000")
+        page.goto("http://localhost:8000/chat?mode=text")
 
         # Wait for app to load
         page.wait_for_selector(".welcome", timeout=10000)
+        page.wait_for_function(
+            "() => window.lifeChat?.state?.isLoading === false",
+            timeout=15000,
+        )
 
         # Verify initial state
         expect(page.locator(".status-text")).to_have_text("Ready")
 
         # Type a question
-        input_field = page.locator(".input-field")
-        input_field.fill("What is LifeOS?")
+        page.mouse.click(600, 760)
+        page.keyboard.type("What is LifeOS?")
 
         # Send the message
-        page.locator(".send-btn").click()
+        page.keyboard.press("Enter")
 
         # User message should appear immediately
         page.wait_for_selector(".message.user", timeout=5000)
@@ -344,7 +348,7 @@ class TestRealUserFlow:
         from playwright.sync_api import expect
 
         page.set_viewport_size({"width": 1280, "height": 800})
-        page.goto("http://localhost:8000")
+        page.goto("http://localhost:8000/chat?mode=text")
         page.wait_for_selector(".welcome", timeout=10000)
 
         # Type and press Enter
@@ -361,7 +365,7 @@ class TestRealUserFlow:
         """User can click a suggestion to send it as a query."""
 
         page.set_viewport_size({"width": 1280, "height": 800})
-        page.goto("http://localhost:8000")
+        page.goto("http://localhost:8000/chat?mode=text")
         page.wait_for_selector(".welcome", timeout=10000)
 
         # Click first suggestion
@@ -383,7 +387,7 @@ class TestRealUserFlow:
 
         # Mobile viewport (iPhone X)
         page.set_viewport_size({"width": 375, "height": 812})
-        page.goto("http://localhost:8000")
+        page.goto("http://localhost:8000/chat?mode=text")
         page.wait_for_selector(".welcome", timeout=10000)
 
         # Sidebar should be hidden

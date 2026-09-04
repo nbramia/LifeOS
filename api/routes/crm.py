@@ -442,8 +442,10 @@ def _person_to_detail_response(
 ) -> PersonDetailResponse:
     """Convert PersonEntity to detailed API response."""
     # Fetch source entities first for category computation
-    source_store = get_source_entity_store()
-    source_entities = source_store.get_for_person(person.id, limit=100) if include_related else None
+    source_entities = []
+    if include_related:
+        source_store = get_source_entity_store()
+        source_entities = source_store.get_for_person(person.id, limit=100)
 
     # Compute category dynamically based on source entities and email domains
     computed_category = compute_person_category(person, source_entities)

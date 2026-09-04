@@ -1007,19 +1007,23 @@ class EntityResolver:
 
                             if last_match and first_match:
                                 # Update with LinkedIn data
-                                entity.linkedin_url = linkedin_url or entity.linkedin_url
-                                entity.company = company or entity.company
-                                entity.position = position or entity.position
-                                if "linkedin" not in entity.sources:
-                                    entity.sources.append("linkedin")
-                                self._store.update(entity)
+                                updated_entity = self._store.get_by_id(entity.id)
+                                if updated_entity:
+                                    updated_entity.linkedin_url = (
+                                        linkedin_url or updated_entity.linkedin_url
+                                    )
+                                    updated_entity.company = company or updated_entity.company
+                                    updated_entity.position = position or updated_entity.position
+                                    if "linkedin" not in updated_entity.sources:
+                                        updated_entity.sources.append("linkedin")
+                                    self._store.update(updated_entity)
 
-                                return ResolutionResult(
-                                    entity=entity,
-                                    is_new=False,
-                                    confidence=0.85,
-                                    match_type="linkedin_domain_match",
-                                )
+                                    return ResolutionResult(
+                                        entity=updated_entity,
+                                        is_new=False,
+                                        confidence=0.85,
+                                        match_type="linkedin_domain_match",
+                                    )
 
         # Try name matching
         result = self.resolve_by_name(full_name, create_if_missing=False)

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-08-21
+> **Last Updated:** 2026-09-04
 
 Codebase organization and module structure for efficient navigation.
 
@@ -93,6 +93,17 @@ Per-backend capabilities (personas, handoff, history ownership, usage capture) a
 - `person_facts.py` - Fact extraction and storage
 - `person_indexer.py` - Person search indexing
 - `person_stats.py` - Statistics computation
+
+`PersonEntityStore.get_all()` keeps a process-local cache of hydrated
+`PersonEntity` objects for the people list and CRM aggregate views. Cache
+entries are keyed by hidden/merged inclusion flags, SQLite `PRAGMA
+data_version` from a long-lived read connection, and a local generation
+counter bumped by store write methods and merged-ID reloads. This means any
+commit to `data/crm.db` from the API process or a separate sync process
+invalidates the cached people list on the next read. Callers receive a new
+list object on each call, but entity objects are shared, so write paths that
+mutate a person fetched from the full list must refetch that person by ID
+before persisting changes.
 
 **Relationships:**
 - `relationship.py` - Relationship store
