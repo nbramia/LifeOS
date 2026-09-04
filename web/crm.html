@@ -133,6 +133,12 @@
             border: 1px solid var(--border-color);
         }
 
+        .nav-link.me-link.active {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+
         .nav-link.me-link:hover {
             background: var(--people);
             color: white;
@@ -7346,15 +7352,15 @@
             <a href="/" class="header-brand">LifeOS</a>
             <nav class="header-nav">
                 <a href="/chat" class="nav-link">💬 Chat</a>
-                <a href="/crm" class="nav-link active">👥 CRM</a>
+                <a href="/crm" class="nav-link active" onclick="return navigateTo('/crm', event)">👥 CRM</a>
                 <a href="/agents" class="nav-link">🛠️ Agents</a>
             </nav>
         </div>
         <div class="header-right">
-            <a href="/birthdays" class="nav-link me-link" data-page="birthdays">🎂 Birthdays</a>
-            <a href="/relationship" class="nav-link me-link">💕 Relationship</a>
-            <a href="/family" class="nav-link me-link">👨‍👩‍👧 Family</a>
-            <a href="/me" class="nav-link me-link">👤 Me</a>
+            <a href="/birthdays" class="nav-link me-link" data-page="birthdays" onclick="return navigateTo('/birthdays', event)">🎂 Birthdays</a>
+            <a href="/relationship" class="nav-link me-link" data-page="relationship" onclick="return navigateTo('/relationship', event)">💕 Relationship</a>
+            <a href="/family" class="nav-link me-link" data-page="family" onclick="return navigateTo('/family', event)">👨‍👩‍👧 Family</a>
+            <a href="/me" class="nav-link me-link" data-page="me" onclick="return navigateTo('/me', event)">👤 Me</a>
             <div class="stats-display">
                 <div class="stat-item">
                     <span>People:</span>
@@ -8694,6 +8700,11 @@
         let meInteractionsCache = null;  // Cache for "Me" page interactions
         let meInteractionsCacheYears = null; // Track which years setting the cache was loaded for
         let meInteractionsSpanPromise = null; // Resolved once per page load; sizes the Me heatmap window
+        let meSpanYears = null; // The Me-specific years value derived from that span (#876: re-asserted
+        // on every ensureMeHeatmapYears() call, not just the first, because `heatmapYears` is a single
+        // shared global the Family/person heatmap views also write to; with dashboard navigation no
+        // longer reloading the document, a Family or person visit in between can leave it pointing at
+        // the wrong window by the time a returning Me visit compares it against meInteractionsCacheYears.
         let meInteractionsPromise = null; // In-flight /me/interactions request, shared across callers
         let meInteractionsPromiseKey = null; // days_back:trend_period the in-flight request is for
         // Config loaded from API
@@ -9252,19 +9263,72 @@
             }
             const method = replace ? 'replaceState' : 'pushState';
             history[method]({ personId, tab }, '', path);
+            // Selecting a person clears whichever dashboard link was
+            // highlighted (or sets "me" for the owner's own profile) --
+            // without this the previous dashboard's link stayed lit while a
+            // person page rendered underneath it (#909 review finding 4).
+            updateActiveNavLink();
         }
 
-        // Handle browser back/forward navigation
-        window.addEventListener('popstate', async (event) => {
-            // Close any open panels when navigating
-            closeEdgePanel();
-            closeNodePanel();
+        // Some direct-load entry points (currently only /birthdays, see
+        // init()) skip loading the people list/stats for a faster initial
+        // render, since that page doesn't need either. If the user then
+        // navigates to a dashboard that does need them -- a nav-link click
+        // or back/forward -- dispatchRoute() below ensures they've been
+        // kicked off at least once per session, via this memoized promise
+        // (#909 review finding 3: previously nothing compensated, leaving
+        // the sidebar and header stats stuck on their loading state
+        // forever).
+        let corePeopleAndStatsPromise = null;
+        function ensurePeopleAndStatsLoaded() {
+            if (!corePeopleAndStatsPromise) {
+                corePeopleAndStatsPromise = Promise.all([loadPeople(), loadStatistics()]);
+            }
+            return corePeopleAndStatsPromise;
+        }
+
+        // Render whatever the current URL (window.location.pathname) points
+        // at, without a document load. Shared by the popstate handler and
+        // navigateTo() (#876) so a click and a back/forward step dispatch
+        // identically. Per-dashboard state (meInteractionsCache, familyData,
+        // communicationGapsData, relationshipToneCache, the person detail
+        // cache) lives in module-scope variables that this function never
+        // clears, so returning to a dashboard with the same parameters
+        // reuses what was already fetched instead of re-requesting it.
+        async function dispatchRoute() {
+            // A running graph force simulation (#896) has its own tick timer
+            // and was never stopped on navigating away from the Graph tab --
+            // harmless under a full document reload (the timer died with the
+            // page), but with dashboard navigation no longer reloading the
+            // document, leaving a person's graph tab for another dashboard
+            // left it ticking indefinitely against DOM it no longer owns,
+            // eventually throwing NaN-attribute console errors once its
+            // physics interacted with whatever the destination view was
+            // doing. Stop it unconditionally here, the single choke point
+            // every dashboard/person navigation passes through; re-entering
+            // the Graph tab starts a fresh one via renderGraph()'s own
+            // (pre-existing) stop-then-restart.
+            if (graphSimulation) {
+                graphSimulation.stop();
+                graphSimulation = null;
+            }
+
+            updateActiveNavLink();
 
             const { personId, tab, isFamily, isRelationship, isBirthdays, birthdayFilter } = parseUrl();
+
             if (isBirthdays) {
-                // Show birthdays page
+                // Show birthdays page (standalone; doesn't need people/stats)
                 showBirthdaysPage(birthdayFilter);
-            } else if (isRelationship) {
+                return;
+            }
+
+            // Every other view renders the sidebar and/or header stats, so
+            // make sure loading them has at least started (see
+            // ensurePeopleAndStatsLoaded() above).
+            ensurePeopleAndStatsLoaded();
+
+            if (isRelationship) {
                 // Show relationship dashboard
                 showRelationshipDashboard();
             } else if (isFamily) {
@@ -9279,9 +9343,11 @@
                 selectedPersonId = personId;
                 renderPeopleList();
                 await loadPersonDetail(personId, false);
-                if (tab) {
-                    await switchTab(tab, true); // true = don't update URL
-                }
+                // Restore the requested tab, or fall back to Overview -- a
+                // click/back-step that lands on a URL with no tab segment
+                // must not leave whatever tab was previously showing (#909
+                // review finding 7).
+                await switchTab(tab || 'overview', true); // true = don't update URL
             } else {
                 // Hide birthdays page and show main container
                 document.getElementById('birthdaysPage').style.display = 'none';
@@ -9294,7 +9360,77 @@
                 document.getElementById('detailEmpty').style.display = 'flex';
                 document.getElementById('detailContent').style.display = 'none';
             }
+        }
+
+        // Handle browser back/forward navigation
+        window.addEventListener('popstate', async (event) => {
+            // Close any open panels when navigating
+            closeEdgePanel();
+            closeNodePanel();
+
+            await dispatchRoute();
         });
+
+        // Highlight whichever of the four dashboard nav links (Birthdays,
+        // Relationship, Family, Me) matches the current URL. The CRM brand
+        // link stays statelessly "active" (it marks the app, not a
+        // dashboard) and is left alone here.
+        function updateActiveNavLink() {
+            const { isFamily, isRelationship, isBirthdays, isMe } = parseUrl();
+            let activePage = null;
+            if (isBirthdays) activePage = 'birthdays';
+            else if (isRelationship) activePage = 'relationship';
+            else if (isFamily) activePage = 'family';
+            else if (isMe) activePage = 'me';
+
+            document.querySelectorAll('.header-right .nav-link.me-link').forEach(link => {
+                link.classList.toggle('active', link.dataset.page === activePage);
+            });
+        }
+
+        // Client-side navigation for the CRM/Me/Family/Birthdays/Relationship
+        // nav links (#876): pushes a history entry and dispatches to the
+        // existing dashboard initializers instead of letting the browser
+        // load the anchor's href as a fresh document. Returning `false`
+        // (via the caller's `onclick="return navigateTo(...)"`) suppresses
+        // the default navigation; returning `true` lets it through
+        // unmodified for modifier-clicks (new tab/window) and non-primary
+        // buttons, which the browser should still handle natively.
+        function navigateTo(path, event) {
+            if (event) {
+                if (event.defaultPrevented || event.button !== 0 ||
+                    event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+                    return true;
+                }
+                event.preventDefault();
+            }
+
+            // /crm has no dashboard of its own - it has always redirected to
+            // /me (see init()); keep that behavior for the client-side path
+            // too so the URL bar reflects where the app actually lands.
+            const targetPath = (path === '/crm' || path === '/crm/') ? '/me' : path;
+
+            // Compare against pathname + search, not pathname alone: none of
+            // the nav links carry a query string, so this only short-circuits
+            // a genuine no-op click. Comparing pathname alone treated e.g.
+            // clicking Birthdays from /birthdays?day=03-15 as "already
+            // there" and left the day filter and Timeline tab in place,
+            // instead of resetting to the plain unfiltered view a document
+            // reload would have shown (#909 review finding 6).
+            if (window.location.pathname + window.location.search === targetPath) {
+                return false;
+            }
+
+            closeEdgePanel();
+            closeNodePanel();
+            history.pushState({}, '', targetPath);
+            // Fire-and-forget (matches the popstate handler's own call
+            // below), but a rejection inside any dashboard initializer
+            // should never vanish as a silent, contextless unhandled
+            // promise rejection (#909 review finding 9).
+            dispatchRoute().catch(err => console.error('Navigation failed:', err));
+            return false;
+        }
 
         // Initialize - uses progressive loading for faster perceived performance
         async function init() {
@@ -9314,6 +9450,7 @@
 
             // Check URL early to show special dashboards immediately (don't wait for loadPeople)
             const { personId, tab, isFamily, isRelationship, isBirthdays, birthdayFilter } = parseUrl();
+            updateActiveNavLink();
 
             // For birthdays page, show immediately (standalone page, no people list needed)
             if (isBirthdays) {
@@ -9324,8 +9461,11 @@
             // For relationship page, show dashboard immediately (don't wait for people list)
             if (isRelationship) {
                 // Load people/stats in background, show dashboard now
-                loadPeople();
-                loadStatistics();
+                const relPeoplePromise = loadPeople();
+                const relStatsPromise = loadStatistics();
+                // Record it under the same memo dispatchRoute() checks, so a
+                // nav-link click before these resolve doesn't refire them.
+                corePeopleAndStatsPromise = Promise.all([relPeoplePromise, relStatsPromise]);
                 await showRelationshipDashboard();
                 return;
             }
@@ -9333,6 +9473,10 @@
             // Progressive loading: start loading people/stats in parallel
             const peoplePromise = loadPeople();
             const statsPromise = loadStatistics();
+            // Same memo dispatchRoute() uses (see ensurePeopleAndStatsLoaded()
+            // above) -- recorded here too so a nav-link click that fires
+            // before these resolve sees loading already under way.
+            corePeopleAndStatsPromise = Promise.all([peoplePromise, statsPromise]);
 
             if (isFamily) {
                 // Family dashboard needs people list
@@ -10739,19 +10883,37 @@
         // Load all interactions for "Me" page (for client-side processing)
         // Size the Me page's heatmap window from the actual span of interaction
         // data (earliest/latest interaction) instead of requesting a fixed 10
-        // years and shrinking the display afterward. Resolves once per page
-        // load; both loadMeHeatMap() and renderMeDashboard() route through
-        // loadMeInteractions(), so awaiting this here (rather than at either
-        // call site) guarantees whichever fires the first real request already
-        // has the corrected heatmapYears, regardless of call order.
-        async function ensureMeHeatmapYears() {
+        // years and shrinking the display afterward. The span fetch itself
+        // resolves once per session; both loadMeHeatMap() and
+        // renderMeDashboard() route through loadMeInteractions(), so awaiting
+        // this here (rather than at either call site) guarantees whichever
+        // fires the first real request already has the corrected
+        // heatmapYears, regardless of call order.
+        //
+        // `respectExplicitYears` (#909 review finding 1): the years dropdown's
+        // own change handler already set `heatmapYears` to what the user
+        // picked before calling down into loadMeHeatMap() -> here; a caller
+        // passes true to mean "don't overwrite that." Without this,
+        // re-asserting from meSpanYears unconditionally (added by #876 to
+        // fix a *different* bug -- heatmapYears drifting from a Family/person
+        // visit in between -- see below) clobbered the user's own selection
+        // on every call, making the dropdown inert. The span promise itself
+        // is still awaited either way so meSpanYears ends up populated for
+        // the next dashboard-entry call.
+        //
+        // When NOT respecting an explicit selection, heatmapYears is
+        // re-asserted from meSpanYears on every call: it's a single global
+        // the Family and person heatmap views also write to, and with
+        // dashboard navigation no longer reloading the document, a Family or
+        // person visit in between can leave it pointing at the wrong window
+        // by the time a returning Me visit compares it against
+        // meInteractionsCacheYears in loadMeInteractions() below.
+        async function ensureMeHeatmapYears(respectExplicitYears = false) {
             if (!meInteractionsSpanPromise) {
                 meInteractionsSpanPromise = api('/me/interactions/span')
                     .then(span => {
                         if (span && span.years) {
-                            heatmapYears = span.years;
-                            const yearsSelect = document.getElementById('heatmapYearsSelect');
-                            if (yearsSelect) yearsSelect.value = span.years.toString();
+                            meSpanYears = span.years;
                         }
                         return span;
                     })
@@ -10760,11 +10922,17 @@
                         return null;
                     });
             }
-            return meInteractionsSpanPromise;
+            const span = await meInteractionsSpanPromise;
+            if (!respectExplicitYears && meSpanYears !== null) {
+                heatmapYears = meSpanYears;
+                const yearsSelect = document.getElementById('heatmapYearsSelect');
+                if (yearsSelect) yearsSelect.value = meSpanYears.toString();
+            }
+            return span;
         }
 
-        async function loadMeInteractions(forceRefresh = false) {
-            await ensureMeHeatmapYears();
+        async function loadMeInteractions(forceRefresh = false, respectExplicitYears = false) {
+            await ensureMeHeatmapYears(respectExplicitYears);
             // Use cache only if it matches current heatmapYears setting
             if (meInteractionsCache && meInteractionsCacheYears === heatmapYears && !forceRefresh) {
                 return meInteractionsCache;
@@ -11305,7 +11473,12 @@
             try {
                 // For "Me" page, aggregate interactions across all people
                 if (isMyPage(personId)) {
-                    await loadMeHeatMap();
+                    // An explicit `years` argument means the caller (the years
+                    // dropdown's change handler) already set heatmapYears to
+                    // what the user picked -- respect it rather than letting
+                    // ensureMeHeatmapYears() re-derive it from the interaction
+                    // span (#909 review finding 1).
+                    await loadMeHeatMap(years !== null);
                     return;
                 }
 
@@ -11359,9 +11532,9 @@
         }
 
         // Load and render heatmap for "Me" page (aggregate across all people)
-        async function loadMeHeatMap() {
+        async function loadMeHeatMap(respectExplicitYears = false) {
             try {
-                const data = await loadMeInteractions();
+                const data = await loadMeInteractions(false, respectExplicitYears);
                 if (!data) {
                     heatmapData = {};
                     sourceTotals = {};
@@ -11636,10 +11809,13 @@
             // Load data
             await loadBirthdaysData();
 
-            // If filter provided, switch to timeline tab
-            if (filterDay) {
-                switchBirthdaysTab('timeline');
-            }
+            // A filter switches to the Timeline tab; no filter resets to the
+            // default Calendar tab -- matching what a fresh document load of
+            // /birthdays would show. Without the explicit reset, navigating
+            // here client-side (#909 review finding 6) after an earlier
+            // filtered visit left the Timeline tab showing even though the
+            // URL and filter had both cleared.
+            switchBirthdaysTab(filterDay ? 'timeline' : 'heatmap');
         }
 
         async function loadBirthdaysData() {
@@ -11904,33 +12080,23 @@
             document.getElementById('familyDashboard').classList.remove('visible');
             document.getElementById('personContentGrid').style.display = 'none';
 
-            // No partner configured (#891): render an empty state and issue no
-            // partner-scoped requests (no insights/timeline/tone/photo calls).
-            const relationshipEmptyState = document.getElementById('relationshipEmptyState');
-            if (!PARTNER_PERSON_ID) {
-                document.getElementById('relationshipDashboard').style.display = 'none';
-                document.getElementById('relationshipDashboard').classList.remove('visible');
-                if (relationshipEmptyState) relationshipEmptyState.style.display = 'flex';
-                return;
-            }
-            if (relationshipEmptyState) relationshipEmptyState.style.display = 'none';
-
             // Hide person-level hero stats
             const personHeroStats = document.getElementById('heroStats');
             if (personHeroStats) personHeroStats.style.display = 'none';
 
-            // Hide family hero stats and selector
+            // Hide family hero stats and selector -- must happen regardless
+            // of whether a partner is configured (#909 review follow-up:
+            // this used to sit after the no-partner early return below, so
+            // Family -> Relationship left Family's hero stats and member
+            // selector visible on top of the "no partner configured" empty
+            // state; unreachable under a full document reload, live once
+            // dashboard navigation stopped reloading the document).
             const familyHeroStats = document.getElementById('familyHeroStats');
             if (familyHeroStats) familyHeroStats.style.display = 'none';
             const familySelectorContainer = document.getElementById('familySelectorContainer');
             if (familySelectorContainer) familySelectorContainer.style.display = 'none';
 
-            // Show relationship dashboard
-            const relationshipDashboard = document.getElementById('relationshipDashboard');
-            relationshipDashboard.style.display = 'block';
-            relationshipDashboard.classList.add('visible');
-
-            // Hide heatmap for relationship view (not needed here)
+            // Hide heatmap (not needed on either the dashboard or the empty state)
             const heatmapContainer = document.querySelector('.heatmap-container');
             if (heatmapContainer) heatmapContainer.style.display = 'none';
 
@@ -11938,7 +12104,8 @@
             const sourceEntitiesFooter = document.getElementById('sourceEntitiesFooter');
             if (sourceEntitiesFooter) sourceEntitiesFooter.style.display = 'none';
 
-            // Customize header for relationship view
+            // Customize header for relationship view (also shown behind the
+            // no-partner empty state, same reasoning as above)
             const detailAvatar = document.getElementById('detailAvatar');
             const detailName = document.getElementById('detailName');
             const detailCompany = document.getElementById('detailCompany');
@@ -11948,11 +12115,10 @@
             if (detailCompany) detailCompany.textContent = PARTNER_NAME || 'Partner';
             if (detailContactQuick) detailContactQuick.innerHTML = '';
             if (detailTagsChips) detailTagsChips.innerHTML = '';
-
-            // Load partner photo if available, otherwise show heart emoji
             if (detailAvatar) {
                 detailAvatar.textContent = '💕';  // Default fallback
-                loadRelationshipPartnerPhoto(PARTNER_PERSON_ID);
+                detailAvatar.style.backgroundImage = '';
+                detailAvatar.classList.remove('has-photo');
             }
 
             // Hide header indicators
@@ -11969,6 +12135,25 @@
             if (detailTabs) {
                 detailTabs.style.display = 'none';
             }
+
+            // No partner configured (#891): render an empty state and issue no
+            // partner-scoped requests (no insights/timeline/tone/photo calls).
+            const relationshipEmptyState = document.getElementById('relationshipEmptyState');
+            if (!PARTNER_PERSON_ID) {
+                document.getElementById('relationshipDashboard').style.display = 'none';
+                document.getElementById('relationshipDashboard').classList.remove('visible');
+                if (relationshipEmptyState) relationshipEmptyState.style.display = 'flex';
+                return;
+            }
+            if (relationshipEmptyState) relationshipEmptyState.style.display = 'none';
+
+            // Show relationship dashboard
+            const relationshipDashboard = document.getElementById('relationshipDashboard');
+            relationshipDashboard.style.display = 'block';
+            relationshipDashboard.classList.add('visible');
+
+            // Load partner photo now that we know one is configured
+            loadRelationshipPartnerPhoto(PARTNER_PERSON_ID);
 
             // Load insights and the timeline first; tone analysis can be slow
             // (a persisted-but-stale month still needs an LLM call) so it must
@@ -17760,6 +17945,14 @@
 
             // Wait for simulation to stabilize a bit before fitting
             setTimeout(() => {
+                // The graph may no longer be the active view by the time this
+                // fires: a full document reload used to kill this timer
+                // outright, but dashboard/person navigation (#876) doesn't,
+                // so navigating away within this 800ms window left graphSvg
+                // (or its container) present but hidden or gone. Re-check
+                // freshness here rather than only when scheduling above.
+                if (!graphSvg || !graphZoom) return;
+
                 // Get first-degree nodes (degree 0 or 1)
                 const firstDegreeNodes = graphNodes.filter(n => n.degree === 0 || n.degree === 1);
                 if (firstDegreeNodes.length === 0) return;
@@ -17781,10 +17974,31 @@
                 const centerX = (minX + maxX) / 2;
                 const centerY = (minY + maxY) / 2;
 
-                // Get container dimensions
-                const container = graphSvg.node().parentElement;
+                // Get container dimensions. graphSvg is a d3 selection,
+                // which stays truthy even after its <svg> node is detached
+                // from the document (e.g. the node was cleared/replaced by
+                // a subsequent renderGraph() call, or the whole subtree was
+                // torn down) -- graphSvg.node() itself, or its
+                // parentElement, can be null at this point, so both must be
+                // checked before reading clientWidth/clientHeight off of
+                // whatever `container` turns out to be (#909 review
+                // follow-up: the freshness guard above this stopped the
+                // NaN-transform case but not this one -- same root cause,
+                // a stale reference outliving the view it belonged to).
+                const svgNode = graphSvg.node();
+                const container = svgNode && svgNode.parentElement;
+                if (!container) return;
                 const width = container.clientWidth;
                 const height = container.clientHeight;
+
+                // A hidden container (its ancestor tab/dashboard no longer
+                // showing) reports 0 for both -- fitting to it produced a
+                // degenerate (zero/NaN) zoom transform applied via
+                // graphZoom.transform, which then threw a stream of
+                // "NaN"-attribute console errors from d3's own zoom/label
+                // update code the next time *anything* dispatched a zoom
+                // event, however unrelated to the graph.
+                if (!width || !height) return;
 
                 // Calculate scale to fit bounds
                 const scale = Math.min(

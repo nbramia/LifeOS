@@ -4,7 +4,7 @@
 **Owner:** CRM
 **Last Updated:** 2026-09-04
 
-The aggregated views that sit alongside the people list: Family Dashboard (`/crm#family`), Me Dashboard (`/me`, the CRM landing page), Birthdays Page (`/birthdays`), and Relationship Dashboard (`/relationship`). Each surfaces interaction patterns and insights derived from the CRM data model.
+The aggregated views that sit alongside the people list: Family Dashboard (`/family`), Me Dashboard (`/me`, the CRM landing page), Birthdays Page (`/birthdays`), and Relationship Dashboard (`/relationship`). Each surfaces interaction patterns and insights derived from the CRM data model.
 
 See [crm-ui.md](crm-ui.md) for the CRM index and the sibling specs that cover people, interactions, and the graph.
 
@@ -21,7 +21,7 @@ See [crm-ui.md](crm-ui.md) for the CRM index and the sibling specs that cover pe
 
 ## Family Dashboard
 
-`URL: /crm#family`
+`URL: /family`
 
 Aggregated view of interactions across multiple selected family members. Lets you track engagement with family as a group and quickly see which member you've been out of touch with.
 
