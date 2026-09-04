@@ -451,6 +451,21 @@ export function initBoard() {
   function onCardDropped(cardId, targetLane) {
     const card = findCard(cardId);
     if (!card || card.kind !== 'task') return;
+    // (#881) The server is still the authority — this is a fast path that
+    // skips the round trip when the board already knows the move is
+    // refused, matching `card.policy` exactly (see _card_policy in
+    // api/routes/agents.py). A stale board (the policy hasn't caught up
+    // with an out-of-band change) still gets caught by moveCard's own
+    // server-error toast path below.
+    const laneEntry = card.policy && card.policy.lanes && card.policy.lanes[targetLane];
+    if (laneEntry && laneEntry.allowed === false) {
+      showToast(laneEntry.reason || `Can't move card to ${laneLabel(targetLane)}.`, true);
+      // Matches moveCard's own failure path: clears any stray drag-over
+      // class and resets `suppressNextClick` (#850 verify-1 finding 3) so
+      // the operator's next click on this card still opens the drawer.
+      render();
+      return;
+    }
     let assignee;
     if (targetLane === 'assigned') {
       // No mid-drag assignee picker with plain HTML5 DnD — default to "me"
@@ -791,6 +806,13 @@ export function initBoard() {
     const isTask = card.kind === 'task';
     const nonAssigneeTags = (card.tags || []).filter(t => !ASSIGNEES.includes(t.toLowerCase()));
     const titleValue = isTask ? (card.title || '') : (card.name || '');
+    // (#881) `card.policy` is the server's own decision — the drawer never
+    // re-derives these rules, it just disables-and-explains. A schedule
+    // card, or a task card from a fixture/response that predates #881,
+    // carries no `policy` at all: treat that as fully allowed rather than
+    // throwing, matching every other place this file reads `card.policy`.
+    const assigneePolicy = (card.policy && card.policy.assignee) || { allowed: true, reason: null };
+    const assigneeDisabled = assigneePolicy.allowed === false;
     drawerEl.innerHTML = `
       <div class="drawer-header">
         <button class="panel-close" data-action="drawer-close">×</button>
@@ -802,10 +824,11 @@ export function initBoard() {
       <div class="drawer-row">
         <div>
           <label class="drawer-label">Assignee</label>
-          <select class="drawer-assignee" data-field="assignee">
+          <select class="drawer-assignee" data-field="assignee" ${assigneeDisabled ? 'disabled' : ''}>
             <option value="">unassigned</option>
             ${ASSIGNEES.map(a => `<option value="${a}" ${card.assignee === a ? 'selected' : ''}>${a}</option>`).join('')}
           </select>
+          ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="assignee-reason">${escapeHtml(assigneePolicy.reason || "This card's assignee can't be changed right now.")}</div>` : ''}
         </div>
         <div>
           <label class="drawer-label">Context</label>
@@ -998,10 +1021,32 @@ export function initBoard() {
         } catch (err) { showToast(`Accept failed: ${err.message}`, true); }
       }]);
     }
-    if (card.lane === 'human_queue' && !card.pending_question) {
+    // (#881) Resolve is a drop onto Done under the hood — never offer it
+    // when that exact move would be refused (a claimed or agent-owned
+    // card can still land in Human queue without being resolvable by a
+    // human). Absent policy (schedule cards never reach here; a pre-#881
+    // fixture/response might) defaults to allowed, matching every other
+    // policy read in this file.
+    const doneAllowed = !card.policy || !card.policy.lanes || card.policy.lanes.done.allowed !== false;
+    if (card.lane === 'human_queue' && !card.pending_question && doneAllowed) {
       // A manually-filed #human card with no agent question behind it —
       // "Resolve" is the operator saying they've handled it by hand.
       buttons.push(['Resolve', async () => { await moveCard(card.id, 'done').catch(() => {}); }]);
+    }
+    if (card.policy && card.policy.cancel && card.policy.cancel.allowed === true) {
+      buttons.push(['Cancel', async () => {
+        try {
+          const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/cancel`, { method: 'POST' });
+          if (!r.ok) {
+            const text = await r.text();
+            let msg = text;
+            try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+            throw new Error(msg || `HTTP ${r.status}`);
+          }
+          showToast('Cancelled.', false);
+          fetchBoard();
+        } catch (err) { showToast(`Cancel failed: ${err.message}`, true); }
+      }]);
     }
 
     for (const [label, handler] of buttons) {

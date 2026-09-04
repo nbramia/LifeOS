@@ -1192,7 +1192,7 @@ class TestFuzzySuppressionBatch5:
         """#852: the morning briefing must surface open Human-queue cards
         by naming the list tool the orchestrator calls to check them."""
         from scripts.seed_proactive_reminders import MORNING_BRIEFING_PROMPT
-        assert "Waiting on You" in MORNING_BRIEFING_PROMPT
+        assert "Human queue" in MORNING_BRIEFING_PROMPT
         assert "manage_human_queue" in MORNING_BRIEFING_PROMPT
 
 

@@ -520,6 +520,35 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
     _require_valid_status(request.status)
     manager = get_task_manager()
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
+
+    # (#881) The board's assignment pickers stamp `fields.assigned_by:
+    # "board"` on every write (see web/agents/assignment.js) — that marker,
+    # and only that marker, routes the request through the same
+    # claimed-card guard the lane endpoint enforces, so a claimed card's
+    # model/effort/host or assignee can't be changed through the drawer
+    # while dragging it is refused. A request without the marker (agent-
+    # side or vault-side writes) never pays for the extra task read.
+    fields_patch = updates.get("fields")
+    if fields_patch and str(fields_patch.get("assigned_by", "")).strip().lower() == "board":
+        from api.services import agent_board
+
+        current = manager.get(task_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        if {"model", "effort", "host"} & set(fields_patch.keys()):
+            error = agent_board.evaluate_card_action(current.status, current.tags, "field_edit")
+            if error is not None:
+                raise HTTPException(status_code=error[0], detail=error[1])
+
+        if "tags" in updates:
+            old_assignee = agent_board.derive_assignee(current.tags)
+            new_assignee = agent_board.derive_assignee(updates["tags"])
+            if new_assignee != old_assignee:
+                error = agent_board.evaluate_card_action(current.status, current.tags, "assignee_change")
+                if error is not None:
+                    raise HTTPException(status_code=error[0], detail=error[1])
+
     try:
         task = manager.update(task_id, **updates)
     except TaskConflictError as e:

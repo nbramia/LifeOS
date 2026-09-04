@@ -848,6 +848,31 @@ async def stream_snapshots() -> StreamingResponse:
 _BOARD_STREAM_INTERVAL = 0.5
 
 
+def _card_policy(task) -> dict[str, Any]:
+    """Server-computed policy block for a task card (#881) — the ONLY
+    source of truth for which human moves are allowed on this card. The
+    drawer and the board both read this instead of re-implementing
+    `agent_board.evaluate_card_action`'s rules in JS, so they can't drift
+    out of sync with each other or with the write paths that enforce them
+    (the lane endpoint, the cancel endpoint, and the guarded
+    `PUT /api/tasks/{id}`).
+    """
+    from api.services import agent_board
+
+    def _outcome(action: str, target_lane: str | None = None) -> dict[str, Any]:
+        error = agent_board.evaluate_card_action(task.status, task.tags, action, target_lane)
+        return {"allowed": error is None, "reason": error[1] if error else None}
+
+    return {
+        "claimed": agent_board.is_claimed(task.tags),
+        "agent_owned": agent_board.is_agent_owned(task.tags),
+        "cancel": _outcome("cancel"),
+        "assignee": _outcome("assignee_change"),
+        "fields": _outcome("field_edit"),
+        "lanes": {lane: _outcome("lane_move", lane) for lane in agent_board.TASK_LANES},
+    }
+
+
 def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
                 open_question_by_task: dict[str, dict[str, Any]]) -> dict[str, Any]:
     from api.services import agent_board
@@ -877,6 +902,7 @@ def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
             }
             if pq else None
         ),
+        "policy": _card_policy(task),
     }
 
 
@@ -1086,6 +1112,62 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
 
     lane = agent_board.derive_lane(task.status, task.tags)
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
+
+
+@router.post("/board/cards/{card_id}/cancel")
+async def cancel_board_card(card_id: str) -> dict[str, Any]:
+    """Cancel an agent-assigned card (#881): kill its live session (and
+    every descendant in its subtree) if one exists, then mark the task
+    `cancelled`. Available on any agent-assigned card that isn't in
+    Review — unlike a lane drag, Cancel works whether or not the worker
+    has claimed the card yet. Idempotent — calling this on an
+    already-cancelled card is a no-op that touches no session.
+    """
+    from api.services import agent_board
+    from api.services.task_manager import get_task_manager, TaskConflictError
+
+    task_manager = get_task_manager()
+    task = task_manager.get(card_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="card not found")
+
+    if task.status == "cancelled":
+        lane = agent_board.derive_lane(task.status, task.tags)
+        return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags), "killed": [], "failures": []}
+
+    error = agent_board.evaluate_card_action(task.status, task.tags, "cancel")
+    if error is not None:
+        status_code, detail = error
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    killed: list[str] = []
+    failures: list[dict[str, str]] = []
+    session_dict = _find_latest_session_for_task(card_id)
+    if session_dict is not None:
+        session_store = _get_session_store()
+        target = session_store.get_by_session_id(session_dict["session_id"])
+        if target is not None and target.status not in TERMINAL_STATUSES:
+            killed, failures = await _kill_session_subtree(target, "cancelled from the board")
+
+    # Strip the tags that would otherwise keep the card out of Done —
+    # `derive_lane` ranks Human queue and In progress above Done, so a
+    # lingering `agent-running`/`agent-blocked`/`human` tag would hide the
+    # cancellation instead of landing the card where the operator expects it.
+    strip = {agent_board.RUNNING_TAG, agent_board.BLOCKED_TAG, agent_board.HUMAN_TAG}
+    new_tags = [t for t in task.tags if t.lstrip("#").lower() not in strip]
+
+    try:
+        task = task_manager.update(card_id, status="cancelled", tags=new_tags)
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail="card not found")
+    _invalidate_board_cache()
+
+    lane = agent_board.derive_lane(task.status, task.tags)
+    return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags), "killed": killed, "failures": failures}
 
 
 @router.get("/pending-questions")
@@ -1465,25 +1547,18 @@ def _maybe_managed_driver():
         return None
 
 
-@router.post("/sessions/{session_id}/kill")
-async def operator_kill_session(session_id: str, body: KillRequest | None = None) -> dict[str, Any]:
-    """Operator-initiated kill: stop the target session and all descendants
-    in its subtree. Target gets an `operator_killed` transcript event;
-    descendants get `cascade_killed`.
+async def _kill_session_subtree(target: Session, reason: str) -> tuple[list[str], list[dict[str, str]]]:
+    """Tear down `target` and every descendant in its subtree. Target gets
+    an `operator_killed` transcript event; descendants get `cascade_killed`.
 
-    Local-network only — must NOT be exposed via Tailscale Funnel or the
-    public MCP HTTP transport.
+    Shared by the operator kill endpoint and Cancel (#881) — both need the
+    exact same subtree teardown, so this is the one place it's written.
+    Caller is responsible for the `TERMINAL_STATUSES` pre-check; this
+    function still no-ops any subtree member that's already terminal by
+    the time it runs.
     """
     session_store = _get_session_store()
     transcript_store = _get_transcript_store()
-    reason = (body.reason if body else "").strip() if body else ""
-
-    target = session_store.get_by_session_id(session_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail=f"session {session_id} not found")
-    if target.status in TERMINAL_STATUSES:
-        return {"killed": [], "failures": [], "reason": f"already {target.status}"}
-
     subtree = _collect_subtree(session_store, target)
     driver = _maybe_managed_driver()
     try:
@@ -1527,14 +1602,47 @@ async def operator_kill_session(session_id: str, body: KillRequest | None = None
                     })
             return killed, failures
 
-        killed, failures = await asyncio.to_thread(_run_teardown)
-        return {"killed": killed, "failures": failures}
+        return await asyncio.to_thread(_run_teardown)
     finally:
         if driver is not None:
             try:
                 driver.close()
             except Exception:  # noqa: BLE001
                 pass
+
+
+@router.post("/sessions/{session_id}/kill")
+async def operator_kill_session(session_id: str, body: KillRequest | None = None) -> dict[str, Any]:
+    """Operator-initiated kill: stop the target session and all descendants
+    in its subtree. Target gets an `operator_killed` transcript event;
+    descendants get `cascade_killed`.
+
+    Local-network only — must NOT be exposed via Tailscale Funnel or the
+    public MCP HTTP transport.
+    """
+    session_store = _get_session_store()
+    reason = (body.reason if body else "").strip() if body else ""
+
+    target = session_store.get_by_session_id(session_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"session {session_id} not found")
+    if target.status in TERMINAL_STATUSES:
+        return {"killed": [], "failures": [], "reason": f"already {target.status}"}
+
+    killed, failures = await _kill_session_subtree(target, reason)
+    return {"killed": killed, "failures": failures}
+
+
+def _find_latest_session_for_task(task_id: str) -> dict[str, Any] | None:
+    """The most-recently-active session linked to `task_id`, the same
+    lookup `_build_board`'s `sessions_by_task` performs for `_task_card` —
+    shared with the Cancel endpoint (#881) so it doesn't re-derive board
+    state just to find a card's live session.
+    """
+    candidates = [sd for sd in _build_snapshot()["sessions"] if sd.get("task_id") == task_id]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda s: s.get("last_activity_at") or 0)
 
 
 class CCResumeRequest(BaseModel):

@@ -97,18 +97,55 @@ Heartbeats: per-session SSE emits a `:heartbeat\n\n` comment every 15s when ther
 
 ## Kanban board
 
-`api/services/agent_board.py` holds every pure decision the board makes — lane derivation, lane-move planning, and the scheduler-entry Scheduled/Done split — with no I/O. `api/routes/agents.py` does the reading and writing; it never re-derives a rule the service module already owns. Unit tests in `tests/test_agent_board.py` cover one case per row of the lane table plus the priority-ordering edge cases (e.g. an `agent-completed` tag beats a terminal status, so a worker-finished task still surfaces in Review instead of silently landing in Done).
+`api/services/agent_board.py` holds every pure decision the board makes — lane derivation, lane-move planning, the shared card-action decision function (#881), and the scheduler-entry Scheduled/Done split — with no I/O. `api/routes/agents.py` does the reading and writing; it never re-derives a rule the service module already owns. Unit tests in `tests/test_agent_board.py` cover one case per row of the lane table plus the priority-ordering edge cases (e.g. an `agent-completed` tag beats a terminal status, so a worker-finished task still surfaces in Review instead of silently landing in Done), plus an exhaustive (assignee × claim-state × action) decision table for `evaluate_card_action`.
 
 ### Endpoints
 
 | Method + Path | Purpose |
 |---|---|
-| `GET /board` | Full view model, always built fresh — `run_in_threadpool(_build_board)` on every call, never served from the stream's cache (see below). `_build_board()` reads `TaskManager.list_tasks()`, joins each task's linked session (matched by `task_id` against the same `_build_snapshot()` sessions list `/snapshot` returns) and any open pending question (matched by `task_id`), derives its lane via `agent_board.derive_lane`, and separately buckets every `SchedulerStore` entry into `scheduled` or `done` via `agent_board.is_schedule_active`. |
+| `GET /board` | Full view model, always built fresh — `run_in_threadpool(_build_board)` on every call, never served from the stream's cache (see below). `_build_board()` reads `TaskManager.list_tasks()`, joins each task's linked session (matched by `task_id` against the same `_build_snapshot()` sessions list `/snapshot` returns) and any open pending question (matched by `task_id`), derives its lane via `agent_board.derive_lane`, computes its `policy` block (see below), and separately buckets every `SchedulerStore` entry into `scheduled` or `done` via `agent_board.is_schedule_active`. |
 | `GET /board/stream` | SSE. Ticks every `_BOARD_STREAM_INTERVAL = 0.5s`, reads the board through the shared `_board_cache` (TTL `_BOARD_CACHE_TTL = 0.25s`), and only emits a `board` event when a JSON-serialized signature of `lanes` differs from the last sent tick — an idle board doesn't push empty ticks to a connected client. |
-| `PUT /board/cards/{id}/lane` | Body `{lane, assignee?}`. Reads the task, calls `agent_board.plan_lane_move`, and applies the resulting `status`/`tags` patch via one `TaskManager.update` call (or raises the planned error and writes nothing). 400 for an unknown or undroppable (`review`/`scheduled`) lane; 409 for a worker-owned card (`agent-running`/`agent-blocked` tag present) dropped on `in_progress` or `done`; 409 for an agent-engine-assigned-but-unclaimed card dropped on `in_progress`; 409 for a pending Review card (`agent-completed` without `accepted`) dropped on `in_progress` or `human_queue` (dropping it on `done` still doubles as accept — see below). A 200 response's `lane` is the card's actual landed lane, which for the tags-only `assigned`/`unassigned` targets may differ from the requested lane if a higher-priority signal (e.g. Human queue) still applies — the frontend toasts when this happens (see [Frontend module split](#frontend-module-split)). |
+| `PUT /board/cards/{id}/lane` | Body `{lane, assignee?}`. Reads the task, calls `agent_board.plan_lane_move` (which itself calls `evaluate_card_action` first — see below), and applies the resulting `status`/`tags` patch via one `TaskManager.update` call (or raises the planned error and writes nothing). 400 for an unknown or undroppable (`review`/`scheduled`) lane; 409 for a claimed card (`agent-running`/`agent-blocked` tag present) dropped on **any** lane (#881 extended this from `in_progress`/`done` only); 409 for an agent-engine-assigned-but-unclaimed card dropped on `in_progress`; 409 for the same unclaimed agent-owned card dropped on `human_queue` or `done` (#881 — "agent-owned cards are managed by the agent"); 409 for a pending Review card (`agent-completed` without `accepted`) dropped on `in_progress` or `human_queue` (dropping it on `done` still doubles as accept — see below). A 200 response's `lane` is the card's actual landed lane, which for the tags-only `assigned`/`unassigned` targets may differ from the requested lane if a higher-priority signal (e.g. Human queue) still applies — the frontend toasts when this happens (see [Frontend module split](#frontend-module-split)). |
 | `POST /board/cards/{id}/accept` | Adds the `accepted` tag (see `ACCEPTED_TAG`) and sets `status="done"` if either isn't already true; a no-op write-wise (no `TaskManager.update` call at all) when both already hold, so the endpoint is genuinely idempotent — not just safe to call twice. |
+| `POST /board/cards/{id}/cancel` | #881. Reads the task; a `status == "cancelled"` card is an idempotent no-op (mirrors accept's idempotence, touches no session). Otherwise calls `evaluate_card_action(..., "cancel")` — 409 `"accept or reject the review"` for a pending review, 409 `"cancel is only available for agent-assigned cards"` for a non-agent-owned card. Finds the card's live session the same way `_task_card` does (`_find_latest_session_for_task`); if one exists and isn't terminal, tears down its whole subtree via `_kill_session_subtree` (shared with the kill endpoint, reason `"cancelled from the board"`). Strips `agent-running`/`agent-blocked`/`human` from the tags (any of which would otherwise outrank Done in `derive_lane`) and writes `status="cancelled"` — `TaskManager` stamps `[cancelled:: <date>]` and the `- [-]` checkbox. Response: `{id, lane, status, tags, killed, failures}`. |
 | `GET /pending-questions` | `session_store.list_open_questions()` — unanswered, unprocessed, not-timed-out `pending_questions` rows whose `kind` is `clarification` or `goal_approval`; `followup` (completion notices) and `status_anchor` (routing plumbing) rows are excluded so a Review card never renders a fake pending-question badge. |
 | `POST /pending-questions/{id}/answer` | `session_store.deposit_answer_by_id(question_id, answer)` — writes `answer`/`answered_at` on that exact row id, then invalidates `_board_cache` so the stream's next tick reflects it immediately. |
+
+### Card action policy (#881)
+
+`agent_board.evaluate_card_action(current_status, current_tags, action, target_lane=None)` is the ONE decision every server write path that can touch an agent-owned card's lane, assignee, or status consults — `None` means allowed, `(http_status, detail)` means refused with that exact status/detail and no write. `action` is one of `"lane_move"` (needs `target_lane`), `"assignee_change"`, `"field_edit"`, or `"cancel"`. Its rule precedence, evaluated top to bottom:
+
+1. An unknown or undroppable (`review`/`scheduled`) `target_lane` — 400 (lane_move only, unchanged from pre-#881).
+2. `claimed` (`agent-running` or `agent-blocked` tag present) — every `lane_move` target is refused, and so is `assignee_change`/`field_edit`; `cancel` is still allowed (it's how a human gets rid of a claimed card without dragging it anywhere).
+3. A pending review (`agent-completed` without `accepted`) — `lane_move` to `in_progress`/`human_queue` refused ("accept the review first"), `done`/`unassigned`/`assigned` allowed; `cancel` refused ("accept or reject the review").
+4. `agent_owned` (assignee is `claude`/`codex`/`hermes`/`local`), unclaimed, not a pending review — `lane_move` to `in_progress` refused ("only the worker claims agent-assigned tasks"), to `human_queue`/`done` refused ("agent-owned cards are managed by the agent — reassign, unassign, or cancel this card instead"), to `unassigned`/`assigned` allowed; `cancel` allowed.
+5. Otherwise (`me` assignee, or none) — every rule and outcome is byte-identical to pre-#881 behavior; `cancel` refused ("cancel is only available for agent-assigned cards" — there's no worker to tear down or reassign).
+
+`plan_lane_move` calls this first (passing `"lane_move"`) and returns its error as-is on refusal; the write-planning half (which tags/status to actually set) only runs once it's cleared. `PUT /api/tasks/{id}` (`api/routes/tasks.py`) calls it for `"field_edit"`/`"assignee_change"` — see the guard below. `_card_policy(task)` (`api/routes/agents.py`) calls it once per lane per card to build the `policy` block every task card in `GET /board`/`GET /board/stream` carries:
+
+```json
+"policy": {
+  "claimed": false,
+  "agent_owned": true,
+  "cancel":   {"allowed": true, "reason": null},
+  "assignee": {"allowed": true, "reason": null},
+  "fields":   {"allowed": true, "reason": null},
+  "lanes": {
+    "unassigned": {"allowed": true, "reason": null},
+    "assigned":   {"allowed": true, "reason": null},
+    "in_progress":{"allowed": false, "reason": "only the worker claims agent-assigned tasks"},
+    "human_queue":{"allowed": false, "reason": "agent-owned cards are managed by the agent — reassign, unassign, or cancel this card instead"},
+    "review":     {"allowed": false, "reason": "lane 'review' cannot be set directly"},
+    "done":       {"allowed": false, "reason": "agent-owned cards are managed by the agent — reassign, unassign, or cancel this card instead"}
+  }
+}
+```
+
+`web/agents/board.js` and `web/agents/assignment.js` read `card.policy` directly — a drag checks `card.policy.lanes[targetLane].allowed` before issuing the PUT (a fast client-side path; the server still refuses independently, so a stale board is caught by the normal error-toast path), the drawer's assignee select and the assignment pickers disable themselves and render `reason` as visible text when their policy entry is refused, the Cancel button is offered exactly when `policy.cancel.allowed`, and Resolve (a drop onto Done under the hood) is gated on `policy.lanes.done.allowed`. Schedule cards carry no `policy` at all (there's nothing to derive it from), and any task card lacking one (e.g. a pre-#881 fixture) is treated as fully allowed everywhere — the frontend never re-implements the rules, so an absent policy defaults open rather than guessing.
+
+### `assigned_by: "board"` guard on `PUT /api/tasks/{id}`
+
+The board's assignment pickers (`web/agents/assignment.js`) write `model`/`effort`/`host`, and its engine picker writes the assignee tag, through `PUT /api/tasks/{id}` rather than the lane endpoint — every one of those writes stamps `fields.assigned_by: "board"`. `api/routes/tasks.py`'s `update_task` checks for that marker (case-insensitive, stripped) ONLY when `request.fields` is present, so a request without it — an agent's own writes, a vault-triggered reindex, any pre-#881 caller — never pays for the extra `TaskManager.get` this guard needs and behaves exactly as before. When the marker is present: a patch touching `model`, `effort`, or `host` runs `evaluate_card_action(..., "field_edit")`; a patch whose `tags` would change the derived assignee (`agent_board.derive_assignee(new) != agent_board.derive_assignee(old)`) runs `evaluate_card_action(..., "assignee_change")`. Either refusal raises the `HTTPException` before `TaskManager.update` is ever called — no partial write.
 
 ### Why the board SSE isn't event-driven
 
@@ -116,7 +153,7 @@ The issue's target is "reflects an external vault edit within ~3 seconds," and t
 
 ### Board cache
 
-`_board_cache` is a module-level `(built_at, board)` tuple used ONLY by `GET /board/stream`'s own tick — never by `GET /board`, which always calls `_build_board()` fresh. The cache exists to de-duplicate simultaneous stream connections within the same instant (multiple open board tabs shouldn't each pay the full build cost on every tick), not to skip rebuilds between ticks: its TTL (`_BOARD_CACHE_TTL = 0.25s`) is far shorter than the tick interval (`_BOARD_STREAM_INTERVAL = 0.5s`). `_invalidate_board_cache()` drops it immediately after every board write — lane-move, accept, and pending-question answer — so a stream tick right after a write never serves pre-write data. Worst-case latency from an external vault edit to every open board tab reflecting it is the sum of three independent legs: the task watcher's debounce (2.0s) + the cache TTL (0.25s, only matters if a tick lands mid-window) + the stream's own tick interval (0.5s) = 2.75s, inside the 3s budget. A direct `GET /board` skips the last two legs entirely since it never reads the cache.
+`_board_cache` is a module-level `(built_at, board)` tuple used ONLY by `GET /board/stream`'s own tick — never by `GET /board`, which always calls `_build_board()` fresh. The cache exists to de-duplicate simultaneous stream connections within the same instant (multiple open board tabs shouldn't each pay the full build cost on every tick), not to skip rebuilds between ticks: its TTL (`_BOARD_CACHE_TTL = 0.25s`) is far shorter than the tick interval (`_BOARD_STREAM_INTERVAL = 0.5s`). `_invalidate_board_cache()` drops it immediately after every board write — lane-move, accept, cancel, and pending-question answer — so a stream tick right after a write never serves pre-write data. Worst-case latency from an external vault edit to every open board tab reflecting it is the sum of three independent legs: the task watcher's debounce (2.0s) + the cache TTL (0.25s, only matters if a tick lands mid-window) + the stream's own tick interval (0.5s) = 2.75s, inside the 3s budget. A direct `GET /board` skips the last two legs entirely since it never reads the cache.
 
 ### Pending-question answer path
 
@@ -455,15 +492,14 @@ POST /api/agents/sessions/{id}/kill   body: {"reason": "..."}
 ```
 
 1. Resolve the target via `session_store.get_by_session_id(id)`. 404 if missing. Idempotent on terminal status (returns `{killed: [], reason: "already <status>"}`).
-2. Walk the subtree via `_collect_subtree(session_store, target)` — BFS from the target through `parent_session_id`, **not** from `root_session_id`. Non-root targets only take down their own descendants, leaving unrelated peers under the same root alone.
-3. For each session in the subtree (target first, then descendants):
-   - Skip already-terminal entries.
-   - Emit `operator_killed` (target) or `cascade_killed` (descendants) to the transcript.
-   - Call `api.services.agent_worker.inter_agent.teardown_session(...)` to actually mark the session terminal in the store and tear down the managed remote if one exists.
-4. Managed-Agents teardown uses a `ManagedAgentsDriver` instance constructed lazily from `settings.anthropic_api_key`. If the key isn't set, kill degrades to local-only and the worker's next managed poll reconciles the remote side.
-5. (#851) For a session whose `host` is set, `teardown_session` signals the process over ssh (`ssh <target> kill -- -<pgid>`, the `<pgid>` recorded from the remote executor's spawn — see [Card assignment](agent-worker.md#card-assignment-851)) instead of the local `os.killpg` path. A missing `remote_pgid` or an unregistered host degrades to a DB-only kill, the same as a missing local pid event does.
+2. The actual subtree teardown is `_kill_session_subtree(target, reason)` (`api/routes/agents.py`, extracted in #881) — shared with `POST /board/cards/{id}/cancel`, which needs the identical mechanics on the card's linked session. It:
+   - Walks the subtree via `_collect_subtree(session_store, target)` — BFS from the target through `parent_session_id`, **not** from `root_session_id`. Non-root targets only take down their own descendants, leaving unrelated peers under the same root alone.
+   - For each session in the subtree (target first, then descendants): skips already-terminal entries, emits `operator_killed` (target) or `cascade_killed` (descendants) to the transcript, and calls `api.services.agent_worker.inter_agent.teardown_session(...)` to actually mark the session terminal in the store and tear down the managed remote if one exists.
+   - Managed-Agents teardown uses a `ManagedAgentsDriver` instance constructed lazily from `settings.anthropic_api_key`. If the key isn't set, kill degrades to local-only and the worker's next managed poll reconciles the remote side.
+   - (#851) For a session whose `host` is set, `teardown_session` signals the process over ssh (`ssh <target> kill -- -<pgid>`, the `<pgid>` recorded from the remote executor's spawn — see [Card assignment](agent-worker.md#card-assignment-851)) instead of the local `os.killpg` path. A missing `remote_pgid` or an unregistered host degrades to a DB-only kill, the same as a missing local pid event does.
+3. `operator_kill_session` itself is now just the 404/terminal pre-checks plus a call into `_kill_session_subtree` — no teardown logic lives in the route handler directly, so a future third caller (or a fix to the teardown mechanics) only has one place to change.
 
-Response: `{killed: [session_ids], failures: [{session_id, error}], reason: <input>}`.
+Response: `{killed: [session_ids], failures: [{session_id, error}], reason: <input>}`. Cancel's teardown call passes reason `"cancelled from the board"` and folds `killed`/`failures` into its own response alongside `id`/`lane`/`status`/`tags` — see [Card action policy](#card-action-policy-881).
 
 The endpoint must not be exposed via Tailscale Funnel or the public MCP HTTP transport. The boundary lives in the route layer; see [Security boundaries](#security-boundaries).
 

@@ -186,22 +186,29 @@ class TestPlanLaneMove:
 
 # ---------------------------------------------------------------------------
 # plan_lane_move — landing lane invariant (#850 round-1 finding 1, sharpened
-# by round-2 findings 1 and 2)
+# by round-2 findings 1 and 2; extended by #881)
 #
 # Dropping a card on a settable lane must either land it there, or be
-# rejected for one of exactly three reasons derived straight from the
+# rejected for one of exactly four reasons derived straight from the
 # starting tags — never "any 409 passes" (round-2 finding 12/2c):
-#   * the worker owns the card (agent-running / agent-blocked present) and
-#     the target is In progress or Done (round-2 finding 1)
+#   * the worker owns the card (agent-running / agent-blocked present) —
+#     EVERY target lane is refused, not just In progress/Done (#881
+#     extends round-2 finding 1's In-progress/Done-only guard to
+#     Unassigned/Assigned/Human queue too — a human could otherwise still
+#     silently detach a live worker task by dragging it there)
 #   * an agent-engine assignee tag is present (not yet claimed by the
-#     worker) and the target is In progress (round-1 finding, unchanged)
+#     worker, not a pending review) and the target is In progress
+#     (round-1 finding, unchanged), or Human queue/Done (#881: agent-owned
+#     cards are managed by the agent — reassign, unassign, or cancel
+#     instead of silently closing or re-routing them)
 #   * the card is a pending review (agent-completed, not yet accepted) and
 #     the target is In progress or Human queue — Done still doubles as the
 #     accept path (round-2 finding 2a)
 # Assigned/unassigned are tags-only by design (an assignee change must not
 # pull a card out of Human queue — the lane table says Human queue beats
 # Assigned), so for those two targets this only checks the assignee-tag
-# outcome and that `status` is left untouched, never landed-lane == target.
+# outcome and that `status` is left untouched, never landed-lane == target
+# — except when the worker owns the card, where they're refused outright.
 # ---------------------------------------------------------------------------
 
 class TestPlanLaneMoveLandsInTargetLane:
@@ -232,6 +239,11 @@ class TestPlanLaneMoveLandsInTargetLane:
     )
     AGENT_ASSIGNEE_ERROR = (409, "only the worker claims agent-assigned tasks")
     REVIEW_ERROR = (409, "accept the review first")
+    AGENT_OWNED_MANAGED_ERROR = (
+        409,
+        "agent-owned cards are managed by the agent — reassign, unassign, or "
+        "cancel this card instead",
+    )
 
     @classmethod
     def _expected_error(cls, current_status, current_tags, target_lane):
@@ -243,12 +255,23 @@ class TestPlanLaneMoveLandsInTargetLane:
         current_assignee = agent_board.derive_assignee(current_tags)
         is_review = "agent-completed" in tags_lower and "accepted" not in tags_lower
 
-        if target_lane in ("in_progress", "done") and worker_owned:
+        # #881: a worker-owned card refuses EVERY target lane, not just
+        # In progress/Done.
+        if worker_owned:
             return cls.WORKER_OWNED_ERROR
         if target_lane == "in_progress" and current_assignee in agent_board.AGENT_ASSIGNEES:
             return cls.AGENT_ASSIGNEE_ERROR
         if target_lane in ("in_progress", "human_queue") and is_review:
             return cls.REVIEW_ERROR
+        # #881: an agent-owned, unclaimed, non-review card also refuses
+        # Human queue and Done — only the agent (via accept/complete) or an
+        # explicit Cancel may land it there, not a human drag.
+        if (
+            target_lane in ("human_queue", "done")
+            and current_assignee in agent_board.AGENT_ASSIGNEES
+            and not is_review
+        ):
+            return cls.AGENT_OWNED_MANAGED_ERROR
         return None
 
     @pytest.mark.parametrize("target_lane", SETTABLE_TARGETS)
@@ -349,3 +372,175 @@ class TestIsScheduleActive:
 
     def test_enabled_with_no_next_trigger_is_not_active(self):
         assert agent_board.is_schedule_active(True, None) is False
+
+
+# ---------------------------------------------------------------------------
+# evaluate_card_action — the #881 shared decision function. Every server
+# write path that can touch an agent-owned card's lane, assignee, or status
+# (the lane endpoint, the cancel endpoint, and the guarded
+# `PUT /api/tasks/{id}`) calls this ONE function — this is the exhaustive
+# (state, action) decision table the issue asks for.
+#
+# States are every combination of:
+#   assignee   -- none, `me`, or one of the four agent engines
+#   condition  -- unclaimed, agent-running, agent-blocked, a pending review
+#                 (agent-completed, not accepted), accepted, done, cancelled
+# crossed against every action:
+#   lane_move  -- to each of the seven lanes
+#   assignee_change, field_edit, cancel
+#
+# `_expected_outcome` below is a second, independent statement of the rules
+# from docs/specs/product/agent-viz.md's Lanes section / the issue's spec —
+# written against the RULE TEXT, not by re-deriving what the implementation
+# happens to return, so a regression in evaluate_card_action's precedence
+# or wording actually fails this table instead of the test quietly agreeing
+# with whatever the code does.
+# ---------------------------------------------------------------------------
+
+ALL_LANES = (
+    "unassigned", "assigned", "in_progress", "human_queue", "scheduled", "review", "done",
+)
+ALL_ASSIGNEES = (None, "me", "claude", "codex", "hermes", "local")
+ALL_CONDITIONS = (
+    "unclaimed", "agent_running", "agent_blocked", "review", "accepted", "done", "cancelled",
+)
+ALL_ACTIONS = ("lane_move", "assignee_change", "field_edit", "cancel")
+
+_WORKER_OWNED = (
+    409,
+    "the worker owns this task while it is running or waiting on an "
+    "answer — answer or kill the session first",
+)
+_REVIEW_FIRST = (409, "accept the review first")
+_ONLY_WORKER_CLAIMS = (409, "only the worker claims agent-assigned tasks")
+_AGENT_MANAGED = (
+    409,
+    "agent-owned cards are managed by the agent — reassign, unassign, or "
+    "cancel this card instead",
+)
+_ACCEPT_OR_REJECT = (409, "accept or reject the review")
+_CANCEL_NOT_AGENT_OWNED = (409, "cancel is only available for agent-assigned cards")
+
+
+def _state_to_status_tags(assignee, condition):
+    """Build a (status, tags) pair for one (assignee, condition) state."""
+    tags = [assignee] if assignee else []
+    status = "todo"
+    if condition == "agent_running":
+        tags += ["agent", "agent-running"]
+    elif condition == "agent_blocked":
+        tags += ["agent", "agent-blocked"]
+    elif condition == "review":
+        tags += ["agent-completed"]
+        status = "done"
+    elif condition == "accepted":
+        tags += ["agent-completed", "accepted"]
+        status = "done"
+    elif condition == "done":
+        status = "done"
+    elif condition == "cancelled":
+        status = "cancelled"
+    return status, tags
+
+
+def _expected_outcome(assignee, condition, action, target_lane=None):
+    """The one legitimate outcome for this (assignee, condition, action,
+    target_lane) combination, per the issue's rule text — `None` for
+    allowed, `(status_code, detail)` for refused."""
+    agent_owned = assignee in ("claude", "codex", "hermes", "local")
+    claimed = condition in ("agent_running", "agent_blocked")
+    is_review = condition == "review"
+
+    if action == "lane_move":
+        if target_lane not in ALL_LANES:
+            return (400, f"unknown lane '{target_lane}'")
+        if target_lane in ("review", "scheduled"):
+            return (400, f"lane '{target_lane}' cannot be set directly")
+        # Rule 3: claimed refuses EVERY target lane.
+        if claimed:
+            return _WORKER_OWNED
+        # Rule 4: a pending review only allows Done (the accept path) plus
+        # the tags-only Unassigned/Assigned targets; In progress/Human
+        # queue must go through accept/reject first.
+        if is_review:
+            if target_lane in ("in_progress", "human_queue"):
+                return _REVIEW_FIRST
+            return None
+        # Rule 5: an unclaimed, non-review agent-owned card may be
+        # (re)assigned or cancelled, but not claimed by a human (In
+        # progress) or silently closed/re-routed (Human queue, Done).
+        if agent_owned:
+            if target_lane == "in_progress":
+                return _ONLY_WORKER_CLAIMS
+            if target_lane in ("human_queue", "done"):
+                return _AGENT_MANAGED
+        # Rule 6: `me` or unassigned — every existing rule/outcome is
+        # unaffected by #881.
+        return None
+
+    if action in ("assignee_change", "field_edit"):
+        return _WORKER_OWNED if claimed else None
+
+    if action == "cancel":
+        if is_review:
+            return _ACCEPT_OR_REJECT
+        if not agent_owned:
+            return _CANCEL_NOT_AGENT_OWNED
+        return None
+
+    raise AssertionError(f"unhandled action {action!r} in test oracle")
+
+
+class TestEvaluateCardActionDecisionTable:
+    @pytest.mark.parametrize("target_lane", ALL_LANES)
+    @pytest.mark.parametrize("action", ["lane_move"])
+    @pytest.mark.parametrize("condition", ALL_CONDITIONS)
+    @pytest.mark.parametrize("assignee", ALL_ASSIGNEES)
+    def test_lane_move_matrix(self, assignee, condition, action, target_lane):
+        status, tags = _state_to_status_tags(assignee, condition)
+        expected = _expected_outcome(assignee, condition, action, target_lane)
+        actual = agent_board.evaluate_card_action(status, tags, action, target_lane)
+        assert actual == expected, (assignee, condition, action, target_lane, actual)
+
+    @pytest.mark.parametrize("action", ["assignee_change", "field_edit", "cancel"])
+    @pytest.mark.parametrize("condition", ALL_CONDITIONS)
+    @pytest.mark.parametrize("assignee", ALL_ASSIGNEES)
+    def test_non_lane_actions_matrix(self, assignee, condition, action):
+        status, tags = _state_to_status_tags(assignee, condition)
+        expected = _expected_outcome(assignee, condition, action)
+        actual = agent_board.evaluate_card_action(status, tags, action)
+        assert actual == expected, (assignee, condition, action, actual)
+
+    # ---- Explicit "unchanged for `me` / unassigned" spot-checks, per the
+    # issue's call-out that this is the easiest rule to accidentally break.
+
+    @pytest.mark.parametrize("assignee", [None, "me"])
+    @pytest.mark.parametrize("target_lane", ["unassigned", "assigned", "in_progress", "human_queue", "done"])
+    def test_me_and_unassigned_unclaimed_lane_moves_are_never_refused(self, assignee, target_lane):
+        status, tags = _state_to_status_tags(assignee, "unclaimed")
+        assert agent_board.evaluate_card_action(status, tags, "lane_move", target_lane) is None
+
+    @pytest.mark.parametrize("assignee", [None, "me"])
+    def test_me_and_unassigned_assignee_and_field_actions_never_refused_when_unclaimed(self, assignee):
+        status, tags = _state_to_status_tags(assignee, "unclaimed")
+        assert agent_board.evaluate_card_action(status, tags, "assignee_change") is None
+        assert agent_board.evaluate_card_action(status, tags, "field_edit") is None
+
+    @pytest.mark.parametrize("assignee", [None, "me"])
+    def test_me_and_unassigned_cannot_cancel(self, assignee):
+        # Cancel is agent-cards-only — `me`/unassigned refuse it regardless
+        # of claimed state (there's no worker to tear down or reassign).
+        status, tags = _state_to_status_tags(assignee, "unclaimed")
+        assert agent_board.evaluate_card_action(status, tags, "cancel") == _CANCEL_NOT_AGENT_OWNED
+
+    @pytest.mark.parametrize("assignee", ["claude", "codex", "hermes", "local"])
+    def test_agent_engines_claimed_refuses_every_lane_but_allows_cancel(self, assignee):
+        for condition in ("agent_running", "agent_blocked"):
+            status, tags = _state_to_status_tags(assignee, condition)
+            for lane in ("unassigned", "assigned", "in_progress", "human_queue", "done"):
+                assert agent_board.evaluate_card_action(status, tags, "lane_move", lane) == _WORKER_OWNED
+            assert agent_board.evaluate_card_action(status, tags, "assignee_change") == _WORKER_OWNED
+            assert agent_board.evaluate_card_action(status, tags, "field_edit") == _WORKER_OWNED
+            # Cancel is the one action still allowed on a claimed card —
+            # it's how a human gets rid of it without dragging it anywhere.
+            assert agent_board.evaluate_card_action(status, tags, "cancel") is None
