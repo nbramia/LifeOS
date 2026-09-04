@@ -8,6 +8,10 @@ Tests are organized by endpoint group:
 - Sync health and status
 - Statistics
 """
+import sqlite3
+import time
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -88,6 +92,85 @@ class TestPersonEndpoints:
             "/api/crm/people/invalid-id-12345", json={"notes": "test"}
         )
         assert response.status_code == 404
+
+    def _large_db_people_count(self):
+        db_path = Path("data/crm.db")
+        if not db_path.exists():
+            return None
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return conn.execute("SELECT COUNT(*) FROM person_entities").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _warm_latency_ms(self, client, path, samples=5):
+        client.get(path)  # warm
+        elapsed_samples = []
+        for _ in range(samples):
+            start = time.perf_counter()
+            response = client.get(path)
+            elapsed_samples.append((time.perf_counter() - start) * 1000)
+            assert response.status_code == 200
+        return min(elapsed_samples)
+
+    def test_get_people_list_warm_latency_large_db(self, client):
+        """Warm GET /people (limit=50, the smaller of the CRM UI's two page
+        sizes) stays under the large-database latency target."""
+        people_count = self._large_db_people_count()
+        if people_count is None:
+            pytest.skip("data/crm.db not present")
+        if people_count <= 5000:
+            pytest.skip("large CRM database not present")
+
+        elapsed = self._warm_latency_ms(client, "/api/crm/people?limit=50&sort=strength")
+
+        # #869/#880 review finding 1: this bound was originally set to 150ms
+        # against a category-computation bug (compute_person_category() was
+        # called with `[]` instead of `None`, silently skipping its
+        # source-entity fallback fetch for the ~40 of every 50 returned
+        # people who don't qualify as "work" via their own email domain).
+        # With that fetch restored (correct behavior) and then batched across
+        # the page in one query (SourceEntityStore.get_for_people_batch(),
+        # #880 follow-up) instead of one query per person, warm latency for
+        # this page is back under 100ms on the real dataset.
+        assert elapsed < 100
+
+    def test_get_people_list_warm_latency_large_db_limit_300(self, client):
+        """Warm GET /people at limit=300 -- the CRM UI's actual page size
+        (web/crm.html's loadPeople requests limit=300)."""
+        people_count = self._large_db_people_count()
+        if people_count is None:
+            pytest.skip("data/crm.db not present")
+        if people_count <= 5000:
+            pytest.skip("large CRM database not present")
+
+        elapsed = self._warm_latency_ms(client, "/api/crm/people?limit=300&sort=strength")
+
+        # #880 follow-up round: batching the per-page source-entity fetch
+        # into one query (SourceEntityStore.get_for_people_batch()) cut warm
+        # latency here from ~600-1100ms (one SourceEntityStore query per
+        # person, each opening its own connection) to ~200-430ms measured on
+        # the real dataset. A 150ms bound (matching the limit=50 case
+        # proportionally) was requested but is NOT achievable while
+        # preserving exact category semantics: a strength-sorted page of 300
+        # is dominated by the highest-interaction people, many of whom have
+        # 10,000-65,000+ source entities each on this real dataset, and
+        # SQLite has no per-group "top-K" query optimization -- a single
+        # combined query (WHERE IN (...) plus either a window function or a
+        # Python-side group/sort) must fully rank/materialize every matching
+        # row before applying any per-person cap, which is measurably SLOWER
+        # here than 300 individually-bounded queries (confirmed via direct
+        # profiling: a window-function query over the same IDs took longer
+        # than this batched approach, even with a composite index added
+        # experimentally). This batched approach's own per-arm/per-query
+        # overhead (~0.7-0.9ms x 300 people) sets a floor around 200ms that
+        # doesn't move with a smaller per-person cap. See PR #880 discussion
+        # for the full measurement trail and the deeper fix that would be
+        # needed to go lower (e.g. reading the already-persisted
+        # PersonEntity.category field -- refreshed nightly by
+        # update_all_strengths() -- instead of recomputing dynamically on
+        # every list request).
+        assert elapsed < 350
 
 
 class TestPersonTimeline:

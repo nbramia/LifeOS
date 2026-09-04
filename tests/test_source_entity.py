@@ -265,6 +265,104 @@ class TestSourceEntityStore:
         assert stats["by_source"]["calendar"] == 1
 
 
+class _CountingConnection:
+    """Wraps a sqlite3.Connection and counts .execute() calls, so tests can
+    assert how many round trips a store method actually issues."""
+
+    def __init__(self, real_conn):
+        self._real_conn = real_conn
+        self.execute_count = 0
+
+    def execute(self, *args, **kwargs):
+        self.execute_count += 1
+        return self._real_conn.execute(*args, **kwargs)
+
+    def close(self):
+        self._real_conn.close()
+
+
+class TestGetForPeopleBatch:
+    """Tests for SourceEntityStore.get_for_people_batch() (#869/#880 follow-up:
+    batch the per-page source-entity fetch that compute_person_category()'s
+    include_related=False fallback needs, instead of one query per person)."""
+
+    def _add_entities(self, store, canonical_person_id: str, count: int, source_type: str = "gmail"):
+        now = datetime.now(timezone.utc)
+        for i in range(count):
+            store.add(SourceEntity(
+                source_type=source_type,
+                source_id=f"{canonical_person_id}-{i}",
+                canonical_person_id=canonical_person_id,
+                observed_at=now - timedelta(minutes=i),
+            ), validate_person=False)
+
+    def test_matches_get_for_person_content_and_order(self, store):
+        """Batch result for each ID is identical (content and order) to
+        calling get_for_person(id, limit=N) individually."""
+        self._add_entities(store, "person-a", 5, source_type="gmail")
+        self._add_entities(store, "person-b", 3, source_type="slack")
+
+        batch = store.get_for_people_batch(["person-a", "person-b", "person-c"], limit_per_person=500)
+
+        assert [e.id for e in batch["person-a"]] == [e.id for e in store.get_for_person("person-a", limit=500)]
+        assert [e.id for e in batch["person-b"]] == [e.id for e in store.get_for_person("person-b", limit=500)]
+        # No source entities at all -> simply absent, matching get_for_person's []
+        assert "person-c" not in batch
+        assert store.get_for_person("person-c", limit=500) == []
+
+    def test_truncates_to_limit_per_person_like_get_for_person(self, store):
+        """limit_per_person caps each person's list the same way
+        get_for_person(id, limit=N) does -- most recent N, in the same order."""
+        self._add_entities(store, "person-a", 10)
+
+        batch = store.get_for_people_batch(["person-a"], limit_per_person=3)
+        single = store.get_for_person("person-a", limit=3)
+
+        assert len(batch["person-a"]) == 3
+        assert [e.id for e in batch["person-a"]] == [e.id for e in single]
+
+    def test_dedupes_repeated_ids_in_input(self, store):
+        """Passing the same ID multiple times does not duplicate its entities
+        or blow up -- the result is keyed by ID, so repeats collapse."""
+        self._add_entities(store, "person-a", 2)
+
+        batch = store.get_for_people_batch(["person-a", "person-a", "person-a"], limit_per_person=500)
+        assert len(batch) == 1
+        assert len(batch["person-a"]) == 2
+
+    def test_empty_input_returns_empty_dict(self, store):
+        assert store.get_for_people_batch([], limit_per_person=500) == {}
+
+    def test_chunks_across_batch_chunk_size_boundary(self, store, monkeypatch):
+        """More IDs than fit in one compound statement still return complete,
+        correct results by issuing multiple chunked queries."""
+        monkeypatch.setattr(store, "_BATCH_CHUNK_SIZE", 3)
+
+        ids = [f"person-{i}" for i in range(7)]  # forces 3 chunks: 3+3+1
+        for pid in ids:
+            self._add_entities(store, pid, 2)
+
+        batch = store.get_for_people_batch(ids, limit_per_person=500)
+
+        assert set(batch.keys()) == set(ids)
+        for pid in ids:
+            assert [e.id for e in batch[pid]] == [e.id for e in store.get_for_person(pid, limit=500)]
+
+    def test_issues_one_query_for_a_page_within_chunk_size(self, store, monkeypatch):
+        """A page of IDs that fits within one chunk issues exactly one query
+        to the database -- not one query per person."""
+        ids = [f"person-{i}" for i in range(50)]
+        for pid in ids:
+            self._add_entities(store, pid, 2)
+
+        counting_conn = _CountingConnection(store._get_connection())
+        monkeypatch.setattr(store, "_get_connection", lambda: counting_conn)
+
+        store.get_for_people_batch(ids, limit_per_person=500)
+
+        assert counting_conn.execute_count == 1
+
+
 class TestRematchingEligibility:
     """Tests for the #507 backoff retry policy on capped source entities.
 

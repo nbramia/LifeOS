@@ -94,12 +94,39 @@ Per-backend capabilities (personas, handoff, history ownership, usage capture) a
 - `person_indexer.py` - Person search indexing
 - `person_stats.py` - Statistics computation
 
+`PersonEntityStore.get_all()` keeps a process-local cache of hydrated
+`PersonEntity` objects for the people list and CRM aggregate views. Cache
+entries are keyed by hidden/merged inclusion flags, SQLite `PRAGMA
+data_version` from a long-lived read connection, and a local generation
+counter bumped by store write methods and merged-ID reloads. This means any
+commit to `data/crm.db` from the API process or a separate sync process
+invalidates the cached people list on the next read. Callers receive a new
+list object on each call, but entity objects are shared, so write paths that
+mutate a person fetched from the full list must refetch that person by ID
+before persisting changes.
+
 **Relationships:**
 - `relationship.py` - Relationship store
 - `relationship_discovery.py` - Connection discovery
 - `relationship_metrics.py` - Strength computation
 - `relationship_summary.py` - Summary generation
 - `relationship_insights.py` - Therapy note insights
+
+The CRM people-list endpoints (`GET /api/crm/people`, `GET /birthdays/today`)
+compute each returned person's category dynamically, which needs that
+person's source entities when they don't already qualify as "work" via their
+own email domain or a `slack` source tag. Rather than calling
+`SourceEntityStore.get_for_person()` once per returned person,
+`SourceEntityStore.get_for_people_batch()` fetches the whole page in one
+round trip (a compound `UNION ALL` of per-person, `LIMIT`-bounded
+subqueries — chosen over a single `WHERE ... IN (...)` query because SQLite
+has no per-group "top-K" optimization for that shape, so it would have to
+fully rank every matching row for the highest-interaction people before
+applying any per-person cap). The category fetch also caps at 50 source
+entities per person rather than the single-person path's 500, verified
+against the full production dataset to produce identical categories either
+way — compute_person_category() only needs to find one qualifying entity,
+not all of them.
 
 **Source Integration:**
 - `source_entity.py` - Raw observation records

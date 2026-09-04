@@ -1,8 +1,13 @@
 """
 Tests for PersonEntity model and PersonEntityStore.
 """
+import json
+import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+
 import pytest
-from datetime import datetime
 
 from api.services.person_entity import (
     PersonEntity,
@@ -300,6 +305,22 @@ class TestPersonEntityStore:
         store._blocklist.clear()
         yield store
 
+    def _add_people(self, store, count: int) -> list[PersonEntity]:
+        """Add synthetic people to the store."""
+        people = [
+            PersonEntity(
+                id=f"person-{i:04d}",
+                canonical_name=f"Person {i:04d}",
+                emails=[f"person{i:04d}@example.com"],
+            )
+            for i in range(count)
+        ]
+        for i, person in enumerate(people):
+            person.relationship_strength = float(count - i)
+        for person in people:
+            store.add(person)
+        return people
+
     def test_add_and_get_by_id(self, temp_store):
         """Test adding an entity and retrieving by ID."""
         entity = PersonEntity(
@@ -504,6 +525,206 @@ class TestPersonEntityStore:
 
         all_entities = temp_store.get_all()
         assert len(all_entities) == 5
+
+    def test_get_all_warm_cache_hit_is_fast_and_equal(self, temp_store):
+        """Second get_all call returns equal contents from the warm cache."""
+        self._add_people(temp_store, 100)
+
+        first = temp_store.get_all()
+        start = time.perf_counter()
+        second = temp_store.get_all()
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        assert elapsed_ms < 5
+        assert second == first
+        assert second is not first
+
+    def test_get_all_sees_separate_connection_write(self, temp_store):
+        """External SQLite commits invalidate get_all through data_version."""
+        person = PersonEntity(
+            id="external-write-person",
+            canonical_name="Before External Write",
+            emails=["external@example.com"],
+        )
+        temp_store.add(person)
+        assert temp_store.get_all()[0].canonical_name == "Before External Write"
+
+        conn = sqlite3.connect(str(temp_store.db_path))
+        try:
+            conn.execute(
+                "UPDATE person_entities SET canonical_name = ?, display_name = ? WHERE id = ?",
+                ("After External Write", "After External Write", person.id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        refreshed = temp_store.get_all()
+        assert refreshed[0].canonical_name == "After External Write"
+
+    def test_get_all_invalidates_after_store_writes(self, temp_store, monkeypatch):
+        """Store add/update/delete/hide/save/purge/reload paths invalidate get_all."""
+        deleted_person = PersonEntity(
+            id="delete-person",
+            canonical_name="Delete Person",
+            emails=["delete@example.com"],
+        )
+        temp_store.add(deleted_person)
+        assert [p.id for p in temp_store.get_all()] == ["delete-person"]
+
+        added_person = PersonEntity(
+            id="add-person",
+            canonical_name="Add Person",
+            emails=["add@example.com"],
+        )
+        temp_store.add(added_person)
+        assert {p.id for p in temp_store.get_all()} == {"delete-person", "add-person"}
+
+        added_person.canonical_name = "Updated Person"
+        temp_store.update(added_person)
+        by_id = {p.id: p for p in temp_store.get_all()}
+        assert by_id["add-person"].canonical_name == "Updated Person"
+
+        temp_store.hide_person("add-person", "synthetic test")
+        assert [p.id for p in temp_store.get_all()] == ["delete-person"]
+        assert {p.id for p in temp_store.get_all(include_hidden=True)} == {
+            "delete-person",
+            "add-person",
+        }
+
+        class EmptyInteractionStore:
+            def get_for_person(self, entity_id, limit=1):
+                return []
+
+        monkeypatch.setattr(
+            "api.services.interaction_store.get_interaction_store",
+            lambda: EmptyInteractionStore(),
+        )
+        assert temp_store.delete("delete-person") is True
+        assert temp_store.get_all() == []
+
+        hidden_old = PersonEntity(
+            id="purge-person",
+            canonical_name="Purge Person",
+            emails=["purge@example.com"],
+            hidden=True,
+            hidden_at=datetime.now(timezone.utc) - timedelta(days=2),
+            hidden_reason="merged_into:survivor",
+        )
+        temp_store.add(hidden_old)
+        assert {p.id for p in temp_store.get_all(include_hidden=True)} == {
+            "add-person",
+            "purge-person",
+        }
+        assert temp_store.purge_hidden(older_than_days=1) == 1
+        assert [p.id for p in temp_store.get_all(include_hidden=True)] == ["add-person"]
+
+        primary = PersonEntity(
+            id="primary-person",
+            canonical_name="Primary Person",
+            emails=["primary@example.com"],
+        )
+        secondary = PersonEntity(
+            id="secondary-person",
+            canonical_name="Secondary Person",
+            emails=["secondary@example.com"],
+        )
+        temp_store.add(primary)
+        temp_store.add(secondary)
+        assert {p.id for p in temp_store.get_all()} == {
+            "primary-person",
+            "secondary-person",
+        }
+        temp_store.MERGED_IDS_PATH = temp_store.db_path.parent / "merged_person_ids.json"
+        temp_store.MERGED_IDS_PATH.write_text(json.dumps({"secondary-person": "primary-person"}))
+        temp_store.reload_merged_ids()
+        assert [p.id for p in temp_store.get_all()] == ["primary-person"]
+        assert {p.id for p in temp_store.get_all(include_merged=True)} == {
+            "primary-person",
+            "secondary-person",
+        }
+
+        row_count = 0
+        original_row_to_entity = temp_store._row_to_entity
+
+        def counting_row_to_entity(row):
+            nonlocal row_count
+            row_count += 1
+            return original_row_to_entity(row)
+
+        temp_store._row_to_entity = counting_row_to_entity
+        temp_store.get_all()
+        after_warm = row_count
+        temp_store.get_all()
+        assert row_count == after_warm
+        temp_store.save()
+        temp_store.get_all()
+        assert row_count > after_warm
+
+    def test_get_all_include_hidden_variants_are_cached_independently(self, temp_store):
+        """Visible-only and include-hidden get_all calls keep separate cache entries."""
+        temp_store.add(PersonEntity(
+            id="visible-person",
+            canonical_name="Visible Person",
+            emails=["visible@example.com"],
+        ))
+        temp_store.add(PersonEntity(
+            id="hidden-person",
+            canonical_name="Hidden Person",
+            emails=["hidden@example.com"],
+            hidden=True,
+            hidden_at=datetime.now(timezone.utc),
+            hidden_reason="synthetic test",
+        ))
+
+        visible = temp_store.get_all()
+        with_hidden = temp_store.get_all(include_hidden=True)
+
+        assert [p.id for p in visible] == ["visible-person"]
+        assert {p.id for p in with_hidden} == {"visible-person", "hidden-person"}
+        assert [p.id for p in temp_store.get_all()] == ["visible-person"]
+        assert {p.id for p in temp_store.get_all(include_hidden=True)} == {
+            "visible-person",
+            "hidden-person",
+        }
+
+    def test_get_all_returns_list_copy_for_caller_mutation(self, temp_store):
+        """Sorting or mutating the returned list does not affect later calls."""
+        self._add_people(temp_store, 3)
+
+        first = temp_store.get_all()
+        original_order = [p.id for p in first]
+        first.sort(key=lambda p: p.id, reverse=True)
+        first.pop()
+
+        second = temp_store.get_all()
+        assert [p.id for p in second] == original_order
+        assert len(second) == 3
+
+    def test_get_all_concurrent_readers_are_consistent_during_writes(self, temp_store):
+        """Concurrent get_all readers see consistent lists while updates commit."""
+        people = self._add_people(temp_store, 25)
+        expected_ids = {p.id for p in people}
+
+        def read_many():
+            for _ in range(50):
+                result = temp_store.get_all()
+                assert len(result) == 25
+                assert {p.id for p in result} == expected_ids
+            return True
+
+        def write_many():
+            for i in range(50):
+                entity = temp_store.get_by_id("person-0000")
+                entity.canonical_name = f"Writer Update {i}"
+                temp_store.update(entity)
+            return True
+
+        with ThreadPoolExecutor(max_workers=9) as executor:
+            futures = [executor.submit(read_many) for _ in range(8)]
+            futures.append(executor.submit(write_many))
+
+            assert all(f.result() for f in futures)
 
     def test_count(self, temp_store):
         """Test counting entities."""
