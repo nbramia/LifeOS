@@ -133,6 +133,12 @@
             border: 1px solid var(--border-color);
         }
 
+        .nav-link.me-link.active {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+
         .nav-link.me-link:hover {
             background: var(--people);
             color: white;
@@ -7346,15 +7352,15 @@
             <a href="/" class="header-brand">LifeOS</a>
             <nav class="header-nav">
                 <a href="/chat" class="nav-link">💬 Chat</a>
-                <a href="/crm" class="nav-link active">👥 CRM</a>
+                <a href="/crm" class="nav-link active" onclick="return navigateTo('/crm', event)">👥 CRM</a>
                 <a href="/agents" class="nav-link">🛠️ Agents</a>
             </nav>
         </div>
         <div class="header-right">
-            <a href="/birthdays" class="nav-link me-link" data-page="birthdays">🎂 Birthdays</a>
-            <a href="/relationship" class="nav-link me-link">💕 Relationship</a>
-            <a href="/family" class="nav-link me-link">👨‍👩‍👧 Family</a>
-            <a href="/me" class="nav-link me-link">👤 Me</a>
+            <a href="/birthdays" class="nav-link me-link" data-page="birthdays" onclick="return navigateTo('/birthdays', event)">🎂 Birthdays</a>
+            <a href="/relationship" class="nav-link me-link" data-page="relationship" onclick="return navigateTo('/relationship', event)">💕 Relationship</a>
+            <a href="/family" class="nav-link me-link" data-page="family" onclick="return navigateTo('/family', event)">👨‍👩‍👧 Family</a>
+            <a href="/me" class="nav-link me-link" data-page="me" onclick="return navigateTo('/me', event)">👤 Me</a>
             <div class="stats-display">
                 <div class="stat-item">
                     <span>People:</span>
@@ -8694,6 +8700,11 @@
         let meInteractionsCache = null;  // Cache for "Me" page interactions
         let meInteractionsCacheYears = null; // Track which years setting the cache was loaded for
         let meInteractionsSpanPromise = null; // Resolved once per page load; sizes the Me heatmap window
+        let meSpanYears = null; // The Me-specific years value derived from that span (#876: re-asserted
+        // on every ensureMeHeatmapYears() call, not just the first, because `heatmapYears` is a single
+        // shared global the Family/person heatmap views also write to; with dashboard navigation no
+        // longer reloading the document, a Family or person visit in between can leave it pointing at
+        // the wrong window by the time a returning Me visit compares it against meInteractionsCacheYears.
         let meInteractionsPromise = null; // In-flight /me/interactions request, shared across callers
         let meInteractionsPromiseKey = null; // days_back:trend_period the in-flight request is for
         // Config loaded from API
@@ -9254,11 +9265,16 @@
             history[method]({ personId, tab }, '', path);
         }
 
-        // Handle browser back/forward navigation
-        window.addEventListener('popstate', async (event) => {
-            // Close any open panels when navigating
-            closeEdgePanel();
-            closeNodePanel();
+        // Render whatever the current URL (window.location.pathname) points
+        // at, without a document load. Shared by the popstate handler and
+        // navigateTo() (#876) so a click and a back/forward step dispatch
+        // identically. Per-dashboard state (meInteractionsCache, familyData,
+        // communicationGapsData, relationshipToneCache, the person detail
+        // cache) lives in module-scope variables that this function never
+        // clears, so returning to a dashboard with the same parameters
+        // reuses what was already fetched instead of re-requesting it.
+        async function dispatchRoute() {
+            updateActiveNavLink();
 
             const { personId, tab, isFamily, isRelationship, isBirthdays, birthdayFilter } = parseUrl();
             if (isBirthdays) {
@@ -9294,7 +9310,66 @@
                 document.getElementById('detailEmpty').style.display = 'flex';
                 document.getElementById('detailContent').style.display = 'none';
             }
+        }
+
+        // Handle browser back/forward navigation
+        window.addEventListener('popstate', async (event) => {
+            // Close any open panels when navigating
+            closeEdgePanel();
+            closeNodePanel();
+
+            await dispatchRoute();
         });
+
+        // Highlight whichever of the four dashboard nav links (Birthdays,
+        // Relationship, Family, Me) matches the current URL. The CRM brand
+        // link stays statelessly "active" (it marks the app, not a
+        // dashboard) and is left alone here.
+        function updateActiveNavLink() {
+            const { isFamily, isRelationship, isBirthdays, isMe } = parseUrl();
+            let activePage = null;
+            if (isBirthdays) activePage = 'birthdays';
+            else if (isRelationship) activePage = 'relationship';
+            else if (isFamily) activePage = 'family';
+            else if (isMe) activePage = 'me';
+
+            document.querySelectorAll('.header-right .nav-link.me-link').forEach(link => {
+                link.classList.toggle('active', link.dataset.page === activePage);
+            });
+        }
+
+        // Client-side navigation for the CRM/Me/Family/Birthdays/Relationship
+        // nav links (#876): pushes a history entry and dispatches to the
+        // existing dashboard initializers instead of letting the browser
+        // load the anchor's href as a fresh document. Returning `false`
+        // (via the caller's `onclick="return navigateTo(...)"`) suppresses
+        // the default navigation; returning `true` lets it through
+        // unmodified for modifier-clicks (new tab/window) and non-primary
+        // buttons, which the browser should still handle natively.
+        function navigateTo(path, event) {
+            if (event) {
+                if (event.defaultPrevented || event.button !== 0 ||
+                    event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+                    return true;
+                }
+                event.preventDefault();
+            }
+
+            // /crm has no dashboard of its own - it has always redirected to
+            // /me (see init()); keep that behavior for the client-side path
+            // too so the URL bar reflects where the app actually lands.
+            const targetPath = (path === '/crm' || path === '/crm/') ? '/me' : path;
+
+            if (window.location.pathname === targetPath) {
+                return false;
+            }
+
+            closeEdgePanel();
+            closeNodePanel();
+            history.pushState({}, '', targetPath);
+            dispatchRoute();
+            return false;
+        }
 
         // Initialize - uses progressive loading for faster perceived performance
         async function init() {
@@ -9314,6 +9389,7 @@
 
             // Check URL early to show special dashboards immediately (don't wait for loadPeople)
             const { personId, tab, isFamily, isRelationship, isBirthdays, birthdayFilter } = parseUrl();
+            updateActiveNavLink();
 
             // For birthdays page, show immediately (standalone page, no people list needed)
             if (isBirthdays) {
@@ -10739,19 +10815,26 @@
         // Load all interactions for "Me" page (for client-side processing)
         // Size the Me page's heatmap window from the actual span of interaction
         // data (earliest/latest interaction) instead of requesting a fixed 10
-        // years and shrinking the display afterward. Resolves once per page
-        // load; both loadMeHeatMap() and renderMeDashboard() route through
-        // loadMeInteractions(), so awaiting this here (rather than at either
-        // call site) guarantees whichever fires the first real request already
-        // has the corrected heatmapYears, regardless of call order.
+        // years and shrinking the display afterward. The span fetch itself
+        // resolves once per session; both loadMeHeatMap() and
+        // renderMeDashboard() route through loadMeInteractions(), so awaiting
+        // this here (rather than at either call site) guarantees whichever
+        // fires the first real request already has the corrected
+        // heatmapYears, regardless of call order.
+        //
+        // heatmapYears is re-asserted from meSpanYears on every call (#876),
+        // not only the first: it's a single global the Family and person
+        // heatmap views also write to, and with dashboard navigation no
+        // longer reloading the document, a Family or person visit in
+        // between can leave it pointing at the wrong window by the time a
+        // returning Me visit compares it against meInteractionsCacheYears
+        // in loadMeInteractions() below.
         async function ensureMeHeatmapYears() {
             if (!meInteractionsSpanPromise) {
                 meInteractionsSpanPromise = api('/me/interactions/span')
                     .then(span => {
                         if (span && span.years) {
-                            heatmapYears = span.years;
-                            const yearsSelect = document.getElementById('heatmapYearsSelect');
-                            if (yearsSelect) yearsSelect.value = span.years.toString();
+                            meSpanYears = span.years;
                         }
                         return span;
                     })
@@ -10760,7 +10843,13 @@
                         return null;
                     });
             }
-            return meInteractionsSpanPromise;
+            const span = await meInteractionsSpanPromise;
+            if (meSpanYears !== null) {
+                heatmapYears = meSpanYears;
+                const yearsSelect = document.getElementById('heatmapYearsSelect');
+                if (yearsSelect) yearsSelect.value = meSpanYears.toString();
+            }
+            return span;
         }
 
         async function loadMeInteractions(forceRefresh = false) {
