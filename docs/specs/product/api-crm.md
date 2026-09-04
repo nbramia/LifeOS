@@ -41,11 +41,13 @@ List/search people with filters.
 - `q` (string): Search query (name, email, company)
 - `category` (string): work, personal, family
 - `source` (string): gmail, calendar, slack, etc.
-- `has_pending` (bool): Has pending links
-- `sort` (string): name, last_seen, interaction_count, strength
-- `order` (string): asc, desc
-- `limit` (int): Results per page (default: 50)
-- `offset` (int): Pagination offset
+- `dunbar_circles` (string): Comma-separated Dunbar circles, e.g. `5,6+`
+- `tags` (string): Comma-separated tags; person must have at least one
+- `has_interactions` (bool): Filter by interaction count > 0
+- `min_interactions` (int, default 0): Minimum total interactions (emails + meetings + mentions + messages)
+- `sort` (string, default `strength`): `interactions`, `last_seen`, `name`, `strength`
+- `offset` (int, default 0): Pagination offset
+- `limit` (int, 1–10000, default 50): Results per page
 
 Each returned person carries `has_profile_photo` (bool, from `photo_count > 0`) alongside the usual fields, so a client can request `GET /api/photos/profile/{id}` only for people flagged true instead of probing everyone (#875). `GET /api/crm/people/{id}` carries the same field for consistency.
 
@@ -245,7 +247,7 @@ relationship table (see
 **Query parameters:**
 - `center_on` (string): Person ID to center on. Required unless `allow_full_graph=true`.
 - `depth` (int, 1–4, default 2): Graph depth
-- `min_strength` (float, 0.0–1.0, default 0.0): Minimum node relationship strength. Currently a no-op regardless of value — validated to 0.0–1.0 while `relationship_strength` is 0–100.
+- `min_strength` (float, 0.0–1.0, default 0.0): Minimum node relationship strength, applied against `relationship_strength` on its 0–100 scale. The parameter itself is only accepted in 0.0–1.0, so only values in that narrow band filter out any nodes.
 - `category` (string): Filter by category. Best-effort for a centered request — see the docs linked above.
 - `max_nodes` (int, 1–500, default 150): Total nodes in the response, including the center
 - `max_second_degree_per_node` (int, 0–50, default 10): Second-(and deeper-)degree neighbors added per node at the previous depth
@@ -408,7 +410,10 @@ Summary for UI display.
 
 ### GET /api/crm/config
 
-Get CRM configuration values for the frontend (owner person ID, work email domain, partner ID, family default selected IDs). Reads from `LIFEOS_*` env vars — see [configuration.md](../../guides/configuration.md).
+Get CRM configuration values for the frontend (owner person ID, work email domain, partner ID, family default selected IDs, `photos_enabled`). Reads from `LIFEOS_*` env vars — see [configuration.md](../../guides/configuration.md).
+
+**Response fields:**
+- `photos_enabled` (bool): Whether Apple Photos is configured on this install. The frontend uses this to decide whether to request avatar/profile photos at all, gated the same as `has_profile_photo` on person list cards — see [crm-people.md](crm-people.md).
 
 ---
 
@@ -469,7 +474,7 @@ Aggregate family statistics.
 
 ### GET /api/crm/family/timeline
 
-Family interaction timeline across selected members. Filters by `person_id IN (...)` in SQL rather than loading every interaction in the window and filtering in Python.
+Family interaction timeline across selected members, filtered to the selected member IDs.
 
 **Query parameters:**
 - `person_ids` (string): Comma-separated person IDs
@@ -479,7 +484,7 @@ Family interaction timeline across selected members. Filters by `person_id IN (.
 
 ### GET /api/crm/family/interactions
 
-Aggregated family interaction data for charts and heatmaps. Filters by `person_id IN (...)` in SQL. Unlike `/me/interactions`, this does not apply a "sent email only" rule — all email (sent and received) counts.
+Aggregated family interaction data for charts and heatmaps, filtered to the selected member IDs. Unlike `/me/interactions`, this does not apply a "sent email only" rule — all email (sent and received) counts.
 
 **Query parameters:**
 - `person_ids` (string): Comma-separated person IDs

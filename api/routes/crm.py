@@ -3843,8 +3843,11 @@ def get_me_interactions(
                 typical_gap_days=typical_gap,
                 dunbar_circle=circle,
             ))
-    # Sort by circle (closer first), then by how overdue they are
-    neglected.sort(key=lambda x: (x.dunbar_circle, -(x.days_since_contact / x.typical_gap_days)))
+    # Sort by circle (closer first), then by how overdue they are, then by
+    # person id as a final tie-break so equally-overdue contacts have a
+    # stable, deterministic order across requests instead of depending on
+    # dict/query iteration order.
+    neglected.sort(key=lambda x: (x.dunbar_circle, -(x.days_since_contact / x.typical_gap_days), x.person_id))
 
     # 2b. Health Score History (longitudinal) - using "vs. average" approach
     # Count personal interactions per period, score relative to average.

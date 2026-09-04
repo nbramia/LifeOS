@@ -8730,6 +8730,9 @@
         // the wrong window by the time a returning Me visit compares it against meInteractionsCacheYears.
         let meInteractionsPromise = null; // In-flight /me/interactions request, shared across callers
         let meInteractionsPromiseKey = null; // days_back:trend_period the in-flight request is for
+        let meStatsCache = null; // Cache for /me/stats (renderMeHeroStats) -- same per-session pattern
+        // as meInteractionsCache above, so a second /me visit reuses the hero-stat totals instead of
+        // re-requesting them.
         // Config loaded from API
         let PARTNER_NAME = '';
         let FAMILY_DEFAULT_SELECTED_IDS = [];
@@ -9952,6 +9955,14 @@
                 }
                 invalidateTimelineCache(mergePrimaryId);
 
+                // A merged person may have been a family member -- clear the
+                // family dashboard's cached membership/data too, the same
+                // way a person/timeline cache is invalidated above, so a
+                // later Family visit doesn't render a stale id.
+                familyMembers = [];
+                familyMembersLoaded = false;
+                familyData = null;
+
                 // Close modal and refresh
                 closeMergeModal();
                 clearSelection();
@@ -10199,6 +10210,13 @@
                     invalidateTimelineCache(splitTargetPersonId);
                 }
 
+                // Either person may have been a family member -- clear the
+                // family dashboard's cached membership/data too (same
+                // invalidation as confirmMerge() above).
+                familyMembers = [];
+                familyMembersLoaded = false;
+                familyData = null;
+
                 // Close modal and refresh
                 closeSplitModal();
                 await loadPeople();
@@ -10338,16 +10356,22 @@
                     loadGraph(personId);
                 }
 
-                // Background refresh: one fetch (with related data) to update the cache
-                api(`/people/${personId}?include_related=true`).then(person => {
-                    if (selectedPersonId === personId) {
-                        setCachedPerson(personId, person);
-                        // Only re-render if data changed (compare key fields)
-                        if (JSON.stringify(cachedPerson) !== JSON.stringify(person)) {
-                            renderPersonDetail(person);
+                // Background refresh: one fetch (with related data) to update the cache.
+                // Skipped for the owner's own page (/me): unlike a contact's
+                // data, the owner's own aggregate profile isn't expected to
+                // drift within a session, so a second /me visit reuses the
+                // cache with no request at all instead of a silent revalidate.
+                if (!isMyPage(personId)) {
+                    api(`/people/${personId}?include_related=true`).then(person => {
+                        if (selectedPersonId === personId) {
+                            setCachedPerson(personId, person);
+                            // Only re-render if data changed (compare key fields)
+                            if (JSON.stringify(cachedPerson) !== JSON.stringify(person)) {
+                                renderPersonDetail(person);
+                            }
                         }
-                    }
-                }).catch(err => console.warn('[Cache] Background refresh failed:', err));
+                    }).catch(err => console.warn('[Cache] Background refresh failed:', err));
+                }
 
                 return;
             }
@@ -10884,7 +10908,8 @@
         // Render hero stats for "Me" page with aggregate totals
         async function renderMeHeroStats() {
             try {
-                const stats = await api('/me/stats');
+                const stats = meStatsCache || await api('/me/stats');
+                meStatsCache = stats;
 
                 // Show aggregate totals
                 document.getElementById('heroStatEmails').textContent = formatCompactNumber(stats.total_emails);
@@ -11646,6 +11671,14 @@
 
         // Family dashboard state
         let familyMembers = [];
+        // Per-session cache flag for loadFamilyMembers() -- an empty
+        // `familyMembers` array can't tell "not loaded yet" apart from "the
+        // API genuinely returned zero family members" (a fresh install with
+        // none configured), so a plain `.length === 0` check would refetch
+        // forever in that case. Cleared alongside familyMembers by the same
+        // merge/split invalidation below when a family member might have
+        // changed.
+        let familyMembersLoaded = false;
         let originalHeaderIndicatorsHtml = null;  // Save original header content for restore
         // Default family members - loaded from API via loadFamilyMembers()
         const DEFAULT_FAMILY_IDS = [];
@@ -11659,6 +11692,7 @@
             try {
                 const data = await api('/family/members');
                 familyMembers = data.members || [];
+                familyMembersLoaded = true;
                 return familyMembers;
             } catch (error) {
                 console.error('Failed to load family members:', error);
@@ -11767,8 +11801,8 @@
                 if (graphTab) graphTab.style.display = 'none';
             }
 
-            // Load family members if not already loaded
-            if (familyMembers.length === 0) {
+            // Load family members if not already loaded this session
+            if (!familyMembersLoaded) {
                 await loadFamilyMembers();
             }
 
@@ -12071,8 +12105,11 @@
         }
 
         function navigateToPerson(personId) {
-            // Navigate to the person's profile page
-            window.location.href = `/crm/${personId}`;
+            // Navigate to the person's profile page client-side (#876
+            // pattern), instead of a full document load that re-downloads
+            // the page and discards whatever the Birthdays page had already
+            // fetched.
+            navigateTo(`/crm/${personId}`);
         }
 
         // Tab click handler for birthdays page
@@ -12395,6 +12432,12 @@
 
         // Tone view mode: 'user', 'partner', 'combined', 'both'
         let toneViewMode = 'combined';
+        // Whether the data currently in relationshipToneCache came from a
+        // refresh=true request -- renderToneTimeline() uses this to decide
+        // whether an all-stale response is a refresh that failed outright
+        // (worth a banner) versus an ordinary first load that simply hasn't
+        // recomputed anything yet (not a failure, nothing to warn about).
+        let toneCacheWasRefreshAttempt = false;
 
         // Load tone analysis (detailed version with separate user/partner scores).
         // Stored, fresh months are served instantly; stale/missing months are
@@ -12410,6 +12453,7 @@
                     : '/relationship/tone-analysis-detailed';
                 const data = await api(path, { method: 'POST' });
                 relationshipToneCache = data;
+                toneCacheWasRefreshAttempt = refresh;
                 renderToneTimeline(data);
             } catch (error) {
                 console.error('Failed to load tone analysis:', error);
@@ -12569,6 +12613,18 @@
             }
 
             const tones = data.monthly_tones;
+
+            // A refresh that couldn't recompute a single month still comes
+            // back 200 with every month marked `status: "stale"` (its last
+            // stored score) rather than failing outright -- the per-point
+            // dimmed markers below are easy to miss, so a refresh attempt
+            // that changed nothing also gets one small banner on the card.
+            // Only a `refresh=true` load counts: an ordinary first load
+            // showing stale months (nothing computed yet this session) is
+            // expected behavior, not a failure worth flagging.
+            const refreshFailedNotice = (toneCacheWasRefreshAttempt && tones.every(t => t.status === 'stale'))
+                ? '<div class="tone-refresh-failed-notice" style="text-align: center; font-size: 0.7rem; color: var(--text-muted); background: var(--bg-secondary); border: 1px solid var(--border-subtle); border-radius: 4px; padding: 0.25rem 0.5rem; margin-bottom: 0.35rem;">Refresh failed; showing stored scores</div>'
+                : '';
 
             // Chart dimensions
             const width = 420;
@@ -12734,6 +12790,7 @@
 
             container.innerHTML = `
                 <div class="tone-timeline-container">
+                    ${refreshFailedNotice}
                     <svg class="tone-timeline-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet">
                         ${gridLines}
                         ${yAxisLabels}
@@ -18893,7 +18950,10 @@
         async function switchTab(tabName, skipUrlUpdate = false) {
             // Update tab UI
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-            document.querySelector(`[data-tab="${tabName}"]`).classList.add('active');
+            // Scoped to `.tab` (the person-detail tab bar): the Birthdays page
+            // also has a `data-tab="timeline"` button (`.birthdays-tab`), and an
+            // unscoped selector would match that one first instead.
+            document.querySelector(`.tab[data-tab="${tabName}"]`).classList.add('active');
 
             // Show/hide content
             document.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');

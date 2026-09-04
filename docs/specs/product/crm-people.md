@@ -184,7 +184,7 @@ Behavior:
 - Real-time search (< 300 ms), debounced; a superseded query's response is discarded so the list always reflects what's currently typed, even if an earlier search's response arrives later (#874).
 - Category tabs (Work / Personal / Family).
 - Cards show avatar, name, company/category, interaction count, strength bar.
-- A card's avatar shows the person's profile photo only when the list response flags them as having one (`has_profile_photo`); nothing else is ever probed. The image loads lazily and falls back to initials with no error if the photo turns out to be unavailable (#875).
+- A card's avatar shows the person's profile photo only when the list response flags them as having one (`has_profile_photo`) AND the install has Apple Photos configured (`GET /api/crm/config`'s `photos_enabled`); nothing else is ever probed. The image loads lazily and falls back to initials with no error if the photo turns out to be unavailable (#875).
 - Cards sorted by relationship strength by default.
 - Infinite scroll loads more people.
 - Mobile-responsive layout.

@@ -492,4 +492,5 @@ LIFEOS_ALERT_EMAIL=you@example.com
 - [ADR-019: A Turn's Lifetime Is Owned by the Server](../adr/019-turn-owned-by-server.md) — Why `LIFEOS_DETACHED_TURN_TIMEOUT_SECONDS` exists.
 - [ADR-012: Embedding Pipeline](../adr/012-embedding-pipeline.md) — Why `LIFEOS_EMBEDDING_MODEL` is overridable; the OOM-protection knobs.
 - [API Reference](../specs/product/api-reference.md) — Gmail send endpoint behavior controlled by the draft send cooldown.
+- [Observability](../specs/technical/observability.md) — Perf tracing, route timing, and alerting behavior controlled by the vars documented above
 - [`config/settings.py`](../../config/settings.py) — The source of truth; this guide should track it.

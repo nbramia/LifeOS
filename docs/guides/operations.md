@@ -90,7 +90,7 @@ Every HTTP request (not just chat turns) is timed by `RouteTimingMiddleware`. So
 curl http://localhost:8000/api/perf/routes | jq
 ```
 
-A request slower than `LIFEOS_SLOW_REQUEST_MS` (default 500ms) also logs one WARNING with its route template, status, duration, and response size — `grep "slow request" logs/lifeos-api-error.log`. Full design in [Observability](../specs/technical/observability.md).
+A request slower than `LIFEOS_SLOW_REQUEST_MS` (default 500ms) also logs one WARNING with its route template, status, duration, and response size — `grep "slow request" logs/server.log` (Linux systemd, which appends stdout+stderr there; on macOS launchd it's `logs/lifeos-api-error.log`). Full design in [Observability](../specs/technical/observability.md).
 
 ## GPU Watchdog
 

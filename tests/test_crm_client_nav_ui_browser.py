@@ -386,10 +386,15 @@ class TestBackForward:
 
 
 class TestDashboardStatePersists:
-    """A Me -> Family -> Me round trip issues no new request for data the
-    first Me visit already fetched and cached, even though Family's own
-    heatmap window (`heatmapYears`, a global shared with Me's) is 10 years
-    while Me's is derived from /me/interactions/span."""
+    """A Me -> Family -> Me -> Family round trip issues no new request for
+    data each dashboard's first visit already fetched and cached, even
+    though Family's own heatmap window (`heatmapYears`, a global shared
+    with Me's) is 10 years while Me's is derived from
+    /me/interactions/span.
+
+    Also covers the CRM performance follow-up review finding 18: the owner's
+    person detail fetch, /api/crm/me/stats, and /api/crm/family/members must
+    each fire at most once per session too, not just /me/interactions."""
 
     def test_second_me_visit_does_not_refetch_interactions(self, page: Page, crm_base_url):
         requests_seen, load_events, console_errors = _goto_me(page, crm_base_url)
@@ -406,10 +411,16 @@ class TestDashboardStatePersists:
             "expected exactly one /me/interactions request from the first Me visit, "
             f"got {_count('/api/crm/me/interactions')}"
         )
+        assert _count("/api/crm/me/stats") == 1
+        assert _count(f"/api/crm/people/{MY_PERSON_ID}") == 1
 
         page.locator('[data-page="family"]').click()
         expect(page.locator("#familyDashboard")).to_be_visible()
         page.wait_for_timeout(200)
+        assert _count("/api/crm/family/members") == 1, (
+            "expected exactly one /family/members request from the first Family visit, "
+            f"got {_count('/api/crm/family/members')}"
+        )
 
         page.locator('[data-page="me"]').click()
         expect(page.locator("#meDashboard")).to_be_visible()
@@ -419,6 +430,22 @@ class TestDashboardStatePersists:
         assert _count("/api/crm/me/interactions") == 1, (
             "second Me render must reuse meInteractionsCache instead of "
             f"re-requesting /me/interactions, got {_count('/api/crm/me/interactions')} total calls"
+        )
+        assert _count("/api/crm/me/stats") == 1, (
+            "second Me render must reuse meStatsCache instead of "
+            f"re-requesting /me/stats, got {_count('/api/crm/me/stats')} total calls"
+        )
+        assert _count(f"/api/crm/people/{MY_PERSON_ID}") == 1, (
+            "second Me render must reuse personDetailCache with no background "
+            f"revalidation, got {_count(f'/api/crm/people/{MY_PERSON_ID}')} total calls"
+        )
+
+        page.locator('[data-page="family"]').click()
+        expect(page.locator("#familyDashboard")).to_be_visible()
+        page.wait_for_timeout(300)
+        assert _count("/api/crm/family/members") == 1, (
+            "second Family render must reuse the cached member list instead of "
+            f"re-requesting /family/members, got {_count('/api/crm/family/members')} total calls"
         )
 
         unexpected_errors = [e for e in console_errors if "d3" not in e.lower()]
@@ -600,6 +627,132 @@ class TestActiveLinkAndTabRegressions:
         expect(page.locator("#tabOverview")).to_be_visible()
         expect(page.locator("#tabTimeline")).to_be_hidden()
         expect(page.locator('.tab[data-tab="overview"]')).to_have_class(re.compile(r"\bactive\b"))
+
+        unexpected_errors = [e for e in console_errors if "d3" not in e.lower()]
+        assert not unexpected_errors, f"Unexpected console errors: {unexpected_errors}"
+
+
+class TestToneRefreshFailureNotice:
+    """Regression test for the CRM performance follow-up review finding 19:
+    when every month in a refresh=true response comes back `status:
+    "stale"` (the server couldn't recompute a single one and fell back to
+    stored scores for all of them), the Tone Evolution card must show one
+    small notice -- the per-point dimmed `(stale)` markers alone are easy
+    to miss. An ordinary first load that happens to be all-stale (nothing
+    computed yet this session, not a failed refresh) must NOT show it."""
+
+    STALE_TONE_RESPONSE = {
+        "monthly_tones": [
+            {"month": "2026-06", "score": 60, "combined_score": 60, "status": "stale"},
+            {"month": "2026-07", "score": 62, "combined_score": 62, "status": "stale"},
+        ],
+        "user_average": 60, "partner_average": 62,
+        "combined_trend": "stable", "user_trend": "stable", "partner_trend": "stable",
+    }
+
+    def test_all_stale_refresh_response_shows_failure_notice(self, page: Page, crm_base_url):
+        _, _, console_errors = _prepare(page)
+
+        def tone_handler(route):
+            is_refresh = "refresh=true" in route.request.url
+            body = self.STALE_TONE_RESPONSE if is_refresh else {
+                "monthly_tones": [
+                    {"month": "2026-06", "score": 55, "combined_score": 55},
+                    {"month": "2026-07", "score": 58, "combined_score": 58},
+                ],
+                "user_average": 55, "partner_average": 58,
+                "combined_trend": "stable", "user_trend": "stable", "partner_trend": "stable",
+            }
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(body))
+
+        page.route("**/api/crm/relationship/tone-analysis-detailed**", tone_handler)
+
+        page.goto(f"{crm_base_url}/relationship")
+        expect(page.locator("#relationshipDashboard")).to_be_visible()
+        expect(page.locator("#toneTimelineViz svg")).to_be_visible()
+        # A normal (non-refresh) first load must never show the notice, even
+        # though this fixture's initial response has no stale months either.
+        expect(page.locator(".tone-refresh-failed-notice")).to_have_count(0)
+
+        page.locator("#toneRefreshBtn").click()
+        expect(page.locator(".tone-refresh-failed-notice")).to_be_visible()
+        expect(page.locator(".tone-refresh-failed-notice")).to_have_text(
+            "Refresh failed; showing stored scores"
+        )
+
+        unexpected_errors = [e for e in console_errors if "d3" not in e.lower()]
+        assert not unexpected_errors, f"Unexpected console errors: {unexpected_errors}"
+
+
+class TestBirthdaysNavigateToPersonIsClientSide:
+    """Regression test for the CRM performance follow-up review finding 16:
+    `navigateToPerson()` (used by the Birthdays timeline's person rows) set
+    `window.location.href` directly, forcing a full document reload instead
+    of going through the same client-side `navigateTo()`/`dispatchRoute()`
+    path every other CRM link uses (#876)."""
+
+    def test_clicking_a_birthday_person_does_not_reload_the_document(
+        self, page: Page, crm_base_url,
+    ):
+        _, load_events, console_errors = _prepare(page)
+
+        def birthdays_all_handler(route):
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "total_people": 1,
+                    "total_dates": 1,
+                    "birthdays": {
+                        "03-15": [
+                            {"id": SYNTHETIC_OTHER_PERSON["id"], "name": "Synthetic Friend"},
+                        ],
+                    },
+                }),
+            )
+
+        page.route("**/api/crm/birthdays/all", birthdays_all_handler)
+
+        page.goto(f"{crm_base_url}/birthdays?day=03-15")
+        expect(page.locator("#birthdaysPage")).to_be_visible()
+        expect(page.locator(".birthday-timeline-person")).to_be_visible()
+        load_events.clear()
+
+        page.locator(".birthday-timeline-person").click()
+
+        expect(page.locator("#personContentGrid")).to_be_visible()
+        expect(page.locator("#birthdaysPage")).to_be_hidden()
+        assert page.evaluate("window.location.pathname") == f"/crm/{SYNTHETIC_OTHER_PERSON['id']}"
+        assert load_events == [], (
+            f"expected zero document loads, got {len(load_events)}"
+        )
+
+        unexpected_errors = [e for e in console_errors if "d3" not in e.lower()]
+        assert not unexpected_errors, f"Unexpected console errors: {unexpected_errors}"
+
+
+class TestDirectLoadTabHighlight:
+    """Regression test for the CRM performance follow-up review finding 15:
+    `switchTab()` used to select `[data-tab="${tabName}"]` unscoped, and the
+    Birthdays page's `.birthdays-tab[data-tab="timeline"]` button sits
+    earlier in the DOM than the person-detail tab bar's own
+    `.tab[data-tab="timeline"]` div -- so `document.querySelector` picked
+    the Birthdays button first and the actual detail Timeline tab never got
+    its `active` class on a direct load of `/crm/{id}/timeline`."""
+
+    def test_direct_load_of_person_timeline_highlights_the_detail_tab(
+        self, page: Page, crm_base_url,
+    ):
+        _, _, console_errors = _prepare(page)
+        page.goto(f"{crm_base_url}/crm/{SYNTHETIC_OTHER_PERSON['id']}/timeline")
+        expect(page.locator("#tabTimeline")).to_be_visible()
+
+        expect(page.locator('.tab[data-tab="timeline"]')).to_have_class(re.compile(r"\bactive\b"))
+        # The Birthdays page's same-named tab must never be the one that
+        # picked up `active` -- it isn't even the visible page here.
+        expect(page.locator('.birthdays-tab[data-tab="timeline"]')).not_to_have_class(
+            re.compile(r"\bactive\b")
+        )
 
         unexpected_errors = [e for e in console_errors if "d3" not in e.lower()]
         assert not unexpected_errors, f"Unexpected console errors: {unexpected_errors}"

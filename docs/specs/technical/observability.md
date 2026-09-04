@@ -168,3 +168,5 @@ Services are tracked on-use, not by polling. Status updates when a service is ac
 - [Architecture](architecture.md) -- System architecture and code structure
 - [Data & Sync](data-and-sync.md) -- Data pipeline (alerting on sync failures)
 - [API Reference](../product/api-reference.md#get-apiperfroutes) -- `GET /api/perf/routes` request/response shape
+- [Operations](../../guides/operations.md) -- Quick commands for the perf-tracing and alerting endpoints documented here
+- [Configuration](../../guides/configuration.md) -- `LIFEOS_SLOW_REQUEST_MS`, `LIFEOS_VRAM_ALERT_PCT`, and other env vars this doc's behavior depends on

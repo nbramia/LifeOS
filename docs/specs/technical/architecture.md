@@ -23,7 +23,7 @@ api/
 │   ├── calendar.py            # Calendar integration
 │   ├── chat.py                # Streaming chat with agentic pipeline
 │   ├── conversations.py       # Conversation history
-│   ├── crm.py                 # CRM endpoints + models (~5,100 LOC) -- see below
+│   ├── crm.py                 # CRM endpoints + models (~6,150 LOC) -- see below
 │   ├── crm_models/            # NOT wired into the app -- see "CRM Models Package"
 │   │   ├── __init__.py        # Re-exports models and utils
 │   │   ├── models.py          # Unused parallel Pydantic models (~600 LOC)
