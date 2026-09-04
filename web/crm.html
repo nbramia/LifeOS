@@ -9263,6 +9263,28 @@
             }
             const method = replace ? 'replaceState' : 'pushState';
             history[method]({ personId, tab }, '', path);
+            // Selecting a person clears whichever dashboard link was
+            // highlighted (or sets "me" for the owner's own profile) --
+            // without this the previous dashboard's link stayed lit while a
+            // person page rendered underneath it (#909 review finding 4).
+            updateActiveNavLink();
+        }
+
+        // Some direct-load entry points (currently only /birthdays, see
+        // init()) skip loading the people list/stats for a faster initial
+        // render, since that page doesn't need either. If the user then
+        // navigates to a dashboard that does need them -- a nav-link click
+        // or back/forward -- dispatchRoute() below ensures they've been
+        // kicked off at least once per session, via this memoized promise
+        // (#909 review finding 3: previously nothing compensated, leaving
+        // the sidebar and header stats stuck on their loading state
+        // forever).
+        let corePeopleAndStatsPromise = null;
+        function ensurePeopleAndStatsLoaded() {
+            if (!corePeopleAndStatsPromise) {
+                corePeopleAndStatsPromise = Promise.all([loadPeople(), loadStatistics()]);
+            }
+            return corePeopleAndStatsPromise;
         }
 
         // Render whatever the current URL (window.location.pathname) points
@@ -9277,10 +9299,19 @@
             updateActiveNavLink();
 
             const { personId, tab, isFamily, isRelationship, isBirthdays, birthdayFilter } = parseUrl();
+
             if (isBirthdays) {
-                // Show birthdays page
+                // Show birthdays page (standalone; doesn't need people/stats)
                 showBirthdaysPage(birthdayFilter);
-            } else if (isRelationship) {
+                return;
+            }
+
+            // Every other view renders the sidebar and/or header stats, so
+            // make sure loading them has at least started (see
+            // ensurePeopleAndStatsLoaded() above).
+            ensurePeopleAndStatsLoaded();
+
+            if (isRelationship) {
                 // Show relationship dashboard
                 showRelationshipDashboard();
             } else if (isFamily) {
@@ -9295,9 +9326,11 @@
                 selectedPersonId = personId;
                 renderPeopleList();
                 await loadPersonDetail(personId, false);
-                if (tab) {
-                    await switchTab(tab, true); // true = don't update URL
-                }
+                // Restore the requested tab, or fall back to Overview -- a
+                // click/back-step that lands on a URL with no tab segment
+                // must not leave whatever tab was previously showing (#909
+                // review finding 7).
+                await switchTab(tab || 'overview', true); // true = don't update URL
             } else {
                 // Hide birthdays page and show main container
                 document.getElementById('birthdaysPage').style.display = 'none';
@@ -9360,14 +9393,25 @@
             // too so the URL bar reflects where the app actually lands.
             const targetPath = (path === '/crm' || path === '/crm/') ? '/me' : path;
 
-            if (window.location.pathname === targetPath) {
+            // Compare against pathname + search, not pathname alone: none of
+            // the nav links carry a query string, so this only short-circuits
+            // a genuine no-op click. Comparing pathname alone treated e.g.
+            // clicking Birthdays from /birthdays?day=03-15 as "already
+            // there" and left the day filter and Timeline tab in place,
+            // instead of resetting to the plain unfiltered view a document
+            // reload would have shown (#909 review finding 6).
+            if (window.location.pathname + window.location.search === targetPath) {
                 return false;
             }
 
             closeEdgePanel();
             closeNodePanel();
             history.pushState({}, '', targetPath);
-            dispatchRoute();
+            // Fire-and-forget (matches the popstate handler's own call
+            // below), but a rejection inside any dashboard initializer
+            // should never vanish as a silent, contextless unhandled
+            // promise rejection (#909 review finding 9).
+            dispatchRoute().catch(err => console.error('Navigation failed:', err));
             return false;
         }
 
@@ -9400,8 +9444,11 @@
             // For relationship page, show dashboard immediately (don't wait for people list)
             if (isRelationship) {
                 // Load people/stats in background, show dashboard now
-                loadPeople();
-                loadStatistics();
+                const relPeoplePromise = loadPeople();
+                const relStatsPromise = loadStatistics();
+                // Record it under the same memo dispatchRoute() checks, so a
+                // nav-link click before these resolve doesn't refire them.
+                corePeopleAndStatsPromise = Promise.all([relPeoplePromise, relStatsPromise]);
                 await showRelationshipDashboard();
                 return;
             }
@@ -9409,6 +9456,10 @@
             // Progressive loading: start loading people/stats in parallel
             const peoplePromise = loadPeople();
             const statsPromise = loadStatistics();
+            // Same memo dispatchRoute() uses (see ensurePeopleAndStatsLoaded()
+            // above) -- recorded here too so a nav-link click that fires
+            // before these resolve sees loading already under way.
+            corePeopleAndStatsPromise = Promise.all([peoplePromise, statsPromise]);
 
             if (isFamily) {
                 // Family dashboard needs people list
@@ -10822,14 +10873,25 @@
         // fires the first real request already has the corrected
         // heatmapYears, regardless of call order.
         //
-        // heatmapYears is re-asserted from meSpanYears on every call (#876),
-        // not only the first: it's a single global the Family and person
-        // heatmap views also write to, and with dashboard navigation no
-        // longer reloading the document, a Family or person visit in
-        // between can leave it pointing at the wrong window by the time a
-        // returning Me visit compares it against meInteractionsCacheYears
-        // in loadMeInteractions() below.
-        async function ensureMeHeatmapYears() {
+        // `respectExplicitYears` (#909 review finding 1): the years dropdown's
+        // own change handler already set `heatmapYears` to what the user
+        // picked before calling down into loadMeHeatMap() -> here; a caller
+        // passes true to mean "don't overwrite that." Without this,
+        // re-asserting from meSpanYears unconditionally (added by #876 to
+        // fix a *different* bug -- heatmapYears drifting from a Family/person
+        // visit in between -- see below) clobbered the user's own selection
+        // on every call, making the dropdown inert. The span promise itself
+        // is still awaited either way so meSpanYears ends up populated for
+        // the next dashboard-entry call.
+        //
+        // When NOT respecting an explicit selection, heatmapYears is
+        // re-asserted from meSpanYears on every call: it's a single global
+        // the Family and person heatmap views also write to, and with
+        // dashboard navigation no longer reloading the document, a Family or
+        // person visit in between can leave it pointing at the wrong window
+        // by the time a returning Me visit compares it against
+        // meInteractionsCacheYears in loadMeInteractions() below.
+        async function ensureMeHeatmapYears(respectExplicitYears = false) {
             if (!meInteractionsSpanPromise) {
                 meInteractionsSpanPromise = api('/me/interactions/span')
                     .then(span => {
@@ -10844,7 +10906,7 @@
                     });
             }
             const span = await meInteractionsSpanPromise;
-            if (meSpanYears !== null) {
+            if (!respectExplicitYears && meSpanYears !== null) {
                 heatmapYears = meSpanYears;
                 const yearsSelect = document.getElementById('heatmapYearsSelect');
                 if (yearsSelect) yearsSelect.value = meSpanYears.toString();
@@ -10852,8 +10914,8 @@
             return span;
         }
 
-        async function loadMeInteractions(forceRefresh = false) {
-            await ensureMeHeatmapYears();
+        async function loadMeInteractions(forceRefresh = false, respectExplicitYears = false) {
+            await ensureMeHeatmapYears(respectExplicitYears);
             // Use cache only if it matches current heatmapYears setting
             if (meInteractionsCache && meInteractionsCacheYears === heatmapYears && !forceRefresh) {
                 return meInteractionsCache;
@@ -11394,7 +11456,12 @@
             try {
                 // For "Me" page, aggregate interactions across all people
                 if (isMyPage(personId)) {
-                    await loadMeHeatMap();
+                    // An explicit `years` argument means the caller (the years
+                    // dropdown's change handler) already set heatmapYears to
+                    // what the user picked -- respect it rather than letting
+                    // ensureMeHeatmapYears() re-derive it from the interaction
+                    // span (#909 review finding 1).
+                    await loadMeHeatMap(years !== null);
                     return;
                 }
 
@@ -11448,9 +11515,9 @@
         }
 
         // Load and render heatmap for "Me" page (aggregate across all people)
-        async function loadMeHeatMap() {
+        async function loadMeHeatMap(respectExplicitYears = false) {
             try {
-                const data = await loadMeInteractions();
+                const data = await loadMeInteractions(false, respectExplicitYears);
                 if (!data) {
                     heatmapData = {};
                     sourceTotals = {};
@@ -11725,10 +11792,13 @@
             // Load data
             await loadBirthdaysData();
 
-            // If filter provided, switch to timeline tab
-            if (filterDay) {
-                switchBirthdaysTab('timeline');
-            }
+            // A filter switches to the Timeline tab; no filter resets to the
+            // default Calendar tab -- matching what a fresh document load of
+            // /birthdays would show. Without the explicit reset, navigating
+            // here client-side (#909 review finding 6) after an earlier
+            // filtered visit left the Timeline tab showing even though the
+            // URL and filter had both cleared.
+            switchBirthdaysTab(filterDay ? 'timeline' : 'heatmap');
         }
 
         async function loadBirthdaysData() {

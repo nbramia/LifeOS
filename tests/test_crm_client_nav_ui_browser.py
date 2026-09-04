@@ -21,9 +21,10 @@ marker, and so runs at pre-push (`browser and not requires_server`).
 """
 import http.server
 import json
+import re
 import threading
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -53,6 +54,8 @@ D3_STUB_JS = """
 })();
 """
 
+PARTNER_PERSON_ID = "person-synthetic-partner"
+
 SYNTHETIC_ME_PERSON = {
     "id": MY_PERSON_ID,
     "canonical_name": "Synthetic Owner",
@@ -66,6 +69,16 @@ SYNTHETIC_ME_PERSON = {
     "relationships": [],
 }
 
+# A second, non-owner person -- used by the /birthdays-entry test to prove
+# the sidebar/stats actually populate rather than being stuck on their
+# loading state (#909 review finding 3).
+SYNTHETIC_OTHER_PERSON = {
+    "id": "person-synthetic-other",
+    "canonical_name": "Synthetic Friend",
+    "category": "personal", "dunbar_circle": 3, "relationship_strength": 5,
+    "company": "", "tags": [],
+}
+
 EMPTY_ME_INTERACTIONS = {
     "daily": [], "by_source": {}, "by_month": {}, "by_circle": {},
     "top_contacts": [], "warming": [], "cooling": [], "total_count": 0,
@@ -74,7 +87,10 @@ EMPTY_ME_INTERACTIONS = {
     "messaging_by_circle": [], "tracked_relationships": [],
 }
 
-EMPTY_PEOPLE_PAGE = {"people": [], "total": 0, "offset": 0, "count": 0}
+# The four dashboard containers that must never be visible at the same time
+# -- a leak here is the class of bug #909 review finding 2 caught
+# (Relationship left rendered underneath Family).
+_DASHBOARD_IDS = ["#meDashboard", "#familyDashboard", "#relationshipDashboard", "#birthdaysPage"]
 
 
 class _CrmHandler(http.server.SimpleHTTPRequestHandler):
@@ -105,24 +121,31 @@ def crm_base_url():
 
 def _route_api(page: Page, requests_seen: list):
     """Stub every /api/crm/** call the page makes, and record each request's
-    path (query string dropped) so tests can assert on call counts. Anything
-    not explicitly modeled below returns `{}` — every loader in crm.html
-    treats a missing/empty aggregate defensively (falls back to an empty
-    list/dict), so this is enough to exercise all five dashboards without
-    error."""
+    path and query params (`{"path": ..., "query": ...}`, `query` from
+    `parse_qs`) so tests can assert on call counts and on the parameters a
+    request carried. Anything not explicitly modeled below returns `{}` —
+    every loader in crm.html treats a missing/empty aggregate defensively
+    (falls back to an empty list/dict), so this is enough to exercise all
+    five dashboards without error."""
 
     def handler(route):
-        path = urlparse(route.request.url).path
-        requests_seen.append(path)
+        parsed = urlparse(route.request.url)
+        path = parsed.path
+        requests_seen.append({"path": path, "query": parse_qs(parsed.query)})
 
         if path == "/api/crm/config":
-            body = {"my_person_id": MY_PERSON_ID}
+            # partner_person_id set so showRelationshipDashboard() renders
+            # the real dashboard rather than the no-partner empty state
+            # (#899) -- keeps the Relationship hops representative of a
+            # configured install, not the degenerate case.
+            body = {"my_person_id": MY_PERSON_ID, "partner_person_id": PARTNER_PERSON_ID,
+                     "partner_name": "Synthetic Partner"}
         elif path == "/api/crm/statistics":
-            body = {}
+            body = {"total_people": 2}
         elif path == "/api/crm/birthdays/today":
             body = {"birthdays": []}
         elif path == "/api/crm/people":
-            body = EMPTY_PEOPLE_PAGE
+            body = {"people": [SYNTHETIC_OTHER_PERSON], "total": 1, "offset": 0, "count": 1}
         elif path == f"/api/crm/people/{MY_PERSON_ID}":
             body = SYNTHETIC_ME_PERSON
         elif path == "/api/crm/me/interactions/span":
@@ -178,6 +201,25 @@ def _active_pages(page: Page):
     )
 
 
+def _visible_dashboards(page: Page):
+    """Which of the four dashboard containers are currently visible.
+
+    #909 review finding 2/5: a leaked dashboard (e.g. Relationship still
+    rendered underneath Family) is invisible to a test that only checks the
+    *target* container is shown -- this checks all four every time so a
+    stacked leak fails immediately, and finding 5's mutation test (deleting
+    `showFamilyDashboard()`'s `#meDashboard`-hiding lines) actually fails
+    the suite instead of passing it.
+    """
+    return [sel for sel in _DASHBOARD_IDS if page.locator(sel).is_visible()]
+
+
+def _assert_only_visible(page: Page, expected_id: str):
+    assert _visible_dashboards(page) == [expected_id], (
+        f"expected only {expected_id} visible, got {_visible_dashboards(page)}"
+    )
+
+
 class TestNoDocumentReload:
     """Clicking a nav link updates the URL and swaps the dashboard without
     the browser performing a fresh document load."""
@@ -186,26 +228,45 @@ class TestNoDocumentReload:
         requests_seen, load_events, console_errors = _goto_me(page, crm_base_url)
 
         assert _active_pages(page) == ["me"]
+        _assert_only_visible(page, "#meDashboard")
 
         page.locator('[data-page="family"]').click()
         expect(page.locator("#familyDashboard")).to_be_visible()
         assert page.evaluate("window.location.pathname") == "/family"
         assert _active_pages(page) == ["family"]
+        _assert_only_visible(page, "#familyDashboard")
 
         page.locator('[data-page="birthdays"]').click()
         expect(page.locator("#birthdaysPage")).to_be_visible()
         assert page.evaluate("window.location.pathname") == "/birthdays"
         assert _active_pages(page) == ["birthdays"]
+        _assert_only_visible(page, "#birthdaysPage")
 
         page.locator('[data-page="relationship"]').click()
         expect(page.locator("#relationshipDashboard")).to_be_visible()
         assert page.evaluate("window.location.pathname") == "/relationship"
         assert _active_pages(page) == ["relationship"]
+        _assert_only_visible(page, "#relationshipDashboard")
+
+        # Relationship -> Family and Family -> Relationship (#909 review
+        # finding 2/5): showFamilyDashboard() used to leave the Relationship
+        # dashboard rendered underneath it, invisible to a test that only
+        # ever entered Family from Me/Birthdays.
+        page.locator('[data-page="family"]').click()
+        expect(page.locator("#familyDashboard")).to_be_visible()
+        assert page.evaluate("window.location.pathname") == "/family"
+        _assert_only_visible(page, "#familyDashboard")
+
+        page.locator('[data-page="relationship"]').click()
+        expect(page.locator("#relationshipDashboard")).to_be_visible()
+        assert page.evaluate("window.location.pathname") == "/relationship"
+        _assert_only_visible(page, "#relationshipDashboard")
 
         page.locator('[data-page="me"]').click()
         expect(page.locator("#meDashboard")).to_be_visible()
         assert page.evaluate("window.location.pathname") == "/me"
         assert _active_pages(page) == ["me"]
+        _assert_only_visible(page, "#meDashboard")
 
         # The CRM brand link has always redirected to /me on a direct load
         # (init()); clicking it client-side preserves that.
@@ -213,6 +274,7 @@ class TestNoDocumentReload:
         expect(page.locator("#meDashboard")).to_be_visible()
         assert page.evaluate("window.location.pathname") == "/me"
         assert _active_pages(page) == ["me"]
+        _assert_only_visible(page, "#meDashboard")
 
         assert load_events == [], (
             f"expected zero document loads after the first, got {len(load_events)}"
@@ -240,6 +302,37 @@ class TestNoDocumentReload:
         # out before calling pushState()/dispatchRoute().
         assert page.evaluate("window.location.pathname") == "/me"
 
+    def test_birthdays_click_resets_a_filtered_query_string(self, page: Page, crm_base_url):
+        """A nav-link click is a no-op only when the target is *exactly*
+        where the page already is -- pathname alone isn't enough: from
+        /birthdays?day=03-15 (Timeline tab, filtered), clicking Birthdays
+        again must land on plain /birthdays, Calendar tab, matching what a
+        full document reload to the bare URL would have shown (#909 review
+        finding 6)."""
+        _, load_events, console_errors = _prepare(page)
+        page.goto(f"{crm_base_url}/birthdays?day=03-15")
+        expect(page.locator("#birthdaysPage")).to_be_visible()
+        expect(page.locator('.birthdays-tab[data-tab="timeline"]')).to_have_class(
+            re.compile(r"\bactive\b")
+        )
+        load_events.clear()
+
+        page.locator('[data-page="birthdays"]').click()
+        expect(page.locator("#birthdaysPage")).to_be_visible()
+        assert page.evaluate("window.location.href").endswith("/birthdays"), (
+            "clicking Birthdays from a filtered URL must clear the query string"
+        )
+        expect(page.locator('.birthdays-tab[data-tab="heatmap"]')).to_have_class(
+            re.compile(r"\bactive\b")
+        )
+        expect(page.locator('.birthdays-tab[data-tab="timeline"]')).not_to_have_class(
+            re.compile(r"\bactive\b")
+        )
+
+        assert load_events == []
+        unexpected_errors = [e for e in console_errors if "d3" not in e.lower()]
+        assert not unexpected_errors, f"Unexpected console errors: {unexpected_errors}"
+
 
 class TestBackForward:
     """Browser back/forward restores the previous dashboard without a
@@ -257,20 +350,24 @@ class TestBackForward:
         expect(page.locator("#familyDashboard")).to_be_visible()
         assert page.evaluate("window.location.pathname") == "/family"
         assert _active_pages(page) == ["family"]
+        _assert_only_visible(page, "#familyDashboard")
 
         page.go_back()
         expect(page.locator("#meDashboard")).to_be_visible()
         assert page.evaluate("window.location.pathname") == "/me"
         assert _active_pages(page) == ["me"]
+        _assert_only_visible(page, "#meDashboard")
 
         page.go_forward()
         expect(page.locator("#familyDashboard")).to_be_visible()
         assert page.evaluate("window.location.pathname") == "/family"
+        _assert_only_visible(page, "#familyDashboard")
 
         page.go_forward()
         expect(page.locator("#birthdaysPage")).to_be_visible()
         assert page.evaluate("window.location.pathname") == "/birthdays"
         assert _active_pages(page) == ["birthdays"]
+        _assert_only_visible(page, "#birthdaysPage")
 
         assert load_events == [], (
             f"expected zero document loads across back/forward, got {len(load_events)}"
@@ -289,7 +386,7 @@ class TestDashboardStatePersists:
         requests_seen, load_events, console_errors = _goto_me(page, crm_base_url)
 
         def _count(path):
-            return len([p for p in requests_seen if p == path])
+            return len([r for r in requests_seen if r["path"] == path])
 
         # Let the first Me visit's /me/interactions settle.
         for _ in range(100):
@@ -343,3 +440,78 @@ class TestDirectLoadsUnchanged:
         page.goto(f"{crm_base_url}/crm")
         expect(page.locator("#meDashboard")).to_be_visible()
         assert page.evaluate("window.location.pathname") == "/me"
+
+
+class TestYearsSelectorRespectsUserOverride:
+    """The Me dashboard's heatmap years dropdown must not be clobbered by
+    ensureMeHeatmapYears()'s span re-assertion (#909 review finding 1):
+    picking a year count fetches that window and keeps showing it, rather
+    than silently reverting to the span-derived default on the very call the
+    selection triggered."""
+
+    def test_selecting_years_fetches_that_window_and_keeps_the_selection(
+        self, page: Page, crm_base_url,
+    ):
+        requests_seen, _, console_errors = _goto_me(page, crm_base_url)
+
+        def _me_interactions_days_back_values():
+            return [
+                r["query"].get("days_back", [None])[0]
+                for r in requests_seen if r["path"] == "/api/crm/me/interactions"
+            ]
+
+        # Let the initial span-derived request (mocked span years=2, i.e.
+        # days_back=737) land before selecting a different window.
+        for _ in range(100):
+            if _me_interactions_days_back_values():
+                break
+            page.wait_for_timeout(20)
+        assert "737" in _me_interactions_days_back_values()
+
+        select = page.locator("#heatmapYearsSelect")
+        select.select_option("3")
+        page.wait_for_timeout(300)
+
+        # 3 years -> days_back = 3*365 + 7 = 1102.
+        assert "1102" in _me_interactions_days_back_values(), (
+            f"expected a /me/interactions request with days_back=1102 (3 years) "
+            f"after selecting '3', got days_back values: {_me_interactions_days_back_values()}"
+        )
+
+        # The selection itself must stick -- not get silently reverted back
+        # to the span-derived "2" by the very call it triggered.
+        assert select.input_value() == "3"
+        expect(page.locator("#heatmapTitle")).to_have_text("3-Year Interaction History")
+
+        unexpected_errors = [e for e in console_errors if "d3" not in e.lower()]
+        assert not unexpected_errors, f"Unexpected console errors: {unexpected_errors}"
+
+
+class TestBirthdaysEntryPoint:
+    """Entering the app at /birthdays (a realistic bookmark/share target)
+    and then navigating to another dashboard must not leave the sidebar and
+    header stats stuck on their loading state forever (#909 review
+    finding 3): /birthdays intentionally skips loadPeople()/loadStatistics()
+    in init() for a faster initial render, and nothing previously
+    compensated once the user moved on to a dashboard that does need them."""
+
+    def test_family_and_me_load_people_and_stats_after_entering_at_birthdays(
+        self, page: Page, crm_base_url,
+    ):
+        _, _, console_errors = _prepare(page)
+        page.goto(f"{crm_base_url}/birthdays")
+        expect(page.locator("#birthdaysPage")).to_be_visible()
+
+        page.locator('[data-page="family"]').click()
+        expect(page.locator("#familyDashboard")).to_be_visible()
+        expect(page.locator("#totalPeople")).to_have_text("2", timeout=3000)
+        expect(page.locator("#peopleList")).not_to_contain_text("Loading people...", timeout=3000)
+        expect(page.locator("#peopleList")).to_contain_text("Synthetic Friend")
+
+        page.locator('[data-page="me"]').click()
+        expect(page.locator("#meDashboard")).to_be_visible()
+        expect(page.locator("#totalPeople")).to_have_text("2")
+        expect(page.locator("#peopleList")).to_contain_text("Synthetic Friend")
+
+        unexpected_errors = [e for e in console_errors if "d3" not in e.lower()]
+        assert not unexpected_errors, f"Unexpected console errors: {unexpected_errors}"
