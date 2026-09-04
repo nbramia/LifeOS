@@ -2,11 +2,13 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-08-12
+**Last Updated:** 2026-09-04
 
-The aggregated views that sit alongside the people list: Family Dashboard (`/crm#family`), Me Dashboard (`/me`, the CRM landing page), Birthdays Page (`/birthdays`), and Relationship Dashboard (`/relationship`). Each surfaces interaction patterns and insights derived from the CRM data model.
+The aggregated views that sit alongside the people list: Family Dashboard (`/family`), Me Dashboard (`/me`, the CRM landing page), Birthdays Page (`/birthdays`), and Relationship Dashboard (`/relationship`). Each surfaces interaction patterns and insights derived from the CRM data model.
 
 See [crm-ui.md](crm-ui.md) for the CRM index and the sibling specs that cover people, interactions, and the graph.
+
+Each dashboard's heaviest endpoint (its interactions/timeline aggregate, plus `/statistics`, `/birthdays/all`, and the default people list) is served from a short-lived server cache, bounded by a five-minute TTL: a repeat request with the same parameters, from any client, returns instantly and a change anywhere in the CRM data invalidates it well within that window — see [architecture.md](../technical/architecture.md) for how the cache is keyed and invalidated.
 
 ---
 
@@ -21,7 +23,7 @@ See [crm-ui.md](crm-ui.md) for the CRM index and the sibling specs that cover pe
 
 ## Family Dashboard
 
-`URL: /crm#family`
+`URL: /family`
 
 Aggregated view of interactions across multiple selected family members. Lets you track engagement with family as a group and quickly see which member you've been out of touch with.
 
@@ -177,6 +179,10 @@ Owner's network health at a glance. Replaces the generic people list as the entr
 - **Messaging by circle** — interaction volume broken down by Dunbar circle (see [crm-people.md § Dunbar Circles](crm-people.md#dunbar-circles)).
 - **Trends** — configurable trend period for interaction patterns.
 
+### Heatmap window sizing
+
+Unlike the Family dashboard's fixed year dropdown (defaulting to 10 years), the Me page's heatmap sizes itself from the actual span of interaction data: it calls `GET /api/crm/me/interactions/span` first, which returns the earliest and latest interaction dates (excluding self, hidden, and peripheral people — the same population `/me/interactions` aggregates) and a suggested `years` value clamped to 1–10. The page requests exactly that window from `/me/interactions` instead of always requesting 10 years and shrinking the display afterward once the (much larger) response arrives.
+
 ### API endpoints
 
 | Endpoint | Purpose |
@@ -184,6 +190,7 @@ Owner's network health at a glance. Replaces the generic people list as the entr
 | `GET /api/crm/me/stats` | Aggregated owner stats (interaction counts, health score) |
 | `GET /api/crm/me/timeline` | Owner's interaction timeline, paginated |
 | `GET /api/crm/me/interactions` | Interaction data with trend and health-period support (heatmap, volume chart, trend visualizations) |
+| `GET /api/crm/me/interactions/span` | Earliest/latest interaction dates and a suggested heatmap year count; used to size the heatmap window before the first `/me/interactions` request |
 
 ---
 
@@ -215,7 +222,7 @@ When contacts have birthdays matching today's date, a dismissible toast banner a
 
 `URL: /relationship`
 
-Therapy-informed insights and communication visualizations for a primary relationship (e.g., partner). Identified by `LIFEOS_PARTNER_NAME` and adjacent settings (see [configuration.md § Relationships](../../guides/configuration.md#relationships)).
+Therapy-informed insights and communication visualizations for a primary relationship (e.g., partner). Identified by `LIFEOS_PARTNER_NAME` and adjacent settings (see [configuration.md § Relationships](../../guides/configuration.md#relationships)). If no partner is configured (`partner_person_id` empty in `GET /api/crm/config`), the page renders a short empty state explaining what to configure instead of issuing any partner-scoped request.
 
 ### Therapy insights
 
@@ -237,7 +244,7 @@ Each panel has a refresh button to re-extract insights on demand.
 | Card | What it shows |
 |------|---------------|
 | **iMessage Dynamics** | Who initiates conversations and volume balance. |
-| **Tone Evolution** | Emotional warmth over time, with view modes (combined / user-only / partner-only / both). |
+| **Tone Evolution** | Emotional warmth over time, with view modes (combined / user-only / partner-only / both). Results are persisted per person/month and only recomputed when stale (see below); a manual refresh button forces recomputation of the full window. |
 | **Interaction Intensity** | Daily connection rhythm over 12 months. |
 | **Weekly Rhythm** | Peak connection days of the week. |
 | **Beyond Texting** | Monthly activity breakdown by channel (email, calendar, etc.). |
@@ -248,7 +255,7 @@ Each panel has a refresh button to re-extract insights on demand.
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /api/crm/relationship/tone-analysis` | Aggregated tone analysis over configurable months (samples up to 20 messages per month). |
-| `POST /api/crm/relationship/tone-analysis-detailed` | Separate user/partner tone scores (samples up to 10 messages per week per person). |
+| `POST /api/crm/relationship/tone-analysis-detailed` | Separate user/partner tone scores, one overall score per person per stale month, persisted so only stale months are ever recomputed. A stale month that couldn't be recomputed keeps its last stored score (the chart renders it as a dimmed point); `refresh=true` forces full recomputation. Full freshness/recompute mechanics and query parameters in [api-crm.md](api-crm.md#post-apicrmrelationshiptone-analysis-detailed); storage schema in [data-and-sync.md § Store Locations](../technical/data-and-sync.md#store-locations). |
 
 ---
 
@@ -259,5 +266,6 @@ Each panel has a refresh button to re-extract insights on demand.
 - [crm-interactions.md](crm-interactions.md) — Interaction source ingestion (the dashboards aggregate over these)
 - [crm-graph.md](crm-graph.md) — Relationship graph (some dashboards link out to the graph view)
 - [api-reference.md](api-reference.md) — Full HTTP endpoint catalog
+- [architecture.md](../technical/architecture.md) — `AggregateCache`, the response cache these dashboards' heaviest endpoints share
 - [journal-analytics.md](journal-analytics.md) — Sibling analytics view (daily-journal emotion wheel) using the same pre-aggregated-response, graceful-window-fallback pattern
 - [configuration.md](../../guides/configuration.md) — `LIFEOS_PARTNER_NAME`, `LIFEOS_THERAPIST_PATTERNS`, `LIFEOS_PERSONAL_RELATIONSHIP_PATTERNS`

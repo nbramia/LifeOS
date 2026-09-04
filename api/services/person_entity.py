@@ -12,11 +12,12 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING
+from typing import Iterable, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from api.services.people_aggregator import PersonRecord
@@ -24,6 +25,26 @@ if TYPE_CHECKING:
 from api.utils.datetime_utils import make_aware as _make_aware
 
 logger = logging.getLogger(__name__)
+
+# Chunk size for any SQL IN/NOT IN clause built from a caller-supplied list
+# of ids. SQLite's default SQLITE_MAX_VARIABLE_NUMBER has been 32766 since
+# 3.32.0 (999 was the default before that, and some builds raise it further
+# still -- this one measures 250,000). 900 has no relationship to any of
+# those numbers; it's a deliberately conservative, portable chunk size that
+# stays safely under all of them without detecting the compiled-in limit at
+# runtime. Mirrored in api/services/interaction_store.py's InteractionStore
+# (kept as a separate constant there -- no shared import for one number).
+SQL_IN_CLAUSE_CHUNK_SIZE = 900
+
+
+def _escape_like_pattern(text: str) -> str:
+    """Escape SQL LIKE wildcards (`%`, `_`) and the escape character itself.
+
+    Without this, a literal `%` or `_` typed into a search box (e.g. an
+    email local part containing `_`) is interpreted as a wildcard instead of
+    a literal character. Pair with `ESCAPE '\\'` in the LIKE clause.
+    """
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 @dataclass
@@ -498,6 +519,13 @@ class PersonEntityStore:
         self.db_path = Path(db_path)
         self._merged_ids: dict[str, str] = {}  # secondary_id -> primary_id
         self._blocklist: set[str] = set()  # Blocked emails/phones (lowercase)
+        self._get_all_cache: dict[
+            tuple[bool, bool],
+            tuple[int, int, tuple[PersonEntity, ...]],
+        ] = {}
+        self._get_all_cache_generation = 0
+        self._get_all_cache_lock = threading.Lock()
+        self._data_version_conn: Optional[sqlite3.Connection] = None
         self._init_db()
         self._load_blocklist()
         self._load_merged_ids()
@@ -591,6 +619,38 @@ class PersonEntityStore:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _get_data_version_connection(self) -> sqlite3.Connection:
+        """Get the persistent connection used only for PRAGMA data_version.
+
+        This connection is read-only (PRAGMA data_version is the only
+        statement ever executed on it) and every call site
+        (_current_data_version) is reached only while holding
+        _get_all_cache_lock, so cross-thread use is serialized. That is
+        what makes check_same_thread=False safe here despite the
+        threadpool dispatch these routers now use.
+        """
+        if self._data_version_conn is None:
+            self._data_version_conn = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,  # threadpool-safe: pragma-only, guarded by lock
+            )
+        return self._data_version_conn
+
+    def _current_data_version(self) -> int:
+        """Read SQLite's cross-connection commit counter."""
+        row = self._get_data_version_connection().execute("PRAGMA data_version").fetchone()
+        return int(row[0])
+
+    def _bump_get_all_cache_generation_locked(self) -> None:
+        """Invalidate get_all cache entries while the cache lock is held."""
+        self._get_all_cache_generation += 1
+        self._get_all_cache.clear()
+
+    def _bump_get_all_cache_generation(self) -> None:
+        """Invalidate get_all cache entries after in-process writes."""
+        with self._get_all_cache_lock:
+            self._bump_get_all_cache_generation_locked()
 
     def _entity_to_values(self, entity: PersonEntity) -> tuple:
         """Convert PersonEntity to tuple of values for SQL INSERT/UPDATE."""
@@ -710,6 +770,7 @@ class PersonEntityStore:
             conn.commit()
         finally:
             conn.close()
+        self._bump_get_all_cache_generation()
         self._blocklist.add(identifier)
 
     def hide_person(self, entity_id: str, reason: str = "") -> Optional[PersonEntity]:
@@ -785,6 +846,7 @@ class PersonEntityStore:
 
             if count > 0:
                 conn.commit()
+                self._bump_get_all_cache_generation()
                 logger.info(f"Purged {count} hidden entities older than {older_than_days} days")
 
             return count
@@ -821,14 +883,20 @@ class PersonEntityStore:
 
     def _load_merged_ids(self) -> None:
         """Load the merged IDs mapping for durability."""
+        merged_ids: dict[str, str] = {}
         if self.MERGED_IDS_PATH.exists():
             try:
                 with open(self.MERGED_IDS_PATH) as f:
-                    self._merged_ids = json.load(f)
-                if self._merged_ids:
-                    logger.info(f"Loaded {len(self._merged_ids)} merged ID mappings")
+                    merged_ids = json.load(f)
+                if merged_ids:
+                    logger.info(f"Loaded {len(merged_ids)} merged ID mappings")
             except Exception as e:
                 logger.warning(f"Failed to load merged IDs: {e}")
+                return
+        with self._get_all_cache_lock:
+            if merged_ids != self._merged_ids:
+                self._merged_ids = merged_ids
+                self._bump_get_all_cache_generation_locked()
 
     def reload_merged_ids(self) -> None:
         """Reload merged IDs mapping from disk (call after a merge operation)."""
@@ -844,7 +912,7 @@ class PersonEntityStore:
         after batch add/update operations. With SQLite, each add/update/delete
         is committed immediately, so explicit save() is no longer needed.
         """
-        pass
+        self._bump_get_all_cache_generation()
 
     def add(self, entity: PersonEntity) -> Optional[PersonEntity]:
         """
@@ -883,6 +951,7 @@ class PersonEntityStore:
             conn.commit()
         finally:
             conn.close()
+        self._bump_get_all_cache_generation()
 
         # Return a copy to avoid reference issues
         return PersonEntity.from_dict(entity.to_dict())
@@ -908,6 +977,7 @@ class PersonEntityStore:
             conn.commit()
         finally:
             conn.close()
+        self._bump_get_all_cache_generation()
 
         return PersonEntity.from_dict(entity.to_dict())
 
@@ -942,6 +1012,7 @@ class PersonEntityStore:
             conn.execute("DELETE FROM person_names WHERE person_id = ?", (entity_id,))
             conn.execute("DELETE FROM person_entities WHERE id = ?", (entity_id,))
             conn.commit()
+            self._bump_get_all_cache_generation()
             return True
         finally:
             conn.close()
@@ -961,6 +1032,112 @@ class PersonEntityStore:
             if row:
                 return self._row_to_entity(row)
             return None
+        finally:
+            conn.close()
+
+    def get_by_ids(self, ids: Iterable[str], exclude_hidden: bool = False) -> dict[str, PersonEntity]:
+        """
+        Batch version of get_by_id(): one query for many ids instead of N.
+
+        Follows the merge chain per id like get_by_id() does, and returns a
+        dict keyed by the ORIGINAL id passed in (not the canonical id), so
+        callers can look up entities by whatever id they started from (e.g.
+        an interaction's person_id) even if it was later merged into another
+        person. Ids with no surviving entity are simply absent from the
+        result.
+
+        Like get_by_id(), hidden entities are included by default. Pass
+        exclude_hidden=True for callers that want get_all()'s default view
+        instead (e.g. a name lookup that should show "Unknown" for a hidden
+        person rather than their real name).
+        """
+        wanted = [i for i in dict.fromkeys(ids) if i]
+        if not wanted:
+            return {}
+
+        canonical_of = {i: self.get_canonical_id(i) for i in wanted}
+        canonical_ids = set(canonical_of.values())
+
+        conn = self._get_connection()
+        try:
+            placeholders = ','.join('?' * len(canonical_ids))
+            query = f"SELECT * FROM person_entities WHERE id IN ({placeholders})"
+            params: list = list(canonical_ids)
+            if exclude_hidden:
+                query += " AND hidden = 0"
+            rows = conn.execute(query, params).fetchall()
+            by_canonical = {row['id']: self._row_to_entity(row) for row in rows}
+        finally:
+            conn.close()
+
+        result: dict[str, PersonEntity] = {}
+        for original_id, canonical_id in canonical_of.items():
+            entity = by_canonical.get(canonical_id)
+            if entity is not None:
+                result[original_id] = entity
+        return result
+
+    def get_ids_where(self, column: str, value) -> set[str]:
+        """
+        Return the set of ids where `column` equals `value`.
+
+        `column` is always a fixed string chosen by the caller in code (never
+        derived from a request), so this is safe from injection; still
+        restricted to a small allow-list of known boolean flag columns.
+        """
+        if column not in {"hidden", "is_peripheral_contact"}:
+            raise ValueError(f"Unsupported column for get_ids_where: {column!r}")
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                f"SELECT id FROM person_entities WHERE {column} = ?", (value,)
+            ).fetchall()
+            return {row[0] for row in rows}
+        finally:
+            conn.close()
+
+    def get_hidden_ids(self) -> set[str]:
+        """All ids currently marked hidden (`WHERE hidden = 1`)."""
+        return self.get_ids_where("hidden", 1)
+
+    def get_merged_secondary_ids(self) -> set[str]:
+        """
+        All ids that were merged into another (surviving) person — the keys
+        of the durable merged-id mapping. In practice every one of these is
+        already hidden too (merge_people.py sets hidden=1 on the secondary),
+        so this is mostly a defensive belt-and-suspenders exclusion for
+        anywhere that can't otherwise rely on get_all()'s own merged-id
+        filtering (e.g. a caller building an exclude list without a full
+        get_all() call, like the /me/interactions/span endpoint).
+        """
+        return set(self._merged_ids.keys())
+
+    def get_totals(self) -> dict[str, int]:
+        """
+        Lifetime interaction totals across non-hidden, non-merged people,
+        summed in SQL — used by /me/stats instead of loading every
+        PersonEntity into Python just to add up three columns.
+        """
+        merged_ids = set(self._merged_ids.keys())
+        conn = self._get_connection()
+        try:
+            query = (
+                "SELECT COUNT(*), COALESCE(SUM(email_count), 0), "
+                "COALESCE(SUM(meeting_count), 0), COALESCE(SUM(message_count), 0) "
+                "FROM person_entities WHERE hidden = 0"
+            )
+            params: list = []
+            if merged_ids:
+                ids = list(merged_ids)
+                query += f" AND id NOT IN ({','.join('?' * len(ids))})"
+                params.extend(ids)
+            row = conn.execute(query, params).fetchone()
+            return {
+                "total_people": row[0] or 0,
+                "total_emails": row[1] or 0,
+                "total_meetings": row[2] or 0,
+                "total_messages": row[3] or 0,
+            }
         finally:
             conn.close()
 
@@ -1012,6 +1189,16 @@ class PersonEntityStore:
         """
         Search entities by name, email, or alias.
 
+        `%` and `_` in `query` are escaped so they match literally rather
+        than as SQL LIKE wildcards.
+
+        Known limitation (pre-existing, not introduced by the LIKE-based
+        matching added in #872): `emails` and `aliases` are stored as JSON
+        text, so a non-ASCII character inside one of those lists is stored
+        as a `\\uXXXX` escape sequence and a LIKE against the raw column
+        cannot match the literal character a caller types. `canonical_name`
+        and `display_name` are plain text columns and are unaffected.
+
         Args:
             query: Search string
             limit: Maximum results to return
@@ -1023,13 +1210,13 @@ class PersonEntityStore:
         """
         query_lower = query.lower()
         merged_ids = set(self._merged_ids.keys()) if not include_merged else set()
-        pattern = f"%{query_lower}%"
+        pattern = f"%{_escape_like_pattern(query_lower)}%"
 
         conn = self._get_connection()
         try:
             conditions = [
-                "(LOWER(canonical_name) LIKE ? OR LOWER(display_name) LIKE ? "
-                "OR LOWER(emails) LIKE ? OR LOWER(aliases) LIKE ?)"
+                "(LOWER(canonical_name) LIKE ? ESCAPE '\\' OR LOWER(display_name) LIKE ? ESCAPE '\\' "
+                "OR LOWER(emails) LIKE ? ESCAPE '\\' OR LOWER(aliases) LIKE ? ESCAPE '\\')"
             ]
             params: list = [pattern, pattern, pattern, pattern]
 
@@ -1041,6 +1228,115 @@ class PersonEntityStore:
                    f"ORDER BY last_seen DESC, canonical_name ASC")
 
             rows = conn.execute(sql, params).fetchall()
+
+            results = []
+            for row in rows:
+                if row['id'] in merged_ids:
+                    continue
+                results.append(self._row_to_entity(row))
+                if len(results) >= limit:
+                    break
+
+            return results
+        finally:
+            conn.close()
+
+    def count_search(self, query: str, include_hidden: bool = False,
+                      include_merged: bool = False) -> int:
+        """
+        Count entities matching the same predicate as search().
+
+        Cheap `COUNT(*)` companion to search() for callers that want a
+        "how many matched in total" figure without paginating through every
+        row. Excludes already-merged duplicate rows the same way search()
+        does, via one `id NOT IN (...)` clause per SQL_IN_CLAUSE_CHUNK_SIZE
+        chunk of merged ids (currently in the low hundreds, so this is a
+        single chunk in practice) -- cheap relative to the LIKE scan this
+        query already has to do.
+
+        Args:
+            query: Search string, same matching as search()
+            include_hidden: If True, include hidden entities (default: False)
+            include_merged: If True, include entities that were merged into
+                others (default: False)
+
+        Returns:
+            Number of matching rows.
+        """
+        query_lower = query.lower()
+        pattern = f"%{_escape_like_pattern(query_lower)}%"
+        merged_ids = list(self._merged_ids.keys()) if not include_merged else []
+
+        conn = self._get_connection()
+        try:
+            conditions = [
+                "(LOWER(canonical_name) LIKE ? ESCAPE '\\' OR LOWER(display_name) LIKE ? ESCAPE '\\' "
+                "OR LOWER(emails) LIKE ? ESCAPE '\\' OR LOWER(aliases) LIKE ? ESCAPE '\\')"
+            ]
+            params: list = [pattern, pattern, pattern, pattern]
+
+            if not include_hidden:
+                conditions.append("hidden = 0")
+
+            # One NOT IN clause per chunk (ANDed together) rather than a
+            # single unbounded one, matching InteractionStore's batch-query
+            # chunking so a future spike in merged people can't turn this
+            # into "too many SQL variables".
+            for i in range(0, len(merged_ids), SQL_IN_CLAUSE_CHUNK_SIZE):
+                chunk = merged_ids[i:i + SQL_IN_CLAUSE_CHUNK_SIZE]
+                placeholders = ",".join("?" * len(chunk))
+                conditions.append(f"id NOT IN ({placeholders})")
+                params.extend(chunk)
+
+            where = " AND ".join(conditions)
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM person_entities WHERE {where}", params
+            ).fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+    def list_recent(self, limit: int = 50, category: Optional[str] = None,
+                     include_hidden: bool = False,
+                     include_merged: bool = False) -> list[PersonEntity]:
+        """
+        List entities ordered by last_seen DESC, most recent first, in SQL.
+
+        This is the bounded counterpart to get_all() for callers (like
+        GET /api/people/list) that only need the top N by recency: it applies
+        ORDER BY / LIMIT and the category filter in SQL instead of loading
+        every entity into Python and sorting there.
+
+        Args:
+            limit: Maximum results to return
+            category: If given, filter to this category in SQL
+            include_hidden: If True, include hidden entities (default: False)
+            include_merged: If True, include entities that were merged into
+                others (default: False)
+
+        Returns:
+            List of PersonEntity objects, most recently seen first.
+        """
+        merged_ids = set(self._merged_ids.keys()) if not include_merged else set()
+
+        conn = self._get_connection()
+        try:
+            conditions = []
+            params: list = []
+
+            if not include_hidden:
+                conditions.append("hidden = 0")
+            if category:
+                conditions.append("category = ?")
+                params.append(category)
+
+            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            # Over-fetch a little when we need to filter out merged rows in
+            # Python, so the final page still has `limit` rows when possible.
+            fetch_limit = limit + len(merged_ids) if merged_ids else limit
+            sql = (f"SELECT * FROM person_entities {where} "
+                   f"ORDER BY last_seen DESC LIMIT ?")
+            rows = conn.execute(sql, params + [fetch_limit]).fetchall()
 
             results = []
             for row in rows:
@@ -1066,25 +1362,41 @@ class PersonEntityStore:
         Returns:
             List of PersonEntity objects
         """
-        merged_ids = set(self._merged_ids.keys()) if not include_merged else set()
+        cache_key = (include_hidden, include_merged)
 
-        conn = self._get_connection()
-        try:
-            if include_hidden:
-                rows = conn.execute("SELECT * FROM person_entities").fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM person_entities WHERE hidden = 0").fetchall()
+        with self._get_all_cache_lock:
+            data_version = self._current_data_version()
+            cached = self._get_all_cache.get(cache_key)
+            if cached:
+                cached_data_version, cached_generation, cached_entities = cached
+                if (cached_data_version == data_version and
+                        cached_generation == self._get_all_cache_generation):
+                    return list(cached_entities)
 
-            results = []
-            for row in rows:
-                if row['id'] in merged_ids:
-                    continue
-                results.append(self._row_to_entity(row))
+            merged_ids = set(self._merged_ids.keys()) if not include_merged else set()
+            conn = self._get_connection()
+            try:
+                if include_hidden:
+                    rows = conn.execute("SELECT * FROM person_entities").fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM person_entities WHERE hidden = 0").fetchall()
 
-            return results
-        finally:
-            conn.close()
+                results = []
+                for row in rows:
+                    if row['id'] in merged_ids:
+                        continue
+                    results.append(self._row_to_entity(row))
+
+                data_version = self._current_data_version()
+                self._get_all_cache[cache_key] = (
+                    data_version,
+                    self._get_all_cache_generation,
+                    tuple(results),
+                )
+                return list(results)
+            finally:
+                conn.close()
 
     def count(self) -> int:
         """Get total number of entities."""
@@ -1150,6 +1462,11 @@ class PersonEntityStore:
 
 # Singleton instance
 _entity_store: Optional[PersonEntityStore] = None
+# #868 moved CRM/people/photos handlers off the event loop and onto worker
+# threads, so two first-requests after a restart can now race this
+# check-and-set. Double-checked locking: the lock is only taken while
+# _entity_store is still None, so it costs nothing once constructed.
+_entity_store_lock = threading.Lock()
 
 
 def get_person_entity_store(db_path: str = None) -> PersonEntityStore:
@@ -1164,7 +1481,9 @@ def get_person_entity_store(db_path: str = None) -> PersonEntityStore:
     """
     global _entity_store
     if _entity_store is None:
-        _entity_store = PersonEntityStore(db_path)
+        with _entity_store_lock:
+            if _entity_store is None:
+                _entity_store = PersonEntityStore(db_path)
     return _entity_store
 
 

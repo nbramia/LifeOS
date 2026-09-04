@@ -8,7 +8,9 @@ Relationships are discovered by analyzing shared contexts:
 - Co-mentions in notes
 """
 import sqlite3
+import contextlib
 import json
+import threading
 import uuid
 import logging
 from dataclasses import dataclass, field, asdict
@@ -26,6 +28,19 @@ TYPE_COWORKER = "coworker"
 TYPE_FRIEND = "friend"
 TYPE_FAMILY = "family"
 TYPE_INFERRED = "inferred"  # Discovered through shared contexts
+
+# Explicit column list matching Relationship.from_row()'s expected positional
+# order (see its "Row order" comment). Named rather than `SELECT *` so a
+# query using it doesn't silently depend on the table's physical column
+# order, and doesn't couple to a query adding its own extra columns
+# (#896 review finding 10 / round 3 blocker 2).
+_RELATIONSHIP_COLUMNS = (
+    "id, person_a_id, person_b_id, relationship_type, shared_contexts, "
+    "shared_events_count, shared_threads_count, first_seen_together, "
+    "last_seen_together, created_at, updated_at, shared_messages_count, "
+    "shared_whatsapp_count, shared_slack_count, is_linkedin_connection, "
+    "shared_phone_calls_count, shared_photos_count"
+)
 
 
 @dataclass
@@ -785,6 +800,188 @@ class RelationshipStore:
         finally:
             conn.close()
 
+    def open_connection(self) -> sqlite3.Connection:
+        """
+        Open a new connection for a caller that will make several
+        RelationshipStore calls in one pass (e.g. selecting a bounded graph
+        neighborhood: one `get_all_for_person()` plus one `get_top_neighbors()`
+        per intermediate node) and wants to share a single connection instead
+        of paying a connect/close cost on every call (#896 review finding 11).
+
+        Pass the returned connection as `conn` to `get_all_for_person()` /
+        `get_top_neighbors()`; the caller owns it and must close it (e.g. via
+        `with contextlib.closing(store.open_connection()) as conn:`).
+        """
+        return self._get_connection()
+
+    def get_all_for_person(
+        self, person_id: str, conn: Optional[sqlite3.Connection] = None
+    ) -> list["Relationship"]:
+        """
+        Get every relationship row where person_id appears as either
+        endpoint, unordered and unlimited.
+
+        Uses the person_a_id/person_b_id indexes (WHERE ... OR ...), never
+        scans the full table. Callers that need a ranking rank/filter the
+        result themselves (see `get_top_neighbors()` for the count-sum-proxy
+        case, or `api/routes/crm.py`'s network endpoint for ranking by the
+        real rendered edge weight).
+
+        Args:
+            person_id: Canonical person ID
+            conn: Optional already-open connection to reuse (see
+                `open_connection()`); a fresh one is opened and closed if
+                omitted.
+
+        Returns:
+            List of relationships involving person_id, in no particular order
+        """
+        owns_conn = conn is None
+        if owns_conn:
+            conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT * FROM relationships WHERE person_a_id = ? OR person_b_id = ?",
+                (person_id, person_id),
+            )
+            return [Relationship.from_row(row) for row in cursor.fetchall()]
+        finally:
+            if owns_conn:
+                conn.close()
+
+    def get_top_neighbors(
+        self, person_id: str, limit: int, conn: Optional[sqlite3.Connection] = None
+    ) -> list["Relationship"]:
+        """
+        Get a person's strongest relationships without scanning the full table.
+
+        Ranks and limits in SQL: an indexed WHERE (person_a_id/person_b_id)
+        narrows to this person's own rows, `ORDER BY <shared-interaction
+        count sum> DESC, id LIMIT ?` picks the top `limit` with a
+        deterministic tiebreak, and only those rows are ever hydrated into
+        `Relationship` objects. This proxy is NOT the same as
+        `Relationship.pair_strength` / `edge_weight` (which factor in
+        recency and diversity too) — it's a server-side ranking heuristic
+        for picking which neighbors to include in a bounded graph; the real
+        strength formula is still used for the edges actually returned.
+
+        An earlier version of this method fetched every relationship for
+        person_id via `get_all_for_person()` and ranked/limited in Python.
+        That fixed the tiebreak and removed a positional-`SELECT *`-plus-
+        computed-column coupling, but turned a bounded fetch into an
+        unbounded one on the hottest path in the network-graph endpoint's
+        selection loop: for a person with hundreds of relationships of
+        their own (a first-degree node during second-degree expansion,
+        not just the center), every one of those rows was hydrated just to
+        keep the top handful. Measured (#896 review round 3): 48
+        `get_top_neighbors` calls for one request pulled ~39,600
+        `Relationship.from_row()` constructions total, at ~9µs each
+        (JSON-decoding `shared_contexts` plus four `fromisoformat` calls) —
+        0.356s of a 0.549s request. Ranking and limiting in SQL again (with
+        an explicit column list, never `SELECT *`, so there's still no
+        positional coupling to a computed or reordered column) keeps both
+        of that version's fixes while hydrating only the rows actually
+        returned.
+
+        Args:
+            person_id: Canonical person ID
+            limit: Maximum relationships to return (strongest first)
+            conn: Optional already-open connection to reuse (see
+                `open_connection()`); a fresh one is opened and closed if
+                omitted.
+
+        Returns:
+            List of relationships, strongest (by the count-sum proxy) first
+        """
+        if limit <= 0:
+            return []
+
+        owns_conn = conn is None
+        if owns_conn:
+            conn = self._get_connection()
+        try:
+            cursor = conn.execute(f"""
+                SELECT {_RELATIONSHIP_COLUMNS}
+                FROM relationships
+                WHERE person_a_id = ? OR person_b_id = ?
+                ORDER BY (
+                    shared_events_count + shared_threads_count + shared_messages_count +
+                    shared_whatsapp_count + shared_slack_count + shared_phone_calls_count +
+                    shared_photos_count
+                ) DESC, id
+                LIMIT ?
+            """, (person_id, person_id, limit))
+            return [Relationship.from_row(row) for row in cursor.fetchall()]
+        finally:
+            if owns_conn:
+                conn.close()
+
+    def get_edges_among(
+        self, person_ids, conn: Optional[sqlite3.Connection] = None
+    ) -> list["Relationship"]:
+        """
+        Get the induced subgraph among a set of person IDs: every relationship
+        where BOTH endpoints are in person_ids.
+
+        Loads person_ids into a temp table and joins it against `relationships`
+        twice (once per endpoint column). This avoids the two-pass
+        `person_a_id IN (...)` / `person_b_id IN (...)` approach's blowup when
+        one of the ids has many relationships overall (e.g. the CRM owner in a
+        150-node selection still has thousands of total relationships, most
+        of which don't have their OTHER endpoint in the set) — measured on
+        the real dataset, that approach fetched and Python-filtered ~48k rows
+        for a 150-node owner-centered request; this join returns only the
+        ~2.4k that actually match, in about a third of the time. Avoids
+        SQLite's bound-parameter limit entirely (no `IN (...)` list at all),
+        so there's no chunking to reason about regardless of person_ids' size.
+
+        Args:
+            person_ids: IDs to restrict the subgraph to
+            conn: Optional already-open connection to reuse (see
+                `open_connection()`); a fresh one is opened and closed if
+                omitted.
+
+        Returns:
+            Deduplicated list of relationships, each unordered pair once
+        """
+        ids_set = set(person_ids)
+        if not ids_set:
+            return []
+
+        owns_conn = conn is None
+        if owns_conn:
+            conn = self._get_connection()
+        try:
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS _network_edge_ids (id TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM _network_edge_ids")
+            conn.executemany(
+                "INSERT OR IGNORE INTO _network_edge_ids (id) VALUES (?)",
+                [(pid,) for pid in ids_set],
+            )
+            cursor = conn.execute("""
+                SELECT r.* FROM relationships r
+                JOIN _network_edge_ids a ON r.person_a_id = a.id
+                JOIN _network_edge_ids b ON r.person_b_id = b.id
+            """)
+            seen: set[tuple[str, str]] = set()
+            results: list[Relationship] = []
+            for row in cursor.fetchall():
+                rel = Relationship.from_row(row)
+                key = (rel.person_a_id, rel.person_b_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append(rel)
+            return results
+        finally:
+            # If the connection is already in a bad state, letting this
+            # raise would mask whatever exception got us into `finally` in
+            # the first place (#896 review round 3 finding 6).
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("DROP TABLE IF EXISTS _network_edge_ids")
+            if owns_conn:
+                conn.close()
+
     def get_all_relationships(self, limit: Optional[int] = None) -> list["Relationship"]:
         """
         Get all relationships.
@@ -844,6 +1041,11 @@ class RelationshipStore:
 
 # Singleton instance
 _relationship_store: Optional[RelationshipStore] = None
+# #868 moved CRM/people/photos handlers off the event loop and onto worker
+# threads, so two first-requests after a restart can now race this
+# check-and-set. Double-checked locking: the lock is only taken while
+# _relationship_store is still None, so it costs nothing once constructed.
+_relationship_store_lock = threading.Lock()
 
 
 def get_relationship_store(db_path: Optional[str] = None) -> RelationshipStore:
@@ -858,5 +1060,7 @@ def get_relationship_store(db_path: Optional[str] = None) -> RelationshipStore:
     """
     global _relationship_store
     if _relationship_store is None:
-        _relationship_store = RelationshipStore(db_path)
+        with _relationship_store_lock:
+            if _relationship_store is None:
+                _relationship_store = RelationshipStore(db_path)
     return _relationship_store

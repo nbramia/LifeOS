@@ -392,7 +392,28 @@ class LifeOSMCPServer:
         except Exception:  # pragma: no cover — keep server bootable without agent worker
             self._result_cache = None
         self._load_openapi_spec()
+        self._cap_people_search_limit()
         self._register_inter_agent_tools()
+
+    def _cap_people_search_limit(self) -> None:
+        """Advertise a smaller `limit` default/max for lifeos_people_search
+        than the API itself allows (default 20, max 200).
+
+        The formatter only ever displays the first 10 results regardless of
+        how many the API returns, so keeping the LLM-facing default at 10 and
+        the max at 50 keeps typical tool-call context small; a caller can
+        still ask for the API's full range directly against the HTTP API if
+        it genuinely needs more. Runs after tool build so it applies whether
+        the schema came from the live OpenAPI spec or the offline fallback.
+        """
+        for tool in self.tools:
+            if tool.get("name") != "lifeos_people_search":
+                continue
+            limit_prop = tool.get("inputSchema", {}).get("properties", {}).get("limit")
+            if limit_prop is not None:
+                limit_prop["default"] = 10
+                limit_prop["maximum"] = 50
+            break
 
     def _register_inter_agent_tools(self) -> None:
         """Expose the `lifeos_agent_*` family to remote agents over MCP.
@@ -692,7 +713,8 @@ class LifeOSMCPServer:
             "lifeos_people_search": {
                 "type": "object",
                 "properties": {
-                    "q": {"type": "string", "description": "Name or email to search"}
+                    "q": {"type": "string", "description": "Name or email to search"},
+                    "limit": {"type": "integer", "description": "Max results (default: 10)", "default": 10, "maximum": 50}
                 },
                 "required": ["q"]
             },
@@ -1225,6 +1247,16 @@ class LifeOSMCPServer:
         if tool_name.startswith("lifeos_agent_"):
             return self._handle_inter_agent(tool_name, dict(arguments))
 
+        # lifeos_people_search defaults to a smaller page than the API's own
+        # default (20) so the formatter's existing top-10 display stays
+        # stable when the caller doesn't specify a limit. Applied before the
+        # cache key is captured below so two calls that omit `limit` share a
+        # cache entry with each other (and with an explicit limit=10 call)
+        # instead of the injected default making every no-limit call look
+        # like a fresh, uncached request.
+        if tool_name == "lifeos_people_search":
+            arguments.setdefault("limit", 10)
+
         # Cache check for read-only tools when the caller is session-aware.
         cache_key_args = arguments
         if self._cache_eligible(tool_name) and session_id and self._result_cache is not None:
@@ -1432,8 +1464,20 @@ class LifeOSMCPServer:
             people = data.get("people", data.get("results", []))
             if not people:
                 return "No people found."
-            text = f"Found {len(people)} people:\n\n"
-            for p in people[:10]:
+            shown = people[:10]
+            # Use the API's total match count when available (falling back to
+            # the page size for older/mocked responses that lack it, or that
+            # carry an explicit `"total": null` -- SearchResponse.total is
+            # Optional, so a sibling endpoint's response could serialize it
+            # that way) so a broad query still signals "there are many more
+            # matches, narrow your query" instead of silently looking like an
+            # exhaustive result set of 10.
+            total = data.get("total") or len(people)
+            if total > len(shown):
+                text = f"Found {total} people (showing {len(shown)}):\n\n"
+            else:
+                text = f"Found {total} people:\n\n"
+            for p in shown:
                 name = p.get("name", p.get("canonical_name", "Unknown"))
                 text += f"- **{name}**"
                 if email := p.get("email"):

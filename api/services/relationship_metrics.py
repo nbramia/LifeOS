@@ -418,8 +418,13 @@ def update_all_strengths() -> dict:
     failed = 0
     peripheral_count = 0
 
-    for person in people:
+    for cached_person in people:
         try:
+            # Deep-copy rather than store.get_by_id(): every iteration ends in
+            # an unconditional store.update(), so a private copy of the
+            # cached entity gives the same mutation-safety without an extra
+            # per-person SQL round trip across this full-list, sync-scale loop.
+            person = PersonEntity.from_dict(cached_person.to_dict())
             strength = compute_strength_for_person(person)
             # Apply manual override if defined
             override = STRENGTH_OVERRIDES_BY_ID.get(person.id)
@@ -541,8 +546,10 @@ def compute_all_dunbar_circles(store=None) -> dict:
             circle_strength_cutoffs[circle] = strength
 
         if person.dunbar_circle != circle:
-            person.dunbar_circle = circle
-            store.update(person)
+            updated_person = store.get_by_id(person.id)
+            if updated_person:
+                updated_person.dunbar_circle = circle
+                store.update(updated_person)
         assigned += 1
 
     # Second pass: assign circles to work people based on strength cutoffs
@@ -561,8 +568,10 @@ def compute_all_dunbar_circles(store=None) -> dict:
                     break
 
         if person.dunbar_circle != circle:
-            person.dunbar_circle = circle
-            store.update(person)
+            updated_person = store.get_by_id(person.id)
+            if updated_person:
+                updated_person.dunbar_circle = circle
+                store.update(updated_person)
         assigned += 1
 
     logger.info(f"Computed Dunbar circles for {assigned} non-peripheral contacts")

@@ -158,6 +158,12 @@
             border: 1px solid var(--border-color);
         }
 
+        .nav-link.me-link.active {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+
         .nav-link.me-link:hover {
             background: var(--people);
             color: white;
@@ -574,6 +580,8 @@
         }
 
         .person-avatar {
+            position: relative;
+            overflow: hidden;
             width: 40px;
             height: 40px;
             background: linear-gradient(135deg, var(--people) 0%, var(--people-hover) 100%);
@@ -588,8 +596,29 @@
             background-size: cover;
             background-position: center;
         }
+        /* Inert here in practice: getAvatarStyle() sets an inline `color`
+           on every .person-avatar, and an inline style always wins over
+           this class rule, so a still-loading (optimistically has-photo)
+           avatar keeps showing its initials in full color rather than
+           hiding them -- which is what we want, since it means a slow or
+           never-resolving photo request degrades to visible initials
+           instead of a blank circle. The .avatar-photo-img overlay below
+           is what actually hides the initials, by visually covering them
+           once the image loads. `has-photo`/`no-photo` mostly serve as a
+           JS/test state marker on .person-avatar; this rule is kept
+           because it's harmless and genuinely does apply to other avatars
+           sharing this class pattern without an inline color (e.g.
+           .detail-avatar.has-photo, a separate rule, does hide its text). */
         .person-avatar.has-photo {
             color: transparent;
+        }
+        .person-avatar .avatar-photo-img {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border-radius: 50%;
         }
 
         .person-info {
@@ -7346,15 +7375,15 @@
             <a href="/" class="header-brand">LifeOS</a>
             <nav class="header-nav">
                 <a href="/chat" class="nav-link">💬 Chat</a>
-                <a href="/crm" class="nav-link active">👥 CRM</a>
+                <a href="/crm" class="nav-link active" onclick="return navigateTo('/crm', event)">👥 CRM</a>
                 <a href="/agents" class="nav-link">🛠️ Agents</a>
             </nav>
         </div>
         <div class="header-right">
-            <a href="/birthdays" class="nav-link me-link" data-page="birthdays">🎂 Birthdays</a>
-            <a href="/relationship" class="nav-link me-link">💕 Relationship</a>
-            <a href="/family" class="nav-link me-link">👨‍👩‍👧 Family</a>
-            <a href="/me" class="nav-link me-link">👤 Me</a>
+            <a href="/birthdays" class="nav-link me-link" data-page="birthdays" onclick="return navigateTo('/birthdays', event)">🎂 Birthdays</a>
+            <a href="/relationship" class="nav-link me-link" data-page="relationship" onclick="return navigateTo('/relationship', event)">💕 Relationship</a>
+            <a href="/family" class="nav-link me-link" data-page="family" onclick="return navigateTo('/family', event)">👨‍👩‍👧 Family</a>
+            <a href="/me" class="nav-link me-link" data-page="me" onclick="return navigateTo('/me', event)">👤 Me</a>
             <div class="stats-display">
                 <div class="stat-item">
                     <span>People:</span>
@@ -8107,13 +8136,16 @@
                                             <div class="viz-card-title">Tone Evolution</div>
                                             <div class="viz-card-subtitle">iMessage emotional warmth over time</div>
                                         </div>
-                                        <div class="tone-view-dropdown" style="position: relative;">
-                                            <select id="toneViewSelect" onchange="setToneViewMode(this.value)" style="font-size: 0.7rem; padding: 0.25rem 0.5rem; border-radius: 4px; border: 1px solid var(--border-subtle); background: var(--bg-secondary); color: var(--text-primary); cursor: pointer;">
-                                                <option value="combined">Shared Tone</option>
-                                                <option value="user">My Tone</option>
-                                                <option value="partner">Partner's Tone</option>
-                                                <option value="both">Both</option>
-                                            </select>
+                                        <div style="display: flex; align-items: center; gap: 0.35rem;">
+                                            <div class="tone-view-dropdown" style="position: relative;">
+                                                <select id="toneViewSelect" onchange="setToneViewMode(this.value)" style="font-size: 0.7rem; padding: 0.25rem 0.5rem; border-radius: 4px; border: 1px solid var(--border-subtle); background: var(--bg-secondary); color: var(--text-primary); cursor: pointer;">
+                                                    <option value="combined">Shared Tone</option>
+                                                    <option value="user">My Tone</option>
+                                                    <option value="partner">Partner's Tone</option>
+                                                    <option value="both">Both</option>
+                                                </select>
+                                            </div>
+                                            <button id="toneRefreshBtn" onclick="refreshToneAnalysis()" title="Recompute tone analysis" style="font-size: 0.75rem; padding: 0.2rem 0.4rem; border-radius: 4px; border: 1px solid var(--border-subtle); background: var(--bg-secondary); color: var(--text-primary); cursor: pointer;">↻</button>
                                         </div>
                                     </div>
                                     <div class="viz-card-content" id="toneTimelineViz">
@@ -8172,6 +8204,13 @@
                                 </div>
                             </div>
 
+                        </div>
+
+                        <!-- Shown instead of relationshipDashboard when no partner is configured (#891) -->
+                        <div class="detail-empty" id="relationshipEmptyState" style="display: none;">
+                            <div class="detail-empty-icon">💕</div>
+                            <p>No partner configured</p>
+                            <p style="font-size: 0.85rem; color: var(--text-muted);">Set <code>partner_person_id</code> in <code>config/relationship_overrides.json</code> to enable the Relationship dashboard.</p>
                         </div>
 
                         <!-- Two-column content grid (hidden for Me page) -->
@@ -8670,6 +8709,9 @@
         let people = [];
         let selectedPersonId = null;
         let searchQuery = '';
+        // AbortController for the in-flight people search, so a slower
+        // earlier response can't overwrite a newer query's results (#874).
+        let currentPeopleSearchController = null;
         // People list filters (multi-select)
         let peopleCategoryFilters = new Set(['self', 'family', 'personal']);  // Work excluded by default
         let peopleDunbarFilters = new Set(['0', '1', '2', '3', '4', '5', '6+']);
@@ -8678,9 +8720,19 @@
         let selectedForMerge = new Set();  // IDs selected for merge
         let mergePrimaryId = null;  // Primary person for merge
         let dunbarCircleMap = new Map();  // Map person ID to Dunbar circle
-        let dunbarCirclesInitialized = false;  // Track if global circles have been calculated
         let meInteractionsCache = null;  // Cache for "Me" page interactions
         let meInteractionsCacheYears = null; // Track which years setting the cache was loaded for
+        let meInteractionsSpanPromise = null; // Resolved once per page load; sizes the Me heatmap window
+        let meSpanYears = null; // The Me-specific years value derived from that span (#876: re-asserted
+        // on every ensureMeHeatmapYears() call, not just the first, because `heatmapYears` is a single
+        // shared global the Family/person heatmap views also write to; with dashboard navigation no
+        // longer reloading the document, a Family or person visit in between can leave it pointing at
+        // the wrong window by the time a returning Me visit compares it against meInteractionsCacheYears.
+        let meInteractionsPromise = null; // In-flight /me/interactions request, shared across callers
+        let meInteractionsPromiseKey = null; // days_back:trend_period the in-flight request is for
+        let meStatsCache = null; // Cache for /me/stats (renderMeHeroStats) -- same per-session pattern
+        // as meInteractionsCache above, so a second /me visit reuses the hero-stat totals instead of
+        // re-requesting them.
         // Config loaded from API
         let PARTNER_NAME = '';
         let FAMILY_DEFAULT_SELECTED_IDS = [];
@@ -9003,32 +9055,16 @@
                     FAMILY_DEFAULT_SELECTED_IDS = config.family_default_selected_ids;
                     console.log('[Config] Loaded family_default_selected_ids:', FAMILY_DEFAULT_SELECTED_IDS.length, 'IDs');
                 }
+                // #907 review finding 2: this used to be its own round trip
+                // to GET /api/photos/stats, which -- when Photos *is*
+                // configured -- runs several full-library aggregate queries
+                // and blocked every page's first render on it. `config`'s
+                // `photos_enabled` is just a Path.exists() check server-side
+                // and this request is already awaited before the list ever
+                // renders, so no extra request is needed.
+                photosEnabled = !!config.photos_enabled;
             } catch (error) {
                 console.warn('[Config] Failed to load CRM config:', error);
-            }
-        }
-
-        // Initialize Dunbar circles globally (called once on page load with ALL people)
-        async function initializeDunbarCircles() {
-            if (dunbarCirclesInitialized) return;
-
-            try {
-                // Fetch ALL people sorted by strength to calculate global circles
-                const data = await api('/people?sort=strength&limit=10000');
-                const allPeople = data.people || [];
-
-                console.log(`[Dunbar] Initializing with ${allPeople.length} people`);
-
-                if (allPeople.length === 0) {
-                    console.warn('[Dunbar] No people returned from API');
-                    return;
-                }
-
-                calculateAndStoreDunbarCircles(allPeople);
-                dunbarCirclesInitialized = true;
-                console.log(`[Dunbar] Initialized map with ${dunbarCircleMap.size} entries`);
-            } catch (error) {
-                console.error('[Dunbar] Failed to initialize:', error);
             }
         }
 
@@ -9113,6 +9149,11 @@
         }
 
         // API helpers
+        // Pass { signal: abortController.signal } in `options` to make a call
+        // cancellable; a cancelled call rejects with a DOMException named
+        // "AbortError" (thrown by fetch() itself, before the response is
+        // ever inspected) that callers should treat as "superseded", not
+        // as a failure to report.
         async function api(path, options = {}) {
             const response = await fetch(`/api/crm${path}`, {
                 headers: { 'Content-Type': 'application/json' },
@@ -9248,19 +9289,72 @@
             }
             const method = replace ? 'replaceState' : 'pushState';
             history[method]({ personId, tab }, '', path);
+            // Selecting a person clears whichever dashboard link was
+            // highlighted (or sets "me" for the owner's own profile) --
+            // without this the previous dashboard's link stayed lit while a
+            // person page rendered underneath it (#909 review finding 4).
+            updateActiveNavLink();
         }
 
-        // Handle browser back/forward navigation
-        window.addEventListener('popstate', async (event) => {
-            // Close any open panels when navigating
-            closeEdgePanel();
-            closeNodePanel();
+        // Some direct-load entry points (currently only /birthdays, see
+        // init()) skip loading the people list/stats for a faster initial
+        // render, since that page doesn't need either. If the user then
+        // navigates to a dashboard that does need them -- a nav-link click
+        // or back/forward -- dispatchRoute() below ensures they've been
+        // kicked off at least once per session, via this memoized promise
+        // (#909 review finding 3: previously nothing compensated, leaving
+        // the sidebar and header stats stuck on their loading state
+        // forever).
+        let corePeopleAndStatsPromise = null;
+        function ensurePeopleAndStatsLoaded() {
+            if (!corePeopleAndStatsPromise) {
+                corePeopleAndStatsPromise = Promise.all([loadPeople(), loadStatistics()]);
+            }
+            return corePeopleAndStatsPromise;
+        }
+
+        // Render whatever the current URL (window.location.pathname) points
+        // at, without a document load. Shared by the popstate handler and
+        // navigateTo() (#876) so a click and a back/forward step dispatch
+        // identically. Per-dashboard state (meInteractionsCache, familyData,
+        // communicationGapsData, relationshipToneCache, the person detail
+        // cache) lives in module-scope variables that this function never
+        // clears, so returning to a dashboard with the same parameters
+        // reuses what was already fetched instead of re-requesting it.
+        async function dispatchRoute() {
+            // A running graph force simulation (#896) has its own tick timer
+            // and was never stopped on navigating away from the Graph tab --
+            // harmless under a full document reload (the timer died with the
+            // page), but with dashboard navigation no longer reloading the
+            // document, leaving a person's graph tab for another dashboard
+            // left it ticking indefinitely against DOM it no longer owns,
+            // eventually throwing NaN-attribute console errors once its
+            // physics interacted with whatever the destination view was
+            // doing. Stop it unconditionally here, the single choke point
+            // every dashboard/person navigation passes through; re-entering
+            // the Graph tab starts a fresh one via renderGraph()'s own
+            // (pre-existing) stop-then-restart.
+            if (graphSimulation) {
+                graphSimulation.stop();
+                graphSimulation = null;
+            }
+
+            updateActiveNavLink();
 
             const { personId, tab, isFamily, isRelationship, isBirthdays, birthdayFilter } = parseUrl();
+
             if (isBirthdays) {
-                // Show birthdays page
+                // Show birthdays page (standalone; doesn't need people/stats)
                 showBirthdaysPage(birthdayFilter);
-            } else if (isRelationship) {
+                return;
+            }
+
+            // Every other view renders the sidebar and/or header stats, so
+            // make sure loading them has at least started (see
+            // ensurePeopleAndStatsLoaded() above).
+            ensurePeopleAndStatsLoaded();
+
+            if (isRelationship) {
                 // Show relationship dashboard
                 showRelationshipDashboard();
             } else if (isFamily) {
@@ -9275,9 +9369,11 @@
                 selectedPersonId = personId;
                 renderPeopleList();
                 await loadPersonDetail(personId, false);
-                if (tab) {
-                    await switchTab(tab, true); // true = don't update URL
-                }
+                // Restore the requested tab, or fall back to Overview -- a
+                // click/back-step that lands on a URL with no tab segment
+                // must not leave whatever tab was previously showing (#909
+                // review finding 7).
+                await switchTab(tab || 'overview', true); // true = don't update URL
             } else {
                 // Hide birthdays page and show main container
                 document.getElementById('birthdaysPage').style.display = 'none';
@@ -9290,7 +9386,77 @@
                 document.getElementById('detailEmpty').style.display = 'flex';
                 document.getElementById('detailContent').style.display = 'none';
             }
+        }
+
+        // Handle browser back/forward navigation
+        window.addEventListener('popstate', async (event) => {
+            // Close any open panels when navigating
+            closeEdgePanel();
+            closeNodePanel();
+
+            await dispatchRoute();
         });
+
+        // Highlight whichever of the four dashboard nav links (Birthdays,
+        // Relationship, Family, Me) matches the current URL. The CRM brand
+        // link stays statelessly "active" (it marks the app, not a
+        // dashboard) and is left alone here.
+        function updateActiveNavLink() {
+            const { isFamily, isRelationship, isBirthdays, isMe } = parseUrl();
+            let activePage = null;
+            if (isBirthdays) activePage = 'birthdays';
+            else if (isRelationship) activePage = 'relationship';
+            else if (isFamily) activePage = 'family';
+            else if (isMe) activePage = 'me';
+
+            document.querySelectorAll('.header-right .nav-link.me-link').forEach(link => {
+                link.classList.toggle('active', link.dataset.page === activePage);
+            });
+        }
+
+        // Client-side navigation for the CRM/Me/Family/Birthdays/Relationship
+        // nav links (#876): pushes a history entry and dispatches to the
+        // existing dashboard initializers instead of letting the browser
+        // load the anchor's href as a fresh document. Returning `false`
+        // (via the caller's `onclick="return navigateTo(...)"`) suppresses
+        // the default navigation; returning `true` lets it through
+        // unmodified for modifier-clicks (new tab/window) and non-primary
+        // buttons, which the browser should still handle natively.
+        function navigateTo(path, event) {
+            if (event) {
+                if (event.defaultPrevented || event.button !== 0 ||
+                    event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+                    return true;
+                }
+                event.preventDefault();
+            }
+
+            // /crm has no dashboard of its own - it has always redirected to
+            // /me (see init()); keep that behavior for the client-side path
+            // too so the URL bar reflects where the app actually lands.
+            const targetPath = (path === '/crm' || path === '/crm/') ? '/me' : path;
+
+            // Compare against pathname + search, not pathname alone: none of
+            // the nav links carry a query string, so this only short-circuits
+            // a genuine no-op click. Comparing pathname alone treated e.g.
+            // clicking Birthdays from /birthdays?day=03-15 as "already
+            // there" and left the day filter and Timeline tab in place,
+            // instead of resetting to the plain unfiltered view a document
+            // reload would have shown (#909 review finding 6).
+            if (window.location.pathname + window.location.search === targetPath) {
+                return false;
+            }
+
+            closeEdgePanel();
+            closeNodePanel();
+            history.pushState({}, '', targetPath);
+            // Fire-and-forget (matches the popstate handler's own call
+            // below), but a rejection inside any dashboard initializer
+            // should never vanish as a silent, contextless unhandled
+            // promise rejection (#909 review finding 9).
+            dispatchRoute().catch(err => console.error('Navigation failed:', err));
+            return false;
+        }
 
         // Initialize - uses progressive loading for faster perceived performance
         async function init() {
@@ -9300,7 +9466,9 @@
                 return;
             }
 
-            // Load CRM config first (needed for myPersonId)
+            // Load CRM config first (needed for myPersonId, and for
+            // photosEnabled -- see loadCRMConfig -- before the people list
+            // can render its first avatar).
             await loadCRMConfig();
 
             // Check for birthdays today (non-blocking)
@@ -9308,6 +9476,7 @@
 
             // Check URL early to show special dashboards immediately (don't wait for loadPeople)
             const { personId, tab, isFamily, isRelationship, isBirthdays, birthdayFilter } = parseUrl();
+            updateActiveNavLink();
 
             // For birthdays page, show immediately (standalone page, no people list needed)
             if (isBirthdays) {
@@ -9318,8 +9487,11 @@
             // For relationship page, show dashboard immediately (don't wait for people list)
             if (isRelationship) {
                 // Load people/stats in background, show dashboard now
-                loadPeople();
-                loadStatistics();
+                const relPeoplePromise = loadPeople();
+                const relStatsPromise = loadStatistics();
+                // Record it under the same memo dispatchRoute() checks, so a
+                // nav-link click before these resolve doesn't refire them.
+                corePeopleAndStatsPromise = Promise.all([relPeoplePromise, relStatsPromise]);
                 await showRelationshipDashboard();
                 return;
             }
@@ -9327,6 +9499,10 @@
             // Progressive loading: start loading people/stats in parallel
             const peoplePromise = loadPeople();
             const statsPromise = loadStatistics();
+            // Same memo dispatchRoute() uses (see ensurePeopleAndStatsLoaded()
+            // above) -- recorded here too so a nav-link click that fires
+            // before these resolve sees loading already under way.
+            corePeopleAndStatsPromise = Promise.all([peoplePromise, statsPromise]);
 
             if (isFamily) {
                 // Family dashboard needs people list
@@ -9354,9 +9530,30 @@
             await statsPromise;
         }
 
-        // Load people list (with search result caching)
+        // Loads/reloads the people list (with search result caching).
+        // Called both for an actual search (handleSearch/clearSearch) and
+        // for a plain reload (init(), and after hide/merge/split).
+        //
+        // Contract: a call may resolve WITHOUT updating `people` or
+        // rendering, if a newer call started first (see the identity check
+        // below) — `await loadPeople()` means "this call finished," not
+        // "the list is now fresh." Every current caller tolerates that
+        // today (none reads `people` right after awaiting in a way that
+        // requires it); a caller that needs a stricter guarantee would need
+        // a separate path that doesn't share this cancellation guard.
         async function loadPeople() {
             const listEl = document.getElementById('peopleList');
+
+            // Cancel whatever search is still in flight (if any) so its
+            // response — cached or not — can never land after this one and
+            // overwrite it. This also covers the cache-hit path below: it
+            // "wins" immediately, so nothing from a still-running earlier
+            // call should be allowed to render or cache over it afterward.
+            if (currentPeopleSearchController) {
+                currentPeopleSearchController.abort();
+            }
+            const searchController = new AbortController();
+            currentPeopleSearchController = searchController;
 
             // Build cache key from search query and dunbar filters
             const cacheKey = getSearchCacheKey(searchQuery, peopleDunbarFilters, peopleTagFilters);
@@ -9412,7 +9609,7 @@
                         params.set('tags', [...peopleTagFilters].join(','));
                         params.set('limit', '1000');  // Increase limit for tag filtering
                     }
-                    return api(`/people?${params}`);
+                    return api(`/people?${params}`, { signal: searchController.signal });
                 });
 
                 const results = await Promise.all(fetchPromises);
@@ -9428,8 +9625,28 @@
                     }
                 }
 
-                // Cache the raw merged results before applying dunbar circles
+                // Cache the raw merged results before applying dunbar circles.
+                // Do this even if this response turns out to be superseded
+                // below — the cache key already encodes the query, so
+                // storing a successful response here is safe (it can only
+                // help a later re-search of this exact query render
+                // instantly from cache) even though this call won't adopt
+                // it as the *current* list right now. This only helps a
+                // response that actually completed after being superseded;
+                // it does nothing for the common debounce case, where the
+                // older request is aborted outright and there's no response
+                // to cache at all.
                 setCachedSearch(cacheKey, allPeople);
+
+                // A newer search may have started (and possibly already
+                // resolved from cache) while these requests were in flight.
+                // Abort() stops the network fetch when it's still pending,
+                // but if this one had already reached the browser before
+                // being superseded, abort() is a no-op — so check identity
+                // too and drop the response rather than render it.
+                if (searchController.signal.aborted || currentPeopleSearchController !== searchController) {
+                    return;
+                }
 
                 people = applyDunbarCircles(allPeople);
                 // Sort: self first, then by Dunbar circle, then by relationship strength
@@ -9444,6 +9661,10 @@
                 });
                 renderPeopleList();
             } catch (error) {
+                if (error.name === 'AbortError') {
+                    // Superseded by a newer search; nothing to report.
+                    return;
+                }
                 console.error('Failed to load people:', error);
                 listEl.innerHTML = '<div class="empty-state"><div class="empty-state-icon">⚠️</div><p>Failed to load people</p></div>';
             }
@@ -9501,12 +9722,17 @@
                 return;
             }
 
-            listEl.innerHTML = filteredPeople.map(person => `
+            listEl.innerHTML = filteredPeople.map(person => {
+                // Computed once and reused for both the class name and the
+                // markup itself, rather than calling renderAvatarPhotoImg()
+                // twice per row for the same answer.
+                const avatarImg = renderAvatarPhotoImg(person);
+                return `
                 <div class="person-card ${person.id === selectedPersonId ? 'selected' : ''}"
                      onclick="selectPerson('${person.id}')">
                     <div class="person-checkbox ${selectedForMerge.has(person.id) ? 'checked' : ''}"
                          onclick="event.stopPropagation(); toggleMergeSelection('${person.id}')"></div>
-                    <div class="person-avatar" data-person-id="${person.id}" style="${getAvatarStyle(person.category)}">${getInitials(person.canonical_name)}</div>
+                    <div class="person-avatar ${avatarImg ? 'has-photo' : 'no-photo'}" data-person-id="${person.id}" style="${getAvatarStyle(person.category)}">${getInitials(person.canonical_name)}${avatarImg}</div>
                     <div class="person-info">
                         <div class="person-name">${escapeHtml(person.canonical_name)}</div>
                         <div class="person-company">${escapeHtml(person.company || '')}</div>
@@ -9516,7 +9742,8 @@
                         <div class="person-strength-bar" style="width: ${person.relationship_strength || 0}%"></div>
                     </div>
                 </div>
-            `).join('');
+            `;
+            }).join('');
 
             updateMergeToolbar();
         }
@@ -9727,6 +9954,24 @@
                     invalidateTimelineCache(id);
                 }
                 invalidateTimelineCache(mergePrimaryId);
+
+                // A merged person may have been a family member -- clear the
+                // family dashboard's cached membership/data too, the same
+                // way a person/timeline cache is invalidated above, so a
+                // later Family visit doesn't render a stale id.
+                familyMembers = [];
+                familyMembersLoaded = false;
+                familyData = null;
+                // Refetch immediately (rather than waiting for the next
+                // Family visit) and drop any now-invalid id from the
+                // current selection, so a merged-away person can't linger
+                // in selectedFamilyIds after this. Only reconcile on a
+                // successful refetch -- a transient failure here shouldn't
+                // wipe out the existing selection.
+                await loadFamilyMembers();
+                if (familyMembersLoaded) {
+                    selectedFamilyIds = selectedFamilyIds.filter(id => familyMembers.some(m => m.id === id));
+                }
 
                 // Close modal and refresh
                 closeMergeModal();
@@ -9975,6 +10220,19 @@
                     invalidateTimelineCache(splitTargetPersonId);
                 }
 
+                // Either person may have been a family member -- clear the
+                // family dashboard's cached membership/data too (same
+                // invalidation as confirmMerge() above).
+                familyMembers = [];
+                familyMembersLoaded = false;
+                familyData = null;
+                // Refetch immediately and reconcile selectedFamilyIds (same
+                // as confirmMerge() above).
+                await loadFamilyMembers();
+                if (familyMembersLoaded) {
+                    selectedFamilyIds = selectedFamilyIds.filter(id => familyMembers.some(m => m.id === id));
+                }
+
                 // Close modal and refresh
                 closeSplitModal();
                 await loadPeople();
@@ -10100,7 +10358,10 @@
             // Check cache first - render immediately if available
             const cachedPerson = getCachedPerson(personId);
             if (cachedPerson) {
-                // Instant render from cache
+                // Instant render from cache. The cached object already
+                // carries source entities/relationships (it was populated
+                // from an include_related=true fetch), so this alone
+                // renders everything renderPersonDetail knows how to show.
                 renderPersonDetail(cachedPerson);
 
                 // Load data for the active tab
@@ -10111,18 +10372,23 @@
                     loadGraph(personId);
                 }
 
-                // Background refresh: fetch fresh data to update cache
-                api(`/people/${personId}`).then(person => {
-                    if (selectedPersonId === personId) {
-                        setCachedPerson(personId, person);
-                        // Only re-render if data changed (compare key fields)
-                        if (JSON.stringify(cachedPerson) !== JSON.stringify(person)) {
-                            renderPersonDetail(person);
+                // Background refresh: one fetch (with related data) to update the cache.
+                // Skipped for the owner's own page (/me): unlike a contact's
+                // data, the owner's own aggregate profile isn't expected to
+                // drift within a session, so a second /me visit reuses the
+                // cache with no request at all instead of a silent revalidate.
+                if (!isMyPage(personId)) {
+                    api(`/people/${personId}?include_related=true`).then(person => {
+                        if (selectedPersonId === personId) {
+                            setCachedPerson(personId, person);
+                            // Only re-render if data changed (compare key fields)
+                            if (JSON.stringify(cachedPerson) !== JSON.stringify(person)) {
+                                renderPersonDetail(person);
+                            }
                         }
-                    }
-                }).catch(err => console.warn('[Cache] Background refresh failed:', err));
+                    }).catch(err => console.warn('[Cache] Background refresh failed:', err));
+                }
 
-                loadRelatedData(personId);
                 return;
             }
 
@@ -10130,13 +10396,11 @@
             showPersonLoadingSkeleton();
 
             try {
-                // First: Load basic person data (fast, no related data)
-                const person = await api(`/people/${personId}`);
+                // Single fetch: person detail plus related data (source
+                // entities, relationships) in one round trip (#874).
+                const person = await api(`/people/${personId}?include_related=true`);
                 setCachedPerson(personId, person);
                 renderPersonDetail(person);
-
-                // Background: Load related data (source entities, relationships)
-                loadRelatedData(personId);
 
                 // Load data for the active tab
                 const activeTab = stayOnCurrentTab ? currentTab : document.querySelector('.tab.active')?.dataset.tab;
@@ -10285,19 +10549,6 @@
             // Called implicitly when renderPersonDetail populates the fields
         }
 
-        // Load related data in background (source entities, relationships)
-        async function loadRelatedData(personId) {
-            try {
-                const person = await api(`/people/${personId}?include_related=true`);
-                // Update source entities if still on same person
-                if (selectedPersonId === personId) {
-                    updateSourceEntities(person.source_entities || [], person.source_entity_count || 0);
-                }
-            } catch (error) {
-                console.error('Failed to load related data:', error);
-            }
-        }
-
         // Update source entities section
         function updateSourceEntities(sourceEntities, count) {
             document.getElementById('sourceEntitiesCount').textContent = count.toLocaleString();
@@ -10347,11 +10598,18 @@
                 familyDashboard.classList.remove('visible');
             }
 
-            // Hide relationship dashboard when viewing any person (including /me)
+            // Hide relationship dashboard (and its no-partner empty state,
+            // #899 review finding 2 -- it was left visible here, rendering
+            // inside an unrelated person's page) when viewing any person
+            // (including /me)
             const relationshipDashboard = document.getElementById('relationshipDashboard');
             if (relationshipDashboard) {
                 relationshipDashboard.style.display = 'none';
                 relationshipDashboard.classList.remove('visible');
+            }
+            const relationshipEmptyStateOnPerson = document.getElementById('relationshipEmptyState');
+            if (relationshipEmptyStateOnPerson) {
+                relationshipEmptyStateOnPerson.style.display = 'none';
             }
 
             // Show heatmap for person views (relationship view hides it, so restore it)
@@ -10503,15 +10761,25 @@
             document.getElementById('notesSaveBtn').style.display = 'none';
             document.getElementById('notesUnsavedIndicator').style.display = 'none';
 
-            // Source entities - show count if available, loading state for list
-            // (full list is loaded in background by loadRelatedData)
+            // Source entities - show count if available, loading state for list.
+            // loadPersonDetail always fetches with include_related=true, so
+            // person.source_entities is normally already present here (as
+            // an array, possibly empty) — the "loading" fallback below is
+            // only reachable if some other caller renders a person object
+            // that omits the key entirely. Checking presence of the key
+            // (not its length) matters: with the old length-based check, an
+            // empty-but-present array fell through to the "loading" branch
+            // and stayed there forever (nothing re-renders it — the
+            // follow-up fetch that used to settle it, loadRelatedData(),
+            // was removed when the two-fetch flow was consolidated).
             const sourceEntityCount = person.source_entity_count || 0;
             document.getElementById('sourceEntitiesCount').textContent = sourceEntityCount.toLocaleString();
             const listEl = document.getElementById('sourceEntitiesList');
 
-            // If source_entities included (from include_related=true), render them
-            // Otherwise show loading state - they'll be loaded by loadRelatedData
-            if (person.source_entities && person.source_entities.length > 0) {
+            // If source_entities is present at all (from include_related=true),
+            // render it — updateSourceEntities() itself renders "No source
+            // entities" for an empty array. Otherwise show a loading state.
+            if (person.source_entities) {
                 updateSourceEntities(person.source_entities, sourceEntityCount);
             } else if (sourceEntityCount > 0) {
                 listEl.innerHTML = '<div class="empty-state"><p>Loading source entities...</p></div>';
@@ -10656,7 +10924,8 @@
         // Render hero stats for "Me" page with aggregate totals
         async function renderMeHeroStats() {
             try {
-                const stats = await api('/me/stats');
+                const stats = meStatsCache || await api('/me/stats');
+                meStatsCache = stats;
 
                 // Show aggregate totals
                 document.getElementById('heroStatEmails').textContent = formatCompactNumber(stats.total_emails);
@@ -10676,22 +10945,93 @@
         }
 
         // Load all interactions for "Me" page (for client-side processing)
-        async function loadMeInteractions(forceRefresh = false) {
+        // Size the Me page's heatmap window from the actual span of interaction
+        // data (earliest/latest interaction) instead of requesting a fixed 10
+        // years and shrinking the display afterward. The span fetch itself
+        // resolves once per session; both loadMeHeatMap() and
+        // renderMeDashboard() route through loadMeInteractions(), so awaiting
+        // this here (rather than at either call site) guarantees whichever
+        // fires the first real request already has the corrected
+        // heatmapYears, regardless of call order.
+        //
+        // `respectExplicitYears` (#909 review finding 1): the years dropdown's
+        // own change handler already set `heatmapYears` to what the user
+        // picked before calling down into loadMeHeatMap() -> here; a caller
+        // passes true to mean "don't overwrite that." Without this,
+        // re-asserting from meSpanYears unconditionally (added by #876 to
+        // fix a *different* bug -- heatmapYears drifting from a Family/person
+        // visit in between -- see below) clobbered the user's own selection
+        // on every call, making the dropdown inert. The span promise itself
+        // is still awaited either way so meSpanYears ends up populated for
+        // the next dashboard-entry call.
+        //
+        // When NOT respecting an explicit selection, heatmapYears is
+        // re-asserted from meSpanYears on every call: it's a single global
+        // the Family and person heatmap views also write to, and with
+        // dashboard navigation no longer reloading the document, a Family or
+        // person visit in between can leave it pointing at the wrong window
+        // by the time a returning Me visit compares it against
+        // meInteractionsCacheYears in loadMeInteractions() below.
+        async function ensureMeHeatmapYears(respectExplicitYears = false) {
+            if (!meInteractionsSpanPromise) {
+                meInteractionsSpanPromise = api('/me/interactions/span')
+                    .then(span => {
+                        if (span && span.years) {
+                            meSpanYears = span.years;
+                        }
+                        return span;
+                    })
+                    .catch(error => {
+                        console.error('Failed to load Me interaction span:', error);
+                        return null;
+                    });
+            }
+            const span = await meInteractionsSpanPromise;
+            if (!respectExplicitYears && meSpanYears !== null) {
+                heatmapYears = meSpanYears;
+                const yearsSelect = document.getElementById('heatmapYearsSelect');
+                if (yearsSelect) yearsSelect.value = meSpanYears.toString();
+            }
+            return span;
+        }
+
+        async function loadMeInteractions(forceRefresh = false, respectExplicitYears = false) {
+            await ensureMeHeatmapYears(respectExplicitYears);
             // Use cache only if it matches current heatmapYears setting
             if (meInteractionsCache && meInteractionsCacheYears === heatmapYears && !forceRefresh) {
                 return meInteractionsCache;
             }
-            try {
-                // Fetch data for the selected number of years
-                const daysBack = (heatmapYears * 365) + 7;
-                const data = await api(`/me/interactions?days_back=${daysBack}&trend_period=${currentTrendPeriod}`);
-                meInteractionsCache = data; // Store the whole aggregated response
-                meInteractionsCacheYears = heatmapYears; // Remember which setting this was for
-                return meInteractionsCache;
-            } catch (error) {
-                console.error('Failed to load Me interactions:', error);
-                return null;
+
+            const daysBack = (heatmapYears * 365) + 7;
+            const requestKey = `${daysBack}:${currentTrendPeriod}`;
+
+            // Share one in-flight request across callers that resume on the
+            // same tick: renderMeDashboard() and loadMeHeatMap() both call
+            // loadMeInteractions() right after ensureMeHeatmapYears()
+            // resolves, and at that point meInteractionsCache is still
+            // empty for both of them — without this, both would miss the
+            // cache and fire their own /me/interactions request for the
+            // same data.
+            if (!forceRefresh && meInteractionsPromise && meInteractionsPromiseKey === requestKey) {
+                return meInteractionsPromise;
             }
+
+            meInteractionsPromiseKey = requestKey;
+            meInteractionsPromise = (async () => {
+                try {
+                    const data = await api(`/me/interactions?days_back=${daysBack}&trend_period=${currentTrendPeriod}`);
+                    meInteractionsCache = data; // Store the whole aggregated response
+                    meInteractionsCacheYears = heatmapYears; // Remember which setting this was for
+                    return meInteractionsCache;
+                } catch (error) {
+                    console.error('Failed to load Me interactions:', error);
+                    return null;
+                } finally {
+                    meInteractionsPromise = null;
+                    meInteractionsPromiseKey = null;
+                }
+            })();
+            return meInteractionsPromise;
         }
 
         // Update hero stats from aggregated source totals (called after heatmap loads)
@@ -11006,6 +11346,10 @@
                     // Clear search cache so tag changes are reflected in filters
                     clearSearchCache();
                     collectAllTags();
+                    // Invalidate the cached person so this reload (and any
+                    // later navigate-away-and-back) fetches the saved tags
+                    // instead of the pre-edit cached copy.
+                    invalidatePersonCache(selectedPersonId);
                     await loadPersonDetail(selectedPersonId);
                 }
             } catch (error) {
@@ -11030,6 +11374,8 @@
                 // Clear search cache so tag changes are reflected in filters
                 clearSearchCache();
                 collectAllTags();
+                // Invalidate the cached person (same reasoning as addTag()).
+                invalidatePersonCache(selectedPersonId);
                 await loadPersonDetail(selectedPersonId);
             } catch (error) {
                 console.error('Failed to remove tag:', error);
@@ -11047,6 +11393,8 @@
                     method: 'PATCH',
                     body: JSON.stringify({ birthday: input.trim() })
                 });
+                // Invalidate the cached person (same reasoning as addTag()).
+                invalidatePersonCache(selectedPersonId);
                 await loadPersonDetail(selectedPersonId);
             } catch (error) {
                 console.error('Failed to add birthday:', error);
@@ -11064,6 +11412,8 @@
                     method: 'PATCH',
                     body: JSON.stringify({ birthday: '' })
                 });
+                // Invalidate the cached person (same reasoning as addTag()).
+                invalidatePersonCache(selectedPersonId);
                 await loadPersonDetail(selectedPersonId);
             } catch (error) {
                 console.error('Failed to remove birthday:', error);
@@ -11197,7 +11547,12 @@
             try {
                 // For "Me" page, aggregate interactions across all people
                 if (isMyPage(personId)) {
-                    await loadMeHeatMap();
+                    // An explicit `years` argument means the caller (the years
+                    // dropdown's change handler) already set heatmapYears to
+                    // what the user picked -- respect it rather than letting
+                    // ensureMeHeatmapYears() re-derive it from the interaction
+                    // span (#909 review finding 1).
+                    await loadMeHeatMap(years !== null);
                     return;
                 }
 
@@ -11251,9 +11606,9 @@
         }
 
         // Load and render heatmap for "Me" page (aggregate across all people)
-        async function loadMeHeatMap() {
+        async function loadMeHeatMap(respectExplicitYears = false) {
             try {
-                const data = await loadMeInteractions();
+                const data = await loadMeInteractions(false, respectExplicitYears);
                 if (!data) {
                     heatmapData = {};
                     sourceTotals = {};
@@ -11269,13 +11624,12 @@
                     heatmapData[day.date] = { total: day.total, sources: day.sources };
                 });
 
-                // For /me page, calculate years from actual interaction data
-                const yearsFromData = calculateYearsFromHeatmapData();
-                heatmapYears = yearsFromData;
-                const yearsSelect = document.getElementById('heatmapYearsSelect');
-                if (yearsSelect) yearsSelect.value = yearsFromData.toString();
+                // heatmapYears was already sized from /me/interactions/span
+                // (via ensureMeHeatmapYears() inside loadMeInteractions()), so
+                // there's no need to re-derive it from the fetched data and
+                // re-fetch a differently-sized window.
 
-                // Update title based on calculated years
+                // Update title based on the current years setting
                 const titleEl = document.getElementById('heatmapTitle');
                 if (titleEl) {
                     titleEl.textContent = heatmapYears === 1
@@ -11343,6 +11697,14 @@
 
         // Family dashboard state
         let familyMembers = [];
+        // Per-session cache flag for loadFamilyMembers() -- an empty
+        // `familyMembers` array can't tell "not loaded yet" apart from "the
+        // API genuinely returned zero family members" (a fresh install with
+        // none configured), so a plain `.length === 0` check would refetch
+        // forever in that case. Cleared alongside familyMembers by the same
+        // merge/split invalidation below when a family member might have
+        // changed.
+        let familyMembersLoaded = false;
         let originalHeaderIndicatorsHtml = null;  // Save original header content for restore
         // Default family members - loaded from API via loadFamilyMembers()
         const DEFAULT_FAMILY_IDS = [];
@@ -11356,6 +11718,7 @@
             try {
                 const data = await api('/family/members');
                 familyMembers = data.members || [];
+                familyMembersLoaded = true;
                 return familyMembers;
             } catch (error) {
                 console.error('Failed to load family members:', error);
@@ -11377,6 +11740,20 @@
             document.getElementById('meDashboard').style.display = 'none';
             document.getElementById('meDashboard').classList.remove('visible');
             document.getElementById('personContentGrid').style.display = 'none';
+
+            // Hide relationship dashboard and its no-partner empty state when
+            // navigating here directly from /relationship (#899 review
+            // finding 2 -- neither was hidden here, so either could keep
+            // rendering underneath the family dashboard).
+            const relationshipDashboardOnFamily = document.getElementById('relationshipDashboard');
+            if (relationshipDashboardOnFamily) {
+                relationshipDashboardOnFamily.style.display = 'none';
+                relationshipDashboardOnFamily.classList.remove('visible');
+            }
+            const relationshipEmptyStateOnFamily = document.getElementById('relationshipEmptyState');
+            if (relationshipEmptyStateOnFamily) {
+                relationshipEmptyStateOnFamily.style.display = 'none';
+            }
 
             // Hide the person-level hero stats (they're in tabOverview which stays visible)
             const personHeroStats = document.getElementById('heroStats');
@@ -11450,8 +11827,8 @@
                 if (graphTab) graphTab.style.display = 'none';
             }
 
-            // Load family members if not already loaded
-            if (familyMembers.length === 0) {
+            // Load family members if not already loaded this session
+            if (!familyMembersLoaded) {
                 await loadFamilyMembers();
             }
 
@@ -11515,10 +11892,13 @@
             // Load data
             await loadBirthdaysData();
 
-            // If filter provided, switch to timeline tab
-            if (filterDay) {
-                switchBirthdaysTab('timeline');
-            }
+            // A filter switches to the Timeline tab; no filter resets to the
+            // default Calendar tab -- matching what a fresh document load of
+            // /birthdays would show. Without the explicit reset, navigating
+            // here client-side (#909 review finding 6) after an earlier
+            // filtered visit left the Timeline tab showing even though the
+            // URL and filter had both cleared.
+            switchBirthdaysTab(filterDay ? 'timeline' : 'heatmap');
         }
 
         async function loadBirthdaysData() {
@@ -11751,8 +12131,11 @@
         }
 
         function navigateToPerson(personId) {
-            // Navigate to the person's profile page
-            window.location.href = `/crm/${personId}`;
+            // Navigate to the person's profile page client-side (#876
+            // pattern), instead of a full document load that re-downloads
+            // the page and discards whatever the Birthdays page had already
+            // fetched.
+            navigateTo(`/crm/${personId}`);
         }
 
         // Tab click handler for birthdays page
@@ -11787,18 +12170,19 @@
             const personHeroStats = document.getElementById('heroStats');
             if (personHeroStats) personHeroStats.style.display = 'none';
 
-            // Hide family hero stats and selector
+            // Hide family hero stats and selector -- must happen regardless
+            // of whether a partner is configured (#909 review follow-up:
+            // this used to sit after the no-partner early return below, so
+            // Family -> Relationship left Family's hero stats and member
+            // selector visible on top of the "no partner configured" empty
+            // state; unreachable under a full document reload, live once
+            // dashboard navigation stopped reloading the document).
             const familyHeroStats = document.getElementById('familyHeroStats');
             if (familyHeroStats) familyHeroStats.style.display = 'none';
             const familySelectorContainer = document.getElementById('familySelectorContainer');
             if (familySelectorContainer) familySelectorContainer.style.display = 'none';
 
-            // Show relationship dashboard
-            const relationshipDashboard = document.getElementById('relationshipDashboard');
-            relationshipDashboard.style.display = 'block';
-            relationshipDashboard.classList.add('visible');
-
-            // Hide heatmap for relationship view (not needed here)
+            // Hide heatmap (not needed on either the dashboard or the empty state)
             const heatmapContainer = document.querySelector('.heatmap-container');
             if (heatmapContainer) heatmapContainer.style.display = 'none';
 
@@ -11806,7 +12190,8 @@
             const sourceEntitiesFooter = document.getElementById('sourceEntitiesFooter');
             if (sourceEntitiesFooter) sourceEntitiesFooter.style.display = 'none';
 
-            // Customize header for relationship view
+            // Customize header for relationship view (also shown behind the
+            // no-partner empty state, same reasoning as above)
             const detailAvatar = document.getElementById('detailAvatar');
             const detailName = document.getElementById('detailName');
             const detailCompany = document.getElementById('detailCompany');
@@ -11816,11 +12201,10 @@
             if (detailCompany) detailCompany.textContent = PARTNER_NAME || 'Partner';
             if (detailContactQuick) detailContactQuick.innerHTML = '';
             if (detailTagsChips) detailTagsChips.innerHTML = '';
-
-            // Load partner photo if available, otherwise show heart emoji
             if (detailAvatar) {
                 detailAvatar.textContent = '💕';  // Default fallback
-                loadRelationshipPartnerPhoto(PARTNER_PERSON_ID);
+                detailAvatar.style.backgroundImage = '';
+                detailAvatar.classList.remove('has-photo');
             }
 
             // Hide header indicators
@@ -11838,12 +12222,34 @@
                 detailTabs.style.display = 'none';
             }
 
-            // Load all data
+            // No partner configured (#891): render an empty state and issue no
+            // partner-scoped requests (no insights/timeline/tone/photo calls).
+            const relationshipEmptyState = document.getElementById('relationshipEmptyState');
+            if (!PARTNER_PERSON_ID) {
+                document.getElementById('relationshipDashboard').style.display = 'none';
+                document.getElementById('relationshipDashboard').classList.remove('visible');
+                if (relationshipEmptyState) relationshipEmptyState.style.display = 'flex';
+                return;
+            }
+            if (relationshipEmptyState) relationshipEmptyState.style.display = 'none';
+
+            // Show relationship dashboard
+            const relationshipDashboard = document.getElementById('relationshipDashboard');
+            relationshipDashboard.style.display = 'block';
+            relationshipDashboard.classList.add('visible');
+
+            // Load partner photo now that we know one is configured
+            loadRelationshipPartnerPhoto(PARTNER_PERSON_ID);
+
+            // Load insights and the timeline first; tone analysis can be slow
+            // (a persisted-but-stale month still needs an LLM call) so it must
+            // not gate the rest of the page from rendering (#873). It renders
+            // itself into the tone card whenever it resolves.
             await Promise.all([
                 loadRelationshipInsights(),
                 loadRelationshipTimeline(),
-                loadToneAnalysis(),
             ]);
+            loadToneAnalysis();
 
             // Render visualizations
             renderIMessageBalance();
@@ -12052,18 +12458,41 @@
 
         // Tone view mode: 'user', 'partner', 'combined', 'both'
         let toneViewMode = 'combined';
+        // Whether the data currently in relationshipToneCache came from a
+        // refresh=true request -- renderToneTimeline() uses this to decide
+        // whether an all-stale response is a refresh that failed outright
+        // (worth a banner) versus an ordinary first load that simply hasn't
+        // recomputed anything yet (not a failure, nothing to warn about).
+        let toneCacheWasRefreshAttempt = false;
 
-        // Load tone analysis (detailed version with separate user/partner scores)
-        async function loadToneAnalysis() {
+        // Load tone analysis (detailed version with separate user/partner scores).
+        // Stored, fresh months are served instantly; stale/missing months are
+        // recomputed server-side (#873). Pass refresh=true to force every
+        // month in the window to recompute regardless of freshness.
+        async function loadToneAnalysis(refresh = false) {
             const container = document.getElementById('toneTimelineViz');
+            const refreshBtn = document.getElementById('toneRefreshBtn');
+            if (refreshBtn) refreshBtn.disabled = true;
             try {
-                const data = await api('/relationship/tone-analysis-detailed', { method: 'POST' });
+                const path = refresh
+                    ? '/relationship/tone-analysis-detailed?refresh=true'
+                    : '/relationship/tone-analysis-detailed';
+                const data = await api(path, { method: 'POST' });
                 relationshipToneCache = data;
+                toneCacheWasRefreshAttempt = refresh;
                 renderToneTimeline(data);
             } catch (error) {
                 console.error('Failed to load tone analysis:', error);
                 container.innerHTML = '<div class="viz-loading">Unable to analyze tone</div>';
+            } finally {
+                if (refreshBtn) refreshBtn.disabled = false;
             }
+        }
+
+        // "Refresh" affordance on the Tone Evolution card: force recomputation
+        // of every month in the window, bypassing the freshness cache.
+        function refreshToneAnalysis() {
+            loadToneAnalysis(true);
         }
 
         // Handle tone view mode change
@@ -12211,6 +12640,18 @@
 
             const tones = data.monthly_tones;
 
+            // A refresh that couldn't recompute a single month still comes
+            // back 200 with every month marked `status: "stale"` (its last
+            // stored score) rather than failing outright -- the per-point
+            // dimmed markers below are easy to miss, so a refresh attempt
+            // that changed nothing also gets one small banner on the card.
+            // Only a `refresh=true` load counts: an ordinary first load
+            // showing stale months (nothing computed yet this session) is
+            // expected behavior, not a failure worth flagging.
+            const refreshFailedNotice = (toneCacheWasRefreshAttempt && tones.every(t => t.status === 'stale'))
+                ? '<div class="tone-refresh-failed-notice" style="text-align: center; font-size: 0.7rem; color: var(--text-muted); background: var(--bg-secondary); border: 1px solid var(--border-subtle); border-radius: 4px; padding: 0.25rem 0.5rem; margin-bottom: 0.35rem;">Refresh failed; showing stored scores</div>'
+                : '';
+
             // Chart dimensions
             const width = 420;
             const height = 200;
@@ -12229,28 +12670,60 @@
                 return t.combined_score ?? t.score ?? 50;
             };
 
-            // Build points for a given score function
+            // Build points for a given score function. Error months (the LLM
+            // couldn't compute them and nothing was ever stored) are skipped
+            // entirely here rather than plotted at a fabricated score -- see
+            // errorMarkers below, which renders a distinct "not analysed"
+            // marker at their x position instead (#899 review finding 3).
+            // A "stale" month (a real, previously-computed score the server
+            // couldn't refresh this load) is NOT skipped -- it still has
+            // real data and #873's own acceptance criteria require serving
+            // it rather than discarding it -- but is rendered dimmed and
+            // distinct from a normal point (#899 review finding N2).
+            // `i` (the original, unfiltered index) is kept on each point so
+            // buildLinePath can detect a skipped month and break the line.
             const buildPoints = (scoreFn) => {
-                return tones.map((t, i) => {
-                    const score = scoreFn(t);
-                    const x = leftMargin + (i / Math.max(1, tones.length - 1)) * chartWidth;
-                    const y = topMargin + chartHeight - (score / 100) * chartHeight;
-                    return { x, y, score, month: t.month };
-                });
+                return tones
+                    .map((t, i) => ({ t, i }))
+                    .filter(({ t }) => t.status !== 'error')
+                    .map(({ t, i }) => {
+                        const score = scoreFn(t);
+                        const x = leftMargin + (i / Math.max(1, tones.length - 1)) * chartWidth;
+                        const y = topMargin + chartHeight - (score / 100) * chartHeight;
+                        return { x, y, score, month: t.month, status: t.status, i };
+                    });
             };
 
-            // Build smooth line path
+            // Build a smooth line path, starting a new sub-path (gap) wherever
+            // consecutive points skip an original index -- i.e. an error
+            // month sits between them and must not be smoothed over.
             const buildLinePath = (points) => {
                 if (points.length === 0) return '';
                 let path = `M ${points[0].x} ${points[0].y}`;
                 for (let i = 1; i < points.length; i++) {
                     const p0 = points[i - 1];
                     const p1 = points[i];
+                    if (p1.i !== p0.i + 1) {
+                        path += ` M ${p1.x} ${p1.y}`;
+                        continue;
+                    }
                     const cpX = (p0.x + p1.x) / 2;
                     path += ` C ${cpX} ${p0.y}, ${cpX} ${p1.y}, ${p1.x} ${p1.y}`;
                 }
                 return path;
             };
+
+            // Distinct markers for months the server couldn't analyse, at the
+            // same x position they'd otherwise occupy.
+            const errorMarkers = tones
+                .map((t, i) => ({ t, i }))
+                .filter(({ t }) => t.status === 'error')
+                .map(({ i }) => {
+                    const x = leftMargin + (i / Math.max(1, tones.length - 1)) * chartWidth;
+                    const y = topMargin + chartHeight / 2;
+                    return `<circle cx="${x}" cy="${y}" r="3" fill="none" stroke="var(--text-muted)" stroke-width="1.5" stroke-dasharray="2,2" class="tone-data-point-error"><title>${tones[i].month}: not analysed</title></circle>`;
+                })
+                .join('');
 
             // Colors
             const userColor = '#3b82f6';  // Blue
@@ -12290,23 +12763,41 @@
                 <text x="${leftMargin - 8}" y="${topMargin + chartHeight + 1}" text-anchor="end" style="font-size: 0.55rem; fill: #e94560;">Dismissive</text>
             `;
 
-            // X-axis month labels
+            // X-axis month labels. Error months are skipped here too (no
+            // label implying real data exists) -- errorMarkers above gives
+            // them their own distinct marker instead.
+            //
+            // `new Date(t.month + '-01')` used to parse "YYYY-MM-01" as UTC
+            // midnight, which toLocaleDateString then renders in the
+            // browser's local timezone -- west of UTC that rolls back to the
+            // last day of the *previous* month, so e.g. "2026-04" rendered
+            // as "Mar". Parsing the year/month directly and constructing the
+            // Date in local time avoids the UTC/local mismatch entirely.
             const showEvery = tones.length > 8 ? 2 : 1;
             const monthLabels = tones.map((t, i) => {
+                if (t.status === 'error') return '';
                 if (i % showEvery !== 0 && i !== tones.length - 1) return '';
                 const x = leftMargin + (i / Math.max(1, tones.length - 1)) * chartWidth;
-                const monthName = new Date(t.month + '-01').toLocaleDateString('en-US', { month: 'short' });
+                const [y, m] = t.month.split('-').map(Number);
+                const monthName = new Date(y, m - 1, 1).toLocaleDateString('en-US', { month: 'short' });
                 return `<text x="${x}" y="${height - 8}" text-anchor="middle" style="font-size: 0.55rem; fill: var(--text-muted);">${monthName}</text>`;
             }).join('');
 
-            // Build SVG paths and points
+            // Build SVG paths and points. A "stale" point (real data the
+            // server couldn't refresh this load) is dimmed and its tooltip
+            // says so, distinct from both a normal point and an error gap
+            // (#899 review finding N2).
             let pathsSvg = '';
             let pointsSvg = '';
             lines.forEach(line => {
                 const path = buildLinePath(line.points);
                 pathsSvg += `<path d="${path}" fill="none" stroke="${line.color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.9" />`;
-                line.points.forEach((p, i) => {
-                    pointsSvg += `<circle cx="${p.x}" cy="${p.y}" r="4" fill="${line.color}" class="tone-data-point"><title>${tones[i].month} (${line.label}): ${Math.round(p.score)}</title></circle>`;
+                line.points.forEach((p) => {
+                    const isStale = p.status === 'stale';
+                    const opacity = isStale ? '0.4' : '1';
+                    const staleClass = isStale ? ' tone-data-point-stale' : '';
+                    const staleSuffix = isStale ? ' (stale)' : '';
+                    pointsSvg += `<circle cx="${p.x}" cy="${p.y}" r="4" fill="${line.color}" opacity="${opacity}" class="tone-data-point${staleClass}"><title>${p.month} (${line.label}): ${Math.round(p.score)}${staleSuffix}</title></circle>`;
                 });
             });
 
@@ -12325,12 +12816,14 @@
 
             container.innerHTML = `
                 <div class="tone-timeline-container">
+                    ${refreshFailedNotice}
                     <svg class="tone-timeline-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet">
                         ${gridLines}
                         ${yAxisLabels}
                         ${monthLabels}
                         ${pathsSvg}
                         ${pointsSvg}
+                        ${errorMarkers}
                     </svg>
                     ${legendHtml}
                     <div style="text-align: center; font-size: 0.65rem; color: var(--text-muted); margin-top: 0.25rem;">${summaryText}</div>
@@ -13203,47 +13696,55 @@
             return name.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase();
         }
 
-        // Cache for profile photo availability
+        // Cache for profile photo availability, keyed by person id. Populated
+        // as list avatars resolve (see renderAvatarPhotoImg/handleAvatarPhotoError
+        // below) and reused by the detail-header and relationship-page loaders.
         const profilePhotoCache = new Map();
 
-        // Load profile photos for visible avatars
-        async function loadProfilePhotos() {
-            const avatars = document.querySelectorAll('.person-avatar[data-person-id]');
-            for (const avatar of avatars) {
-                const personId = avatar.dataset.personId;
-                if (!personId) continue;
+        // Whether the Photos integration is configured server-side at all
+        // (settings.photos_enabled, cheap: a Path.exists() check). Set from
+        // GET /api/crm/config's `photos_enabled` field in loadCRMConfig(),
+        // which init() already awaits before the people list first renders --
+        // no separate request (see #907 review finding 2: this used to be
+        // its own round trip to GET /api/photos/stats, which runs several
+        // full-library aggregate queries when Photos *is* configured and
+        // blocked every page's first render on it). Defaults to false (no
+        // requests) until loadCRMConfig() resolves, so an install without
+        // Photos configured issues zero photo requests instead of letting
+        // every flagged person's <img> fail with a 503.
+        let photosEnabled = false;
 
-                // Skip if already processed
-                if (avatar.classList.contains('has-photo') || avatar.classList.contains('no-photo')) continue;
+        // Returns the <img> markup for a person-list avatar, or '' when no photo
+        // request should be issued at all. Renders only for people the list
+        // response flagged via has_profile_photo -- never a HEAD probe, never a
+        // loop over every rendered row. `loading="lazy"` defers the actual
+        // network request until the row nears the viewport, so a 300-row list
+        // does not fire hundreds of image loads on render. A person already
+        // known (from an earlier render this session) to have no reachable
+        // thumbnail is skipped entirely so a repeat render can't re-trigger the
+        // same failed request.
+        function renderAvatarPhotoImg(person) {
+            if (!photosEnabled) return '';
+            if (!person.has_profile_photo) return '';
+            if (profilePhotoCache.get(person.id) === false) return '';
+            return `<img class="avatar-photo-img" data-person-id="${person.id}" loading="lazy" alt=""
+                        src="/api/photos/profile/${person.id}"
+                        onload="profilePhotoCache.set('${person.id}', true)"
+                        onerror="handleAvatarPhotoError(this, '${person.id}')">`;
+        }
 
-                // Check cache first
-                if (profilePhotoCache.has(personId)) {
-                    const hasPhoto = profilePhotoCache.get(personId);
-                    if (hasPhoto) {
-                        avatar.style.backgroundImage = `url(/api/photos/profile/${personId})`;
-                        avatar.classList.add('has-photo');
-                    } else {
-                        avatar.classList.add('no-photo');
-                    }
-                    continue;
-                }
-
-                // Try to load the photo
-                try {
-                    const response = await fetch(`/api/photos/profile/${personId}`, { method: 'HEAD' });
-                    if (response.ok) {
-                        avatar.style.backgroundImage = `url(/api/photos/profile/${personId})`;
-                        avatar.classList.add('has-photo');
-                        profilePhotoCache.set(personId, true);
-                    } else {
-                        avatar.classList.add('no-photo');
-                        profilePhotoCache.set(personId, false);
-                    }
-                } catch {
-                    avatar.classList.add('no-photo');
-                    profilePhotoCache.set(personId, false);
-                }
+        // Fallback when a flagged person's thumbnail can't actually be loaded
+        // (e.g. the photo record exists but the file is missing on disk).
+        // Removes the broken <img> so the initials underneath show through,
+        // and remembers the miss so later renders don't retry it.
+        function handleAvatarPhotoError(img, personId) {
+            profilePhotoCache.set(personId, false);
+            const avatar = img.closest('.person-avatar');
+            if (avatar) {
+                avatar.classList.remove('has-photo');
+                avatar.classList.add('no-photo');
             }
+            img.remove();
         }
 
         // Load profile photo for detail avatar
@@ -13253,6 +13754,16 @@
 
             // Reset classes
             avatar.classList.remove('has-photo', 'no-photo');
+
+            // #907 review finding 7: without this, an install with Photos
+            // not configured issued a photo request (and got a 503, logged
+            // to the console) every time a person was selected -- the list
+            // half of #875 already avoids this, this loader didn't.
+            if (!photosEnabled) {
+                avatar.style.backgroundImage = '';
+                avatar.classList.add('no-photo');
+                return;
+            }
 
             // Check cache first
             if (profilePhotoCache.has(personId)) {
@@ -13287,6 +13798,12 @@
         async function loadRelationshipPartnerPhoto(personId) {
             const avatar = document.getElementById('detailAvatar');
             if (!avatar || !personId) return;
+
+            // #907 review finding 7: see loadDetailProfilePhoto -- without
+            // this, a Photos-less install issued a photo request (503) every
+            // time the relationship dashboard loaded. Leave the default
+            // emoji in place, same as the "no photo" outcome below.
+            if (!photosEnabled) return;
 
             // Check cache first
             if (profilePhotoCache.has(personId)) {
@@ -16661,10 +17178,25 @@
 
             if (firstDegreeEdges.length === 0) return 0;
 
-            // Get weights of first-degree edges
-            const weights = firstDegreeEdges.map(l => l.weight);
+            // Weight range comes from ALL links (matching getGraphWeightStats(),
+            // which is what applyGraphFilters() actually turns a percent back
+            // into a threshold with), not just the first-degree ones. Picking a
+            // percent against a narrower first-degree-only range and then
+            // applying it against the full range is how a real response (e.g.
+            // first-degree weights 9-35 but other edges up to 99) could still
+            // pick a percent that excludes every first-degree edge once
+            // applied (#896 review round 4, MINOR finding 3).
+            const weights = links.map(l => l.weight);
             const maxWeight = weights.reduce((a, b) => Math.max(a, b), 1);
             const minWeight = weights.reduce((a, b) => Math.min(a, b), Infinity);
+
+            // Every edge shares one weight - there's no discriminating
+            // threshold to pick, and forcing a minimum weightRange of 1 below
+            // would make even a 5% step exclude every edge (weight >=
+            // minWeight + 0.05), blanking the whole tab (#896 review round 3
+            // finding 1).
+            if (maxWeight === minWeight) return 0;
+
             const weightRange = Math.max(1, maxWeight - minWeight);
 
             // Count first-degree nodes (excluding center)
@@ -16695,6 +17227,12 @@
                 });
 
                 const nodeCount = visibleNodes.size;
+
+                // Never pick a threshold that hides every first-degree
+                // node - being closer to the target count is worthless if
+                // the tab ends up blank (#896 review round 3 finding 1).
+                if (nodeCount === 0) break;
+
                 const diff = Math.abs(nodeCount - targetNodeCount);
 
                 if (diff < bestDiff) {
@@ -16724,7 +17262,10 @@
             container.innerHTML = '<div class="loading">Loading graph...</div>';
 
             try {
-                // Use the network endpoint with depth=2 for second-degree connections
+                // Use the network endpoint with depth=2 for second-degree connections.
+                // Only depth/center_on are sent - max_nodes/max_second_degree_per_node/
+                // max_edges are left to the server's own defaults so a future default
+                // change reaches the tab without a frontend edit (#896 review finding 12).
                 const data = await api(`/network?center_on=${personId}&depth=2`);
 
                 if (!data.nodes || data.nodes.length === 0) {
@@ -17510,6 +18051,14 @@
 
             // Wait for simulation to stabilize a bit before fitting
             setTimeout(() => {
+                // The graph may no longer be the active view by the time this
+                // fires: a full document reload used to kill this timer
+                // outright, but dashboard/person navigation (#876) doesn't,
+                // so navigating away within this 800ms window left graphSvg
+                // (or its container) present but hidden or gone. Re-check
+                // freshness here rather than only when scheduling above.
+                if (!graphSvg || !graphZoom) return;
+
                 // Get first-degree nodes (degree 0 or 1)
                 const firstDegreeNodes = graphNodes.filter(n => n.degree === 0 || n.degree === 1);
                 if (firstDegreeNodes.length === 0) return;
@@ -17531,10 +18080,31 @@
                 const centerX = (minX + maxX) / 2;
                 const centerY = (minY + maxY) / 2;
 
-                // Get container dimensions
-                const container = graphSvg.node().parentElement;
+                // Get container dimensions. graphSvg is a d3 selection,
+                // which stays truthy even after its <svg> node is detached
+                // from the document (e.g. the node was cleared/replaced by
+                // a subsequent renderGraph() call, or the whole subtree was
+                // torn down) -- graphSvg.node() itself, or its
+                // parentElement, can be null at this point, so both must be
+                // checked before reading clientWidth/clientHeight off of
+                // whatever `container` turns out to be (#909 review
+                // follow-up: the freshness guard above this stopped the
+                // NaN-transform case but not this one -- same root cause,
+                // a stale reference outliving the view it belonged to).
+                const svgNode = graphSvg.node();
+                const container = svgNode && svgNode.parentElement;
+                if (!container) return;
                 const width = container.clientWidth;
                 const height = container.clientHeight;
+
+                // A hidden container (its ancestor tab/dashboard no longer
+                // showing) reports 0 for both -- fitting to it produced a
+                // degenerate (zero/NaN) zoom transform applied via
+                // graphZoom.transform, which then threw a stream of
+                // "NaN"-attribute console errors from d3's own zoom/label
+                // update code the next time *anything* dispatched a zoom
+                // event, however unrelated to the graph.
+                if (!width || !height) return;
 
                 // Calculate scale to fit bounds
                 const scale = Math.min(
@@ -17979,8 +18549,29 @@
                 // Get memoized weight stats from FULL dataset (avoids recalculating on every filter change)
                 const weightStats = getGraphWeightStats();
                 const { maxWeight, minWeight, weightRange } = weightStats;
-                const threshold = minWeight + (weightRange * (thresholdPercent / 100));
+                let threshold = minWeight + (weightRange * (thresholdPercent / 100));
                 const secondThreshold = minWeight + (weightRange * (secondThresholdPercent / 100));
+
+                // Safety net, independent of calculateOptimalEdgeThreshold()'s
+                // own correctness: if the threshold this slider position maps
+                // to would exclude every first-degree edge (e.g. the slider
+                // was dragged manually, or the first-degree and full weight
+                // ranges still diverge for some case not accounted for), fall
+                // back to showing everything rather than rendering a blank
+                // tab (#896 review round 4, MINOR finding 3).
+                const firstDegreeEdgesAll = graphLinksAll.filter(l => {
+                    if (!l) return false;
+                    const isFirstDegree = l.source === graphCenterId || l.target === graphCenterId;
+                    return isFirstDegree && edgeHasSelectedSource(l, selectedSources);
+                });
+                if (firstDegreeEdgesAll.length > 0 && !firstDegreeEdgesAll.some(l => l.weight >= threshold)) {
+                    threshold = minWeight;
+                    if (slider) {
+                        slider.value = 0;
+                        const sliderLabel = document.getElementById('edgeStrengthValue');
+                        if (sliderLabel) sliderLabel.textContent = '0%';
+                    }
+                }
 
                 // Build node lookup by ID from ORIGINAL data
                 const nodeById = {};
@@ -18385,7 +18976,10 @@
         async function switchTab(tabName, skipUrlUpdate = false) {
             // Update tab UI
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-            document.querySelector(`[data-tab="${tabName}"]`).classList.add('active');
+            // Scoped to `.tab` (the person-detail tab bar): the Birthdays page
+            // also has a `data-tab="timeline"` button (`.birthdays-tab`), and an
+            // unscoped selector would match that one first instead.
+            document.querySelector(`.tab[data-tab="${tabName}"]`).classList.add('active');
 
             // Show/hide content
             document.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
@@ -18475,6 +19069,11 @@
                     method: 'PATCH',
                     body: JSON.stringify({ notes })
                 });
+
+                // Invalidate the cached person so navigating away and back
+                // this session shows the saved notes instead of whatever
+                // was cached before this edit.
+                invalidatePersonCache(selectedPersonId);
 
                 // Update original value and hide save button
                 originalNotesValue = notes;

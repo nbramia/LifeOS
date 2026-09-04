@@ -1,8 +1,13 @@
 """
 Tests for PersonEntity model and PersonEntityStore.
 """
+import json
+import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+
 import pytest
-from datetime import datetime
 
 from api.services.person_entity import (
     PersonEntity,
@@ -300,6 +305,22 @@ class TestPersonEntityStore:
         store._blocklist.clear()
         yield store
 
+    def _add_people(self, store, count: int) -> list[PersonEntity]:
+        """Add synthetic people to the store."""
+        people = [
+            PersonEntity(
+                id=f"person-{i:04d}",
+                canonical_name=f"Person {i:04d}",
+                emails=[f"person{i:04d}@example.com"],
+            )
+            for i in range(count)
+        ]
+        for i, person in enumerate(people):
+            person.relationship_strength = float(count - i)
+        for person in people:
+            store.add(person)
+        return people
+
     def test_add_and_get_by_id(self, temp_store):
         """Test adding an entity and retrieving by ID."""
         entity = PersonEntity(
@@ -505,6 +526,206 @@ class TestPersonEntityStore:
         all_entities = temp_store.get_all()
         assert len(all_entities) == 5
 
+    def test_get_all_warm_cache_hit_is_fast_and_equal(self, temp_store):
+        """Second get_all call returns equal contents from the warm cache."""
+        self._add_people(temp_store, 100)
+
+        first = temp_store.get_all()
+        start = time.perf_counter()
+        second = temp_store.get_all()
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        assert elapsed_ms < 5
+        assert second == first
+        assert second is not first
+
+    def test_get_all_sees_separate_connection_write(self, temp_store):
+        """External SQLite commits invalidate get_all through data_version."""
+        person = PersonEntity(
+            id="external-write-person",
+            canonical_name="Before External Write",
+            emails=["external@example.com"],
+        )
+        temp_store.add(person)
+        assert temp_store.get_all()[0].canonical_name == "Before External Write"
+
+        conn = sqlite3.connect(str(temp_store.db_path))
+        try:
+            conn.execute(
+                "UPDATE person_entities SET canonical_name = ?, display_name = ? WHERE id = ?",
+                ("After External Write", "After External Write", person.id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        refreshed = temp_store.get_all()
+        assert refreshed[0].canonical_name == "After External Write"
+
+    def test_get_all_invalidates_after_store_writes(self, temp_store, monkeypatch):
+        """Store add/update/delete/hide/save/purge/reload paths invalidate get_all."""
+        deleted_person = PersonEntity(
+            id="delete-person",
+            canonical_name="Delete Person",
+            emails=["delete@example.com"],
+        )
+        temp_store.add(deleted_person)
+        assert [p.id for p in temp_store.get_all()] == ["delete-person"]
+
+        added_person = PersonEntity(
+            id="add-person",
+            canonical_name="Add Person",
+            emails=["add@example.com"],
+        )
+        temp_store.add(added_person)
+        assert {p.id for p in temp_store.get_all()} == {"delete-person", "add-person"}
+
+        added_person.canonical_name = "Updated Person"
+        temp_store.update(added_person)
+        by_id = {p.id: p for p in temp_store.get_all()}
+        assert by_id["add-person"].canonical_name == "Updated Person"
+
+        temp_store.hide_person("add-person", "synthetic test")
+        assert [p.id for p in temp_store.get_all()] == ["delete-person"]
+        assert {p.id for p in temp_store.get_all(include_hidden=True)} == {
+            "delete-person",
+            "add-person",
+        }
+
+        class EmptyInteractionStore:
+            def get_for_person(self, entity_id, limit=1):
+                return []
+
+        monkeypatch.setattr(
+            "api.services.interaction_store.get_interaction_store",
+            lambda: EmptyInteractionStore(),
+        )
+        assert temp_store.delete("delete-person") is True
+        assert temp_store.get_all() == []
+
+        hidden_old = PersonEntity(
+            id="purge-person",
+            canonical_name="Purge Person",
+            emails=["purge@example.com"],
+            hidden=True,
+            hidden_at=datetime.now(timezone.utc) - timedelta(days=2),
+            hidden_reason="merged_into:survivor",
+        )
+        temp_store.add(hidden_old)
+        assert {p.id for p in temp_store.get_all(include_hidden=True)} == {
+            "add-person",
+            "purge-person",
+        }
+        assert temp_store.purge_hidden(older_than_days=1) == 1
+        assert [p.id for p in temp_store.get_all(include_hidden=True)] == ["add-person"]
+
+        primary = PersonEntity(
+            id="primary-person",
+            canonical_name="Primary Person",
+            emails=["primary@example.com"],
+        )
+        secondary = PersonEntity(
+            id="secondary-person",
+            canonical_name="Secondary Person",
+            emails=["secondary@example.com"],
+        )
+        temp_store.add(primary)
+        temp_store.add(secondary)
+        assert {p.id for p in temp_store.get_all()} == {
+            "primary-person",
+            "secondary-person",
+        }
+        temp_store.MERGED_IDS_PATH = temp_store.db_path.parent / "merged_person_ids.json"
+        temp_store.MERGED_IDS_PATH.write_text(json.dumps({"secondary-person": "primary-person"}))
+        temp_store.reload_merged_ids()
+        assert [p.id for p in temp_store.get_all()] == ["primary-person"]
+        assert {p.id for p in temp_store.get_all(include_merged=True)} == {
+            "primary-person",
+            "secondary-person",
+        }
+
+        row_count = 0
+        original_row_to_entity = temp_store._row_to_entity
+
+        def counting_row_to_entity(row):
+            nonlocal row_count
+            row_count += 1
+            return original_row_to_entity(row)
+
+        temp_store._row_to_entity = counting_row_to_entity
+        temp_store.get_all()
+        after_warm = row_count
+        temp_store.get_all()
+        assert row_count == after_warm
+        temp_store.save()
+        temp_store.get_all()
+        assert row_count > after_warm
+
+    def test_get_all_include_hidden_variants_are_cached_independently(self, temp_store):
+        """Visible-only and include-hidden get_all calls keep separate cache entries."""
+        temp_store.add(PersonEntity(
+            id="visible-person",
+            canonical_name="Visible Person",
+            emails=["visible@example.com"],
+        ))
+        temp_store.add(PersonEntity(
+            id="hidden-person",
+            canonical_name="Hidden Person",
+            emails=["hidden@example.com"],
+            hidden=True,
+            hidden_at=datetime.now(timezone.utc),
+            hidden_reason="synthetic test",
+        ))
+
+        visible = temp_store.get_all()
+        with_hidden = temp_store.get_all(include_hidden=True)
+
+        assert [p.id for p in visible] == ["visible-person"]
+        assert {p.id for p in with_hidden} == {"visible-person", "hidden-person"}
+        assert [p.id for p in temp_store.get_all()] == ["visible-person"]
+        assert {p.id for p in temp_store.get_all(include_hidden=True)} == {
+            "visible-person",
+            "hidden-person",
+        }
+
+    def test_get_all_returns_list_copy_for_caller_mutation(self, temp_store):
+        """Sorting or mutating the returned list does not affect later calls."""
+        self._add_people(temp_store, 3)
+
+        first = temp_store.get_all()
+        original_order = [p.id for p in first]
+        first.sort(key=lambda p: p.id, reverse=True)
+        first.pop()
+
+        second = temp_store.get_all()
+        assert [p.id for p in second] == original_order
+        assert len(second) == 3
+
+    def test_get_all_concurrent_readers_are_consistent_during_writes(self, temp_store):
+        """Concurrent get_all readers see consistent lists while updates commit."""
+        people = self._add_people(temp_store, 25)
+        expected_ids = {p.id for p in people}
+
+        def read_many():
+            for _ in range(50):
+                result = temp_store.get_all()
+                assert len(result) == 25
+                assert {p.id for p in result} == expected_ids
+            return True
+
+        def write_many():
+            for i in range(50):
+                entity = temp_store.get_by_id("person-0000")
+                entity.canonical_name = f"Writer Update {i}"
+                temp_store.update(entity)
+            return True
+
+        with ThreadPoolExecutor(max_workers=9) as executor:
+            futures = [executor.submit(read_many) for _ in range(8)]
+            futures.append(executor.submit(write_many))
+
+            assert all(f.result() for f in futures)
+
     def test_count(self, temp_store):
         """Test counting entities."""
         assert temp_store.count() == 0
@@ -514,6 +735,136 @@ class TestPersonEntityStore:
 
         temp_store.add(PersonEntity(canonical_name="Two", emails=["two@test.com"]))
         assert temp_store.count() == 2
+
+
+class TestMeFamilyAggregates:
+    """Tests for the person-store helpers #871 adds for the Me/Family
+    dashboards: get_by_ids, get_hidden_ids, get_ids_where, get_totals."""
+
+    @pytest.fixture
+    def temp_store(self, tmp_path):
+        db_path = str(tmp_path / "test_person_entity_aggregates.db")
+        store = PersonEntityStore(db_path)
+        store._blocklist.clear()
+        yield store
+
+    # ---- get_by_ids ----
+
+    def test_get_by_ids_returns_only_matching(self, temp_store):
+        temp_store.add(PersonEntity(id="p1", canonical_name="One", emails=["one@test.com"]))
+        temp_store.add(PersonEntity(id="p2", canonical_name="Two", emails=["two@test.com"]))
+
+        result = temp_store.get_by_ids(["p1", "nonexistent"])
+        assert set(result.keys()) == {"p1"}
+        assert result["p1"].canonical_name == "One"
+
+    def test_get_by_ids_empty_input(self, temp_store):
+        assert temp_store.get_by_ids([]) == {}
+
+    def test_get_by_ids_follows_merge_chain_keyed_by_original_id(self, temp_store):
+        """A merged-away secondary id should resolve to the surviving primary
+        entity, but the result dict is still keyed by the id the caller
+        asked for (e.g. an interaction's still-unrepointed person_id)."""
+        temp_store.add(PersonEntity(id="primary", canonical_name="Primary", emails=["p@test.com"]))
+        temp_store.MERGED_IDS_PATH = temp_store.db_path.parent / "merged_ids.json"
+        temp_store.MERGED_IDS_PATH.write_text(json.dumps({"secondary": "primary"}))
+        temp_store.reload_merged_ids()
+
+        result = temp_store.get_by_ids(["secondary"])
+        assert set(result.keys()) == {"secondary"}
+        assert result["secondary"].id == "primary"
+
+    def test_get_by_ids_include_hidden_default(self, temp_store):
+        """Like get_by_id(), hidden entities are included by default."""
+        temp_store.add(PersonEntity(
+            id="hidden-person", canonical_name="Hidden", emails=["h@test.com"],
+            hidden=True,
+        ))
+        result = temp_store.get_by_ids(["hidden-person"])
+        assert "hidden-person" in result
+
+    def test_get_by_ids_exclude_hidden(self, temp_store):
+        """exclude_hidden=True matches get_all()'s default view — used by
+        callers whose name lookup should show "Unknown" for a hidden person
+        instead of leaking their real name."""
+        temp_store.add(PersonEntity(
+            id="hidden-person", canonical_name="Hidden", emails=["h@test.com"],
+            hidden=True,
+        ))
+        temp_store.add(PersonEntity(id="visible", canonical_name="Visible", emails=["v@test.com"]))
+
+        result = temp_store.get_by_ids(["hidden-person", "visible"], exclude_hidden=True)
+        assert set(result.keys()) == {"visible"}
+
+    # ---- get_hidden_ids / get_ids_where ----
+
+    def test_get_hidden_ids(self, temp_store):
+        temp_store.add(PersonEntity(id="p1", canonical_name="One", emails=["one@test.com"]))
+        temp_store.add(PersonEntity(
+            id="p2", canonical_name="Two", emails=["two@test.com"], hidden=True,
+        ))
+        assert temp_store.get_hidden_ids() == {"p2"}
+
+    def test_get_ids_where_peripheral(self, temp_store):
+        temp_store.add(PersonEntity(
+            id="p1", canonical_name="One", emails=["one@test.com"],
+            is_peripheral_contact=True,
+        ))
+        temp_store.add(PersonEntity(id="p2", canonical_name="Two", emails=["two@test.com"]))
+        assert temp_store.get_ids_where("is_peripheral_contact", 1) == {"p1"}
+
+    def test_get_ids_where_rejects_unknown_column(self, temp_store):
+        with pytest.raises(ValueError):
+            temp_store.get_ids_where("canonical_name", "x")
+
+    # ---- get_totals ----
+
+    def test_get_totals_sums_only_non_hidden(self, temp_store):
+        p1 = PersonEntity(id="p1", canonical_name="One", emails=["one@test.com"])
+        p1.email_count, p1.meeting_count, p1.message_count = 10, 2, 5
+        p2 = PersonEntity(
+            id="p2", canonical_name="Two", emails=["two@test.com"], hidden=True,
+        )
+        p2.email_count, p2.meeting_count, p2.message_count = 100, 100, 100
+        temp_store.add(p1)
+        temp_store.add(p2)
+
+        totals = temp_store.get_totals()
+        assert totals == {
+            "total_people": 1,
+            "total_emails": 10,
+            "total_meetings": 2,
+            "total_messages": 5,
+        }
+
+    def test_get_totals_excludes_merged(self, temp_store):
+        """A merged-away secondary that's somehow not yet flagged hidden
+        (the historical edge case get_all()'s Python filter also guards
+        against) must still be excluded from the SQL sums."""
+        primary = PersonEntity(id="primary", canonical_name="Primary", emails=["p@test.com"])
+        primary.email_count = 10
+        secondary = PersonEntity(
+            id="secondary", canonical_name="Secondary", emails=["s@test.com"],
+        )
+        secondary.email_count = 1000  # would blow up the total if not excluded
+        temp_store.add(primary)
+        temp_store.add(secondary)
+
+        temp_store.MERGED_IDS_PATH = temp_store.db_path.parent / "merged_ids.json"
+        temp_store.MERGED_IDS_PATH.write_text(json.dumps({"secondary": "primary"}))
+        temp_store.reload_merged_ids()
+
+        totals = temp_store.get_totals()
+        assert totals["total_people"] == 1
+        assert totals["total_emails"] == 10
+
+    def test_get_totals_empty_store(self, temp_store):
+        assert temp_store.get_totals() == {
+            "total_people": 0,
+            "total_emails": 0,
+            "total_meetings": 0,
+            "total_messages": 0,
+        }
 
 
 class TestTimezoneHandling:

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Operations
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-04
 > **Audience:** Operators
 
 Operational procedures that don't belong in the day-to-day coding reference: the Apple Data Agent, Monarch Money auth, and quick observability commands. Moved here from `AGENTS.md` to keep the agent-facing file lean.
@@ -81,6 +81,18 @@ curl http://localhost:8000/api/perf/stats | jq                    # Aggregate st
 curl "http://localhost:8000/api/perf/traces?limit=10" | jq        # Recent traces
 curl http://localhost:8000/api/perf/traces/{trace_id} | jq        # Single trace
 ```
+
+### What's slow right now (#877)
+
+Every HTTP request (not just chat turns) is timed by `RouteTimingMiddleware`. Sorted by p95 descending, so the slowest routes are at the top:
+
+```bash
+curl http://localhost:8000/api/perf/routes | jq
+```
+
+A request slower than `LIFEOS_SLOW_REQUEST_MS` (default 500ms) also logs one WARNING with its route template, status, duration, and response size — `grep "slow request" logs/server.log` (Linux systemd, which appends stdout+stderr there; on macOS launchd it's `logs/lifeos-api-error.log`). Full design in [Observability](../specs/technical/observability.md).
+
+The uvicorn access log itself has its query string stripped before it ever reaches disk (`api/services/log_redaction.py`), so grepping `logs/server.log` for a raw path never turns up whatever a user typed into a search box — see [Observability § Log Redaction](../specs/technical/observability.md#log-redaction).
 
 ## GPU Watchdog
 

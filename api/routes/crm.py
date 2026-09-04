@@ -5,12 +5,16 @@ Provides comprehensive endpoints for managing people, relationships,
 and entity linking workflows.
 """
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+import asyncio
+import bisect
+import contextlib
 import json
 import logging
 import sqlite3
+import threading
 import time
 
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
@@ -18,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from api.services.person_entity import PersonEntity, get_person_entity_store, compute_person_category
 from api.services.interaction_store import get_interaction_store
+from api.services.aggregate_cache import cached_aggregate
 from config.people_config import InteractionConfig
 from config.settings import settings
 from api.services.source_entity import (
@@ -26,7 +31,7 @@ from api.services.source_entity import (
     LINK_STATUS_CONFIRMED,
     LINK_STATUS_REJECTED,
 )
-from api.services.relationship import get_relationship_store
+from api.services.relationship import get_relationship_store, Relationship
 from api.services.relationship_metrics import (
     get_strength_breakdown,
     update_all_strengths,
@@ -47,6 +52,22 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/crm", tags=["crm"])
 
+# Serializes the mutating handlers below (merge, split, hide, review-queue
+# confirm/reject, and the sync-trigger POSTs — plus photos.py's own sync
+# trigger, which imports this lock).  #868 converted these from `async def`
+# with no `await` to plain `def`, which restores fairness by dispatching
+# them to the worker threadpool instead of running them start-to-finish
+# inline on the event loop — but that inline run was also, incidentally,
+# every mutating handler's only serialization against every other request.
+# Off the loop, two of these can now genuinely interleave; several
+# (`merge_people` in particular, via `scripts/merge_people.py`'s single
+# global intent log and merged-id read-modify-write) are not safe under
+# that interleaving. This is a single coarse lock rather than one per
+# handler because they can mutate overlapping state (a merge and a split
+# both touch person_store); a single-user host pays essentially nothing for
+# serializing writes that used to be serialized anyway.
+_mutation_lock = threading.Lock()
+
 # Work email domain for category detection (loaded from settings)
 WORK_EMAIL_DOMAIN = settings.work_email_domain if hasattr(settings, 'work_email_domain') and settings.work_email_domain else "example.com"
 
@@ -62,6 +83,77 @@ def _get_strength_override(person_id: str) -> float | None:
     if not person_id:
         return None
     return STRENGTH_OVERRIDES_BY_ID.get(person_id)
+
+
+def _me_exclude_ids(person_store, all_people: Optional[list] = None) -> list[str]:
+    """
+    Self + hidden + peripheral + merged-secondary person ids — the
+    population both /me/interactions and /me/interactions/span exclude.
+
+    Pass `all_people` (from a get_all() the caller already has, e.g.
+    /me/interactions) to derive peripheral ids from it directly instead of
+    an extra query. Without it, peripheral ids come from a targeted
+    `is_peripheral_contact = 1` query — the lightweight path
+    /me/interactions/span uses to stay well under its own latency budget.
+    Merged-secondary ids are normally already hidden (merge_people.py sets
+    hidden=1 on the secondary), so including them here is mostly a
+    defensive belt-and-suspenders exclusion (#897 review finding 6).
+    """
+    hidden_ids = person_store.get_hidden_ids()
+    if all_people is not None:
+        peripheral_ids = {p.id for p in all_people if p.is_peripheral_contact}
+    else:
+        peripheral_ids = person_store.get_ids_where("is_peripheral_contact", 1)
+    merged_ids = person_store.get_merged_secondary_ids()
+    return [MY_PERSON_ID] + list(hidden_ids | peripheral_ids | merged_ids)
+
+
+def _bucket_counts_by_period(
+    items: list, time_points: list[datetime], get_ts=lambda item: item.timestamp,
+) -> list[int]:
+    """
+    Count `items` into the periods bounded by consecutive `time_points`:
+    each bucket i is `(time_points[i-1], time_points[i]]` (bucket 0 uses a
+    synthetic lower bound one inter-point interval before `time_points[0]`),
+    matching the health-score/tracked-relationship widgets' bucketing rule
+    exactly. `get_ts` extracts each item's raw timestamp — the default reads
+    `.timestamp` (for a list of Interaction objects); pass
+    `get_ts=lambda ts: ts` for a list of already-resolved datetimes.
+
+    O(N log N) — every timestamp is resolved and sorted once, then each
+    bucket's count comes from two `bisect` lookups — instead of the
+    equivalent O(len(time_points) * N) of comparing every interaction
+    against every bucket boundary directly. On the production dataset, the
+    "top 25 by relationship strength" or "circles 0-3" restrictions this
+    feeds from turn out to still mean hundreds of thousands of interactions
+    (close family and friends are, unsurprisingly, the highest-volume
+    contacts), so the nested-loop version was the dominant cost in the
+    /me/interactions request, not the SQL fetching it replaced.
+    """
+    resolved: list[datetime] = []
+    for item in items:
+        ts = get_ts(item)
+        if not ts:
+            continue
+        if hasattr(ts, 'tzinfo'):
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        else:
+            ts = datetime.fromisoformat(str(ts)[:10]).replace(tzinfo=timezone.utc)
+        resolved.append(ts)
+    resolved.sort()
+
+    counts = []
+    for i, point_date in enumerate(time_points):
+        if i == 0:
+            interval = (time_points[1] - time_points[0]).days if len(time_points) > 1 else 14
+            prev_date = point_date - timedelta(days=interval)
+        else:
+            prev_date = time_points[i - 1]
+        lo = bisect.bisect_right(resolved, prev_date)
+        hi = bisect.bisect_right(resolved, point_date)
+        counts.append(hi - lo)
+    return counts
 
 
 def _tokenize(text: str) -> list[str]:
@@ -179,6 +271,9 @@ class PersonDetailResponse(BaseModel):
     slack_message_count: int = 0  # Actual Slack messages (not daily summaries)
     # Pre-computed Dunbar circle (0-6 for meaningful, 7 for peripheral)
     dunbar_circle: Optional[int] = None
+    # True when photo_count > 0, so the client knows to request an avatar
+    # instead of rendering initials -- no per-person probe needed.
+    has_profile_photo: bool = False
     # Related data
     source_entities: list[SourceEntityResponse] = []
     relationships: list[RelationshipResponse] = []
@@ -436,14 +531,52 @@ def _relationship_to_response(
     )
 
 
+# compute_person_category()'s own internal fallback fetch (triggered by
+# passing None) uses limit=500 per person -- appropriate for a single-person
+# detail view, but far too expensive to run per person across a whole list
+# page: a strength-sorted CRM page is dominated by the highest-interaction
+# people, and on the real dataset a majority of those have thousands to tens
+# of thousands of source entities each (heavy iMessage/calendar/Slack
+# history), so naively batching a 500-per-person fetch still means
+# constructing tens of thousands of SourceEntity objects per page.
+#
+# compute_person_category() only needs to find ONE qualifying source entity
+# (Slack, work-domain email, or work account metadata) among the most recent
+# ones -- it doesn't need all 500. Verified against the full real dataset
+# (14,414 people, not a sample): reducing this cap to 20 still produces
+# IDENTICAL final categories vs the None/500 path for every person (0
+# mismatches); 10 starts to introduce mismatches (3/14,414). 50 keeps a 2.5x
+# safety margin above the smallest value that was still exact, while cutting
+# the batch fetch's cost by 10x relative to 500.
+_CATEGORY_BATCH_SOURCE_LIMIT = 50
+
+
 def _person_to_detail_response(
     person: PersonEntity,
     include_related: bool = True,
+    category_source_entities: Optional[list] = None,
 ) -> PersonDetailResponse:
-    """Convert PersonEntity to detailed API response."""
-    # Fetch source entities first for category computation
-    source_store = get_source_entity_store()
-    source_entities = source_store.get_for_person(person.id, limit=100) if include_related else None
+    """Convert PersonEntity to detailed API response.
+
+    category_source_entities: only used when include_related=False. An
+    optional pre-fetched list of this person's source entities (e.g. from a
+    single batched query across a whole page, via
+    SourceEntityStore.get_for_people_batch()) to pass to
+    compute_person_category() instead of letting it do its own per-person
+    fetch. If not supplied, source_entities stays None and
+    compute_person_category() falls back to its own internal single-person
+    fetch -- unchanged behavior for single-person callers.
+    """
+    # Fetch source entities first for category computation. When include_related
+    # is False, pass None (not []) so compute_person_category() falls back to its
+    # own internal source-entity fetch instead of skipping that work entirely --
+    # unless the caller already batched that fetch for us.
+    source_entities = None
+    if include_related:
+        source_store = get_source_entity_store()
+        source_entities = source_store.get_for_person(person.id, limit=100)
+    elif category_source_entities is not None:
+        source_entities = category_source_entities
 
     # Compute category dynamically based on source entities and email domains
     computed_category = compute_person_category(person, source_entities)
@@ -477,6 +610,7 @@ def _person_to_detail_response(
         message_count=person.message_count,
         slack_message_count=person.slack_message_count,
         dunbar_circle=person.dunbar_circle,
+        has_profile_photo=person.photo_count > 0,
     )
 
     if include_related:
@@ -502,6 +636,14 @@ class CRMConfigResponse(BaseModel):
     partner_person_id: str = ""
     partner_name: str = ""
     family_default_selected_ids: list[str] = []
+    # Whether Apple Photos is configured at all (settings.photos_enabled is
+    # just Path.exists() on the library's database file -- cheap, unlike
+    # GET /api/photos/stats, which runs several full-library aggregate
+    # queries when Photos *is* configured). The client uses this to decide
+    # whether to request avatar/profile photos at all, so a Photos-less
+    # install never issues a request that would otherwise 503 (#875, #907
+    # review finding 2).
+    photos_enabled: bool = False
 
 
 def _load_family_default_selected_ids() -> list[str]:
@@ -532,7 +674,7 @@ def _get_partner_name() -> str:
 
 
 @router.get("/config", response_model=CRMConfigResponse)
-async def get_crm_config():
+def get_crm_config():
     """
     Get CRM configuration values for frontend.
 
@@ -545,27 +687,41 @@ async def get_crm_config():
         partner_person_id=PARTNER_PERSON_ID,
         partner_name=_get_partner_name(),
         family_default_selected_ids=_load_family_default_selected_ids(),
+        photos_enabled=settings.photos_enabled,
     )
 
 
 @router.get("/birthdays/today")
-async def get_todays_birthdays():
+def get_todays_birthdays():
     """Get all people with birthdays today."""
     person_store = get_person_entity_store()
     people = person_store.get_all()
 
     today_mm_dd = datetime.now().strftime("%m-%d")
+    matching_people = [p for p in people if p.birthday == today_mm_dd]
+
+    # Batch-fetch source entities for category computation in one query
+    # instead of one SourceEntityStore query per matching person.
+    source_store = get_source_entity_store()
+    category_source_entities_by_id = source_store.get_for_people_batch(
+        [p.id for p in matching_people], limit_per_person=_CATEGORY_BATCH_SOURCE_LIMIT
+    )
+
     birthday_people = [
-        _person_to_detail_response(p, include_related=False)
-        for p in people
-        if p.birthday == today_mm_dd
+        _person_to_detail_response(
+            p,
+            include_related=False,
+            category_source_entities=category_source_entities_by_id.get(p.id, []),
+        )
+        for p in matching_people
     ]
 
     return {"birthdays": birthday_people, "count": len(birthday_people)}
 
 
 @router.get("/birthdays/all")
-async def get_all_birthdays():
+@cached_aggregate()
+def get_all_birthdays():
     """Get all people with birthdays, grouped by date."""
     person_store = get_person_entity_store()
     people = person_store.get_all()
@@ -592,8 +748,19 @@ async def get_all_birthdays():
     }
 
 
+def _people_cache_eligible(kwargs: dict) -> bool:
+    """Only the parameter shape the CRM page's default load actually uses
+    (no search text, a bounded page size) is worth caching -- a per-keystroke
+    search query or a `limit=10000` export is requested once and never
+    again, so caching it only spends memory and a measurable
+    jsonable_encoder()/json.dumps() pass on every miss for no reuse (#917
+    review finding 6)."""
+    return not kwargs.get("q") and kwargs.get("limit", 50) <= 300
+
+
 @router.get("/people", response_model=PersonListResponse)
-async def list_people(
+@cached_aggregate(should_cache=_people_cache_eligible)
+def list_people(
     q: Optional[str] = Query(default=None, description="Search query"),
     category: Optional[str] = Query(default=None, description="Filter by category"),
     source: Optional[str] = Query(default=None, description="Filter by source"),
@@ -689,9 +856,20 @@ async def list_people(
     has_more = offset + limit < total
     people = people[offset:offset + limit]
 
+    # Batch-fetch source entities for category computation in one query
+    # instead of one SourceEntityStore query per returned person.
+    source_store = get_source_entity_store()
+    category_source_entities_by_id = source_store.get_for_people_batch(
+        [p.id for p in people], limit_per_person=_CATEGORY_BATCH_SOURCE_LIMIT
+    )
+
     result = PersonListResponse(
         people=[
-            _person_to_detail_response(p, include_related=False)
+            _person_to_detail_response(
+                p,
+                include_related=False,
+                category_source_entities=category_source_entities_by_id.get(p.id, []),
+            )
             for p in people
         ],
         count=len(people),
@@ -700,14 +878,17 @@ async def list_people(
         has_more=has_more,
     )
 
+    # #904: never log the raw search text or other filter values here -- the
+    # CRM search box's contents (names, partial emails) are personal data.
+    # Counts and timing only.
     elapsed = (time.time() - start_time) * 1000
-    logger.info(f"list_people(q={q}, category={category}, limit={limit}) took {elapsed:.1f}ms ({total} total, {len(people)} returned)")
+    logger.info(f"list_people took {elapsed:.1f}ms (limit={limit}, {total} total, {len(people)} returned)")
 
     return result
 
 
 @router.get("/people/{person_id}", response_model=PersonDetailResponse)
-async def get_person(
+def get_person(
     person_id: str,
     include_related: bool = Query(default=False, description="Include source entities and relationships"),
     refresh_strength: bool = Query(default=False, description="Recompute relationship strength (slower)"),
@@ -746,7 +927,7 @@ async def get_person(
 
 
 @router.patch("/people/{person_id}", response_model=PersonDetailResponse)
-async def update_person(person_id: str, request: PersonUpdateRequest):
+def update_person(person_id: str, request: PersonUpdateRequest):
     """
     Update a person's notes, tags, or category.
     """
@@ -807,7 +988,7 @@ class PersonMergeResponse(BaseModel):
 
 
 @router.post("/people/merge", response_model=PersonMergeResponse)
-async def merge_people(request: PersonMergeRequest):
+def merge_people(request: PersonMergeRequest):
     """
     Merge multiple people into a single record.
 
@@ -823,58 +1004,60 @@ async def merge_people(request: PersonMergeRequest):
     The merge is durable - merged IDs are tracked so entity resolution
     won't recreate duplicates from future syncs.
     """
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-    from scripts.merge_people import merge_people as do_merge
+    with _mutation_lock:
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+        from scripts.merge_people import merge_people as do_merge
 
-    person_store = get_person_entity_store()
-    _source_store = get_source_entity_store()  # noqa: F841
+        person_store = get_person_entity_store()
+        _source_store = get_source_entity_store()  # noqa: F841
 
-    # Validate primary exists
-    primary = person_store.get_by_id(request.primary_id)
-    if not primary:
-        raise HTTPException(status_code=404, detail=f"Primary person '{request.primary_id}' not found")
+        # Validate primary exists
+        primary = person_store.get_by_id(request.primary_id)
+        if not primary:
+            raise HTTPException(status_code=404, detail=f"Primary person '{request.primary_id}' not found")
 
-    # Validate all secondaries exist
-    for sec_id in request.secondary_ids:
-        secondary = person_store.get_by_id(sec_id)
-        if not secondary:
-            raise HTTPException(status_code=404, detail=f"Secondary person '{sec_id}' not found")
-        if sec_id == request.primary_id:
-            raise HTTPException(status_code=400, detail="Cannot merge a person into itself")
+        # Validate all secondaries exist
+        for sec_id in request.secondary_ids:
+            secondary = person_store.get_by_id(sec_id)
+            if not secondary:
+                raise HTTPException(status_code=404, detail=f"Secondary person '{sec_id}' not found")
+            if sec_id == request.primary_id:
+                raise HTTPException(status_code=400, detail="Cannot merge a person into itself")
 
-    # Perform merges
-    total_stats = {
-        'interactions_updated': 0,
-        'source_entities_updated': 0,
-        'facts_cleared': 0,
-        'emails_merged': 0,
-        'phones_merged': 0,
-        'aliases_added': 0,
-        'tags_merged': 0,
-        'notes_merged': 0,
-    }
+        # Perform merges
+        total_stats = {
+            'interactions_updated': 0,
+            'source_entities_updated': 0,
+            'facts_cleared': 0,
+            'tone_rows_cleared': 0,
+            'emails_merged': 0,
+            'phones_merged': 0,
+            'aliases_added': 0,
+            'tags_merged': 0,
+            'notes_merged': 0,
+        }
 
-    merged_ids = []
-    for sec_id in request.secondary_ids:
-        try:
-            stats = do_merge(request.primary_id, sec_id, dry_run=False)
-            merged_ids.append(sec_id)
-            for key in total_stats:
-                total_stats[key] += stats.get(key, 0)
-        except Exception as e:
-            logger.error(f"Failed to merge {sec_id} into {request.primary_id}: {e}")
-            raise HTTPException(status_code=500, detail=f"Merge failed for {sec_id}: {str(e)}")
+        merged_ids = []
+        for sec_id in request.secondary_ids:
+            try:
+                stats = do_merge(request.primary_id, sec_id, dry_run=False)
+                merged_ids.append(sec_id)
+                for key in total_stats:
+                    total_stats[key] += stats.get(key, 0)
+            except Exception as e:
+                logger.error(f"Failed to merge {sec_id} into {request.primary_id}: {e}")
+                raise HTTPException(status_code=500, detail=f"Merge failed for {sec_id}: {str(e)}")
 
-    logger.info(f"Merged {len(merged_ids)} people into {request.primary_id}: {merged_ids}")
+        logger.info(f"Merged {len(merged_ids)} people into {request.primary_id}: {merged_ids}")
 
-    return PersonMergeResponse(
-        status="completed",
-        primary_id=request.primary_id,
-        merged_ids=merged_ids,
-        stats=total_stats,
-    )
+        return PersonMergeResponse(
+            status="completed",
+            primary_id=request.primary_id,
+            merged_ids=merged_ids,
+            stats=total_stats,
+        )
 
 
 # ============================================================================
@@ -1064,7 +1247,7 @@ class ContactSource(BaseModel):
 
 
 @router.get("/people/{person_id}/contact-sources")
-async def get_person_contact_sources(person_id: str):
+def get_person_contact_sources(person_id: str):
     """
     Get aggregated contact sources linked to a person.
 
@@ -1190,7 +1373,7 @@ async def get_person_contact_sources(person_id: str):
 
 
 @router.get("/people/{person_id}/source-entities")
-async def get_person_source_entities(
+def get_person_source_entities(
     person_id: str,
     limit: int = Query(default=500, ge=1, le=5000, description="Max source entities to return"),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
@@ -1277,7 +1460,7 @@ async def get_person_source_entities(
 
 
 @router.post("/people/split", response_model=PersonSplitResponse)
-async def split_person(request: PersonSplitRequest):
+def split_person(request: PersonSplitRequest):
     """
     Split source entities from one person to another.
 
@@ -1296,263 +1479,264 @@ async def split_person(request: PersonSplitRequest):
 
     If to_person_id is None, a new person is created with new_person_name.
     """
-    import uuid
-    from pathlib import Path
-    from datetime import datetime, timezone
+    with _mutation_lock:
+        import uuid
+        from pathlib import Path
+        from datetime import datetime, timezone
 
-    from api.services.link_override import get_link_override_store, LinkOverride
+        from api.services.link_override import get_link_override_store, LinkOverride
 
-    person_store = get_person_entity_store()
-    _source_store = get_source_entity_store()  # noqa: F841
+        person_store = get_person_entity_store()
+        _source_store = get_source_entity_store()  # noqa: F841
 
-    # Validate from_person exists
-    from_person = person_store.get_by_id(request.from_person_id)
-    if not from_person:
-        raise HTTPException(status_code=404, detail=f"From person '{request.from_person_id}' not found")
+        # Validate from_person exists
+        from_person = person_store.get_by_id(request.from_person_id)
+        if not from_person:
+            raise HTTPException(status_code=404, detail=f"From person '{request.from_person_id}' not found")
 
-    # Get or create to_person
-    if request.to_person_id:
-        to_person = person_store.get_by_id(request.to_person_id)
-        if not to_person:
-            raise HTTPException(status_code=404, detail=f"To person '{request.to_person_id}' not found")
-    else:
-        if not request.new_person_name:
-            raise HTTPException(status_code=400, detail="new_person_name required when to_person_id is not provided")
+        # Get or create to_person
+        if request.to_person_id:
+            to_person = person_store.get_by_id(request.to_person_id)
+            if not to_person:
+                raise HTTPException(status_code=404, detail=f"To person '{request.to_person_id}' not found")
+        else:
+            if not request.new_person_name:
+                raise HTTPException(status_code=400, detail="new_person_name required when to_person_id is not provided")
 
-        to_person = PersonEntity(
-            id=str(uuid.uuid4()),
-            canonical_name=request.new_person_name,
-            sources=[],
-            first_seen=datetime.now(timezone.utc),
-            last_seen=datetime.now(timezone.utc),
-        )
-        person_store.add(to_person)
+            to_person = PersonEntity(
+                id=str(uuid.uuid4()),
+                canonical_name=request.new_person_name,
+                sources=[],
+                first_seen=datetime.now(timezone.utc),
+                last_seen=datetime.now(timezone.utc),
+            )
+            person_store.add(to_person)
+            person_store.save()
+            logger.info(f"Created new person for split: {to_person.canonical_name} ({to_person.id})")
+
+            # Verify the person was saved correctly
+            verify_person = person_store.get_by_id(to_person.id)
+            if not verify_person:
+                logger.error(f"CRITICAL: Person {to_person.id} was not saved correctly after split creation!")
+                raise HTTPException(status_code=500, detail="Failed to save new person during split")
+
+        # Get source entity details for override creation
+        crm_db = Path(__file__).parent.parent.parent / "data" / "crm.db"
+        conn = sqlite3.connect(crm_db)
+        conn.row_factory = sqlite3.Row
+
+        placeholders = ','.join('?' * len(request.source_entity_ids))
+        cursor = conn.execute(f"""
+            SELECT id, source_type, source_id, observed_name, observed_email, observed_phone
+            FROM source_entities
+            WHERE id IN ({placeholders})
+            AND canonical_person_id = ?
+        """, request.source_entity_ids + [request.from_person_id])
+
+        source_entity_details = [dict(row) for row in cursor]
+
+        if len(source_entity_details) != len(request.source_entity_ids):
+            found_ids = {se['id'] for se in source_entity_details}
+            missing = set(request.source_entity_ids) - found_ids
+            raise HTTPException(
+                status_code=400,
+                detail=f"Some source entities not found or not linked to from_person: {missing}"
+            )
+
+        # Move source entities
+        cursor = conn.execute(f"""
+            UPDATE source_entities
+            SET canonical_person_id = ?, linked_at = ?, link_status = 'confirmed'
+            WHERE id IN ({placeholders})
+        """, [to_person.id, datetime.now(timezone.utc).isoformat()] + request.source_entity_ids)
+        source_entities_moved = cursor.rowcount
+        conn.commit()
+
+        # Move interactions - get source_types from the source entities
+        _source_types = list({se['source_type'] for se in source_entity_details})  # noqa: F841
+        source_ids = [se['source_id'] for se in source_entity_details if se['source_id']]
+
+        interactions_moved = 0
+        if source_ids:
+            int_db = Path(__file__).parent.parent.parent / "data" / "interactions.db"
+            int_conn = sqlite3.connect(int_db)
+
+            id_placeholders = ','.join('?' * len(source_ids))
+            cursor = int_conn.execute(f"""
+                UPDATE interactions
+                SET person_id = ?
+                WHERE person_id = ?
+                AND source_id IN ({id_placeholders})
+            """, [to_person.id, request.from_person_id] + source_ids)
+            interactions_moved = cursor.rowcount
+            int_conn.commit()
+            int_conn.close()
+
+        # Update source lists on both persons
+        cursor = conn.execute("""
+            SELECT DISTINCT source_type FROM source_entities
+            WHERE canonical_person_id = ?
+        """, (from_person.id,))
+        from_person.sources = [row[0] for row in cursor]
+
+        cursor = conn.execute("""
+            SELECT DISTINCT source_type FROM source_entities
+            WHERE canonical_person_id = ?
+        """, (to_person.id,))
+        to_person.sources = [row[0] for row in cursor]
+
+        # Update phone_numbers and emails based on remaining source entities
+        # Get phones/emails that were moved
+        moved_phones = {se.get('observed_phone') for se in source_entity_details if se.get('observed_phone')}
+        moved_emails = {se.get('observed_email', '').lower() for se in source_entity_details if se.get('observed_email')}
+
+        # Add moved phones/emails to to_person
+        for phone in moved_phones:
+            if phone and phone not in to_person.phone_numbers:
+                to_person.phone_numbers.append(phone)
+                if not to_person.phone_primary:
+                    to_person.phone_primary = phone
+        for email in moved_emails:
+            if email and not to_person.has_email(email):
+                to_person.emails.append(email)
+
+        # Remove phones from from_person that no longer have source entities
+        cursor = conn.execute("""
+            SELECT DISTINCT observed_phone FROM source_entities
+            WHERE canonical_person_id = ? AND observed_phone IS NOT NULL
+        """, (from_person.id,))
+        remaining_phones = {row[0] for row in cursor}
+        from_person.phone_numbers = [p for p in from_person.phone_numbers if p in remaining_phones]
+        if from_person.phone_primary and from_person.phone_primary not in remaining_phones:
+            from_person.phone_primary = from_person.phone_numbers[0] if from_person.phone_numbers else None
+
+        # Remove emails from from_person that no longer have source entities
+        cursor = conn.execute("""
+            SELECT DISTINCT LOWER(observed_email) FROM source_entities
+            WHERE canonical_person_id = ? AND observed_email IS NOT NULL
+        """, (from_person.id,))
+        remaining_emails = {row[0] for row in cursor}
+        from_person.emails = [e for e in from_person.emails if e.lower() in remaining_emails]
+
+        person_store.update(from_person)
+        person_store.update(to_person)
         person_store.save()
-        logger.info(f"Created new person for split: {to_person.canonical_name} ({to_person.id})")
 
-        # Verify the person was saved correctly
-        verify_person = person_store.get_by_id(to_person.id)
-        if not verify_person:
-            logger.error(f"CRITICAL: Person {to_person.id} was not saved correctly after split creation!")
-            raise HTTPException(status_code=500, detail="Failed to save new person during split")
+        conn.close()
 
-    # Get source entity details for override creation
-    crm_db = Path(__file__).parent.parent.parent / "data" / "crm.db"
-    conn = sqlite3.connect(crm_db)
-    conn.row_factory = sqlite3.Row
+        # Create link overrides for durability
+        overrides_created = 0
+        if request.create_overrides:
+            override_store = get_link_override_store()
 
-    placeholders = ','.join('?' * len(request.source_entity_ids))
-    cursor = conn.execute(f"""
-        SELECT id, source_type, source_id, observed_name, observed_email, observed_phone
-        FROM source_entities
-        WHERE id IN ({placeholders})
-        AND canonical_person_id = ?
-    """, request.source_entity_ids + [request.from_person_id])
+            # Group by name pattern + source_type
+            patterns = {}
+            for se in source_entity_details:
+                name = se.get('observed_name', '')
+                source_type = se.get('source_type', '')
+                source_id = se.get('source_id', '')
 
-    source_entity_details = [dict(row) for row in cursor]
+                if not name:
+                    continue
 
-    if len(source_entity_details) != len(request.source_entity_ids):
-        found_ids = {se['id'] for se in source_entity_details}
-        missing = set(request.source_entity_ids) - found_ids
-        raise HTTPException(
-            status_code=400,
-            detail=f"Some source entities not found or not linked to from_person: {missing}"
-        )
+                key = (name.lower(), source_type)
+                if key not in patterns:
+                    patterns[key] = {'name': name, 'source_type': source_type, 'contexts': set()}
 
-    # Move source entities
-    cursor = conn.execute(f"""
-        UPDATE source_entities
-        SET canonical_person_id = ?, linked_at = ?, link_status = 'confirmed'
-        WHERE id IN ({placeholders})
-    """, [to_person.id, datetime.now(timezone.utc).isoformat()] + request.source_entity_ids)
-    source_entities_moved = cursor.rowcount
-    conn.commit()
+                # Extract context patterns from source_id
+                if source_type in ('vault', 'granola') and source_id:
+                    _work = settings.current_work_path.rstrip('/')
+                    if _work in source_id:
+                        patterns[key]['contexts'].add(f'{_work}/')
+                    elif 'Work/' in source_id:
+                        patterns[key]['contexts'].add('Work/')
 
-    # Move interactions - get source_types from the source entities
-    _source_types = list({se['source_type'] for se in source_entity_details})  # noqa: F841
-    source_ids = [se['source_id'] for se in source_entity_details if se['source_id']]
-
-    interactions_moved = 0
-    if source_ids:
-        int_db = Path(__file__).parent.parent.parent / "data" / "interactions.db"
-        int_conn = sqlite3.connect(int_db)
-
-        id_placeholders = ','.join('?' * len(source_ids))
-        cursor = int_conn.execute(f"""
-            UPDATE interactions
-            SET person_id = ?
-            WHERE person_id = ?
-            AND source_id IN ({id_placeholders})
-        """, [to_person.id, request.from_person_id] + source_ids)
-        interactions_moved = cursor.rowcount
-        int_conn.commit()
-        int_conn.close()
-
-    # Update source lists on both persons
-    cursor = conn.execute("""
-        SELECT DISTINCT source_type FROM source_entities
-        WHERE canonical_person_id = ?
-    """, (from_person.id,))
-    from_person.sources = [row[0] for row in cursor]
-
-    cursor = conn.execute("""
-        SELECT DISTINCT source_type FROM source_entities
-        WHERE canonical_person_id = ?
-    """, (to_person.id,))
-    to_person.sources = [row[0] for row in cursor]
-
-    # Update phone_numbers and emails based on remaining source entities
-    # Get phones/emails that were moved
-    moved_phones = {se.get('observed_phone') for se in source_entity_details if se.get('observed_phone')}
-    moved_emails = {se.get('observed_email', '').lower() for se in source_entity_details if se.get('observed_email')}
-
-    # Add moved phones/emails to to_person
-    for phone in moved_phones:
-        if phone and phone not in to_person.phone_numbers:
-            to_person.phone_numbers.append(phone)
-            if not to_person.phone_primary:
-                to_person.phone_primary = phone
-    for email in moved_emails:
-        if email and not to_person.has_email(email):
-            to_person.emails.append(email)
-
-    # Remove phones from from_person that no longer have source entities
-    cursor = conn.execute("""
-        SELECT DISTINCT observed_phone FROM source_entities
-        WHERE canonical_person_id = ? AND observed_phone IS NOT NULL
-    """, (from_person.id,))
-    remaining_phones = {row[0] for row in cursor}
-    from_person.phone_numbers = [p for p in from_person.phone_numbers if p in remaining_phones]
-    if from_person.phone_primary and from_person.phone_primary not in remaining_phones:
-        from_person.phone_primary = from_person.phone_numbers[0] if from_person.phone_numbers else None
-
-    # Remove emails from from_person that no longer have source entities
-    cursor = conn.execute("""
-        SELECT DISTINCT LOWER(observed_email) FROM source_entities
-        WHERE canonical_person_id = ? AND observed_email IS NOT NULL
-    """, (from_person.id,))
-    remaining_emails = {row[0] for row in cursor}
-    from_person.emails = [e for e in from_person.emails if e.lower() in remaining_emails]
-
-    person_store.update(from_person)
-    person_store.update(to_person)
-    person_store.save()
-
-    conn.close()
-
-    # Create link overrides for durability
-    overrides_created = 0
-    if request.create_overrides:
-        override_store = get_link_override_store()
-
-        # Group by name pattern + source_type
-        patterns = {}
-        for se in source_entity_details:
-            name = se.get('observed_name', '')
-            source_type = se.get('source_type', '')
-            source_id = se.get('source_id', '')
-
-            if not name:
-                continue
-
-            key = (name.lower(), source_type)
-            if key not in patterns:
-                patterns[key] = {'name': name, 'source_type': source_type, 'contexts': set()}
-
-            # Extract context patterns from source_id
-            if source_type in ('vault', 'granola') and source_id:
-                _work = settings.current_work_path.rstrip('/')
-                if _work in source_id:
-                    patterns[key]['contexts'].add(f'{_work}/')
-                elif 'Work/' in source_id:
-                    patterns[key]['contexts'].add('Work/')
-
-        for (name_lower, source_type), pattern in patterns.items():
-            if pattern['contexts']:
-                for context in pattern['contexts']:
+            for (name_lower, source_type), pattern in patterns.items():
+                if pattern['contexts']:
+                    for context in pattern['contexts']:
+                        override = LinkOverride(
+                            id=str(uuid.uuid4()),
+                            name_pattern=pattern['name'],
+                            source_type=source_type,
+                            context_pattern=context,
+                            preferred_person_id=to_person.id,
+                            rejected_person_id=from_person.id,
+                            reason=f"Split via UI from {from_person.canonical_name}",
+                        )
+                        override_store.add(override)
+                        overrides_created += 1
+                else:
                     override = LinkOverride(
                         id=str(uuid.uuid4()),
                         name_pattern=pattern['name'],
                         source_type=source_type,
-                        context_pattern=context,
+                        context_pattern=None,
                         preferred_person_id=to_person.id,
                         rejected_person_id=from_person.id,
                         reason=f"Split via UI from {from_person.canonical_name}",
                     )
                     override_store.add(override)
                     overrides_created += 1
-            else:
-                override = LinkOverride(
-                    id=str(uuid.uuid4()),
-                    name_pattern=pattern['name'],
-                    source_type=source_type,
-                    context_pattern=None,
-                    preferred_person_id=to_person.id,
-                    rejected_person_id=from_person.id,
-                    reason=f"Split via UI from {from_person.canonical_name}",
-                )
-                override_store.add(override)
-                overrides_created += 1
 
-    # Recalculate stats and relationships for both persons
-    # (Consistent with merge behavior - recalculate after moving data)
-    logger.info("Recalculating stats and relationships...")
+        # Recalculate stats and relationships for both persons
+        # (Consistent with merge behavior - recalculate after moving data)
+        logger.info("Recalculating stats and relationships...")
 
-    int_db = Path(__file__).parent.parent.parent / "data" / "interactions.db"
-    int_conn_stats = sqlite3.connect(int_db)
+        int_db = Path(__file__).parent.parent.parent / "data" / "interactions.db"
+        int_conn_stats = sqlite3.connect(int_db)
 
-    # Recalculate stats for both persons
-    from_stats = _recalculate_person_stats(from_person.id, int_conn_stats, person_store)
-    to_stats = _recalculate_person_stats(to_person.id, int_conn_stats, person_store)
+        # Recalculate stats for both persons
+        from_stats = _recalculate_person_stats(from_person.id, int_conn_stats, person_store)
+        to_stats = _recalculate_person_stats(to_person.id, int_conn_stats, person_store)
 
-    if from_stats:
-        logger.info(f"  {from_person.canonical_name} stats: {from_stats['old']} -> {from_stats['new']}")
-    if to_stats:
-        logger.info(f"  {to_person.canonical_name} stats: {to_stats['old']} -> {to_stats['new']}")
+        if from_stats:
+            logger.info(f"  {from_person.canonical_name} stats: {from_stats['old']} -> {from_stats['new']}")
+        if to_stats:
+            logger.info(f"  {to_person.canonical_name} stats: {to_stats['old']} -> {to_stats['new']}")
 
-    # Recalculate relationships with my_person_id
-    my_person_id = settings.my_person_id
-    if my_person_id:
-        from_rel = _recalculate_relationship_with_me(from_person.id, my_person_id, int_conn_stats)
-        to_rel = _recalculate_relationship_with_me(to_person.id, my_person_id, int_conn_stats)
+        # Recalculate relationships with my_person_id
+        my_person_id = settings.my_person_id
+        if my_person_id:
+            from_rel = _recalculate_relationship_with_me(from_person.id, my_person_id, int_conn_stats)
+            to_rel = _recalculate_relationship_with_me(to_person.id, my_person_id, int_conn_stats)
 
-        if from_rel.get('action') != 'none':
-            logger.info(f"  {from_person.canonical_name} relationship: {from_rel}")
-        if to_rel.get('action') != 'none':
-            logger.info(f"  {to_person.canonical_name} relationship: {to_rel}")
+            if from_rel.get('action') != 'none':
+                logger.info(f"  {from_person.canonical_name} relationship: {from_rel}")
+            if to_rel.get('action') != 'none':
+                logger.info(f"  {to_person.canonical_name} relationship: {to_rel}")
 
-    int_conn_stats.close()
+        int_conn_stats.close()
 
-    # Recalculate relationship strength for both persons
-    # (also updates is_peripheral_contact; dunbar_circle requires full recalc)
-    from_strength = update_strength_for_person(from_person.id)
-    if from_strength is not None:
-        logger.info(f"  {from_person.canonical_name} strength: {from_strength}")
+        # Recalculate relationship strength for both persons
+        # (also updates is_peripheral_contact; dunbar_circle requires full recalc)
+        from_strength = update_strength_for_person(from_person.id)
+        if from_strength is not None:
+            logger.info(f"  {from_person.canonical_name} strength: {from_strength}")
 
-    to_strength = update_strength_for_person(to_person.id)
-    if to_strength is not None:
-        logger.info(f"  {to_person.canonical_name} strength: {to_strength}")
+        to_strength = update_strength_for_person(to_person.id)
+        if to_strength is not None:
+            logger.info(f"  {to_person.canonical_name} strength: {to_strength}")
 
-    person_store.save()
+        person_store.save()
 
-    logger.info(
-        f"Split {source_entities_moved} source entities from {from_person.canonical_name} "
-        f"to {to_person.canonical_name}, {interactions_moved} interactions, "
-        f"{overrides_created} overrides created"
-    )
+        logger.info(
+            f"Split {source_entities_moved} source entities from {from_person.canonical_name} "
+            f"to {to_person.canonical_name}, {interactions_moved} interactions, "
+            f"{overrides_created} overrides created"
+        )
 
-    return PersonSplitResponse(
-        status="completed",
-        from_person_id=request.from_person_id,
-        to_person_id=to_person.id,
-        source_entities_moved=source_entities_moved,
-        interactions_moved=interactions_moved,
-        overrides_created=overrides_created,
-    )
+        return PersonSplitResponse(
+            status="completed",
+            from_person_id=request.from_person_id,
+            to_person_id=to_person.id,
+            source_entities_moved=source_entities_moved,
+            interactions_moved=interactions_moved,
+            overrides_created=overrides_created,
+        )
 
 
 @router.get("/people/{person_id}/timeline", response_model=TimelineResponse)
-async def get_person_timeline(
+def get_person_timeline(
     person_id: str,
     source_type: Optional[str] = Query(
         default=None,
@@ -1634,7 +1818,7 @@ SOURCE_BADGES = {
 
 
 @router.get("/people/{person_id}/timeline/aggregated", response_model=AggregatedTimelineResponse)
-async def get_person_timeline_aggregated(
+def get_person_timeline_aggregated(
     person_id: str,
     source_type: Optional[str] = Query(
         default=None,
@@ -1798,7 +1982,7 @@ async def get_person_timeline_aggregated(
 
 
 @router.get("/people/{person_id}/connections", response_model=ConnectionsResponse)
-async def get_person_connections(
+def get_person_connections(
     person_id: str,
     relationship_type: Optional[str] = Query(default=None, description="Filter by type"),
     limit: int = Query(default=50, ge=1, le=200, description="Max results"),
@@ -1866,7 +2050,7 @@ async def get_person_connections(
 
 
 @router.get("/people/{person_id}/strength", response_model=dict)
-async def get_person_strength_breakdown(person_id: str):
+def get_person_strength_breakdown(person_id: str):
     """
     Get detailed breakdown of relationship strength components.
 
@@ -1905,7 +2089,7 @@ def _fact_to_response(fact: PersonFact) -> PersonFactResponse:
 
 
 @router.get("/people/{person_id}/facts", response_model=PersonFactsResponse)
-async def get_person_facts(person_id: str):
+def get_person_facts(person_id: str):
     """
     Get all facts about a person.
 
@@ -1965,19 +2149,27 @@ async def extract_person_facts(person_id: str, model: Optional[str] = None):
         model = PersonFactExtractor.MODEL_SONNET
     elif model == "haiku":
         model = PersonFactExtractor.MODEL_HAIKU
-    person_store = get_person_entity_store()
-    person = person_store.get_by_id(person_id)
+    # get_person_entity_store()/get_interaction_store() themselves run
+    # inside the thread hop, not just the calls made on their result: on a
+    # cold singleton they run _init_db() etc, which is exactly the blocking
+    # work this handler must keep off the event loop.
+    def _fetch_person():
+        return get_person_entity_store().get_by_id(person_id)
+
+    person = await asyncio.to_thread(_fetch_person)
 
     if not person:
         raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found")
 
     # Get ALL interactions for the person (extractor will sample strategically)
-    interaction_store = get_interaction_store()
-    interactions = interaction_store.get_for_person(
-        person_id,
-        days_back=3650,  # Look back 10 years for full history
-        limit=100000,  # No practical limit - let extractor sample
-    )
+    def _fetch_interactions():
+        return get_interaction_store().get_for_person(
+            person_id,
+            days_back=3650,  # Look back 10 years for full history
+            limit=100000,  # No practical limit - let extractor sample
+        )
+
+    interactions = await asyncio.to_thread(_fetch_interactions)
 
     if not interactions:
         return FactExtractionResponse(
@@ -2001,7 +2193,7 @@ async def extract_person_facts(person_id: str, model: Optional[str] = None):
 
     # Extract facts (use async version for proper event loop handling)
     try:
-        extractor = get_person_fact_extractor()
+        extractor = await asyncio.to_thread(get_person_fact_extractor)
         extracted_facts = await extractor.extract_facts_async(
             person_id=person_id,
             person_name=person.canonical_name,
@@ -2020,7 +2212,7 @@ async def extract_person_facts(person_id: str, model: Optional[str] = None):
 
 
 @router.put("/people/{person_id}/facts/{fact_id}", response_model=PersonFactResponse)
-async def update_person_fact(person_id: str, fact_id: str, request: FactUpdateRequest):
+def update_person_fact(person_id: str, fact_id: str, request: FactUpdateRequest):
     """
     Update a fact's value or metadata.
     """
@@ -2051,7 +2243,7 @@ async def update_person_fact(person_id: str, fact_id: str, request: FactUpdateRe
 
 
 @router.delete("/people/{person_id}/facts/{fact_id}")
-async def delete_person_fact(person_id: str, fact_id: str):
+def delete_person_fact(person_id: str, fact_id: str):
     """
     Delete a fact.
     """
@@ -2070,7 +2262,7 @@ async def delete_person_fact(person_id: str, fact_id: str):
 
 
 @router.post("/people/{person_id}/facts/{fact_id}/confirm")
-async def confirm_person_fact(person_id: str, fact_id: str):
+def confirm_person_fact(person_id: str, fact_id: str):
     """
     Mark a fact as confirmed by user.
 
@@ -2091,7 +2283,7 @@ async def confirm_person_fact(person_id: str, fact_id: str):
 
 
 @router.post("/people/{person_id}/hide")
-async def hide_person(person_id: str, request: HidePersonRequest):
+def hide_person(person_id: str, request: HidePersonRequest):
     """
     Hide a person (soft delete) and blocklist their identifiers.
 
@@ -2104,35 +2296,36 @@ async def hide_person(person_id: str, request: HidePersonRequest):
     The person is not deleted, just hidden. Hidden people won't appear
     in search results or the people list.
     """
-    person_store = get_person_entity_store()
-    person = person_store.get_by_id(person_id)
+    with _mutation_lock:
+        person_store = get_person_entity_store()
+        person = person_store.get_by_id(person_id)
 
-    if not person:
-        raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found")
+        if not person:
+            raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found")
 
-    # Check if already hidden
-    if person.hidden:
+        # Check if already hidden
+        if person.hidden:
+            return {
+                "status": "already_hidden",
+                "person_id": person_id,
+                "hidden_at": person.hidden_at.isoformat() if person.hidden_at else None,
+            }
+
+        # Hide the person
+        hidden = person_store.hide_person(person_id, request.reason)
+
         return {
-            "status": "already_hidden",
+            "status": "hidden",
             "person_id": person_id,
-            "hidden_at": person.hidden_at.isoformat() if person.hidden_at else None,
+            "name": hidden.canonical_name,
+            "emails_blocked": len(hidden.emails),
+            "phones_blocked": len(hidden.phone_numbers),
+            "reason": request.reason,
         }
-
-    # Hide the person
-    hidden = person_store.hide_person(person_id, request.reason)
-
-    return {
-        "status": "hidden",
-        "person_id": person_id,
-        "name": hidden.canonical_name,
-        "emails_blocked": len(hidden.emails),
-        "phones_blocked": len(hidden.phone_numbers),
-        "reason": request.reason,
-    }
 
 
 @router.get("/discover", response_model=DiscoverResponse)
-async def discover_connections(
+def discover_connections(
     person_id: Optional[str] = Query(default=None, description="Person to find suggestions for"),
     limit: int = Query(default=10, ge=1, le=50, description="Max suggestions"),
 ):
@@ -2230,18 +2423,23 @@ async def import_source_data(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to decode file: {e}")
 
-    source_store = get_source_entity_store()
+    # get_source_entity_store() itself runs inside the thread hop, not just
+    # the calls made on its result: on a cold singleton it runs _init_db()
+    # etc, which is exactly the blocking work this handler must keep off
+    # the event loop.
+    source_store = await asyncio.to_thread(get_source_entity_store)
 
     if source_type == "whatsapp":
         from api.services.whatsapp_import import import_whatsapp_export
-        stats = import_whatsapp_export(
+        stats = await asyncio.to_thread(
+            import_whatsapp_export,
             content_str,
             file.filename or "chat.txt",
             source_store,
         )
     else:  # signal
         from api.services.signal_import import import_signal_export
-        stats = import_signal_export(content_str, source_store)
+        stats = await asyncio.to_thread(import_signal_export, content_str, source_store)
 
     return {
         "status": "completed",
@@ -2252,28 +2450,29 @@ async def import_source_data(
 
 
 @router.post("/sources/{source_type}/sync")
-async def sync_source(source_type: str):
+def sync_source(source_type: str):
     """
     Trigger a sync for a specific data source.
     """
-    # WhatsApp has no standalone nightly sync of its own (issue #784) — its
-    # data is imported as part of the combined apple_import step, so a
-    # WhatsApp entry here belongs at the same (currently stub, see TODO
-    # below) parity level as gmail/imessage/linkedin, not below it.
-    valid_sources = {"gmail", "calendar", "slack", "contacts", "imessage", "linkedin", "vault", "whatsapp"}
-    if source_type not in valid_sources:
-        raise HTTPException(status_code=400, detail=f"Invalid source type: {source_type}")
+    with _mutation_lock:
+        # WhatsApp has no standalone nightly sync of its own (issue #784) — its
+        # data is imported as part of the combined apple_import step, so a
+        # WhatsApp entry here belongs at the same (currently stub, see TODO
+        # below) parity level as gmail/imessage/linkedin, not below it.
+        valid_sources = {"gmail", "calendar", "slack", "contacts", "imessage", "linkedin", "vault", "whatsapp"}
+        if source_type not in valid_sources:
+            raise HTTPException(status_code=400, detail=f"Invalid source type: {source_type}")
 
-    # TODO: Implement actual sync triggers
-    return {
-        "status": "queued",
-        "source_type": source_type,
-        "message": "Sync queued for processing",
-    }
+        # TODO: Implement actual sync triggers
+        return {
+            "status": "queued",
+            "source_type": source_type,
+            "message": "Sync queued for processing",
+        }
 
 
 @router.post("/relationships/discover")
-async def trigger_relationship_discovery():
+def trigger_relationship_discovery():
     """
     Trigger relationship discovery across all sources.
 
@@ -2281,32 +2480,35 @@ async def trigger_relationship_discovery():
     to discover connections between people.
     Automatically recalculates relationship strengths after discovery.
     """
-    results = run_full_discovery()
+    with _mutation_lock:
+        results = run_full_discovery()
 
-    # Automatically recalculate relationship strengths after discovery
-    strength_results = update_all_strengths()
-    results["strengths_updated"] = strength_results.get("updated", 0)
+        # Automatically recalculate relationship strengths after discovery
+        strength_results = update_all_strengths()
+        results["strengths_updated"] = strength_results.get("updated", 0)
 
-    return {
-        "status": "completed",
-        "discovered": results,
-    }
+        return {
+            "status": "completed",
+            "discovered": results,
+        }
 
 
 @router.post("/strengths/update")
-async def update_relationship_strengths():
+def update_relationship_strengths():
     """
     Update relationship strength scores for all people.
     """
-    results = update_all_strengths()
-    return {
-        "status": "completed",
-        "results": results,
-    }
+    with _mutation_lock:
+        results = update_all_strengths()
+        return {
+            "status": "completed",
+            "results": results,
+        }
 
 
 @router.get("/statistics", response_model=StatisticsResponse)
-async def get_crm_statistics():
+@cached_aggregate()
+def get_crm_statistics():
     """
     Get comprehensive CRM statistics.
     """
@@ -2334,12 +2536,70 @@ async def get_crm_statistics():
     )
 
 
+def _rendered_edge_weight(
+    rel: Relationship,
+    a_canonical: str,
+    b_canonical: str,
+    my_person_id: str,
+    people_by_id: dict[str, PersonEntity],
+) -> int:
+    """
+    The edge weight exactly as rendered to the client: for an edge that
+    touches the CRM owner, the OTHER person's relationship_strength;
+    otherwise the pair's own `Relationship.pair_strength`.
+
+    `a_canonical`/`b_canonical` must already be canonicalised — a
+    Relationship row's own person_a_id/person_b_id can be a legacy
+    (merged-away) id, and `people_by_id` must be keyed by canonical id (e.g.
+    `PersonEntityStore.get_all()`) or the "other person" lookup silently
+    misses and falls back to pair_strength (#896 review finding 1 — this is
+    the exact bug that made one real edge's weight 90 before vs 96 after).
+    """
+    if a_canonical == my_person_id or b_canonical == my_person_id:
+        other_canonical = b_canonical if a_canonical == my_person_id else a_canonical
+        other_person = people_by_id.get(other_canonical)
+        return int(other_person.relationship_strength) if other_person else rel.pair_strength
+    return rel.pair_strength
+
+
+def _build_network_edge(rel: Relationship, source_id: str, target_id: str, weight: int) -> "NetworkEdge":
+    """Build a NetworkEdge from a Relationship row for already-resolved
+    (canonical) source/target ids and a precomputed weight."""
+    return NetworkEdge(
+        source=source_id,
+        target=target_id,
+        weight=weight,
+        type=rel.relationship_type,
+        shared_events_count=rel.shared_events_count or 0,
+        shared_threads_count=rel.shared_threads_count or 0,
+        shared_messages_count=rel.shared_messages_count or 0,
+        shared_whatsapp_count=rel.shared_whatsapp_count or 0,
+        shared_slack_count=rel.shared_slack_count or 0,
+        shared_phone_calls_count=rel.shared_phone_calls_count or 0,
+        shared_photos_count=rel.shared_photos_count or 0,
+        is_linkedin_connection=rel.is_linkedin_connection,
+    )
+
+
 @router.get("/network", response_model=NetworkGraphResponse)
-async def get_network_graph(
+def get_network_graph(
     center_on: Optional[str] = Query(default=None, description="Person ID to center the graph on"),
     depth: int = Query(default=2, ge=1, le=4, description="Hops from center person"),
     min_strength: float = Query(default=0.0, ge=0.0, le=1.0, description="Minimum relationship strength"),
     category: Optional[str] = Query(default=None, description="Filter by category"),
+    max_nodes: int = Query(
+        default=150, ge=1, le=500,
+        description="Maximum nodes to return for a centered request (ignored with allow_full_graph)",
+    ),
+    max_second_degree_per_node: int = Query(
+        default=10, ge=0, le=50,
+        description="Maximum second-(and deeper-)degree neighbors to add per node at the previous depth",
+    ),
+    max_edges: int = Query(
+        default=2000, ge=1, le=20000,
+        description="Target maximum edges for a centered request; every edge touching the centre is "
+                     "always included even if that alone exceeds this (ignored with allow_full_graph)",
+    ),
     allow_full_graph: bool = Query(
         default=False,
         description="Required to load full graph without center_on (expensive operation)"
@@ -2351,11 +2611,42 @@ async def get_network_graph(
     Returns nodes (people) and edges (relationships) for rendering
     an interactive force-directed network graph.
 
-    If center_on is provided, only returns people within 'depth' hops
-    of the center person. Otherwise, returns all people and relationships.
+    If center_on is provided, this returns a bounded neighborhood:
 
-    PERFORMANCE: Without center_on, this loads ALL relationships (5000+ edges).
-    Set allow_full_graph=true to explicitly opt-in to this expensive operation.
+    - Node selection: the center (degree 0), then the strongest first-degree
+      connections (degree 1) up to 75% of `max_nodes` when `depth >= 2` (the
+      full `max_nodes - 1` when `depth == 1`, since there is no deeper tier to
+      reserve budget for), ranked by the same value the response renders as
+      edge weight (`_rendered_edge_weight` — the owner's other-person
+      relationship_strength, or pair_strength otherwise), via one indexed
+      query for the center's own relationships. The remaining node budget
+      goes to deeper hops: each first-degree node (processed strongest
+      first) contributes up to `max_second_degree_per_node` of its own
+      strongest neighbors (ranked by a cheaper shared-interaction-count
+      proxy, `RelationshipStore.get_top_neighbors`), until `max_nodes` is
+      reached. The full 500k+-row relationship table is never loaded for a
+      centered request.
+    - Edge selection: every edge connecting the center to a first-degree
+      node is always included (this is what guarantees "every first-degree
+      node has an edge to the center", regardless of `max_edges`). The
+      remaining edge budget (`max_edges` minus those center edges) is filled
+      with the strongest remaining edges among the selected nodes
+      (`RelationshipStore.get_edges_among`), ranked by the same rendered
+      edge weight. Both a merged/legacy id appearing as an endpoint in the
+      raw relationship table, and the id of the CRM owner, are resolved to
+      their canonical id before any of this ranking, lookup, or de-dup.
+    - `category`, if set, is applied during first-degree selection over a
+      window of the 3×`max_nodes` strongest candidates (categories computed
+      via the batched source-entity path, same as `GET /people`), then the
+      top slots are taken from the survivors — best-effort: a category
+      concentrated outside that window is under-represented. Deeper-hop
+      candidates use a cheaper per-person category check with no batched
+      fetch. `min_strength` is applied to already-selected nodes exactly as
+      before (see the docs for a pre-existing scale note).
+
+    Without center_on, this loads ALL relationships (500k+ edges) and all
+    people; none of the caps above apply. Set allow_full_graph=true to
+    explicitly opt-in to this expensive operation.
 
     Each node includes a 'degree' field:
     - 0 = center person
@@ -2375,58 +2666,241 @@ async def get_network_graph(
 
     # Build the graph
     nodes: list[NetworkNode] = []
-    edges: list[NetworkEdge] = []
-    # Map person_id -> degree (distance from center)
+    # Map person_id -> degree (distance from center); center_edges maps a
+    # first-degree canonical id to the exact Relationship row that selected
+    # it, so the center-to-first-degree edges never depend on get_edges_among
+    # re-finding them by id (#896 review finding 1).
     node_degrees: dict[str, int] = {}
+    center_edges: dict[str, Relationship] = {}
+
+    # #880: cached and cheap. Also serves as the canonical-id-keyed strength
+    # lookup used to rank first-degree candidates by the real rendered edge
+    # weight (finding 5), and as the final node-building/edge-weight lookup
+    # (already canonical-keyed, so no separate batch-by-id call is needed —
+    # finding 1's third consequence was exactly a requested-id-keyed dict).
+    all_people_dict = {p.id: p for p in person_store.get_all()}
+
+    my_person_id = person_store.get_canonical_id(settings.my_person_id)
 
     if center_on:
-        # BFS to find people within depth hops of center, tracking degree
         center_person = person_store.get_by_id(center_on)
         if not center_person:
             raise HTTPException(status_code=404, detail=f"Person '{center_on}' not found")
+        # A merged/legacy center id resolves to the surviving canonical
+        # person (get_by_id() above already followed the merge chain to
+        # fetch it) - without this, `all_people_dict` (canonical-keyed)
+        # never has an entry for the raw requested id, so the center
+        # silently drops out of the response even though it "exists"
+        # (#896 review round 3, not-verified note).
+        center_on = center_person.id
 
-        # Get the CRM owner's ID - exclude from 2nd+ degree traversal
-        # since they're connected to everyone and would pollute the graph
-        my_person_id = settings.my_person_id
+        # Exclude the CRM owner from 2nd+ degree traversal since they're
+        # connected to everyone and would pollute the graph.
         is_viewing_self = (center_on == my_person_id)
 
-        # BFS traversal with degree tracking - use batch queries
-        node_degrees[center_on] = 0  # Center is degree 0
-        current_level: set[str] = {center_on}
+        node_degrees[center_on] = 0
+        frontier: list[str] = []
+        # Ids whose category match was already confirmed during selection
+        # (via compute_person_category, possibly with batched source
+        # entities) - the node-building filter below trusts these instead
+        # of re-checking with a cheaper/different computation, which is
+        # what let a node be selected under one category decision and then
+        # dropped (or kept) under a different one (#896 review round 3
+        # finding 5).
+        category_confirmed_ids: set[str] = set()
 
-        for current_depth in range(1, depth + 1):
-            if not current_level:
-                break
-            # Batch query for all people at this level
-            level_relationships = rel_store.get_for_people_batch(current_level)
-            next_level: set[str] = set()
-            for person_id in current_level:
-                # Skip "me" as a bridge for 2nd+ degree when not viewing self
-                # This prevents everyone appearing as 2nd-degree through me
-                if not is_viewing_self and current_depth > 1 and person_id == my_person_id:
+        # depth == 1 has no deeper tier, so first-degree gets the full
+        # remaining budget; depth >= 2 reserves ~25% of max_nodes for
+        # second-(and deeper-)degree hops instead of consuming the whole
+        # budget on first-degree alone (#896 review finding 3).
+        first_degree_limit = 0
+        if max_nodes > 1:
+            first_degree_limit = (max_nodes - 1) if depth < 2 else max(1, int(max_nodes * 0.75))
+
+        # Every one of the center's own direct relationships, canonicalised
+        # and de-duped (kept regardless of whether it makes the
+        # first_degree_limit cut) - used both to rank first-degree
+        # candidates and, after selection, to relabel any node that has a
+        # genuine direct center relationship as degree 1 even if it was
+        # only re-discovered through a friend (#896 review round 3
+        # finding 4: capping first-degree selection means a real direct
+        # connection can miss the cut and re-enter as a "second-degree"
+        # node, which is misleading and makes the degree filter lie).
+        all_direct_candidates: dict[str, Relationship] = {}
+        # The full ranked (and, if category is set, category-filtered) list
+        # of direct candidates first-degree selection drew from - kept so
+        # any part of the deeper-hop budget that goes unspent can be
+        # backfilled from the next-strongest direct candidates instead of
+        # coming back under max_nodes (#896 review round 5, MINOR finding).
+        selection_pool: list[tuple[str, Relationship]] = []
+
+        with contextlib.closing(rel_store.open_connection()) as conn:
+            if first_degree_limit > 0:
+                raw_rels = rel_store.get_all_for_person(center_on, conn=conn)
+
+                # Canonicalise every neighbor id and de-dup, keeping the
+                # higher-weight relationship row when more than one raw row
+                # resolves to the same canonical id (#896 finding 1).
+                for rel in raw_rels:
+                    other_raw = rel.other_person(center_on)
+                    if not other_raw:
+                        continue
+                    other_canonical = person_store.get_canonical_id(other_raw)
+                    if other_canonical == center_on:
+                        continue  # self-loop after a merge
+                    weight = _rendered_edge_weight(rel, center_on, other_canonical, my_person_id, all_people_dict)
+                    existing = all_direct_candidates.get(other_canonical)
+                    if existing is not None:
+                        existing_weight = _rendered_edge_weight(
+                            existing, center_on, other_canonical, my_person_id, all_people_dict
+                        )
+                        if weight <= existing_weight:
+                            continue
+                    all_direct_candidates[other_canonical] = rel
+
+                # Rank by the real rendered edge weight (not a proxy),
+                # deterministic tiebreak by canonical id (#896 finding 5/9).
+                ranked = sorted(
+                    all_direct_candidates.items(),
+                    key=lambda kv: (
+                        -_rendered_edge_weight(kv[1], center_on, kv[0], my_person_id, all_people_dict),
+                        kv[0],
+                    ),
+                )
+
+                if category:
+                    # Best-effort: consider a window of the strongest
+                    # candidates, compute categories via one batched
+                    # source-entity fetch (same pattern as GET /people),
+                    # filter, then take the top first_degree_limit of the
+                    # still-ranked survivors (#896 finding 6). Every id that
+                    # passes is recorded so the node-building filter below
+                    # trusts this decision instead of re-deriving a
+                    # possibly different one (#896 review round 3 finding 5).
+                    window = ranked[:min(len(ranked), 3 * max_nodes)]
+                    source_store = get_source_entity_store()
+                    cat_sources_by_id = source_store.get_for_people_batch(
+                        [cid for cid, _ in window], limit_per_person=_CATEGORY_BATCH_SOURCE_LIMIT
+                    )
+                    selection_pool = []
+                    for cid, rel in window:
+                        cand_person = all_people_dict.get(cid)
+                        if cand_person is None:
+                            continue
+                        if compute_person_category(cand_person, cat_sources_by_id.get(cid, [])) == category:
+                            selection_pool.append((cid, rel))
+                            category_confirmed_ids.add(cid)
+                else:
+                    selection_pool = ranked
+
+                for canonical_other, rel in selection_pool[:first_degree_limit]:
+                    node_degrees[canonical_other] = 1
+                    frontier.append(canonical_other)
+                    center_edges[canonical_other] = rel
+
+            # For depth >= 2, expand each frontier node's strongest
+            # neighbors (up to max_second_degree_per_node each, in
+            # first-degree strength order) into the budget left after the
+            # first-degree tier above.
+            for current_depth in range(2, depth + 1):
+                if not frontier or len(node_degrees) >= max_nodes:
+                    break
+                next_frontier: list[str] = []
+                for node_id in frontier:
+                    if len(node_degrees) >= max_nodes:
+                        break
+                    # Skip "me" as a bridge for 2nd+ degree when not viewing
+                    # self - this prevents everyone appearing as 2nd-degree
+                    # through me (same rationale as the original BFS).
+                    if not is_viewing_self and node_id == my_person_id:
+                        continue
+                    if max_second_degree_per_node <= 0:
+                        continue
+                    for rel in rel_store.get_top_neighbors(node_id, limit=max_second_degree_per_node, conn=conn):
+                        if len(node_degrees) >= max_nodes:
+                            break
+                        other_raw = rel.other_person(node_id)
+                        if not other_raw:
+                            continue
+                        other_canonical = person_store.get_canonical_id(other_raw)
+                        if other_canonical in node_degrees:
+                            continue
+                        if other_canonical in all_direct_candidates:
+                            # A genuine direct connection of the center
+                            # isn't a friend-of-friend - skip it here so the
+                            # budget reserved for deeper hops goes to actual
+                            # second-degree people instead of being spent
+                            # (and then immediately relabeled back to
+                            # degree 1 below) on centre connections that
+                            # merely missed the first-degree cut (#896
+                            # review round 4, MAJOR finding: this reclaimed
+                            # the whole reserved budget for dense centres,
+                            # collapsing the second-degree tier again).
+                            continue
+                        if category:
+                            # Cheap best-effort check (no batched
+                            # source-entity fetch per intermediate node).
+                            cand_person = all_people_dict.get(other_canonical)
+                            if cand_person is None or compute_person_category(cand_person, []) != category:
+                                continue
+                            category_confirmed_ids.add(other_canonical)
+                        node_degrees[other_canonical] = current_depth
+                        next_frontier.append(other_canonical)
+                frontier = next_frontier
+
+        # A node that has a genuine direct relationship to the center is
+        # relabeled degree 1 even if it was only added above via a friend
+        # (#896 review round 3 finding 4) - and gets its guaranteed center
+        # edge, same as any other first-degree node. The skip above means
+        # this shouldn't fire in practice any more (a direct candidate is
+        # never added as a deeper-hop node in the first place), but it's
+        # kept as a correctness backstop rather than relied upon.
+        for node_id, rel in all_direct_candidates.items():
+            if node_degrees.get(node_id, 0) > 1:
+                node_degrees[node_id] = 1
+                center_edges[node_id] = rel
+
+        # The deeper-hop tier's reserved share of the budget can't always
+        # be spent (a dense centre may have few or no genuine
+        # friends-of-friends once direct connections are excluded from it
+        # above), so backfill any leftover slots with the next-strongest
+        # direct candidates that missed the first-degree cut - they're
+        # real first-degree people, and every prior version of this
+        # endpoint showed them. Without this, a dense centre's response
+        # came back well under max_nodes even though its own network had
+        # more to show (#896 review round 5, MINOR finding).
+        if len(node_degrees) < max_nodes and len(selection_pool) > first_degree_limit:
+            for canonical_other, rel in selection_pool[first_degree_limit:]:
+                if len(node_degrees) >= max_nodes:
+                    break
+                if canonical_other in node_degrees:
                     continue
-                for rel in level_relationships.get(person_id, []):
-                    other_id = rel.other_person(person_id)
-                    if other_id and other_id not in node_degrees:
-                        next_level.add(other_id)
-                        node_degrees[other_id] = current_depth
-            current_level = next_level
+                node_degrees[canonical_other] = 1
+                center_edges[canonical_other] = rel
     else:
-        # Get all people (no center, all are degree 1)
-        all_people = person_store.get_all()
-        node_degrees = {p.id: 1 for p in all_people}
+        # Get all people (no center, all are degree 1) - unchanged full-graph path.
+        node_degrees = {p.id: 1 for p in all_people_dict.values()}
 
-    # Get all people in one pass (avoid N+1 lookups)
-    all_people_dict = {p.id: p for p in person_store.get_all()}
+    # Filter by category and strength, then build nodes. category_confirmed_ids
+    # is empty for a non-centered (full-graph) request, so every person there
+    # is freshly checked below - same as always for that path.
+    if not center_on:
+        category_confirmed_ids: set[str] = set()
 
-    # Filter by category and strength, then build nodes
     for person_id, degree in node_degrees.items():
         person = all_people_dict.get(person_id)
         if not person:
             continue
 
-        # Apply filters
-        if category and person.category != category:
+        # The exact category this node will be labeled with - also the
+        # single predicate used for the filter below, so a node can never
+        # be selected under one category decision and dropped (or kept)
+        # under a different one (#896 review round 3 finding 5). An id
+        # already confirmed during selection (possibly via a batched,
+        # more-accurate source-entity lookup) is trusted as-is instead of
+        # being re-derived from this cheaper per-node call.
+        computed_category = compute_person_category(person, [])
+        if category and person_id not in category_confirmed_ids and computed_category != category:
             continue
         if person.relationship_strength < min_strength:
             continue
@@ -2436,7 +2910,7 @@ async def get_network_graph(
         nodes.append(NetworkNode(
             id=person.id,
             name=person.display_name or person.canonical_name,
-            category=compute_person_category(person, []),
+            category=computed_category,
             strength=person.relationship_strength,
             interaction_count=interaction_count,
             degree=degree,
@@ -2445,50 +2919,56 @@ async def get_network_graph(
     # Build a set of valid node IDs after filtering
     valid_node_ids = {n.id for n in nodes}
 
-    # Get all edges in one query instead of per-node queries
-    all_relationships = rel_store.get_all_relationships()
-    seen_edges: set[tuple[str, str]] = set()
+    edges_by_pair: dict[tuple[str, str], NetworkEdge] = {}
 
-    # Get owner ID for determining edge weight source
-    my_person_id = settings.my_person_id
+    if center_on:
+        # Every edge touching the center is unconditionally included -
+        # these are exactly the relationship rows used to select each
+        # first-degree node, so this edge is never missing even for a
+        # legacy/merged neighbor id (#896 findings 1 and 2) - UNLESS the
+        # center itself didn't survive the category/min_strength filter
+        # above, in which case it's not in the response at all and an edge
+        # naming it would violate "every edge's endpoints are both present"
+        # (#896 review round 3 finding 3).
+        if center_on in valid_node_ids:
+            for neighbor_id, rel in center_edges.items():
+                if neighbor_id not in valid_node_ids:
+                    continue  # dropped by the category/min_strength filter above
+                weight = _rendered_edge_weight(rel, center_on, neighbor_id, my_person_id, all_people_dict)
+                pair = (min(center_on, neighbor_id), max(center_on, neighbor_id))
+                edges_by_pair[pair] = _build_network_edge(rel, center_on, neighbor_id, weight)
 
-    for rel in all_relationships:
-        # Both people must be in valid nodes
-        if rel.person_a_id not in valid_node_ids or rel.person_b_id not in valid_node_ids:
-            continue
+        # Fill the remaining edge budget with the strongest non-center
+        # edges among the selected nodes (#896 findings 2 and 4).
+        remaining_budget = max_edges - len(edges_by_pair)
+        if remaining_budget > 0 and len(valid_node_ids) > 1:
+            scored: list[tuple[int, tuple[str, str], Relationship, str, str]] = []
+            for rel in rel_store.get_edges_among(valid_node_ids):
+                a_canonical = person_store.get_canonical_id(rel.person_a_id)
+                b_canonical = person_store.get_canonical_id(rel.person_b_id)
+                if a_canonical not in valid_node_ids or b_canonical not in valid_node_ids:
+                    continue
+                pair = (min(a_canonical, b_canonical), max(a_canonical, b_canonical))
+                if pair in edges_by_pair:
+                    continue
+                weight = _rendered_edge_weight(rel, a_canonical, b_canonical, my_person_id, all_people_dict)
+                scored.append((weight, pair, rel, a_canonical, b_canonical))
+            # Strongest first, deterministic tiebreak by pair.
+            scored.sort(key=lambda t: (-t[0], t[1]))
+            for weight, pair, rel, a_canonical, b_canonical in scored[:remaining_budget]:
+                edges_by_pair[pair] = _build_network_edge(rel, a_canonical, b_canonical, weight)
+    else:
+        # allow_full_graph path: unchanged behavior, no max_edges cap.
+        for rel in rel_store.get_all_relationships():
+            if rel.person_a_id not in valid_node_ids or rel.person_b_id not in valid_node_ids:
+                continue
+            pair = (min(rel.person_a_id, rel.person_b_id), max(rel.person_a_id, rel.person_b_id))
+            if pair in edges_by_pair:
+                continue
+            weight = _rendered_edge_weight(rel, rel.person_a_id, rel.person_b_id, my_person_id, all_people_dict)
+            edges_by_pair[pair] = _build_network_edge(rel, rel.person_a_id, rel.person_b_id, weight)
 
-        # Create consistent edge key (smaller ID first)
-        edge_key = (min(rel.person_a_id, rel.person_b_id), max(rel.person_a_id, rel.person_b_id))
-        if edge_key in seen_edges:
-            continue
-        seen_edges.add(edge_key)
-
-        # Determine edge weight:
-        # - For edges involving the owner: use the other person's relationship_strength
-        # - For edges between two other people: use pair_strength
-        if rel.person_a_id == my_person_id or rel.person_b_id == my_person_id:
-            # Owner edge - use the other person's relationship_strength
-            other_id = rel.person_b_id if rel.person_a_id == my_person_id else rel.person_a_id
-            other_person = all_people_dict.get(other_id)
-            weight = int(other_person.relationship_strength) if other_person else rel.pair_strength
-        else:
-            # Non-owner edge - use pair_strength
-            weight = rel.pair_strength
-
-        edges.append(NetworkEdge(
-            source=rel.person_a_id,
-            target=rel.person_b_id,
-            weight=weight,
-            type=rel.relationship_type,
-            shared_events_count=rel.shared_events_count or 0,
-            shared_threads_count=rel.shared_threads_count or 0,
-            shared_messages_count=rel.shared_messages_count or 0,
-            shared_whatsapp_count=rel.shared_whatsapp_count or 0,
-            shared_slack_count=rel.shared_slack_count or 0,
-            shared_phone_calls_count=rel.shared_phone_calls_count or 0,
-            shared_photos_count=rel.shared_photos_count or 0,
-            is_linkedin_connection=rel.is_linkedin_connection,
-        ))
+    edges = list(edges_by_pair.values())
 
     elapsed = (time.time() - start_time) * 1000
     logger.info(f"network_graph(center={center_on}, depth={depth}) took {elapsed:.1f}ms ({len(nodes)} nodes, {len(edges)} edges)")
@@ -2521,7 +3001,7 @@ class RelationshipDetailResponse(BaseModel):
 
 
 @router.get("/relationship/{person_a_id}/{person_b_id}", response_model=RelationshipDetailResponse)
-async def get_relationship_details(person_a_id: str, person_b_id: str):
+def get_relationship_details(person_a_id: str, person_b_id: str):
     """
     Get detailed information about the relationship between two people.
 
@@ -2608,7 +3088,7 @@ async def get_relationship_details(person_a_id: str, person_b_id: str):
 # =======================
 
 @router.get("/slack/status")
-async def get_slack_status():
+def get_slack_status():
     """
     Get Slack integration status.
 
@@ -2627,7 +3107,7 @@ async def get_slack_status():
 
 
 @router.get("/slack/oauth/start")
-async def start_slack_oauth(state: Optional[str] = None):
+def start_slack_oauth(state: Optional[str] = None):
     """
     Start Slack OAuth flow.
 
@@ -2646,7 +3126,7 @@ async def start_slack_oauth(state: Optional[str] = None):
 
 
 @router.get("/slack/callback")
-async def slack_oauth_callback(code: str, state: Optional[str] = None):
+def slack_oauth_callback(code: str, state: Optional[str] = None):
     """
     Handle Slack OAuth callback.
 
@@ -2670,40 +3150,41 @@ async def slack_oauth_callback(code: str, state: Optional[str] = None):
 
 
 @router.post("/slack/sync")
-async def sync_slack_users_endpoint(workspace_id: str = "default"):
+def sync_slack_users_endpoint(workspace_id: str = "default"):
     """
     Sync Slack users to the CRM.
 
     Creates SourceEntity records for all users in the workspace.
     """
-    from api.services.slack_integration import (
-        get_slack_client,
-        sync_slack_users,
-        SlackAPIError,
-    )
-
-    client = get_slack_client()
-    if not client.is_connected(workspace_id):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Not connected to Slack workspace {workspace_id}. Complete OAuth first.",
+    with _mutation_lock:
+        from api.services.slack_integration import (
+            get_slack_client,
+            sync_slack_users,
+            SlackAPIError,
         )
 
-    source_store = get_source_entity_store()
+        client = get_slack_client()
+        if not client.is_connected(workspace_id):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not connected to Slack workspace {workspace_id}. Complete OAuth first.",
+            )
 
-    try:
-        stats = sync_slack_users(client, source_store, workspace_id)
-        return {
-            "status": "completed",
-            "workspace_id": workspace_id,
-            "stats": stats,
-        }
-    except SlackAPIError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        source_store = get_source_entity_store()
+
+        try:
+            stats = sync_slack_users(client, source_store, workspace_id)
+            return {
+                "status": "completed",
+                "workspace_id": workspace_id,
+                "stats": stats,
+            }
+        except SlackAPIError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/slack/disconnect")
-async def disconnect_slack(workspace_id: str = "default"):
+def disconnect_slack(workspace_id: str = "default"):
     """
     Disconnect a Slack workspace.
 
@@ -2724,7 +3205,7 @@ async def disconnect_slack(workspace_id: str = "default"):
 # ==================================
 
 @router.get("/contacts/status")
-async def get_contacts_status():
+def get_contacts_status():
     """
     Get Apple Contacts integration status.
 
@@ -2741,36 +3222,37 @@ async def get_contacts_status():
 
 
 @router.post("/contacts/sync")
-async def sync_contacts_endpoint():
+def sync_contacts_endpoint():
     """
     Sync Apple Contacts to the CRM.
 
     Creates SourceEntity records for all contacts.
     Requires macOS and Contacts permission.
     """
-    from api.services.apple_contacts import get_contacts_reader, sync_apple_contacts
+    with _mutation_lock:
+        from api.services.apple_contacts import get_contacts_reader, sync_apple_contacts
 
-    reader = get_contacts_reader()
-    if not reader.is_available:
-        raise HTTPException(
-            status_code=400,
-            detail="Apple Contacts not available. Requires macOS and pyobjc-framework-Contacts.",
-        )
+        reader = get_contacts_reader()
+        if not reader.is_available:
+            raise HTTPException(
+                status_code=400,
+                detail="Apple Contacts not available. Requires macOS and pyobjc-framework-Contacts.",
+            )
 
-    auth_status = reader.check_authorization()
-    if auth_status != "authorized":
-        raise HTTPException(
-            status_code=403,
-            detail=f"Contacts access not authorized: {auth_status}. Grant permission in System Preferences.",
-        )
+        auth_status = reader.check_authorization()
+        if auth_status != "authorized":
+            raise HTTPException(
+                status_code=403,
+                detail=f"Contacts access not authorized: {auth_status}. Grant permission in System Preferences.",
+            )
 
-    source_store = get_source_entity_store()
-    stats = sync_apple_contacts(source_store, reader)
+        source_store = get_source_entity_store()
+        stats = sync_apple_contacts(source_store, reader)
 
-    return {
-        "status": "completed",
-        "stats": stats,
-    }
+        return {
+            "status": "completed",
+            "stats": stats,
+        }
 
 
 # =============================
@@ -2884,6 +3366,13 @@ class MeInteractionsResponse(BaseModel):
     tracked_relationships: list[TrackedRelationship] = []  # Parent/Coparent tracking
 
 
+class MeInteractionsSpanResponse(BaseModel):
+    """Earliest/latest interaction dates, for sizing the Me heatmap window."""
+    earliest: Optional[str] = None  # ISO timestamp, or null if there's no data
+    latest: Optional[str] = None
+    years: int  # Suggested heatmap window, clamped to [1, 10]
+
+
 class FamilyMember(BaseModel):
     """Family member for multi-select dropdown and visualizations."""
     id: str
@@ -2936,34 +3425,28 @@ class FamilyInteractionsResponse(BaseModel):
 
 
 @router.get("/me/stats", response_model=MeStatsResponse)
-async def get_me_stats():
+def get_me_stats():
     """
     Get aggregate statistics for the owner's personal dashboard.
 
-    Returns total counts across all people in the CRM.
+    Returns total counts across all non-hidden, non-merged people in the CRM,
+    computed with a single SQL SUM instead of loading every PersonEntity.
     """
     person_store = get_person_entity_store()
-    _interaction_store = get_interaction_store()  # noqa: F841
 
-    # Get all people
-    all_people = person_store.get_all()
-    total_people = len(all_people)
-
-    # Aggregate stats from all people
-    total_emails = sum(p.email_count for p in all_people)
-    total_meetings = sum(p.meeting_count for p in all_people)
-    total_messages = sum(p.message_count for p in all_people)
+    totals = person_store.get_totals()
 
     return MeStatsResponse(
-        total_people=total_people,
-        total_emails=total_emails,
-        total_meetings=total_meetings,
-        total_messages=total_messages,
+        total_people=totals["total_people"],
+        total_emails=totals["total_emails"],
+        total_meetings=totals["total_meetings"],
+        total_messages=totals["total_messages"],
     )
 
 
 @router.get("/me/timeline", response_model=TimelineResponse)
-async def get_me_timeline(
+@cached_aggregate()
+def get_me_timeline(
     source_type: Optional[str] = Query(
         default=None,
         description="Filter by source type. Supports comma-separated values for compound "
@@ -2998,10 +3481,9 @@ async def get_me_timeline(
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
-    # Get hidden person IDs to exclude from results
-    hidden_person_ids = {
-        p.id for p in person_store.get_all(include_hidden=True) if p.hidden
-    }
+    # Get hidden person IDs to exclude from results (targeted query, not a
+    # full people load)
+    hidden_person_ids = person_store.get_hidden_ids()
 
     # Get all interactions, excluding self and hidden people
     # Note: We fetch extra for pagination (offset + limit + 1 to check has_more)
@@ -3014,8 +3496,9 @@ async def get_me_timeline(
         specific_date=date,
     )
 
-    # Build person lookup for adding person names to timeline items
-    person_lookup = {p.id: p for p in person_store.get_all()}
+    # Batch-lookup names only for the (small, already-paginated) people
+    # referenced by this page's interactions, instead of loading everyone.
+    person_lookup = person_store.get_by_ids({i.person_id for i in interactions}, exclude_hidden=True)
 
     # Filter to only include interactions with known (non-orphaned) person IDs
     interactions = [i for i in interactions if i.person_id in person_lookup]
@@ -3046,7 +3529,8 @@ async def get_me_timeline(
 
 
 @router.get("/me/interactions", response_model=MeInteractionsResponse)
-async def get_me_interactions(
+@cached_aggregate()
+def get_me_interactions(
     days_back: int = Query(default=365, ge=1, le=3660, description="Days of history (up to 10 years)"),
     trend_period: str = Query(default="quarter", description="Trend comparison period: week, month, quarter, year"),
     health_period: str = Query(default="quarter", description="Health score history period: month, quarter, year"),
@@ -3066,14 +3550,19 @@ async def get_me_interactions(
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
-    # Build person lookup for names (excludes hidden people by default)
+    # Single full-person-list load. Cheap (#880 caches this), and genuinely
+    # needed here (unlike the other Me/Family handlers): the health-score
+    # widget's "top 25 family/personal contacts" is chosen by
+    # relationship_strength across ALL people regardless of whether they have
+    # interactions in this window, so it can't be derived from a
+    # window-scoped aggregate the way daily/top_contacts/trends can.
     all_people = person_store.get_all()
     person_lookup = {p.id: p for p in all_people}
 
-    # Get hidden person IDs to exclude from metrics
-    hidden_person_ids = {
-        p.id for p in person_store.get_all(include_hidden=True) if p.hidden
-    }
+    # Get hidden person IDs (targeted query) — used on its own below by the
+    # network-growth widget, which checks self/hidden/peripheral/orphaned
+    # separately rather than via one combined exclude set.
+    hidden_person_ids = person_store.get_hidden_ids()
 
     # Get peripheral contact IDs to exclude from counts
     # These are people with is_peripheral_contact=True (relationship_strength < 3.0)
@@ -3081,18 +3570,16 @@ async def get_me_interactions(
         p.id for p in all_people if p.is_peripheral_contact
     }
 
-    # Get all interactions in date range, excluding self, hidden, and peripheral contacts
-    all_interactions_raw = interaction_store.get_all_in_range(
-        start_date=start_date,
-        end_date=end_date,
-        exclude_person_ids=[MY_PERSON_ID] + list(hidden_person_ids) + list(peripheral_person_ids),
-    )
-
-    # Filter to only include interactions with known (non-orphaned) person IDs
-    all_interactions = [
-        i for i in all_interactions_raw
-        if i.person_id in person_lookup
-    ]
+    # Self + hidden + peripheral + merged-secondary — shared with
+    # /me/interactions/span so both exclude the same population (#897
+    # review finding 6).
+    exclude_ids = _me_exclude_ids(person_store, all_people)
+    # A separate set for Python-side `in` checks (e.g. filtering window_rows
+    # below): `exclude_ids` itself stays a list because SQL query building
+    # needs an ordered sequence of params, but a list `in` check is O(n) per
+    # lookup — against ~9,500 excluded ids here, that turned a ~50,000-row
+    # Python loop into thousands of times more comparisons than necessary.
+    exclude_id_set = set(exclude_ids)
 
     # Use pre-computed Dunbar circles from person entities
     circle_map = {
@@ -3101,16 +3588,6 @@ async def get_me_interactions(
     }
     circle_map[MY_PERSON_ID] = -1  # Self
 
-    # Aggregation structures
-    daily_data = defaultdict(lambda: {"total": 0, "sources": defaultdict(int)})
-    by_source = defaultdict(int)
-    by_month = defaultdict(int)
-    by_circle = defaultdict(int)
-    person_counts_30d = defaultdict(int)
-    person_counts_recent = defaultdict(int)
-    person_counts_previous = defaultdict(int)
-
-    # Date boundaries for trends based on period
     now = datetime.now(timezone.utc)
     period_days = {
         "week": 7,
@@ -3123,67 +3600,81 @@ async def get_me_interactions(
     trend_previous_start = now - timedelta(days=trend_days * 2)
     thirty_days_ago = now - timedelta(days=30)
 
-    total_count = 0
+    # ---- Daily heatmap + by_source/by_month/total_count/by_circle/messaging ----
+    # A single (day, person_id, source_type) scan of the window instead of
+    # separate day+source, person, and person+month scans. On the production
+    # dataset, most of the window's ~9,500 hidden/peripheral/self people make
+    # a SQL `person_id NOT IN (...)` exclusion filter expensive (measured
+    # ~250-400ms per full-window scan REGARDLESS of which columns are
+    # grouped — the per-row membership check against ~9,500 ids dominates,
+    # not the grouping itself), so exclusion happens here in Python as a
+    # `set` lookup against the already-small GROUPED rows instead — free
+    # since every widget below iterates them anyway. This also folds in the
+    # same "known (non-orphaned) person id" check the old code applied via
+    # `if i.person_id in person_lookup`, and what used to be three separate
+    # full-window queries (one each for day-level, person-level, and
+    # per-month breakdowns) into one.
+    # "Only count SENT emails" is the /me dashboard's one global rule
+    # (gmail_sent_only=True), matching the single upstream
+    # `if source == 'gmail' ... continue` the old code applied once to a
+    # shared all_interactions list.
+    window_rows = interaction_store.get_daily_person_source_counts(
+        start_date, end_date, gmail_sent_only=True,
+    )
 
-    for interaction in all_interactions:
-        # Get date string
-        if interaction.timestamp:
-            if hasattr(interaction.timestamp, 'strftime'):
-                ts = interaction.timestamp
-                # Ensure timezone-aware for comparisons
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                date_str = ts.strftime('%Y-%m-%d')
-                month_str = ts.strftime('%Y-%m')
-            else:
-                date_str = str(interaction.timestamp)[:10]
-                month_str = date_str[:7]
-                ts = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
-        else:
+    daily_data = defaultdict(lambda: {"total": 0, "sources": defaultdict(int)})
+    by_source = defaultdict(int)
+    by_month = defaultdict(int)
+    by_circle = defaultdict(int)
+    total_count = 0
+    monthly_messaging = defaultdict(lambda: {
+        "total": 0,
+        "by_circle": defaultdict(int),
+        "people_by_circle": defaultdict(set),  # circle -> set of person_ids
+    })
+    MESSAGING_SOURCES = {'imessage', 'whatsapp'}
+
+    for day, person_id, source, cnt in window_rows:
+        if person_id not in person_lookup or person_id in exclude_id_set:
             continue
 
-        source = (interaction.source_type or "unknown").lower()
-        person_id = interaction.person_id
+        daily_data[day]["total"] += cnt
+        daily_data[day]["sources"][source] += cnt
+        by_source[source] += cnt
+        by_month[day[:7]] += cnt
+        total_count += cnt
+
         circle = circle_map.get(person_id, 7)
+        by_circle[str(circle)] += cnt
 
-        # For /me dashboard: only count SENT emails (title starts with →)
-        # Received emails (←) are excluded to focus on outbound activity
-        if source == 'gmail':
-            title = interaction.title or ""
-            is_sent = title.startswith("→")
-            if not is_sent:
-                continue  # Skip received emails entirely
+        if source in MESSAGING_SOURCES:
+            month_key = day[:7]
+            messaging_circle = min(circle, 5)  # circles 5+ grouped as "outer"
+            monthly_messaging[month_key]["total"] += cnt
+            monthly_messaging[month_key]["by_circle"][str(messaging_circle)] += cnt
+            monthly_messaging[month_key]["people_by_circle"][str(messaging_circle)].add(person_id)
 
-        # Daily aggregates
-        daily_data[date_str]["total"] += 1
-        daily_data[date_str]["sources"][source] += 1
-
-        # Breakdown totals
-        by_source[source] += 1
-        by_month[month_str] += 1
-        by_circle[str(circle)] += 1
-
-        # Top contacts (last 30 days)
-        if ts >= thirty_days_ago:
-            person_counts_30d[person_id] += 1
-
-        # Trend data (period-based comparison)
-        if ts >= trend_recent_start:
-            person_counts_recent[person_id] += 1
-        elif ts >= trend_previous_start:
-            person_counts_previous[person_id] += 1
-
-        total_count += 1
-
-    # Build daily aggregates list
     daily_list = [
         DailyAggregate(date=date, total=data["total"], sources=dict(data["sources"]))
         for date, data in sorted(daily_data.items())
     ]
 
-    # Build top contacts (top 10 by count in last 30 days)
+    # ---- Top contacts (last 30 days) ----
+    # `pool_start_date`/`pool_end_date` reproduce the original algorithm's
+    # outer `all_interactions` pool (bounded to `days_back`, day-string,
+    # including its end-date exclusion quirk — see _range_predicate) ANDed
+    # with the exact "last 30 days" lower-bound check the old Python code
+    # applied within it. Without the pool bound, this query would look
+    # further back than `days_back` whenever the caller asks for a shorter
+    # window than 30 days (#897 review finding 1). There is no exact upper
+    # bound here — the old `if ts >= thirty_days_ago:` check had none of its
+    # own either, relying entirely on the pool's own end_date.
+    top_counts = interaction_store.get_person_counts(
+        thirty_days_ago, None, exclude_person_ids=exclude_ids, gmail_sent_only=True, exact=True,
+        pool_start_date=start_date, pool_end_date=end_date,
+    )
     top_contacts = []
-    for person_id, count in sorted(person_counts_30d.items(), key=lambda x: -x[1])[:10]:
+    for person_id, count in sorted(top_counts.items(), key=lambda x: -x[1])[:10]:
         person = person_lookup.get(person_id)
         top_contacts.append(TopContact(
             person_id=person_id,
@@ -3191,13 +3682,31 @@ async def get_me_interactions(
             count=count,
         ))
 
-    # Build trend data (warming and cooling)
+    # ---- Trend data (warming and cooling) ----
+    # Same pool-clamping as top_contacts above: a trend period longer than
+    # half of `days_back` (e.g. trend_period="year" with a short
+    # `days_back`) must not reach further back than the outer window did in
+    # the original algorithm (#897 review finding 1).
+    # The "previous" bucket also excludes its upper edge so it never
+    # double-counts the exact instant where the "recent" bucket begins
+    # (matching the old `if ts >= trend_recent_start: ... elif ts >=
+    # trend_previous_start:`) — that boundary is unrelated to the pool and
+    # stays an exact julianday comparison.
+    recent_counts = interaction_store.get_person_counts(
+        trend_recent_start, None, exclude_person_ids=exclude_ids, gmail_sent_only=True, exact=True,
+        pool_start_date=start_date, pool_end_date=end_date,
+    )
+    previous_counts = interaction_store.get_person_counts(
+        trend_previous_start, trend_recent_start, exclude_person_ids=exclude_ids,
+        gmail_sent_only=True, exact=True, end_inclusive=False,
+        pool_start_date=start_date, pool_end_date=end_date,
+    )
     warming = []
     cooling = []
-    all_person_ids = set(person_counts_recent.keys()) | set(person_counts_previous.keys())
+    all_person_ids = set(recent_counts.keys()) | set(previous_counts.keys())
     for person_id in all_person_ids:
-        recent = person_counts_recent.get(person_id, 0)
-        prev = person_counts_previous.get(person_id, 0)
+        recent = recent_counts.get(person_id, 0)
+        prev = previous_counts.get(person_id, 0)
         if recent == prev:
             continue
         person = person_lookup.get(person_id)
@@ -3224,78 +3733,25 @@ async def get_me_interactions(
     # Limited to top 25 family/personal contacts by relationship strength
     HEALTH_INTERACTION_TYPES = {'imessage', 'whatsapp', 'phone', 'phone_call', 'calendar', 'gmail'}
 
-    # Get top 25 family/personal contacts by relationship strength
+    # Get top 25 family/personal contacts by relationship strength (chosen
+    # from the full person list — lifetime relationship_strength, not
+    # windowed — so this can't come from a window-scoped aggregate)
     personal_family_people = [
         p for p in person_lookup.values()
         if p.category in ('family', 'personal') and p.id != MY_PERSON_ID
     ]
     personal_family_people.sort(key=lambda p: p.relationship_strength or 0, reverse=True)
-    top_25_ids = {p.id for p in personal_family_people[:25]}
+    top_25_ids = [p.id for p in personal_family_people[:25]]
 
-    # Filter to personal interactions with top 25 family/personal contacts
-    personal_interactions = [
-        i for i in all_interactions
-        if (i.source_type or "").lower() in HEALTH_INTERACTION_TYPES
-        and i.person_id in top_25_ids
+    # 2. Neglected Contacts candidates.
+    # People in circles 0-3 who haven't been contacted in longer than their typical gap
+    neglect_candidate_ids = [
+        pid for pid, circle in circle_map.items()
+        if pid != MY_PERSON_ID and circle <= 3 and pid not in peripheral_person_ids
     ]
 
-    # Current health score will be calculated after we build the history
-    health_score = 0
-
-    # 2. Neglected Contacts
-    # People in circles 0-3 who haven't been contacted in longer than their typical gap
-    neglected = []
-    person_interaction_dates = defaultdict(list)
-    for interaction in all_interactions:
-        if interaction.timestamp:
-            ts = interaction.timestamp
-            if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            elif not hasattr(ts, 'tzinfo'):
-                ts = datetime.fromisoformat(str(ts)[:10]).replace(tzinfo=timezone.utc)
-            person_interaction_dates[interaction.person_id].append(ts)
-
-    for person_id, dates in person_interaction_dates.items():
-        person = person_lookup.get(person_id)
-        if not person:
-            continue
-        circle = circle_map.get(person_id, 7)
-        if circle > 3:  # Only alert for circles 0-3
-            continue
-        if len(dates) < 5:  # Need meaningful history to establish pattern
-            continue
-        dates_sorted = sorted(dates)
-        # Calculate typical gap (median of gaps, excluding outliers)
-        gaps = [(dates_sorted[i+1] - dates_sorted[i]).days for i in range(len(dates_sorted)-1)]
-        if not gaps:
-            continue
-        # Use median of gaps
-        gaps_sorted = sorted(gaps)
-        typical_gap = gaps_sorted[len(gaps_sorted)//2]
-        # Minimum based on circle - closer relationships have lower thresholds
-        min_gap = {0: 3, 1: 5, 2: 7, 3: 14}.get(circle, 14)
-        if typical_gap < min_gap:
-            typical_gap = min_gap
-        # Days since last contact
-        last_contact = dates_sorted[-1]
-        days_since = (now - last_contact).days
-        # Alert if 1.5x typical gap has passed (was 2x, now more sensitive)
-        if days_since > typical_gap * 1.5:
-            neglected.append(NeglectedContact(
-                person_id=person_id,
-                person_name=person.canonical_name,
-                days_since_contact=days_since,
-                typical_gap_days=typical_gap,
-                dunbar_circle=circle,
-            ))
-    # Sort by circle (closer first), then by how overdue they are
-    neglected.sort(key=lambda x: (x.dunbar_circle, -(x.days_since_contact / x.typical_gap_days)))
-
-    # 2b. Health Score History (longitudinal) - using "vs. average" approach
-    # Count personal interactions per period, score relative to average
-    health_score_history = []
-
-    # Determine time points based on health_period
+    # Determine health-score time points now (moved up from where they used
+    # to live, right before the SQL-side bucket query below).
     if health_period == "month":
         total_days = 61  # ~2 months
         num_points = 9
@@ -3309,28 +3765,95 @@ async def get_me_interactions(
     time_points = [now - timedelta(days=int(i * total_days / (num_points - 1))) for i in range(num_points)]
     time_points = sorted(time_points)  # oldest first
 
-    # First pass: collect raw personal interaction counts for each period
-    health_raw_counts = []
-    for i, point_date in enumerate(time_points):
-        if i == 0:
-            interval = (time_points[1] - time_points[0]).days if len(time_points) > 1 else 14
-            prev_date = point_date - timedelta(days=interval)
-        else:
-            prev_date = time_points[i - 1]
+    # SQL-side bucket counts for the health score (#897 review finding 3):
+    # one SUM(CASE ...) per time-point bucket over the top-25 population,
+    # instead of fetching every one of their interactions and bisecting in
+    # Python. On the production dataset "top 25 by relationship strength"
+    # still means hundreds of thousands of interactions (the closest
+    # family/friends are, unsurprisingly, the highest-volume contacts), so
+    # this is the difference between returning ~13 numbers and
+    # hydrating/parsing every row. `pool_start_date`/`pool_end_date`
+    # reproduce the original algorithm's outer `all_interactions` pool
+    # bound (day-string, matching get_all_in_range), since the old
+    # `personal_interactions` this fed from was filtered from that same
+    # pool.
+    health_raw_counts = interaction_store.get_bucketed_counts(
+        time_points, person_ids=top_25_ids, exclude_person_ids=exclude_ids,
+        source_types=HEALTH_INTERACTION_TYPES,
+        pool_start_date=start_date, pool_end_date=end_date,
+    ) if top_25_ids else [0] * len(time_points)
 
-        # Count personal interactions in this period
-        period_count = 0
-        for interaction in personal_interactions:
-            if interaction.timestamp:
-                ts = interaction.timestamp
-                if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                elif not hasattr(ts, 'tzinfo'):
-                    ts = datetime.fromisoformat(str(ts)[:10]).replace(tzinfo=timezone.utc)
-                if prev_date < ts <= point_date:
-                    period_count += 1
+    # Current health score will be calculated after we build the history
+    health_score = 0
 
-        health_raw_counts.append(period_count)
+    # A covering (person_id, timestamp)-index query — no source_type, since
+    # neglected-contacts considers every interaction type, unlike health
+    # score — restricted to a small, specifically named set of people
+    # (#897 review finding 3). Returns julian-day floats directly so the
+    # gap-median calculation below is plain float subtraction (1.0 == one
+    # day) instead of building a datetime per row.
+    # No exclude_person_ids here: neglect_candidate_ids already excludes
+    # self and peripheral explicitly above, and hidden implicitly (it's
+    # built from circle_map, which is derived from all_people —
+    # get_all()'s default already excludes hidden) — measured ~120ms faster
+    # without a redundant `NOT IN (~9,500)` clause on a query already
+    # restricted to a couple dozen people (#897 review finding 3).
+    neglect_jd_rows = interaction_store.get_person_julianday_timestamps(
+        start_date, end_date, person_ids=neglect_candidate_ids,
+    ) if neglect_candidate_ids else []
+    now_jd = interaction_store.get_julianday(now)
+
+    neglected = []
+    person_interaction_jds = defaultdict(list)
+    for pid, jd in neglect_jd_rows:
+        person_interaction_jds[pid].append(jd)
+
+    for person_id, jds in person_interaction_jds.items():
+        person = person_lookup.get(person_id)
+        if not person:
+            continue
+        circle = circle_map.get(person_id, 7)
+        if circle > 3:  # Only alert for circles 0-3
+            continue
+        if len(jds) < 5:  # Need meaningful history to establish pattern
+            continue
+        jds_sorted = sorted(jds)
+        # Calculate typical gap (median of gaps, excluding outliers). Every
+        # gap here is between consecutive sorted timestamps, so it's always
+        # >= 0 — int() truncation matches timedelta.days' floor exactly.
+        gaps = [int(jds_sorted[i + 1] - jds_sorted[i]) for i in range(len(jds_sorted) - 1)]
+        if not gaps:
+            continue
+        # Use median of gaps
+        gaps_sorted = sorted(gaps)
+        typical_gap = gaps_sorted[len(gaps_sorted)//2]
+        # Minimum based on circle - closer relationships have lower thresholds
+        min_gap = {0: 3, 1: 5, 2: 7, 3: 14}.get(circle, 14)
+        if typical_gap < min_gap:
+            typical_gap = min_gap
+        # Days since last contact
+        last_contact_jd = jds_sorted[-1]
+        days_since = int(now_jd - last_contact_jd)
+        # Alert if 1.5x typical gap has passed (was 2x, now more sensitive)
+        if days_since > typical_gap * 1.5:
+            neglected.append(NeglectedContact(
+                person_id=person_id,
+                person_name=person.canonical_name,
+                days_since_contact=days_since,
+                typical_gap_days=typical_gap,
+                dunbar_circle=circle,
+            ))
+    # Sort by circle (closer first), then by how overdue they are, then by
+    # person id as a final tie-break so equally-overdue contacts have a
+    # stable, deterministic order across requests instead of depending on
+    # dict/query iteration order.
+    neglected.sort(key=lambda x: (x.dunbar_circle, -(x.days_since_contact / x.typical_gap_days), x.person_id))
+
+    # 2b. Health Score History (longitudinal) - using "vs. average" approach
+    # Count personal interactions per period, score relative to average.
+    # `time_points` and `health_raw_counts` were already computed above,
+    # alongside top_25_ids, so the SQL bucket query could use them directly.
+    health_score_history = []
 
     # Calculate average for normalization
     if health_raw_counts:
@@ -3392,42 +3915,28 @@ async def get_me_interactions(
             ))
 
     # 4. Messaging Volume by Circle (iMessage + WhatsApp only)
-    # Group by month, then by circle - track both message counts and unique people
-    monthly_messaging = defaultdict(lambda: {
-        "total": 0,
-        "by_circle": defaultdict(int),
-        "people_by_circle": defaultdict(set),  # circle -> set of person_ids
-    })
-    for interaction in all_interactions:
-        source = (interaction.source_type or "").lower()
-        if source not in ('imessage', 'whatsapp'):
-            continue
-        if interaction.timestamp:
-            ts = interaction.timestamp
-            if hasattr(ts, 'strftime'):
-                month_key = ts.strftime('%Y-%m')
-            else:
-                month_key = str(ts)[:7]
-        else:
-            continue
-        person_id = interaction.person_id
-        circle = circle_map.get(person_id, 7)
-        if circle > 4:  # Only track circles 0-4
-            circle = 5  # Group 5+ as "outer"
-        monthly_messaging[month_key]["total"] += 1
-        monthly_messaging[month_key]["by_circle"][str(circle)] += 1
-        monthly_messaging[month_key]["people_by_circle"][str(circle)].add(person_id)
+    # `monthly_messaging` was already built in the single combined window
+    # scan above (see the "Daily heatmap + ... + messaging" block) — no
+    # second full-window query needed here.
 
     # Build messaging list (based on days_back)
+    # NOTE (#871 bugfix): this loop used to reassign the *outer* `by_circle`
+    # dict (the full-window, all-sources total returned by the response's
+    # own `by_circle` field) to `dict(data["by_circle"])` on every iteration,
+    # so after the loop it silently held only the LAST processed month's
+    # iMessage/WhatsApp-only breakdown instead of the true window total —
+    # the Me page's "By Dunbar Circle" chart was rendering that stale,
+    # wrong-in-scope data. Renamed to `month_by_circle` so it can no longer
+    # shadow the response-level `by_circle` variable computed above.
     messaging_by_circle = []
     for month in sorted(monthly_messaging.keys()):
         if month >= chart_months_cutoff:
             data = monthly_messaging[month]
             total = data["total"]
-            by_circle = dict(data["by_circle"])
+            month_by_circle = dict(data["by_circle"])
             # Calculate percentages
             percentages = {}
-            for c, count in by_circle.items():
+            for c, count in month_by_circle.items():
                 percentages[c] = round(count / total * 100, 1) if total > 0 else 0
             # Calculate unique people per circle
             unique_by_circle = {c: len(people) for c, people in data["people_by_circle"].items()}
@@ -3435,7 +3944,7 @@ async def get_me_interactions(
             messaging_by_circle.append(MonthlyMessagingVolume(
                 month=month,
                 total=total,
-                by_circle=by_circle,
+                by_circle=month_by_circle,
                 circle_percentages=percentages,
                 unique_by_circle=unique_by_circle,
                 unique_total=unique_total,
@@ -3457,6 +3966,19 @@ async def get_me_interactions(
         return []
 
     TRACKED_RELATIONSHIPS_CONFIG = _load_tracked_relationships()
+
+    # Fetch all tracked people's interactions in this window in one query
+    # (still subject to the self/hidden/peripheral exclusions, and only for
+    # ids that resolve to a real, included person — an id typo'd into the
+    # config would otherwise silently pick up an unrelated/orphaned row).
+    tracked_all_ids = sorted({
+        pid for config in TRACKED_RELATIONSHIPS_CONFIG for pid in config["person_ids"]
+        if pid in person_lookup
+    })
+    tracked_all_interactions = interaction_store.get_all_in_range(
+        start_date=start_date, end_date=end_date,
+        person_ids=tracked_all_ids, exclude_person_ids=exclude_ids,
+    ) if tracked_all_ids else []
 
     tracked_relationships = []
     for config in TRACKED_RELATIONSHIPS_CONFIG:
@@ -3489,33 +4011,12 @@ async def get_me_interactions(
 
         # Group interactions by tracked people
         tracked_interactions = [
-            i for i in all_interactions
+            i for i in tracked_all_interactions
             if i.person_id in person_ids
         ]
 
-        # First pass: collect raw counts for each period
-        raw_counts = []
-        for i, point_date in enumerate(tracked_time_points):
-            if i == 0:
-                # For first point, use same interval as between points
-                interval = (tracked_time_points[1] - tracked_time_points[0]).days if len(tracked_time_points) > 1 else 14
-                prev_date = point_date - timedelta(days=interval)
-            else:
-                prev_date = tracked_time_points[i - 1]
-
-            # Count interactions in this period
-            period_count = 0
-            for interaction in tracked_interactions:
-                if interaction.timestamp:
-                    ts = interaction.timestamp
-                    if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=timezone.utc)
-                    elif not hasattr(ts, 'tzinfo'):
-                        ts = datetime.fromisoformat(str(ts)[:10]).replace(tzinfo=timezone.utc)
-                    if prev_date < ts <= point_date:
-                        period_count += 1
-
-            raw_counts.append(period_count)
+        # Raw counts for each period (see _bucket_counts_by_period)
+        raw_counts = _bucket_counts_by_period(tracked_interactions, tracked_time_points)
 
         # Calculate baseline stats for normalization
         # Use historical average as the baseline for scoring
@@ -3600,12 +4101,43 @@ async def get_me_interactions(
     )
 
 
+@router.get("/me/interactions/span", response_model=MeInteractionsSpanResponse)
+def get_me_interactions_span():
+    """
+    Get the earliest and latest interaction dates, excluding self, hidden,
+    peripheral, and merged-secondary people — the same population
+    /me/interactions aggregates (both use the shared `_me_exclude_ids`
+    helper, #897 review finding 6).
+
+    The Me dashboard calls this first to size its heatmap window from the
+    actual span of data, instead of requesting a fixed 10 years and shrinking
+    the display afterward once the (much larger) response arrives.
+    """
+    person_store = get_person_entity_store()
+    interaction_store = get_interaction_store()
+
+    exclude_ids = _me_exclude_ids(person_store)
+
+    earliest, latest = interaction_store.get_span(exclude_person_ids=exclude_ids)
+
+    years = 1
+    if earliest:
+        earliest_dt = datetime.fromisoformat(earliest)
+        if earliest_dt.tzinfo is None:
+            earliest_dt = earliest_dt.replace(tzinfo=timezone.utc)
+        days_since = (datetime.now(timezone.utc) - earliest_dt).days
+        if days_since > 0:
+            years = max(1, min(10, (days_since + 364) // 365))
+
+    return MeInteractionsSpanResponse(earliest=earliest, latest=latest, years=years)
+
+
 # Family Dashboard Routes
 # =======================
 
 
 @router.get("/family/members", response_model=FamilyMembersResponse)
-async def get_family_members():
+def get_family_members():
     """
     Get all family members for the multi-select dropdown and visualizations.
 
@@ -3701,7 +4233,7 @@ async def get_family_members():
 
 
 @router.get("/family/stats", response_model=FamilyStatsResponse)
-async def get_family_stats(
+def get_family_stats(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs to get lifetime stats for"
@@ -3740,7 +4272,8 @@ async def get_family_stats(
 
 
 @router.get("/family/timeline", response_model=TimelineResponse)
-async def get_family_timeline(
+@cached_aggregate()
+def get_family_timeline(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs to include in timeline"
@@ -3779,26 +4312,24 @@ async def get_family_timeline(
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
-    # Get interactions - don't apply limit yet since we need to filter by person IDs
-    # Note: This is less efficient than a direct DB filter, but works for family view
-    selected_ids_set = set(selected_ids)
-    all_interactions = interaction_store.get_all_in_range(
+    # Filter by person_id IN (...) directly in SQL, and paginate there too
+    # (same pattern as /me/timeline), instead of loading every interaction
+    # in the window across all people and filtering/paginating in Python.
+    interactions = interaction_store.get_all_in_range(
         start_date=start_date,
         end_date=end_date,
+        person_ids=selected_ids,
         exclude_person_ids=[MY_PERSON_ID],
         source_type=source_type,
+        limit=offset + limit + 1,
         specific_date=date,
     )
 
-    # Filter to only interactions with selected people
-    interactions = [i for i in all_interactions if i.person_id in selected_ids_set]
-
-    # Apply pagination after filtering
     has_more = len(interactions) > offset + limit
     interactions = interactions[offset:offset + limit]
 
-    # Build person lookup for names
-    person_lookup = {p.id: p for p in person_store.get_all()}
+    # Batch-lookup names only for this page's people
+    person_lookup = person_store.get_by_ids({i.person_id for i in interactions}, exclude_hidden=True)
 
     elapsed = (time.time() - start_time) * 1000
     logger.info(f"family_timeline took {elapsed:.1f}ms ({len(interactions)} interactions)")
@@ -3822,7 +4353,8 @@ async def get_family_timeline(
 
 
 @router.get("/family/interactions", response_model=FamilyInteractionsResponse)
-async def get_family_interactions(
+@cached_aggregate()
+def get_family_interactions(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs to aggregate"
@@ -3851,8 +4383,8 @@ async def get_family_interactions(
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
-    # Build person lookup
-    person_lookup = {p.id: p for p in person_store.get_all()}
+    # Batch-lookup names for just the selected people
+    person_lookup = person_store.get_by_ids(selected_ids, exclude_hidden=True)
 
     # Get selected person names
     selected_names = []
@@ -3862,27 +4394,6 @@ async def get_family_interactions(
             selected_names.append(person.canonical_name)
         else:
             selected_names.append("Unknown")
-
-    # Get interactions only with selected people
-    all_interactions_raw = interaction_store.get_all_in_range(
-        start_date=start_date,
-        end_date=end_date,
-        exclude_person_ids=[MY_PERSON_ID],  # Don't exclude selected people
-    )
-
-    # Filter to only interactions with selected people
-    all_interactions = [
-        i for i in all_interactions_raw
-        if i.person_id in selected_ids
-    ]
-
-    # Aggregation structures
-    daily_data = defaultdict(lambda: {"total": 0, "sources": defaultdict(int)})
-    by_source = defaultdict(int)
-    by_month = defaultdict(int)
-    person_counts_30d = defaultdict(int)
-    person_counts_recent = defaultdict(int)
-    person_counts_previous = defaultdict(int)
 
     now = datetime.now(timezone.utc)
     period_days = {
@@ -3896,55 +4407,40 @@ async def get_family_interactions(
     trend_previous_start = now - timedelta(days=trend_days * 2)
     thirty_days_ago = now - timedelta(days=30)
 
+    # ---- Daily heatmap + by_source/by_month/total_count ----
+    # Filtered by person_id IN (selected_ids) in SQL — unlike /me/interactions,
+    # this dashboard has no "sent email only" or peripheral/hidden exclusion
+    # rule; it counts every interaction with the selected people.
+    daily_rows = interaction_store.get_daily_source_counts(
+        start_date, end_date, person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID],
+    )
+    daily_data = defaultdict(lambda: {"total": 0, "sources": defaultdict(int)})
+    by_source = defaultdict(int)
+    by_month = defaultdict(int)
     total_count = 0
+    for day, source, cnt in daily_rows:
+        daily_data[day]["total"] += cnt
+        daily_data[day]["sources"][source] += cnt
+        by_source[source] += cnt
+        by_month[day[:7]] += cnt
+        total_count += cnt
 
-    for interaction in all_interactions:
-        if interaction.timestamp:
-            if hasattr(interaction.timestamp, 'strftime'):
-                ts = interaction.timestamp
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                date_str = ts.strftime('%Y-%m-%d')
-                month_str = ts.strftime('%Y-%m')
-            else:
-                date_str = str(interaction.timestamp)[:10]
-                month_str = date_str[:7]
-                ts = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
-        else:
-            continue
-
-        source = (interaction.source_type or "unknown").lower()
-        person_id = interaction.person_id
-
-        # Daily aggregates
-        daily_data[date_str]["total"] += 1
-        daily_data[date_str]["sources"][source] += 1
-
-        # Breakdown totals
-        by_source[source] += 1
-        by_month[month_str] += 1
-
-        # Top contacts (last 30 days)
-        if ts >= thirty_days_ago:
-            person_counts_30d[person_id] += 1
-
-        # Trend data
-        if ts >= trend_recent_start:
-            person_counts_recent[person_id] += 1
-        elif ts >= trend_previous_start:
-            person_counts_previous[person_id] += 1
-
-        total_count += 1
-
-    # Build daily aggregates list
     daily_list = [
         DailyAggregate(date=date, total=data["total"], sources=dict(data["sources"]))
         for date, data in sorted(daily_data.items())
     ]
 
-    # Build top contacts
+    # ---- Top contacts (last 30 days) ----
+    # `pool_start_date`/`pool_end_date` clip this to the outer `days_back`
+    # window, matching the original algorithm's `all_interactions` pool
+    # (#897 review finding 1 — same fix as /me/interactions). No exact upper
+    # bound: the old `if ts >= thirty_days_ago:` check had none of its own.
+    top_counts = interaction_store.get_person_counts(
+        thirty_days_ago, None, person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID],
+        exact=True, pool_start_date=start_date, pool_end_date=end_date,
+    )
     top_contacts = []
-    for person_id, count in sorted(person_counts_30d.items(), key=lambda x: -x[1])[:10]:
+    for person_id, count in sorted(top_counts.items(), key=lambda x: -x[1])[:10]:
         person = person_lookup.get(person_id)
         top_contacts.append(TopContact(
             person_id=person_id,
@@ -3952,12 +4448,22 @@ async def get_family_interactions(
             count=count,
         ))
 
-    # Build trends
+    # ---- Trends (warming and cooling) ----
+    # Same pool-clamping as top_contacts above (#897 review finding 1).
+    recent_counts = interaction_store.get_person_counts(
+        trend_recent_start, None, person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID],
+        exact=True, pool_start_date=start_date, pool_end_date=end_date,
+    )
+    previous_counts = interaction_store.get_person_counts(
+        trend_previous_start, trend_recent_start, person_ids=selected_ids,
+        exclude_person_ids=[MY_PERSON_ID], exact=True, end_inclusive=False,
+        pool_start_date=start_date, pool_end_date=end_date,
+    )
     warming = []
     cooling = []
     for person_id in selected_ids:
-        recent = person_counts_recent.get(person_id, 0)
-        prev = person_counts_previous.get(person_id, 0)
+        recent = recent_counts.get(person_id, 0)
+        prev = previous_counts.get(person_id, 0)
         if recent == prev:
             continue
         person = person_lookup.get(person_id)
@@ -3991,27 +4497,18 @@ async def get_family_interactions(
     time_points = [now - timedelta(days=int(i * total_days_history / (num_points - 1))) for i in range(num_points)]
     time_points = sorted(time_points)
 
-    # Collect raw counts for each period
-    health_raw_counts = []
-    for i, point_date in enumerate(time_points):
-        if i == 0:
-            interval = (time_points[1] - time_points[0]).days if len(time_points) > 1 else 14
-            prev_date = point_date - timedelta(days=interval)
-        else:
-            prev_date = time_points[i - 1]
+    # The health-score buckets need exact per-interaction timestamps (their
+    # boundaries aren't day-aligned), but only for the selected people — a
+    # small, explicit id list — so fetching those interactions directly
+    # (rather than deriving bucket counts in SQL) keeps this exact without
+    # needing julianday()-based bucket queries.
+    selected_interactions = interaction_store.get_all_in_range(
+        start_date=start_date, end_date=end_date,
+        person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID],
+    )
 
-        period_count = 0
-        for interaction in all_interactions:
-            if interaction.timestamp:
-                ts = interaction.timestamp
-                if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                elif not hasattr(ts, 'tzinfo'):
-                    ts = datetime.fromisoformat(str(ts)[:10]).replace(tzinfo=timezone.utc)
-                if prev_date < ts <= point_date:
-                    period_count += 1
-
-        health_raw_counts.append(period_count)
+    # Raw counts for each period (see _bucket_counts_by_period)
+    health_raw_counts = _bucket_counts_by_period(selected_interactions, time_points)
 
     # Calculate average
     health_avg = sum(health_raw_counts) / len(health_raw_counts) if health_raw_counts else 0
@@ -4067,7 +4564,7 @@ class CommunicationGapsResponse(BaseModel):
 
 
 @router.get("/family/communication-gaps", response_model=CommunicationGapsResponse)
-async def get_family_communication_gaps(
+def get_family_communication_gaps(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs"
@@ -4188,7 +4685,7 @@ class ChannelMixResponse(BaseModel):
 
 
 @router.get("/family/channel-mix", response_model=ChannelMixResponse)
-async def get_family_channel_mix(
+def get_family_channel_mix(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs"
@@ -4276,7 +4773,7 @@ class SyncErrorResponse(BaseModel):
 
 
 @router.get("/sync/health", response_model=list[SyncHealthResponse])
-async def get_all_sync_health():
+def get_all_sync_health():
     """
     Get health status for all sync sources.
 
@@ -4303,7 +4800,7 @@ async def get_all_sync_health():
 
 
 @router.get("/sync/health/summary", response_model=SyncHealthSummaryResponse)
-async def get_sync_health_summary():
+def get_sync_health_summary():
     """
     Get summary of sync health across all sources.
 
@@ -4318,7 +4815,7 @@ async def get_sync_health_summary():
 
 
 @router.get("/sync/health/{source}", response_model=SyncHealthResponse)
-async def get_source_sync_health(source: str):
+def get_source_sync_health(source: str):
     """
     Get health status for a specific sync source.
     """
@@ -4345,7 +4842,7 @@ async def get_source_sync_health(source: str):
 
 
 @router.get("/sync/errors", response_model=list[SyncErrorResponse])
-async def get_sync_errors(
+def get_sync_errors(
     source: Optional[str] = Query(default=None, description="Filter by source"),
     limit: int = Query(default=50, ge=1, le=200, description="Max results"),
 ):
@@ -4372,7 +4869,7 @@ async def get_sync_errors(
 
 
 @router.get("/sync/stale", response_model=list[SyncHealthResponse])
-async def get_stale_syncs():
+def get_stale_syncs():
     """
     Get list of syncs that are stale (>24 hours old).
 
@@ -4425,7 +4922,7 @@ class ReviewQueueResponse(BaseModel):
 
 
 @router.get("/review-queue", response_model=ReviewQueueResponse)
-async def get_review_queue(
+def get_review_queue(
     min_confidence: float = Query(default=0.0, ge=0.0, le=1.0, description="Minimum confidence"),
     max_confidence: float = Query(default=0.85, ge=0.0, le=1.0, description="Maximum confidence"),
     link_method: Optional[str] = Query(default=None, description="Filter by resolution method (e.g. email_exact, name_fuzzy)"),
@@ -4490,93 +4987,95 @@ async def get_review_queue(
 
 
 @router.post("/review-queue/{entity_id}/confirm")
-async def confirm_review_item(entity_id: str):
+def confirm_review_item(entity_id: str):
     """
     Confirm a low-confidence match as correct.
 
     Updates the link confidence to 1.0 and status to confirmed.
     """
-    source_store = get_source_entity_store()
-    entity = source_store.get_by_id(entity_id)
+    with _mutation_lock:
+        source_store = get_source_entity_store()
+        entity = source_store.get_by_id(entity_id)
 
-    if not entity:
-        raise HTTPException(status_code=404, detail=f"Source entity '{entity_id}' not found")
+        if not entity:
+            raise HTTPException(status_code=404, detail=f"Source entity '{entity_id}' not found")
 
-    if not entity.canonical_person_id:
-        raise HTTPException(status_code=400, detail="Source entity is not linked to any person")
+        if not entity.canonical_person_id:
+            raise HTTPException(status_code=400, detail="Source entity is not linked to any person")
 
-    # Update to confirmed status
-    source_store.link_to_person(
-        entity_id,
-        entity.canonical_person_id,
-        confidence=1.0,
-        status=LINK_STATUS_CONFIRMED,
-    )
+        # Update to confirmed status
+        source_store.link_to_person(
+            entity_id,
+            entity.canonical_person_id,
+            confidence=1.0,
+            status=LINK_STATUS_CONFIRMED,
+        )
 
-    return {"status": "confirmed", "entity_id": entity_id}
+        return {"status": "confirmed", "entity_id": entity_id}
 
 
 @router.post("/review-queue/{entity_id}/reject")
-async def reject_review_item(entity_id: str, request: LinkConfirmRequest):
+def reject_review_item(entity_id: str, request: LinkConfirmRequest):
     """
     Reject a low-confidence match.
 
     Optionally creates a new person from the source entity.
     """
-    source_store = get_source_entity_store()
-    person_store = get_person_entity_store()
-    entity = source_store.get_by_id(entity_id)
+    with _mutation_lock:
+        source_store = get_source_entity_store()
+        person_store = get_person_entity_store()
+        entity = source_store.get_by_id(entity_id)
 
-    if not entity:
-        raise HTTPException(status_code=404, detail=f"Source entity '{entity_id}' not found")
+        if not entity:
+            raise HTTPException(status_code=404, detail=f"Source entity '{entity_id}' not found")
 
-    new_person_id = None
+        new_person_id = None
 
-    if request.create_new_person:
-        if not request.new_person_name:
-            name = entity.observed_name or entity.observed_email or "Unknown"
+        if request.create_new_person:
+            if not request.new_person_name:
+                name = entity.observed_name or entity.observed_email or "Unknown"
+            else:
+                name = request.new_person_name
+
+            # Create new person
+            new_person = PersonEntity(
+                canonical_name=name,
+                display_name=name,
+                emails=[entity.observed_email] if entity.observed_email else [],
+                phone_numbers=[entity.observed_phone] if entity.observed_phone else [],
+                sources=[entity.source_type],
+                first_seen=entity.observed_at,
+                last_seen=entity.observed_at,
+                source_entity_count=1,
+            )
+            person_store.add(new_person)
+            person_store.save()
+
+            # Verify the person was saved correctly
+            verify_person = person_store.get_by_id(new_person.id)
+            if not verify_person:
+                logger.error(f"CRITICAL: Person {new_person.id} was not saved correctly after reject creation!")
+                raise HTTPException(status_code=500, detail="Failed to save new person during reject")
+
+            # Link to new person
+            source_store.link_to_person(
+                entity_id,
+                new_person.id,
+                confidence=1.0,
+                status=LINK_STATUS_CONFIRMED,
+            )
+            new_person_id = new_person.id
         else:
-            name = request.new_person_name
+            # Mark as rejected
+            entity.link_status = LINK_STATUS_REJECTED
+            entity.canonical_person_id = None
+            source_store.update(entity)
 
-        # Create new person
-        new_person = PersonEntity(
-            canonical_name=name,
-            display_name=name,
-            emails=[entity.observed_email] if entity.observed_email else [],
-            phone_numbers=[entity.observed_phone] if entity.observed_phone else [],
-            sources=[entity.source_type],
-            first_seen=entity.observed_at,
-            last_seen=entity.observed_at,
-            source_entity_count=1,
-        )
-        person_store.add(new_person)
-        person_store.save()
-
-        # Verify the person was saved correctly
-        verify_person = person_store.get_by_id(new_person.id)
-        if not verify_person:
-            logger.error(f"CRITICAL: Person {new_person.id} was not saved correctly after reject creation!")
-            raise HTTPException(status_code=500, detail="Failed to save new person during reject")
-
-        # Link to new person
-        source_store.link_to_person(
-            entity_id,
-            new_person.id,
-            confidence=1.0,
-            status=LINK_STATUS_CONFIRMED,
-        )
-        new_person_id = new_person.id
-    else:
-        # Mark as rejected
-        entity.link_status = LINK_STATUS_REJECTED
-        entity.canonical_person_id = None
-        source_store.update(entity)
-
-    return {
-        "status": "rejected",
-        "entity_id": entity_id,
-        "new_person_id": new_person_id,
-    }
+        return {
+            "status": "rejected",
+            "entity_id": entity_id,
+            "new_person_id": new_person_id,
+        }
 
 
 # ============================================================================
@@ -4585,7 +5084,7 @@ async def reject_review_item(entity_id: str, request: LinkConfirmRequest):
 
 
 @router.get("/data-health")
-async def get_data_health():
+def get_data_health():
     """
     Get comprehensive data health statistics.
 
@@ -4724,9 +5223,9 @@ async def get_data_health():
 
 
 @router.get("/data-health/summary")
-async def get_data_health_summary():
+def get_data_health_summary():
     """Get a brief summary of data health for the UI header."""
-    health = await get_data_health()
+    health = get_data_health()
 
     return {
         "total_interactions": sum(
@@ -4758,7 +5257,7 @@ class LinkOverrideResponse(BaseModel):
 
 
 @router.get("/link-overrides")
-async def get_link_overrides(person_id: Optional[str] = Query(default=None)):
+def get_link_overrides(person_id: Optional[str] = Query(default=None)):
     """
     Get all link override rules.
 
@@ -4805,7 +5304,7 @@ async def get_link_overrides(person_id: Optional[str] = Query(default=None)):
 
 
 @router.delete("/link-overrides/{override_id}")
-async def delete_link_override(override_id: str):
+def delete_link_override(override_id: str):
     """Delete a link override rule."""
     from api.services.link_override import get_link_override_store
 
@@ -4877,6 +5376,7 @@ class ToneDataPointDetailed(BaseModel):
     combined_score: float  # Average of the two
     user_sample_count: int = 0
     partner_sample_count: int = 0
+    status: Optional[str] = None  # None = ok; "error" if the LLM failed for this month
 
 
 class ToneAnalysisResponse(BaseModel):
@@ -4898,7 +5398,7 @@ class ToneAnalysisDetailedResponse(BaseModel):
 
 
 @router.get("/relationship/insights", response_model=RelationshipInsightsResponse)
-async def get_relationship_insights(person_id: Optional[str] = None):
+def get_relationship_insights(person_id: Optional[str] = None):
     """
     Get all relationship insights for the configured partner.
 
@@ -4939,7 +5439,7 @@ async def get_relationship_insights(person_id: Optional[str] = None):
 
 
 @router.post("/relationship/insights/generate", response_model=RelationshipInsightsResponse)
-async def generate_relationship_insights(
+def generate_relationship_insights(
     person_id: Optional[str] = None,
     category: Optional[str] = None
 ):
@@ -4995,7 +5495,7 @@ async def generate_relationship_insights(
 
 
 @router.post("/relationship/insights/{insight_id}/confirm")
-async def confirm_relationship_insight(insight_id: str):
+def confirm_relationship_insight(insight_id: str):
     """
     Mark an insight as confirmed.
 
@@ -5013,7 +5513,7 @@ async def confirm_relationship_insight(insight_id: str):
 
 
 @router.delete("/relationship/insights/{insight_id}")
-async def delete_relationship_insight(insight_id: str):
+def delete_relationship_insight(insight_id: str):
     """
     Delete/dismiss an insight.
     """
@@ -5029,7 +5529,7 @@ async def delete_relationship_insight(insight_id: str):
 
 
 @router.post("/relationship/tone-analysis", response_model=ToneAnalysisResponse)
-async def analyze_relationship_tone(person_id: Optional[str] = None, months: int = 12):
+def analyze_relationship_tone(person_id: Optional[str] = None, months: int = 12):
     """
     Analyze tone/sentiment in iMessage conversations over time.
 
@@ -5173,97 +5673,126 @@ MESSAGES:
         raise HTTPException(status_code=500, detail=f"Tone analysis failed: {str(e)}")
 
 
-@router.post("/relationship/tone-analysis-detailed", response_model=ToneAnalysisDetailedResponse)
-async def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: int = 12):
+# Stored tone results older than this are recomputed even if the
+# interaction count for that month hasn't changed (#873).
+TONE_FRESHNESS_DAYS = 30
+
+# Cap on how many stale months go into a single LLM call. The prompt is
+# still one call per chunk rather than one call per month (#899 review
+# finding 4), but capping the chunk size means a single slow/timed-out call
+# only blanks a few months' worth of recompute instead of the whole window
+# -- a 12-month first-ever load used to be all-or-nothing (#899 review
+# finding N2: a single stuck 12-month call turned every month to
+# status="error" at once, discarding whatever was already stored for them).
+TONE_MAX_MONTHS_PER_LLM_CALL = 4
+
+# How long a request waits to acquire the per-person lock below before
+# falling through to a storage-only response (#899 review finding N3): the
+# lock has no timeout otherwise, so one slow/stuck computation for a person
+# would stall every other request for that same person indefinitely, each
+# holding a threadpool worker.
+TONE_LOCK_TIMEOUT_SECONDS = 5
+
+# Per-person locks serializing concurrent tone-analysis requests for the same
+# person, so a double-clicked refresh or two open tabs don't both pay for the
+# same LLM call (#899 review finding 9). Keyed by person_id; created lazily
+# and never removed (bounded by the number of distinct people ever analyzed,
+# which is small). `_tone_analysis_locks_meta_lock` only guards the dict
+# itself, held for the instant it takes to look up or create one entry --
+# the actual tone-analysis work happens under the per-person lock it returns,
+# acquired with TONE_LOCK_TIMEOUT_SECONDS rather than blocking forever.
+_tone_analysis_locks: dict[str, threading.Lock] = {}
+_tone_analysis_locks_meta_lock = threading.Lock()
+
+
+def _get_tone_analysis_lock(person_id: str) -> threading.Lock:
+    """Get or create the per-person lock used to serialize tone analysis."""
+    with _tone_analysis_locks_meta_lock:
+        lock = _tone_analysis_locks.get(person_id)
+        if lock is None:
+            lock = threading.Lock()
+            _tone_analysis_locks[person_id] = lock
+        return lock
+
+
+def _derive_trend(scores: list) -> str:
+    """Derive a trend label from a chronological list of monthly scores.
+
+    Heuristic, computed from already-scored data -- not the LLM's own
+    trend text. Needed because a response can now be assembled from a mix
+    of stored months (scored in earlier, separate calls) and freshly
+    recomputed ones, so no single LLM call sees the whole window anymore.
+    Compares the average of the first half of the window to the second
+    half; options mirror the ones the prompt used to ask the LLM for.
     """
-    Analyze tone/sentiment separately for the user and their partner in iMessage conversations.
+    if len(scores) < 2:
+        return "insufficient-data"
+    mid = len(scores) // 2
+    first_avg = sum(scores[:mid]) / mid
+    second_avg = sum(scores[mid:]) / (len(scores) - mid)
+    diff = second_avg - first_avg
+    if diff > 8:
+        return "improving"
+    if diff < -8:
+        return "declining"
+    overall_avg = sum(scores) / len(scores)
+    variance = sum((s - overall_avg) ** 2 for s in scores) / len(scores)
+    if variance > 225:  # stddev > 15
+        return "variable"
+    return "stable-positive" if overall_avg >= 60 else "stable-neutral"
 
-    Groups messages by week, analyzes each person's tone separately, normalizes 0-100,
-    then aggregates to monthly averages. Returns separate scores for each person
-    plus a combined average.
+
+def _compute_tone_for_months(
+    client,
+    stale_months: list,
+    user_by_month_week: dict,
+    partner_by_month_week: dict,
+    user_name: str,
+    partner_name: str,
+) -> tuple:
+    """Call the LLM ONCE for the given months (`stale_months` here is
+    usually one chunk of at most TONE_MAX_MONTHS_PER_LLM_CALL months, not
+    the whole stale set -- see the caller), asking for one overall score
+    per person per month. Returns (results_by_month, model_name), where
+    `results_by_month` holds an entry only for the months the parsed
+    response actually covers -- a month present in `stale_months` but
+    absent from the result means the LLM omitted it. The original version
+    made one call per stale month (up to `months` sequential calls on a
+    first load or a refresh, each several seconds to minutes on a local
+    model); batching restores something close to a "one call per request"
+    cost while capping how much a single slow/timed-out call can affect
+    (#899 review findings 4 and N2).
+
+    Raises only if the call itself fails or the response can't be parsed at
+    all -- the caller treats every month in this chunk as missing in that
+    case and marks it `status="stale"` (if a prior stored value exists) or
+    `status="error"` (if not), never failing the request.
+
+    Messages are still presented to the LLM grouped by week within each
+    month (each (month, week) pair holds only that month's own messages --
+    see the handler's bucketing, which fixes #899 review finding 1), purely
+    for readability in the prompt; the requested output is one score per
+    month, not per week, since nothing downstream needs week-level
+    resolution (trend is now derived locally from the monthly scores, see
+    _derive_trend).
     """
-    from api.services.llm_client import get_anthropic_llm
-    import json
-    from datetime import datetime, timezone, timedelta
-    from collections import defaultdict
-
-    target_id = person_id or PARTNER_PERSON_ID
-    interaction_store = get_interaction_store()
-
-    # Get date range
-    now = datetime.now(timezone.utc)
-    start_date = now - timedelta(days=months * 30)
-
-    # Fetch iMessage interactions for this person
-    interactions = interaction_store.get_for_person(
-        person_id=target_id,
-        source_type="imessage",
-        limit=10000,  # Get more for weekly analysis
-    )
-
-    # Get names from settings
-    user_name = settings.user_name if settings.user_name else "User"
-    partner_name = settings.partner_name if settings.partner_name else "Partner"
-
-    # Separate messages by sender and group by week
-    # iMessage interactions have is_from_me attribute or we check title patterns
-    user_by_week: dict[str, list] = defaultdict(list)
-    partner_by_week: dict[str, list] = defaultdict(list)
-
-    for interaction in interactions:
-        dt = interaction.timestamp
-        if dt < start_date:
-            continue
-
-        # Week key: year-week number
-        week_key = dt.strftime("%Y-W%W")
-        title = interaction.title or ""
-
-        # Determine sender from title arrow prefix
-        # → means sent BY user, ← means received FROM partner
-        is_from_user = title.startswith("→")
-        message_text = title.lstrip("→←").strip() if title else ""
-
-        if is_from_user:
-            user_by_week[week_key].append(message_text)
-        else:
-            partner_by_week[week_key].append(message_text)
-
-    if not user_by_week and not partner_by_week:
-        return ToneAnalysisDetailedResponse(
-            monthly_tones=[],
-            user_trend="insufficient-data",
-            partner_trend="insufficient-data",
-            combined_trend="insufficient-data",
-            user_average=50.0,
-            partner_average=50.0,
-            generated_at=now.isoformat(),
-        )
-
-    # Get all weeks and sort them
-    all_weeks = sorted(set(user_by_week.keys()) | set(partner_by_week.keys()))
-
-    # Sample messages for tone analysis (max 10 per week per person)
-    def format_weekly_samples(by_week: dict, person_name: str) -> str:
+    def format_month_samples(by_month_week: dict, person_name: str) -> str:
         lines = []
-        for week in all_weeks:
-            msgs = by_week.get(week, [])
-            if msgs:
+        for month in stale_months:
+            for week in sorted(by_month_week.get(month, {}).keys()):
+                msgs = by_month_week[month][week]
                 sample = [m for m in msgs[:10] if m]
                 if sample:
-                    lines.append(f"=== {week} ({person_name}) ===\n" + "\n".join(sample))
+                    lines.append(f"=== {month} {week} ({person_name}) ===\n" + "\n".join(sample))
         return "\n\n".join(lines)
 
-    user_text = format_weekly_samples(user_by_week, user_name)
-    partner_text = format_weekly_samples(partner_by_week, partner_name)
-
-    # Use local LLM to analyze tone for each person
-    client = get_anthropic_llm()
+    user_text = format_month_samples(user_by_month_week, user_name)
+    partner_text = format_month_samples(partner_by_month_week, partner_name)
 
     prompt = f"""Analyze the emotional warmth of these iMessage conversations between {user_name} and {partner_name}.
-Messages are grouped by week and separated by sender.
+Messages are grouped by month, then by week within each month, and separated by sender.
 
-For EACH week where messages exist, rate emotional warmth on a scale from 0 to 100:
+For EACH month listed below, rate the OVERALL emotional warmth for that whole month on a scale from 0 to 100:
 - 100 = Extremely warm: Affectionate, loving, deeply connected
 - 75 = Warm: Friendly, caring, positive
 - 50 = Neutral: Everyday logistics, matter-of-fact
@@ -5278,106 +5807,360 @@ Analyze {user_name}'s messages and {partner_name}'s messages SEPARATELY.
 {partner_name.upper()}'S MESSAGES:
 {partner_text if partner_text else "(No messages)"}
 
-Return ONLY valid JSON with separate scores for each person for each week:
+Return ONLY valid JSON with one overall score per person for EACH month listed:
 {{
-  "weekly_scores": [
-    {{"week": "2025-W01", "user_score": 72, "partner_score": 68}},
-    {{"week": "2025-W02", "user_score": 65, "partner_score": 70}}
-  ],
-  "user_trend": "stable-positive",
-  "partner_trend": "stable-positive"
+  "monthly_scores": [
+    {{"month": "2025-03", "user_score": 72, "partner_score": 68}},
+    {{"month": "2025-04", "user_score": 65, "partner_score": 70}}
+  ]
 }}
 
-Trend options: stable-positive, stable-neutral, improving, declining, variable
-If a person has no messages for a week, omit their score for that week (don't put null)."""
+Months to score: {", ".join(stale_months)}
+If a person has few or no messages in a month, still include that month with your best estimate from context, or 50 if there is none."""
 
-    try:
-        response = client.create(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=4096,
-        )
+    response = client.create(
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=4096,
+    )
 
-        response_text = response.text
+    response_text = response.text
+    if "```json" in response_text:
+        json_start = response_text.find("```json") + 7
+        json_end = response_text.find("```", json_start)
+        response_text = response_text[json_start:json_end].strip()
+    elif "```" in response_text:
+        json_start = response_text.find("```") + 3
+        json_end = response_text.find("```", json_start)
+        response_text = response_text[json_start:json_end].strip()
 
-        # Parse JSON
-        if "```json" in response_text:
-            json_start = response_text.find("```json") + 7
-            json_end = response_text.find("```", json_start)
-            response_text = response_text[json_start:json_end].strip()
-        elif "```" in response_text:
-            json_start = response_text.find("```") + 3
-            json_end = response_text.find("```", json_start)
-            response_text = response_text[json_start:json_end].strip()
+    data = json.loads(response_text)
+    monthly_scores = data.get("monthly_scores", [])
 
-        data = json.loads(response_text)
-        weekly_scores = data.get("weekly_scores", [])
+    stale_month_set = set(stale_months)
+    results = {}
+    for item in monthly_scores:
+        month = item.get("month", "")
+        if month not in stale_month_set:
+            continue
+        if "user_score" not in item and "partner_score" not in item:
+            continue
+        user_score = float(item.get("user_score", 50.0))
+        partner_score = float(item.get("partner_score", 50.0))
+        combined_score = (user_score + partner_score) / 2
+        user_sample_count = sum(len(v) for v in user_by_month_week.get(month, {}).values())
+        partner_sample_count = sum(len(v) for v in partner_by_month_week.get(month, {}).values())
+        results[month] = {
+            "user_score": round(user_score, 1),
+            "partner_score": round(partner_score, 1),
+            "combined_score": round(combined_score, 1),
+            "user_sample_count": user_sample_count,
+            "partner_sample_count": partner_sample_count,
+        }
 
-        # Aggregate weekly scores to monthly
-        monthly_user: dict[str, list] = defaultdict(list)
-        monthly_partner: dict[str, list] = defaultdict(list)
+    model_name = getattr(response, "model", "") or ""
+    return results, model_name
 
-        for item in weekly_scores:
-            week = item.get("week", "")
-            if not week:
-                continue
 
-            # Convert week to month (approximate: use the Monday of that week)
-            try:
-                year = int(week[:4])
-                week_num = int(week.split("W")[1])
-                # Get first day of that week
-                from datetime import date
-                first_day = date.fromisocalendar(year, week_num, 1)
-                month_key = first_day.strftime("%Y-%m")
-            except (ValueError, IndexError):
-                continue
+def _tone_analysis_window_start(now, months: int):
+    """Calendar-month-aligned start of the tone-analysis window: the 1st of
+    the month `months` calendar months back from `now`'s month, inclusive
+    of the current month.
 
-            if "user_score" in item:
-                monthly_user[month_key].append(float(item["user_score"]))
-            if "partner_score" in item:
-                monthly_partner[month_key].append(float(item["partner_score"]))
+    Deliberately never `now - timedelta(days=months * 30)`: that rolling
+    cutoff drifts by a fraction of a day with every request, so the oldest
+    retained month's messages (and therefore its "current" interaction
+    count) shift purely from wall-clock time passing, forcing a needless
+    recompute on every load even though nothing about that month changed
+    (#899 review finding 5). Extracted as its own function so this exact
+    property is directly testable rather than only observable end-to-end
+    through a synthetic fixture that happens to sit inside either window
+    (#899 review finding N4 -- the original drift-regression test didn't
+    actually distinguish this from a reverted rolling window).
+    """
+    current_month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    year, month = current_month_start.year, current_month_start.month - (months - 1)
+    while month <= 0:
+        month += 12
+        year -= 1
+    return current_month_start.replace(year=year, month=month)
 
-        # Compute monthly averages
-        all_months = sorted(set(monthly_user.keys()) | set(monthly_partner.keys()))
 
-        monthly_tones = []
-        all_user_scores = []
-        all_partner_scores = []
+def _bucket_interactions_by_month_and_week(interactions: list) -> tuple:
+    """Bucket messages by their own calendar month first, then by week
+    within that month -- never by week alone. A week that straddles a
+    month boundary used to be looked up in one week-keyed dict shared
+    across both months, so both months' LLM prompts got the *other*
+    month's messages too and both months' sample counts roughly doubled
+    (#899 review finding 1). Keying week dicts under their month first
+    makes that impossible: each message lands under exactly one
+    (month, week) pair.
 
-        for month in all_months:
-            user_scores = monthly_user.get(month, [])
-            partner_scores = monthly_partner.get(month, [])
+    The month key is computed from the UTC-normalized instant
+    (`dt.astimezone(timezone.utc)`), not `dt`'s own stored offset, to match
+    `InteractionStore.get_monthly_interaction_counts_in_range`'s
+    `strftime('%Y-%m', timestamp)`, which SQLite always evaluates in UTC
+    regardless of what offset the timestamp string carries. Every
+    interaction in this codebase is stored with a `+00:00` offset today, so
+    this is a no-op in practice, but without it a row ever stored with a
+    non-UTC offset would land in a different month here than in that
+    count query -- and a month whose bucketed count permanently disagrees
+    with its stored `interaction_count` would recompute on every single
+    load (#899 review, second pass, nit 1).
 
-            user_avg = sum(user_scores) / len(user_scores) if user_scores else 50.0
-            partner_avg = sum(partner_scores) / len(partner_scores) if partner_scores else 50.0
-            combined_avg = (user_avg + partner_avg) / 2
+    Returns (user_by_month_week, partner_by_month_week).
+    """
+    from collections import defaultdict
 
-            all_user_scores.extend(user_scores)
-            all_partner_scores.extend(partner_scores)
+    user_by_month_week: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    partner_by_month_week: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
 
-            monthly_tones.append(ToneDataPointDetailed(
-                month=month,
-                user_score=round(user_avg, 1),
-                partner_score=round(partner_avg, 1),
-                combined_score=round(combined_avg, 1),
-                user_sample_count=len(user_by_week.get(month, [])),
-                partner_sample_count=len(partner_by_week.get(month, [])),
-            ))
+    for interaction in interactions:
+        dt = interaction.timestamp.astimezone(timezone.utc)
+        month_key = dt.strftime("%Y-%m")
+        week_key = dt.strftime("%Y-W%W")
 
-        # Overall averages
-        user_overall = sum(all_user_scores) / len(all_user_scores) if all_user_scores else 50.0
-        partner_overall = sum(all_partner_scores) / len(all_partner_scores) if all_partner_scores else 50.0
+        title = interaction.title or ""
+        # → means sent BY user, ← means received FROM partner
+        is_from_user = title.startswith("→")
+        message_text = title.lstrip("→←").strip() if title else ""
 
+        if is_from_user:
+            user_by_month_week[month_key][week_key].append(message_text)
+        else:
+            partner_by_month_week[month_key][week_key].append(message_text)
+
+    return user_by_month_week, partner_by_month_week
+
+
+def _chunked(items: list, size: int):
+    """Yield successive `size`-length slices of `items`."""
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+@router.post("/relationship/tone-analysis-detailed", response_model=ToneAnalysisDetailedResponse)
+def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: int = 12, refresh: bool = False):
+    """
+    Analyze tone/sentiment separately for the user and their partner in iMessage conversations.
+
+    Freshness is decided from a lightweight per-month COUNT query
+    (`get_monthly_interaction_counts_in_range`) that never loads a single
+    interaction row -- a fully-cached response touches storage only, no
+    row scan and no LLM call (#899 review finding N1). Only when at least
+    one month is stale does the handler fetch and bucket the actual
+    messages (by calendar month first, then by week within that month --
+    #899 review finding 1) to build LLM prompts, chunked at
+    `TONE_MAX_MONTHS_PER_LLM_CALL` months per call so one slow or timed-out
+    call can't blank the whole window (#899 review finding N2). Results
+    are persisted per person/month in `tone_analysis_results`
+    (api/services/tone_analysis_store.py): a month is served from storage
+    when its stored interaction count still matches the current count and
+    the result is within the freshness window (`TONE_FRESHNESS_DAYS`).
+    Pass `refresh=true` to force recomputation of every month in the window
+    regardless of freshness.
+
+    Never discards a good stored result and never raises for an LLM
+    failure or unavailability: a stale month that couldn't be recomputed
+    this request is returned with its last stored score and
+    `status="stale"` if one exists, or `status="error"` only if nothing
+    was ever stored for it (#899 review finding N2; ADR-025 fallback
+    preserved via get_anthropic_llm).
+    """
+    from api.services.llm_client import get_anthropic_llm
+    from api.services.tone_analysis_store import get_tone_analysis_store
+    from datetime import datetime, timezone, timedelta
+
+    target_id = person_id or PARTNER_PERSON_ID
+    interaction_store = get_interaction_store()
+    tone_store = get_tone_analysis_store()
+
+    now = datetime.now(timezone.utc)
+    start_date = _tone_analysis_window_start(now, months)
+
+    # Cheap freshness check: counts only, no rows loaded (#899 review
+    # finding N1). get_for_person_in_range (which loads every row) is only
+    # called below once stale_months is known to be non-empty.
+    month_interaction_counts = interaction_store.get_monthly_interaction_counts_in_range(
+        person_id=target_id,
+        start_date=start_date,
+        end_date=now,
+        source_type="imessage",
+    )
+
+    if not month_interaction_counts:
         return ToneAnalysisDetailedResponse(
-            monthly_tones=monthly_tones,
-            user_trend=data.get("user_trend", "variable"),
-            partner_trend=data.get("partner_trend", "variable"),
-            combined_trend="stable-positive" if abs(user_overall - partner_overall) < 10 else "variable",
-            user_average=round(user_overall, 1),
-            partner_average=round(partner_overall, 1),
+            monthly_tones=[],
+            user_trend="insufficient-data",
+            partner_trend="insufficient-data",
+            combined_trend="insufficient-data",
+            user_average=50.0,
+            partner_average=50.0,
             generated_at=now.isoformat(),
         )
 
-    except Exception as e:
-        logger.error(f"Detailed tone analysis failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Tone analysis failed: {str(e)}")
+    all_months = sorted(month_interaction_counts.keys())
+    user_name = settings.user_name if settings.user_name else "User"
+    partner_name = settings.partner_name if settings.partner_name else "Partner"
+
+    stored_by_month = {r.period_key: r for r in tone_store.get_for_person(target_id)}
+
+    def _compute_stale_months(stored_map: dict) -> list:
+        stale = []
+        for month in all_months:
+            stored = stored_map.get(month)
+            current_count = month_interaction_counts.get(month, 0)
+            if refresh or stored is None or stored.interaction_count != current_count:
+                stale.append(month)
+                continue
+            age = (now - stored.updated_at) if stored.updated_at else timedelta.max
+            if age > timedelta(days=TONE_FRESHNESS_DAYS):
+                stale.append(month)
+        return stale
+
+    stale_months = _compute_stale_months(stored_by_month)
+
+    # Serialize same-person requests: two concurrent tabs or a double-clicked
+    # refresh must not both pay for the same LLM call (#899 review finding
+    # 9). Bounded to TONE_LOCK_TIMEOUT_SECONDS (#899 review finding N3): a
+    # request that can't get the lock in time falls through to a
+    # storage-only response (marking anything stale as such) rather than
+    # blocking on someone else's in-flight computation and tying up a
+    # threadpool worker indefinitely. This only affects the *same* person --
+    # other people and unrelated endpoints (e.g. GET /api/crm/config) are
+    # unaffected, since the handler still runs off the event loop.
+    results_by_month: dict = {}
+    model_name = ""
+    if stale_months:
+        lock = _get_tone_analysis_lock(target_id)
+        lock_acquired = lock.acquire(timeout=TONE_LOCK_TIMEOUT_SECONDS)
+        try:
+            if lock_acquired:
+                # Re-check under the lock: a concurrent request may have
+                # already refreshed some or all of these months while this
+                # one waited.
+                stored_by_month = {r.period_key: r for r in tone_store.get_for_person(target_id)}
+                stale_months = _compute_stale_months(stored_by_month)
+
+                if stale_months:
+                    interactions = interaction_store.get_for_person_in_range(
+                        person_id=target_id, start_date=start_date, end_date=now,
+                        source_type="imessage",
+                    )
+                    user_by_month_week, partner_by_month_week = _bucket_interactions_by_month_and_week(
+                        interactions,
+                    )
+
+                    # One LLM call per chunk of at most TONE_MAX_MONTHS_PER_LLM_CALL
+                    # months, not one call for the whole window (#899 review
+                    # finding N2) and not one call per month (#899 review
+                    # finding 4) -- each chunk's result is upserted as soon as
+                    # it completes, so a later chunk's failure or timeout
+                    # (bounded by the LLM client's own configured timeout;
+                    # see api/services/llm_client.py) can't undo an earlier
+                    # chunk's success.
+                    for chunk in _chunked(stale_months, TONE_MAX_MONTHS_PER_LLM_CALL):
+                        try:
+                            client = get_anthropic_llm()
+                            chunk_results, model_name = _compute_tone_for_months(
+                                client, chunk, user_by_month_week, partner_by_month_week,
+                                user_name, partner_name,
+                            )
+                        except Exception as e:
+                            # Never a 500 for an LLM failure or unavailability --
+                            # catches both client acquisition (get_anthropic_llm)
+                            # and the call itself. Log without personal data (no
+                            # prompt/message content); this chunk's months are
+                            # marked stale/error below, but earlier chunks'
+                            # upserts already happened and are unaffected.
+                            logger.warning(
+                                "Tone analysis failed for a %d-month chunk: %s",
+                                len(chunk), e,
+                            )
+                            chunk_results = {}
+
+                        for month in chunk:
+                            if month in chunk_results:
+                                stored_by_month[month] = tone_store.upsert(
+                                    person_id=target_id,
+                                    period_key=month,
+                                    interaction_count=month_interaction_counts.get(month, 0),
+                                    result=chunk_results[month],
+                                    model=model_name,
+                                )
+                                results_by_month[month] = chunk_results[month]
+            else:
+                # Couldn't get the lock in time -- fall through without
+                # attempting the LLM, rather than blocking this request on
+                # someone else's in-flight computation. Re-read storage
+                # (and re-check staleness against it) before assembly: the
+                # lock holder may have just upserted some or all of these
+                # months while this request waited, and without this
+                # re-read they'd still be reported "stale" from the
+                # pre-wait snapshot for the rest of this response, even
+                # though a fresh score already landed (#899 review, second
+                # pass, nit 2).
+                stored_by_month = {r.period_key: r for r in tone_store.get_for_person(target_id)}
+                stale_months = _compute_stale_months(stored_by_month)
+        finally:
+            if lock_acquired:
+                lock.release()
+
+    # Assemble the response from storage. A month left in stale_months that
+    # wasn't freshly computed this request (chunk failed, response omitted
+    # it, or the lock couldn't be acquired) is served its last stored score
+    # marked status="stale" -- never discarded -- or status="error" only if
+    # nothing was ever stored for it (#899 review finding N2).
+    monthly_tones = []
+    all_user_scores = []
+    all_partner_scores = []
+
+    for month in all_months:
+        stored = stored_by_month.get(month)
+        if month in results_by_month:
+            status = None
+        elif month in stale_months:
+            status = "stale" if stored is not None else "error"
+        else:
+            status = None
+
+        if stored is not None:
+            r = stored.result
+            user_score = float(r.get("user_score", 50.0))
+            partner_score = float(r.get("partner_score", 50.0))
+            combined_score = float(r.get("combined_score", (user_score + partner_score) / 2))
+            monthly_tones.append(ToneDataPointDetailed(
+                month=month,
+                user_score=user_score,
+                partner_score=partner_score,
+                combined_score=combined_score,
+                user_sample_count=int(r.get("user_sample_count", 0)),
+                partner_sample_count=int(r.get("partner_sample_count", 0)),
+                status=status,
+            ))
+            all_user_scores.append(user_score)
+            all_partner_scores.append(partner_score)
+        else:
+            # No stored result exists at all for this month -- report the
+            # gap, don't fail the request or fabricate a score.
+            monthly_tones.append(ToneDataPointDetailed(
+                month=month,
+                user_score=50.0,
+                partner_score=50.0,
+                combined_score=50.0,
+                user_sample_count=0,
+                partner_sample_count=0,
+                status="error",
+            ))
+
+    user_overall = sum(all_user_scores) / len(all_user_scores) if all_user_scores else 50.0
+    partner_overall = sum(all_partner_scores) / len(all_partner_scores) if all_partner_scores else 50.0
+
+    return ToneAnalysisDetailedResponse(
+        monthly_tones=monthly_tones,
+        user_trend=_derive_trend(all_user_scores),
+        partner_trend=_derive_trend(all_partner_scores),
+        combined_trend="stable-positive" if abs(user_overall - partner_overall) < 10 else "variable",
+        user_average=round(user_overall, 1),
+        partner_average=round(partner_overall, 1),
+        generated_at=now.isoformat(),
+    )

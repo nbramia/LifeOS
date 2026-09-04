@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** API Gateway
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-04
 
 MCP (Model Context Protocol) server that exposes LifeOS capabilities to AI assistants like Claude Code.
 
@@ -333,6 +333,7 @@ Search for people in your network.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | q | string | Yes | Name or email to search |
+| limit | integer | No | Max results (default: 10, max: 50) |
 
 ### lifeos_memories_create
 

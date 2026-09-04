@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-04
 
 Codebase organization and module structure for efficient navigation.
 
@@ -23,11 +23,11 @@ api/
 │   ├── calendar.py            # Calendar integration
 │   ├── chat.py                # Streaming chat with agentic pipeline
 │   ├── conversations.py       # Conversation history
-│   ├── crm.py                 # CRM endpoints (~5,100 LOC)
-│   ├── crm_models/            # CRM Pydantic models and helpers
+│   ├── crm.py                 # CRM endpoints + models (~6,150 LOC) -- see below
+│   ├── crm_models/            # NOT wired into the app -- see "CRM Models Package"
 │   │   ├── __init__.py        # Re-exports models and utils
-│   │   ├── models.py          # All Pydantic models (~600 LOC)
-│   │   └── _utils.py          # Shared helper functions
+│   │   ├── models.py          # Unused parallel Pydantic models (~600 LOC)
+│   │   └── _utils.py          # is_family_member() is kept in sync by a test
 │   ├── _proxy.py              # Shared reverse-proxy router factory (agent/hermes)
 │   ├── agent_proxy.py         # Agent text-backend reverse proxy
 │   ├── hermes_proxy.py        # Hermes text-backend reverse proxy + persona envelope
@@ -93,6 +93,57 @@ Per-backend capabilities (personas, handoff, history ownership, usage capture) a
 - `person_facts.py` - Fact extraction and storage
 - `person_indexer.py` - Person search indexing
 - `person_stats.py` - Statistics computation
+- `aggregate_cache.py` - Response cache for the heaviest CRM aggregate endpoints (see below)
+
+`PersonEntityStore.get_all()` keeps a process-local cache of hydrated
+`PersonEntity` objects for the people list and CRM aggregate views. Cache
+entries are keyed by hidden/merged inclusion flags, SQLite `PRAGMA
+data_version` from a long-lived read connection, and a local generation
+counter bumped by store write methods and merged-ID reloads. This means any
+commit to `data/crm.db` from the API process or a separate sync process
+invalidates the cached people list on the next read. Callers receive a new
+list object on each call, but entity objects are shared, so write paths that
+mutate a person fetched from the full list must refetch that person by ID
+before persisting changes.
+
+`aggregate_cache.py`'s `AggregateCache` memoizes the return value of the
+CRM's heaviest read endpoints — `/me/interactions`, `/me/timeline`,
+`/family/interactions`, `/family/timeline`, `/birthdays/all`, `/statistics`,
+and `/people` (only for its default page shape — no search text, `limit` ≤
+300; a search or a large export is requested once and never reused, so it
+bypasses the cache rather than spending memory and encode time on an entry
+that will never hit) — applied via a `@cached_aggregate()` decorator
+directly under each route's `@router.get(...)`. The cache key is the
+route's resolved keyword arguments (every query parameter FastAPI
+resolved); the data_version pair is a *generation stamp* held outside the
+key, so a commit anywhere drops every existing entry outright rather than
+merely making old-generation keys unreachable inside the bounds below.
+`crm.db` is watched at every path a CRM store actually reads it from —
+`PersonEntityStore`'s hardcoded path and `api.utils.db_paths.get_crm_db_path()`'s
+settings-derived one, deduped by `os.path.realpath` (the two are the same
+file by default, but can diverge under a non-default `LIFEOS_CHROMA_PATH`)
+— plus `interactions.db`, each read from a long-lived, pragma-only
+connection following the same pattern as `PersonEntityStore`'s own
+data_version connection above, opened read-only with a `mode=ro` URI so a missing
+file is never silently created. A `PRAGMA data_version` read failure (a
+missing file, a file mid-replacement) never fails the request: it logs
+once and falls through to computing uncached, reopening the connection on
+the next call. A 300-second TTL is a backstop bound on entry lifetime, not
+the primary invalidation path — a response can be up to five minutes old
+with no intervening writes, and a time-windowed aggregate (computed from
+the request time) freezes "now" for the life of the entry that served it.
+Concurrent misses for the same key single-flight behind a per-key
+`threading.Event`, so only the first caller actually computes. Entries are
+bounded by count (200) and total serialized bytes (~7 MB, deliberately far
+below the 20 MB a naive reading suggests: a serialized-JSON byte undercounts
+the retained Python-object heap by roughly 7x, measured, so the bound
+targets a real ~50 MB heap ceiling rather than a 20 MB serialized one); an
+entry larger than the byte cap is skipped rather than evicting everything
+else to make room for it. The cached (and returned) value is always a deep
+copy, so a caller mutating its own result can never poison another
+caller's hit. A raised exception (including an `HTTPException` for a
+non-200 response) propagates before the cache-store step, so error
+responses are never cached.
 
 **Relationships:**
 - `relationship.py` - Relationship store
@@ -100,6 +151,23 @@ Per-backend capabilities (personas, handoff, history ownership, usage capture) a
 - `relationship_metrics.py` - Strength computation
 - `relationship_summary.py` - Summary generation
 - `relationship_insights.py` - Therapy note insights
+- `tone_analysis_store.py` - Persisted per-person/month iMessage tone scores
+
+The CRM people-list endpoints (`GET /api/crm/people`, `GET /birthdays/today`)
+compute each returned person's category dynamically, which needs that
+person's source entities when they don't already qualify as "work" via their
+own email domain or a `slack` source tag. Rather than calling
+`SourceEntityStore.get_for_person()` once per returned person,
+`SourceEntityStore.get_for_people_batch()` fetches the whole page in one
+round trip (a compound `UNION ALL` of per-person, `LIMIT`-bounded
+subqueries — chosen over a single `WHERE ... IN (...)` query because SQLite
+has no per-group "top-K" optimization for that shape, so it would have to
+fully rank every matching row for the highest-interaction people before
+applying any per-person cap). The category fetch also caps at 50 source
+entities per person rather than the single-person path's 500, verified
+against the full production dataset to produce identical categories either
+way — compute_person_category() only needs to find one qualifying entity,
+not all of them.
 
 **Source Integration:**
 - `source_entity.py` - Raw observation records
@@ -174,39 +242,29 @@ db_path = get_crm_db_path()  # Returns "data/crm.db"
 
 ## CRM Models Package (api/routes/crm_models/)
 
-The CRM models package consolidates Pydantic models and utilities for the CRM API.
+**Not currently wired into the running API.** The Pydantic models the CRM API
+actually serves — `PersonDetailResponse` (including `has_profile_photo`,
+added in #875), `PersonListResponse`, `TimelineItem`, and the rest — are
+defined directly inside `api/routes/crm.py`, alongside the route handlers
+that use them; `api/main.py` mounts only `crm.router`. `crm_models/` is a
+separate, parallel module tree (`models.py`, `_utils.py`, `__init__.py`)
+that predates or anticipated a split of `crm.py` into smaller files but was
+never finished wiring up — nothing in `api/main.py` or `api/routes/crm.py`
+imports from it.
 
-### Importing Models
+It isn't dead code, though: `api.routes.crm_models._utils.is_family_member`
+is a second, independent implementation of the family-matching logic that
+`api.services.person_entity._is_family_member` also implements for the live
+path, and `tests/test_family_matching.py` exercises both directly so the two
+can't silently drift apart. Anyone touching family-matching rules needs to
+update both. If `crm_models/` is ever finished and wired up (or removed),
+that test and this note both need to move with it.
+
+### Importing the family-matching utility
 
 ```python
-from api.routes.crm_models import (
-    PersonDetailResponse,
-    TimelineItem,
-    NetworkGraphResponse,
-)
+from api.routes.crm_models._utils import is_family_member
 ```
-
-### Importing Utilities
-
-```python
-from api.routes.crm_models import (
-    compute_person_category,
-    person_to_detail_response,
-    MY_PERSON_ID,
-)
-```
-
-### Models Reference
-
-| Category | Models |
-|----------|--------|
-| Person | PersonDetailResponse, PersonListResponse, PersonUpdateRequest, PersonMergeRequest, PersonSplitRequest |
-| Timeline | TimelineItem, TimelineResponse, AggregatedTimelineResponse |
-| Relationships | RelationshipResponse, RelationshipDetailResponse, ConnectionResponse |
-| Network | NetworkNode, NetworkEdge, NetworkGraphResponse |
-| Facts | PersonFactResponse, PersonFactsResponse, FactExtractionResponse |
-| Dashboard | MeStatsResponse, MeInteractionsResponse, FamilyInteractionsResponse |
-| Health | SyncHealthResponse, ReviewQueueResponse |
 
 ---
 
@@ -244,12 +302,13 @@ from api.routes import (
 
 ### CRM Models
 
+`api/routes/crm.py` defines and uses its own response models directly — they
+aren't re-exported for other modules to import. The one thing from
+`api/routes/crm_models/` that another module does import (see [CRM Models
+Package](#crm-models-package-apiroutescrm_models) above):
+
 ```python
-from api.routes.crm_models import (
-    PersonDetailResponse, TimelineItem, NetworkGraphResponse,
-    compute_person_category, person_to_detail_response,
-    MY_PERSON_ID, FAMILY_EXACT_NAMES,
-)
+from api.routes.crm_models._utils import is_family_member
 ```
 
 ---
@@ -260,7 +319,7 @@ from api.routes.crm_models import (
 
 ```python
 @router.get("/endpoint", response_model=ResponseModel)
-async def endpoint_handler(
+def endpoint_handler(
     param: str = Query(..., description="Required parameter"),
     optional: int = Query(default=10, ge=1, le=100),
 ):
@@ -275,6 +334,38 @@ async def endpoint_handler(
 
     return ResponseModel(...)
 ```
+
+**`def` vs. `async def` (#868).** LifeOS runs one uvicorn process with a
+single event loop; every client surface (chat, Telegram, voice, MCP, the
+agent worker, and the CRM/people UI) shares it. A handler declared `async
+def` with nothing to `await` still runs inline on that loop, so its
+synchronous DB/CPU work blocks every other in-flight request until it
+returns. A handler declared plain `def` is dispatched by FastAPI to the
+worker threadpool (via Starlette's `run_in_threadpool`, anyio's default
+capacity of 40) automatically, which restores fairness between requests.
+The CRM, people, and photos routers (`api/routes/crm.py`, `api/routes/people.py`,
+`api/routes/photos.py`) follow this rule as of #868: a handler is `async def`
+only if its own body actually awaits something (an LLM call, `await
+file.read()`); otherwise it is `def`. A handler that keeps `async def`
+pushes its blocking store or LLM calls onto a thread explicitly with `await
+asyncio.to_thread(...)` (e.g. `api/routes/investments.py`, `api/routes/crm.py`'s
+fact-extraction and source-import endpoints) rather than doing them inline.
+This is a fairness fix, not a throughput one — CPU-bound work still holds
+the GIL while it runs; per-endpoint throughput is tracked separately
+(issues #869-#874). **Scope:** this is the rule for these three routers
+specifically, enforced by `tests/test_route_handlers_sync.py`; the rest of
+`api/routes/` still has `async def` handlers with no `await` that #868 did
+not touch — converting them is a separate, unstarted effort, not a silent
+exception to the rule above.
+Moving these handlers off the loop also removed the implicit serialization
+an inline `async def` gave every request against every other one. Handlers
+that mutate shared on-disk state (`merge_people`, `split_person`,
+`hide_person`, the review-queue confirm/reject endpoints, and the
+sync-trigger POSTs) now hold a module-level `threading.Lock`
+(`api/routes/crm.py`'s `_mutation_lock`) across their bodies to restore
+that serialization explicitly, since two of them interleaving could
+otherwise corrupt shared bookkeeping (e.g. `scripts/merge_people.py`'s
+merge-intent log).
 
 ### Service Store Pattern
 
@@ -413,5 +504,7 @@ Tests are in `tests/` with naming convention `test_*.py`.
 - [Client Surfaces](client-surfaces.md) -- HTTP consumers and breaking-change policy
 - [Frontend](frontend.md) -- UI components and patterns
 - [API Reference](../product/api-reference.md) -- API endpoint contracts
+- [CRM Dashboards & Insights](../product/crm-analytics.md) -- The dashboards `AggregateCache` serves
+- [CRM API Reference](../product/api-crm.md) -- The specific endpoints `AggregateCache` covers
 - [ADR-001: Python/FastAPI](../../adr/001-python-fastapi.md) -- Why Python/FastAPI was chosen
 - [Python Conventions](../standards/python-conventions.md) -- Coding style and module patterns

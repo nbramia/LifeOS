@@ -127,6 +127,20 @@ def clear_merge_log():
         MERGE_LOG_FILE.unlink()
 
 
+def _tone_analysis_results_table_exists(conn: sqlite3.Connection) -> bool:
+    """True if crm.db has a tone_analysis_results table.
+
+    Unlike the other tables merge_people touches, this one is created
+    lazily by ToneAnalysisStore on its first use
+    (api/services/tone_analysis_store.py) rather than always being
+    present, so a crm.db where tone analysis has never run doesn't have it
+    yet (#910).
+    """
+    return conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='tone_analysis_results'"
+    ).fetchone() is not None
+
+
 def get_canonical_person_id(person_id: str) -> str:
     """
     Get the canonical (primary) person ID, following merge chain if needed.
@@ -270,6 +284,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
         'interactions_updated': 0,
         'source_entities_updated': 0,
         'facts_cleared': 0,
+        'tone_rows_cleared': 0,
         'emails_merged': 0,
         'phones_merged': 0,
         'aliases_added': 0,
@@ -408,6 +423,13 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
             (canonical_primary_id, canonical_secondary_id)
         ).fetchone()[0]
         logger.info(f"4. {stats['facts_cleared']} facts to clear")
+        stats['tone_rows_cleared'] = 0
+        if _tone_analysis_results_table_exists(crm_conn):
+            stats['tone_rows_cleared'] = crm_conn.execute(
+                "SELECT COUNT(*) FROM tone_analysis_results WHERE person_id = ?",
+                (canonical_secondary_id,)
+            ).fetchone()[0]
+        logger.info(f"   {stats['tone_rows_cleared']} tone analysis rows to clear")
 
         # 4. Count relationships
         from api.services.relationship import get_relationship_store
@@ -435,6 +457,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
         logger.info(f"Interactions: {stats['interactions_updated']}")
         logger.info(f"Source entities: {stats['source_entities_updated']}")
         logger.info(f"Facts: {stats['facts_cleared']}")
+        logger.info(f"Tone analysis rows: {stats['tone_rows_cleared']}")
         logger.info(f"Relationships: {stats['relationships_updated']} transfer, {stats['relationships_merged']} merge, {stats['relationships_deleted']} delete")
         logger.info(f"Emails: +{stats['emails_merged']}, Phones: +{stats['phones_merged']}, Aliases: +{stats['aliases_added']}")
         logger.info("\nDRY RUN - no changes made. Use --execute to apply.")
@@ -525,6 +548,39 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
                 (canonical_primary_id, canonical_secondary_id)
             )
         logger.info(f"   Facts cleared: {stats['facts_cleared']}")
+
+        # 4b-2. Remove tone analysis results for the absorbed person only
+        # (#910). Unlike facts (cleared for *both* ids, above), the
+        # primary's own tone_analysis_results rows are deliberately left
+        # alone: each row's freshness is already keyed to a stored
+        # interaction_count compared against the person's *current*
+        # interaction count (api/routes/crm.py's analyze_relationship_tone_detailed).
+        # Step 3 above just repointed the secondary's interactions to the
+        # primary, so any month where that changes the primary's count
+        # self-heals the next time tone analysis runs for the primary --
+        # it recomputes using the now-complete, merged interaction history
+        # rather than needing this script to know that. The secondary's
+        # own rows have no such self-healing (the id they're keyed to is
+        # about to stop existing), so those are the ones that must be
+        # deleted here to avoid orphaning -- not re-keyed onto the primary,
+        # since a re-keyed row could collide with a period_key the primary
+        # already has (the table's primary key is (person_id, period_key)),
+        # and simply deleting it lets the primary's next tone-analysis
+        # request compute a fresh score from the merged data instead of
+        # carrying forward a score computed from only half of it.
+        stats['tone_rows_cleared'] = 0
+        if _tone_analysis_results_table_exists(crm_conn):
+            cursor = crm_conn.execute(
+                "SELECT COUNT(*) FROM tone_analysis_results WHERE person_id = ?",
+                (canonical_secondary_id,)
+            )
+            stats['tone_rows_cleared'] = cursor.fetchone()[0]
+            if stats['tone_rows_cleared'] > 0:
+                crm_conn.execute(
+                    "DELETE FROM tone_analysis_results WHERE person_id = ?",
+                    (canonical_secondary_id,)
+                )
+        logger.info(f"   Tone analysis rows cleared: {stats['tone_rows_cleared']}")
 
         # 4c. Merge relationships (raw SQL within same transaction)
         stats['relationships_updated'] = 0
@@ -713,6 +769,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
     logger.info(f"Interactions updated: {stats['interactions_updated']}")
     logger.info(f"Source entities updated: {stats['source_entities_updated']}")
     logger.info(f"Facts cleared: {stats['facts_cleared']} (will regenerate)")
+    logger.info(f"Tone analysis rows cleared: {stats['tone_rows_cleared']}")
     logger.info(f"Relationships: {stats['relationships_updated']} transferred, {stats['relationships_merged']} merged, {stats['relationships_deleted']} deleted")
     logger.info(f"Emails merged: {stats['emails_merged']}")
     logger.info(f"Phones merged: {stats['phones_merged']}")
