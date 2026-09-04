@@ -127,6 +127,20 @@ def clear_merge_log():
         MERGE_LOG_FILE.unlink()
 
 
+def _tone_analysis_results_table_exists(conn: sqlite3.Connection) -> bool:
+    """True if crm.db has a tone_analysis_results table.
+
+    Unlike the other tables merge_people touches, this one is created
+    lazily by ToneAnalysisStore on its first use
+    (api/services/tone_analysis_store.py) rather than always being
+    present, so a crm.db where tone analysis has never run doesn't have it
+    yet (#910).
+    """
+    return conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='tone_analysis_results'"
+    ).fetchone() is not None
+
+
 def get_canonical_person_id(person_id: str) -> str:
     """
     Get the canonical (primary) person ID, following merge chain if needed.
@@ -409,10 +423,12 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
             (canonical_primary_id, canonical_secondary_id)
         ).fetchone()[0]
         logger.info(f"4. {stats['facts_cleared']} facts to clear")
-        stats['tone_rows_cleared'] = crm_conn.execute(
-            "SELECT COUNT(*) FROM tone_analysis_results WHERE person_id = ?",
-            (canonical_secondary_id,)
-        ).fetchone()[0]
+        stats['tone_rows_cleared'] = 0
+        if _tone_analysis_results_table_exists(crm_conn):
+            stats['tone_rows_cleared'] = crm_conn.execute(
+                "SELECT COUNT(*) FROM tone_analysis_results WHERE person_id = ?",
+                (canonical_secondary_id,)
+            ).fetchone()[0]
         logger.info(f"   {stats['tone_rows_cleared']} tone analysis rows to clear")
 
         # 4. Count relationships
@@ -552,16 +568,18 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
         # and simply deleting it lets the primary's next tone-analysis
         # request compute a fresh score from the merged data instead of
         # carrying forward a score computed from only half of it.
-        cursor = crm_conn.execute(
-            "SELECT COUNT(*) FROM tone_analysis_results WHERE person_id = ?",
-            (canonical_secondary_id,)
-        )
-        stats['tone_rows_cleared'] = cursor.fetchone()[0]
-        if stats['tone_rows_cleared'] > 0:
-            crm_conn.execute(
-                "DELETE FROM tone_analysis_results WHERE person_id = ?",
+        stats['tone_rows_cleared'] = 0
+        if _tone_analysis_results_table_exists(crm_conn):
+            cursor = crm_conn.execute(
+                "SELECT COUNT(*) FROM tone_analysis_results WHERE person_id = ?",
                 (canonical_secondary_id,)
             )
+            stats['tone_rows_cleared'] = cursor.fetchone()[0]
+            if stats['tone_rows_cleared'] > 0:
+                crm_conn.execute(
+                    "DELETE FROM tone_analysis_results WHERE person_id = ?",
+                    (canonical_secondary_id,)
+                )
         logger.info(f"   Tone analysis rows cleared: {stats['tone_rows_cleared']}")
 
         # 4c. Merge relationships (raw SQL within same transaction)

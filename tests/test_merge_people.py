@@ -464,3 +464,55 @@ class TestMergePeopleToneAnalysisResults:
         fact_store = merge_env["fact_store"]
         assert fact_store.get_for_person("primary-person") == []
         assert fact_store.get_for_person("secondary-person") == []
+
+    @pytest.fixture
+    def merge_env_without_tone_table(self, tmp_path, monkeypatch):
+        """Same as merge_env, but the tone_analysis_results table is never
+        created -- reproducing a crm.db from an install where tone
+        analysis has never run (the table is created lazily). Regression
+        coverage for a real bug this addition introduced and fixed in the
+        same round: tests/test_merge_crash_safety.py's fixture builds its
+        own crm.db without this table, and the first version of this
+        change 500'd on it with `no such table: tone_analysis_results`."""
+        from api.services.person_entity import PersonEntity, PersonEntityStore
+        from api.services.relationship import RelationshipStore
+        from api.services.source_entity import SourceEntityStore
+        from api.services.person_facts import PersonFactStore
+        from api.services.interaction_store import InteractionStore
+
+        crm_db_path = str(tmp_path / "crm.db")
+        interactions_db_path = str(tmp_path / "interactions.db")
+
+        person_store = PersonEntityStore(crm_db_path)
+        RelationshipStore(crm_db_path)
+        SourceEntityStore(crm_db_path)
+        PersonFactStore(crm_db_path)
+        InteractionStore(interactions_db_path, strict=False)
+        # Deliberately no ToneAnalysisStore(crm_db_path) call here.
+
+        person_store.add(PersonEntity(id="primary-person", canonical_name="Primary Person"))
+        person_store.add(PersonEntity(id="secondary-person", canonical_name="Secondary Person"))
+
+        monkeypatch.setattr("scripts.merge_people.get_person_entity_store", lambda: person_store)
+        monkeypatch.setattr("scripts.merge_people.get_crm_db_path", lambda: crm_db_path)
+        monkeypatch.setattr("scripts.merge_people.get_interaction_db_path", lambda: interactions_db_path)
+        monkeypatch.setattr("scripts.merge_people.MERGED_IDS_FILE", tmp_path / "merged_ids.json")
+        monkeypatch.setattr("scripts.merge_people.MERGE_LOG_FILE", tmp_path / "merge_log.json")
+        monkeypatch.setattr("api.services.person_stats.refresh_person_stats", lambda *a, **k: {})
+        monkeypatch.setattr("api.services.relationship_metrics.update_strength_for_person", lambda *a, **k: None)
+
+    def test_merge_execute_succeeds_when_tone_analysis_results_table_does_not_exist_yet(
+        self, merge_env_without_tone_table,
+    ):
+        from scripts.merge_people import merge_people
+
+        stats = merge_people("primary-person", "secondary-person", dry_run=False)
+        assert stats["tone_rows_cleared"] == 0
+
+    def test_merge_dry_run_succeeds_when_tone_analysis_results_table_does_not_exist_yet(
+        self, merge_env_without_tone_table,
+    ):
+        from scripts.merge_people import merge_people
+
+        stats = merge_people("primary-person", "secondary-person", dry_run=True)
+        assert stats["tone_rows_cleared"] == 0
