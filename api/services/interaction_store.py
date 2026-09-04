@@ -853,6 +853,21 @@ class InteractionStore:
         bucketed every row in the window just to compute a count comparison
         (#899 review finding N1).
 
+        Month grouping relies on every `timestamp` being stored with a
+        `+00:00` offset (true for every writer in this codebase today,
+        verified across all interactions in production). `strftime('%Y-%m',
+        timestamp)` below normalizes the timestamp to UTC before extracting
+        the month, regardless of what offset the string carries -- SQLite
+        does this unconditionally, it is not something this query opts
+        into. The Python-side bucketing this count is compared against
+        (`api/routes/crm.py`'s `_bucket_interactions_by_month_and_week`)
+        mirrors that by converting to UTC itself (`dt.astimezone(timezone.utc)`)
+        rather than trusting `dt`'s own offset, so the two sides agree even
+        if a row were ever stored with a non-UTC offset (#899 review,
+        second pass, nit 1) -- see `test_month_grouping_is_utc_normalized...`
+        in tests/test_interaction_store.py, which pins this directly rather
+        than relying on production data happening to already be UTC.
+
         Args:
             person_id: PersonEntity ID
             start_date: Start of date range (inclusive)

@@ -380,6 +380,38 @@ class TestInteractionStore:
         )
         assert counts == {}
 
+    def test_month_grouping_is_utc_normalized_even_for_a_non_utc_offset_row(self, temp_store):
+        """#899 review, second pass, nit 1: get_monthly_interaction_counts_in_range's
+        SQL grouping (`strftime('%Y-%m', timestamp)`, which SQLite always
+        evaluates in UTC regardless of the stored offset) must agree with
+        `api/routes/crm.py`'s Python-side bucketing for the same row --
+        even when that row is stored with a non-UTC offset, not just when
+        (as every writer in this codebase does today) it's already
+        `+00:00`. Pins the dependency directly rather than relying on
+        production data happening to already be UTC."""
+        from api.routes.crm import _bucket_interactions_by_month_and_week
+
+        person_id = "person-non-utc-offset"
+        # 2026-06-30 22:00 at UTC-04:00 is 2026-07-01 02:00 UTC -- a genuine
+        # month-boundary crossing that only a UTC-normalizing comparison
+        # gets right on both sides.
+        ts = datetime(2026, 6, 30, 22, 0, tzinfo=timezone(timedelta(hours=-4)))
+        interaction = Interaction(
+            id=str(uuid.uuid4()), person_id=person_id, timestamp=ts,
+            source_type="imessage", title="→ boundary-crossing message",
+        )
+        temp_store.add(interaction)
+
+        counts = temp_store.get_monthly_interaction_counts_in_range(
+            person_id=person_id,
+            start_date=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            end_date=datetime(2026, 7, 31, tzinfo=timezone.utc),
+        )
+        assert counts == {"2026-07": 1}  # SQL side: normalized to UTC
+
+        user_by_month_week, _ = _bucket_interactions_by_month_and_week([interaction])
+        assert set(user_by_month_week.keys()) == {"2026-07"}  # Python side must agree
+
     def test_get_for_person_by_source_type(self, temp_store):
         """Test filtering interactions by source type."""
         person_id = "person-filter"

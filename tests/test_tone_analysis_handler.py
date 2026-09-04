@@ -11,6 +11,7 @@ interaction store, and the tone analysis store so these tests never touch
 """
 import json
 import sqlite3
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -803,6 +804,58 @@ class TestLockTimeout:
         data = response.json()
         assert data["monthly_tones"][0]["status"] == "stale"
         assert data["monthly_tones"][0]["user_score"] == 55.0
+
+    def test_lock_timeout_fallthrough_rereads_storage_for_freshly_upserted_months(
+        self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
+    ):
+        """#899 review, second pass, nit 2: the fall-through must re-read
+        storage before assembling its response. Without that re-read, a
+        month the lock holder finishes and upserts *while this request is
+        still waiting* on the lock (but before releasing it) would be
+        reported based on the stale pre-wait snapshot, even though a fresh
+        score already landed while this request waited.
+
+        Reproduces the actual race, not just its end state: month_a is
+        genuinely unstored (and so genuinely stale) at the moment this
+        request starts and takes its initial snapshot; only ~1.5s into
+        this request's 5s wait for the lock does a background thread
+        upsert a fresh result -- still without releasing the lock, so this
+        request's `acquire()` still times out and must take the
+        fall-through path, not the "lock acquired" path."""
+        month_a = _two_distinct_months()[0]
+        patch_interactions(_interactions_for_months([month_a]))  # 2 interactions, unstored
+
+        lock = crm_module._get_tone_analysis_lock(PARTNER_ID)
+        lock.acquire()
+
+        def _hold_then_upsert_then_release():
+            time.sleep(1.5)  # well within TONE_LOCK_TIMEOUT_SECONDS (5s)
+            tone_store.upsert(PARTNER_ID, month_a, 2, {
+                "user_score": 77.0, "partner_score": 77.0, "combined_score": 77.0,
+                "user_sample_count": 1, "partner_sample_count": 1,
+            })
+            # Keep holding well past this request's own lock-acquire
+            # timeout, so it genuinely times out and falls through rather
+            # than acquiring the lock itself.
+            time.sleep(crm_module.TONE_LOCK_TIMEOUT_SECONDS)
+            lock.release()
+
+        holder = threading.Thread(target=_hold_then_upsert_then_release)
+        holder.start()
+        try:
+            client = _patch_llm(monkeypatch, _RecordingLLMClient(user_score=99.0, partner_score=99.0))
+            response = app_client.post("/api/crm/relationship/tone-analysis-detailed")
+        finally:
+            holder.join(timeout=crm_module.TONE_LOCK_TIMEOUT_SECONDS + 5)
+            if lock.locked():
+                lock.release()
+
+        assert response.status_code == 200
+        assert client.calls == []  # never attempted the LLM while the lock was held
+
+        data = response.json()
+        assert data["monthly_tones"][0]["status"] is None  # fresh, not stale/error
+        assert data["monthly_tones"][0]["user_score"] == 77.0
 
 
 class TestFailureHandling:

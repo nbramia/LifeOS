@@ -5578,6 +5578,18 @@ def _bucket_interactions_by_month_and_week(interactions: list) -> tuple:
     makes that impossible: each message lands under exactly one
     (month, week) pair.
 
+    The month key is computed from the UTC-normalized instant
+    (`dt.astimezone(timezone.utc)`), not `dt`'s own stored offset, to match
+    `InteractionStore.get_monthly_interaction_counts_in_range`'s
+    `strftime('%Y-%m', timestamp)`, which SQLite always evaluates in UTC
+    regardless of what offset the timestamp string carries. Every
+    interaction in this codebase is stored with a `+00:00` offset today, so
+    this is a no-op in practice, but without it a row ever stored with a
+    non-UTC offset would land in a different month here than in that
+    count query -- and a month whose bucketed count permanently disagrees
+    with its stored `interaction_count` would recompute on every single
+    load (#899 review, second pass, nit 1).
+
     Returns (user_by_month_week, partner_by_month_week).
     """
     from collections import defaultdict
@@ -5586,7 +5598,7 @@ def _bucket_interactions_by_month_and_week(interactions: list) -> tuple:
     partner_by_month_week: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
 
     for interaction in interactions:
-        dt = interaction.timestamp
+        dt = interaction.timestamp.astimezone(timezone.utc)
         month_key = dt.strftime("%Y-%m")
         week_key = dt.strftime("%Y-W%W")
 
@@ -5759,11 +5771,19 @@ def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: 
                                     model=model_name,
                                 )
                                 results_by_month[month] = chunk_results[month]
-            # else: couldn't get the lock in time -- fall through without
-            # attempting the LLM. Assembly below serves stored_by_month as
-            # already fetched, marking anything still in stale_months
-            # "stale" (has a stored score) or "error" (never stored) rather
-            # than blocking this request.
+            else:
+                # Couldn't get the lock in time -- fall through without
+                # attempting the LLM, rather than blocking this request on
+                # someone else's in-flight computation. Re-read storage
+                # (and re-check staleness against it) before assembly: the
+                # lock holder may have just upserted some or all of these
+                # months while this request waited, and without this
+                # re-read they'd still be reported "stale" from the
+                # pre-wait snapshot for the rest of this response, even
+                # though a fresh score already landed (#899 review, second
+                # pass, nit 2).
+                stored_by_month = {r.period_key: r for r in tone_store.get_for_person(target_id)}
+                stale_months = _compute_stale_months(stored_by_month)
         finally:
             if lock_acquired:
                 lock.release()
