@@ -388,6 +388,28 @@ def test_console_output_names_log_path(stub_python, tmp_path):
 
 
 @pytest.mark.unit
+def test_preexisting_log_dir_is_tightened_to_0700(stub_python, tmp_path):
+    """Finding C: `mkdir -p -m 700` only sets the mode when it CREATES the
+    directory — a no-op `mkdir -p` on one that already exists never touches
+    its mode. This is exactly why the unconditional `chmod 700` exists
+    (comment: "a directory left behind world-writable... would never get
+    tightened"), but every other test's log directory is freshly created
+    by the hook itself, so `-m 700` alone already satisfies them and a
+    `chmod 700 -> true` mutation slips through undetected. Pre-create the
+    directory with a permissive mode BEFORE running the hook to force the
+    unconditional chmod to be the only thing that can fix it.
+    """
+    log_dir = tmp_path / "lifeos-prepush"
+    log_dir.mkdir(mode=0o777)
+    os.chmod(log_dir, 0o777)  # mkdir(mode=...) is affected by umask; force it
+
+    result = _run_real_hook(stub_python, tmp_path, local_ref="refs/heads/feat/preexisting-mode-check")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert log_dir.stat().st_mode & 0o777 == 0o700, (
+        "a pre-existing, permissive log directory must be tightened to 0700")
+
+
+@pytest.mark.unit
 def test_real_unit_failure_names_existing_log_with_failure_text(stub_python, tmp_path):
     """A real failing unit run must fail the push, name a log that actually
     exists, and stop before the browser stage ever runs."""
