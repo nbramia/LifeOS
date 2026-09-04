@@ -66,16 +66,24 @@ _LIVE_REFRESH_GRACE_SECONDS = 60 * 60  # 60 min
 _TERMINAL_STATUSES_CACHE: frozenset[str] | None = None
 
 
+# CLI session statuses ("ended"/"inactive") don't exist in the worker's
+# TERMINAL_STATUSES set at all — they're event-driven statuses from
+# `cli_sessions` / the transcript scan's file-age guess, not worker session
+# statuses. Without this a CLI session's fallback label was never cached and
+# the prefetcher retried it on every tick forever (#863).
+_CLI_TERMINAL_STATUSES = frozenset({"ended", "inactive"})
+
+
 def _is_terminal(status: str) -> bool:
     global _TERMINAL_STATUSES_CACHE
     if _TERMINAL_STATUSES_CACHE is None:
         try:
             from api.services.agent_worker.session_store import TERMINAL_STATUSES
-            _TERMINAL_STATUSES_CACHE = frozenset(TERMINAL_STATUSES)
+            _TERMINAL_STATUSES_CACHE = frozenset(TERMINAL_STATUSES) | _CLI_TERMINAL_STATUSES
         except Exception:  # noqa: BLE001
             _TERMINAL_STATUSES_CACHE = frozenset({
                 "completed", "failed", "budget_exceeded", "killed", "cascade_killed",
-            })
+            }) | _CLI_TERMINAL_STATUSES
     return (status or "") in _TERMINAL_STATUSES_CACHE
 
 
@@ -353,6 +361,21 @@ def _fallback_label(label: str) -> str:
     return " ".join(words[:5]).strip() or "Untitled"
 
 
+def _cache_if_terminal(session_id: str, last_activity_at: float, status: str,
+                        result: SummaryResult) -> None:
+    """Cache `result` for a session whose status is terminal, so it drops out
+    of the prefetch candidate list for good. A live session's activity keeps
+    moving and might yet produce real content, so callers must not cache for
+    it — the next access retries instead (#863)."""
+    if not _is_terminal(status):
+        return
+    now = time.time()
+    if len(_cache) >= _CACHE_MAX:
+        _cache.pop(next(iter(_cache)))
+    _cache[session_id] = (last_activity_at, now, result)
+    _disk_put(session_id, last_activity_at, result)
+
+
 async def summarize_session(
     session_id: str,
     *,
@@ -396,12 +419,7 @@ async def summarize_session(
             short_label=_fallback_label(label),
             summary="(No transcript content yet.)",
         )
-        if _is_terminal(status):
-            now = time.time()
-            if len(_cache) >= _CACHE_MAX:
-                _cache.pop(next(iter(_cache)))
-            _cache[session_id] = (last_activity_at, now, result)
-            _disk_put(session_id, last_activity_at, result)
+        _cache_if_terminal(session_id, last_activity_at, status, result)
         return result
 
     prompt = _build_prompt(label, ctx)
@@ -435,10 +453,15 @@ async def summarize_session(
             short_label = " ".join(words[:7])
     except Exception as exc:  # noqa: BLE001 — never break the panel on summary failure
         logger.warning("session summary failed for %s: %s", session_id, exc)
-        return SummaryResult(
+        fallback = SummaryResult(
             short_label=_fallback_label(label),
             summary=f"(Summary unavailable: {type(exc).__name__})",
         )
+        # (#863) A terminal session whose summary call keeps raising was
+        # never cached, so the prefetcher retried it on every tick forever.
+        # A live session might succeed later, so it stays uncached.
+        _cache_if_terminal(session_id, last_activity_at, status, fallback)
+        return fallback
 
     result = SummaryResult(short_label=short_label, summary=summary)
     if len(_cache) >= _CACHE_MAX:

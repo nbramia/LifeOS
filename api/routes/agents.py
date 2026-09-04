@@ -191,9 +191,10 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "session_id": s.session_id,
         "task_id": s.task_id,
         "status": s.status,
-        # Worker sessions only ever run on the machine hosting the API
-        # (#849) — no cross-host worker dispatch exists.
-        "host": api_host_name(),
+        # (#851) `Session.host` is the board-assignment field a worker was
+        # dispatched to run on; unset (legacy rows, or a session created
+        # before #851) falls back to the machine hosting this API process.
+        "host": s.host or api_host_name(),
         "routing": s.routing,
         "parent_session_id": s.parent_session_id,
         "root_session_id": s.root_session_id,
@@ -210,7 +211,14 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "total_active_seconds": round(s.total_active_seconds, 3),
         "expected_output": s.expected_output,
         "label": _label_for_session(s, events),
-        "model_label": _model_label_for_routing(s.routing),
+        "model_label": _model_label_for_routing(s.routing, getattr(s, "model", None)),
+        # (#863) board-assignment + identity fields, passed through so the
+        # panel and filters can surface them without re-deriving.
+        "model": getattr(s, "model", None),
+        "effort": getattr(s, "effort", None),
+        "conversation_id": getattr(s, "conversation_id", None),
+        "bot": getattr(s, "bot", None),
+        "origin": getattr(s, "origin", None),
         "last_event_kind": summary["last_event_kind"],
         "tool_call_count": summary["tool_call_count"],
         "error_count": summary["error_count"],
@@ -310,7 +318,9 @@ def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
         from api.services.codex import session_ingest as cx
         model_lbl = cx.model_label(cli.model or "")
     else:
-        model_lbl = "Claude"
+        # (#863) An unrecognized engine used to hardcode a Claude tier
+        # guess ("Claude") — surface the engine's own name instead.
+        model_lbl = cli.engine.replace("_", " ").title() if cli.engine else "Claude"
     return {
         "session_id": cli.session_id,
         "task_id": cli.task_id,
@@ -330,7 +340,9 @@ def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
         "total_dollars": 0.0,
         "total_active_seconds": 0.0,
         "expected_output": None,
-        "label": cli.session_id,
+        # (#863) Prefer the hook-posted prompt preview — the session id is
+        # not a human label.
+        "label": cli.prompt_preview or cli.session_id,
         "model_label": model_lbl,
         "last_event_kind": "",
         "tool_call_count": 0,
@@ -454,20 +466,36 @@ def _build_snapshot() -> dict[str, Any]:
     }
 
 
-def _model_label_for_routing(routing: str | None) -> str:
+def _model_label_for_routing(routing: str | None, model: str | None = None) -> str:
     if (routing or "local") == "local":
         return "Local"
+    if routing == "ask":
+        # (#863) A worker session parked waiting on the operator has no
+        # model running at all — it must never render a Claude tier guess.
+        return "Waiting on you"
     if routing == "remote":
         # (#809) `#cloud` — the configured remote OpenAI-compatible provider,
         # not an Anthropic model, so it must not fall into the Claude-model-
         # name guessing below.
-        return "Remote"
+        try:
+            from config.settings import settings
+            return settings.remote_llm_label or "Remote"
+        except Exception:  # noqa: BLE001
+            return "Remote"
     from api.services.agent_worker.hermes_session import HERMES_ROUTING
     if routing == HERMES_ROUTING:
         # (#850) Hermes sessions used to fall through to the Claude-model-name
         # guess below and get mislabeled "Claude" — Hermes runs its own
         # DeepSeek-backed engine, not an Anthropic model.
+        # (#863) When the session's `model` column is populated, surface it
+        # alongside "Hermes" — nothing else records what Hermes last used.
+        if model:
+            return f"Hermes · {model}"
         return "Hermes"
+    if routing in ("claude_code", "code"):
+        return "Claude Code"
+    if routing == "codex":
+        return "Codex"
     try:
         from config.settings import settings
         m = (settings.agent_managed_model or "").lower()

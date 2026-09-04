@@ -88,13 +88,25 @@ async def _summarize_one(session: dict[str, Any]) -> bool:
     last_activity = float(session.get("last_activity_at") or 0.0)
     label = session.get("label") or sid
 
-    # Pull events the same way the /summary route does — dispatch by cc:
-    # prefix because the two stores live in different modules.
+    # Pull events the same way the /summary route does — mirror its
+    # three-way dispatch (cc: / cx: / everything else) so Codex sessions
+    # get summarized too (#863 — Codex ids used to fall through to the
+    # LifeOS TranscriptStore, which returns [] for them).
     try:
         if sid.startswith("cc:"):
+            from api.routes.agents import _claude_code_enabled
+            if not _claude_code_enabled():
+                return False
             from config.settings import settings
             from api.services.claude_code import session_ingest as cc
             events = cc.read_normalized_events(sid, settings.claude_code_projects_dir)
+        elif sid.startswith("cx:"):
+            from api.routes.agents import _codex_enabled
+            if not _codex_enabled():
+                return False
+            from config.settings import settings
+            from api.services.codex import session_ingest as cx
+            events = cx.read_normalized_events(sid, settings.codex_sessions_dir)
         else:
             from api.services.agent_worker.transcript_store import TranscriptStore
             events = TranscriptStore().read(sid)

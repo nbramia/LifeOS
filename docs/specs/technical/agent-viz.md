@@ -153,9 +153,9 @@ One session row, unified shape (both sources):
 | Field | Type | Notes |
 |---|---|---|
 | `session_id` | str | LifeOS: bare uuid. Claude Code: `cc:<uuid>`. Subagent: `cc:<parent>:agent:<tool_use_id>`. |
-| `task_id` | str | LifeOS: task id from the worker. Claude Code: bare session uuid. |
+| `task_id` | str \| null | LifeOS: task id from the worker. Claude Code / Codex: `null` for a locally scanned session — a scanned session's `raw_session_id`/tool_use_id is not a LifeOS task link (#863) — overlaid with a real LifeOS task id only when a hook-registered `cli_sessions` row supplies one (`_apply_cli_session_to_dict`). |
 | `status` | str | See [Status inference (Claude Code)](#status-inference-claude-code) and product spec. |
-| `routing` | str | `local`, `claude`, or `claude_code`. |
+| `routing` | str | `local`, `claude`, `ask`, `remote`, `hermes`, `claude_code` / `code`, or `codex`. |
 | `parent_session_id` | str \| null | Spawn parent. Used by graph edges. |
 | `root_session_id` | str \| null | Top of the spawn tree. Used by the kill subtree walk. |
 | `spawn_depth` | int | 0 for root, 1+ for children. |
@@ -167,9 +167,14 @@ One session row, unified shape (both sources):
 | `total_dollars` | float | Cost so far. Cache-aware via `cost_for(model, input, output, cache_creation, cache_read)`. |
 | `total_active_seconds` | float | LifeOS wall-time accounting. Always 0 for Claude Code (no wall meter). |
 | `expected_output` | str \| null | LifeOS preflight classification — `text` / `file` / `external_action` / `structured`. |
-| `label` | str | Display name. Cached per session id. |
-| `custom_label` | str \| null | Operator-pinned manual label (via `PUT /sessions/{id}/label`). When set, the frontend uses it as the node name in preference to the AI `short_label` and `label`. |
-| `model_label` | str | Short badge — `Local` / `Haiku` / `Sonnet` / `Opus` / `Claude Code`. |
+| `label` | str | Display name. Cached per session id. On a synthetic remote-CLI row (`_cli_session_to_dict`) this is `prompt_preview` when non-empty, else the session id (#863). |
+| `custom_label` | str \| null | Operator-pinned manual label (via `PUT /sessions/{id}/label`). When set, the frontend uses it as the node name in preference to every other source. |
+| `model_label` | str | Short badge — `Local` / `Haiku` / `Sonnet` / `Opus` / `Claude Code` / `Codex` / `Waiting on you` (routing `ask`) / the configured `remote_llm_label` (routing `remote`) / `Hermes` or `Hermes · <model>` (routing `hermes`, when a model is known). See [LifeOS agent ingest](#lifeos-agent-ingest). |
+| `model` | str \| null | LifeOS only. Board-assignment model id (#851) from `Session.model`; also the source of the `Hermes · <model>` badge above when routing is `hermes`, since nothing else records what Hermes last used. |
+| `effort` | str \| null | LifeOS only. Board-assignment effort value (#851) from `Session.effort`. |
+| `conversation_id` | str \| null | LifeOS only, `hermes` routing. `Session.conversation_id`. |
+| `bot` | str \| null | LifeOS only. Telegram bot persona that owns this session's operator-facing messages (`Session.bot`; `null` = primary). |
+| `origin` | str \| null | LifeOS only. `Session.origin` — e.g. `operator`, `hermes`. |
 | `last_event_kind` | str | Most recent transcript event kind — drives the side-panel "last" tooltip. |
 | `tool_call_count`, `error_count` | int | Summed across the transcript tail (last 100 events). |
 | `source` | str | `lifeos_agent`, `claude_code`, or `codex`. Frontend uses this to pick the shape. |
@@ -189,7 +194,7 @@ Read paths in `api/routes/agents.py`:
 - `_session_to_dict(s, transcript)` — projects a `Session` row to the snapshot shape. Defends against the optional `total_cache_*_tokens` attrs being absent on old rows.
 - `_label_for_session(s, events)` — walks the first five transcript events looking for `description` / `task_description` / `prompt`; falls back to the session id. Result cached per session id (capped at 500 entries).
 - `_summarize_events(events)` — counts tool calls and errors across the last 100 events. `_is_error_kind` matches the literal set `{failed, managed_failed, child_failed_internal, killed, cascade_killed}` plus any kind ending in `_failed` or `_error` (future-proof).
-- `_model_label_for_routing(routing)` — `local` → `Local`, `remote` → `Remote`, `hermes` → `Hermes` (fixed in #850 — previously fell through to the Claude-model-name guess below and was mislabeled `Claude`), otherwise derives the badge from `settings.agent_managed_model`. Falls back to `Claude` if the model name doesn't match any known family.
+- `_model_label_for_routing(routing, model=None)` (#863) — `local` → `Local`; `ask` → `Waiting on you` (a session parked waiting on the operator has no model running, so it must never render a Claude-tier guess); `remote` → `settings.remote_llm_label` (falls back to `Remote` if unset or settings import fails); `hermes` → `Hermes` alone, or `Hermes · <model>` when the session's `model` column is populated (nothing else records what Hermes last used — see the `model` field above); `claude_code`/`code` → `Claude Code`; `codex` → `Codex`; otherwise derives the badge from `settings.agent_managed_model`, falling back to `Claude` if the model name doesn't match any known family. `_session_to_dict` passes `getattr(s, "model", None)` as the second arg.
 
 Per snapshot tick the route calls `session_store.list_sessions(limit=200)` (newest-first) and emits one edge per session with a `parent_session_id`. Subagents that exist only inside the transcript (no SessionStore row) do not appear in this path — they show up via the Claude Code ingest below.
 
@@ -216,6 +221,8 @@ Event normalization (`normalize_event`) maps three Claude Code message types int
 **Session label precedence.** `parse_session` picks a Claude Code session's display label, most human-intentful first: the user's explicit `/rename` (the CLI's `custom-title` record → `customTitle`), then the CLI's auto-generated `ai-title` (`aiTitle`), then the most recent user prompt (truncated to 60), then the working-directory basename, then the raw session id. The `custom-title` / `ai-title` records are dropped from the normalized *event* stream as noise but read here for labeling; the latest record of each kind wins.
 
 Subagent spawns are detected when an assistant message contains a `tool_use` block with `name in {"Agent", "Task"}`. Each such tool-use becomes a synthetic session node — `subagent_session_dict(parent, subagent)` — with id `<parent>:agent:<tool_use_id>` and a spawn edge from the parent. These nodes don't have their own jsonl; clicking one currently loads the parent's transcript (filtered-by-tool-use-id is future work).
+
+**`task_id` (#863).** `to_session_dict` and `subagent_session_dict` both emit `task_id: None` — `SessionMeta` carries no LifeOS task link of its own (it only has `raw_session_id`, the Claude Code UUID, and subagents only have a `tool_use_id`), and either leaking into `task_id` poisoned `_build_board`'s `sessions_by_task` join in `api/routes/agents.py`, which keys purely on truthiness. A locally scanned session gets a real `task_id` only when overlaid afterwards by `_apply_cli_session_to_dict` from a hook-registered `cli_sessions` row that named one (see [Snapshot union](#snapshot-union) below).
 
 ---
 
@@ -290,11 +297,11 @@ On a successful call, if the event's `host` equals this API's own host (`api_hos
 `_build_snapshot()` reads every `cli_sessions` row into a dict keyed by `session_id` before running the Claude Code and Codex transcript scans. Each transcript-derived row `.pop()`s its match out of that dict:
 
 - **Match found** (`_apply_cli_session_to_dict`) — the transcript row's `status`/`status_inferred` are overwritten from the registration (event-driven status always wins over the transcript's file-age guess); `host`, `branch`, `prompt_preview` are copied in; `task_id` is copied in only if the event supplied one. Token/dollar fields are left as the transcript computed them — the hook posts no usage data.
-- **No match** (`_cli_session_to_dict`) — a fully synthetic row: `host`/`branch`/`prompt_preview`/`task_id` from the `cli_sessions` row, `source` = the engine name, `status_inferred = False` always (there's no inference here, only events), zero token/dollar fields, `decoded_cwd` from the row's `cwd`.
+- **No match** (`_cli_session_to_dict`) — a fully synthetic row: `host`/`branch`/`prompt_preview`/`task_id` from the `cli_sessions` row, `source` = the engine name, `status_inferred = False` always (there's no inference here, only events), zero token/dollar fields, `decoded_cwd` from the row's `cwd`. `label` prefers `prompt_preview` when non-empty, falling back to the session id (#863 — previously always the session id, even with a usable `prompt_preview` sitting right on the same row). `model_label` comes from the matching ingest module's `model_label()` helper for `claude_code`/`codex`; an engine value outside that pair (defensive only — the route only ever writes `claude_code`/`codex`) title-cases the engine name instead of guessing a Claude tier.
 
 Whatever's left in the dict after both scans ran — a remote host, or (rarely) a local hook post that raced ahead of the transcript scan's 30s cache — is bounded to the same recency window each engine's transcript scan already applies (`claude_code_lookback_days` / `codex_lookback_days`) before becoming a synthetic row, so a stale registration doesn't linger in the snapshot forever.
 
-Worker (`lifeos_agent`) rows always get `host = api_host_name()` directly in `_session_to_dict` — there's no cross-host worker dispatch, so they never need a `cli_sessions` lookup.
+Worker (`lifeos_agent`) rows use `s.host or api_host_name()` directly in `_session_to_dict` (#863) — `Session.host` (#851) is the board-assignment field a worker was dispatched to run on; unset (legacy rows, or no board assignment) falls back to the machine hosting this API process. They never need a `cli_sessions` lookup.
 
 ### Focus / Resume and remote hosts
 
@@ -317,6 +324,8 @@ Two caches:
 2. **`_label_cache`** in `agents.py` — keyed by session id, capped at 500 entries. Labels are derived from the first 5 transcript events and don't change once a non-fallback label has been resolved.
 
 Both caches are lock-guarded so concurrent FastAPI threads can't see partial entries. Invalidation is on-demand via `invalidate_cache()` / `invalidate_process_cache()` (used by tests and reachable from a future admin endpoint if needed).
+
+A third cache, `agent_viz_summary.py`'s in-process + disk-backed short-label cache, treats a session as terminal (cacheable forever) using `TERMINAL_STATUSES` from `session_store.py` **unioned with** `{"ended", "inactive"}` (#863) — those two are CLI-only statuses (`cli_sessions` events / the transcript scan's file-age guess) that don't exist in the worker's own terminal set, so a CLI session's fallback label used to never cache and `agent_viz_summary_prefetch.py`'s background loop retried it every tick forever. The same fix applies to a summarizer call that raises (not just the deterministic empty-transcript fallback): `_cache_if_terminal(session_id, last_activity_at, status, result)` is the single helper both paths call, and it only writes for a terminal status — a live session's fallback stays uncached so it can still pick up real content later. The prefetcher's own dispatch (`_summarize_one`) mirrors the `/summary` route's three-way `cc:`/`cx:`/else split (previously only `cc:` was special-cased, so a Codex session's events always resolved to `TranscriptStore().read()`, which returns `[]` for a `cx:` id and left every Codex session unsummarized).
 
 ---
 
@@ -347,6 +356,8 @@ setTimeout(() => simulation.alpha(0).stop(), 8000);  // 8s convergence backstop
 | `velocityDecay 0.45`, `alphaDecay 0.025` | Settles in ~6s; the 8s `alpha(0).stop()` is a backstop in case extreme node counts prevent natural convergence. |
 
 Node shape varies by routing (`nodeShapeTag`) — `rect` (Claude Code CLI, `rx`/`ry` rounded; `source`/`routing` = `claude_code`), `polygon` (local-agent diamond; `routing` local/unset), `circle` (cloud-agent dot; routed to Claude). Subagents follow the same routing rule rather than getting a dedicated shape. The simulation tick re-positions whichever element is bound to each datum; size and color are re-applied on every snapshot tick via `applyShapeAttrs`. The actively-writing pulse (white border, 1.4s ease-in-out) is a CSS keyframe applied via the `.pulsing` class — far simpler than the previous vis-network `DataSet.update` polling.
+
+`nodeLabel(d)` (#863) picks the rendered label, first non-empty of: `custom_label` → `short_label` → `label` (skipped when it's just `session_id`, or a prefix of it — not a human label) → `prompt_preview` → `model_label` → `routingLabel(d.routing)` → `session_id.slice(0, 8)`. Never emits a literal `'?'` — the previous version special-cased an unresolved CLI `model_label` (`"Claude Code"`/`"Codex"`) into a bare `'?'` glyph instead of falling through to any of the other sources on the row.
 
 The `viewBox` is `1600 × 1100` with `preserveAspectRatio="xMidYMid meet"` and `overflow: visible` so collision-pushed nodes don't get clipped at the edges.
 

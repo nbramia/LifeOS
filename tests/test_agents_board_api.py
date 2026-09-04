@@ -129,6 +129,27 @@ class TestGetBoard:
         assert pq["question"] == "Which environment — staging or prod?"
         assert pq["session_id"] == session.session_id
 
+    def test_locally_scanned_cc_session_does_not_bogus_link_to_a_task(self, client, stores, monkeypatch):
+        """#863: `to_session_dict`'s `task_id` used to be the Claude Code
+        UUID, so `_build_board`'s `sessions_by_task` join (keyed purely on
+        truthiness) treated every locally scanned CC session as if it had a
+        real LifeOS task link. A session with no real link (`task_id: None`,
+        the corrected shape) must not surface on any task's card."""
+        task_manager, *_ = stores
+        task = task_manager.create("Ping the vendor", context="Work", tags=["me"])
+        monkeypatch.setattr(
+            agents_route, "_claude_code_snapshot",
+            lambda: ([{
+                "session_id": "cc:unrelated-raw-uuid", "task_id": None,
+                "status": "running", "last_activity_at": 200,
+            }], []),
+        )
+        r = client.get("/api/agents/board")
+        assigned = r.json()["lanes"]["assigned"]
+        assert len(assigned) == 1
+        assert assigned[0]["id"] == task.id
+        assert assigned[0]["session"] is None
+
     def test_card_carries_its_linked_session(self, client, stores):
         """Round-1 finding 13: `_task_card`'s session join was untested —
         every prior fixture card had `session: None`."""

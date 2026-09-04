@@ -17,6 +17,11 @@ page family.
 scenario here clicks into the Graph tab before touching graph-specific
 elements like `#filter-host` or `.node`, which now live in initially-hidden
 markup and aren't wired up until `initGraph()` runs.
+
+`TestRecentChipAndRouteFilterAndNodeLabels` (#863) covers the "recent" chip
+(completed + ended), the route filter's `hermes`/`ask` options, and that no
+rendered node label is a literal '?' — using a second synthetic snapshot
+(`SNAPSHOT2`) on a single host so the host filter doesn't interfere.
 """
 import http.server
 import json
@@ -220,3 +225,175 @@ class TestPanelFields:
         expect(panel.locator('[data-field="host"]')).to_have_text("api-host")
         expect(panel.locator('[data-field="branch-hint"]')).to_have_count(0)
         expect(panel.locator('[data-field="prompt-preview-hint"]')).to_have_count(0)
+
+
+# ---------------------------------------------------------------------------
+# #863 — recent chip (completed + ended), the route filter's hermes/ask
+# options, and the graph's node label precedence (never a literal '?').
+# Same server-free pattern as above: everything on one host so the host
+# filter doesn't interfere with these assertions, a mix of routing/status
+# values, and a CLI row with no label/short_label/prompt_preview at all —
+# the shape that used to render a literal '?'.
+# ---------------------------------------------------------------------------
+
+SNAPSHOT2 = {
+    "sessions": [
+        {
+            "session_id": "sess_label_completed",
+            "task_id": "t-completed",
+            "status": "completed",
+            "status_inferred": False,
+            "routing": "local",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 5,
+            "total_output_tokens": 5,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "labeltest-alpha-completed",
+            "model_label": "Local",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "cc:label-ended-no-label",
+            "task_id": None,
+            "status": "ended",
+            "status_inferred": False,
+            "routing": "claude_code",
+            "source": "claude_code",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 10,
+            "total_output_tokens": 20,
+            "total_dollars": 0.01,
+            "spawn_depth": 0,
+            # Deliberately no label/short_label/prompt_preview — the shape
+            # that used to fall through to a literal '?' node label.
+            "model_label": "Claude Code",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_label_ask",
+            "task_id": "t-ask",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "ask",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "labeltest-ask",
+            "model_label": "Waiting on you",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_label_hermes",
+            "task_id": "t-hermes",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "hermes",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 1,
+            "total_output_tokens": 1,
+            "total_dollars": 0.001,
+            "spawn_depth": 0,
+            "label": "labeltest-hermes",
+            "model_label": "Hermes",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_label_remote",
+            "task_id": "t-remote",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "remote",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 1,
+            "total_output_tokens": 1,
+            "total_dollars": 0.002,
+            "spawn_depth": 0,
+            "label": "labeltest-remote",
+            "model_label": "Remote",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+    ],
+    "edges": [],
+    "generated_at": 1234567890,
+}
+
+
+def _open_agents2(page: Page, base_url):
+    def handler(route):
+        if "/stream" in route.request.url:
+            # graph.js opens an EventSource against /api/agents/stream — a
+            # plain JSON stub response makes the browser log a real MIME-type
+            # console error unrelated to anything under test here.
+            route.fulfill(status=200, content_type="text/event-stream", body="")
+            return
+        if "/api/agents/snapshot" in route.request.url:
+            body = SNAPSHOT2
+        elif "/api/agents/board" in route.request.url:
+            body = {"lanes": {}, "generated_at": 0}
+        else:
+            body = {}
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(body))
+
+    page.route("**/api/**", handler)
+    page.goto(f"{base_url}/agents")
+    page.click('[data-tab="graph"]')
+    page.wait_for_selector("#filter-route")
+    page.select_option("#filter-recency", "all")
+    page.locator("#filter-terminal").check()
+    page.wait_for_timeout(400)
+
+
+class TestRecentChipAndRouteFilterAndNodeLabels:
+    def test_recent_chip_counts_completed_and_ended(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        expect(page.locator("#chip-recent")).to_have_text("2")
+
+    def test_route_filter_lists_hermes_remote_and_ask(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        options = page.locator("#filter-route option").all_inner_texts()
+        assert "hermes" in options
+        assert "remote" in options
+        assert "ask" in options
+
+    def test_route_filter_selecting_hermes_shows_only_hermes_node(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        page.select_option("#filter-route", "hermes")
+        page.wait_for_timeout(400)
+        expect(page.locator(".node")).to_have_count(1)
+
+    def test_route_filter_selecting_ask_shows_only_ask_node(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        page.select_option("#filter-route", "ask")
+        page.wait_for_timeout(400)
+        expect(page.locator(".node")).to_have_count(1)
+
+    def test_no_node_label_is_a_literal_question_mark(self, page: Page, agents_base_url):
+        errors = []
+        page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
+
+        _open_agents2(page, agents_base_url)
+        expect(page.locator(".node")).to_have_count(5)
+        # Let the force-layout / label-render tick settle before reading text.
+        page.wait_for_timeout(300)
+        labels = page.locator("text.node-label").all_inner_texts()
+        assert len(labels) == 5
+        assert all((label or "").strip() != "?" for label in labels)
+        assert errors == []

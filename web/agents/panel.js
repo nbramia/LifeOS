@@ -38,6 +38,7 @@ export function routingLabel(routing) {
   if (routing === 'codex') return 'Codex';
   if (routing === 'remote') return 'Remote';  // #809: #cloud tag, not Anthropic
   if (routing === 'hermes') return 'Hermes';  // #850: was falling through to 'Claude'
+  if (routing === 'ask') return 'Ask';  // #863: waiting on the operator, not a model
   return 'Claude';
 }
 

@@ -6,6 +6,7 @@ so the real data/ directory is never touched.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -336,6 +337,107 @@ def test_model_label_claude_routing_derives_from_settings(client, stores, monkey
 
 
 # ---------------------------------------------------------------------------
+# #863 — model_label per routing arm, host passthrough, board-assignment
+# field passthrough. A session parked on `ask` used to render a Claude tier
+# guess; `remote` ignored the configured label; `hermes` never surfaced the
+# model it ran; `claude_code`/`codex` routing (an operator-directed
+# escalation, not just CLI ingest) fell through to the Claude-tier guess too.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_model_label_ask_routing_is_waiting_on_you(client, stores):
+    """A session parked waiting on the operator must never render a Claude
+    model name (#863)."""
+    session_store, _ = stores
+    session_store.create(task_id="t-ask", status=STATUS_RUNNING, routing="ask")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["model_label"] == "Waiting on you"
+
+
+@pytest.mark.unit
+def test_model_label_remote_routing_uses_configured_label(client, stores, monkeypatch):
+    from config import settings as settings_mod
+    session_store, _ = stores
+    session_store.create(task_id="t-remote", status=STATUS_RUNNING, routing="remote")
+
+    monkeypatch.setattr(settings_mod.settings, "remote_llm_label", "DeepSeek (Fireworks)")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["model_label"] == "DeepSeek (Fireworks)"
+
+
+@pytest.mark.unit
+def test_model_label_remote_routing_falls_back_when_label_unset(client, stores, monkeypatch):
+    from config import settings as settings_mod
+    session_store, _ = stores
+    session_store.create(task_id="t-remote2", status=STATUS_RUNNING, routing="remote")
+
+    monkeypatch.setattr(settings_mod.settings, "remote_llm_label", "")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["model_label"] == "Remote"
+
+
+@pytest.mark.unit
+def test_model_label_hermes_routing_with_and_without_model(client, stores):
+    session_store, _ = stores
+    session_store.create(task_id="t-herm-bare", status=STATUS_RUNNING, routing="hermes")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["model_label"] == "Hermes"
+
+    session_store.create(
+        task_id="t-herm-model", status=STATUS_RUNNING, routing="hermes",
+        model="deepseek-v4-flash",
+    )
+    sessions = {s["task_id"]: s for s in client.get("/api/agents/snapshot").json()["sessions"]}
+    assert sessions["t-herm-model"]["model_label"] == "Hermes · deepseek-v4-flash"
+
+
+@pytest.mark.unit
+def test_model_label_claude_code_and_codex_routing(client, stores):
+    session_store, _ = stores
+    session_store.create(task_id="t-cc", status=STATUS_RUNNING, routing="claude_code")
+    session_store.create(task_id="t-code", status=STATUS_RUNNING, routing="code")
+    session_store.create(task_id="t-codex", status=STATUS_RUNNING, routing="codex")
+    sessions = {s["task_id"]: s for s in client.get("/api/agents/snapshot").json()["sessions"]}
+    assert sessions["t-cc"]["model_label"] == "Claude Code"
+    assert sessions["t-code"]["model_label"] == "Claude Code"
+    assert sessions["t-codex"]["model_label"] == "Codex"
+
+
+@pytest.mark.unit
+def test_snapshot_host_defaults_to_api_host_when_unset(client, stores):
+    from api.routes import agents as agents_route
+    session_store, _ = stores
+    session_store.create(task_id="t-nohost", status=STATUS_RUNNING, routing="local")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["host"] == agents_route.api_host_name()
+
+
+@pytest.mark.unit
+def test_snapshot_host_uses_session_host_when_set(client, stores):
+    session_store, _ = stores
+    session_store.create(task_id="t-host", status=STATUS_RUNNING, routing="local", host="build-box")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["host"] == "build-box"
+
+
+@pytest.mark.unit
+def test_snapshot_passes_through_board_assignment_fields(client, stores):
+    session_store, _ = stores
+    session_store.create(
+        task_id="t-fields", status=STATUS_RUNNING, routing="claude",
+        model="claude-sonnet-5", effort="high", bot="doctor", origin="operator",
+    )
+    session_store.set_conversation_id("t-fields", "conv-123")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["model"] == "claude-sonnet-5"
+    assert sess["effort"] == "high"
+    assert sess["conversation_id"] == "conv-123"
+    assert sess["bot"] == "doctor"
+    assert sess["origin"] == "operator"
+
+
+# ---------------------------------------------------------------------------
 # Summary search (issue #252) — GET /api/agents/search + the cache-only
 # search_cached_summaries helper. Seeds the disk cache directly so no LLM runs.
 # ---------------------------------------------------------------------------
@@ -487,6 +589,143 @@ def test_no_content_live_session_not_cached(summary_db):
     # A live session may gain content later, so the fallback must NOT be
     # cached — the next access should retry.
     assert avs.get_cached_summary(sid, 1000.0, status=STATUS_RUNNING) is None
+
+
+# ---------------------------------------------------------------------------
+# #863 — CLI-only terminal statuses ("ended"/"inactive") union into the
+# terminal set, and a summary call that keeps *raising* gets the same
+# cache-the-fallback treatment as the no-content case above. Without this,
+# a CLI session whose summarizer errors is retried by the prefetcher on
+# every tick forever.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", ["completed", "failed", "budget_exceeded", "ended", "inactive"])
+def test_raising_summarizer_caches_fallback_for_terminal_statuses(summary_db, monkeypatch, status):
+    import asyncio
+    from api.services import agent_viz_summary as avs
+
+    calls = {"n": 0}
+
+    async def _raise(*args, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("synthetic LLM failure")
+
+    monkeypatch.setattr(avs, "generate_text", _raise)
+
+    sid = f"sess_raise_{status}"
+    events = [
+        {"kind": "user_message", "payload": {"text": "do the thing"}},
+        {"kind": "assistant_message", "payload": {"text": "done"}},
+    ]
+    for _ in range(2):
+        result = asyncio.run(avs.summarize_session(
+            sid, label="Some Task", last_activity_at=1000.0, events=events, status=status,
+        ))
+        assert "Summary unavailable" in result.summary
+
+    # Second call was a cache hit — the raising summarizer ran exactly once.
+    assert calls["n"] == 1
+    cached = avs.get_cached_summary(sid, 1000.0, status=status)
+    assert cached is not None
+
+
+@pytest.mark.unit
+def test_raising_summarizer_not_cached_for_live_session(summary_db, monkeypatch):
+    import asyncio
+    from api.services import agent_viz_summary as avs
+
+    calls = {"n": 0}
+
+    async def _raise(*args, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("synthetic LLM failure")
+
+    monkeypatch.setattr(avs, "generate_text", _raise)
+
+    sid = "sess_raise_live"
+    events = [
+        {"kind": "user_message", "payload": {"text": "do the thing"}},
+        {"kind": "assistant_message", "payload": {"text": "done"}},
+    ]
+    for _ in range(2):
+        asyncio.run(avs.summarize_session(
+            sid, label="Some Task", last_activity_at=1000.0, events=events, status=STATUS_RUNNING,
+        ))
+    # A live session isn't cached, so both calls hit the (raising) summarizer.
+    assert calls["n"] == 2
+    assert avs.get_cached_summary(sid, 1000.0, status=STATUS_RUNNING) is None
+
+
+# ---------------------------------------------------------------------------
+# #863 — the prefetcher used to dispatch only `cc:`/other; a `cx:` id fell
+# through to the LifeOS TranscriptStore (which returns [] for a Codex id),
+# so Codex sessions never got a summary at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_prefetch_summarizes_codex_session_and_snapshot_carries_short_label(
+    client, tmp_path: Path, monkeypatch
+):
+    import asyncio
+    from api.services import agent_viz_summary as avs
+    from api.services import agent_viz_summary_prefetch as prefetch
+    from api.services.codex import session_ingest as cx
+    from api.routes import agents as agents_route
+    from api.services.agent_worker.session_store import SessionStore
+    from api.services.agent_worker.transcript_store import TranscriptStore
+    from config.settings import settings as settings_obj
+
+    monkeypatch.setattr(avs, "_DB_PATH", str(tmp_path / "summaries.db"))
+    avs._init_db()
+    avs.reset_cache()
+
+    session_store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcript_store = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    monkeypatch.setattr(agents_route, "_session_store", session_store)
+    monkeypatch.setattr(agents_route, "_transcript_store", transcript_store)
+    monkeypatch.setattr(agents_route, "_claude_code_snapshot", lambda: ([], []))
+    agents_route._label_cache.clear()
+
+    codex_dir = tmp_path / "codex_sessions"
+    sub = codex_dir / "2026" / "05" / "30"
+    sub.mkdir(parents=True)
+    raw_id = "prefetch-target"
+    rollout = sub / f"rollout-2026-05-30T10-41-38-{raw_id}.jsonl"
+    with rollout.open("w", encoding="utf-8") as f:
+        # A bare session_meta line — no user/agent messages — is enough for
+        # discover_sessions/parse_session to find the session; content-free
+        # events also mean summarize_session takes the deterministic
+        # fallback path, so this test needs no LLM mock.
+        f.write(json.dumps({
+            "timestamp": "2026-05-30T10:41:38Z",
+            "type": "session_meta",
+            "payload": {
+                "id": raw_id, "cwd": "/home/synthetic/proj", "originator": "codex_exec",
+                "cli_version": "0.135.0", "source": "exec", "model_provider": "openai",
+            },
+        }) + "\n")
+
+    monkeypatch.setattr(settings_obj, "codex_sessions_dir", str(codex_dir))
+    cx.invalidate_cache()
+
+    cx_sessions, _ = cx.build_snapshot(sessions_dir=codex_dir, lookback_days=7)
+    target = next(s for s in cx_sessions if s["session_id"] == "cx:prefetch-target")
+
+    ok = asyncio.run(prefetch._summarize_one(dict(target, status="completed")))
+    assert ok is True
+    cached = avs.get_cached_summary(
+        target["session_id"], target["last_activity_at"], status="completed",
+    )
+    assert cached is not None
+    assert cached.short_label
+
+    r = client.get("/api/agents/snapshot")
+    assert r.status_code == 200
+    sessions = {s["session_id"]: s for s in r.json()["sessions"]}
+    assert sessions["cx:prefetch-target"]["short_label"] == cached.short_label
 
 
 # ---------------------------------------------------------------------------

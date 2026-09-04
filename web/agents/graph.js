@@ -299,12 +299,22 @@ export function initGraph() {
   }
 
   function nodeLabel(d) {
-    if (d.custom_label) return d.custom_label;
-    if (d.short_label) return d.short_label;
-    const isCli = d.source === 'claude_code' || d.source === 'codex';
-    let label = d.model_label || routingLabel(d.routing) || d.session_id.slice(0, 8);
-    if (isCli && (label === 'Claude Code' || label === 'Codex')) label = '?';
-    return label;
+    // (#863) Precedence, first non-empty wins. `label` is skipped when it's
+    // just the session id (or a prefix of it) — that's not a human label,
+    // it's the id we fall back to at the very end anyway. Never emits '?'.
+    const candidates = [
+      d.custom_label,
+      d.short_label,
+      (d.label && d.session_id && d.session_id.startsWith(d.label)) ? '' : d.label,
+      d.prompt_preview,
+      d.model_label,
+      routingLabel(d.routing),
+    ];
+    for (const c of candidates) {
+      const trimmed = (c || '').toString().trim();
+      if (trimmed) return trimmed;
+    }
+    return d.session_id.slice(0, 8);
   }
 
   const LABEL_CHAR_W = 6.6;
@@ -550,7 +560,7 @@ export function initGraph() {
   function updateChips(sessions) {
     const running = sessions.filter(s => s.status === 'running').length;
     const blocked = sessions.filter(s => s.status === 'blocked').length;
-    const recent = sessions.filter(s => s.status === 'completed').length;
+    const recent = sessions.filter(s => s.status === 'completed' || s.status === 'ended').length;
     const cli = sessions.filter(s => s.source === 'claude_code' || s.source === 'codex').length;
     const apiSpend = sessions
       .filter(s => s.source !== 'claude_code' && s.source !== 'codex')
