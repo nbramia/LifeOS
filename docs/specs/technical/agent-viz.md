@@ -134,6 +134,8 @@ The issue's target is "reflects an external vault edit within ~3 seconds," and t
 
 A successful drop always re-fetches the board (`fetchBoard()`) rather than mutating the DOM optimistically — the server is the single source of truth for a card's lane, and a rejected move (400/409/500) leaves the card exactly where the last successful fetch put it, with a toast surfacing the server's error text.
 
+`board.js` also owns three pieces of client-side state added by the lane-filter/composer work (#882). The lane-selection filter persists to `localStorage` under the key `lifeos.agents.board.lanes`, defaulting to every lane except Done; a missing or malformed (non-JSON, non-array) stored value falls back to that default, and an unknown lane id inside an otherwise-valid array is dropped individually, only falling back to the default when nothing valid survives, while a deliberately-emptied selection (`[]`) round-trips as empty rather than being treated as malformed. The drawer's click-outside-close guard requires the `mousedown`, `mouseup`, **and** `click` to all target the backdrop element itself — the same event-target plumbing the drag/drop paragraph above relies on — because a single `click` listener alone would also close the drawer on a text selection or scrollbar drag that starts inside the drawer and ends on the backdrop. And the New-card composer's create is two calls, not one: `POST /api/tasks` creates the task, then, for any lane other than Unassigned, `PUT /api/agents/board/cards/{id}/lane` moves it there; if that second call fails, the card still exists at its tag-derived resting lane, an error toast reports the failure, and the board re-fetches to reflect what's actually true server-side.
+
 ---
 
 ## Snapshot shape
