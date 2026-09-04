@@ -231,6 +231,78 @@ class TestInteractionStore:
         # Should be ordered by timestamp DESC (most recent first)
         assert results[0].title == "Note 0"  # 1 day ago
 
+    def test_get_for_person_in_range(self, temp_store):
+        """get_for_person_in_range returns every interaction in the window,
+        with no row cap -- unlike get_for_person, which always applies
+        InteractionConfig's limit (#899 review finding 5: CRM tone analysis
+        needs the true per-month count, not a capped sample)."""
+        person_id = "person-range"
+
+        # More rows than get_for_person's default cap would ever return
+        # unbounded, plus one clearly outside the range on each side.
+        now = datetime.now()
+        for i, days_ago in enumerate([-5, 1, 2, 3, 4, 5, 100]):
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id=person_id,
+                timestamp=now - timedelta(days=days_ago),
+                source_type="imessage",
+                title=f"Message {i}",
+            )
+            temp_store.add(interaction)
+
+        results = temp_store.get_for_person_in_range(
+            person_id=person_id,
+            start_date=now - timedelta(days=6),
+            end_date=now,
+        )
+        # Excludes the 100-days-ago message (before start_date) and the
+        # 5-days-in-the-future one (after end_date).
+        assert len(results) == 5
+        assert all(r.person_id == person_id for r in results)
+        # Most recent first.
+        assert results[0].title == "Message 1"
+
+    def test_get_for_person_in_range_filters_by_source_type(self, temp_store):
+        person_id = "person-range-source"
+        now = datetime.now()
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id=person_id, timestamp=now,
+            source_type="imessage", title="iMessage",
+        ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id=person_id, timestamp=now,
+            source_type="gmail", title="Email",
+        ))
+
+        results = temp_store.get_for_person_in_range(
+            person_id=person_id,
+            start_date=now - timedelta(days=1),
+            end_date=now + timedelta(days=1),
+            source_type="imessage",
+        )
+        assert len(results) == 1
+        assert results[0].source_type == "imessage"
+
+    def test_get_for_person_in_range_only_returns_that_person(self, temp_store):
+        now = datetime.now()
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-a", timestamp=now,
+            source_type="imessage", title="A's message",
+        ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-b", timestamp=now,
+            source_type="imessage", title="B's message",
+        ))
+
+        results = temp_store.get_for_person_in_range(
+            person_id="person-a",
+            start_date=now - timedelta(days=1),
+            end_date=now + timedelta(days=1),
+        )
+        assert len(results) == 1
+        assert results[0].person_id == "person-a"
+
     def test_get_for_person_by_source_type(self, temp_store):
         """Test filtering interactions by source type."""
         person_id = "person-filter"

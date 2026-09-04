@@ -88,17 +88,6 @@ def test_get_month_returns_the_stored_row(store):
     assert r.period_key == "2026-01"
 
 
-def test_delete_for_person_removes_all_their_rows_and_returns_count(store):
-    store.upsert("synthetic-person-1", "2026-01", 1, _sample_result())
-    store.upsert("synthetic-person-1", "2026-02", 1, _sample_result())
-    store.upsert("synthetic-person-2", "2026-01", 1, _sample_result())
-
-    deleted = store.delete_for_person("synthetic-person-1")
-    assert deleted == 2
-    assert store.get_for_person("synthetic-person-1") == []
-    assert len(store.get_for_person("synthetic-person-2")) == 1
-
-
 def test_init_db_is_idempotent(tmp_path):
     """Re-opening a store against the same DB file must not error even
     though the table already exists (CREATE TABLE IF NOT EXISTS)."""

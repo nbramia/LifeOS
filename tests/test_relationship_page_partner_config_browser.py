@@ -17,7 +17,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Browser, Page, expect
 
 pytestmark = [pytest.mark.browser, pytest.mark.slow]
 
@@ -50,10 +50,14 @@ def crm_base_url():
         server.server_close()
 
 
-def _open_relationship_page(page: Page, crm_base_url: str, *, partner_person_id: str):
+def _open_relationship_page(
+    page: Page, crm_base_url: str, *, partner_person_id: str, tone_response: dict = None,
+):
     """Load /relationship, stubbing /api/crm/config with the given partner id
     (empty string == not configured) and every other /api/** call with an
-    empty-but-valid JSON body. Returns the list of request URLs observed."""
+    empty-but-valid JSON body. `tone_response`, if given, overrides the
+    stubbed body for the tone-analysis-detailed call specifically. Returns
+    the list of request URLs observed and any console errors logged."""
     requests: list[str] = []
     console_errors: list[str] = []
 
@@ -67,6 +71,8 @@ def _open_relationship_page(page: Page, crm_base_url: str, *, partner_person_id:
                 "partner_person_id": partner_person_id,
                 "partner_name": "Synthetic Partner" if partner_person_id else "",
             }
+        elif "tone-analysis-detailed" in route.request.url and tone_response is not None:
+            body = tone_response
         elif "/timeline" in route.request.url:
             body = {"items": []}
         elif "/people" in route.request.url:
@@ -109,6 +115,20 @@ class TestNoPartnerConfigured:
         expect(empty_state).to_contain_text("No partner configured")
         expect(page.locator("#relationshipDashboard")).to_be_hidden()
 
+    def test_navigating_to_a_person_hides_the_empty_state(self, page: Page, crm_base_url):
+        """#899 review finding 2 (BLOCKER): the empty state was never hidden
+        by the person-detail render path, so it kept rendering inside an
+        unrelated person's page after navigating away from /relationship."""
+        _open_relationship_page(page, crm_base_url, partner_person_id="")
+        expect(page.locator("#relationshipEmptyState")).to_be_visible()
+
+        # Simulate clicking a person in the sidebar (selectPerson is the
+        # click handler every person-list row wires to).
+        page.evaluate("selectPerson('synthetic-person-x')")
+        page.wait_for_timeout(300)
+
+        expect(page.locator("#relationshipEmptyState")).to_be_hidden()
+
 
 class TestPartnerConfigured:
     def test_partner_scoped_requests_still_fire(self, page: Page, crm_base_url):
@@ -125,3 +145,100 @@ class TestPartnerConfigured:
         _open_relationship_page(page, crm_base_url, partner_person_id=SYNTHETIC_PARTNER_ID)
         expect(page.locator("#relationshipDashboard")).to_be_visible()
         expect(page.locator("#relationshipEmptyState")).to_be_hidden()
+
+
+# A tone-analysis-detailed response with one error month sandwiched between
+# two normal ones -- used by both the error-marker test and (implicitly) to
+# confirm normal months still render.
+_TONE_RESPONSE_WITH_ERROR_MONTH = {
+    "monthly_tones": [
+        {"month": "2026-05", "user_score": 80.0, "partner_score": 80.0,
+         "combined_score": 80.0, "user_sample_count": 5, "partner_sample_count": 5,
+         "status": None},
+        {"month": "2026-06", "user_score": 50.0, "partner_score": 50.0,
+         "combined_score": 50.0, "user_sample_count": 0, "partner_sample_count": 0,
+         "status": "error"},
+        {"month": "2026-07", "user_score": 20.0, "partner_score": 20.0,
+         "combined_score": 20.0, "user_sample_count": 5, "partner_sample_count": 5,
+         "status": None},
+    ],
+    "user_trend": "declining", "partner_trend": "declining", "combined_trend": "declining",
+    "user_average": 50.0, "partner_average": 50.0, "generated_at": "2026-07-15T00:00:00+00:00",
+}
+
+
+class TestToneChartErrorMonth:
+    """#899 review finding 3 (MAJOR): a status="error" month used to be
+    plotted as a fabricated score of 50, indistinguishable from a genuinely
+    neutral month, and disagreeing with the summary average (which already
+    excluded it server-side)."""
+
+    def test_error_month_gets_a_distinct_marker_not_a_fabricated_point(self, page: Page, crm_base_url):
+        _open_relationship_page(
+            page, crm_base_url, partner_person_id=SYNTHETIC_PARTNER_ID,
+            tone_response=_TONE_RESPONSE_WITH_ERROR_MONTH,
+        )
+        page.wait_for_timeout(300)
+
+        error_markers = page.locator(".tone-data-point-error")
+        expect(error_markers).to_have_count(1)
+
+        marker_title = error_markers.first.locator("title").text_content()
+        assert "2026-06" in marker_title
+        assert "not analysed" in marker_title.lower()
+
+    def test_error_month_is_not_drawn_as_a_real_data_point(self, page: Page, crm_base_url):
+        _open_relationship_page(
+            page, crm_base_url, partner_person_id=SYNTHETIC_PARTNER_ID,
+            tone_response=_TONE_RESPONSE_WITH_ERROR_MONTH,
+        )
+        page.wait_for_timeout(300)
+
+        titles = page.locator(".tone-data-point title").all_text_contents()
+        assert not any("2026-06" in t for t in titles), (
+            f"error month plotted as a real data point: {titles}"
+        )
+        # The two normal months on either side of it must still render.
+        assert any("2026-05" in t for t in titles)
+        assert any("2026-07" in t for t in titles)
+
+
+class TestToneChartMonthLabel:
+    """Pre-existing bug, fixed while in this code per the #899 review:
+    `new Date(t.month + '-01')` parses "YYYY-MM-01" as UTC midnight, and
+    `toLocaleDateString` then renders in the browser's local timezone --
+    west of UTC that rolls back to the last day of the *previous* month
+    (e.g. "2026-04" rendered as "Mar"). Verified with an explicit
+    negative-UTC-offset timezone so the test actually exercises the bug
+    rather than happening to pass under a UTC host."""
+
+    def test_month_label_matches_the_month_key_in_a_negative_utc_offset_timezone(
+        self, browser: Browser, crm_base_url,
+    ):
+        context = browser.new_context(timezone_id="America/Los_Angeles")
+        try:
+            page = context.new_page()
+            tone_response = {
+                "monthly_tones": [
+                    {"month": "2026-04", "user_score": 70.0, "partner_score": 70.0,
+                     "combined_score": 70.0, "user_sample_count": 3, "partner_sample_count": 3,
+                     "status": None},
+                ],
+                "user_trend": "stable-neutral", "partner_trend": "stable-neutral",
+                "combined_trend": "stable-neutral", "user_average": 70.0, "partner_average": 70.0,
+                "generated_at": "2026-04-15T00:00:00+00:00",
+            }
+            _open_relationship_page(
+                page, crm_base_url, partner_person_id=SYNTHETIC_PARTNER_ID,
+                tone_response=tone_response,
+            )
+            page.wait_for_timeout(300)
+
+            label_texts = page.locator("#toneTimelineViz svg text").all_text_contents()
+            assert "Apr" in label_texts, f"expected an 'Apr' label for 2026-04, got: {label_texts}"
+            assert "Mar" not in label_texts, (
+                f"month label off-by-one regression: rendered 'Mar' for 2026-04 in a "
+                f"negative-UTC-offset timezone: {label_texts}"
+            )
+        finally:
+            context.close()

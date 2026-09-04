@@ -583,16 +583,16 @@ Analyze tone/sentiment in iMessage conversations over time. Samples messages mon
 
 ### POST /api/crm/relationship/tone-analysis-detailed
 
-Detailed tone analysis with separate scores for the user and their partner. Groups messages by week, analyzes each person separately, then aggregates to monthly averages.
+Detailed tone analysis with separate scores for the user and their partner. Messages are bucketed by calendar month first, then by week within that month (so a week straddling a month boundary is never double-counted), and each stale month gets one overall score per person.
 
-Results are persisted per person and month (see [crm-analytics.md](crm-analytics.md#tone-analysis-apis)). A month is served from storage when it's still fresh; only missing or stale months trigger an LLM call, so a fully-cached response returns in well under 200ms. If the LLM fails or is unavailable for a month that needs recomputing, that month's data point comes back with `"status": "error"` instead of failing the whole request.
+Results are persisted per person and month (see [crm-analytics.md](crm-analytics.md#tone-analysis-apis)). A month is served from storage when it's still fresh; only missing or stale months trigger an LLM call, and every stale month in a request is scored together in a single call, so a fully-cached response returns in well under 200ms and an uncached one costs one LLM call regardless of how many months are stale. Concurrent requests for the same person are serialized so two open tabs don't both pay for that call. If the LLM fails, is unavailable, or its response omits a month that needed recomputing, that month's data point comes back with `"status": "error"` instead of failing the whole request or fabricating a score. `user_trend`/`partner_trend`/`combined_trend` are computed locally from the assembled monthly scores, not authored by the LLM.
 
 **Query parameters:**
 - `person_id` (string, optional): Target person (defaults to partner)
 - `months` (int): Months to analyze (default: 12)
 - `refresh` (bool, optional): Force recomputation of every month in the window, bypassing the freshness cache (default: false)
 
-**Response:** each entry in `monthly_tones` may carry `"status": "error"` when that month couldn't be computed and has no prior stored result; omitted (`null`) otherwise.
+**Response:** each entry in `monthly_tones` may carry `"status": "error"` when that month couldn't be computed and has no prior stored result; omitted (`null`) otherwise. The Relationship page's Tone Evolution chart shows an error month as a gap with a "not analysed" marker rather than plotting a score for it.
 
 ---
 

@@ -777,6 +777,61 @@ class InteractionStore:
         finally:
             conn.close()
 
+    def get_for_person_in_range(
+        self,
+        person_id: str,
+        start_date: datetime,
+        end_date: datetime,
+        source_type: Optional[str] = None,
+    ) -> list[Interaction]:
+        """
+        Get ALL of a person's interactions within a date range, with no row
+        limit -- unlike get_for_person(), which always applies
+        InteractionConfig's cap (1000 by default) regardless of how many
+        interactions actually exist in the window.
+
+        Used where every interaction in the window must be counted exactly
+        rather than sampled: CRM tone analysis's per-month interaction
+        counts (api/routes/crm.py) need the true count for every month in
+        the window, and a capped, newest-first fetch silently truncates the
+        oldest months once total volume exceeds the cap -- worse, that
+        truncation point drifts with every new message, so an old month's
+        apparent count kept changing even though nothing about that month
+        did (#899 review finding 5).
+
+        Args:
+            person_id: PersonEntity ID
+            start_date: Start of date range (inclusive)
+            end_date: End of date range (inclusive)
+            source_type: Filter by source type; comma-separated for multiple.
+
+        Returns:
+            List of interactions in the range, most recent first.
+        """
+        conn = self._get_connection()
+        try:
+            source_types = None
+            if source_type:
+                source_types = [s.strip() for s in source_type.split(",") if s.strip()]
+
+            query = """
+                SELECT * FROM interactions
+                WHERE person_id = ? AND timestamp >= ? AND timestamp <= ?
+            """
+            params = [person_id, start_date.isoformat(), end_date.isoformat()]
+
+            if source_types:
+                placeholders = ",".join("?" * len(source_types))
+                query += f" AND source_type IN ({placeholders})"
+                params.extend(source_types)
+
+            query += " ORDER BY timestamp DESC"
+
+            cursor = conn.execute(query, params)
+            return [Interaction.from_row(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
     def get_interaction_counts(
         self, person_id: str, days_back: int = None
     ) -> dict[str, int]:

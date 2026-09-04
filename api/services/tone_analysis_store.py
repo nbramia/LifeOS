@@ -175,17 +175,6 @@ class ToneAnalysisStore:
             updated_at=_make_aware(datetime.fromisoformat(now)),
         )
 
-    def delete_for_person(self, person_id: str) -> int:
-        """Delete all stored tone results for a person. Returns rows deleted."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.execute(
-                "DELETE FROM tone_analysis_results WHERE person_id = ?", (person_id,)
-            )
-            conn.commit()
-            return cursor.rowcount
-        finally:
-            conn.close()
 
 
 # Singleton instance
