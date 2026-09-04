@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 import asyncio
 import bisect
+import contextlib
 import json
 import logging
 import sqlite3
@@ -29,7 +30,7 @@ from api.services.source_entity import (
     LINK_STATUS_CONFIRMED,
     LINK_STATUS_REJECTED,
 )
-from api.services.relationship import get_relationship_store
+from api.services.relationship import get_relationship_store, Relationship
 from api.services.relationship_metrics import (
     get_strength_breakdown,
     update_all_strengths,
@@ -2521,12 +2522,70 @@ def get_crm_statistics():
     )
 
 
+def _rendered_edge_weight(
+    rel: Relationship,
+    a_canonical: str,
+    b_canonical: str,
+    my_person_id: str,
+    people_by_id: dict[str, PersonEntity],
+) -> int:
+    """
+    The edge weight exactly as rendered to the client: for an edge that
+    touches the CRM owner, the OTHER person's relationship_strength;
+    otherwise the pair's own `Relationship.pair_strength`.
+
+    `a_canonical`/`b_canonical` must already be canonicalised — a
+    Relationship row's own person_a_id/person_b_id can be a legacy
+    (merged-away) id, and `people_by_id` must be keyed by canonical id (e.g.
+    `PersonEntityStore.get_all()`) or the "other person" lookup silently
+    misses and falls back to pair_strength (#896 review finding 1 — this is
+    the exact bug that made one real edge's weight 90 before vs 96 after).
+    """
+    if a_canonical == my_person_id or b_canonical == my_person_id:
+        other_canonical = b_canonical if a_canonical == my_person_id else a_canonical
+        other_person = people_by_id.get(other_canonical)
+        return int(other_person.relationship_strength) if other_person else rel.pair_strength
+    return rel.pair_strength
+
+
+def _build_network_edge(rel: Relationship, source_id: str, target_id: str, weight: int) -> "NetworkEdge":
+    """Build a NetworkEdge from a Relationship row for already-resolved
+    (canonical) source/target ids and a precomputed weight."""
+    return NetworkEdge(
+        source=source_id,
+        target=target_id,
+        weight=weight,
+        type=rel.relationship_type,
+        shared_events_count=rel.shared_events_count or 0,
+        shared_threads_count=rel.shared_threads_count or 0,
+        shared_messages_count=rel.shared_messages_count or 0,
+        shared_whatsapp_count=rel.shared_whatsapp_count or 0,
+        shared_slack_count=rel.shared_slack_count or 0,
+        shared_phone_calls_count=rel.shared_phone_calls_count or 0,
+        shared_photos_count=rel.shared_photos_count or 0,
+        is_linkedin_connection=rel.is_linkedin_connection,
+    )
+
+
 @router.get("/network", response_model=NetworkGraphResponse)
 def get_network_graph(
     center_on: Optional[str] = Query(default=None, description="Person ID to center the graph on"),
     depth: int = Query(default=2, ge=1, le=4, description="Hops from center person"),
     min_strength: float = Query(default=0.0, ge=0.0, le=1.0, description="Minimum relationship strength"),
     category: Optional[str] = Query(default=None, description="Filter by category"),
+    max_nodes: int = Query(
+        default=150, ge=1, le=500,
+        description="Maximum nodes to return for a centered request (ignored with allow_full_graph)",
+    ),
+    max_second_degree_per_node: int = Query(
+        default=10, ge=0, le=50,
+        description="Maximum second-(and deeper-)degree neighbors to add per node at the previous depth",
+    ),
+    max_edges: int = Query(
+        default=2000, ge=1, le=20000,
+        description="Target maximum edges for a centered request; every edge touching the centre is "
+                     "always included even if that alone exceeds this (ignored with allow_full_graph)",
+    ),
     allow_full_graph: bool = Query(
         default=False,
         description="Required to load full graph without center_on (expensive operation)"
@@ -2538,11 +2597,42 @@ def get_network_graph(
     Returns nodes (people) and edges (relationships) for rendering
     an interactive force-directed network graph.
 
-    If center_on is provided, only returns people within 'depth' hops
-    of the center person. Otherwise, returns all people and relationships.
+    If center_on is provided, this returns a bounded neighborhood:
 
-    PERFORMANCE: Without center_on, this loads ALL relationships (5000+ edges).
-    Set allow_full_graph=true to explicitly opt-in to this expensive operation.
+    - Node selection: the center (degree 0), then the strongest first-degree
+      connections (degree 1) up to 75% of `max_nodes` when `depth >= 2` (the
+      full `max_nodes - 1` when `depth == 1`, since there is no deeper tier to
+      reserve budget for), ranked by the same value the response renders as
+      edge weight (`_rendered_edge_weight` — the owner's other-person
+      relationship_strength, or pair_strength otherwise), via one indexed
+      query for the center's own relationships. The remaining node budget
+      goes to deeper hops: each first-degree node (processed strongest
+      first) contributes up to `max_second_degree_per_node` of its own
+      strongest neighbors (ranked by a cheaper shared-interaction-count
+      proxy, `RelationshipStore.get_top_neighbors`), until `max_nodes` is
+      reached. The full 500k+-row relationship table is never loaded for a
+      centered request.
+    - Edge selection: every edge connecting the center to a first-degree
+      node is always included (this is what guarantees "every first-degree
+      node has an edge to the center", regardless of `max_edges`). The
+      remaining edge budget (`max_edges` minus those center edges) is filled
+      with the strongest remaining edges among the selected nodes
+      (`RelationshipStore.get_edges_among`), ranked by the same rendered
+      edge weight. Both a merged/legacy id appearing as an endpoint in the
+      raw relationship table, and the id of the CRM owner, are resolved to
+      their canonical id before any of this ranking, lookup, or de-dup.
+    - `category`, if set, is applied during first-degree selection over a
+      window of the 3×`max_nodes` strongest candidates (categories computed
+      via the batched source-entity path, same as `GET /people`), then the
+      top slots are taken from the survivors — best-effort: a category
+      concentrated outside that window is under-represented. Deeper-hop
+      candidates use a cheaper per-person category check with no batched
+      fetch. `min_strength` is applied to already-selected nodes exactly as
+      before (see the docs for a pre-existing scale note).
+
+    Without center_on, this loads ALL relationships (500k+ edges) and all
+    people; none of the caps above apply. Set allow_full_graph=true to
+    explicitly opt-in to this expensive operation.
 
     Each node includes a 'degree' field:
     - 0 = center person
@@ -2562,58 +2652,241 @@ def get_network_graph(
 
     # Build the graph
     nodes: list[NetworkNode] = []
-    edges: list[NetworkEdge] = []
-    # Map person_id -> degree (distance from center)
+    # Map person_id -> degree (distance from center); center_edges maps a
+    # first-degree canonical id to the exact Relationship row that selected
+    # it, so the center-to-first-degree edges never depend on get_edges_among
+    # re-finding them by id (#896 review finding 1).
     node_degrees: dict[str, int] = {}
+    center_edges: dict[str, Relationship] = {}
+
+    # #880: cached and cheap. Also serves as the canonical-id-keyed strength
+    # lookup used to rank first-degree candidates by the real rendered edge
+    # weight (finding 5), and as the final node-building/edge-weight lookup
+    # (already canonical-keyed, so no separate batch-by-id call is needed —
+    # finding 1's third consequence was exactly a requested-id-keyed dict).
+    all_people_dict = {p.id: p for p in person_store.get_all()}
+
+    my_person_id = person_store.get_canonical_id(settings.my_person_id)
 
     if center_on:
-        # BFS to find people within depth hops of center, tracking degree
         center_person = person_store.get_by_id(center_on)
         if not center_person:
             raise HTTPException(status_code=404, detail=f"Person '{center_on}' not found")
+        # A merged/legacy center id resolves to the surviving canonical
+        # person (get_by_id() above already followed the merge chain to
+        # fetch it) - without this, `all_people_dict` (canonical-keyed)
+        # never has an entry for the raw requested id, so the center
+        # silently drops out of the response even though it "exists"
+        # (#896 review round 3, not-verified note).
+        center_on = center_person.id
 
-        # Get the CRM owner's ID - exclude from 2nd+ degree traversal
-        # since they're connected to everyone and would pollute the graph
-        my_person_id = settings.my_person_id
+        # Exclude the CRM owner from 2nd+ degree traversal since they're
+        # connected to everyone and would pollute the graph.
         is_viewing_self = (center_on == my_person_id)
 
-        # BFS traversal with degree tracking - use batch queries
-        node_degrees[center_on] = 0  # Center is degree 0
-        current_level: set[str] = {center_on}
+        node_degrees[center_on] = 0
+        frontier: list[str] = []
+        # Ids whose category match was already confirmed during selection
+        # (via compute_person_category, possibly with batched source
+        # entities) - the node-building filter below trusts these instead
+        # of re-checking with a cheaper/different computation, which is
+        # what let a node be selected under one category decision and then
+        # dropped (or kept) under a different one (#896 review round 3
+        # finding 5).
+        category_confirmed_ids: set[str] = set()
 
-        for current_depth in range(1, depth + 1):
-            if not current_level:
-                break
-            # Batch query for all people at this level
-            level_relationships = rel_store.get_for_people_batch(current_level)
-            next_level: set[str] = set()
-            for person_id in current_level:
-                # Skip "me" as a bridge for 2nd+ degree when not viewing self
-                # This prevents everyone appearing as 2nd-degree through me
-                if not is_viewing_self and current_depth > 1 and person_id == my_person_id:
+        # depth == 1 has no deeper tier, so first-degree gets the full
+        # remaining budget; depth >= 2 reserves ~25% of max_nodes for
+        # second-(and deeper-)degree hops instead of consuming the whole
+        # budget on first-degree alone (#896 review finding 3).
+        first_degree_limit = 0
+        if max_nodes > 1:
+            first_degree_limit = (max_nodes - 1) if depth < 2 else max(1, int(max_nodes * 0.75))
+
+        # Every one of the center's own direct relationships, canonicalised
+        # and de-duped (kept regardless of whether it makes the
+        # first_degree_limit cut) - used both to rank first-degree
+        # candidates and, after selection, to relabel any node that has a
+        # genuine direct center relationship as degree 1 even if it was
+        # only re-discovered through a friend (#896 review round 3
+        # finding 4: capping first-degree selection means a real direct
+        # connection can miss the cut and re-enter as a "second-degree"
+        # node, which is misleading and makes the degree filter lie).
+        all_direct_candidates: dict[str, Relationship] = {}
+        # The full ranked (and, if category is set, category-filtered) list
+        # of direct candidates first-degree selection drew from - kept so
+        # any part of the deeper-hop budget that goes unspent can be
+        # backfilled from the next-strongest direct candidates instead of
+        # coming back under max_nodes (#896 review round 5, MINOR finding).
+        selection_pool: list[tuple[str, Relationship]] = []
+
+        with contextlib.closing(rel_store.open_connection()) as conn:
+            if first_degree_limit > 0:
+                raw_rels = rel_store.get_all_for_person(center_on, conn=conn)
+
+                # Canonicalise every neighbor id and de-dup, keeping the
+                # higher-weight relationship row when more than one raw row
+                # resolves to the same canonical id (#896 finding 1).
+                for rel in raw_rels:
+                    other_raw = rel.other_person(center_on)
+                    if not other_raw:
+                        continue
+                    other_canonical = person_store.get_canonical_id(other_raw)
+                    if other_canonical == center_on:
+                        continue  # self-loop after a merge
+                    weight = _rendered_edge_weight(rel, center_on, other_canonical, my_person_id, all_people_dict)
+                    existing = all_direct_candidates.get(other_canonical)
+                    if existing is not None:
+                        existing_weight = _rendered_edge_weight(
+                            existing, center_on, other_canonical, my_person_id, all_people_dict
+                        )
+                        if weight <= existing_weight:
+                            continue
+                    all_direct_candidates[other_canonical] = rel
+
+                # Rank by the real rendered edge weight (not a proxy),
+                # deterministic tiebreak by canonical id (#896 finding 5/9).
+                ranked = sorted(
+                    all_direct_candidates.items(),
+                    key=lambda kv: (
+                        -_rendered_edge_weight(kv[1], center_on, kv[0], my_person_id, all_people_dict),
+                        kv[0],
+                    ),
+                )
+
+                if category:
+                    # Best-effort: consider a window of the strongest
+                    # candidates, compute categories via one batched
+                    # source-entity fetch (same pattern as GET /people),
+                    # filter, then take the top first_degree_limit of the
+                    # still-ranked survivors (#896 finding 6). Every id that
+                    # passes is recorded so the node-building filter below
+                    # trusts this decision instead of re-deriving a
+                    # possibly different one (#896 review round 3 finding 5).
+                    window = ranked[:min(len(ranked), 3 * max_nodes)]
+                    source_store = get_source_entity_store()
+                    cat_sources_by_id = source_store.get_for_people_batch(
+                        [cid for cid, _ in window], limit_per_person=_CATEGORY_BATCH_SOURCE_LIMIT
+                    )
+                    selection_pool = []
+                    for cid, rel in window:
+                        cand_person = all_people_dict.get(cid)
+                        if cand_person is None:
+                            continue
+                        if compute_person_category(cand_person, cat_sources_by_id.get(cid, [])) == category:
+                            selection_pool.append((cid, rel))
+                            category_confirmed_ids.add(cid)
+                else:
+                    selection_pool = ranked
+
+                for canonical_other, rel in selection_pool[:first_degree_limit]:
+                    node_degrees[canonical_other] = 1
+                    frontier.append(canonical_other)
+                    center_edges[canonical_other] = rel
+
+            # For depth >= 2, expand each frontier node's strongest
+            # neighbors (up to max_second_degree_per_node each, in
+            # first-degree strength order) into the budget left after the
+            # first-degree tier above.
+            for current_depth in range(2, depth + 1):
+                if not frontier or len(node_degrees) >= max_nodes:
+                    break
+                next_frontier: list[str] = []
+                for node_id in frontier:
+                    if len(node_degrees) >= max_nodes:
+                        break
+                    # Skip "me" as a bridge for 2nd+ degree when not viewing
+                    # self - this prevents everyone appearing as 2nd-degree
+                    # through me (same rationale as the original BFS).
+                    if not is_viewing_self and node_id == my_person_id:
+                        continue
+                    if max_second_degree_per_node <= 0:
+                        continue
+                    for rel in rel_store.get_top_neighbors(node_id, limit=max_second_degree_per_node, conn=conn):
+                        if len(node_degrees) >= max_nodes:
+                            break
+                        other_raw = rel.other_person(node_id)
+                        if not other_raw:
+                            continue
+                        other_canonical = person_store.get_canonical_id(other_raw)
+                        if other_canonical in node_degrees:
+                            continue
+                        if other_canonical in all_direct_candidates:
+                            # A genuine direct connection of the center
+                            # isn't a friend-of-friend - skip it here so the
+                            # budget reserved for deeper hops goes to actual
+                            # second-degree people instead of being spent
+                            # (and then immediately relabeled back to
+                            # degree 1 below) on centre connections that
+                            # merely missed the first-degree cut (#896
+                            # review round 4, MAJOR finding: this reclaimed
+                            # the whole reserved budget for dense centres,
+                            # collapsing the second-degree tier again).
+                            continue
+                        if category:
+                            # Cheap best-effort check (no batched
+                            # source-entity fetch per intermediate node).
+                            cand_person = all_people_dict.get(other_canonical)
+                            if cand_person is None or compute_person_category(cand_person, []) != category:
+                                continue
+                            category_confirmed_ids.add(other_canonical)
+                        node_degrees[other_canonical] = current_depth
+                        next_frontier.append(other_canonical)
+                frontier = next_frontier
+
+        # A node that has a genuine direct relationship to the center is
+        # relabeled degree 1 even if it was only added above via a friend
+        # (#896 review round 3 finding 4) - and gets its guaranteed center
+        # edge, same as any other first-degree node. The skip above means
+        # this shouldn't fire in practice any more (a direct candidate is
+        # never added as a deeper-hop node in the first place), but it's
+        # kept as a correctness backstop rather than relied upon.
+        for node_id, rel in all_direct_candidates.items():
+            if node_degrees.get(node_id, 0) > 1:
+                node_degrees[node_id] = 1
+                center_edges[node_id] = rel
+
+        # The deeper-hop tier's reserved share of the budget can't always
+        # be spent (a dense centre may have few or no genuine
+        # friends-of-friends once direct connections are excluded from it
+        # above), so backfill any leftover slots with the next-strongest
+        # direct candidates that missed the first-degree cut - they're
+        # real first-degree people, and every prior version of this
+        # endpoint showed them. Without this, a dense centre's response
+        # came back well under max_nodes even though its own network had
+        # more to show (#896 review round 5, MINOR finding).
+        if len(node_degrees) < max_nodes and len(selection_pool) > first_degree_limit:
+            for canonical_other, rel in selection_pool[first_degree_limit:]:
+                if len(node_degrees) >= max_nodes:
+                    break
+                if canonical_other in node_degrees:
                     continue
-                for rel in level_relationships.get(person_id, []):
-                    other_id = rel.other_person(person_id)
-                    if other_id and other_id not in node_degrees:
-                        next_level.add(other_id)
-                        node_degrees[other_id] = current_depth
-            current_level = next_level
+                node_degrees[canonical_other] = 1
+                center_edges[canonical_other] = rel
     else:
-        # Get all people (no center, all are degree 1)
-        all_people = person_store.get_all()
-        node_degrees = {p.id: 1 for p in all_people}
+        # Get all people (no center, all are degree 1) - unchanged full-graph path.
+        node_degrees = {p.id: 1 for p in all_people_dict.values()}
 
-    # Get all people in one pass (avoid N+1 lookups)
-    all_people_dict = {p.id: p for p in person_store.get_all()}
+    # Filter by category and strength, then build nodes. category_confirmed_ids
+    # is empty for a non-centered (full-graph) request, so every person there
+    # is freshly checked below - same as always for that path.
+    if not center_on:
+        category_confirmed_ids: set[str] = set()
 
-    # Filter by category and strength, then build nodes
     for person_id, degree in node_degrees.items():
         person = all_people_dict.get(person_id)
         if not person:
             continue
 
-        # Apply filters
-        if category and person.category != category:
+        # The exact category this node will be labeled with - also the
+        # single predicate used for the filter below, so a node can never
+        # be selected under one category decision and dropped (or kept)
+        # under a different one (#896 review round 3 finding 5). An id
+        # already confirmed during selection (possibly via a batched,
+        # more-accurate source-entity lookup) is trusted as-is instead of
+        # being re-derived from this cheaper per-node call.
+        computed_category = compute_person_category(person, [])
+        if category and person_id not in category_confirmed_ids and computed_category != category:
             continue
         if person.relationship_strength < min_strength:
             continue
@@ -2623,7 +2896,7 @@ def get_network_graph(
         nodes.append(NetworkNode(
             id=person.id,
             name=person.display_name or person.canonical_name,
-            category=compute_person_category(person, []),
+            category=computed_category,
             strength=person.relationship_strength,
             interaction_count=interaction_count,
             degree=degree,
@@ -2632,50 +2905,56 @@ def get_network_graph(
     # Build a set of valid node IDs after filtering
     valid_node_ids = {n.id for n in nodes}
 
-    # Get all edges in one query instead of per-node queries
-    all_relationships = rel_store.get_all_relationships()
-    seen_edges: set[tuple[str, str]] = set()
+    edges_by_pair: dict[tuple[str, str], NetworkEdge] = {}
 
-    # Get owner ID for determining edge weight source
-    my_person_id = settings.my_person_id
+    if center_on:
+        # Every edge touching the center is unconditionally included -
+        # these are exactly the relationship rows used to select each
+        # first-degree node, so this edge is never missing even for a
+        # legacy/merged neighbor id (#896 findings 1 and 2) - UNLESS the
+        # center itself didn't survive the category/min_strength filter
+        # above, in which case it's not in the response at all and an edge
+        # naming it would violate "every edge's endpoints are both present"
+        # (#896 review round 3 finding 3).
+        if center_on in valid_node_ids:
+            for neighbor_id, rel in center_edges.items():
+                if neighbor_id not in valid_node_ids:
+                    continue  # dropped by the category/min_strength filter above
+                weight = _rendered_edge_weight(rel, center_on, neighbor_id, my_person_id, all_people_dict)
+                pair = (min(center_on, neighbor_id), max(center_on, neighbor_id))
+                edges_by_pair[pair] = _build_network_edge(rel, center_on, neighbor_id, weight)
 
-    for rel in all_relationships:
-        # Both people must be in valid nodes
-        if rel.person_a_id not in valid_node_ids or rel.person_b_id not in valid_node_ids:
-            continue
+        # Fill the remaining edge budget with the strongest non-center
+        # edges among the selected nodes (#896 findings 2 and 4).
+        remaining_budget = max_edges - len(edges_by_pair)
+        if remaining_budget > 0 and len(valid_node_ids) > 1:
+            scored: list[tuple[int, tuple[str, str], Relationship, str, str]] = []
+            for rel in rel_store.get_edges_among(valid_node_ids):
+                a_canonical = person_store.get_canonical_id(rel.person_a_id)
+                b_canonical = person_store.get_canonical_id(rel.person_b_id)
+                if a_canonical not in valid_node_ids or b_canonical not in valid_node_ids:
+                    continue
+                pair = (min(a_canonical, b_canonical), max(a_canonical, b_canonical))
+                if pair in edges_by_pair:
+                    continue
+                weight = _rendered_edge_weight(rel, a_canonical, b_canonical, my_person_id, all_people_dict)
+                scored.append((weight, pair, rel, a_canonical, b_canonical))
+            # Strongest first, deterministic tiebreak by pair.
+            scored.sort(key=lambda t: (-t[0], t[1]))
+            for weight, pair, rel, a_canonical, b_canonical in scored[:remaining_budget]:
+                edges_by_pair[pair] = _build_network_edge(rel, a_canonical, b_canonical, weight)
+    else:
+        # allow_full_graph path: unchanged behavior, no max_edges cap.
+        for rel in rel_store.get_all_relationships():
+            if rel.person_a_id not in valid_node_ids or rel.person_b_id not in valid_node_ids:
+                continue
+            pair = (min(rel.person_a_id, rel.person_b_id), max(rel.person_a_id, rel.person_b_id))
+            if pair in edges_by_pair:
+                continue
+            weight = _rendered_edge_weight(rel, rel.person_a_id, rel.person_b_id, my_person_id, all_people_dict)
+            edges_by_pair[pair] = _build_network_edge(rel, rel.person_a_id, rel.person_b_id, weight)
 
-        # Create consistent edge key (smaller ID first)
-        edge_key = (min(rel.person_a_id, rel.person_b_id), max(rel.person_a_id, rel.person_b_id))
-        if edge_key in seen_edges:
-            continue
-        seen_edges.add(edge_key)
-
-        # Determine edge weight:
-        # - For edges involving the owner: use the other person's relationship_strength
-        # - For edges between two other people: use pair_strength
-        if rel.person_a_id == my_person_id or rel.person_b_id == my_person_id:
-            # Owner edge - use the other person's relationship_strength
-            other_id = rel.person_b_id if rel.person_a_id == my_person_id else rel.person_a_id
-            other_person = all_people_dict.get(other_id)
-            weight = int(other_person.relationship_strength) if other_person else rel.pair_strength
-        else:
-            # Non-owner edge - use pair_strength
-            weight = rel.pair_strength
-
-        edges.append(NetworkEdge(
-            source=rel.person_a_id,
-            target=rel.person_b_id,
-            weight=weight,
-            type=rel.relationship_type,
-            shared_events_count=rel.shared_events_count or 0,
-            shared_threads_count=rel.shared_threads_count or 0,
-            shared_messages_count=rel.shared_messages_count or 0,
-            shared_whatsapp_count=rel.shared_whatsapp_count or 0,
-            shared_slack_count=rel.shared_slack_count or 0,
-            shared_phone_calls_count=rel.shared_phone_calls_count or 0,
-            shared_photos_count=rel.shared_photos_count or 0,
-            is_linkedin_connection=rel.is_linkedin_connection,
-        ))
+    edges = list(edges_by_pair.values())
 
     elapsed = (time.time() - start_time) * 1000
     logger.info(f"network_graph(center={center_on}, depth={depth}) took {elapsed:.1f}ms ({len(nodes)} nodes, {len(edges)} edges)")

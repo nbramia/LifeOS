@@ -234,13 +234,21 @@ Merge two person records. Combines all interactions, relationships, and source e
 
 ### GET /api/crm/network
 
-Network graph data (nodes + edges).
+Network graph data (nodes + edges). With `center_on`, this is a bounded
+neighborhood — the strongest connections within `depth` hops, capped by
+`max_nodes`, `max_second_degree_per_node`, and `max_edges` — not the full
+relationship table (see
+[crm-graph.md § Bounded Neighborhood](crm-graph.md#bounded-neighborhood)).
 
 **Query parameters:**
-- `center_on` (string): Person ID to center on
-- `depth` (int): Graph depth
-- `min_strength` (float): Minimum edge strength
-- `category` (string): Filter by category
+- `center_on` (string): Person ID to center on. Required unless `allow_full_graph=true`.
+- `depth` (int, 1–4, default 2): Graph depth
+- `min_strength` (float, 0.0–1.0, default 0.0): Minimum node relationship strength. Currently a no-op regardless of value — validated to 0.0–1.0 while `relationship_strength` is 0–100.
+- `category` (string): Filter by category. Best-effort for a centered request — see the docs linked above.
+- `max_nodes` (int, 1–500, default 150): Total nodes in the response, including the center
+- `max_second_degree_per_node` (int, 0–50, default 10): Second-(and deeper-)degree neighbors added per node at the previous depth
+- `max_edges` (int, 1–20000, default 2000): Target maximum edges; every edge touching the center is always included even if that alone exceeds this
+- `allow_full_graph` (bool, default false): Opt-in to load every person and relationship (no `center_on`); ignores the three caps above
 
 **Response includes edge source breakdown:**
 - `shared_events_count`

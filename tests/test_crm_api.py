@@ -396,6 +396,217 @@ class TestNetworkGraph:
         assert response.status_code == 200
 
 
+class TestNetworkGraphPruning:
+    """Tests for the bounded/pruned centered neighborhood (#870)."""
+
+    def test_max_nodes_validation(self, client, sample_person_id):
+        """max_nodes outside 1..500 is rejected.
+
+        api/main.py's app-wide RequestValidationError handler converts
+        FastAPI's default 422 to 400 for all endpoints.
+        """
+        for value in (0, 501):
+            response = client.get(
+                f"/api/crm/network?center_on={sample_person_id}&max_nodes={value}"
+            )
+            assert response.status_code == 400
+
+    def test_max_second_degree_per_node_validation(self, client, sample_person_id):
+        """max_second_degree_per_node outside 0..50 is rejected (see above:
+        validation errors surface as 400, not 422, app-wide)."""
+        for value in (-1, 51):
+            response = client.get(
+                f"/api/crm/network?center_on={sample_person_id}"
+                f"&max_second_degree_per_node={value}"
+            )
+            assert response.status_code == 400
+
+    def test_max_edges_validation(self, client, sample_person_id):
+        """max_edges outside 1..20000 is rejected (#896 review finding 2/4)."""
+        for value in (0, 20001):
+            response = client.get(
+                f"/api/crm/network?center_on={sample_person_id}&max_edges={value}"
+            )
+            assert response.status_code == 400
+
+    def test_edges_bounded_by_max_edges(self, client, sample_person_id):
+        """The edge count stays near max_edges — allowing for the fact that
+        every centre-touching edge is always included even if there are
+        more first-degree nodes than max_edges (#896 review finding 2/4)."""
+        response = client.get(
+            f"/api/crm/network?center_on={sample_person_id}&depth=2&max_edges=50"
+        )
+        assert response.status_code == 200
+        data = response.json()
+        first_degree_count = sum(1 for n in data["nodes"] if n["degree"] == 1)
+        assert len(data["edges"]) <= max(50, first_degree_count)
+
+    def test_response_never_exceeds_max_nodes(self, client, sample_person_id):
+        """The returned node count never exceeds max_nodes."""
+        response = client.get(
+            f"/api/crm/network?center_on={sample_person_id}&depth=2"
+            f"&max_nodes=20&max_second_degree_per_node=5"
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["nodes"]) <= 20
+
+    def test_response_reaches_max_nodes_for_a_well_connected_centre(self, client, sample_person_id):
+        """A centre with enough direct connections to fill the whole budget
+        on its own must actually get max_nodes back, not come back short
+        because the reserved second-degree share went unspent (#896 review
+        round 5, MINOR finding: backfill any leftover deeper-hop budget
+        from the next-strongest direct candidates)."""
+        from api.services.relationship import get_relationship_store
+
+        rel_store = get_relationship_store()
+        if len(rel_store.get_all_for_person(sample_person_id)) < 150:
+            pytest.skip("Person has fewer than 150 relationships; can't test the full-budget case")
+
+        response = client.get(f"/api/crm/network?center_on={sample_person_id}&depth=2")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["nodes"]) == 150
+
+    def test_first_degree_nodes_are_the_true_top_n_by_rendered_weight(self, client, sample_person_id):
+        """When a center has more first-degree connections than fit, the
+        kept set equals the TRUE top-N by rendered edge weight — computed
+        independently here from every one of the center's relationship
+        rows, not by calling the endpoint's own ranking helper (#896 review
+        finding 5: the old version of this test compared against
+        RelationshipStore.get_top_neighbors(), the very function the
+        endpoint used to rank candidates, so it could not fail on a wrong
+        ranking). Skips cleanly without the real dataset."""
+        from api.services.relationship import get_relationship_store
+        from api.services.person_entity import get_person_entity_store
+        from api.routes.crm import _rendered_edge_weight
+        from config.settings import settings
+
+        rel_store = get_relationship_store()
+        person_store = get_person_entity_store()
+
+        raw_rels = rel_store.get_all_for_person(sample_person_id)
+        if len(raw_rels) < 5:
+            pytest.skip("Person has fewer than 5 relationships; can't test top-N ordering meaningfully")
+
+        all_people_dict = {p.id: p for p in person_store.get_all()}
+        my_person_id = person_store.get_canonical_id(settings.my_person_id)
+
+        # Independently compute the true top-N (canonicalised, de-duped,
+        # ranked by the exact rendered-weight formula) the same way a
+        # correct implementation must.
+        candidates: dict[str, float] = {}
+        for rel in raw_rels:
+            other_raw = rel.other_person(sample_person_id)
+            if not other_raw:
+                continue
+            other_canonical = person_store.get_canonical_id(other_raw)
+            if other_canonical == sample_person_id:
+                continue
+            weight = _rendered_edge_weight(
+                rel, sample_person_id, other_canonical, my_person_id, all_people_dict
+            )
+            if other_canonical not in candidates or weight > candidates[other_canonical]:
+                candidates[other_canonical] = weight
+
+        n = 5
+        expected_top_n = {
+            cid for cid, _ in sorted(candidates.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+        }
+
+        response = client.get(
+            f"/api/crm/network?center_on={sample_person_id}&depth=1&max_nodes={n + 1}"
+        )
+        assert response.status_code == 200
+        data = response.json()
+        returned_first_degree = {n_["id"] for n_ in data["nodes"] if n_["degree"] == 1}
+        assert returned_first_degree == expected_top_n
+
+    def test_edge_closure_invariants(self, client, sample_person_id):
+        """Center present; every edge's endpoints are both in the node set;
+        every first-degree node has an edge to the center."""
+        response = client.get(
+            f"/api/crm/network?center_on={sample_person_id}&depth=2"
+            f"&max_nodes=50&max_second_degree_per_node=5"
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        node_ids = {n["id"] for n in data["nodes"]}
+        assert sample_person_id in node_ids
+
+        edge_pairs = set()
+        for edge in data["edges"]:
+            assert edge["source"] in node_ids
+            assert edge["target"] in node_ids
+            edge_pairs.add(frozenset((edge["source"], edge["target"])))
+
+        first_degree_ids = {n["id"] for n in data["nodes"] if n["degree"] == 1}
+        for fid in first_degree_ids:
+            assert frozenset((sample_person_id, fid)) in edge_pairs
+
+    def test_centered_request_never_loads_all_relationships(
+        self, client, sample_person_id, monkeypatch
+    ):
+        """A centered request must use the indexed neighbor/edge queries,
+        never RelationshipStore.get_all_relationships() (the 5+ second,
+        546k-row scan this issue exists to avoid)."""
+        from api.services.relationship import RelationshipStore
+
+        def _must_not_be_called(self, limit=None):
+            raise AssertionError(
+                "get_all_relationships() must not be called for a centered request"
+            )
+
+        monkeypatch.setattr(RelationshipStore, "get_all_relationships", _must_not_be_called)
+
+        response = client.get(f"/api/crm/network?center_on={sample_person_id}&depth=2")
+        assert response.status_code == 200
+
+    def test_allow_full_graph_still_calls_get_all_relationships(self, client, monkeypatch):
+        """The opt-in full-graph path is untouched: it still calls
+        get_all_relationships(). Stubbed to return [] instead of calling the
+        original so this runs in milliseconds rather than materializing the
+        full ~546k-edge graph in memory (#896 review finding 8)."""
+        from api.services.relationship import RelationshipStore
+
+        calls = []
+
+        def _stub(self, limit=None):
+            calls.append(1)
+            return []
+
+        monkeypatch.setattr(RelationshipStore, "get_all_relationships", _stub)
+
+        response = client.get("/api/crm/network?allow_full_graph=true")
+        assert response.status_code == 200
+        assert calls, "allow_full_graph=true should still call get_all_relationships()"
+
+
+class TestNetworkGraphLatency:
+    """Latency regression test for #870 - skips cleanly on a small/fresh dataset."""
+
+    def test_centered_depth2_under_500ms(self, client, sample_person_id):
+        """A centered depth=2 request completes in well under 500ms on the
+        production-sized dataset (the pre-#870 endpoint took 10+ seconds)."""
+        import time
+        from api.services.relationship import get_relationship_store
+
+        rel_store = get_relationship_store()
+        if rel_store.count() < 10000:
+            pytest.skip(
+                "Relationship table is too small to be a meaningful latency "
+                "check (not the production dataset)"
+            )
+
+        start = time.monotonic()
+        response = client.get(f"/api/crm/network?center_on={sample_person_id}&depth=2")
+        elapsed_ms = (time.monotonic() - start) * 1000
+
+        assert response.status_code == 200
+        assert elapsed_ms < 500, f"network graph took {elapsed_ms:.1f}ms (limit 500ms)"
+
+
 class TestRelationshipDetail:
     """Tests for relationship detail endpoint."""
 
