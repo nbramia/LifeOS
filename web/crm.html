@@ -9296,6 +9296,23 @@
         // clears, so returning to a dashboard with the same parameters
         // reuses what was already fetched instead of re-requesting it.
         async function dispatchRoute() {
+            // A running graph force simulation (#896) has its own tick timer
+            // and was never stopped on navigating away from the Graph tab --
+            // harmless under a full document reload (the timer died with the
+            // page), but with dashboard navigation no longer reloading the
+            // document, leaving a person's graph tab for another dashboard
+            // left it ticking indefinitely against DOM it no longer owns,
+            // eventually throwing NaN-attribute console errors once its
+            // physics interacted with whatever the destination view was
+            // doing. Stop it unconditionally here, the single choke point
+            // every dashboard/person navigation passes through; re-entering
+            // the Graph tab starts a fresh one via renderGraph()'s own
+            // (pre-existing) stop-then-restart.
+            if (graphSimulation) {
+                graphSimulation.stop();
+                graphSimulation = null;
+            }
+
             updateActiveNavLink();
 
             const { personId, tab, isFamily, isRelationship, isBirthdays, birthdayFilter } = parseUrl();
@@ -17919,6 +17936,14 @@
 
             // Wait for simulation to stabilize a bit before fitting
             setTimeout(() => {
+                // The graph may no longer be the active view by the time this
+                // fires: a full document reload used to kill this timer
+                // outright, but dashboard/person navigation (#876) doesn't,
+                // so navigating away within this 800ms window left graphSvg
+                // (or its container) present but hidden or gone. Re-check
+                // freshness here rather than only when scheduling above.
+                if (!graphSvg || !graphZoom) return;
+
                 // Get first-degree nodes (degree 0 or 1)
                 const firstDegreeNodes = graphNodes.filter(n => n.degree === 0 || n.degree === 1);
                 if (firstDegreeNodes.length === 0) return;
@@ -17944,6 +17969,15 @@
                 const container = graphSvg.node().parentElement;
                 const width = container.clientWidth;
                 const height = container.clientHeight;
+
+                // A hidden container (its ancestor tab/dashboard no longer
+                // showing) reports 0 for both -- fitting to it produced a
+                // degenerate (zero/NaN) zoom transform applied via
+                // graphZoom.transform, which then threw a stream of
+                // "NaN"-attribute console errors from d3's own zoom/label
+                // update code the next time *anything* dispatched a zoom
+                // event, however unrelated to the graph.
+                if (!width || !height) return;
 
                 // Calculate scale to fit bounds
                 const scale = Math.min(
