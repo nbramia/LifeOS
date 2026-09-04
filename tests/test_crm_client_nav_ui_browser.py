@@ -654,16 +654,16 @@ class TestToneRefreshFailureNotice:
         _, _, console_errors = _prepare(page)
 
         def tone_handler(route):
-            is_refresh = "refresh=true" in route.request.url
-            body = self.STALE_TONE_RESPONSE if is_refresh else {
-                "monthly_tones": [
-                    {"month": "2026-06", "score": 55, "combined_score": 55},
-                    {"month": "2026-07", "score": 58, "combined_score": 58},
-                ],
-                "user_average": 55, "partner_average": 58,
-                "combined_trend": "stable", "user_trend": "stable", "partner_trend": "stable",
-            }
-            route.fulfill(status=200, content_type="application/json", body=json.dumps(body))
+            # Both responses are all-stale -- the *only* difference between
+            # them is whether the request was a refresh=true one. If the
+            # first-load fixture had no stale months, "must not show on
+            # first load" would pass regardless of whether the code checks
+            # toneCacheWasRefreshAttempt at all (the allStale half of the
+            # condition would already be false). Making both fixtures
+            # all-stale isolates that half: the only thing that can be
+            # preventing the notice on first load is the refresh-attempt
+            # flag.
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(self.STALE_TONE_RESPONSE))
 
         page.route("**/api/crm/relationship/tone-analysis-detailed**", tone_handler)
 
@@ -671,7 +671,7 @@ class TestToneRefreshFailureNotice:
         expect(page.locator("#relationshipDashboard")).to_be_visible()
         expect(page.locator("#toneTimelineViz svg")).to_be_visible()
         # A normal (non-refresh) first load must never show the notice, even
-        # though this fixture's initial response has no stale months either.
+        # though this fixture's initial response is all-stale too.
         expect(page.locator(".tone-refresh-failed-notice")).to_have_count(0)
 
         page.locator("#toneRefreshBtn").click()
@@ -752,6 +752,84 @@ class TestDirectLoadTabHighlight:
         # picked up `active` -- it isn't even the visible page here.
         expect(page.locator('.birthdays-tab[data-tab="timeline"]')).not_to_have_class(
             re.compile(r"\bactive\b")
+        )
+
+        unexpected_errors = [e for e in console_errors if "d3" not in e.lower()]
+        assert not unexpected_errors, f"Unexpected console errors: {unexpected_errors}"
+
+
+class TestNotesEditInvalidatesPersonCache:
+    """Regression test for the CRM performance follow-up review's round-2
+    nit 6: saveNotes() must invalidate the cached person after a
+    successful save, or navigating away and back within the same session
+    renders the pre-edit cached copy instead of what was just saved.
+
+    Proven without any timing race by making the post-edit GET hang
+    forever: a correctly-invalidated cache takes the no-cache path on the
+    second visit, which shows the loading skeleton (name stuck on
+    "Loading...") while that fetch is pending; an un-invalidated cache
+    renders the stale cached person synchronously instead, with no fetch
+    ever issued at all -- these two end states never converge, so there is
+    nothing to race."""
+
+    def test_saving_notes_invalidates_the_person_cache(self, page: Page, crm_base_url):
+        _, _, console_errors = _goto_me(page, crm_base_url)
+
+        saved = {"done": False}
+        pending_second_fetch = {"count": 0}
+
+        def person_handler(route):
+            if route.request.method == "PATCH":
+                saved["done"] = True
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({"status": "ok"}))
+                return
+            if saved["done"]:
+                # Deliberately never fulfilled -- its existence alone proves
+                # a fetch was issued (cache miss); it must never resolve
+                # within this test, so a background self-heal can't
+                # coincidentally make a missing invalidation look correct.
+                pending_second_fetch["count"] += 1
+                return
+            body = dict(SYNTHETIC_OTHER_PERSON)
+            body["notes"] = "before-save"
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(body))
+
+        # Precise patterns only -- a broad `**id**` glob also catches the
+        # page's other person-scoped background loaders (facts, timeline
+        # aggregation, fact extraction), which aren't part of what this test
+        # is pinning and would otherwise get miscounted as extra pending
+        # fetches below.
+        person_url = f"**/api/crm/people/{SYNTHETIC_OTHER_PERSON['id']}"
+        page.route(person_url, person_handler)
+        page.route(f"{person_url}?include_related=true", person_handler)
+
+        # Not awaited on the JS side by design below -- page.evaluate() would
+        # otherwise block on selectPerson()'s returned promise, which never
+        # resolves once the second fetch starts hanging.
+        page.evaluate(f"() => {{ selectPerson('{SYNTHETIC_OTHER_PERSON['id']}'); }}")
+        expect(page.locator("#personContentGrid")).to_be_visible()
+        expect(page.locator("#notesArea")).to_have_value("before-save")
+
+        page.fill("#notesArea", "after-save")
+        page.dispatch_event("#notesArea", "input")
+        page.click("#notesSaveBtn")
+        expect(page.locator("#notesSaveBtn")).to_be_hidden()
+        assert saved["done"] is True
+
+        # Navigate away and back within the session.
+        page.locator('[data-page="me"]').click()
+        expect(page.locator("#meDashboard")).to_be_visible()
+        page.evaluate(f"() => {{ selectPerson('{SYNTHETIC_OTHER_PERSON['id']}'); }}")
+
+        page.wait_for_timeout(300)
+        assert pending_second_fetch["count"] == 1, (
+            "expected exactly one (permanently pending) refetch after the cache "
+            f"invalidation, got {pending_second_fetch['count']} -- a cache hit "
+            "would issue none at all"
+        )
+        assert page.locator("#detailName").inner_text() == "Loading...", (
+            "expected the no-cache loading skeleton after an invalidated cache; "
+            "a cache hit would render the stale cached person synchronously instead"
         )
 
         unexpected_errors = [e for e in console_errors if "d3" not in e.lower()]

@@ -786,6 +786,20 @@ class TestMeInteractionsOracle:
             for days_ago in (20, 30, 40, 50, 60):
                 _add_interaction(istore, pid, days_ago=days_ago, source_type="imessage")
 
+        # get_person_julianday_timestamps' covering index is on person_id,
+        # so the real store already returns rows person_id-ascending -- that
+        # alone would make this assertion pass even with the x.person_id
+        # tie-break key removed (dict insertion order would coincidentally
+        # already be "a" before "z"). Wrap the store method to return the
+        # opposite order, so the assertion actually exercises the explicit
+        # tie-break rather than a coincidence of index order.
+        real_get_jds = istore.get_person_julianday_timestamps
+
+        def reversed_get_jds(*args, **kwargs):
+            return list(reversed(real_get_jds(*args, **kwargs)))
+
+        monkeypatch.setattr(istore, 'get_person_julianday_timestamps', reversed_get_jds)
+
         monkeypatch.setattr('api.routes.crm.get_interaction_store', lambda: istore)
         monkeypatch.setattr('api.routes.crm.get_person_entity_store', lambda: pstore)
         monkeypatch.setattr('api.routes.crm.MY_PERSON_ID', MY_PERSON_ID)

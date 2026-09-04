@@ -9962,6 +9962,16 @@
                 familyMembers = [];
                 familyMembersLoaded = false;
                 familyData = null;
+                // Refetch immediately (rather than waiting for the next
+                // Family visit) and drop any now-invalid id from the
+                // current selection, so a merged-away person can't linger
+                // in selectedFamilyIds after this. Only reconcile on a
+                // successful refetch -- a transient failure here shouldn't
+                // wipe out the existing selection.
+                await loadFamilyMembers();
+                if (familyMembersLoaded) {
+                    selectedFamilyIds = selectedFamilyIds.filter(id => familyMembers.some(m => m.id === id));
+                }
 
                 // Close modal and refresh
                 closeMergeModal();
@@ -10216,6 +10226,12 @@
                 familyMembers = [];
                 familyMembersLoaded = false;
                 familyData = null;
+                // Refetch immediately and reconcile selectedFamilyIds (same
+                // as confirmMerge() above).
+                await loadFamilyMembers();
+                if (familyMembersLoaded) {
+                    selectedFamilyIds = selectedFamilyIds.filter(id => familyMembers.some(m => m.id === id));
+                }
 
                 // Close modal and refresh
                 closeSplitModal();
@@ -11330,6 +11346,10 @@
                     // Clear search cache so tag changes are reflected in filters
                     clearSearchCache();
                     collectAllTags();
+                    // Invalidate the cached person so this reload (and any
+                    // later navigate-away-and-back) fetches the saved tags
+                    // instead of the pre-edit cached copy.
+                    invalidatePersonCache(selectedPersonId);
                     await loadPersonDetail(selectedPersonId);
                 }
             } catch (error) {
@@ -11354,6 +11374,8 @@
                 // Clear search cache so tag changes are reflected in filters
                 clearSearchCache();
                 collectAllTags();
+                // Invalidate the cached person (same reasoning as addTag()).
+                invalidatePersonCache(selectedPersonId);
                 await loadPersonDetail(selectedPersonId);
             } catch (error) {
                 console.error('Failed to remove tag:', error);
@@ -11371,6 +11393,8 @@
                     method: 'PATCH',
                     body: JSON.stringify({ birthday: input.trim() })
                 });
+                // Invalidate the cached person (same reasoning as addTag()).
+                invalidatePersonCache(selectedPersonId);
                 await loadPersonDetail(selectedPersonId);
             } catch (error) {
                 console.error('Failed to add birthday:', error);
@@ -11388,6 +11412,8 @@
                     method: 'PATCH',
                     body: JSON.stringify({ birthday: '' })
                 });
+                // Invalidate the cached person (same reasoning as addTag()).
+                invalidatePersonCache(selectedPersonId);
                 await loadPersonDetail(selectedPersonId);
             } catch (error) {
                 console.error('Failed to remove birthday:', error);
@@ -19043,6 +19069,11 @@
                     method: 'PATCH',
                     body: JSON.stringify({ notes })
                 });
+
+                // Invalidate the cached person so navigating away and back
+                // this session shows the saved notes instead of whatever
+                // was cached before this edit.
+                invalidatePersonCache(selectedPersonId);
 
                 // Update original value and hide save button
                 originalNotesValue = notes;

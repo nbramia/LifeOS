@@ -247,7 +247,7 @@ relationship table (see
 **Query parameters:**
 - `center_on` (string): Person ID to center on. Required unless `allow_full_graph=true`.
 - `depth` (int, 1–4, default 2): Graph depth
-- `min_strength` (float, 0.0–1.0, default 0.0): Minimum node relationship strength, applied against `relationship_strength` on its 0–100 scale. The parameter itself is only accepted in 0.0–1.0, so only values in that narrow band filter out any nodes.
+- `min_strength` (float, 0.0–1.0, default 0.0): Minimum node relationship strength, applied against `relationship_strength` on its 0–100 scale. Since the parameter itself is only accepted up to 1.0, the only nodes it can drop are those with a `relationship_strength` below 1.0 (in practice, strength-0 nodes).
 - `category` (string): Filter by category. Best-effort for a centered request — see the docs linked above.
 - `max_nodes` (int, 1–500, default 150): Total nodes in the response, including the center
 - `max_second_degree_per_node` (int, 0–50, default 10): Second-(and deeper-)degree neighbors added per node at the previous depth

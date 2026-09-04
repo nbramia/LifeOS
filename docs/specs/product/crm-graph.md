@@ -153,8 +153,8 @@ the cheap one otherwise) — an id is never selected under one category
 decision and then dropped, or kept, under a different one. `min_strength` is
 applied to already-selected nodes exactly as it always was, against
 `relationship_strength` on its 0–100 scale — since the parameter itself is
-only accepted in 0.0–1.0, only values in that narrow band filter out any
-nodes.
+only accepted up to 1.0, the only nodes it can drop are those with a
+`relationship_strength` below 1.0 (in practice, strength-0 nodes).
 
 A well-connected center often has few or no genuine friends-of-friends left
 to fill the deeper-hop tier once its own direct connections are excluded
