@@ -53,7 +53,7 @@ class _SpySourceEntityStore:
 
 
 class TestListPeopleBatchesSourceEntityFetch:
-    async def test_issues_one_batch_call_not_one_per_person(self):
+    def test_issues_one_batch_call_not_one_per_person(self):
         people = _make_people(50)
         person_store = MagicMock()
         person_store.get_all.return_value = people
@@ -61,7 +61,7 @@ class TestListPeopleBatchesSourceEntityFetch:
 
         with patch("api.routes.crm.get_person_entity_store", return_value=person_store), \
                 patch("api.routes.crm.get_source_entity_store", return_value=spy_source_store):
-            result = await list_people(
+            result = list_people(
                 q=None, category=None, source=None, dunbar_circles=None, tags=None,
                 has_interactions=None, min_interactions=0, sort="strength",
                 offset=0, limit=50,
@@ -72,7 +72,7 @@ class TestListPeopleBatchesSourceEntityFetch:
         assert set(spy_source_store.get_for_people_batch_calls[0]) == {p.id for p in people}
         assert spy_source_store.get_for_person_calls == []
 
-    async def test_batch_call_only_covers_the_current_page(self):
+    def test_batch_call_only_covers_the_current_page(self):
         """Pagination (offset/limit) narrows the batch to the returned page,
         not the full result set."""
         people = _make_people(120)
@@ -82,7 +82,7 @@ class TestListPeopleBatchesSourceEntityFetch:
 
         with patch("api.routes.crm.get_person_entity_store", return_value=person_store), \
                 patch("api.routes.crm.get_source_entity_store", return_value=spy_source_store):
-            result = await list_people(
+            result = list_people(
                 q=None, category=None, source=None, dunbar_circles=None, tags=None,
                 has_interactions=None, min_interactions=0, sort="strength",
                 offset=0, limit=10,
@@ -94,7 +94,7 @@ class TestListPeopleBatchesSourceEntityFetch:
 
 
 class TestBirthdaysTodayBatchesSourceEntityFetch:
-    async def test_issues_one_batch_call_not_one_per_person(self):
+    def test_issues_one_batch_call_not_one_per_person(self):
         people = _make_people(5)
         from datetime import datetime
         today_mm_dd = datetime.now().strftime("%m-%d")
@@ -107,7 +107,7 @@ class TestBirthdaysTodayBatchesSourceEntityFetch:
 
         with patch("api.routes.crm.get_person_entity_store", return_value=person_store), \
                 patch("api.routes.crm.get_source_entity_store", return_value=spy_source_store):
-            result = await get_todays_birthdays()
+            result = get_todays_birthdays()
 
         assert result["count"] == 5
         assert len(spy_source_store.get_for_people_batch_calls) == 1

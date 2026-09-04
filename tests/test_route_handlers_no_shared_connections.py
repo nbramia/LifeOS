@@ -19,6 +19,20 @@ check that would otherwise raise if a connection built on one thread were
 used from another; needing it at all would mean a connection is being
 shared across threads, which these stores must never do now that their
 callers run on the worker threadpool.
+
+One narrow, explicitly-marked exception exists: `PersonEntityStore`'s
+persistent connection (`api/services/person_entity.py`,
+`_get_data_version_connection`) is kept open across calls solely to read
+SQLite's `PRAGMA data_version` counter cheaply -- every call site is reached
+only while holding `_get_all_cache_lock`, so cross-thread use is serialized
+and reopening it per call would defeat the point of caching `get_all()`. A
+`sqlite3.connect(...)` call (or the `self.<attr> = ...` assignment wrapping
+it) is exempt from BOTH checks above, but only when the marker comment
+`# threadpool-safe: pragma-only, guarded by lock` (see `_MARKER` below)
+appears on one of the source lines the call/assignment spans. Any other
+`check_same_thread=False` or self-cached connection -- marked or not --
+still fails the guard; the marker is not a generic escape hatch, it is tied
+to this one construct via `test_unmarked_check_same_thread_false_still_fails`.
 """
 import ast
 from pathlib import Path
@@ -28,6 +42,13 @@ import pytest
 pytestmark = pytest.mark.unit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Marker comment that narrowly allowlists one specific pattern: a persistent,
+# lock-guarded, pragma-only connection (see module docstring). A connect
+# call or self-assignment is exempt from the checks below only when this
+# exact string appears on one of the source lines it spans -- it is not a
+# blanket opt-out for check_same_thread=False or connection caching.
+_MARKER = "# threadpool-safe: pragma-only, guarded by lock"
 
 # Every store module reachable from api/routes/crm.py, api/routes/people.py,
 # and api/routes/photos.py (verified by grepping their imports at review
@@ -66,21 +87,49 @@ def _has_check_same_thread_false(call: ast.Call) -> bool:
     return False
 
 
-def _caches_connection_on_self(tree) -> bool:
+def _node_has_marker(source_lines: list[str], node: ast.AST) -> bool:
+    """True if `_MARKER` appears on any source line the node spans.
+
+    Both the call to `sqlite3.connect(...)` and the `self.<attr> = ...`
+    assignment wrapping it span the same lines for a multi-line call (the
+    assignment's line range is a superset of the call's), so this one
+    helper covers both guard checks below.
+    """
+    end_lineno = node.end_lineno or node.lineno
+    for lineno in range(node.lineno, end_lineno + 1):
+        if _MARKER in source_lines[lineno - 1]:
+            return True
+    return False
+
+
+def _is_sqlite_connect_call(value: ast.AST) -> bool:
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Attribute)
+        and value.func.attr == "connect"
+        and isinstance(value.func.value, ast.Name)
+        and value.func.value.id == "sqlite3"
+    )
+
+
+def _unsafe_check_same_thread_calls(tree: ast.AST, source_lines: list[str]) -> list[ast.Call]:
+    """`sqlite3.connect(..., check_same_thread=False)` calls not covered by
+    `_MARKER` on one of their source lines."""
+    return [
+        call
+        for call in _sqlite_connect_calls(tree)
+        if _has_check_same_thread_false(call) and not _node_has_marker(source_lines, call)
+    ]
+
+
+def _caches_connection_on_self(tree: ast.AST, source_lines: list[str]) -> bool:
     """True if any `self.<attr> = sqlite3.connect(...)` assignment exists
-    anywhere in the module -- the anti-pattern this guard forbids."""
+    anywhere in the module -- the anti-pattern this guard forbids -- unless
+    `_MARKER` appears on one of the lines the assignment spans."""
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
             continue
-        value = node.value
-        is_sqlite_connect_call = (
-            isinstance(value, ast.Call)
-            and isinstance(value.func, ast.Attribute)
-            and value.func.attr == "connect"
-            and isinstance(value.func.value, ast.Name)
-            and value.func.value.id == "sqlite3"
-        )
-        if not is_sqlite_connect_call:
+        if not _is_sqlite_connect_call(node.value):
             continue
         for target in node.targets:
             if (
@@ -88,6 +137,8 @@ def _caches_connection_on_self(tree) -> bool:
                 and isinstance(target.value, ast.Name)
                 and target.value.id == "self"
             ):
+                if _node_has_marker(source_lines, node):
+                    continue
                 return True
     return False
 
@@ -96,21 +147,49 @@ def _caches_connection_on_self(tree) -> bool:
 def test_store_does_not_share_a_connection_across_calls(relative_path):
     path = REPO_ROOT / relative_path
     source = path.read_text()
+    source_lines = source.splitlines()
     tree = ast.parse(source, filename=str(path))
 
-    unsafe_connects = [
-        call for call in _sqlite_connect_calls(tree) if _has_check_same_thread_false(call)
-    ]
+    unsafe_connects = _unsafe_check_same_thread_calls(tree, source_lines)
     assert not unsafe_connects, (
         f"{relative_path} opens a sqlite3 connection with "
         "check_same_thread=False -- that only makes sense for a connection "
         "shared across threads, which these routers' stores must not do "
-        "now that their handlers run on the worker threadpool"
+        "now that their handlers run on the worker threadpool (unless the "
+        f"connection carries the {_MARKER!r} marker -- see module docstring)"
     )
 
-    assert not _caches_connection_on_self(tree), (
+    assert not _caches_connection_on_self(tree, source_lines), (
         f"{relative_path} assigns a sqlite3.connect(...) result to a "
         "'self.*' attribute -- stores reachable from the CRM/people/photos "
         "routers must open a fresh connection per call, not cache one "
-        "across calls/threads"
+        f"across calls/threads (unless it carries the {_MARKER!r} marker -- "
+        "see module docstring)"
+    )
+
+
+def test_unmarked_check_same_thread_false_still_fails():
+    """The marker exemption is narrowly scoped to a marked line -- an
+    otherwise-identical unmarked `check_same_thread=False` connection must
+    still fail the guard, whether or not it is also cached on `self`."""
+    source = '''
+import sqlite3
+
+class Store:
+    def __init__(self):
+        self._conn = sqlite3.connect(
+            "example.db",
+            check_same_thread=False,
+        )
+'''
+    source_lines = source.splitlines()
+    tree = ast.parse(source)
+
+    assert _unsafe_check_same_thread_calls(tree, source_lines), (
+        "an unmarked check_same_thread=False connection should still be "
+        "flagged by the guard"
+    )
+    assert _caches_connection_on_self(tree, source_lines), (
+        "an unmarked self-cached connection should still be flagged by "
+        "the guard"
     )
