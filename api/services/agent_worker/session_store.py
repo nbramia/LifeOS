@@ -126,7 +126,7 @@ class Session:
     effort: str | None = None
     conversation_id: str | None = None
     remote_pgid: int | None = None
-    # (#892) The model Hermes ITSELF reported for a turn this session ran —
+    # (#892) The model Hermes ITSELF reported for its most recent turn —
     # observed from the turn's own `usage` event (`_HermesTurnPersister.
     # reported_model`), not declared. Explicitly distinct from `model`
     # above: `model` is the board's operator-chosen picker value, which
@@ -795,7 +795,14 @@ class SessionStore:
         keeps for `/api/health`, which #863 found gets overwritten by ANY
         Hermes turn on ANY surface). Ignores a falsy model rather than
         clobbering a real prior observation with nothing, same rule
-        `record_hermes_chat_turn_model` follows."""
+        `record_hermes_chat_turn_model` follows. (round-1 review, R-4)
+        `.strip()`s before that guard so a whitespace-only model (e.g. a
+        malformed upstream `usage` event's `model` field) degrades to the
+        same "no turn observed" outcome as an empty one, instead of writing
+        a value that renders as `Hermes ·    ` — no length cap, matching
+        `usage_store`/`/api/health`, which take this same string verbatim."""
+        if isinstance(model, str):
+            model = model.strip()
         if not model:
             return
         with self._connect() as conn:
