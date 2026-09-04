@@ -5,8 +5,9 @@ call is a stub — no network call and no real subprocess is ever made.
 """
 from __future__ import annotations
 
+import asyncio
 import subprocess
-import time
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -132,26 +133,55 @@ async def test_online_null_on_unparseable_json(registry, api_host):
 
 
 @pytest.mark.asyncio
-async def test_online_null_on_timeout_expired_and_returns_promptly(registry, api_host):
+async def test_online_null_on_timeout_expired(registry, api_host):
     """Simulates the real production runner's `subprocess.run(timeout=...)`
     raising `TimeoutExpired` on a hung `tailscale status` — the catalog
-    must catch it and degrade to `online: null`, not propagate. Since the
-    fake runner raises immediately rather than actually sleeping (no real
-    subprocess is spawned in this suite), wall-clock elapsed time also
-    proves the call never blocks anywhere near the endpoint's 2-second
-    budget.
+    must catch it and degrade to `online: null`, not propagate.
+
+    (round 1, finding R3) This test does NOT prove the 2-second budget —
+    the fake runner raises `TimeoutExpired` immediately rather than
+    actually blocking, so a wall-clock assertion here would be vacuous:
+    it could not fail for any implementation, timeout-bounded or not. The
+    bound itself is proven by
+    `test_default_status_runner_invokes_tailscale_with_bounded_timeout`
+    below, which asserts the real runner passes `timeout=` to
+    `subprocess.run` at all.
     """
     def _hang():
         raise subprocess.TimeoutExpired(cmd=["tailscale", "status", "--json"], timeout=1.5)
     catalog = HostCatalog(status_runner=_hang, clock=_FrozenClock())
-    start = time.monotonic()
     result = await catalog.get(ttl_seconds=86400)
-    elapsed = time.monotonic() - start
-    assert elapsed < 2.0
     by_name = {h["name"]: h for h in result["hosts"]}
     assert by_name["studio-box"]["online"] is None
     assert by_name["laptop"]["online"] is None
     assert by_name["desktop-box"]["online"] is True
+
+
+def test_default_status_runner_invokes_tailscale_with_bounded_timeout(monkeypatch):
+    """(round 1, finding R3) The two-second endpoint budget has exactly one
+    enforcement mechanism: `_default_status_runner` passing `timeout=` to
+    `subprocess.run`. Nothing else in this suite touches
+    `_default_status_runner` or the timeout constant directly — deleting
+    the `timeout=` argument left the rest of this file's 14 tests green
+    (verified as this finding's mutation proof), because every other test
+    injects its own `status_runner` stub instead of using the real one."""
+    calls = []
+
+    def _fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _FakeResult(stdout="{}", returncode=0)
+
+    monkeypatch.setattr(host_catalog_module.subprocess, "run", _fake_run)
+    result = host_catalog_module._default_status_runner()
+
+    assert isinstance(result, _FakeResult)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == ["tailscale", "status", "--json"]
+    assert kwargs.get("timeout") == host_catalog_module._TAILSCALE_TIMEOUT_SECONDS
+    # The constant itself must stay comfortably inside the endpoint's
+    # 2-second budget (a regression here would silently blow that budget).
+    assert host_catalog_module._TAILSCALE_TIMEOUT_SECONDS < 2.0
 
 
 @pytest.mark.asyncio
@@ -182,6 +212,28 @@ async def test_no_duplicate_entry_when_registry_names_the_api_host(api_host, mon
 
 
 @pytest.mark.asyncio
+async def test_api_host_ssh_target_found_despite_registry_key_case_difference(api_host, monkeypatch):
+    """(round 1, finding M1) The dedup guard above already matches a
+    registry key against `api_host_name()` case-insensitively — a
+    registry entry named e.g. `DESKTOP-BOX` for an API host reported as
+    `desktop-box` gets merged into the single `is_api_host: true` row, not
+    a duplicate. But merging isn't enough on its own: the `ssh_target`
+    lookup for that merged row must use the SAME lowercased key, or the
+    entry that WAS found for dedup purposes gets its target dropped on
+    the floor by a case-sensitive `registry.get(api_name)`. Synthetic
+    names throughout — never this machine's real hostname."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {
+        "DESKTOP-BOX": "operator@desktop-box.example",
+    }, raising=False)
+    catalog = HostCatalog(status_runner=_runner(_status_json()), clock=_FrozenClock())
+    result = await catalog.get(ttl_seconds=86400)
+    assert {h["name"] for h in result["hosts"]} == {"desktop-box"}  # no duplicate
+    api_entry = next(h for h in result["hosts"] if h["is_api_host"])
+    assert api_entry["ssh_target"] == "operator@desktop-box.example"
+
+
+@pytest.mark.asyncio
 async def test_ttl_cache_hit_avoids_a_second_probe(registry, api_host):
     clock = _FrozenClock()
     catalog = HostCatalog(status_runner=_runner(_status_json()), clock=clock)
@@ -200,6 +252,40 @@ async def test_ttl_expiry_triggers_a_fresh_probe(registry, api_host):
     clock.now += 11
     await catalog.get(ttl_seconds=10)
     assert catalog.probe_call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cold_get_calls_probe_exactly_once(registry, api_host):
+    """(round 1, finding R4) N concurrent `get()` calls that all miss the
+    cache at once must coalesce into ONE probe, not one per caller — the
+    `asyncio.Lock` + double-checked-locking in `get()` is what makes that
+    true. `_gated_runner` blocks (on a worker thread, via
+    `asyncio.to_thread` — never the event loop thread) until every
+    concurrent caller has had a chance to reach `get()` and either win the
+    lock race or start waiting on it, so this can't pass by accident of
+    scheduling."""
+    gate = threading.Event()
+
+    def _gated_runner():
+        gate.wait(timeout=2.0)
+        return _FakeResult(stdout=_status_json(), returncode=0)
+
+    catalog = HostCatalog(status_runner=_gated_runner, clock=_FrozenClock())
+
+    async def _get():
+        return await catalog.get(ttl_seconds=86400)
+
+    tasks = [asyncio.create_task(_get()) for _ in range(5)]
+    # Let every task run up to its first suspend point: the lock winner
+    # blocks inside asyncio.to_thread (a worker thread, not this loop);
+    # the other four suspend waiting on the lock. Neither can progress
+    # further until `gate` is set below.
+    await asyncio.sleep(0.05)
+    gate.set()
+    results = await asyncio.gather(*tasks)
+
+    assert catalog.probe_call_count == 1
+    assert all(r == results[0] for r in results)
 
 
 @pytest.mark.asyncio

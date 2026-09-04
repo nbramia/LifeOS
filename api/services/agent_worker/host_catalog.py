@@ -33,7 +33,12 @@ changes minute to minute, and the probe itself is cheap and bounded).
 Unlike the model catalog, a cache MISS always re-reads
 `settings.agent_hosts` fresh rather than reusing whatever names a
 previous build saw — the registry is local config, not a network call,
-so there's no reason to let it go stale between probes.
+so there's no reason to let it go stale between probes. Concurrent cache
+misses are coalesced behind an `asyncio.Lock` (double-checked after
+acquiring it) so N callers arriving at once share one probe rather than
+each spawning their own `tailscale status`; the cache timestamp is
+stamped only after the build completes, so a slow build never shortens
+the effective TTL.
 
 The probe itself is bounded well under the endpoint's 2-second budget:
 `_TAILSCALE_TIMEOUT_SECONDS` (1.5s) is passed straight to
@@ -115,7 +120,16 @@ def _online_for(name: str, ssh_target: Optional[str], peers: list[dict]) -> Opti
 class HostCatalog:
     """Injectable-everything catalog builder (status_runner + clock test
     seams), mirroring `ModelCatalog`'s pattern. `probe_call_count` lets
-    tests assert the TTL cache actually skips a second probe."""
+    tests assert the TTL cache actually skips a second probe.
+
+    `get()` coalesces concurrent cache misses behind an `asyncio.Lock`
+    with post-acquire double-checked locking: N callers that all miss the
+    cache at once share ONE `_build()` call rather than each spawning
+    their own `tailscale` probe (#901 round 1, finding R4). `_cached_at`
+    is stamped AFTER the build completes, not before — stamping first
+    would silently shorten the effective TTL by however long the build
+    took.
+    """
 
     status_runner: Optional[StatusRunner] = None
     clock: Callable[[], float] = field(default=time.monotonic)
@@ -124,31 +138,51 @@ class HostCatalog:
 
     _cached: Optional[dict] = field(default=None, init=False, repr=False)
     _cached_at: Optional[float] = field(default=None, init=False, repr=False)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+
+    def _fresh(self, ttl: int) -> bool:
+        now = self.clock()
+        return (
+            self._cached is not None
+            and self._cached_at is not None
+            and (now - self._cached_at) < ttl
+        )
 
     async def get(self, *, ttl_seconds: Optional[int] = None) -> dict:
         ttl = ttl_seconds if ttl_seconds is not None else _HOST_CATALOG_TTL_SECONDS
-        now = self.clock()
-        if self._cached is not None and self._cached_at is not None and (now - self._cached_at) < ttl:
+        if self._fresh(ttl):
             return self._cached
-        result = await asyncio.to_thread(self._build)
-        self._cached = result
-        self._cached_at = now
-        return result
+        async with self._lock:
+            # Double-checked: another coroutine may have already rebuilt
+            # the catalog while we were waiting on the lock.
+            if self._fresh(ttl):
+                return self._cached
+            result = await asyncio.to_thread(self._build)
+            self._cached = result
+            self._cached_at = self.clock()  # stamped AFTER the build, not before
+            return result
 
     def _build(self) -> dict:
         from api.services.agent_worker.remote_spawn import api_host_name
 
         api_name = api_host_name()
         registry = dict(settings.agent_hosts)  # read fresh on every cache miss
+        # Lowercased once, then used for BOTH the dedup guard below and the
+        # API host's own ssh_target lookup — matching a registry key that
+        # differs only in case from api_name requires the same
+        # case-insensitive key on both sides, or the target lookup misses
+        # the entry the dedup guard just merged away (#901 round 1, M1).
+        registry_by_key = {(name or "").strip().lower(): target for name, target in registry.items()}
         peers = self._probe_peers()
 
+        api_key = api_name.strip().lower()
         hosts: list[dict] = [{
             "name": api_name,
-            "ssh_target": registry.get(api_name),
+            "ssh_target": registry_by_key.get(api_key),
             "online": True,
             "is_api_host": True,
         }]
-        seen = {api_name.strip().lower()}
+        seen = {api_key}
         for name, target in registry.items():
             key = (name or "").strip().lower()
             if not key or key in seen:

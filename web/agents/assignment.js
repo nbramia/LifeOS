@@ -66,18 +66,36 @@ function loadModelCatalog(fetchImpl = fetch) {
   return _catalogPromise;
 }
 
-// Fetches the host registry once per page load and caches it — mirrors
-// loadModelCatalog above exactly. A fetch failure degrades to an empty
-// host list (the select still renders "this machine" plus any unknown
-// saved host — see renderAssignmentPickers's host-select handling).
-let _hostsPromise = null;
+// Fetches the host registry — mostly mirrors loadModelCatalog above, but
+// differs in two ways the model catalog doesn't need (#901 round 1,
+// findings R1/R2):
+//   - a short client-side TTL (`_HOSTS_CLIENT_TTL_MS`, matched to
+//     host_catalog.py's own `_HOST_CATALOG_TTL_SECONDS`) instead of a
+//     once-per-page-load cache — reachability drifts minute to minute,
+//     unlike a 24h model list, so an operator who leaves /agents open
+//     needs the markers to actually refresh on a later drawer open.
+//   - a fetch failure is NOT cached: the caller for that one call gets
+//     `null` back, but the cache itself is cleared immediately so the
+//     NEXT drawer open retries instead of being stuck with an empty
+//     catalog (and thus no way to pick a host at all) for the rest of
+//     the page session. `populateHostOptions` below treats a `null`
+//     result as "leave the synchronous seed alone" — distinct from a
+//     catalog that resolved with a genuinely empty `hosts` list.
+let _hostsCache = null; // { at: number (Date.now() ms), promise: Promise }
+const _HOSTS_CLIENT_TTL_MS = 30_000;
 function loadHostCatalog(fetchImpl = fetch) {
-  if (!_hostsPromise) {
-    _hostsPromise = fetchImpl('/api/agents/hosts')
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .catch(() => ({ hosts: [] }));
+  const now = Date.now();
+  if (_hostsCache && (now - _hostsCache.at) < _HOSTS_CLIENT_TTL_MS) {
+    return _hostsCache.promise;
   }
-  return _hostsPromise;
+  const promise = fetchImpl('/api/agents/hosts')
+    .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+    .catch(() => {
+      _hostsCache = null; // don't poison the cache with a failure — retry next time
+      return null;
+    });
+  _hostsCache = { at: now, promise };
+  return promise;
 }
 
 /**
@@ -210,15 +228,26 @@ export function renderAssignmentPickers(container, card, opts = {}) {
     return host.name;
   }
   function populateHostOptions(catalog) {
-    const hosts = (catalog && catalog.hosts) || [];
-    const known = hosts.some(h => h.name === currentHost);
+    // `null` means the fetch failed (see loadHostCatalog) — leave the
+    // synchronous seed exactly as seedHostOptions() rendered it rather
+    // than collapsing it to just "this machine".
+    if (!catalog) return;
+    // Read the LIVE selection, not `currentHost` (the render-time
+    // snapshot) — the operator may have already changed the host while
+    // this fetch was in flight, and that live choice must win over the
+    // catalog landing (#901 round 1, finding A1). `hostEl.value` still
+    // equals the seeded `currentHost` when nothing has changed, so the
+    // synchronous-seed behavior above is unaffected.
+    const current = hostEl.value;
+    const hosts = (catalog.hosts) || [];
+    const known = hosts.some(h => h.name === current);
     const optionsHtml = ['<option value="">this machine</option>'];
     for (const h of hosts) {
-      const selected = currentHost === h.name ? 'selected' : '';
+      const selected = current === h.name ? 'selected' : '';
       optionsHtml.push(`<option value="${escapeHtml(h.name)}" ${selected}>${escapeHtml(hostLabel(h))}</option>`);
     }
-    if (currentHost && !known) {
-      optionsHtml.push(`<option value="${escapeHtml(currentHost)}" selected data-unknown="true">${escapeHtml(currentHost)} (unknown)</option>`);
+    if (current && !known) {
+      optionsHtml.push(`<option value="${escapeHtml(current)}" selected data-unknown="true">${escapeHtml(current)} (unknown)</option>`);
     }
     hostEl.innerHTML = optionsHtml.join('');
   }
