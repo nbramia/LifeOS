@@ -585,9 +585,14 @@ Analyze tone/sentiment in iMessage conversations over time. Samples messages mon
 
 Detailed tone analysis with separate scores for the user and their partner. Groups messages by week, analyzes each person separately, then aggregates to monthly averages.
 
+Results are persisted per person and month (see [crm-analytics.md](crm-analytics.md#tone-analysis-apis)). A month is served from storage when it's still fresh; only missing or stale months trigger an LLM call, so a fully-cached response returns in well under 200ms. If the LLM fails or is unavailable for a month that needs recomputing, that month's data point comes back with `"status": "error"` instead of failing the whole request.
+
 **Query parameters:**
 - `person_id` (string, optional): Target person (defaults to partner)
 - `months` (int): Months to analyze (default: 12)
+- `refresh` (bool, optional): Force recomputation of every month in the window, bypassing the freshness cache (default: false)
+
+**Response:** each entry in `monthly_tones` may carry `"status": "error"` when that month couldn't be computed and has no prior stored result; omitted (`null`) otherwise.
 
 ---
 

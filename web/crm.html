@@ -8084,13 +8084,16 @@
                                             <div class="viz-card-title">Tone Evolution</div>
                                             <div class="viz-card-subtitle">iMessage emotional warmth over time</div>
                                         </div>
-                                        <div class="tone-view-dropdown" style="position: relative;">
-                                            <select id="toneViewSelect" onchange="setToneViewMode(this.value)" style="font-size: 0.7rem; padding: 0.25rem 0.5rem; border-radius: 4px; border: 1px solid var(--border-subtle); background: var(--bg-secondary); color: var(--text-primary); cursor: pointer;">
-                                                <option value="combined">Shared Tone</option>
-                                                <option value="user">My Tone</option>
-                                                <option value="partner">Partner's Tone</option>
-                                                <option value="both">Both</option>
-                                            </select>
+                                        <div style="display: flex; align-items: center; gap: 0.35rem;">
+                                            <div class="tone-view-dropdown" style="position: relative;">
+                                                <select id="toneViewSelect" onchange="setToneViewMode(this.value)" style="font-size: 0.7rem; padding: 0.25rem 0.5rem; border-radius: 4px; border: 1px solid var(--border-subtle); background: var(--bg-secondary); color: var(--text-primary); cursor: pointer;">
+                                                    <option value="combined">Shared Tone</option>
+                                                    <option value="user">My Tone</option>
+                                                    <option value="partner">Partner's Tone</option>
+                                                    <option value="both">Both</option>
+                                                </select>
+                                            </div>
+                                            <button id="toneRefreshBtn" onclick="refreshToneAnalysis()" title="Recompute tone analysis" style="font-size: 0.75rem; padding: 0.2rem 0.4rem; border-radius: 4px; border: 1px solid var(--border-subtle); background: var(--bg-secondary); color: var(--text-primary); cursor: pointer;">↻</button>
                                         </div>
                                     </div>
                                     <div class="viz-card-content" id="toneTimelineViz">
@@ -8149,6 +8152,13 @@
                                 </div>
                             </div>
 
+                        </div>
+
+                        <!-- Shown instead of relationshipDashboard when no partner is configured (#891) -->
+                        <div class="detail-empty" id="relationshipEmptyState" style="display: none;">
+                            <div class="detail-empty-icon">💕</div>
+                            <p>No partner configured</p>
+                            <p style="font-size: 0.85rem; color: var(--text-muted);">Set <code>partner_person_id</code> in <code>config/relationship_overrides.json</code> to enable the Relationship dashboard.</p>
                         </div>
 
                         <!-- Two-column content grid (hidden for Me page) -->
@@ -11834,6 +11844,17 @@
             document.getElementById('familyDashboard').classList.remove('visible');
             document.getElementById('personContentGrid').style.display = 'none';
 
+            // No partner configured (#891): render an empty state and issue no
+            // partner-scoped requests (no insights/timeline/tone/photo calls).
+            const relationshipEmptyState = document.getElementById('relationshipEmptyState');
+            if (!PARTNER_PERSON_ID) {
+                document.getElementById('relationshipDashboard').style.display = 'none';
+                document.getElementById('relationshipDashboard').classList.remove('visible');
+                if (relationshipEmptyState) relationshipEmptyState.style.display = 'flex';
+                return;
+            }
+            if (relationshipEmptyState) relationshipEmptyState.style.display = 'none';
+
             // Hide person-level hero stats
             const personHeroStats = document.getElementById('heroStats');
             if (personHeroStats) personHeroStats.style.display = 'none';
@@ -11889,12 +11910,15 @@
                 detailTabs.style.display = 'none';
             }
 
-            // Load all data
+            // Load insights and the timeline first; tone analysis can be slow
+            // (a persisted-but-stale month still needs an LLM call) so it must
+            // not gate the rest of the page from rendering (#873). It renders
+            // itself into the tone card whenever it resolves.
             await Promise.all([
                 loadRelationshipInsights(),
                 loadRelationshipTimeline(),
-                loadToneAnalysis(),
             ]);
+            loadToneAnalysis();
 
             // Render visualizations
             renderIMessageBalance();
@@ -12104,17 +12128,33 @@
         // Tone view mode: 'user', 'partner', 'combined', 'both'
         let toneViewMode = 'combined';
 
-        // Load tone analysis (detailed version with separate user/partner scores)
-        async function loadToneAnalysis() {
+        // Load tone analysis (detailed version with separate user/partner scores).
+        // Stored, fresh months are served instantly; stale/missing months are
+        // recomputed server-side (#873). Pass refresh=true to force every
+        // month in the window to recompute regardless of freshness.
+        async function loadToneAnalysis(refresh = false) {
             const container = document.getElementById('toneTimelineViz');
+            const refreshBtn = document.getElementById('toneRefreshBtn');
+            if (refreshBtn) refreshBtn.disabled = true;
             try {
-                const data = await api('/relationship/tone-analysis-detailed', { method: 'POST' });
+                const path = refresh
+                    ? '/relationship/tone-analysis-detailed?refresh=true'
+                    : '/relationship/tone-analysis-detailed';
+                const data = await api(path, { method: 'POST' });
                 relationshipToneCache = data;
                 renderToneTimeline(data);
             } catch (error) {
                 console.error('Failed to load tone analysis:', error);
                 container.innerHTML = '<div class="viz-loading">Unable to analyze tone</div>';
+            } finally {
+                if (refreshBtn) refreshBtn.disabled = false;
             }
+        }
+
+        // "Refresh" affordance on the Tone Evolution card: force recomputation
+        // of every month in the window, bypassing the freshness cache.
+        function refreshToneAnalysis() {
+            loadToneAnalysis(true);
         }
 
         // Handle tone view mode change

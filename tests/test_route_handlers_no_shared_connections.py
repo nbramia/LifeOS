@@ -61,6 +61,7 @@ STORE_MODULES = [
     "api/services/person_facts.py",
     "api/services/relationship_insights.py",
     "api/services/apple_photos.py",
+    "api/services/tone_analysis_store.py",
 ]
 
 
