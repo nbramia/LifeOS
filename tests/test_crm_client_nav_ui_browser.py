@@ -119,14 +119,21 @@ def crm_base_url():
         server.server_close()
 
 
-def _route_api(page: Page, requests_seen: list):
+def _route_api(page: Page, requests_seen: list, partner_configured: bool = True):
     """Stub every /api/crm/** call the page makes, and record each request's
     path and query params (`{"path": ..., "query": ...}`, `query` from
     `parse_qs`) so tests can assert on call counts and on the parameters a
     request carried. Anything not explicitly modeled below returns `{}` —
     every loader in crm.html treats a missing/empty aggregate defensively
     (falls back to an empty list/dict), so this is enough to exercise all
-    five dashboards without error."""
+    five dashboards without error.
+
+    `partner_configured=False` models a fresh install (no
+    `partner_person_id` set) -- the default is `True` so most tests exercise
+    the real Relationship dashboard rather than its no-partner empty state;
+    `TestRelationshipNoPartnerChrome` below explicitly wants the empty-state
+    path (#909 review follow-up finding 1: a fresh install is not a corner
+    case)."""
 
     def handler(route):
         parsed = urlparse(route.request.url)
@@ -134,12 +141,14 @@ def _route_api(page: Page, requests_seen: list):
         requests_seen.append({"path": path, "query": parse_qs(parsed.query)})
 
         if path == "/api/crm/config":
-            # partner_person_id set so showRelationshipDashboard() renders
-            # the real dashboard rather than the no-partner empty state
-            # (#899) -- keeps the Relationship hops representative of a
-            # configured install, not the degenerate case.
-            body = {"my_person_id": MY_PERSON_ID, "partner_person_id": PARTNER_PERSON_ID,
-                     "partner_name": "Synthetic Partner"}
+            # partner_person_id set (by default) so showRelationshipDashboard()
+            # renders the real dashboard rather than the no-partner empty
+            # state (#899) -- keeps the Relationship hops representative of
+            # a configured install, not the degenerate case.
+            body = {"my_person_id": MY_PERSON_ID}
+            if partner_configured:
+                body["partner_person_id"] = PARTNER_PERSON_ID
+                body["partner_name"] = "Synthetic Partner"
         elif path == "/api/crm/statistics":
             body = {"total_people": 2}
         elif path == "/api/crm/birthdays/today":
@@ -168,7 +177,7 @@ def _route_api(page: Page, requests_seen: list):
     page.route("**/api/crm/**", handler)
 
 
-def _prepare(page: Page):
+def _prepare(page: Page, partner_configured: bool = True):
     """Install the d3 stub and API stub before any page script runs, and
     start recording document `load` events (one always fires for the
     initial `page.goto()` - callers should clear the list after the first
@@ -176,7 +185,7 @@ def _prepare(page: Page):
     navigation)."""
     page.add_init_script(D3_STUB_JS)
     requests_seen = []
-    _route_api(page, requests_seen)
+    _route_api(page, requests_seen, partner_configured=partner_configured)
     load_events = []
     page.on("load", lambda: load_events.append(1))
     console_errors = []
@@ -512,6 +521,85 @@ class TestBirthdaysEntryPoint:
         expect(page.locator("#meDashboard")).to_be_visible()
         expect(page.locator("#totalPeople")).to_have_text("2")
         expect(page.locator("#peopleList")).to_contain_text("Synthetic Friend")
+
+        unexpected_errors = [e for e in console_errors if "d3" not in e.lower()]
+        assert not unexpected_errors, f"Unexpected console errors: {unexpected_errors}"
+
+
+class TestRelationshipNoPartnerChrome:
+    """Family -> Relationship must not leak Family's hero stats or member
+    selector onto the no-partner empty state (#909 review follow-up
+    finding 1). A fresh install has no partner configured by default, so
+    this is not a corner case -- every other test in this file configures a
+    partner (see `_route_api`'s default) specifically so the Relationship
+    hops exercise the real dashboard; this one deliberately doesn't."""
+
+    def test_family_chrome_hidden_after_navigating_to_relationship(self, page: Page, crm_base_url):
+        _prepare(page, partner_configured=False)
+        page.goto(f"{crm_base_url}/family")
+        expect(page.locator("#familyDashboard")).to_be_visible()
+        expect(page.locator("#familyHeroStats")).to_be_visible()
+
+        page.locator('[data-page="relationship"]').click()
+        expect(page.locator("#relationshipEmptyState")).to_be_visible()
+        expect(page.locator("#relationshipDashboard")).to_be_hidden()
+
+        # The bug: these two, plus the detail header, used to still show
+        # Family's content underneath/around the empty state.
+        expect(page.locator("#familyHeroStats")).to_be_hidden()
+        expect(page.locator("#familySelectorContainer")).to_be_hidden()
+        expect(page.locator("#detailName")).to_have_text("Relationship Dashboard")
+
+
+class TestActiveLinkAndTabRegressions:
+    """Regression tests for two one-line fixes from the #909 review that
+    shipped without their own test the first time (review finding 3):
+    selecting a person must clear whichever dashboard link was highlighted,
+    and landing on a person's URL with no tab segment must show Overview
+    even if a different tab was showing a moment ago."""
+
+    def test_selecting_a_person_from_me_clears_the_active_dashboard_link(
+        self, page: Page, crm_base_url,
+    ):
+        _, _, console_errors = _goto_me(page, crm_base_url)
+        assert _active_pages(page) == ["me"]
+
+        page.evaluate(f"selectPerson('{SYNTHETIC_OTHER_PERSON['id']}')")
+        expect(page.locator("#personContentGrid")).to_be_visible()
+        assert _active_pages(page) == [], (
+            "selecting a person must clear the Me link, not leave it highlighted"
+        )
+
+        unexpected_errors = [e for e in console_errors if "d3" not in e.lower()]
+        assert not unexpected_errors, f"Unexpected console errors: {unexpected_errors}"
+
+    def test_selecting_a_person_from_family_clears_the_active_dashboard_link(
+        self, page: Page, crm_base_url,
+    ):
+        _, _, console_errors = _prepare(page)
+        page.goto(f"{crm_base_url}/family")
+        expect(page.locator("#familyDashboard")).to_be_visible()
+        assert _active_pages(page) == ["family"]
+
+        page.evaluate(f"selectPerson('{SYNTHETIC_OTHER_PERSON['id']}')")
+        expect(page.locator("#personContentGrid")).to_be_visible()
+        assert _active_pages(page) == [], (
+            "selecting a person must clear the Family link, not leave it highlighted"
+        )
+
+    def test_me_from_a_no_tab_url_shows_overview_not_a_stale_tab(self, page: Page, crm_base_url):
+        """Landing on /me (no tab segment) after /me/timeline was showing
+        must reset to the Overview tab, not leave Timeline displayed."""
+        _, _, console_errors = _goto_me(page, crm_base_url)
+
+        page.evaluate("window.history.pushState({}, '', '/me/timeline')")
+        page.evaluate("dispatchRoute()")
+        expect(page.locator("#tabTimeline")).to_be_visible()
+
+        page.locator('[data-page="me"]').click()
+        expect(page.locator("#tabOverview")).to_be_visible()
+        expect(page.locator("#tabTimeline")).to_be_hidden()
+        expect(page.locator('.tab[data-tab="overview"]')).to_have_class(re.compile(r"\bactive\b"))
 
         unexpected_errors = [e for e in console_errors if "d3" not in e.lower()]
         assert not unexpected_errors, f"Unexpected console errors: {unexpected_errors}"

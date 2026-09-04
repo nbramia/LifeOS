@@ -12080,33 +12080,23 @@
             document.getElementById('familyDashboard').classList.remove('visible');
             document.getElementById('personContentGrid').style.display = 'none';
 
-            // No partner configured (#891): render an empty state and issue no
-            // partner-scoped requests (no insights/timeline/tone/photo calls).
-            const relationshipEmptyState = document.getElementById('relationshipEmptyState');
-            if (!PARTNER_PERSON_ID) {
-                document.getElementById('relationshipDashboard').style.display = 'none';
-                document.getElementById('relationshipDashboard').classList.remove('visible');
-                if (relationshipEmptyState) relationshipEmptyState.style.display = 'flex';
-                return;
-            }
-            if (relationshipEmptyState) relationshipEmptyState.style.display = 'none';
-
             // Hide person-level hero stats
             const personHeroStats = document.getElementById('heroStats');
             if (personHeroStats) personHeroStats.style.display = 'none';
 
-            // Hide family hero stats and selector
+            // Hide family hero stats and selector -- must happen regardless
+            // of whether a partner is configured (#909 review follow-up:
+            // this used to sit after the no-partner early return below, so
+            // Family -> Relationship left Family's hero stats and member
+            // selector visible on top of the "no partner configured" empty
+            // state; unreachable under a full document reload, live once
+            // dashboard navigation stopped reloading the document).
             const familyHeroStats = document.getElementById('familyHeroStats');
             if (familyHeroStats) familyHeroStats.style.display = 'none';
             const familySelectorContainer = document.getElementById('familySelectorContainer');
             if (familySelectorContainer) familySelectorContainer.style.display = 'none';
 
-            // Show relationship dashboard
-            const relationshipDashboard = document.getElementById('relationshipDashboard');
-            relationshipDashboard.style.display = 'block';
-            relationshipDashboard.classList.add('visible');
-
-            // Hide heatmap for relationship view (not needed here)
+            // Hide heatmap (not needed on either the dashboard or the empty state)
             const heatmapContainer = document.querySelector('.heatmap-container');
             if (heatmapContainer) heatmapContainer.style.display = 'none';
 
@@ -12114,7 +12104,8 @@
             const sourceEntitiesFooter = document.getElementById('sourceEntitiesFooter');
             if (sourceEntitiesFooter) sourceEntitiesFooter.style.display = 'none';
 
-            // Customize header for relationship view
+            // Customize header for relationship view (also shown behind the
+            // no-partner empty state, same reasoning as above)
             const detailAvatar = document.getElementById('detailAvatar');
             const detailName = document.getElementById('detailName');
             const detailCompany = document.getElementById('detailCompany');
@@ -12124,11 +12115,10 @@
             if (detailCompany) detailCompany.textContent = PARTNER_NAME || 'Partner';
             if (detailContactQuick) detailContactQuick.innerHTML = '';
             if (detailTagsChips) detailTagsChips.innerHTML = '';
-
-            // Load partner photo if available, otherwise show heart emoji
             if (detailAvatar) {
                 detailAvatar.textContent = '💕';  // Default fallback
-                loadRelationshipPartnerPhoto(PARTNER_PERSON_ID);
+                detailAvatar.style.backgroundImage = '';
+                detailAvatar.classList.remove('has-photo');
             }
 
             // Hide header indicators
@@ -12145,6 +12135,25 @@
             if (detailTabs) {
                 detailTabs.style.display = 'none';
             }
+
+            // No partner configured (#891): render an empty state and issue no
+            // partner-scoped requests (no insights/timeline/tone/photo calls).
+            const relationshipEmptyState = document.getElementById('relationshipEmptyState');
+            if (!PARTNER_PERSON_ID) {
+                document.getElementById('relationshipDashboard').style.display = 'none';
+                document.getElementById('relationshipDashboard').classList.remove('visible');
+                if (relationshipEmptyState) relationshipEmptyState.style.display = 'flex';
+                return;
+            }
+            if (relationshipEmptyState) relationshipEmptyState.style.display = 'none';
+
+            // Show relationship dashboard
+            const relationshipDashboard = document.getElementById('relationshipDashboard');
+            relationshipDashboard.style.display = 'block';
+            relationshipDashboard.classList.add('visible');
+
+            // Load partner photo now that we know one is configured
+            loadRelationshipPartnerPhoto(PARTNER_PERSON_ID);
 
             // Load insights and the timeline first; tone analysis can be slow
             // (a persisted-but-stale month still needs an LLM call) so it must
@@ -17965,8 +17974,20 @@
                 const centerX = (minX + maxX) / 2;
                 const centerY = (minY + maxY) / 2;
 
-                // Get container dimensions
-                const container = graphSvg.node().parentElement;
+                // Get container dimensions. graphSvg is a d3 selection,
+                // which stays truthy even after its <svg> node is detached
+                // from the document (e.g. the node was cleared/replaced by
+                // a subsequent renderGraph() call, or the whole subtree was
+                // torn down) -- graphSvg.node() itself, or its
+                // parentElement, can be null at this point, so both must be
+                // checked before reading clientWidth/clientHeight off of
+                // whatever `container` turns out to be (#909 review
+                // follow-up: the freshness guard above this stopped the
+                // NaN-transform case but not this one -- same root cause,
+                // a stale reference outliving the view it belonged to).
+                const svgNode = graphSvg.node();
+                const container = svgNode && svgNode.parentElement;
+                if (!container) return;
                 const width = container.clientWidth;
                 const height = container.clientHeight;
 
