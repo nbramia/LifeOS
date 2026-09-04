@@ -88,6 +88,7 @@
     flex-wrap: wrap;
     margin-left: auto;
   }
+  .chips[hidden] { display: none; }
   .chip {
     background: var(--bg-card);
     border: 1px solid var(--border);
@@ -112,7 +113,7 @@
     color: var(--text-secondary);
   }
   .filters label { display: flex; align-items: center; gap: 0.35rem; cursor: pointer; }
-  .filters select {
+  .filters select, .filters input[type="text"] {
     background: var(--bg-card);
     color: var(--text-primary);
     border: 1px solid var(--border);
@@ -767,6 +768,207 @@
     }
     .chips { display: none; }
   }
+
+  /* -------------------------------------------------------------------
+     Board tab (#850) — Kanban board that reuses the styles above for
+     chips, panel-*, modal-*, and toast markup (the drawer's session
+     panel section renders the same `.panel-header` / `.events` / etc.
+     structure SessionPanel builds for the Graph tab).
+     ------------------------------------------------------------------- */
+  .tabs {
+    display: flex;
+    gap: 0.25rem;
+    margin-left: 0.5rem;
+  }
+  .tab-btn {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 0.375rem 0.75rem;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .tab-btn:hover { background: var(--bg-card); color: var(--text-primary); }
+  .tab-btn.active { background: var(--accent); color: var(--bg-primary); }
+  .tab-view[hidden] { display: none; }
+  #board-view {
+    height: calc(100vh - 56px - 45px);
+    display: flex;
+    flex-direction: column;
+  }
+  #board-view[hidden] { display: none; }
+  .board-filters {
+    display: flex;
+    gap: 0.6rem;
+    align-items: center;
+    padding: 0.5rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    flex-wrap: wrap;
+  }
+  .board-filters select,
+  .board-filters input[type="text"],
+  .board-filters input[type="search"] {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.8rem;
+  }
+  .board-filters label { display: flex; align-items: center; gap: 0.3rem; cursor: pointer; }
+  #board-new-card {
+    margin-left: auto;
+    background: var(--accent);
+    color: var(--bg-primary);
+    border: none;
+    border-radius: 6px;
+    padding: 0.35rem 0.8rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #board-lanes {
+    flex: 1;
+    display: flex;
+    gap: 0.75rem;
+    padding: 0.75rem 1.25rem;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .board-lane {
+    flex: 0 0 260px;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .board-lane.drag-over { border-color: var(--accent); }
+  .board-lane-header {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+  }
+  .board-lane-count { color: var(--text-dim); font-weight: 400; }
+  .board-lane-cards {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .board-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem 0.6rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .board-card:hover { border-color: var(--accent); }
+  .board-card.dragging-source { opacity: 0.4; }
+  .board-card-ghost { opacity: 0.9; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+  .board-card-title { font-weight: 600; word-break: break-word; }
+  .board-card-question {
+    margin-top: 0.3rem;
+    font-size: 0.72rem;
+    color: var(--blocked);
+  }
+  .board-card-lastrun {
+    margin-top: 0.3rem;
+    font-size: 0.7rem;
+    color: var(--text-dim);
+  }
+  .board-card-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    margin-top: 0.35rem;
+  }
+  .board-chip {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.05rem 0.5rem;
+    font-size: 0.68rem;
+    color: var(--text-secondary);
+  }
+  .board-chip-assignee { color: var(--accent); border-color: var(--accent); }
+  .board-chip-host { color: var(--claimed); border-color: var(--claimed); }
+  #board-connection-state { margin-left: 0.5rem; color: var(--text-dim); font-size: 0.75rem; }
+
+  .board-drawer-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.5);
+    z-index: 90;
+    display: flex;
+    justify-content: flex-end;
+  }
+  .board-drawer-backdrop[hidden] { display: none; }
+  .board-drawer {
+    width: min(440px, 92vw);
+    height: 100vh;
+    background: var(--bg-secondary);
+    border-left: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 1rem;
+  }
+  .drawer-header { position: relative; margin-bottom: 0.75rem; }
+  .drawer-title {
+    width: 100%;
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+    font-size: 1rem;
+    font-weight: 600;
+    padding: 0.2rem 1.75rem 0.2rem 0;
+  }
+  .drawer-title:focus { outline: 1px solid var(--accent); border-radius: 4px; }
+  .drawer-label {
+    display: block;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    margin: 0.6rem 0 0.25rem;
+  }
+  .drawer-notes, .drawer-tags, .drawer-context, .drawer-assignee {
+    width: 100%;
+    background: var(--bg-elev);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.4rem 0.55rem;
+    font-family: inherit;
+    font-size: 0.8rem;
+  }
+  .drawer-notes { min-height: 5rem; resize: vertical; }
+  .drawer-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+  .drawer-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.75rem; }
+  .drawer-action {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+    border-radius: 6px;
+    padding: 0.3rem 0.65rem;
+    font-size: 0.75rem;
+    cursor: pointer;
+  }
+  .drawer-action:hover { border-color: var(--accent); }
+  .drawer-session { margin-top: 0.75rem; border-top: 1px solid var(--border); padding-top: 0.5rem; }
+  .drawer-session .panel-header { padding: 0; border: none; }
+  .drawer-session .events { max-height: 40vh; padding: 0.5rem 0; }
+  .drawer-schedule-hint { color: var(--text-dim); font-size: 0.8rem; margin-top: 0.5rem; }
 </style>
 </head>
 <body>
@@ -777,7 +979,11 @@
     <a href="/crm" class="nav-link">👥 CRM</a>
     <a href="/agents" class="nav-link active">🛠️ Agents</a>
   </nav>
-  <div class="chips" id="chips">
+  <div class="tabs" id="tabs">
+    <button class="tab-btn active" id="tab-btn-board" data-tab="board">Board</button>
+    <button class="tab-btn" id="tab-btn-graph" data-tab="graph">Graph</button>
+  </div>
+  <div class="chips" id="graph-chips" hidden>
     <span class="chip running">running <strong id="chip-running">0</strong></span>
     <span class="chip blocked">blocked <strong id="chip-blocked">0</strong></span>
     <span class="chip">recent <strong id="chip-recent">0</strong></span>
@@ -790,1863 +996,147 @@
     </span>
   </div>
 </header>
-<div class="filters">
-  <div class="search-wrap" id="search-wrap">
-    <input type="search" id="search-input" placeholder="Search sessions…" autocomplete="off" spellcheck="false"
-           title="Search session names and summaries. Matches in visible nodes rank above filtered-out ones; click a result to highlight it." />
-    <div class="search-results" id="search-results" hidden></div>
-  </div>
-  <label title="Include sessions that already finished — completed, failed, or budget-exceeded. Hidden by default so the graph focuses on what's live right now."><input type="checkbox" id="filter-terminal" /> include finished</label>
-  <label title="Hide sessions whose last activity is older than this. Default flips to 1 week when 'include finished' is on; 30min otherwise.">recency
-    <select id="filter-recency">
-      <option value="60">1 min</option>
-      <option value="1800" selected>30 min</option>
+
+<!-- Board tab (#850) — the primary /agents view. -->
+<div class="tab-view" id="board-view">
+  <div class="board-filters" id="board-filters">
+    <input type="search" id="board-search" placeholder="Search cards…" autocomplete="off" spellcheck="false" />
+    <select id="board-filter-lane" title="Lane">
+      <option value="all">all lanes</option>
+      <option value="unassigned">Unassigned</option>
+      <option value="assigned">Assigned</option>
+      <option value="in_progress">In progress</option>
+      <option value="human_queue">Human queue</option>
+      <option value="scheduled">Scheduled</option>
+      <option value="review">Review</option>
+      <option value="done">Done</option>
+    </select>
+    <select id="board-filter-assignee" title="Assignee">
+      <option value="all">any assignee</option>
+      <option value="unassigned">unassigned</option>
+      <option value="me">me</option>
+      <option value="claude">claude</option>
+      <option value="codex">codex</option>
+      <option value="hermes">hermes</option>
+      <option value="local">local</option>
+    </select>
+    <select id="board-filter-host" title="Host"><option value="all">all hosts</option></select>
+    <input type="text" id="board-filter-tag" placeholder="tag" />
+    <select id="board-filter-context" title="Context"><option value="all">all contexts</option></select>
+    <select id="board-filter-recency" title="Recency">
+      <option value="all" selected>all time</option>
+      <option value="3600">1 h</option>
       <option value="86400">24 h</option>
       <option value="604800">1 wk</option>
-      <option value="all">all time</option>
     </select>
-  </label>
-  <label title="Limit to sessions whose project working directory matches.">cwd
-    <select id="filter-cwd">
-      <option value="all">all</option>
-    </select>
-  </label>
-  <label title="Limit to sessions running on a specific machine.">host
-    <select id="filter-host">
-      <option value="all">all</option>
-    </select>
-  </label>
-  <label>route
-    <select id="filter-route">
-      <option value="all">all</option>
-      <option value="local">local</option>
-      <option value="remote">remote</option>
-      <option value="claude">claude</option>
-      <option value="claude_code">claude code</option>
-      <option value="codex">codex</option>
-    </select>
-  </label>
-  <label>status
-    <select id="filter-status">
-      <option value="all">all</option>
-      <option value="running">running</option>
-      <option value="claimed">claimed</option>
-      <option value="yielded">yielded</option>
-      <option value="inactive">inactive</option>
-      <option value="idle">idle</option>
-      <option value="blocked">blocked</option>
-      <option value="completed">completed</option>
-      <option value="ended">ended</option>
-      <option value="failed">failed</option>
-    </select>
-  </label>
-  <span style="margin-left:auto;color:var(--text-dim);font-size:0.75rem" id="connection-state">connecting…</span>
+    <label><input type="checkbox" id="board-filter-done" /> include cancelled</label>
+    <button id="board-new-card" type="button">+ New card</button>
+    <span id="board-connection-state">connecting…</span>
+  </div>
+  <div id="board-lanes"></div>
 </div>
-<main>
-  <section id="graph">
-    <svg id="graph-svg" preserveAspectRatio="xMidYMid meet"></svg>
-    <div class="empty-state" id="empty-state">
-      <div class="icon">🛠️</div>
-      <div class="label">No agent sessions yet</div>
-      <div class="hint">Sessions will appear here when an <code>#agent</code> task is claimed.</div>
+<div class="board-drawer-backdrop" id="board-drawer-backdrop" hidden>
+  <aside class="board-drawer" id="board-drawer"></aside>
+</div>
+
+<!-- Graph tab (#850) — the pre-#850 /agents page, unchanged, as a secondary tab. -->
+<div class="tab-view" id="graph-view" hidden>
+  <div class="filters">
+    <div class="search-wrap" id="search-wrap">
+      <input type="search" id="search-input" placeholder="Search sessions…" autocomplete="off" spellcheck="false"
+             title="Search session names and summaries. Matches in visible nodes rank above filtered-out ones; click a result to highlight it." />
+      <div class="search-results" id="search-results" hidden></div>
     </div>
-  </section>
-  <aside class="panel" id="panel-outer">
-    <div class="panel-resizer" id="panel-resizer" title="Drag to resize"></div>
-    <div class="panel-content" id="panel">
-      <div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>
-    </div>
-  </aside>
-</main>
-
-<script>
-(() => {
-  const STATUS_COLORS = {
-    running:   '#34d399',
-    claimed:   '#60a5fa',
-    yielded:   '#fbbf24',  // agent worker — paused waiting on children
-    inactive:  '#fbbf24',  // claude code — paused, resumable
-    idle:      '#fbbf24',  // cli session — event-driven, waiting for input (not terminal)
-    blocked:   '#fb923c',
-    completed: '#6b7280',
-    ended:     '#6b7280',  // cli session — event-driven, session ended
-    failed:    '#f87171',
-    budget_exceeded: '#f87171',
-  };
-  // NOTE: 'idle' is a live cli session waiting for input — it must NOT be
-  // treated as terminal. Only 'ended' (an explicit SessionEnd event) is.
-  const TERMINAL = new Set(['completed', 'failed', 'budget_exceeded', 'ended']);
-
-  const filterTerminalEl = document.getElementById('filter-terminal');
-  const filterRouteEl = document.getElementById('filter-route');
-  const filterStatusEl = document.getElementById('filter-status');
-  const filterRecencyEl = document.getElementById('filter-recency');
-  const filterCwdEl = document.getElementById('filter-cwd');
-  const filterHostEl = document.getElementById('filter-host');
-  const connStateEl = document.getElementById('connection-state');
-  const emptyStateEl = document.getElementById('empty-state');
-  const panelEl = document.getElementById('panel');
-  const panelOuterEl = document.getElementById('panel-outer');
-  const panelResizerEl = document.getElementById('panel-resizer');
-  // Operator chooses recency manually → don't auto-flip on include-finished toggle.
-  let recencyManuallySet = false;
-
-  let allSessions = [];
-  let allEdges = [];
-  let selectedSessionId = null;
-  let transcriptES = null;
-
-  // -------------------------------------------------------------------
-  // D3 force-directed graph (mirrors /crm/graph patterns).
-  // Replaced an earlier vis-network implementation — see #173 for context.
-  // -------------------------------------------------------------------
-  const graphEl = document.getElementById('graph');
-  const svg = d3.select('#graph-svg');
-  // viewBox-driven coordinates: pick a virtual canvas and let SVG scale
-  // it to fit the actual element. Easier than tracking pixel size and
-  // resizing canvases — and gives us a clean window for the recency-x rail.
-  const VIEW_W = 1600;
-  const VIEW_H = 1100;
-  svg.attr('viewBox', `0 0 ${VIEW_W} ${VIEW_H}`);
-  // Allow the SVG to render content outside the viewBox so collision-pushed
-  // nodes don't get clipped at the edges. The viewBox is the *intended*
-  // window; physics may briefly nudge nodes beyond it.
-  svg.style('overflow', 'visible');
-  // Single zoomable viewport that wraps both layers — the d3.zoom behavior
-  // mutates this group's transform, mirroring /crm/graph (crm.html:17528).
-  const viewport = svg.append('g').attr('class', 'viewport');
-  const linkLayer = viewport.append('g').attr('class', 'links');
-  const nodeLayer = viewport.append('g').attr('class', 'nodes');
-
-  // Pan (drag background) + zoom (wheel / pinch). d3.drag on nodes stops
-  // propagation, so node-drags don't also pan the canvas.
-  const zoom = d3.zoom()
-    .scaleExtent([0.2, 5])
-    .on('zoom', (event) => {
-      viewport.attr('transform', event.transform);
-    });
-  svg.call(zoom);
-  // Match crm.html: cursor hint on the background so the operator knows it's
-  // pannable. Node cursors override this when hovering a draggable node.
-  svg.style('cursor', 'grab');
-  svg.on('mousedown.cursor', () => svg.style('cursor', 'grabbing'));
-  svg.on('mouseup.cursor',   () => svg.style('cursor', 'grab'));
-
-  // Click on empty SVG background → deselect (mirrors /crm/graph's
-  // close-panels-on-empty-click pattern at crm.html:17522). Node clicks bubble
-  // up too, but we only act when the target is the svg itself.
-  svg.on('click', (event) => {
-    if (event.target === svg.node() && selectedSessionId) closePanel();
-  });
-
-  // Width fraction of the viewBox used by the recency rail. Scales with the
-  // visible-node count: 1 node centers, 2 nodes sit on a narrow band, many
-  // nodes spread across most of the canvas.
-  let visibleCount = 0;
-  // Sorted-and-joined visible session_id set from the previous render. Used
-  // to detect structural changes (filter operations, new sessions arriving,
-  // sessions terminating out of view) so the simulation only re-energizes
-  // when there's an actual reason to move nodes — never on a same-set
-  // snapshot tick, which would otherwise jitter every 2 seconds.
-  let _lastVisibleIdsKey = '';
-  // Click-vs-dblclick debounce on graph nodes. See node `.on('click')` /
-  // `.on('dblclick')` handlers — a deferred timer lets a second click
-  // arrive in time to cancel the panel toggle and run Go To instead.
-  let _nodeClickTimer = null;
-  function recencyRailSpan() {
-    if (visibleCount <= 1) return 0;
-    return Math.min(0.84, 0.15 + 0.15 * Math.log2(visibleCount));
-  }
-
-  // Map session.last_activity_at → x in viewBox coords. Newer to the right,
-  // older to the left, clamped at 24h. Width of the rail shrinks as
-  // visibleCount shrinks so single-node filters end up centered.
-  function recencyTargetX(s) {
-    const span = recencyRailSpan();
-    const nowSec = Date.now() / 1000;
-    const ageSec = Math.max(0, nowSec - (s.last_activity_at || nowSec));
-    const ageNorm = Math.min(ageSec, 86400) / 86400;
-    return VIEW_W * (0.5 + span / 2 - ageNorm * span);
-  }
-
-  // Force simulation. Constants chosen to mirror /crm/graph's settled feel:
-  // weak link strength, strong charge, very weak centering, and aggressive
-  // collision so the token-based-sized nodes never overlap.
-  const simulation = d3.forceSimulation()
-    .force('link', d3.forceLink().id(d => d.session_id).distance(80).strength(0.04))
-    .force('charge', d3.forceManyBody().strength(-220).distanceMax(600))
-    .force('center-y', d3.forceY(VIEW_H / 2).strength(0.12))
-    .force('recency-x', d3.forceX(recencyTargetX).strength(0.18))
-    .force('collide', d3.forceCollide().radius(d => collideRadius(d)).strength(0.9))
-    .alphaDecay(0.025)
-    .alphaMin(0.001)
-    .velocityDecay(0.45);
-
-  // 8-second backstop in case the simulation doesn't naturally converge.
-  setTimeout(() => simulation.alpha(0).stop(), 8000);
-
-  // Per-tick: position SVG elements from the simulation's computed (x, y).
-  simulation.on('tick', () => {
-    nodeLayer.selectAll('.node').attr('transform', d => `translate(${d.x},${d.y})`);
-    linkLayer.selectAll('.link').attr('d', d => {
-      const sx = d.source.x, sy = d.source.y;
-      const tx = d.target.x, ty = d.target.y;
-      // Gentle curve so spawn edges don't all sit on top of each other.
-      const dx = tx - sx, dy = ty - sy;
-      const dr = Math.sqrt(dx * dx + dy * dy) * 1.6 || 1;
-      return `M${sx},${sy}A${dr},${dr} 0 0,1 ${tx},${ty}`;
-    });
-  });
-
-  // Strip the user's home directory prefix for display.
-  // /home/user/Code/LifeOS → /Code/LifeOS
-  function shortenCwd(p) {
-    if (!p) return p;
-    const m = p.match(/^\/(home|Users)\/[^/]+(\/.*)?$/);
-    if (m) return m[2] || '/';
-    return p;
-  }
-
-  // Re-populate the cwd dropdown with unique decoded_cwd values from the
-  // snapshot. Preserves operator selection if the chosen cwd still exists.
-  let _lastCwdOptionKey = '';
-  let _lastHostOptionKey = '';
-  function updateCwdOptions(sessions) {
-    if (!filterCwdEl) return;
-    const cwds = [...new Set(sessions.map(s => s.decoded_cwd).filter(Boolean))].sort();
-    const key = cwds.join('|');
-    if (key === _lastCwdOptionKey) return;
-    _lastCwdOptionKey = key;
-    const current = filterCwdEl.value;
-    filterCwdEl.innerHTML = '<option value="all">all</option>'
-      + cwds.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(shortenCwd(c))}</option>`).join('');
-    if (current && (current === 'all' || cwds.includes(current))) {
-      filterCwdEl.value = current;
-    }
-    const wrap = filterCwdEl.closest('label');
-    if (wrap) wrap.style.display = cwds.length > 0 ? '' : 'none';
-  }
-
-  // Host filter (#849) — same pattern as cwd above: options derive from
-  // whatever hosts are present in the current snapshot (local + any
-  // cross-machine cli_sessions rows), hidden entirely on a single-host
-  // deployment where the filter has nothing to distinguish.
-  function updateHostOptions(sessions) {
-    if (!filterHostEl) return;
-    const hosts = [...new Set(sessions.map(s => s.host).filter(Boolean))].sort();
-    const key = hosts.join('|');
-    if (key === _lastHostOptionKey) return;
-    _lastHostOptionKey = key;
-    const current = filterHostEl.value;
-    filterHostEl.innerHTML = '<option value="all">all</option>'
-      + hosts.map(h => `<option value="${escapeHtml(h)}">${escapeHtml(h)}</option>`).join('');
-    if (current && (current === 'all' || hosts.includes(current))) {
-      filterHostEl.value = current;
-    }
-    const wrap = filterHostEl.closest('label');
-    if (wrap) wrap.style.display = hosts.length > 1 ? '' : 'none';
-  }
-
-  function applyFilters(sessions) {
-    const showTerm = filterTerminalEl.checked;
-    const route = filterRouteEl.value;
-    const status = filterStatusEl.value;
-    const recencyRaw = filterRecencyEl ? filterRecencyEl.value : 'all';
-    const recencySec = (recencyRaw === 'all') ? null : Number(recencyRaw);
-    const cwdSel = filterCwdEl ? filterCwdEl.value : 'all';
-    const hostSel = filterHostEl ? filterHostEl.value : 'all';
-    const nowSec = Date.now() / 1000;
-    return sessions.filter(s => {
-      if (!showTerm && TERMINAL.has(s.status)) return false;
-      if (recencySec !== null && s.last_activity_at
-          && (nowSec - s.last_activity_at) > recencySec) {
-        return false;
-      }
-      if (cwdSel !== 'all' && s.decoded_cwd !== cwdSel) return false;
-      if (hostSel !== 'all' && s.host !== hostSel) return false;
-      if (route !== 'all') {
-        const r = s.routing || 'local';
-        if (r !== route) return false;
-      }
-      if (status !== 'all' && s.status !== status) return false;
-      return true;
-    });
-  }
-
-  function applyRecencyDefault() {
-    if (recencyManuallySet || !filterRecencyEl) return;
-    filterRecencyEl.value = filterTerminalEl.checked ? '604800' : '1800';
-  }
-  applyRecencyDefault();
-
-  function routingLabel(routing) {
-    if (!routing || routing === 'local') return 'Local';
-    if (routing === 'claude_code' || routing === 'code') return 'Claude Code';
-    if (routing === 'codex') return 'Codex';
-    if (routing === 'remote') return 'Remote';  // #809: #cloud tag, not Anthropic
-    return 'Claude';
-  }
-
-  // Hex helper — lighten/darken/transparentize a color for terminal nodes
-  // so completed/failed sessions read as "done" without losing their status hue.
-  function hexWithAlpha(hex, alpha) {
-    const h = hex.replace('#', '');
-    const r = parseInt(h.slice(0, 2), 16);
-    const g = parseInt(h.slice(2, 4), 16);
-    const b = parseInt(h.slice(4, 6), 16);
-    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-  }
-
-  // Token-based sizing. Log scale so a 100k-token session is roughly 2x the
-  // size of a 1k-token session — not 100x. Capped at 56 so the canvas
-  // doesn't get dominated by one fat node.
-  function sizeForTokens(totalTokens) {
-    const t = Math.max(0, totalTokens || 0);
-    const grown = Math.log10(t + 10) * 6; // log10(10)=1 → +6; log10(100k)≈5 → +30
-    return Math.min(56, Math.max(14, 14 + grown));
-  }
-
-  // Node radius in viewBox units — used by collide force and shape sizing.
-  // Drives the visual size across all three shape types (circle / rect /
-  // diamond) so size still encodes token volume.
-  function nodeRadius(d) {
-    return sizeForTokens(
-      (d.total_input_tokens || 0)
-      + (d.total_output_tokens || 0)
-      + (d.total_cache_creation_tokens || 0)
-      + (d.total_cache_read_tokens || 0)
-    );
-  }
-
-  // Build the SVG content for a node group: shape + label. Shape varies by
-  // routing (circle / rounded rect / diamond) but the per-frame transform
-  // is handled by the simulation tick. Status color → fill; token volume →
-  // size; recent activity (<60s) → `.pulsing` class for CSS keyframe.
-  function nodeColors(d) {
-    const c = STATUS_COLORS[d.status] || '#6b7280';
-    const isTerm = TERMINAL.has(d.status);
-    return {
-      fill: isTerm ? hexWithAlpha(c, 0.35) : hexWithAlpha(c, 0.85),
-      stroke: c,
-      borderWidth: d.status === 'blocked' ? 4 : 2,
-    };
-  }
-
-  function nodeLabel(d) {
-    // Prefer the LLM-generated short label when we have one — it tells the
-    // operator what the session is actually about, which is far more useful
-    // than knowing it ran on Opus vs. Sonnet. Falls back to the model badge
-    // until the summary is fetched (lazy, on panel open).
-    // An operator-pinned manual label wins over everything else.
-    if (d.custom_label) return d.custom_label;
-    if (d.short_label) return d.short_label;
-    const isCli = d.source === 'claude_code' || d.source === 'codex';
-    let label = d.model_label || routingLabel(d.routing) || d.session_id.slice(0, 8);
-    // Generic CLI fallbacks aren't informative — replace with a placeholder.
-    if (isCli && (label === 'Claude Code' || label === 'Codex')) label = '?';
-    return label;
-  }
-
-  // --- Label wrapping ---------------------------------------------------
-  // SVG <text> never wraps on its own, so long session labels used to run
-  // off in a single line and overlap neighbouring nodes. We word-wrap into
-  // multiple <tspan> lines and cap at LABEL_MAX_LINES (excess truncated with
-  // an ellipsis). Widths are estimated from character counts rather than
-  // measured with getComputedTextLength — deterministic, cheap per render,
-  // and avoids the 0-width result you get when the tab is backgrounded.
-  const LABEL_CHAR_W = 6.6;   // approx px per char at the 12px label font
-  const LABEL_MAX_W = 132;    // max line width in viewBox units before wrapping
-  const LABEL_MAX_CHARS = Math.floor(LABEL_MAX_W / LABEL_CHAR_W);  // ~20
-  const LABEL_LINE_H = 13;    // line height in viewBox units
-  const LABEL_MAX_LINES = 3;
-  const LABEL_GAP = 14;       // gap between node edge and first label baseline
-
-  // Greedy word-wrap to a character budget. Words longer than the budget are
-  // hard-broken so a single long token (e.g. a hyphen-free slug) still wraps.
-  function wrapLabelText(str, maxChars) {
-    const words = String(str).split(/\s+/).filter(Boolean);
-    const lines = [];
-    let line = '';
-    for (let w of words) {
-      // Hard-break any single word that can't fit on its own line.
-      while (w.length > maxChars) {
-        if (line) { lines.push(line); line = ''; }
-        lines.push(w.slice(0, maxChars));
-        w = w.slice(maxChars);
-      }
-      const candidate = line ? line + ' ' + w : w;
-      if (candidate.length > maxChars) {
-        if (line) lines.push(line);
-        line = w;
-      } else {
-        line = candidate;
-      }
-    }
-    if (line) lines.push(line);
-    return lines.length ? lines : [''];
-  }
-
-  // Render a node's (possibly multi-line) label into its <text> element and
-  // stash the resulting line count / pixel width on the datum so the collide
-  // force can reserve room for it. `this` is the <text> element.
-  function renderNodeLabel(d) {
-    const textEl = d3.select(this);
-    let lines = wrapLabelText(nodeLabel(d), LABEL_MAX_CHARS);
-    if (lines.length > LABEL_MAX_LINES) {
-      lines = lines.slice(0, LABEL_MAX_LINES);
-      let last = lines[LABEL_MAX_LINES - 1];
-      if (last.length >= LABEL_MAX_CHARS) last = last.slice(0, LABEL_MAX_CHARS - 1);
-      lines[LABEL_MAX_LINES - 1] = last.replace(/\s+$/, '') + '…';
-    }
-    textEl.attr('y', nodeRadius(d) + LABEL_GAP).text(null);
-    lines.forEach((ln, i) => {
-      textEl.append('tspan')
-        .attr('x', 0)
-        .attr('dy', i === 0 ? 0 : LABEL_LINE_H)
-        .text(ln);
-    });
-    d._labelLines = lines.length;
-    d._labelW = Math.max(...lines.map(l => l.length)) * LABEL_CHAR_W;
-  }
-
-  // Collision radius that encloses both the node shape and its label block so
-  // neither shapes nor labels overlap once the simulation settles. The label
-  // sits centred below the node; the farthest point is a bottom corner of its
-  // bounding box, so we use the hypotenuse from node centre to that corner.
-  // Scaled down slightly (corners are conservative) to avoid over-sparsing.
-  function collideRadius(d) {
-    const r = nodeRadius(d);
-    const lines = d._labelLines || 1;
-    const halfW = Math.max(r, (d._labelW || 0) / 2) + 6;
-    const labelBottom = r + LABEL_GAP + (lines - 1) * LABEL_LINE_H + LABEL_LINE_H * 0.5;
-    const enclose = Math.hypot(halfW, labelBottom) * 0.85;
-    return Math.max(r + 14, enclose);
-  }
-
-  // Human-readable source label. Codex and Claude Code are both CLI surfaces;
-  // anything else is the LifeOS agent worker.
-  function sourceLabelFor(d) {
-    if (d.source === 'claude_code') return 'Claude Code CLI';
-    if (d.source === 'codex') return 'Codex CLI';
-    return 'LifeOS agent';
-  }
-
-  function nodeTitle(d) {
-    return [
-      d.label,
-      d.decoded_cwd ? `cwd: ${d.decoded_cwd}` : null,
-      `source: ${sourceLabelFor(d)}`,
-      `status: ${d.status}`,
-      `routing: ${routingLabel(d.routing)}`,
-      `tokens: ${d.total_input_tokens} in / ${d.total_output_tokens} out`,
-      `cost: $${(d.total_dollars || 0).toFixed(4)}`,
-      d.last_event_kind ? `last: ${d.last_event_kind}` : null,
-    ].filter(Boolean).join('\n');
-  }
-
-  function isActivelyWriting(d) {
-    const nowSec = Date.now() / 1000;
-    return d.status === 'running'
-      && d.last_activity_at
-      && (nowSec - d.last_activity_at) < 60;
-  }
-
-  function nodeShapeTag(d) {
-    // Shape encodes where the agent runs — applied uniformly to top-level
-    // sessions and subagents. CLI = rounded square (Claude Code OR Codex),
-    // local agent = diamond, cloud agent (Claude API) = circle. Mirrors
-    // routingLabel()'s buckets.
-    if (d.source === 'claude_code' || d.source === 'codex'
-        || d.routing === 'claude_code' || d.routing === 'codex') return 'rect';
-    if (!d.routing || d.routing === 'local') return 'polygon';  // local: diamond
-    return 'circle';                       // cloud (Claude): dot
-  }
-
-  // Set shape-specific attrs (radius/width/points). Called on enter+update.
-  function applyShapeAttrs(sel) {
-    sel.each(function(d) {
-      const el = d3.select(this);
-      const r = nodeRadius(d);
-      const colors = nodeColors(d);
-      el.attr('fill', colors.fill).attr('stroke', colors.stroke)
-        .attr('stroke-width', colors.borderWidth)
-        .classed('pulsing', isActivelyWriting(d));
-      if (this.tagName === 'circle') {
-        el.attr('r', r);
-      } else if (this.tagName === 'rect') {
-        const side = r * 1.8;
-        el.attr('x', -side / 2).attr('y', -side / 2)
-          .attr('width', side).attr('height', side)
-          .attr('rx', Math.min(side * 0.22, 12))
-          .attr('ry', Math.min(side * 0.22, 12));
-      } else if (this.tagName === 'polygon') {
-        // Diamond: 4 vertices, half-side = r * sqrt(2)/2 * 1.4
-        const h = r * 1.4;
-        el.attr('points', `0,${-h} ${h},0 0,${h} ${-h},0`);
-      }
-    });
-  }
-
-  // Incremental D3 join — nodes and links carry session_id and edge id as
-  // keys so positions persist across snapshot ticks. Simulation gets the
-  // updated array and `alpha(0.3).restart()` reflows new arrivals.
-  function renderGraph(sessions, snapshotEdges) {
-    const visible = applyFilters(sessions);
-    const visibleIds = new Set(visible.map(s => s.session_id));
-
-    // ----- Links (parent → subagent spawn edges) -----
-    const visibleLinks = (snapshotEdges || [])
-      .filter(e => visibleIds.has(e.from) && visibleIds.has(e.to))
-      .map(e => ({ id: `${e.from}->${e.to}`, source: e.from, target: e.to }));
-
-    linkLayer.selectAll('path.link')
-      .data(visibleLinks, d => d.id)
-      .join(
-        enter => enter.append('path').attr('class', 'link'),
-        update => update,
-        exit => exit.remove()
-      );
-
-    // ----- Nodes -----
-    // Preserve per-node positions across re-renders by reading them off the
-    // simulation's previous data, so a snapshot tick doesn't jitter the
-    // already-laid-out nodes.
-    const oldById = new Map();
-    nodeLayer.selectAll('.node').each(function(d) { oldById.set(d.session_id, d); });
-    const merged = visible.map(s => {
-      const prev = oldById.get(s.session_id);
-      if (prev) {
-        // Mutate prev in place (D3 forces hold the same object reference).
-        Object.assign(prev, s);
-        return prev;
-      }
-      // New node — seed at recency-x target so it doesn't fly in from (0, 0).
-      return Object.assign({ x: recencyTargetX(s), y: VIEW_H / 2 }, s);
-    });
-
-    const sel = nodeLayer.selectAll('.node')
-      .data(merged, d => d.session_id);
-
-    const entered = sel.enter().append('g')
-      .attr('class', 'node')
-      .style('cursor', 'grab')
-      .call(d3.drag()
-        .on('start', (event, d) => {
-          if (!event.active) simulation.alphaTarget(0.1).restart();
-          d.fx = d.x;
-          d.fy = d.y;
-        })
-        .on('drag', (event, d) => {
-          d.fx = event.x;
-          d.fy = event.y;
-        })
-        .on('end', (event, d) => {
-          if (!event.active) simulation.alphaTarget(0);
-          // Leave fx/fy set so the node stays where dropped (mirrors /crm/graph).
-        }))
-      .on('click', (event, d) => {
-        // Defer the panel toggle so a quick second click can cancel it
-        // and run the dblclick Go To instead. Single-click latency is
-        // ~220ms — noticeable but acceptable for a graph UI where
-        // dblclick is a first-class action.
-        if (_nodeClickTimer) clearTimeout(_nodeClickTimer);
-        _nodeClickTimer = setTimeout(() => {
-          _nodeClickTimer = null;
-          if (d.session_id === selectedSessionId) closePanel();
-          else openPanel(d.session_id);
-        }, 220);
-      })
-      .on('dblclick', (event, d) => {
-        // Double-click = Go To. Handled for both CLI sources (Claude Code
-        // and Codex) since /focus dispatches by prefix; for anything else,
-        // let the deferred single-click panel toggle run normally.
-        const isCli = d.source === 'claude_code' || d.source === 'codex';
-        if (!isCli || d.is_subagent) {
-          return;
-        }
-        event.preventDefault();
-        event.stopPropagation();  // suppress d3.zoom default dblclick zoom-in
-        if (_nodeClickTimer) {
-          clearTimeout(_nodeClickTimer);
-          _nodeClickTimer = null;
-        }
-        focusCcSession(d);
-      });
-    // One shape element per node, type chosen by routing (see nodeShapeTag).
-    entered.append(d => document.createElementNS('http://www.w3.org/2000/svg', nodeShapeTag(d)))
-      .attr('class', 'node-shape');
-    entered.append('title');
-    entered.append('text').attr('class', 'node-label');
-
-    const all = entered.merge(sel);
-    applyShapeAttrs(all.select('.node-shape'));
-    all.select('text.node-label').each(renderNodeLabel);
-    all.select('title').text(d => nodeTitle(d));
-
-    sel.exit().remove();
-
-    // Feed the merged node array + links into the simulation. Only re-energize
-    // alpha when the visible *set* actually changed (new ids appeared or old
-    // ones disappeared) — otherwise the 2s snapshot tick would keep nudging
-    // settled nodes for no structural reason, manifesting as periodic jitter.
-    // visibleCount feeds `recencyRailSpan()` so the rail compresses to center
-    // when few nodes are visible.
-    visibleCount = merged.length;
-    simulation.nodes(merged);
-    simulation.force('link').links(visibleLinks);
-    const visibleIdsKey = visible.map(s => s.session_id).sort().join('|');
-    if (visibleIdsKey !== _lastVisibleIdsKey) {
-      _lastVisibleIdsKey = visibleIdsKey;
-      simulation.alpha(0.3).restart();
-    }
-
-    emptyStateEl.style.display = visible.length === 0 ? '' : 'none';
-    updateChips(visible);
-    updateCwdOptions(allSessions);
-    updateHostOptions(allSessions);
-    applySelectionStyles();
-  }
-
-  // Pull session_id off a link endpoint regardless of whether the force-link
-  // pass has converted it from a string id into a node object yet.
-  function linkEndpoints(e) {
-    const s = (typeof e.source === 'object') ? e.source.session_id : e.source;
-    const t = (typeof e.target === 'object') ? e.target.session_id : e.target;
-    return [s, t];
-  }
-
-  // 1-hop parent/child set for the currently selected session.
-  function relatedTo(sessionId) {
-    const out = new Set();
-    if (!sessionId) return out;
-    linkLayer.selectAll('path.link').each(function(e) {
-      const [s, t] = linkEndpoints(e);
-      if (s === sessionId) out.add(t);
-      if (t === sessionId) out.add(s);
-    });
-    return out;
-  }
-
-  // Toggle .selected / .related / .dimmed across the visible nodes + edges
-  // based on `selectedSessionId`. Cheap to re-run on every render and panel
-  // open/close — no allocations per node beyond the related set.
-  function applySelectionStyles() {
-    const hasSelection = !!selectedSessionId;
-    const related = relatedTo(selectedSessionId);
-
-    nodeLayer.selectAll('.node-shape')
-      .classed('selected', d => hasSelection && d.session_id === selectedSessionId)
-      .classed('related',  d => hasSelection && related.has(d.session_id))
-      .classed('dimmed',   d => hasSelection && d.session_id !== selectedSessionId && !related.has(d.session_id));
-
-    nodeLayer.selectAll('text.node-label')
-      .classed('dimmed', d => hasSelection && d.session_id !== selectedSessionId && !related.has(d.session_id));
-
-    linkLayer.selectAll('path.link')
-      .classed('highlighted', e => {
-        if (!hasSelection) return false;
-        const [s, t] = linkEndpoints(e);
-        return s === selectedSessionId || t === selectedSessionId;
-      })
-      .classed('dimmed', e => {
-        if (!hasSelection) return false;
-        const [s, t] = linkEndpoints(e);
-        return s !== selectedSessionId && t !== selectedSessionId;
-      });
-  }
-
-  function updateChips(sessions) {
-    const running = sessions.filter(s => s.status === 'running').length;
-    const blocked = sessions.filter(s => s.status === 'blocked').length;
-    const recent = sessions.filter(s => s.status === 'completed').length;
-    // CLI-sourced sessions (both Claude Code and Codex) share the chip —
-    // both are subscription-billed surfaces sitting outside the LifeOS
-    // agent worker. Renaming the chip would be a bigger UI change; for
-    // now the count rolls them together.
-    const cli = sessions.filter(s => s.source === 'claude_code' || s.source === 'codex').length;
-    // API spend = LifeOS agent worker sessions only. Claude Code and Codex
-    // CLI both bill against flat subscriptions, not metered API tokens,
-    // so their dollar numbers would distort the chip's "real cost" intent.
-    const apiSpend = sessions
-      .filter(s => s.source !== 'claude_code' && s.source !== 'codex')
-      .reduce((acc, s) => acc + (s.total_dollars || 0), 0);
-    document.getElementById('chip-running').textContent = running;
-    document.getElementById('chip-blocked').textContent = blocked;
-    document.getElementById('chip-recent').textContent = recent;
-    document.getElementById('chip-cc').textContent = cli;
-    document.getElementById('chip-spend').textContent = '$' + apiSpend.toFixed(2);
-  }
-
-  function applySnapshot(snap) {
-    allSessions = snap.sessions || [];
-    allEdges = snap.edges || [];
-    renderGraph(allSessions, allEdges);
-    // Update the panel meta in place if the selected session is still around.
-    // Replacing innerHTML on every tick would wipe the events container and
-    // detach the live SSE renderer — the previous bug where the side panel
-    // blinked into view and then went blank.
-    if (selectedSessionId) {
-      const s = allSessions.find(x => x.session_id === selectedSessionId);
-      if (s) updatePanelMeta(s);
-    }
-  }
-
-  // --- Side panel ---
-  // Build the panel scaffold once per session selection. Subsequent snapshot
-  // ticks call updatePanelMeta() which only touches data-attributed spans —
-  // never the events container. This is what fixes the "click → blink → blank"
-  // bug where the SSE event list was getting destroyed every 2s.
-  function renderPanelHeader(s) {
-    const live = !TERMINAL.has(s.status);
-    const safeStatus = escapeAttr(s.status);
-    const isCli = (s.source === 'claude_code' || s.source === 'codex');
-    const isSubagent = !!s.is_subagent;
-    // No kill button for CLI sessions — we don't have a safe primitive to
-    // terminate them from outside the terminal.
-    const showKill = live && !isCli;
-    // Resume button: only for terminal-state CLI sessions (not subagents).
-    // Whether the backend will actually accept the click depends on
-    // LIFEOS_CC_RESUME_ENABLED / LIFEOS_CODEX_RESUME_ENABLED on the server;
-    // if disabled, click → toast error.
-    const showResume = isCli && !isSubagent && (TERMINAL.has(s.status) || s.status === 'inactive' || s.status === 'yielded');
-    // Go To button: any non-subagent CLI session, including live ones. The
-    // backend uses a stored mapping (set by Resume or by the SessionStart
-    // hook) and falls back to an FD probe so this works for sessions
-    // started organically in wezterm.
-    const showGoTo = isCli && !isSubagent;
-    const sourceLabel = sourceLabelFor(s);
-    const inferredHint = s.status_inferred ? ' (inferred)' : '';
-    panelEl.innerHTML = `
-      <div class="panel-header">
-        <button class="panel-close" aria-label="Close" id="panel-close">×</button>
-        ${showKill ? '<button class="panel-kill" id="panel-kill">Kill</button>' : ''}
-        ${showResume ? '<button class="panel-resume" id="panel-resume" title="Open a new wezterm tab and run claude --resume">Resume</button>' : ''}
-        ${showGoTo ? '<button class="panel-focus" id="panel-focus" title="Jump to the existing wezterm pane for this session (or run Resume if there isn\'t one). Double-clicking the node does the same. Wayland disallows cross-app window raise — click the wezterm dock icon to bring it forward; it will already be on the right pane.">Go To</button>' : ''}
-        <div class="label" data-field="label" title="Click to rename this session">${escapeHtml(s.custom_label || s.label || s.session_id)}</div>
-        <div class="cwd-hint" data-field="cwd-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-all">${s.decoded_cwd ? escapeHtml(s.decoded_cwd) : ''}</div>
-        ${s.branch ? `<div class="branch-hint" data-field="branch-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.1rem">branch: ${escapeHtml(s.branch)}</div>` : ''}
-        <div class="meta" data-field="meta">
-          <span data-field="live-dot">${live ? '<span class="live-dot" title="live"></span>' : ''}</span>
-          <span class="badge status-${safeStatus}" data-field="status">${escapeHtml(s.status + inferredHint)}</span>
-          <span class="badge" data-field="source">${escapeHtml(sourceLabel)}</span>
-          ${s.host ? `<span class="badge" data-field="host" title="Machine this session is running on">${escapeHtml(s.host)}</span>` : ''}
-          <span class="badge" data-field="routing">${escapeHtml(routingLabel(s.routing))}</span>
-          <span class="badge" data-field="cost">$${(s.total_dollars || 0).toFixed(4)}</span>
-          <span class="badge" data-field="tokens">${s.total_input_tokens}↓ / ${s.total_output_tokens}↑</span>
-          <span data-field="depth">${s.spawn_depth ? `<span class="badge">depth ${s.spawn_depth}</span>` : ''}</span>
-        </div>
-        ${s.prompt_preview ? `<div class="prompt-preview-hint" data-field="prompt-preview-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-word">“${escapeHtml(s.prompt_preview)}”</div>` : ''}
+    <label title="Include sessions that already finished — completed, failed, or budget-exceeded. Hidden by default so the graph focuses on what's live right now."><input type="checkbox" id="filter-terminal" /> include finished</label>
+    <label title="Hide sessions whose last activity is older than this. Default flips to 1 week when 'include finished' is on; 30min otherwise.">recency
+      <select id="filter-recency">
+        <option value="60">1 min</option>
+        <option value="1800" selected>30 min</option>
+        <option value="86400">24 h</option>
+        <option value="604800">1 wk</option>
+        <option value="all">all time</option>
+      </select>
+    </label>
+    <label title="Limit to sessions whose project working directory matches.">cwd
+      <select id="filter-cwd">
+        <option value="all">all</option>
+      </select>
+    </label>
+    <label title="Limit to sessions running on a specific machine.">host
+      <select id="filter-host">
+        <option value="all">all</option>
+      </select>
+    </label>
+    <label>route
+      <select id="filter-route">
+        <option value="all">all</option>
+        <option value="local">local</option>
+        <option value="remote">remote</option>
+        <option value="claude">claude</option>
+        <option value="claude_code">claude code</option>
+        <option value="codex">codex</option>
+      </select>
+    </label>
+    <label>status
+      <select id="filter-status">
+        <option value="all">all</option>
+        <option value="running">running</option>
+        <option value="claimed">claimed</option>
+        <option value="yielded">yielded</option>
+        <option value="inactive">inactive</option>
+        <option value="idle">idle</option>
+        <option value="blocked">blocked</option>
+        <option value="completed">completed</option>
+        <option value="ended">ended</option>
+        <option value="failed">failed</option>
+      </select>
+    </label>
+    <span style="margin-left:auto;color:var(--text-dim);font-size:0.75rem" id="connection-state">connecting…</span>
+  </div>
+  <main>
+    <section id="graph">
+      <svg id="graph-svg" preserveAspectRatio="xMidYMid meet"></svg>
+      <div class="empty-state" id="empty-state">
+        <div class="icon">🛠️</div>
+        <div class="label">No agent sessions yet</div>
+        <div class="hint">Sessions will appear here when an <code>#agent</code> task is claimed.</div>
       </div>
-      <div class="session-summary loading" id="session-summary">
-        <div class="ss-label">Summary</div>
-        <div class="ss-short" data-field="ss-short">${escapeHtml(s.short_label || '')}</div>
-        <div class="ss-body" data-field="ss-body">Summarizing…</div>
+    </section>
+    <aside class="panel" id="panel-outer">
+      <div class="panel-resizer" id="panel-resizer" title="Drag to resize"></div>
+      <div class="panel-content" id="panel">
+        <div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>
       </div>
-      <div class="events" id="events"></div>
-    `;
-    document.getElementById('panel-close').onclick = closePanel;
-    const labelEl = panelEl.querySelector('[data-field="label"]');
-    if (labelEl) labelEl.onclick = () => startLabelEdit(s);
-    if (showKill) {
-      document.getElementById('panel-kill').onclick = () => openKillModal(s);
-    }
-    if (showResume) {
-      document.getElementById('panel-resume').onclick = () => resumeCcSession(s);
-    }
-    if (showGoTo) {
-      document.getElementById('panel-focus').onclick = () => focusCcSession(s);
-    }
-  }
+    </aside>
+  </main>
+</div>
 
-  async function focusCcSession(s) {
-    // Called from both the panel Go To button AND the graph node dblclick.
-    // Button reference may be null if dblclick fires before the panel
-    // header rendered — handle gracefully.
-    const btn = document.getElementById('panel-focus');
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = 'Locating…';
-    }
-    try {
-      const r = await fetch(`/api/agents/sessions/${encodeURIComponent(s.session_id)}/focus`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-      });
-      if (!r.ok) {
-        const text = await r.text();
-        let msg = text;
-        try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
-        // 404 = no cached mapping AND probe couldn't find a pane (session
-        // not running, or in a non-wezterm terminal). 410 = mapping existed
-        // and the pane is gone (typical: closed tab); a re-probe also failed.
-        if (r.status === 404) {
-          showToast(`Couldn't locate pane — session not running, wezterm unreachable, or SessionStart hook not installed.`, true);
-        } else if (r.status === 410) {
-          showToast(`Pane no longer exists. Click Resume to open a new one.`, true);
-        } else {
-          showToast(`Go To failed: ${msg}`, true);
-        }
-        return;
-      }
-      // Wayland disallows cross-client window raise, so the pane is selected
-      // inside wezterm but the window doesn't pop forward — set the
-      // expectation in the toast.
-      showToast(`Pane selected in wezterm. Click the wezterm dock icon to bring it forward.`, false);
-    } catch (err) {
-      showToast(`Go To failed: ${err.message}`, true);
-    } finally {
-      setTimeout(() => {
-        if (btn) {
-          btn.disabled = false;
-          btn.textContent = 'Go To';
-        }
-      }, 1500);
+<script type="module">
+  import { initBoard } from '/static/agents/board.js';
+  import { initGraph } from '/static/agents/graph.js';
+
+  const boardView = document.getElementById('board-view');
+  const graphView = document.getElementById('graph-view');
+  const graphChips = document.getElementById('graph-chips');
+  const tabButtons = document.querySelectorAll('.tab-btn');
+  let graphInitialized = false;
+
+  function activateTab(name) {
+    tabButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.tab === name));
+    boardView.hidden = name !== 'board';
+    graphView.hidden = name !== 'graph';
+    graphChips.hidden = name !== 'graph';
+    if (name === 'graph' && !graphInitialized) {
+      graphInitialized = true;
+      initGraph();
     }
   }
 
-  async function resumeCcSession(s) {
-    const btn = document.getElementById('panel-resume');
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = 'Resuming…';
-    }
-    try {
-      const r = await fetch(`/api/agents/sessions/${encodeURIComponent(s.session_id)}/resume`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
-      });
-      if (!r.ok) {
-        const text = await r.text();
-        // FastAPI returns {"detail": "..."} on HTTPException — surface that.
-        let msg = text;
-        try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
-        throw new Error(`HTTP ${r.status}: ${msg}`);
-      }
-      const result = await r.json();
-      // With the default wezterm launcher the inner command is already
-      // running inside the new tab — no paste needed. The server still
-      // copies it to the clipboard as a backup in case the operator has
-      // overridden cc_resume_cmd to a launcher that opens an empty
-      // terminal (e.g. legacy `warp://` flow).
-      let copied = !!result.clipboard_copied;
-      if (!copied && result.inner_command && navigator.clipboard && navigator.clipboard.writeText) {
-        try {
-          await navigator.clipboard.writeText(result.inner_command);
-          copied = true;
-        } catch (_) {
-          // ignore — toast will show the command for manual copy
-        }
-      }
-      if (result.pane_id != null) {
-        showToast(`Wezterm tab opened (pane ${result.pane_id}). Focus button will return here.`, false);
-      } else if (copied) {
-        showToast(`Tab opened. Resume command copied to clipboard — paste it.`, false);
-      } else if (result.inner_command) {
-        showToast(`Tab opened. Run: ${result.inner_command}`, false);
-      } else {
-        showToast(`Spawned (pid ${result.pid}) in ${result.cwd}`, false);
-      }
-    } catch (err) {
-      showToast(`Resume failed: ${err.message}`, true);
-    } finally {
-      // Re-enable after a beat so accidental double-click is harmless.
-      setTimeout(() => {
-        if (btn) {
-          btn.disabled = false;
-          btn.textContent = 'Resume';
-        }
-      }, 4000);
-    }
-  }
+  tabButtons.forEach(btn => btn.addEventListener('click', () => activateTab(btn.dataset.tab)));
 
-  // In-place metadata refresh — keeps the events container intact across
-  // snapshot ticks. Only updates fields by their data-field selectors.
-  function updatePanelMeta(s) {
-    if (!panelEl) return;
-    const setText = (sel, text) => {
-      const el = panelEl.querySelector(`[data-field="${sel}"]`);
-      if (el) el.textContent = text;
-    };
-    const setHtml = (sel, html) => {
-      const el = panelEl.querySelector(`[data-field="${sel}"]`);
-      if (el) el.innerHTML = html;
-    };
-    const inferredHint = s.status_inferred ? ' (inferred)' : '';
-    const sourceLabel = sourceLabelFor(s);
-    // Don't overwrite the title while the operator is mid-rename.
-    if (!panelEl.querySelector('#label-edit-input')) {
-      setText('label', s.custom_label || s.label || s.session_id);
-    }
-    setText('status', s.status + inferredHint);
-    setText('source', sourceLabel);
-    setText('routing', routingLabel(s.routing));
-    setText('cost', '$' + (s.total_dollars || 0).toFixed(4));
-    setText('tokens', `${s.total_input_tokens}↓ / ${s.total_output_tokens}↑`);
-    setText('cwd-hint', s.decoded_cwd || '');
-
-    // Status changed → swap the badge class so the color follows.
-    const statusBadge = panelEl.querySelector('[data-field="status"]');
-    if (statusBadge) {
-      statusBadge.className = `badge status-${escapeAttr(s.status)}`;
-    }
-
-    // Live dot + kill button visibility track terminal state.
-    const live = !TERMINAL.has(s.status);
-    setHtml('live-dot', live ? '<span class="live-dot" title="live"></span>' : '');
-    setHtml('depth', s.spawn_depth ? `<span class="badge">depth ${s.spawn_depth}</span>` : '');
-
-    const killBtn = document.getElementById('panel-kill');
-    if (live && !killBtn) {
-      // Add the kill button if the session just transitioned to non-terminal
-      // (rare; usually the other direction).
-      const header = panelEl.querySelector('.panel-header');
-      if (header) {
-        const closeBtn = header.querySelector('#panel-close');
-        const btn = document.createElement('button');
-        btn.className = 'panel-kill';
-        btn.id = 'panel-kill';
-        btn.textContent = 'Kill';
-        btn.onclick = () => openKillModal(s);
-        header.insertBefore(btn, closeBtn);
-      }
-    } else if (!live && killBtn) {
-      killBtn.remove();
-    }
-  }
-
-  function openKillModal(session) {
-    // BFS down parent_session_id so non-root targets only show *their* subtree,
-    // matching the backend cascade scope. (Filtering by root_session_id would
-    // wrongly include unrelated peers under the same root.)
-    const childrenOf = new Map();
-    for (const x of allSessions) {
-      if (!x.parent_session_id) continue;
-      if (!childrenOf.has(x.parent_session_id)) childrenOf.set(x.parent_session_id, []);
-      childrenOf.get(x.parent_session_id).push(x);
-    }
-    const descendants = [];
-    const queue = [session.session_id];
-    const seen = new Set([session.session_id]);
-    while (queue.length) {
-      const sid = queue.shift();
-      for (const child of (childrenOf.get(sid) || [])) {
-        if (seen.has(child.session_id)) continue;
-        seen.add(child.session_id);
-        if (!TERMINAL.has(child.status)) descendants.push(child);
-        queue.push(child.session_id);
-      }
-    }
-    const backdrop = document.createElement('div');
-    backdrop.className = 'modal-backdrop';
-    backdrop.innerHTML = `
-      <div class="modal" role="dialog" aria-labelledby="kill-title">
-        <h2 id="kill-title">Kill agent session?</h2>
-        <div class="target">${escapeHtml(session.label || session.session_id)}</div>
-        ${descendants.length > 0 ? `
-          <div class="descendants">
-            Will also kill ${descendants.length} descendant${descendants.length === 1 ? '' : 's'}:
-            ${descendants.slice(0, 5).map(d =>
-              `<div>• ${escapeHtml(d.label || d.session_id)}</div>`
-            ).join('')}
-            ${descendants.length > 5 ? `<div>…and ${descendants.length - 5} more</div>` : ''}
-          </div>
-        ` : ''}
-        <label style="font-size:0.75rem;color:var(--text-secondary)">Reason (optional)</label>
-        <textarea id="kill-reason" placeholder="Why are you killing this?"></textarea>
-        <div class="actions">
-          <button id="kill-cancel">Cancel</button>
-          <button class="danger" id="kill-confirm">Kill</button>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(backdrop);
-    const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
-    backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
-    document.getElementById('kill-cancel').onclick = cleanup;
-    document.getElementById('kill-confirm').onclick = async () => {
-      const reason = document.getElementById('kill-reason').value || '';
-      const confirmBtn = document.getElementById('kill-confirm');
-      confirmBtn.disabled = true;
-      confirmBtn.textContent = 'Killing…';
-      try {
-        const r = await fetch(`/api/agents/sessions/${encodeURIComponent(session.session_id)}/kill`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ reason }),
-        });
-        if (!r.ok) {
-          const text = await r.text();
-          throw new Error(`HTTP ${r.status}: ${text}`);
-        }
-        const result = await r.json();
-        const failures = result.failures || [];
-        const killed = result.killed || [];
-        if (killed.length === 0 && result.reason) {
-          showToast(`Already ${result.reason}`, false);
-        } else if (failures.length === 0) {
-          showToast(`Killed ${killed.length} session${killed.length === 1 ? '' : 's'}`, false);
-        } else {
-          showToast(`Killed ${killed.length}; ${failures.length} remote failure(s)`, true);
-        }
-        cleanup();
-      } catch (err) {
-        showToast(`Kill failed: ${err.message}`, true);
-        confirmBtn.disabled = false;
-        confirmBtn.textContent = 'Kill';
-      }
-    };
-  }
-
-  function showToast(message, isError) {
-    const t = document.createElement('div');
-    t.className = 'toast' + (isError ? ' error' : '');
-    t.textContent = message;
-    document.body.appendChild(t);
-    setTimeout(() => { if (t.parentNode) t.parentNode.removeChild(t); }, 3500);
-  }
-
-  function closePanel() {
-    selectedSessionId = null;
-    eventKindFilter = null;
-    if (transcriptES) { transcriptES.close(); transcriptES = null; }
-    panelEl.innerHTML = '<div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>';
-    applySelectionStyles();
-  }
-
-  function openPanel(sessionId) {
-    if (transcriptES) { transcriptES.close(); transcriptES = null; }
-    // Reset filter when switching sessions — kinds are session-scoped.
-    eventKindFilter = null;
-    selectedSessionId = sessionId;
-    applySelectionStyles();
-    const s = allSessions.find(x => x.session_id === sessionId);
-    if (!s) return;
-    renderPanelHeader(s);
-    fetchSessionSummary(sessionId);
-    loadSessionEvents(sessionId, 0);
-  }
-
-  // Backfill the transcript, then open the live SSE tail. The backfill is a
-  // one-shot fetch, so a transient failure — most often the server being
-  // bounced by another agent's commit/deploy hook — would otherwise leave a
-  // dead panel ("Failed to load events") until the operator re-clicks the
-  // node. Retry a few times with backoff to ride through a restart window,
-  // then fall back to a manual Retry link (mirrors the summary's recovery).
-  // The live SSE (opened only after a successful backfill) auto-reconnects on
-  // its own, so once the server is back the feed self-heals.
-  const _EVENTS_RETRY_DELAYS = [800, 1600, 3200];  // ms; ~5.6s before giving up
-  function loadSessionEvents(sessionId, attempt) {
-    fetch(`/api/agents/sessions/${encodeURIComponent(sessionId)}/events?limit=200`)
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .then(payload => {
-        // Bail if the operator switched sessions while we were loading.
-        if (sessionId !== selectedSessionId) return;
-        const events = payload.events || [];
-        // Default kind-filter to user_message when any exist — most of the
-        // time the operator just wants to skim the user prompts. If there
-        // are none (e.g. a freshly-spawned subagent), no filter is applied.
-        if (events.some(ev => (ev.kind || '') === 'user_message')) {
-          eventKindFilter = 'user_message';
-        }
-        const container = document.getElementById('events');
-        if (container) container.innerHTML = '';  // clear any reconnect/error notice
-        events.forEach(ev => appendEvent(ev, false));
-        applyEventFilter();
-        // Now open live SSE.
-        const es = new EventSource(`/api/agents/sessions/${encodeURIComponent(sessionId)}/stream?backfill=0`);
-        transcriptES = es;
-        es.addEventListener('transcript_event', e => {
-          try { appendEvent(JSON.parse(e.data), true); } catch (_) {}
-        });
-        es.addEventListener('closed', () => { es.close(); });
-        es.onerror = () => {}; // browser auto-retries
-      })
-      .catch(err => {
-        // Stale — the operator moved to another session; let that load win.
-        if (sessionId !== selectedSessionId) return;
-        const container = document.getElementById('events');
-        if (!container) return;
-        if (attempt < _EVENTS_RETRY_DELAYS.length) {
-          container.innerHTML = '<div class="event">Loading events… (reconnecting)</div>';
-          setTimeout(() => {
-            if (sessionId === selectedSessionId) loadSessionEvents(sessionId, attempt + 1);
-          }, _EVENTS_RETRY_DELAYS[attempt]);
-        } else {
-          container.innerHTML = `<div class="event">Failed to load events: ${escapeHtml(String(err))} <a href="#" data-action="retry-events" style="color:var(--accent)">Retry</a></div>`;
-          const retry = container.querySelector('[data-action="retry-events"]');
-          if (retry) retry.addEventListener('click', ev => {
-            ev.preventDefault();
-            container.innerHTML = '<div class="event">Loading events…</div>';
-            loadSessionEvents(sessionId, 0);
-          });
-        }
-      });
-  }
-
-  // Track the in-flight summary fetch so a new openPanel can abort the old
-  // one — otherwise stale long-running fetches pile up behind Gemma.
-  let summaryAbort = null;
-
-  // Turn the panel title into an inline text box prepopulated with the
-  // current label. Enter (or blur) saves, Escape cancels. An empty save
-  // clears the override and reverts the node to auto-naming.
-  function startLabelEdit(s) {
-    if (!panelEl) return;
-    const labelEl = panelEl.querySelector('[data-field="label"]');
-    if (!labelEl || labelEl.querySelector('#label-edit-input')) return;
-    const current = s.custom_label || s.label || '';
-    const input = document.createElement('input');
-    input.id = 'label-edit-input';
-    input.type = 'text';
-    input.maxLength = 120;
-    input.value = current;
-    input.style.cssText =
-      'width:100%;box-sizing:border-box;font:inherit;font-weight:600;' +
-      'color:var(--text-primary,#fff);background:var(--bg-elev);' +
-      'border:1px solid var(--accent);border-radius:4px;padding:2px 6px';
-    labelEl.textContent = '';
-    labelEl.appendChild(input);
-    input.focus();
-    input.select();
-
-    let done = false;
-    const finish = (save) => {
-      if (done) return;
-      done = true;
-      if (save) {
-        saveLabelEdit(s, input.value);
-      } else {
-        labelEl.textContent = s.custom_label || s.label || s.session_id;
-      }
-    };
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
-      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
-    });
-    input.addEventListener('blur', () => finish(true));
-  }
-
-  // Persist a manual label (durably, server-side) and reflect it immediately
-  // on the open panel and the graph node so the operator doesn't wait for the
-  // next snapshot tick.
-  async function saveLabelEdit(s, rawValue) {
-    const labelEl = panelEl ? panelEl.querySelector('[data-field="label"]') : null;
-    const fallback = () => { if (labelEl) labelEl.textContent = s.custom_label || s.label || s.session_id; };
-    try {
-      const r = await fetch(
-        `/api/agents/sessions/${encodeURIComponent(s.session_id)}/label`,
-        {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ label: (rawValue || '').trim() }),
-        },
-      );
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const data = await r.json();
-      const custom = data.custom_label || null;
-      s.custom_label = custom;
-      // Keep the canonical in-memory copy in sync so snapshot ticks agree.
-      const canonical = allSessions.find(x => x.session_id === s.session_id);
-      if (canonical) canonical.custom_label = custom;
-      if (labelEl) labelEl.textContent = custom || s.label || s.session_id;
-      // Nudge the node label immediately (custom_label || short_label || …).
-      nodeLayer.selectAll('.node')
-        .filter(d => d.session_id === s.session_id)
-        .each(function(d) { d.custom_label = custom; })
-        .select('text.node-label')
-        .text(d => nodeLabel(d));
-    } catch (err) {
-      console.warn('label save failed', err);
-      fallback();
-    }
-  }
-
-  // Fetch and render the LLM-generated session summary. Decoupled from the
-  // event stream — slow LLM calls won't block transcript display. The panel
-  // header shows "Summarizing…" until this resolves.
-  async function fetchSessionSummary(sessionId) {
-    if (summaryAbort) summaryAbort.abort();
-    const ac = new AbortController();
-    summaryAbort = ac;
-    // 5 minutes — covers worst-case Gemma queueing (a big CC session behind
-    // the agent worker can easily push past 60s). The browser will return
-    // an AbortError if the LLM is genuinely stuck so the user can retry.
-    const timeoutId = setTimeout(() => ac.abort(), 5 * 60 * 1000);
-    try {
-      const r = await fetch(
-        `/api/agents/sessions/${encodeURIComponent(sessionId)}/summary`,
-        { signal: ac.signal },
-      );
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const data = await r.json();
-      // Bail if the operator moved on to a different session while we waited.
-      if (sessionId !== selectedSessionId) return;
-      const wrap = document.getElementById('session-summary');
-      if (!wrap) return;
-      wrap.classList.remove('loading');
-      const shortEl = wrap.querySelector('[data-field="ss-short"]');
-      const bodyEl = wrap.querySelector('[data-field="ss-body"]');
-      if (shortEl) shortEl.textContent = data.short_label || '';
-      if (bodyEl) bodyEl.innerHTML = renderSummaryBody(data.summary || '');
-      // Patch the in-memory session so subsequent snapshot ticks pick up the
-      // short label. Also nudge the corresponding node immediately so the
-      // operator doesn't wait up to 2s for the next tick.
-      const s = allSessions.find(x => x.session_id === sessionId);
-      if (s && data.short_label) {
-        s.short_label = data.short_label;
-        nodeLayer.selectAll('.node')
-          .filter(d => d.session_id === sessionId)
-          .each(function(d) { d.short_label = data.short_label; })
-          .select('text.node-label')
-          .text(d => nodeLabel(d));
-      }
-    } catch (err) {
-      // AbortError from a panel switch is expected — just bail silently.
-      if (err.name === 'AbortError' && sessionId !== selectedSessionId) return;
-      if (sessionId !== selectedSessionId) return;
-      const bodyEl = document.querySelector('#session-summary [data-field="ss-body"]');
-      if (!bodyEl) return;
-      const friendly = err.name === 'AbortError'
-        ? 'Timed out — Gemma may be busy.'
-        : `Summary unavailable: ${err.message}.`;
-      bodyEl.innerHTML = `${escapeHtml(friendly)} <a href="#" data-action="retry-summary" style="color:var(--accent)">Retry</a>`;
-      const retry = bodyEl.querySelector('[data-action="retry-summary"]');
-      if (retry) {
-        retry.addEventListener('click', e => {
-          e.preventDefault();
-          bodyEl.textContent = 'Summarizing…';
-          document.getElementById('session-summary')?.classList.add('loading');
-          fetchSessionSummary(sessionId);
-        });
-      }
-    } finally {
-      clearTimeout(timeoutId);
-      if (summaryAbort === ac) summaryAbort = null;
-    }
-  }
-
-  // Minimal markdown — only converts leading `- ` lines into a <ul>. Anything
-  // else is rendered as escaped text with line breaks preserved. We control
-  // the Gemma prompt so the only expected formatting is bullets vs. paragraph.
-  function renderSummaryBody(text) {
-    const lines = (text || '').split(/\r?\n/);
-    const isBullet = l => /^\s*[-*]\s+/.test(l);
-    if (lines.some(isBullet)) {
-      const items = lines.filter(isBullet).map(l => {
-        const content = l.replace(/^\s*[-*]\s+/, '');
-        return `<li>${escapeHtml(content)}</li>`;
-      });
-      return `<ul>${items.join('')}</ul>`;
-    }
-    return escapeHtml(text);
-  }
-
-  // Kind filter state for the side-panel feed. null = show all; otherwise
-  // only events whose kind matches the filter are visible. Clicking the same
-  // kind label twice toggles back to "show all".
-  let eventKindFilter = null;
-
-  // Format a unix-epoch timestamp as "MM/DD h:mm:ssa ET" — explicit Eastern
-  // tz so it matches the rest of LifeOS (timezone='America/New_York' in
-  // settings.py) regardless of the browser machine's locale.
-  function formatTs(ts) {
-    if (!ts) return '';
-    const d = new Date(ts * 1000);
-    const date = d.toLocaleDateString('en-US', {
-      timeZone: 'America/New_York',
-      month: 'numeric',
-      day: 'numeric',
-    });
-    const time = d.toLocaleTimeString('en-US', {
-      timeZone: 'America/New_York',
-      hour: 'numeric',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: true,
-    });
-    return `${date} ${time} ET`;
-  }
-
-  // Compact 1.3k / 500k / 1.2M for token counts and similar.
-  function formatNumCompact(n) {
-    const x = Number(n);
-    if (!isFinite(x)) return String(n);
-    if (Math.abs(x) >= 1_000_000) return (x / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M';
-    if (Math.abs(x) >= 1_000)     return (x / 1_000).toFixed(1).replace(/\.0$/, '') + 'k';
-    return String(x);
-  }
-
-  // Field-aware payload renderer. Maps the most common transcript-event
-  // shapes (model responses, routing decisions, tool calls, errors, etc.)
-  // to compact human-readable HTML. Anything unrecognized falls through to
-  // a generic key/value tail, and the full raw JSON is always available
-  // via click-to-expand for diagnostics.
-  const NOISE_FIELDS = new Set([
-    'iterations', 'inference_geo', 'server_tool_use', 'cache_creation',
-    'ephemeral_1h_input_tokens', 'ephemeral_5m_input_tokens',
-    'thinking_chars',  // surfaced separately when nonzero
-  ]);
-  const SECONDARY_BADGES = ['model', 'task_id', 'expected_output', 'speed', 'service_tier', 'source', 'parent_session_id', 'child_session_id'];
-
-  function prettyPayload(payload) {
-    if (payload == null) return '';
-    if (typeof payload !== 'object') {
-      return `<div class="pp-text">${escapeHtml(String(payload))}</div>`;
-    }
-    const parts = [];
-
-    // Routing decision (routing_resolved et al.)
-    if (payload.routing) {
-      let s = `<div class="pp-routing">→ <span class="pp-target">${escapeHtml(String(payload.routing))}</span>`;
-      if (payload.routing_reason) s += ` <span class="pp-reason">· ${escapeHtml(payload.routing_reason)}</span>`;
-      s += `</div>`;
-      parts.push(s);
-    }
-
-    // Primary text body. `text` empty + `tool_uses` present is the common
-    // assistant-called-tools case — surface that explicitly.
-    if (typeof payload.text === 'string' && payload.text.trim()) {
-      parts.push(`<div class="pp-text">${escapeHtml(payload.text)}</div>`);
-    } else if (payload.text === '' && Array.isArray(payload.tool_uses) && payload.tool_uses.length) {
-      parts.push(`<div class="pp-text muted">(no text — called tools)</div>`);
-    }
-
-    // Tool uses → pills with name + arg keys.
-    if (Array.isArray(payload.tool_uses) && payload.tool_uses.length) {
-      const tools = payload.tool_uses.map(t => {
-        const name = t && t.name ? String(t.name) : 'tool';
-        const argKeys = Array.isArray(t && t.input_keys)
-          ? t.input_keys
-          : (t && t.input && typeof t.input === 'object' ? Object.keys(t.input) : []);
-        const argStr = argKeys.length ? `<span class="pp-tool-args">(${escapeHtml(argKeys.join(', '))})</span>` : '';
-        return `<span class="pp-tool"><span class="pp-tool-name">${escapeHtml(name)}</span>${argStr}</span>`;
-      }).join('');
-      parts.push(`<div class="pp-tools">${tools}</div>`);
-    }
-
-    // Labeled freeform fields — render in this order so the reader sees the
-    // semantically most useful info first.
-    const TEXT_FIELDS = [
-      ['question', 'question'],
-      ['answer', 'answer'],
-      ['prompt', 'prompt'],
-      ['reason', 'reason'],
-      ['ambiguity', 'ambiguity'],
-      ['sane_reason', 'sane reason'],
-      ['description', 'description'],
-      ['label', 'label'],
-    ];
-    for (const [field, label] of TEXT_FIELDS) {
-      const v = payload[field];
-      if (typeof v === 'string' && v.trim()) {
-        parts.push(`<div class="pp-field"><span class="pp-label">${escapeHtml(label)}</span><span class="pp-value">${escapeHtml(v)}</span></div>`);
-      }
-    }
-
-    // Budget — compact "90s · $0.30 · 500k tok"
-    if (payload.budget && typeof payload.budget === 'object') {
-      const b = payload.budget;
-      const bits = [];
-      if (b.wall_seconds != null)  bits.push(`${b.wall_seconds}s`);
-      if (b.max_dollars != null)   bits.push(`$${Number(b.max_dollars).toFixed(2)}`);
-      if (b.max_tokens != null)    bits.push(`${formatNumCompact(b.max_tokens)} tok`);
-      if (bits.length) parts.push(`<div class="pp-budget"><span class="pp-label">budget</span>${escapeHtml(bits.join(' · '))}</div>`);
-    }
-
-    // Usage — compact "↓ 1 in · ↑ 1.3k out · cache 400k read / 199 create"
-    if (payload.usage && typeof payload.usage === 'object') {
-      const u = payload.usage;
-      const bits = [];
-      if (u.input_tokens != null)  bits.push(`↓ ${formatNumCompact(u.input_tokens)} in`);
-      if (u.output_tokens != null) bits.push(`↑ ${formatNumCompact(u.output_tokens)} out`);
-      const cacheR = u.cache_read_input_tokens;
-      const cacheC = u.cache_creation_input_tokens;
-      if (cacheR || cacheC) {
-        const cb = [];
-        if (cacheR) cb.push(`${formatNumCompact(cacheR)} read`);
-        if (cacheC) cb.push(`${formatNumCompact(cacheC)} create`);
-        bits.push(`cache ${cb.join(' / ')}`);
-      }
-      if (bits.length) parts.push(`<div class="pp-usage"><span class="pp-label">usage</span>${escapeHtml(bits.join(' · '))}</div>`);
-    }
-
-    // Thinking chars (only if nonzero — when zero it's pure noise).
-    if (typeof payload.thinking_chars === 'number' && payload.thinking_chars > 0) {
-      parts.push(`<div class="pp-field"><span class="pp-label">thinking</span><span class="pp-value">${formatNumCompact(payload.thinking_chars)} chars</span></div>`);
-    }
-
-    // Scalar badges (model, task_id, etc.)
-    const badges = [];
-    for (const f of SECONDARY_BADGES) {
-      const v = payload[f];
-      if (v != null && typeof v !== 'object') {
-        badges.push(`<span class="pp-badge"><span class="pp-label">${escapeHtml(f.replace(/_/g, ' '))}</span>${escapeHtml(String(v))}</span>`);
-      }
-    }
-    if (payload.sane === false) {
-      badges.push(`<span class="pp-badge pp-warn">not sane</span>`);
-    }
-    if (badges.length) parts.push(`<div class="pp-badges">${badges.join('')}</div>`);
-
-    // Anything else (scalar tail) — fields we didn't explicitly handle.
-    const handled = new Set([
-      'routing', 'routing_reason', 'text', 'tool_uses',
-      ...TEXT_FIELDS.map(t => t[0]),
-      'budget', 'usage', 'thinking_chars',
-      ...SECONDARY_BADGES, 'sane',
-      ...NOISE_FIELDS,
-    ]);
-    const remainder = Object.entries(payload).filter(([k, v]) =>
-      !handled.has(k) && v != null
-      && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')
-    );
-    if (remainder.length) {
-      const items = remainder.map(([k, v]) =>
-        `<span class="pp-kv"><span class="pp-label">${escapeHtml(k.replace(/_/g, ' '))}</span>${escapeHtml(String(v))}</span>`
-      ).join('');
-      parts.push(`<div class="pp-extra">${items}</div>`);
-    }
-
-    return parts.length ? parts.join('') : `<div class="pp-empty">(no fields)</div>`;
-  }
-
-  // appendEvent always renders newest-on-top so backfill and live additions
-  // share the same visual order. Backfill is delivered oldest-first, so we
-  // prepend each one as it arrives, leaving the chronologically-newest event
-  // at the top by the time live tail begins.
-  function appendEvent(ev, _live) {
-    const container = document.getElementById('events');
-    if (!container) return;
-    const kind = String(ev.kind || '');
-    const ts = formatTs(ev.ts);
-    const payload = ev.payload || null;
-    const prettyHtml = payload ? prettyPayload(payload) : '';
-    const rawJson = payload ? JSON.stringify(payload, null, 2) : '';
-    const div = document.createElement('div');
-    // classList.add validates token shape — defense-in-depth even though
-    // `kind` is server-controlled today.
-    div.classList.add('event');
-    if (kind) {
-      const safeKind = kind.replace(/[^a-zA-Z0-9_-]/g, '_');
-      div.classList.add(`kind-${safeKind}`);
-      div.dataset.kind = kind;
-    }
-    div.innerHTML = `
-      <div><span class="kind" role="button" tabindex="0" title="Click to filter to this event type">${escapeHtml(kind)}</span><span class="ts">${escapeHtml(ts)}</span></div>
-      ${prettyHtml ? `<div class="payload" title="Click to expand">${prettyHtml}</div>` : ''}
-      ${rawJson ? `<pre class="payload-raw">${escapeHtml(rawJson)}</pre>` : ''}
-    `;
-    // Hide the event up front if a filter is active and doesn't match.
-    if (eventKindFilter && kind !== eventKindFilter) {
-      div.style.display = 'none';
-    }
-    // Click on the kind label → toggle filter on this kind.
-    const kindEl = div.querySelector('.kind');
-    if (kindEl && kind) {
-      kindEl.addEventListener('click', e => {
-        e.stopPropagation();
-        toggleKindFilter(kind);
-      });
-      kindEl.addEventListener('keydown', e => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          toggleKindFilter(kind);
-        }
-      });
-    }
-    // Click anywhere else on the event → toggle expanded (reveals raw JSON).
-    div.addEventListener('click', e => {
-      if (e.target.closest('.kind')) return;
-      div.classList.toggle('expanded');
-    });
-    container.prepend(div);
-  }
-
-  function toggleKindFilter(kind) {
-    eventKindFilter = (eventKindFilter === kind) ? null : kind;
-    applyEventFilter();
-  }
-
-  function applyEventFilter() {
-    const container = document.getElementById('events');
-    if (!container) return;
-    const events = container.querySelectorAll('.event');
-    events.forEach(el => {
-      const k = el.dataset.kind;
-      if (!eventKindFilter || k === eventKindFilter) {
-        el.style.display = '';
-      } else {
-        el.style.display = 'none';
-      }
-    });
-    // Visually mark filtered state on every visible kind label.
-    container.querySelectorAll('.kind').forEach(el => {
-      const k = el.parentElement?.parentElement?.dataset?.kind;
-      if (eventKindFilter && k === eventKindFilter) {
-        el.classList.add('kind-active-filter');
-      } else {
-        el.classList.remove('kind-active-filter');
-      }
-    });
-  }
-
-  function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
-
-  // For values that go into HTML attribute positions via template strings.
-  // Restricts to a known-safe charset so attribute-context injection is
-  // structurally impossible.
-  function escapeAttr(s) {
-    return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
-  }
-
-  // --- Filters ---
-  // Release any drag-pinned positions so the new visible set lays out from
-  // the recency rail / center forces instead of frozen drop points.
-  function releasePins() {
-    nodeLayer.selectAll('.node').each(function(d) { d.fx = null; d.fy = null; });
-  }
-  function onFilterChange() {
-    releasePins();
-    // Reset the pan/zoom transform so the new visible set lays out at the
-    // natural scale + position. Without this, an operator who had zoomed
-    // into a corner would see the freshly-filtered set still anchored
-    // there — usually empty space — even though the simulation correctly
-    // re-centered around the recency rail + center-y forces.
-    svg.transition().duration(300).call(zoom.transform, d3.zoomIdentity);
-    renderGraph(allSessions, allEdges);
-    // Keep the search dropdown's visible/hidden split in sync with the filters.
-    if (searchQuery.trim()) renderSearchResults();
-  }
-  filterTerminalEl.addEventListener('change', () => {
-    applyRecencyDefault();
-    onFilterChange();
-  });
-  if (filterRecencyEl) {
-    filterRecencyEl.addEventListener('change', () => {
-      recencyManuallySet = true;
-      onFilterChange();
-    });
-  }
-  [filterRouteEl, filterStatusEl, filterCwdEl, filterHostEl].filter(Boolean).forEach(el =>
-    el.addEventListener('change', onFilterChange)
-  );
-
-  // --- Search (issue #252) ---
-  // A live, ranked dropdown over session names + cached summaries. The label
-  // tier is matched client-side (every session carries a label); the summary
-  // tiers (short_label / paragraph summary) come from /api/agents/search,
-  // which reads only the cached-summary DB so a keystroke never costs an LLM
-  // call. Results rank visible-before-hidden, then label > short_label >
-  // summary. Clicking a result highlights the node (reusing openPanel +
-  // applySelectionStyles) and pans to it; a filtered-out result first relaxes
-  // only the filter predicates that were hiding it.
-  const searchInputEl = document.getElementById('search-input');
-  const searchResultsEl = document.getElementById('search-results');
-  const searchWrapEl = document.getElementById('search-wrap');
-  let searchQuery = '';
-  let summaryMatches = new Map();   // session_id -> { field, snippet } from backend
-  let searchSeq = 0;                // guards against out-of-order fetch responses
-  let searchActiveIndex = -1;       // keyboard-highlighted row
-  let searchDebounceTimer = null;
-
-  const SEARCH_TIER = { label: 0, short_label: 1, summary: 2 };
-  // Distinct badge per matched field so the operator can tell which tier hit:
-  // the task name, the node's short label, or the paragraph summary.
-  const SEARCH_BADGE = { label: 'name', short_label: 'label', summary: 'summary' };
-
-  function sessionDisplayName(s) {
-    return s.custom_label || s.short_label || s.label || s.session_id.slice(0, 8);
-  }
-
-  // Escape, then wrap the first case-insensitive occurrence of `q` in <mark>.
-  function highlightMatch(text, q) {
-    const t = String(text || '');
-    if (!q) return escapeHtml(t);
-    const idx = t.toLowerCase().indexOf(q.toLowerCase());
-    if (idx < 0) return escapeHtml(t);
-    return escapeHtml(t.slice(0, idx))
-      + '<mark>' + escapeHtml(t.slice(idx, idx + q.length)) + '</mark>'
-      + escapeHtml(t.slice(idx + q.length));
-  }
-
-  // Merge the local label matches with the backend summary matches into a
-  // single ranked list. Each session appears once at its best (lowest) tier.
-  function buildSearchResults() {
-    const q = searchQuery.trim().toLowerCase();
-    if (!q) return [];
-    const visibleIds = new Set(applyFilters(allSessions).map(s => s.session_id));
-    const byId = new Map(allSessions.map(s => [s.session_id, s]));
-    const entries = new Map();
-
-    function consider(sessionId, field, snippet) {
-      const s = byId.get(sessionId);
-      if (!s) return;  // a summary match for a session no longer in the snapshot
-      const prev = entries.get(sessionId);
-      if (prev && SEARCH_TIER[prev.field] <= SEARCH_TIER[field]) return;
-      entries.set(sessionId, { session: s, field, snippet, visible: visibleIds.has(sessionId) });
-    }
-
-    // Tier 0: label — client-side, covers every session. Matches the
-    // displayed name, so an operator-pinned custom label is findable too.
-    for (const s of allSessions) {
-      const name = s.custom_label || s.label || '';
-      if (name.toLowerCase().includes(q)) consider(s.session_id, 'label', name);
-    }
-    // Tiers 1/2: short_label / paragraph summary — from the backend.
-    for (const [sid, m] of summaryMatches) consider(sid, m.field, m.snippet);
-
-    return [...entries.values()].sort((a, b) => {
-      if (a.visible !== b.visible) return a.visible ? -1 : 1;
-      if (SEARCH_TIER[a.field] !== SEARCH_TIER[b.field]) return SEARCH_TIER[a.field] - SEARCH_TIER[b.field];
-      return sessionDisplayName(a.session).localeCompare(sessionDisplayName(b.session));
-    });
-  }
-
-  function renderSearchResults() {
-    const q = searchQuery.trim();
-    if (!q) { hideSearchResults(); return; }
-    searchActiveIndex = -1;
-    const results = buildSearchResults();
-    if (results.length === 0) {
-      searchResultsEl.innerHTML = '<div class="search-empty">No matches</div>';
-      searchResultsEl.hidden = false;
-      return;
-    }
-    const visible = results.filter(r => r.visible);
-    const hidden = results.filter(r => !r.visible);
-    let html = '';
-    const renderGroup = (items, groupClass, labelText) => {
-      if (items.length === 0) return;
-      if (labelText) html += `<div class="search-group-label">${labelText}</div>`;
-      html += `<div class="search-group ${groupClass}">`;
-      for (const r of items) {
-        // Title shows the text where the match actually landed so the
-        // highlighted query is always visible: the label for a label hit, the
-        // short label for a short_label hit, else the session's display name.
-        const titleText = r.field === 'label' ? (r.session.label || sessionDisplayName(r.session))
-          : r.field === 'short_label' ? (r.session.short_label || sessionDisplayName(r.session))
-          : sessionDisplayName(r.session);
-        // A summary hit's query lives in the paragraph, not the title — surface
-        // it in the snippet line. Title/short_label hits are self-evident.
-        const snippetHtml = r.field === 'summary'
-          ? `<div class="sr-snippet">${highlightMatch(r.snippet, q)}</div>`
-          : '';
-        html += `<button class="search-result" type="button" data-session="${escapeHtml(r.session.session_id)}">`
-          + `<div class="sr-title"><span class="sr-name">${highlightMatch(titleText, q)}</span>`
-          + `<span class="sr-badge">${SEARCH_BADGE[r.field]}</span></div>`
-          + snippetHtml + `</button>`;
-      }
-      html += `</div>`;
-    };
-    renderGroup(visible, 'visible-group', null);
-    renderGroup(hidden, 'hidden-group', 'Hidden by filters');
-    searchResultsEl.innerHTML = html;
-    searchResultsEl.hidden = false;
-  }
-
-  function hideSearchResults() {
-    searchResultsEl.hidden = true;
-    searchResultsEl.innerHTML = '';
-    searchActiveIndex = -1;
-  }
-
-  // Flip only the filter controls that currently exclude `s`, so a hidden
-  // search hit can be revealed with the least disruption to the operator's
-  // other filter choices.
-  function relaxFiltersFor(s) {
-    const nowSec = Date.now() / 1000;
-    if (!filterTerminalEl.checked && TERMINAL.has(s.status)) filterTerminalEl.checked = true;
-    if (filterRecencyEl && filterRecencyEl.value !== 'all' && s.last_activity_at) {
-      const age = nowSec - s.last_activity_at;
-      if (age > Number(filterRecencyEl.value)) {
-        // Smallest recency window that still includes this session (options are
-        // ordered ascending in the DOM; 'all' is the catch-all at the end).
-        const fit = [...filterRecencyEl.options]
-          .map(o => o.value)
-          .find(v => v === 'all' || age <= Number(v));
-        filterRecencyEl.value = fit || 'all';
-        recencyManuallySet = true;
-      }
-    }
-    if (filterCwdEl && filterCwdEl.value !== 'all' && s.decoded_cwd !== filterCwdEl.value) {
-      filterCwdEl.value = 'all';
-    }
-    if (filterRouteEl.value !== 'all' && (s.routing || 'local') !== filterRouteEl.value) {
-      filterRouteEl.value = 'all';
-    }
-    if (filterStatusEl.value !== 'all' && s.status !== filterStatusEl.value) {
-      filterStatusEl.value = 'all';
-    }
-  }
-
-  // Center the viewport on a node, preserving the current zoom scale (min 1x).
-  // `delay` lets a just-revealed node's simulation settle before we pan.
-  function panToNode(sessionId, delay) {
-    const run = () => {
-      let target = null;
-      nodeLayer.selectAll('.node').each(function(d) { if (d.session_id === sessionId) target = d; });
-      if (!target || target.x == null || target.y == null) return;
-      const k = Math.max(d3.zoomTransform(svg.node()).k, 1);
-      const tx = VIEW_W / 2 - k * target.x;
-      const ty = VIEW_H / 2 - k * target.y;
-      svg.transition().duration(450)
-        .call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(k));
-    };
-    if (delay) setTimeout(run, delay); else run();
-  }
-
-  function selectSearchResult(sessionId) {
-    const s = allSessions.find(x => x.session_id === sessionId);
-    if (!s) return;
-    const visibleIds = new Set(applyFilters(allSessions).map(x => x.session_id));
-    const wasHidden = !visibleIds.has(sessionId);
-    if (wasHidden) {
-      relaxFiltersFor(s);
-      releasePins();
-      renderGraph(allSessions, allEdges);
-    }
-    hideSearchResults();
-    openPanel(sessionId);  // sets selectedSessionId → applySelectionStyles highlights it
-    panToNode(sessionId, wasHidden ? 400 : 0);
-  }
-
-  async function fetchSummaryMatches(q) {
-    const seq = ++searchSeq;
-    try {
-      const r = await fetch('/api/agents/search?q=' + encodeURIComponent(q));
-      if (!r.ok) return;
-      const data = await r.json();
-      // Drop stale responses: a newer keystroke fired, or the box moved on.
-      if (seq !== searchSeq || searchQuery.trim() !== q) return;
-      summaryMatches = new Map((data.matches || []).map(m => [m.session_id, m]));
-      renderSearchResults();
-    } catch (_) { /* network blip — the label tier still works offline */ }
-  }
-
-  function onSearchInput() {
-    searchQuery = searchInputEl.value;
-    const q = searchQuery.trim();
-    clearTimeout(searchDebounceTimer);
-    // Invalidate prior summary matches; the debounced fetch refills them. The
-    // label tier renders instantly below regardless.
-    summaryMatches = new Map();
-    if (q.length >= 2) {
-      searchDebounceTimer = setTimeout(() => fetchSummaryMatches(q), 180);
-    }
-    renderSearchResults();
-  }
-
-  if (searchInputEl) {
-    searchInputEl.addEventListener('input', onSearchInput);
-    searchInputEl.addEventListener('focus', () => { if (searchQuery.trim()) renderSearchResults(); });
-    searchInputEl.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
-        searchInputEl.value = ''; searchQuery = ''; summaryMatches = new Map();
-        hideSearchResults(); searchInputEl.blur();
-        return;
-      }
-      const btns = [...searchResultsEl.querySelectorAll('.search-result')];
-      if (!btns.length) return;
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        searchActiveIndex = Math.min(searchActiveIndex + 1, btns.length - 1);
-      } else if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        searchActiveIndex = Math.max(searchActiveIndex - 1, 0);
-      } else if (e.key === 'Enter') {
-        e.preventDefault();
-        const pick = searchActiveIndex >= 0 ? btns[searchActiveIndex] : btns[0];
-        if (pick) selectSearchResult(pick.dataset.session);
-        return;
-      } else {
-        return;
-      }
-      btns.forEach((b, i) => b.classList.toggle('active', i === searchActiveIndex));
-      if (searchActiveIndex >= 0) btns[searchActiveIndex].scrollIntoView({ block: 'nearest' });
-    });
-    searchResultsEl.addEventListener('click', (e) => {
-      const btn = e.target.closest('.search-result');
-      if (btn) selectSearchResult(btn.dataset.session);
-    });
-    document.addEventListener('click', (e) => {
-      if (searchWrapEl && !searchWrapEl.contains(e.target)) hideSearchResults();
-    });
-  }
-
-  // --- Side panel resize ---
-  // Drag handle on the left edge of aside.panel resizes the panel width.
-  // Persists in localStorage so the operator's chosen width survives reload.
-  // CSS var `--panel-width` drives the grid layout; updating it shifts the
-  // graph column automatically. The SVG-based D3 graph uses viewBox sizing
-  // so it scales with its container — no explicit redraw needed.
-  (function setupPanelResizer() {
-    if (!panelResizerEl || !panelOuterEl) return;
-    const STORAGE_KEY = 'lifeos.agents.panelWidth';
-    const MIN_WIDTH = 280;
-    const MAX_RATIO = 0.7;
-    const setWidth = (px) => {
-      const max = Math.floor(window.innerWidth * MAX_RATIO);
-      const clamped = Math.max(MIN_WIDTH, Math.min(max, Math.round(px)));
-      document.documentElement.style.setProperty('--panel-width', clamped + 'px');
-      return clamped;
-    };
-    // Restore last width if present.
-    try {
-      const saved = parseInt(localStorage.getItem(STORAGE_KEY) || '', 10);
-      if (saved && !isNaN(saved)) setWidth(saved);
-    } catch (_) {}
-
-    let dragging = false;
-    let startX = 0;
-    let startWidth = 0;
-    panelResizerEl.addEventListener('mousedown', (e) => {
-      dragging = true;
-      startX = e.clientX;
-      startWidth = panelOuterEl.getBoundingClientRect().width;
-      panelResizerEl.classList.add('dragging');
-      document.body.style.cursor = 'col-resize';
-      document.body.style.userSelect = 'none';
-      e.preventDefault();
-    });
-    window.addEventListener('mousemove', (e) => {
-      if (!dragging) return;
-      // Dragging left increases panel width (delta = startX - clientX).
-      const newWidth = setWidth(startWidth + (startX - e.clientX));
-      try { localStorage.setItem(STORAGE_KEY, String(newWidth)); } catch (_) {}
-    });
-    window.addEventListener('mouseup', () => {
-      if (!dragging) return;
-      dragging = false;
-      panelResizerEl.classList.remove('dragging');
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      // SVG viewBox auto-scales; nudge the simulation so collision can
-      // settle if any node ended up partly out of view after the resize.
-      try { simulation.alpha(0.1).restart(); } catch (_) {}
-    });
-  })();
-
-  // --- Initial load + stream ---
-  fetch('/api/agents/snapshot')
-    .then(r => r.json())
-    .then(applySnapshot)
-    .catch(err => { connStateEl.textContent = 'failed: ' + err; });
-
-  const snapshotES = new EventSource('/api/agents/stream');
-  snapshotES.onopen = () => { connStateEl.textContent = 'live'; };
-  snapshotES.onerror = () => { connStateEl.textContent = 'reconnecting…'; };
-  snapshotES.addEventListener('snapshot', e => {
-    try { applySnapshot(JSON.parse(e.data)); } catch (_) {}
-  });
-})();
+  // Board is the primary view — boots immediately. The Graph tab's snapshot
+  // fetch + SSE stream only start once the operator opens it.
+  initBoard();
 </script>
 </body>
 </html>

@@ -12,20 +12,21 @@ Engineering view of the `/agents` page — endpoint shapes, ingest paths, status
 
 1. [Architecture overview](#architecture-overview)
 2. [Endpoints](#endpoints)
-3. [Snapshot shape](#snapshot-shape)
-4. [LifeOS agent ingest](#lifeos-agent-ingest)
-5. [Claude Code ingest](#claude-code-ingest)
-6. [Status inference (Claude Code)](#status-inference-claude-code)
-7. [Live process detection](#live-process-detection)
-8. [Cross-machine CLI session registration](#cross-machine-cli-session-registration)
-9. [Snapshot caching](#snapshot-caching)
-10. [D3 force-graph](#d3-force-graph)
-11. [Side-panel SSE](#side-panel-sse)
-12. [Operator kill](#operator-kill)
-13. [Claude Code resume](#claude-code-resume)
-14. [Worker resilience](#worker-resilience)
-15. [Security boundaries](#security-boundaries)
-16. [Related Documents](#related-documents)
+3. [Kanban board](#kanban-board)
+4. [Snapshot shape](#snapshot-shape)
+5. [LifeOS agent ingest](#lifeos-agent-ingest)
+6. [Claude Code ingest](#claude-code-ingest)
+7. [Status inference (Claude Code)](#status-inference-claude-code)
+8. [Live process detection](#live-process-detection)
+9. [Cross-machine CLI session registration](#cross-machine-cli-session-registration)
+10. [Snapshot caching](#snapshot-caching)
+11. [D3 force-graph](#d3-force-graph)
+12. [Side-panel SSE](#side-panel-sse)
+13. [Operator kill](#operator-kill)
+14. [Claude Code resume + Go To](#claude-code-resume--go-to)
+15. [Worker resilience](#worker-resilience)
+16. [Security boundaries](#security-boundaries)
+17. [Related Documents](#related-documents)
 
 ---
 
@@ -33,8 +34,10 @@ Engineering view of the `/agents` page — endpoint shapes, ingest paths, status
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                          web/agents.html                                  │
-│   D3 force-simulation graph, SSE consumer, side panel, kill/resume UI     │
+│  web/agents.html (shell + tabs)                                           │
+│    web/agents/board.js  — Kanban board, drag/drop, drawer                 │
+│    web/agents/graph.js  — D3 force-simulation graph (Graph tab, lazy-init)│
+│    web/agents/panel.js  — shared session-detail panel (both tabs)         │
 └─────────────────────────────┬────────────────────────────────────────────┘
                               │ HTTP + SSE
                               ▼
@@ -42,6 +45,8 @@ Engineering view of the `/agents` page — endpoint shapes, ingest paths, status
 │                       api/routes/agents.py                                │
 │   /api/agents/snapshot · /stream · /sessions/{id}/events · /stream       │
 │                       · /kill · /resume                                   │
+│   /api/agents/board · /board/stream · /board/cards/{id}/lane · /accept   │
+│   /api/agents/pending-questions · /pending-questions/{id}/answer         │
 └────┬───────────────────────────────────┬─────────────────────────────────┘
      │ LifeOS agent worker               │ Claude Code CLI
      ▼                                   ▼
@@ -54,6 +59,11 @@ Engineering view of the `/agents` page — endpoint shapes, ingest paths, status
 │ process; read here.     │    │   - build_snapshot() (cached 30s)        │
 └─────────────────────────┘    └──────────────────────────────────────────┘
 ```
+
+The board joins two more read paths not pictured above: `TaskManager` (the
+vault task store, `api/services/task_manager.py`) and `SchedulerStore`
+(`api/services/scheduler_store.py`) — both already-owned singletons the
+board route reads from directly, same pattern as `SessionStore`/`TranscriptStore`.
 
 The route file imports the worker's `SessionStore` and `TranscriptStore` directly (read-only) and unions their output with the Claude Code adapter's normalized shape. No second worker process; the API server reads the same SQLite + JSONL files the worker writes.
 
@@ -78,6 +88,49 @@ All under `/api/agents`. Local-network only, with one deliberate exception: `POS
 | `POST /cli-sessions/events` | Cross-machine session registration (#849) — see [Cross-machine CLI session registration](#cross-machine-cli-session-registration). Bearer-token gated, reachable from any host. Body `{engine, event, session_id, host, cwd?, transcript_path?, branch?, model?, prompt_preview?, task_id?, pane_id?, wezterm_pid?}`. |
 
 Heartbeats: per-session SSE emits a `:heartbeat\n\n` comment every 15s when there's no new event, so dropped connections surface quickly through the browser's `EventSource` retry.
+
+`GET /sessions/{id}/stream` dispatches by prefix: `cc:` to the Claude Code ingest path, `cx:` to the Codex ingest path (`_stream_codex_session`, mirroring `_stream_claude_code_session` — same 1s poll loop, same 5-minute idle close, no DB status to read), everything else to the LifeOS transcript store. Before this the `cx:` branch was missing and fell through to the LifeOS path, which 400'd on the prefix — opening a Codex session's panel never streamed.
+
+---
+
+## Kanban board
+
+`api/services/agent_board.py` holds every pure decision the board makes — lane derivation, lane-move planning, and the scheduler-entry Scheduled/Done split — with no I/O. `api/routes/agents.py` does the reading and writing; it never re-derives a rule the service module already owns. Unit tests in `tests/test_agent_board.py` cover one case per row of the lane table plus the priority-ordering edge cases (e.g. an `agent-completed` tag beats a terminal status, so a worker-finished task still surfaces in Review instead of silently landing in Done).
+
+### Endpoints
+
+| Method + Path | Purpose |
+|---|---|
+| `GET /board` | Full view model, always built fresh — `run_in_threadpool(_build_board)` on every call, never served from the stream's cache (see below). `_build_board()` reads `TaskManager.list_tasks()`, joins each task's linked session (matched by `task_id` against the same `_build_snapshot()` sessions list `/snapshot` returns) and any open pending question (matched by `task_id`), derives its lane via `agent_board.derive_lane`, and separately buckets every `SchedulerStore` entry into `scheduled` or `done` via `agent_board.is_schedule_active`. |
+| `GET /board/stream` | SSE. Ticks every `_BOARD_STREAM_INTERVAL = 0.5s`, reads the board through the shared `_board_cache` (TTL `_BOARD_CACHE_TTL = 0.25s`), and only emits a `board` event when a JSON-serialized signature of `lanes` differs from the last sent tick — an idle board doesn't push empty ticks to a connected client. |
+| `PUT /board/cards/{id}/lane` | Body `{lane, assignee?}`. Reads the task, calls `agent_board.plan_lane_move`, and applies the resulting `status`/`tags` patch via one `TaskManager.update` call (or raises the planned error and writes nothing). 400 for an unknown or undroppable (`review`/`scheduled`) lane; 409 for a worker-owned card (`agent-running`/`agent-blocked` tag present) dropped on `in_progress` or `done`; 409 for an agent-engine-assigned-but-unclaimed card dropped on `in_progress`; 409 for a pending Review card (`agent-completed` without `accepted`) dropped on `in_progress` or `human_queue` (dropping it on `done` still doubles as accept — see below). A 200 response's `lane` is the card's actual landed lane, which for the tags-only `assigned`/`unassigned` targets may differ from the requested lane if a higher-priority signal (e.g. Human queue) still applies — the frontend toasts when this happens (see [Frontend module split](#frontend-module-split)). |
+| `POST /board/cards/{id}/accept` | Adds the `accepted` tag (see `ACCEPTED_TAG`) and sets `status="done"` if either isn't already true; a no-op write-wise (no `TaskManager.update` call at all) when both already hold, so the endpoint is genuinely idempotent — not just safe to call twice. |
+| `GET /pending-questions` | `session_store.list_open_questions()` — unanswered, unprocessed, not-timed-out `pending_questions` rows whose `kind` is `clarification` or `goal_approval`; `followup` (completion notices) and `status_anchor` (routing plumbing) rows are excluded so a Review card never renders a fake pending-question badge. |
+| `POST /pending-questions/{id}/answer` | `session_store.deposit_answer_by_id(question_id, answer)` — writes `answer`/`answered_at` on that exact row id, then invalidates `_board_cache` so the stream's next tick reflects it immediately. |
+
+### Why the board SSE isn't event-driven
+
+The issue's target is "reflects an external vault edit within ~3 seconds," and the task watcher's own debounce (`api/services/task_watcher.py`, `_DEBOUNCE_SECONDS = 2.0`) already spends most of that budget before `TaskManager`'s in-memory index even updates. Wiring a real push (an `asyncio.Event` set from the watcher's background thread via `loop.call_soon_threadsafe`, fanned out to every open SSE connection) would work but adds real cross-thread state for a three-second target that a fast poll already meets comfortably: both `TaskManager` and `SchedulerStore` serve `list_tasks()`/`list_all()` from an in-memory dict, so rebuilding the board costs a dict walk, not disk or DB I/O. `tests/test_agents_board_watch.py` proves the actual (not sped-up) production debounce lands well inside 3 seconds by starting a real `TaskWatcher` against a temp vault, writing an external edit, and polling the stream's own cached read (`_get_board_cached()`) until the change shows up.
+
+### Board cache
+
+`_board_cache` is a module-level `(built_at, board)` tuple used ONLY by `GET /board/stream`'s own tick — never by `GET /board`, which always calls `_build_board()` fresh. The cache exists to de-duplicate simultaneous stream connections within the same instant (multiple open board tabs shouldn't each pay the full build cost on every tick), not to skip rebuilds between ticks: its TTL (`_BOARD_CACHE_TTL = 0.25s`) is far shorter than the tick interval (`_BOARD_STREAM_INTERVAL = 0.5s`). `_invalidate_board_cache()` drops it immediately after every board write — lane-move, accept, and pending-question answer — so a stream tick right after a write never serves pre-write data. Worst-case latency from an external vault edit to every open board tab reflecting it is the sum of three independent legs: the task watcher's debounce (2.0s) + the cache TTL (0.25s, only matters if a tick lands mid-window) + the stream's own tick interval (0.5s) = 2.75s, inside the 3s budget. A direct `GET /board` skips the last two legs entirely since it never reads the cache.
+
+### Pending-question answer path
+
+`SessionStore.deposit_answer_by_id` (new in #850, alongside the pre-existing `deposit_answer` keyed by Telegram message id and `deposit_answer_by_session_id` keyed by session) sets exactly the columns `deposit_answer` sets — `answer` and `answered_at` on the matched `pending_questions` row, gated on `answered_at IS NULL AND timed_out = 0 AND kind != 'status_anchor'`. `worker.py::_process_clarification_answers` drains any row with `answered_at IS NOT NULL AND processed = 0` on its next tick regardless of which `deposit_answer*` method wrote it — the board's answer endpoint needed no change to `worker.py`.
+
+### Frontend module split
+
+`web/agents.html` used to be one 2,600-line file (inline CSS + a single IIFE covering the graph, side panel, filters, and search). It's now a shell (CSS + tab markup) plus three ES modules under `web/agents/`, served the same way `web/chat/`'s split (#360) is — `<script type="module">` tags resolving against the existing `/static` mount, no bundler:
+
+- **`panel.js`** — the shared session-detail panel: header render, inline label edit, backfill + live SSE transcript tail, LLM summary fetch, and the kill/resume/focus actions, plus the small cross-cutting helpers (`routingLabel`, `escapeHtml`, `showToast`, `prettyPayload`, …) both other modules import. Exports a `SessionPanel` class constructed with a `container` element rather than hardcoded ids, so the Graph tab's side panel and the Board tab's drawer can each hold an independent instance without DOM id collisions (both tabs' markup stays mounted; only one is visible via `[hidden]`).
+- **`graph.js`** — the D3 force-simulation graph, filters, chips, and search, moved with the rendering/simulation/interaction code unchanged; only the panel-specific calls were swapped for a `SessionPanel` instance. Exports `initGraph()`, called once, lazily, the first time the operator opens the Graph tab — so loading the board (the default view) doesn't also open a second SSE connection (`/api/agents/stream`) nobody is watching.
+- **`board.js`** — the Kanban board: fetch + SSE, lane rendering, filters, and the drawer. Exports `initBoard()`, called immediately on page load.
+
+**Drag and drop is pointer-based, not the native HTML5 Drag and Drop API.** `draggable="true"` + `dragstart`/`dragover`/`drop` only fires through the browser's OS-level drag gesture — synthetic mouse events (Playwright's included) can't reliably trigger it, which would have made the server-free browser test (`tests/test_agents_board_ui_browser.py`) unable to drive a drag at all. `board.js` instead tracks `mousedown` → `mousemove` (past a 4px threshold, to distinguish a drag from a click) → `mouseup`, rendering a floating ghost card and using `document.elementFromPoint` to resolve the lane under the cursor. The trailing `click` event that a `mouseup` also fires is suppressed via a `suppressNextClick` flag set only when a real drag happened, so the same gesture never both moves a card and opens its drawer.
+
+A successful drop always re-fetches the board (`fetchBoard()`) rather than mutating the DOM optimistically — the server is the single source of truth for a card's lane, and a rejected move (400/409/500) leaves the card exactly where the last successful fetch put it, with a toast surfacing the server's error text.
 
 ---
 
@@ -132,7 +185,7 @@ Read paths in `api/routes/agents.py`:
 - `_session_to_dict(s, transcript)` — projects a `Session` row to the snapshot shape. Defends against the optional `total_cache_*_tokens` attrs being absent on old rows.
 - `_label_for_session(s, events)` — walks the first five transcript events looking for `description` / `task_description` / `prompt`; falls back to the session id. Result cached per session id (capped at 500 entries).
 - `_summarize_events(events)` — counts tool calls and errors across the last 100 events. `_is_error_kind` matches the literal set `{failed, managed_failed, child_failed_internal, killed, cascade_killed}` plus any kind ending in `_failed` or `_error` (future-proof).
-- `_model_label_for_routing(routing)` — derives the model badge from `settings.agent_managed_model`. Falls back to `Claude` if the model name doesn't match any known family.
+- `_model_label_for_routing(routing)` — `local` → `Local`, `remote` → `Remote`, `hermes` → `Hermes` (fixed in #850 — previously fell through to the Claude-model-name guess below and was mislabeled `Claude`), otherwise derives the badge from `settings.agent_managed_model`. Falls back to `Claude` if the model name doesn't match any known family.
 
 Per snapshot tick the route calls `session_store.list_sessions(limit=200)` (newest-first) and emits one edge per session with a `parent_session_id`. Subagents that exist only inside the transcript (no SessionStore row) do not appear in this path — they show up via the Claude Code ingest below.
 
@@ -418,7 +471,7 @@ RestartSec=10
 
 ## Security boundaries
 
-The threat model: the LifeOS MCP HTTP transport is publicly accessible via Tailscale Funnel and is the obvious place an external agent or compromised credential could hit LifeOS endpoints. `/cli-sessions/events` is the one endpoint in this file deliberately reachable over Tailscale rather than local-network-only — it's gated by `LIFEOS_AGENT_HOOK_TOKEN` instead of an IP check, disabled entirely (503) until an operator sets one, and `hmac.compare_digest` avoids a timing side-channel on the comparison. It carries no more authority than "register a session and its metadata" — it cannot kill, resume, or focus anything, and the `host` field it accepts is trusted as-given rather than verified: a bearer-token holder can name any host, so a fabricated session can appear to run somewhere it doesn't. The one place this matters is the pane-store mirror: `pane_id`/`wezterm_pid` are written into `cc_wezterm_store` — the table `/focus` reads to pick a real WezTerm pane — only when the reported `host` matches this API's own AND the request itself arrived from loopback (the same IP check `/cc-pane-bind` and `/cx-pane-bind` use). A remote or spoofed-host event still records its metadata and status on the `cli_sessions` row, but never touches the shared pane store, so it cannot redirect Go To for a real local session. `/kill`, `/resume`, and `/focus`:
+The threat model: the LifeOS MCP HTTP transport is publicly accessible via Tailscale Funnel and is the obvious place an external agent or compromised credential could hit LifeOS endpoints. `/cli-sessions/events` is the one endpoint in this file deliberately reachable over Tailscale rather than local-network-only — it's gated by `LIFEOS_AGENT_HOOK_TOKEN` instead of an IP check, disabled entirely (503) until an operator sets one, and `hmac.compare_digest` avoids a timing side-channel on the comparison. It carries no more authority than "register a session and its metadata" — it cannot kill, resume, or focus anything, and the `host` field it accepts is trusted as-given rather than verified: a bearer-token holder can name any host, so a fabricated session can appear to run somewhere it doesn't. The one place this matters is the pane-store mirror: `pane_id`/`wezterm_pid` are written into `cc_wezterm_store` — the table `/focus` reads to pick a real WezTerm pane — only when the reported `host` matches this API's own AND the request itself arrived from loopback (the same IP check `/cc-pane-bind` and `/cx-pane-bind` use). A remote or spoofed-host event still records its metadata and status on the `cli_sessions` row, but never touches the shared pane store, so it cannot redirect Go To for a real local session. `/kill`, `/resume`, `/focus`, and the board's own write surface — `PUT /board/cards/{id}/lane`, `POST /board/cards/{id}/accept`, and `POST /pending-questions/{id}/answer` — sit on the same footing:
 
 - Live under `/api/agents/*` — the MCP transport never proxies this prefix.
 - Are not registered as MCP tools — so they cannot be invoked through the MCP layer even if an attacker has a bearer token.
@@ -426,6 +479,7 @@ The threat model: the LifeOS MCP HTTP transport is publicly accessible via Tails
 - Resume runs a configured launcher via `shlex.split` only — no `shell=True`. Template substitutions are URL-encoded where they go into URI strings. The rendered `{inner_command}` is split into individual argv tokens before reaching the launcher, so a malicious inner command cannot smuggle shell metacharacters.
 - Focus calls `wezterm cli activate-pane` with a fixed argv (no template) using the pane id from the local SQLite mapping. The store is only writeable from the same process (no cross-machine exposure), and pane ids are integers — there is no path for an external caller to inject arbitrary argv. The FD-probe fallback never reads attacker-controlled data: `lsof` is invoked with the transcript path that LifeOS itself derived from `discover_sessions`, and `/proc/<pid>/fd/0` is read as a symlink target whose filtering keeps only `/dev/pts/N` paths.
 - `/cc-pane-bind` is bound to loopback by IP check (`127.0.0.1` / `::1`); the public MCP transport runs on the same host but a different prefix and would never route to it. The accepted body is constrained: `session_id` runs through `validate_session_id` (rejects path traversal), `pane_id` must be a non-negative int, `cwd` is opaque text.
+- `/pending-questions/{id}/answer` deliberately drops the `bot` scoping `deposit_answer` has (`session_store.py::deposit_answer_by_id`, above). Bot scoping exists to disambiguate Telegram's multi-bot inbound channel — which reply belongs to which persona's chat — not because the operator lacks authority over a question; the board is a single local surface with strictly less authority than the pre-existing, equally ungated `POST /spawn` and `POST /threads/{id}/reply`, so an unscoped write here adds no new exposure.
 
 Per-source guarantees:
 
@@ -438,9 +492,11 @@ Per-source guarantees:
 ## Related Documents
 
 - [ADR-011: External Agent Ingest](../../adr/011-external-agent-ingest.md) — Read-only adapter pattern this spec implements
-- [Agent Viz — Product](../product/agent-viz.md) — Consumer view: filters, chips, status semantics, operator controls
+- [Agent Viz — Product](../product/agent-viz.md) — Consumer view: filters, chips, status semantics, operator controls, the board's lanes and drawer
 - [Agent Worker — Technical](agent-worker.md) — Sessions, transcripts, kill primitives, inter-agent coordination
 - [Agent Worker — Product](../product/agent-worker.md) — `#agent` task lifecycle, Telegram interactions
 - [API Reference](../product/api-reference.md) — `POST /api/agents/cli-sessions/events` and other agent endpoint contracts
 - [Architecture](architecture.md) — Where the route + adapter fit in the broader code structure
 - [Observability](observability.md) — Adjacent traces / health surfaces
+- [Task Management — Technical](task-management.md) — `TaskManager`, the store the board's cards are read from
+- [Scheduler — Technical](scheduler.md) — `SchedulerStore`, the store the Scheduled column is read from

@@ -174,6 +174,7 @@ prompt.
 - [MCP Tools](../specs/product/mcp-tools.md) — The `lifeos_human_queue_*` tools in the full MCP catalog
 - [Agent Worker — Technical](../specs/technical/agent-worker.md) — The poll tick that resolves `done_when` cards
 - [Data & Sync — Technical](../specs/technical/data-and-sync.md#failure-notifications) — Sync failures file a card keyed `sync:<source>`
+- [Agent Viz — Product](../specs/product/agent-viz.md) — The `/agents` board's Human queue lane is the derived view of these cards
 
 ### Guides
 - [Configuration](configuration.md) — `LIFEOS_HUMAN_QUEUE_POLL_SECONDS`

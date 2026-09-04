@@ -73,7 +73,7 @@ You can override the API base URL with `LIFEOS_API_URL` if you run on a non-defa
 
 ## 3. Try it
 
-Open two wezterm panes in the same project directory, run `claude` in each, then open `/agents` in your browser. Both sessions should show a **Go To** button. Click it (or double-click the node in the graph) — wezterm focuses the right pane. On GNOME Wayland the focus changes inside wezterm but the window won't pop forward (compositor restriction); click the wezterm dock icon to bring it forward, the right pane will already be selected.
+Open two wezterm panes in the same project directory, run `claude` in each, then open `/agents` in your browser and open the **Graph** tab (the page now opens on the Board tab by default). Both sessions should show a **Go To** button. Click it (or double-click the node in the graph) — wezterm focuses the right pane. On GNOME Wayland the focus changes inside wezterm but the window won't pop forward (compositor restriction); click the wezterm dock icon to bring it forward, the right pane will already be selected. The board drawer's equivalent action is labelled **Focus** rather than **Go To**.
 
 If the toast says "Couldn't locate pane" — meaning the session isn't running where we can reach it, wezterm itself can't be queried, or no cached mapping exists — the most likely causes are:
 
@@ -118,7 +118,7 @@ A session registered this way shows a `host` badge in the side panel, plus its g
 ## Related Documents
 
 ### Specifications
-- [Agent Viz — Product](../specs/product/agent-viz.md#operator-controls--resume-and-go-to) — Operator-facing controls overview
+- [Agent Viz — Product](../specs/product/agent-viz.md#graph-tab--operator-controls--resume-and-go-to) — Operator-facing controls overview
 - [Agent Viz — Technical](../specs/technical/agent-viz.md#claude-code-resume--go-to) — Endpoint shapes, probe algorithm, security boundaries
 
 ### Code References

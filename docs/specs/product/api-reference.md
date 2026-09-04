@@ -26,13 +26,14 @@ Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Thr
 10. [People Endpoints](#people-endpoints)
 11. [Photos Endpoints](#photos-endpoints)
 12. [Task Endpoints](#task-endpoints)
-13. [Scheduler & Telegram Endpoints](#scheduler--telegram-endpoints)
-14. [Monarch Money Endpoints](#monarch-money-endpoints)
-15. [Job Queue Endpoints](#job-queue-endpoints)
-16. [Performance Trace Endpoints](#performance-trace-endpoints)
-17. [Admin Endpoints](#admin-endpoints)
-18. [Card Assignment Endpoints](#card-assignment-endpoints-851)
-19. [MCP Tools — see mcp-tools.md](mcp-tools.md)
+13. [Agent Board Endpoints](#agent-board-endpoints)
+14. [Scheduler & Telegram Endpoints](#scheduler--telegram-endpoints)
+15. [Monarch Money Endpoints](#monarch-money-endpoints)
+16. [Job Queue Endpoints](#job-queue-endpoints)
+17. [Performance Trace Endpoints](#performance-trace-endpoints)
+18. [Admin Endpoints](#admin-endpoints)
+19. [Card Assignment Endpoints](#card-assignment-endpoints-851)
+20. [MCP Tools — see mcp-tools.md](mcp-tools.md)
 
 ---
 
@@ -829,6 +830,81 @@ request.
 
 ---
 
+## Agent Board Endpoints
+
+The `/agents` Kanban board (see [Agent Viz](agent-viz.md)). Lanes are derived
+from task status/tags on every read — there is no stored lane field. See
+[Agent Viz — Technical](../technical/agent-viz.md) for the derivation rules
+and the SSE update cadence.
+
+### GET /api/agents/board
+
+Full board view model, always built fresh (never cached): `{lanes:
+{unassigned, assigned, in_progress, human_queue, scheduled, review, done},
+generated_at}`. `kind` (`"task"` | `"schedule"`) is the first field of every
+card and the only discriminator between the two shapes below — both kinds
+can land in the `done` lane. Each task card carries `kind: "task"`, `id,
+title, notes, status, tags, assignee, fields, context, updated_at, session
+(nullable), pending_question (nullable)`. Each scheduled card carries `kind:
+"schedule"`, `id, name, message_content, enabled, next_fire_at, recurring,
+last_run {at, outcome, snippet} (nullable)`.
+
+### GET /api/agents/board/stream
+
+SSE stream of the board view model — emits a full `board` event whenever
+the lanes change. Reads through a short-lived shared cache (see
+[Agent Viz — Technical](../technical/agent-viz.md#board-cache)); `GET
+/api/agents/board` above never does.
+
+### PUT /api/agents/board/cards/{id}/lane
+
+Move a task card to a lane, writing the corresponding status/tag at once —
+or writing nothing and returning an error. Body: `{lane, assignee?}`.
+`lane: "done"` marks the task done; `lane: "unassigned"` clears the
+assignee tag; `lane: "assigned"` requires `assignee` (one of
+`me`/`claude`/`codex`/`hermes`/`local`) and replaces any existing assignee
+tag. `review` and `scheduled` can't be set directly (derived from a tag
+and the scheduler store, respectively) and return **400**.
+
+Three **409** cases, no write in any of them:
+- The card is worker-owned (`agent-running` or `agent-blocked` tag
+  present) and `lane` is `in_progress` or `done` — the worker owns this
+  card while it's running or waiting on an answer; answer the question or
+  kill the session first.
+- The card's assignee is an agent engine that hasn't been claimed by the
+  worker yet and `lane` is `in_progress` — only the agent worker claims
+  agent-assigned tasks.
+- The card is a pending review (`agent-completed` tag without `accepted`)
+  and `lane` is `in_progress` or `human_queue` — accept or reject the
+  review first. `lane: "done"` on a pending review still succeeds and acts
+  as accept (adds `accepted`), same as `POST .../accept`.
+
+On success, the response's `lane` is the card's actual landed lane, which
+for `lane: "assigned"`/`"unassigned"` (tags-only writes) can differ from
+the requested lane if a higher-priority signal still applies — e.g. a
+Human-queue card assigned to someone stays in Human queue. The web board
+toasts when this happens.
+
+### POST /api/agents/board/cards/{id}/accept
+
+Move a Review card to Done by adding the `accepted` tag. Idempotent.
+Returns **409** if the card isn't in the Review lane and isn't already
+accepted.
+
+### GET /api/agents/pending-questions
+
+List unanswered agent questions: `{questions: [{id, task_id, session_id,
+question, asked_at, bot}]}`.
+
+### POST /api/agents/pending-questions/{id}/answer
+
+Answer a pending question. Body: `{answer}`, 1-4096 characters — an empty,
+whitespace-only, or over-length answer returns **400**. Writes the same
+columns a Telegram reply would — the agent worker resumes the session on
+its next tick unchanged.
+
+---
+
 ## Scheduler & Telegram Endpoints
 
 Schedules can also be created, edited, listed, and deleted via natural language through the chat interface (`POST /api/ask/stream`). See [Scheduler Guide](../../guides/scheduler.md).
@@ -1054,3 +1130,4 @@ Open an Assigned card (`status == "todo"`, a recognized assignee tag, no session
 - [Client Surfaces](../technical/client-surfaces.md) — HTTP consumers and breaking-change policy
 - [CRM UI](crm-ui.md) — CRM index pointing at the four product sub-specs
 - [Configuration](../../guides/configuration.md) — Env vars referenced by several endpoints (LIFEOS_USER_NAME, LIFEOS_WORK_DOMAIN, etc.)
+- [Agent Viz](agent-viz.md) — The `/agents` Kanban board these endpoints back

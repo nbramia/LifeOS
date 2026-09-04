@@ -229,3 +229,4 @@ id-addressed writes, the notes body, and conflict-file handling actually work.
 - [Scheduler Guide](../../guides/scheduler.md) -- Schedules; the `agent` action writes `#agent` tasks here
 - [Agent Worker](agent-worker.md) -- Tasks tagged `#agent` are picked up by the autonomous worker for hands-free completion
 - [Human Queue](../../guides/human-queue.md) -- Human-queue cards are tasks tagged `human` with status `blocked`
+- [Agent Viz](agent-viz.md) -- The `/agents` Kanban board is a card-per-task view backed by this store

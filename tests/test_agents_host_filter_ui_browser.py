@@ -11,6 +11,12 @@ why this carries no `requires_server` marker and runs at pre-push
 `/api/**` is intercepted here (same as the voice test), so that request goes
 to the real network like it does for every other browser test against this
 page family.
+
+#850 made the Kanban board the default /agents view and moved this graph
+(unchanged) behind a Graph tab, lazily initialized on first open — so every
+scenario here clicks into the Graph tab before touching graph-specific
+elements like `#filter-host` or `.node`, which now live in initially-hidden
+markup and aren't wired up until `initGraph()` runs.
 """
 import http.server
 import json
@@ -26,10 +32,15 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 
 class _AgentsHandler(http.server.SimpleHTTPRequestHandler):
+    """Serves agents.html the way api/main.py does: `/agents` is agents.html
+    and the web/agents/*.js modules (#850) hang off `/static/`."""
+
     def translate_path(self, path):
         path = path.split("?", 1)[0].split("#", 1)[0]
-        if path == "/agents":
+        if path in ("/agents", "/"):
             return str(WEB_DIR / "agents.html")
+        if path.startswith("/static/"):
+            return str(WEB_DIR / path[len("/static/"):])
         return str(WEB_DIR / path.lstrip("/"))
 
     def log_message(self, *args):  # keep pytest output clean
@@ -125,6 +136,8 @@ def _open_agents(page: Page, base_url):
     def handler(route):
         if "/api/agents/snapshot" in route.request.url:
             body = SNAPSHOT
+        elif "/api/agents/board" in route.request.url:
+            body = {"lanes": {}, "generated_at": 0}
         else:
             body = {}
         route.fulfill(status=200, content_type="application/json",
@@ -132,6 +145,9 @@ def _open_agents(page: Page, base_url):
 
     page.route("**/api/**", handler)
     page.goto(f"{base_url}/agents")
+    # #850: the board is the default tab; the graph (and its filters) live
+    # behind the Graph tab and only initialize once it's opened.
+    page.click('[data-tab="graph"]')
     page.wait_for_selector("#filter-host")
 
 
