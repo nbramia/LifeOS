@@ -601,11 +601,19 @@ class PersonEntityStore:
         return conn
 
     def _get_data_version_connection(self) -> sqlite3.Connection:
-        """Get the persistent connection used only for PRAGMA data_version."""
+        """Get the persistent connection used only for PRAGMA data_version.
+
+        This connection is read-only (PRAGMA data_version is the only
+        statement ever executed on it) and every call site
+        (_current_data_version) is reached only while holding
+        _get_all_cache_lock, so cross-thread use is serialized. That is
+        what makes check_same_thread=False safe here despite the
+        threadpool dispatch these routers now use.
+        """
         if self._data_version_conn is None:
             self._data_version_conn = sqlite3.connect(
                 str(self.db_path),
-                check_same_thread=False,
+                check_same_thread=False,  # threadpool-safe: pragma-only, guarded by lock
             )
         return self._data_version_conn
 
