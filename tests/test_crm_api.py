@@ -47,16 +47,22 @@ class TestCRMConfig:
         `photos_enabled=settings.photos_enabled` from get_crm_config()
         left every other test in this repo green, because
         CRMConfigResponse.photos_enabled defaults to False and this host
-        has no Photos library configured (settings.photos_enabled is also
-        False here) -- the mutation and the real answer coincided. This
-        pins the False case against the actual settings value; the next
-        test below forces the True case so the field can't be silently
-        hardcoded to False and still pass both."""
-        from config.settings import settings
+        (at authoring time) had no Photos library configured -- the
+        mutation and the real answer coincided. Forces False explicitly
+        (rather than asserting against whatever settings.photos_enabled
+        happens to be on the machine running the suite, e.g. a Mac with a
+        real Photos library configured) so this pins the False case
+        unconditionally; the next test below forces the True case, so the
+        field can't be silently hardcoded to one value and still pass
+        both."""
+        from unittest.mock import patch, PropertyMock
+        from config.settings import Settings
 
-        response = client.get("/api/crm/config")
+        with patch.object(Settings, "photos_enabled", new_callable=PropertyMock, return_value=False):
+            response = client.get("/api/crm/config")
+
         assert response.status_code == 200
-        assert response.json()["photos_enabled"] == settings.photos_enabled is False
+        assert response.json()["photos_enabled"] is False
 
     def test_photos_enabled_reflects_settings_when_true(self, client):
         from unittest.mock import patch, PropertyMock
