@@ -289,7 +289,12 @@ def test_apply_graph_filters_falls_back_when_manual_slider_would_blank_the_tab(p
     page.wait_for_selector("#graphContainer")
 
     page.evaluate("(id) => window.loadGraph(id)", CENTER_ID)
-    page.wait_for_timeout(300)
+    # updateEdgeVisibility debounces applyGraphFilters() by 500ms, so the
+    # slider-input handler below doesn't actually run applyGraphFilters()
+    # until ~500ms after the dispatched event - 300ms was too short and
+    # read the pre-change render, silently not exercising the fallback at
+    # all (#896 review round 5 nit). 1200ms gives comfortable margin.
+    page.wait_for_timeout(1200)
 
     page.evaluate("""
         () => {
@@ -298,7 +303,7 @@ def test_apply_graph_filters_falls_back_when_manual_slider_would_blank_the_tab(p
             slider.dispatchEvent(new Event('input', { bubbles: true }));
         }
     """)
-    page.wait_for_timeout(300)
+    page.wait_for_timeout(1200)
 
     circle_count = page.locator("#graphContainer svg circle").count()
     assert circle_count > 1, "applyGraphFilters() did not fall back to threshold 0"

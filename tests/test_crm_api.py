@@ -451,6 +451,23 @@ class TestNetworkGraphPruning:
         data = response.json()
         assert len(data["nodes"]) <= 20
 
+    def test_response_reaches_max_nodes_for_a_well_connected_centre(self, client, sample_person_id):
+        """A centre with enough direct connections to fill the whole budget
+        on its own must actually get max_nodes back, not come back short
+        because the reserved second-degree share went unspent (#896 review
+        round 5, MINOR finding: backfill any leftover deeper-hop budget
+        from the next-strongest direct candidates)."""
+        from api.services.relationship import get_relationship_store
+
+        rel_store = get_relationship_store()
+        if len(rel_store.get_all_for_person(sample_person_id)) < 150:
+            pytest.skip("Person has fewer than 150 relationships; can't test the full-budget case")
+
+        response = client.get(f"/api/crm/network?center_on={sample_person_id}&depth=2")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["nodes"]) == 150
+
     def test_first_degree_nodes_are_the_true_top_n_by_rendered_weight(self, client, sample_person_id):
         """When a center has more first-degree connections than fit, the
         kept set equals the TRUE top-N by rendered edge weight — computed

@@ -248,7 +248,22 @@ class TestSecondDegreeTier:
         first-degree cut (re-discovered through a friend, then promoted
         back to degree 1 by the finding-4 relabelling), leaving nothing
         for genuine friends-of-friends on a dense centre. Fixed by skipping
-        ids already in all_direct_candidates during deeper-hop expansion."""
+        ids already in all_direct_candidates during deeper-hop expansion.
+
+        `max_second_degree_per_node=1` here is deliberate (#896 review round
+        5 nit): with a larger limit, a genuine friend can slip in on the
+        same first-degree node's turn even without the skip, since that
+        node's own budget covers both candidates - the earlier version of
+        this test passed regardless of whether the skip existed. With
+        limit=1, only ONE second-degree slot is even fetched per
+        first-degree node, so which one it is matters: the first 5
+        first-degree nodes here only know a "missed" direct candidate, and
+        the last 2 only know a genuine friend. Without the skip, the first
+        5 nodes' "missed" additions (later relabeled to degree 1, but only
+        after they've already occupied the reserved budget during
+        traversal) exhaust the 2-slot reserved budget before the 2
+        friend-only nodes are ever reached - so this only passes when the
+        skip is actually skipping."""
         monkeypatch.setattr(settings, "my_person_id", "nobody")
 
         people = {"center": PersonEntity(id="center", canonical_name="Center")}
@@ -263,17 +278,22 @@ class TestSecondDegreeTier:
                 person_a_id="center", person_b_id=pid, shared_events_count=30 - i,
             ))
 
-        # Each selected first-degree node also knows one of the "missed"
-        # direct candidates (the old bug's re-entry path) AND one genuine
-        # friend-of-friend who has no relationship with the centre at all.
+        # first0..first4 each know only ONE of the "missed" direct
+        # candidates (the old bug's re-entry path) - no genuine friend at
+        # all. first5/first6 each know only ONE genuine friend-of-friend
+        # who has no relationship with the centre at all.
         neighbor_rels_by_id = {}
-        for i in range(7):
+        for i in range(5):
             first_id = f"first{i}"
-            missed_id = f"missed{i % 5}"
+            missed_id = f"missed{i}"
+            neighbor_rels_by_id[first_id] = [
+                Relationship(person_a_id=first_id, person_b_id=missed_id, shared_events_count=10),
+            ]
+        for i in range(5, 7):
+            first_id = f"first{i}"
             friend_id = f"genuine_friend{i}"
             people[friend_id] = PersonEntity(id=friend_id, canonical_name=friend_id)
             neighbor_rels_by_id[first_id] = [
-                Relationship(person_a_id=first_id, person_b_id=missed_id, shared_events_count=10),
                 Relationship(person_a_id=first_id, person_b_id=friend_id, shared_events_count=9),
             ]
 
@@ -281,7 +301,7 @@ class TestSecondDegreeTier:
         rel_store = _FakeRelationshipStore(center_rels=center_rels, neighbor_rels_by_id=neighbor_rels_by_id)
 
         result = _call_network_graph(
-            person_store, rel_store, depth=2, max_nodes=10, max_second_degree_per_node=5,
+            person_store, rel_store, depth=2, max_nodes=10, max_second_degree_per_node=1,
         )
 
         degree2_ids = {n.id for n in result.nodes if n.degree == 2}
@@ -440,29 +460,41 @@ class TestCentreEdgeSkippedWhenCentreFiltered:
 
 
 class TestDegreeRelabeling:
-    """#896 review round 3, MINOR finding 4, as refined by round 4: `degree`
-    must mean "has a direct edge to the centre." Round 3 achieved this by
-    relabelling a direct connection that missed the first-degree cut back
-    to degree 1 if a friend happened to re-introduce it as "second-degree" -
-    but round 4 found that re-entry path was reclaiming the whole budget
-    reserved for genuine friends-of-friends on a dense centre. The deeper-hop
-    expansion now skips any id that's already a known direct connection of
-    the centre (see TestSecondDegreeTier's dense-centre test), so a missed
-    direct connection is no longer re-discoverable at all - it's simply
-    absent from a budget-constrained response, exactly like any other
-    candidate that didn't make the cut. `all_direct_candidates` is kept in
-    `api/routes/crm.py` as a relabelling backstop that should no longer be
-    reachable in practice; this test locks down the now-correct behavior
-    (absence, not relabelling) for the exact scenario round 3's test used."""
+    """#896 review round 3, MINOR finding 4, refined by rounds 4 and 5:
+    `degree` must mean "has a direct edge to the centre."
 
-    def test_direct_neighbor_that_missed_the_cut_is_simply_absent(self, monkeypatch):
+    Round 3 achieved this by relabelling a direct connection that missed
+    the first-degree cut back to degree 1 if a friend happened to
+    re-introduce it as "second-degree" - but round 4 found that re-entry
+    path was reclaiming the whole budget reserved for genuine
+    friends-of-friends on a dense centre, so deeper-hop expansion was
+    changed to skip any id already known to be a direct connection of the
+    centre (see TestSecondDegreeTier's dense-centre test) instead of
+    relying on relabelling to clean it up afterward.
+
+    Round 5 found that skip alone made a missed-cut direct connection
+    disappear from the response entirely whenever the reserved tier didn't
+    have a genuine friend-of-friend to spend its budget on - a real
+    first-degree person, shown by every prior version of this endpoint,
+    now simply absent even though there was room for them. The fix
+    backfills any leftover budget from the next-strongest direct
+    candidates (ranked, category-filtered the same way first-degree
+    selection was) instead of leaving those slots unused. `all_direct_candidates`'s
+    relabelling loop is kept in `api/routes/crm.py` as a backstop that
+    should no longer be reachable in practice; this test locks down the
+    backfill as the mechanism that brings a missed-cut direct connection
+    back, with degree 1 and its own centre edge - not a "second-degree"
+    relabel."""
+
+    def test_direct_neighbor_that_missed_the_cut_is_backfilled_as_degree_one(self, monkeypatch):
         monkeypatch.setattr(settings, "my_person_id", "nobody")
 
         people = {"center": PersonEntity(id="center", canonical_name="Center")}
         center_rels = []
         # 8 genuine direct candidates; max_nodes=10 with depth>=2 caps
         # first-degree at 75% = 7, so the weakest ("missed") gets excluded
-        # from the first pass despite having a real edge to the centre.
+        # from the first pass despite having a real edge to the centre -
+        # leaving 2 of the 10 slots unused (8 selected so far: centre + 7).
         for i in range(8):
             pid = f"first{i}" if i < 7 else "missed"
             people[pid] = PersonEntity(id=pid, canonical_name=pid)
@@ -471,26 +503,44 @@ class TestDegreeRelabeling:
                 person_a_id="center", person_b_id=pid, shared_events_count=20 - i,
             ))
 
-        # first0 (the strongest, definitely selected) is also directly
-        # connected to "missed" - this is the round-3 re-entry path, which
-        # must now be skipped rather than followed.
-        friend_rel = Relationship(person_a_id="first0", person_b_id="missed", shared_events_count=3)
-
         person_store = _FakePersonStore(people_by_id=people)
-        rel_store = _FakeRelationshipStore(
-            center_rels=center_rels,
-            neighbor_rels_by_id={"first0": [friend_rel]},
-        )
+        rel_store = _FakeRelationshipStore(center_rels=center_rels)
 
         result = _call_network_graph(
             person_store, rel_store, depth=2, max_nodes=10, max_second_degree_per_node=5,
         )
 
-        node_ids = {n.id for n in result.nodes}
-        assert "missed" not in node_ids
+        missed_node = next(n for n in result.nodes if n.id == "missed")
+        assert missed_node.degree == 1
 
         edge_pairs = {frozenset((e.source, e.target)) for e in result.edges}
-        assert frozenset(("center", "missed")) not in edge_pairs
+        assert frozenset(("center", "missed")) in edge_pairs
+
+    def test_backfill_does_not_exceed_max_nodes(self, monkeypatch):
+        """The backfill must still respect the overall cap - it fills
+        leftover slots, it doesn't add an unbounded number of extras."""
+        monkeypatch.setattr(settings, "my_person_id", "nobody")
+
+        people = {"center": PersonEntity(id="center", canonical_name="Center")}
+        center_rels = []
+        # 20 direct candidates for a budget of only 10 (centre + 9) - no
+        # room for backfill at all; every remaining candidate must stay
+        # excluded.
+        for i in range(20):
+            pid = f"cand{i}"
+            people[pid] = PersonEntity(id=pid, canonical_name=pid)
+            center_rels.append(Relationship(
+                person_a_id="center", person_b_id=pid, shared_events_count=20 - i,
+            ))
+
+        person_store = _FakePersonStore(people_by_id=people)
+        rel_store = _FakeRelationshipStore(center_rels=center_rels)
+
+        result = _call_network_graph(
+            person_store, rel_store, depth=2, max_nodes=10, max_second_degree_per_node=5,
+        )
+
+        assert len(result.nodes) == 10
 
 
 class TestCategoryPredicateConsistency:

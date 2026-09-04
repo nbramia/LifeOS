@@ -2712,6 +2712,12 @@ def get_network_graph(
         # connection can miss the cut and re-enter as a "second-degree"
         # node, which is misleading and makes the degree filter lie).
         all_direct_candidates: dict[str, Relationship] = {}
+        # The full ranked (and, if category is set, category-filtered) list
+        # of direct candidates first-degree selection drew from - kept so
+        # any part of the deeper-hop budget that goes unspent can be
+        # backfilled from the next-strongest direct candidates instead of
+        # coming back under max_nodes (#896 review round 5, MINOR finding).
+        selection_pool: list[tuple[str, Relationship]] = []
 
         with contextlib.closing(rel_store.open_connection()) as conn:
             if first_degree_limit > 0:
@@ -2838,6 +2844,24 @@ def get_network_graph(
             if node_degrees.get(node_id, 0) > 1:
                 node_degrees[node_id] = 1
                 center_edges[node_id] = rel
+
+        # The deeper-hop tier's reserved share of the budget can't always
+        # be spent (a dense centre may have few or no genuine
+        # friends-of-friends once direct connections are excluded from it
+        # above), so backfill any leftover slots with the next-strongest
+        # direct candidates that missed the first-degree cut - they're
+        # real first-degree people, and every prior version of this
+        # endpoint showed them. Without this, a dense centre's response
+        # came back well under max_nodes even though its own network had
+        # more to show (#896 review round 5, MINOR finding).
+        if len(node_degrees) < max_nodes and len(selection_pool) > first_degree_limit:
+            for canonical_other, rel in selection_pool[first_degree_limit:]:
+                if len(node_degrees) >= max_nodes:
+                    break
+                if canonical_other in node_degrees:
+                    continue
+                node_degrees[canonical_other] = 1
+                center_edges[canonical_other] = rel
     else:
         # Get all people (no center, all are degree 1) - unchanged full-graph path.
         node_degrees = {p.id: 1 for p in all_people_dict.values()}
