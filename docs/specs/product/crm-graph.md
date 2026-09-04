@@ -155,6 +155,14 @@ applied to already-selected nodes exactly as it always was — note it's
 currently a no-op in practice regardless of value, since it's validated to
 0.0–1.0 while `relationship_strength` is on a 0–100 scale.
 
+A well-connected center often has few or no genuine friends-of-friends left
+to fill the deeper-hop tier once its own direct connections are excluded
+from that tier (point 3 above) — so any of that tier's budget that goes
+unspent is backfilled from the center's next-strongest direct candidates
+that missed the first-degree cut. They're real first-degree people (see the
+relabeling note above), so a dense center's response still reaches
+`max_nodes` rather than coming back short.
+
 The Graph tab's own auto-selected strength-slider threshold
 (`calculateOptimalEdgeThreshold`) never picks a threshold that would hide
 every first-degree node, and returns 0 outright when every first-degree
