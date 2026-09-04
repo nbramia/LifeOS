@@ -946,3 +946,268 @@ def test_stale_failed_fetch_does_not_clobber_a_newer_cache_entry(page: Page, web
     assert len(responses) == 2  # still just the two -- no clobber-triggered refetch
     host_select3 = page.locator("#test-assignment-container [data-field='host']")
     expect(host_select3.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
+
+
+# ---------------------------------------------------------------------------
+# #901 round 3: A5 (overlapping saves are serialized so a rejected save can
+# no longer revert an accepted one, or vice versa), R9 (a revert to a host
+# whose option was removed re-seeds it, flagged, instead of silently
+# clearing to "this machine").
+# ---------------------------------------------------------------------------
+
+def test_serialized_save_lone_change_still_saves_immediately_and_sticks(page: Page, web_base_url):
+    """Over-correction guard for A5's serialization: a single, non-
+    overlapping change must still save right away and stick -- chaining
+    onto an already-resolved `saveChain` must not add a meaningful delay
+    or drop the change."""
+    _load_module(page, web_base_url)
+    _render(page, {"id": "t60", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {"host": "laptop", "effort": "medium"}})
+
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
+
+    host_select.select_option("studio-box")
+    expect(host_select).to_have_value("studio-box")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 1
+    assert calls[0]["patch"]["fields"]["host"] == "studio-box"
+
+
+def test_serialized_saves_two_sequential_changes_both_land_in_order(page: Page, web_base_url):
+    """Over-correction guard for A5: two changes made one after the
+    OTHER has already settled must both land, each carrying the other's
+    already-saved value forward -- serialization must not turn into
+    losing or reordering non-overlapping saves."""
+    _load_module(page, web_base_url)
+    _render(page, {"id": "t61", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {"host": "laptop", "effort": "medium"}})
+
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
+
+    host_select.select_option("studio-box")
+    expect(host_select).to_have_value("studio-box")
+    page.locator("[data-field='effort']").select_option("high")
+    expect(page.locator("[data-field='effort']")).to_have_value("high")
+
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 2
+    first, second = calls[0]["patch"]["fields"], calls[1]["patch"]["fields"]
+    assert (first["effort"], first["host"]) == ("medium", "studio-box")
+    assert (second["effort"], second["host"]) == ("high", "studio-box")
+
+
+def test_overlapping_saves_accepted_host_change_survives_a_later_rejected_effort_change(page: Page, web_base_url):
+    """(#901 round 3, finding A5, reproduction F1) With two saves in
+    flight -- an ACCEPTED host change that takes a while, and a REJECTED
+    effort change sent shortly after -- the accepted host must not be
+    silently reverted by the unrelated rejection, and the rejected effort
+    must revert to what was actually last committed. Before A5,
+    `lastSaved*` was reconstructed from the live controls at whichever
+    save resolved LAST -- here, the rejected one -- so the revert
+    clobbered a host the server had already committed, with no toast at
+    any point."""
+    _load_module(page, web_base_url)
+    page.evaluate(
+        """(card) => {
+            const container = document.createElement('div');
+            container.id = 'test-assignment-container';
+            document.body.appendChild(container);
+            window.__lastCalls = [];
+            window.__errorCalls = [];
+            window.__renderAssignmentPickers(container, card, {
+                putTask: (id, patch) => {
+                    window.__lastCalls.push({ id, patch });
+                    return new Promise((resolve, reject) => {
+                        // The host change (effort still 'high' at the
+                        // moment IT runs) takes 300ms and is accepted; a
+                        // save actually carrying the rejected effort
+                        // value is rejected near-instantly (20ms).
+                        const delay = patch.fields.effort === 'low' ? 20 : 300;
+                        setTimeout(() => {
+                            if (patch.fields.effort === 'low') {
+                                reject(new Error('effort low is not permitted'));
+                            } else {
+                                resolve({ id, ...patch });
+                            }
+                        }, delay);
+                    });
+                },
+                onError: (message) => { window.__errorCalls.push(message); },
+            });
+        }""",
+        {"id": "t62", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {"host": "laptop", "effort": "high"}},
+    )
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    effort_select = page.locator("#test-assignment-container [data-field='effort']")
+    error_el = page.locator("#test-assignment-container [data-field='error']")
+    expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))  # wait for the catalog
+
+    # Two changes fired back to back, well inside the first save's 300ms
+    # flight -- the second is queued behind the first (A5's serialization),
+    # not fired concurrently.
+    host_select.select_option("studio-box")
+    effort_select.select_option("low")
+
+    # Wait for BOTH saves to settle (the rejection's error surfacing is
+    # the signal the second -- and thus also the first -- has resolved).
+    expect(error_el).to_contain_text("effort low is not permitted")
+
+    # The ACCEPTED host must still be selected -- not reverted by the
+    # unrelated rejection.
+    expect(host_select).to_have_value("studio-box")
+    # The REJECTED effort must revert to what was actually last
+    # committed ("high", from the accepted save), not silently stay at
+    # the operator's rejected "low".
+    expect(effort_select).to_have_value("high")
+
+    # A later, unrelated save must carry the ACCEPTED host forward.
+    effort_select.select_option("medium")
+    expect(error_el).to_be_hidden()
+    calls = page.evaluate("() => window.__lastCalls")
+    last = calls[-1]["patch"]["fields"]
+    assert last["host"] == "studio-box"  # not lost
+    assert last["effort"] == "medium"
+
+
+def test_overlapping_saves_rejected_effort_reverts_even_when_the_accepted_save_settles_first(page: Page, web_base_url):
+    """(#901 round 3, finding A5, reproduction F2) Mirror image of the
+    test above: the ACCEPTED host change settles quickly, the REJECTED
+    effort change (sent shortly after) takes longer to come back. Before
+    A5, `lastSaved*` was captured from the live controls AFTER each
+    save's own `await` -- so the accepted save, resolving first while the
+    operator had already moved the effort control, recorded the
+    operator's unconfirmed value as "last known good," making the
+    later rejection's revert a no-op. The rejected value must still
+    revert here, and must not ride along on the next save."""
+    _load_module(page, web_base_url)
+    page.evaluate(
+        """(card) => {
+            const container = document.createElement('div');
+            container.id = 'test-assignment-container';
+            document.body.appendChild(container);
+            window.__lastCalls = [];
+            window.__errorCalls = [];
+            window.__renderAssignmentPickers(container, card, {
+                putTask: (id, patch) => {
+                    window.__lastCalls.push({ id, patch });
+                    return new Promise((resolve, reject) => {
+                        const delay = patch.fields.effort === 'low' ? 700 : 100;
+                        setTimeout(() => {
+                            if (patch.fields.effort === 'low') {
+                                reject(new Error('effort low is not permitted'));
+                            } else {
+                                resolve({ id, ...patch });
+                            }
+                        }, delay);
+                    });
+                },
+                onError: (message) => { window.__errorCalls.push(message); },
+            });
+        }""",
+        {"id": "t63", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {"host": "laptop", "effort": "high"}},
+    )
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    effort_select = page.locator("#test-assignment-container [data-field='effort']")
+    error_el = page.locator("#test-assignment-container [data-field='error']")
+    expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
+
+    host_select.select_option("studio-box")
+    effort_select.select_option("low")
+
+    expect(error_el).to_contain_text("effort low is not permitted")
+    expect(effort_select).to_have_value("high")  # reverted, not left at the rejected "low"
+    expect(host_select).to_have_value("studio-box")  # the accepted change unaffected
+
+    # The next save must not carry the rejected effort forward.
+    host_select.select_option("laptop")
+    expect(error_el).to_be_hidden()
+    calls = page.evaluate("() => window.__lastCalls")
+    last = calls[-1]["patch"]["fields"]
+    assert last["effort"] == "high"  # NOT "low"
+    assert last["host"] == "laptop"
+
+
+def test_unknown_saved_host_survives_a_rejected_save_racing_the_hosts_fetch(page: Page, web_base_url):
+    """(#901 round 3, finding R9) Three realistic preconditions stacked:
+    the card's saved host has dropped out of the registry (unknown,
+    flagged); the operator clears the host to "this machine" WHILE `GET
+    /api/agents/hosts` is still in flight (round 1's A1 deliberately
+    supports changing the live selection mid-fetch); and that catalog
+    landing's rebuild (still keyed off the live selection, now "") drops
+    the flagged-unknown option entirely, right before the save is
+    REJECTED. The naive `hostEl.value = lastSavedHost` then finds no
+    matching option, and the DOM silently sets the value to `""` --
+    itself a real, different, meaningful value ("this machine") -- rather
+    than restoring the original unknown host."""
+    pending = []
+
+    def api_handler(route):
+        if "/api/agents/models" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+        elif "/api/agents/hosts" in route.request.url:
+            pending.append(route)  # stashed -- fulfilled mid-test, below
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    page.evaluate(
+        """(card) => {
+            const container = document.createElement('div');
+            container.id = 'test-assignment-container';
+            document.body.appendChild(container);
+            window.__lastCalls = [];
+            window.__errorCalls = [];
+            window.__pendingSaves = [];
+            window.__renderAssignmentPickers(container, card, {
+                putTask: (id, patch) => {
+                    window.__lastCalls.push({ id, patch });
+                    return new Promise((resolve, reject) => {
+                        window.__pendingSaves.push({ resolve, reject });
+                    });
+                },
+                onError: (message) => { window.__errorCalls.push(message); },
+            });
+        }""",
+        {"id": "t64", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {"host": "ghost-box", "effort": "medium"}},
+    )
+
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    error_el = page.locator("#test-assignment-container [data-field='error']")
+    # Seeded synchronously, before the (still-stashed) hosts fetch: "this
+    # machine" + the flagged-unknown ghost-box.
+    expect(host_select.locator("option")).to_have_count(2)
+    assert host_select.input_value() == "ghost-box"
+
+    # Clear the host to "this machine" while the fetch is still in flight
+    # -- this save is left pending (its putTask promise is stashed, not
+    # settled) until explicitly resolved below.
+    host_select.select_option("")
+    for _ in range(50):
+        if page.evaluate("() => window.__pendingSaves.length") >= 1:
+            break
+        page.wait_for_timeout(20)
+    assert page.evaluate("() => window.__pendingSaves.length") == 1
+
+    # NOW let the hosts catalog land, while the save above is STILL
+    # pending. A1's rebuild reads the live selection ("") -- known
+    # ("this machine" always is) -- and drops the flagged-unknown
+    # ghost-box option entirely, since nothing needs it anymore.
+    for route in pending:
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+    pending.clear()
+    expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
+    expect(host_select.locator("option[data-unknown='true']")).to_have_count(0)
+
+    # THEN the save is rejected -- the option it needs to revert to no
+    # longer exists in the DOM.
+    page.evaluate("() => window.__pendingSaves[0].reject(new Error('cannot clear host'))")
+    expect(error_el).to_contain_text("cannot clear host")
+
+    # R9: restored, flagged, and re-selected -- not silently cleared.
+    expect(host_select.locator("option[data-unknown='true']")).to_have_count(1)
+    assert host_select.input_value() == "ghost-box"  # NOT "" ("this machine")
+
+    # A later, unrelated save must still send the ORIGINAL host, not None.
+    page.locator("[data-field='effort']").select_option("high")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert calls[-1]["patch"]["fields"]["host"] == "ghost-box"  # NOT None
