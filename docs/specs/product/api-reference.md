@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-03
+**Last Updated:** 2026-09-04
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Three adjacent catalogs split out for size:
 
@@ -1110,6 +1110,10 @@ Card kill/resume/focus/registration endpoints are documented in [agent-viz.md §
 ### GET /api/agents/models
 
 Per-engine model catalog for the board's assignment pickers: `{engines: {claude: [...], codex: [...], local: [...], hermes: [...]}, refreshed_at, stale}`, each entry `{id, label, pricing}`. Cached for `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` (default 24h); `stale: true` means the last successful refresh, not this one, is being served.
+
+### GET /api/agents/hosts
+
+Host registry for the board's host picker (#883): `{hosts: [{name, ssh_target, online, is_api_host}], refreshed_at}`. The list is always the API host itself (`is_api_host: true`, `online: true`) plus every entry in `LIFEOS_AGENT_HOSTS`, deduplicated by name. `online` is `true`/`false` when a `tailscale status --json` probe ran successfully and matched the host to a peer, `null` when the signal is inconclusive — `tailscale` isn't installed, the probe failed/timed out, it ran fine but simply found no matching peer (a host can still be reachable over plain LAN ssh), or the catalog build itself failed for any other reason (every registry host still listed, just without a fresh probe). The route enforces a real ~1.8s ceiling on top of the probe's own bound, falling back to that same registry-preserving degraded response — never the bare API host alone, unless the degraded build itself fails — on a timeout or any other failure. Cached server-side for 30 seconds. The board client re-fetches when a drawer is opened more than ~30s after the last fetch, rather than once per page load or on a fixed cadence; a drawer left open never refetches on its own. After two consecutive client-side fetch failures, the client stops retrying for 10 seconds rather than issuing one request per drawer open against a dead endpoint. See [agent-worker.md § Host catalog](../technical/agent-worker.md#host-catalog-883) for the probe/matching/degrade mechanism.
 
 ### POST /api/agents/board/cards/{id}/open
 

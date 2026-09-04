@@ -45,6 +45,15 @@ _MODEL_CATALOG = {
     "stale": False,
 }
 
+# Obviously synthetic — same shape GET /api/agents/hosts returns (#883).
+_HOST_CATALOG = {
+    "hosts": [
+        {"name": "desktop-box", "ssh_target": None, "online": True, "is_api_host": True},
+        {"name": "build-box-2", "ssh_target": "operator@build-box-2.example", "online": True, "is_api_host": False},
+    ],
+    "refreshed_at": "2026-01-01T00:00:00Z",
+}
+
 # Assignee-name tags board.js's own drawer strips/re-adds on an assignee
 # change (web/agents/board.js ASSIGNEES) — used by the lane stub below to
 # mirror plan_lane_move's tag bookkeeping on a drawer-driven assign (#859
@@ -175,7 +184,8 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
     /api/agents/board/cards/{id}/open). `open_response`, when given, is
     `{"status": <code>, "detail": <str>}` — the 409 failure path (#859);
     omitted defaults to a 200 success. `GET /api/agents/models` is served
-    from `_MODEL_CATALOG`.
+    from `_MODEL_CATALOG`; `GET /api/agents/hosts` from `_HOST_CATALOG`
+    (#883).
 
     `board_stream_frames`: SSE frame strings (each a full
     "event: board\\ndata: {...}\\n\\n" block), delivered one per *reconnect*
@@ -245,6 +255,10 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
 
         if re.search(r"/api/agents/models$", url) and method == "GET":
             route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+            return
+
+        if re.search(r"/api/agents/hosts$", url) and method == "GET":
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
             return
 
         lane_match = re.search(r"/api/agents/board/cards/([^/]+)/lane$", url)
@@ -1049,16 +1063,19 @@ class TestAssignmentPickers:
         }
 
     def test_changing_host_writes_exactly_one_fields_put(self, page: Page, agents_base_url):
+        """The host field is a `<select>` of registry hosts (#883), not
+        free text — pick "build-box-2" (one of `_HOST_CATALOG`'s synthetic
+        entries) from the dropdown rather than typing it."""
         task_puts = []
         _open_board(page, agents_base_url, task_puts=task_puts)
         page.locator('[data-card-id="t7"]').click()
         expect(
             page.locator(".drawer-assignment [data-field='model'] option")
         ).to_have_count(3)
-        host_input = page.locator(".drawer-assignment [data-field='host']")
-        expect(host_input).to_be_visible()
-        host_input.fill("build-box-2")
-        host_input.press("Tab")  # text input needs an explicit blur to fire `change`
+        host_select = page.locator(".drawer-assignment [data-field='host']")
+        expect(host_select).to_be_visible()
+        expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
+        host_select.select_option("build-box-2")
         _wait_for(lambda: any("fields" in p for p in task_puts), page=page)
         page.wait_for_timeout(100)  # let any second, unwanted PUT land before counting
         fields_puts = [p for p in task_puts if "fields" in p]

@@ -941,7 +941,7 @@ export function initBoard() {
       renderAssignmentPickers(assignmentEl, card, {
         putTask,
         onSaved: () => fetchBoard(),
-        onError: (message) => showToast(`Couldn't save assignment: ${message}`, true),
+        onError: (message) => { if (message) showToast(`Couldn't save assignment: ${message}`, true); },
       });
       const engineRow = assignmentEl.querySelector('[data-row="engine"]');
       if (engineRow) engineRow.hidden = true;
