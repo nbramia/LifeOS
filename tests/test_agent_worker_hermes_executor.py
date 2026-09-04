@@ -399,6 +399,17 @@ def test_two_real_hermes_turns_interleaved_never_cross_attribute_on_the_real_sna
     sa = store.create(task_id="t-alpha", status=STATUS_RUNNING, routing="hermes")
     sb = store.create(task_id="t-beta", status=STATUS_RUNNING, routing="hermes")
 
+    # Each `execute()` call resolves a caller session id via a bare
+    # `SessionStore()` (see `_resolve_caller_session_id` in
+    # `api/routes/hermes_proxy.py`) — same tmp-path db the fixture above
+    # redirects `sa`/`sb` to. Constructing one here, before the two threads
+    # start, forces its schema/WAL init to happen once, up front, instead of
+    # racing two threads against the same not-yet-initialized file: mirrors
+    # production, where the worker's db is initialized at startup long
+    # before any turn.
+    from api.services.agent_worker.session_store import SessionStore as _SS
+    _SS()
+
     turn = Turnstile()
     ea = HermesExecutor(
         session_store=store, transcript_store=ts,
