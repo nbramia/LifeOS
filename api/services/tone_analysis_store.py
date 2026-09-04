@@ -15,6 +15,15 @@ Each row is one person's tone result for one calendar month (`period_key`,
 shape). `interaction_count` is the number of interactions that went into
 computing the result -- the caller uses it, together with `updated_at`, to
 decide whether a stored month is still fresh.
+
+Known gap (#899 review finding 8): nothing currently deletes a person's
+rows here on merge or delete -- `scripts/merge_people.py` and
+`scripts/cleanup_orphaned_records.py` cover `person_facts`,
+`relationships`, `link_overrides`, and `source_entities`, but not this
+table, so a merged/deleted person's tone rows orphan indefinitely. A prior
+`delete_for_person()` method existed for this but had no caller and was
+removed per AGENTS.md Simplicity; wiring cleanup into one of those scripts
+is a reasonable follow-up rather than in-scope work here.
 """
 import json
 import logging
