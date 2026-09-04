@@ -168,3 +168,89 @@ def test_http_error_fails_gracefully(tmp_path, monkeypatch):
     outcome = executor.execute(session, {"description": "hello"})
     assert outcome.status == STATUS_FAILED
     assert "hermes request failed" in outcome.reason
+
+
+# ---------------------------------------------------------------------------
+# #892 — HermesExecutor is the only writer of Session.hermes_model. It must
+# record the model Hermes reported for THIS session's OWN turn, on both the
+# normal-completion exit path and the failure exit path (a dropped
+# connection after usage was reported still means the turn ran on that
+# model).
+# ---------------------------------------------------------------------------
+
+
+def test_completed_turn_records_the_reported_model_on_its_own_session(tmp_path, monkeypatch):
+    body = _sse([
+        {"type": "conversation_id", "conversation_id": "conv-model-1"},
+        {"type": "content", "content": "here you go"},
+        {"type": "usage", "model": "gpt-5.5", "input_tokens": 10, "output_tokens": 5, "cost_usd": 0.002},
+        {"type": "done"},
+    ])
+    executor, store, session, captured = _build(tmp_path, monkeypatch, body=body)
+    outcome = executor.execute(session, {"description": "hi"})
+    assert outcome.status == STATUS_COMPLETED
+    assert store.get("t1").hermes_model == "gpt-5.5"
+
+
+def test_no_usage_event_leaves_hermes_model_null(tmp_path, monkeypatch):
+    """A turn whose upstream never sent a well-formed `usage` event (e.g.
+    the malformed-event case `_HermesTurnPersister._handle_usage` already
+    drops) must not write a bogus/empty value onto the session."""
+    body = _sse([
+        {"type": "conversation_id", "conversation_id": "conv-model-2"},
+        {"type": "content", "content": "ack"},
+        {"type": "done"},
+    ])
+    executor, store, session, captured = _build(tmp_path, monkeypatch, body=body)
+    outcome = executor.execute(session, {"description": "hi"})
+    assert outcome.status == STATUS_COMPLETED
+    assert store.get("t1").hermes_model is None
+
+
+def test_failed_turn_after_usage_event_still_records_the_reported_model(tmp_path, monkeypatch):
+    """(#892) The upstream connection can drop AFTER Hermes's own `usage`
+    event already arrived (simulated here as an `iter_bytes()` that yields
+    the usage frame, then raises mid-stream, exactly like a genuine
+    connection error). The turn still ran on that model, so it must still
+    be recorded even though the executor's outcome is FAILED — dropping it
+    would be less honest, not more (design.md, #892)."""
+    usage_frame = _sse([
+        {"type": "conversation_id", "conversation_id": "conv-model-3"},
+        {"type": "usage", "model": "drop-after-usage-model", "input_tokens": 3, "output_tokens": 2, "cost_usd": 0.001},
+    ])
+
+    class _DropAfterUsageResponse(_FakeResponse):
+        def iter_bytes(self):
+            yield self._body
+            raise httpx.ReadError("connection dropped mid-stream")
+
+    class _DropAfterUsageClient(_FakeClient):
+        def stream(self, method, url, content=None, headers=None):
+            self.captured["method"] = method
+            self.captured["url"] = url
+            self.captured["content"] = content
+            self.captured["headers"] = headers
+            return _FakeStreamCM(_DropAfterUsageResponse(self._body))
+
+    from config.settings import settings
+    monkeypatch.setattr(settings, "hermes_backend_url", "http://hermes-backend.example", raising=False)
+    monkeypatch.setattr(settings, "hermes_backend_token", "test-token", raising=False)
+
+    conv_store = ConversationStore(db_path=str(tmp_path / "conversations.db"))
+    usage_store = UsageStore(db_path=str(tmp_path / "usage.db"))
+    monkeypatch.setattr(hp, "get_store", lambda: conv_store)
+    monkeypatch.setattr(hp, "get_usage_store", lambda: usage_store)
+    monkeypatch.setattr(hp, "schedule_retitle", lambda conv_id: None)
+
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    captured: dict = {}
+    factory = lambda: _DropAfterUsageClient(usage_frame, 200, captured)  # noqa: E731
+    executor = HermesExecutor(
+        session_store=store, transcript_store=transcripts, http_client_factory=factory,
+    )
+    session = store.create(task_id="t1", routing="hermes")
+
+    outcome = executor.execute(session, {"description": "hi"})
+    assert outcome.status == STATUS_FAILED
+    assert store.get("t1").hermes_model == "drop-after-usage-model"
