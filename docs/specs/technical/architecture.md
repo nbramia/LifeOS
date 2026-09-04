@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-08-21
+> **Last Updated:** 2026-09-04
 
 Codebase organization and module structure for efficient navigation.
 
@@ -259,7 +259,7 @@ from api.routes.crm_models import (
 
 ```python
 @router.get("/endpoint", response_model=ResponseModel)
-async def endpoint_handler(
+def endpoint_handler(
     param: str = Query(..., description="Required parameter"),
     optional: int = Query(default=10, ge=1, le=100),
 ):
@@ -274,6 +274,38 @@ async def endpoint_handler(
 
     return ResponseModel(...)
 ```
+
+**`def` vs. `async def` (#868).** LifeOS runs one uvicorn process with a
+single event loop; every client surface (chat, Telegram, voice, MCP, the
+agent worker, and the CRM/people UI) shares it. A handler declared `async
+def` with nothing to `await` still runs inline on that loop, so its
+synchronous DB/CPU work blocks every other in-flight request until it
+returns. A handler declared plain `def` is dispatched by FastAPI to the
+worker threadpool (via Starlette's `run_in_threadpool`, anyio's default
+capacity of 40) automatically, which restores fairness between requests.
+The CRM, people, and photos routers (`api/routes/crm.py`, `api/routes/people.py`,
+`api/routes/photos.py`) follow this rule as of #868: a handler is `async def`
+only if its own body actually awaits something (an LLM call, `await
+file.read()`); otherwise it is `def`. A handler that keeps `async def`
+pushes its blocking store or LLM calls onto a thread explicitly with `await
+asyncio.to_thread(...)` (e.g. `api/routes/investments.py`, `api/routes/crm.py`'s
+fact-extraction and source-import endpoints) rather than doing them inline.
+This is a fairness fix, not a throughput one — CPU-bound work still holds
+the GIL while it runs; per-endpoint throughput is tracked separately
+(issues #869-#874). **Scope:** this is the rule for these three routers
+specifically, enforced by `tests/test_route_handlers_sync.py`; the rest of
+`api/routes/` still has `async def` handlers with no `await` that #868 did
+not touch — converting them is a separate, unstarted effort, not a silent
+exception to the rule above.
+Moving these handlers off the loop also removed the implicit serialization
+an inline `async def` gave every request against every other one. Handlers
+that mutate shared on-disk state (`merge_people`, `split_person`,
+`hide_person`, the review-queue confirm/reject endpoints, and the
+sync-trigger POSTs) now hold a module-level `threading.Lock`
+(`api/routes/crm.py`'s `_mutation_lock`) across their bodies to restore
+that serialization explicitly, since two of them interleaving could
+otherwise corrupt shared bookkeeping (e.g. `scripts/merge_people.py`'s
+merge-intent log).
 
 ### Service Store Pattern
 

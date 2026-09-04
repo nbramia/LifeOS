@@ -46,22 +46,20 @@ class TestMeStatsEndpoint:
         store.get_all.return_value = people
         return store
 
-    @pytest.mark.asyncio
-    async def test_returns_aggregate_stats(self, mock_person_store):
+    def test_returns_aggregate_stats(self, mock_person_store):
         """Stats endpoint should return totals across all people."""
         from api.routes.crm import get_me_stats
 
         with patch('api.routes.crm.get_person_entity_store', return_value=mock_person_store):
             with patch('api.routes.crm.get_interaction_store'):
-                result = await get_me_stats()
+                result = get_me_stats()
 
         assert result.total_people == 3
         assert result.total_emails == 175  # 100 + 50 + 25
         assert result.total_meetings == 35  # 20 + 10 + 5
         assert result.total_messages == 800  # 500 + 200 + 100
 
-    @pytest.mark.asyncio
-    async def test_handles_empty_database(self):
+    def test_handles_empty_database(self):
         """Stats endpoint should handle empty database gracefully."""
         from api.routes.crm import get_me_stats
 
@@ -70,7 +68,7 @@ class TestMeStatsEndpoint:
 
         with patch('api.routes.crm.get_person_entity_store', return_value=mock_store):
             with patch('api.routes.crm.get_interaction_store'):
-                result = await get_me_stats()
+                result = get_me_stats()
 
         assert result.total_people == 0
         assert result.total_emails == 0
@@ -141,8 +139,7 @@ class TestMeInteractionsEndpoint:
 
         return person_store, interaction_store
 
-    @pytest.mark.asyncio
-    async def test_returns_aggregated_data(self, mock_stores):
+    def test_returns_aggregated_data(self, mock_stores):
         """Interactions endpoint should return aggregated data for dashboard."""
         from api.routes.crm import get_me_interactions
 
@@ -150,7 +147,7 @@ class TestMeInteractionsEndpoint:
 
         with patch('api.routes.crm.get_person_entity_store', return_value=person_store):
             with patch('api.routes.crm.get_interaction_store', return_value=interaction_store):
-                result = await get_me_interactions(days_back=30)
+                result = get_me_interactions(days_back=30)
 
         # Should have total count
         assert result.total_count == 2
@@ -167,8 +164,7 @@ class TestMeInteractionsEndpoint:
         # Check source breakdown
         assert 'imessage' in result.by_source
 
-    @pytest.mark.asyncio
-    async def test_excludes_self_interactions(self, mock_stores):
+    def test_excludes_self_interactions(self, mock_stores):
         """Interactions should not include self-interactions (via get_all_in_range exclude)."""
         from api.routes.crm import get_me_interactions
 
@@ -176,15 +172,14 @@ class TestMeInteractionsEndpoint:
 
         with patch('api.routes.crm.get_person_entity_store', return_value=person_store):
             with patch('api.routes.crm.get_interaction_store', return_value=interaction_store):
-                await get_me_interactions(days_back=365)
+                get_me_interactions(days_back=365)
 
         # Verify get_all_in_range was called with exclude_person_ids
         interaction_store.get_all_in_range.assert_called_once()
         call_args = interaction_store.get_all_in_range.call_args
         assert MY_PERSON_ID in call_args.kwargs.get('exclude_person_ids', [])
 
-    @pytest.mark.asyncio
-    async def test_filters_by_date_range(self):
+    def test_filters_by_date_range(self):
         """Date filtering is done by get_all_in_range method."""
         from api.routes.crm import get_me_interactions
 
@@ -217,7 +212,7 @@ class TestMeInteractionsEndpoint:
 
         with patch('api.routes.crm.get_person_entity_store', return_value=person_store):
             with patch('api.routes.crm.get_interaction_store', return_value=interaction_store):
-                result = await get_me_interactions(days_back=30)
+                result = get_me_interactions(days_back=30)
 
         assert result.total_count == 1
         assert len(result.daily) == 1  # Should have one day with data

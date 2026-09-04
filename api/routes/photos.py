@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from api.routes.crm import _mutation_lock
 from config.settings import settings
 
 router = APIRouter(prefix="/api/photos", tags=["photos"])
@@ -76,7 +77,7 @@ def _check_photos_enabled():
 
 
 @router.get("/stats", response_model=PhotosStatsResponse)
-async def get_photos_stats():
+def get_photos_stats():
     """
     Get statistics about the Photos library.
 
@@ -115,7 +116,7 @@ async def get_photos_stats():
 
 
 @router.get("/people", response_model=list[PhotosPersonResponse])
-async def list_photos_people(
+def list_photos_people(
     linked_only: bool = Query(
         default=True,
         description="Only return people linked to Apple Contacts"
@@ -162,7 +163,7 @@ async def list_photos_people(
 
 
 @router.get("/person/{person_id}", response_model=PhotosForPersonResponse)
-async def get_photos_for_person(
+def get_photos_for_person(
     person_id: str,
     date: Optional[str] = Query(None, description="Filter by date (YYYY-MM-DD)"),
     limit: int = Query(default=50, ge=1, le=200),
@@ -214,7 +215,7 @@ async def get_photos_for_person(
 
 
 @router.get("/shared/{person_a_id}/{person_b_id}", response_model=CoAppearanceResponse)
-async def get_shared_photos(
+def get_shared_photos(
     person_a_id: str,
     person_b_id: str,
     limit: int = Query(default=20, ge=1, le=100),
@@ -259,7 +260,7 @@ async def get_shared_photos(
 
 
 @router.post("/sync", response_model=SyncResponse)
-async def trigger_photo_sync(
+def trigger_photo_sync(
     incremental: bool = Query(
         default=True,
         description="If true, only sync new photos since last sync"
@@ -271,39 +272,40 @@ async def trigger_photo_sync(
     Creates SourceEntity and Interaction records for matched people
     in Photos face recognition data.
     """
-    _check_photos_enabled()
+    with _mutation_lock:
+        _check_photos_enabled()
 
-    from api.services.apple_photos_sync import sync_apple_photos
+        from api.services.apple_photos_sync import sync_apple_photos
 
-    try:
-        # For now, always do full sync (incremental requires tracking state)
-        stats = sync_apple_photos(since=None)
+        try:
+            # For now, always do full sync (incremental requires tracking state)
+            stats = sync_apple_photos(since=None)
 
-        return SyncResponse(
-            success=True,
-            stats=stats,
-            message=f"Synced {stats.get('person_matches', 0)} people, "
-                    f"created {stats.get('interactions_created', 0)} interactions"
-        )
-    except Exception as e:
-        # A plain JSONResponse, not a SyncResponse, so a top-level "error"
-        # key can ride alongside the existing fields instead of being
-        # filtered out by response_model validation. #609 made this legible
-        # (top-level "error" key); #614 decided a total failure must also
-        # be non-2xx, since a consumer that only checks HTTP status
-        # (`raise_for_status()`) should get correct behavior without
-        # knowing about the body convention. 500 because this is an
-        # unhandled exception, not a classified upstream/dependency
-        # failure. The "error" key stays as additive defense —
-        # `mcp_server.py: dispatch()` and the agent worker's ToolRegistry
-        # already flag any tool result as an error generically whenever the
-        # body carries a top-level "error" key.
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "stats": {"error": str(e)},
-            "message": f"Sync failed: {e}",
-            "error": str(e),
-        })
+            return SyncResponse(
+                success=True,
+                stats=stats,
+                message=f"Synced {stats.get('person_matches', 0)} people, "
+                        f"created {stats.get('interactions_created', 0)} interactions"
+            )
+        except Exception as e:
+            # A plain JSONResponse, not a SyncResponse, so a top-level "error"
+            # key can ride alongside the existing fields instead of being
+            # filtered out by response_model validation. #609 made this legible
+            # (top-level "error" key); #614 decided a total failure must also
+            # be non-2xx, since a consumer that only checks HTTP status
+            # (`raise_for_status()`) should get correct behavior without
+            # knowing about the body convention. 500 because this is an
+            # unhandled exception, not a classified upstream/dependency
+            # failure. The "error" key stays as additive defense —
+            # `mcp_server.py: dispatch()` and the agent worker's ToolRegistry
+            # already flag any tool result as an error generically whenever the
+            # body carries a top-level "error" key.
+            return JSONResponse(status_code=500, content={
+                "success": False,
+                "stats": {"error": str(e)},
+                "message": f"Sync failed: {e}",
+                "error": str(e),
+            })
 
 
 def _get_thumbnail_path(uuid: str) -> Path | None:
@@ -355,7 +357,7 @@ def _get_thumbnail_path(uuid: str) -> Path | None:
 
 
 @router.get("/thumbnail/{uuid}")
-async def get_photo_thumbnail(uuid: str):
+def get_photo_thumbnail(uuid: str):
     """
     Get a thumbnail for a photo by UUID.
 
@@ -407,7 +409,7 @@ async def get_photo_thumbnail(uuid: str):
 
 
 @router.get("/profile/{person_id}")
-async def get_profile_photo(person_id: str):
+def get_profile_photo(person_id: str):
     """
     Get a profile photo thumbnail for a person.
 
@@ -481,7 +483,7 @@ def _get_photo_file_path(uuid: str) -> Path | None:
 
 
 @router.get("/open/{uuid}")
-async def open_photo_in_app(uuid: str):
+def open_photo_in_app(uuid: str):
     """
     Open a specific photo in the Photos app or Preview.
 

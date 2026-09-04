@@ -1,7 +1,7 @@
 # Python Conventions
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-26
+> **Last Updated:** 2026-09-04
 > **Audience:** All developers and AI agents
 
 Coding conventions extracted from the LifeOS codebase. Match these patterns when writing new code.
@@ -67,14 +67,16 @@ from config.settings import settings
 
 ## Route Handler Pattern
 
-Routes are thin async functions on an `APIRouter`. They delegate to a service singleton and return Pydantic models or dicts.
+Routes are thin functions on an `APIRouter`. They delegate to a service singleton and return Pydantic models or dicts.
 
 ```python
-# api/routes/tasks.py
+# Generic shape, modeled on api/routes/tasks.py's list_tasks -- see the
+# `async def` vs. `def` bullet below for which form a new handler like this
+# one should actually use.
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
 @router.get("", response_model=TaskListResponse)
-async def list_tasks(
+def list_tasks(
     status: Optional[str] = None,
     context: Optional[str] = None,
 ):
@@ -91,6 +93,7 @@ Key patterns:
 - Request/response Pydantic models are defined at the top of the route file.
 - 404s use `raise HTTPException(status_code=404, detail="...")`.
 - No try/except in routes -- services handle errors internally.
+- `async def` only if the handler's own body actually `await`s something; otherwise plain `def` (#868). LifeOS runs a single uvicorn event loop shared by every client surface, so a coroutine handler with no `await` still runs inline on that loop instead of FastAPI's worker threadpool -- one slow handler then blocks everyone else's requests. A handler that keeps `async def` pushes its blocking store/LLM calls onto a thread with `await asyncio.to_thread(...)` rather than calling them inline. Applied and enforced (`tests/test_route_handlers_sync.py`) for `api/routes/crm.py`, `api/routes/people.py`, and `api/routes/photos.py` as of #868 -- the rest of `api/routes/` has not been converted yet, so `async def` with no `await` elsewhere is pre-existing, not an exception to this rule.
 
 ## Service / Store Pattern
 

@@ -5,6 +5,7 @@ Stores lightweight interaction records with links to sources.
 Each interaction represents a single touchpoint (email, meeting, note mention).
 """
 import sqlite3
+import threading
 import uuid
 import logging
 from dataclasses import dataclass, field, asdict
@@ -1466,6 +1467,11 @@ class InteractionStore:
 
 # Singleton instance
 _interaction_store: Optional[InteractionStore] = None
+# #868 moved CRM/people/photos handlers off the event loop and onto worker
+# threads, so two first-requests after a restart can now race this
+# check-and-set. Double-checked locking: the lock is only taken while
+# _interaction_store is still None, so it costs nothing once constructed.
+_interaction_store_lock = threading.Lock()
 
 
 def get_interaction_store(db_path: Optional[str] = None) -> InteractionStore:
@@ -1480,7 +1486,9 @@ def get_interaction_store(db_path: Optional[str] = None) -> InteractionStore:
     """
     global _interaction_store
     if _interaction_store is None:
-        _interaction_store = InteractionStore(db_path)
+        with _interaction_store_lock:
+            if _interaction_store is None:
+                _interaction_store = InteractionStore(db_path)
     return _interaction_store
 
 

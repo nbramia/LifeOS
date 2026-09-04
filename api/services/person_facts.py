@@ -23,6 +23,7 @@ import logging
 import random
 import re
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1732,13 +1733,20 @@ Interactions:
 # Singleton instances
 _fact_store: Optional[PersonFactStore] = None
 _fact_extractor: Optional[PersonFactExtractor] = None
+# #868 moved CRM/people/photos handlers off the event loop and onto worker
+# threads, so two first-requests after a restart can now race this
+# check-and-set. Double-checked locking: the lock is only taken while
+# _fact_store is still None, so it costs nothing once constructed.
+_fact_store_lock = threading.Lock()
 
 
 def get_person_fact_store(db_path: Optional[str] = None) -> PersonFactStore:
     """Get or create the singleton PersonFactStore."""
     global _fact_store
     if _fact_store is None:
-        _fact_store = PersonFactStore(db_path)
+        with _fact_store_lock:
+            if _fact_store is None:
+                _fact_store = PersonFactStore(db_path)
     return _fact_store
 
 

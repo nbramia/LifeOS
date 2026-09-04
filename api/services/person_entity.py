@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
@@ -1150,6 +1151,11 @@ class PersonEntityStore:
 
 # Singleton instance
 _entity_store: Optional[PersonEntityStore] = None
+# #868 moved CRM/people/photos handlers off the event loop and onto worker
+# threads, so two first-requests after a restart can now race this
+# check-and-set. Double-checked locking: the lock is only taken while
+# _entity_store is still None, so it costs nothing once constructed.
+_entity_store_lock = threading.Lock()
 
 
 def get_person_entity_store(db_path: str = None) -> PersonEntityStore:
@@ -1164,7 +1170,9 @@ def get_person_entity_store(db_path: str = None) -> PersonEntityStore:
     """
     global _entity_store
     if _entity_store is None:
-        _entity_store = PersonEntityStore(db_path)
+        with _entity_store_lock:
+            if _entity_store is None:
+                _entity_store = PersonEntityStore(db_path)
     return _entity_store
 
 

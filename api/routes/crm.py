@@ -8,9 +8,11 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+import asyncio
 import json
 import logging
 import sqlite3
+import threading
 import time
 
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
@@ -46,6 +48,22 @@ from api.services.person_facts import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/crm", tags=["crm"])
+
+# Serializes the mutating handlers below (merge, split, hide, review-queue
+# confirm/reject, and the sync-trigger POSTs — plus photos.py's own sync
+# trigger, which imports this lock).  #868 converted these from `async def`
+# with no `await` to plain `def`, which restores fairness by dispatching
+# them to the worker threadpool instead of running them start-to-finish
+# inline on the event loop — but that inline run was also, incidentally,
+# every mutating handler's only serialization against every other request.
+# Off the loop, two of these can now genuinely interleave; several
+# (`merge_people` in particular, via `scripts/merge_people.py`'s single
+# global intent log and merged-id read-modify-write) are not safe under
+# that interleaving. This is a single coarse lock rather than one per
+# handler because they can mutate overlapping state (a merge and a split
+# both touch person_store); a single-user host pays essentially nothing for
+# serializing writes that used to be serialized anyway.
+_mutation_lock = threading.Lock()
 
 # Work email domain for category detection (loaded from settings)
 WORK_EMAIL_DOMAIN = settings.work_email_domain if hasattr(settings, 'work_email_domain') and settings.work_email_domain else "example.com"
@@ -532,7 +550,7 @@ def _get_partner_name() -> str:
 
 
 @router.get("/config", response_model=CRMConfigResponse)
-async def get_crm_config():
+def get_crm_config():
     """
     Get CRM configuration values for frontend.
 
@@ -549,7 +567,7 @@ async def get_crm_config():
 
 
 @router.get("/birthdays/today")
-async def get_todays_birthdays():
+def get_todays_birthdays():
     """Get all people with birthdays today."""
     person_store = get_person_entity_store()
     people = person_store.get_all()
@@ -565,7 +583,7 @@ async def get_todays_birthdays():
 
 
 @router.get("/birthdays/all")
-async def get_all_birthdays():
+def get_all_birthdays():
     """Get all people with birthdays, grouped by date."""
     person_store = get_person_entity_store()
     people = person_store.get_all()
@@ -593,7 +611,7 @@ async def get_all_birthdays():
 
 
 @router.get("/people", response_model=PersonListResponse)
-async def list_people(
+def list_people(
     q: Optional[str] = Query(default=None, description="Search query"),
     category: Optional[str] = Query(default=None, description="Filter by category"),
     source: Optional[str] = Query(default=None, description="Filter by source"),
@@ -707,7 +725,7 @@ async def list_people(
 
 
 @router.get("/people/{person_id}", response_model=PersonDetailResponse)
-async def get_person(
+def get_person(
     person_id: str,
     include_related: bool = Query(default=False, description="Include source entities and relationships"),
     refresh_strength: bool = Query(default=False, description="Recompute relationship strength (slower)"),
@@ -746,7 +764,7 @@ async def get_person(
 
 
 @router.patch("/people/{person_id}", response_model=PersonDetailResponse)
-async def update_person(person_id: str, request: PersonUpdateRequest):
+def update_person(person_id: str, request: PersonUpdateRequest):
     """
     Update a person's notes, tags, or category.
     """
@@ -807,7 +825,7 @@ class PersonMergeResponse(BaseModel):
 
 
 @router.post("/people/merge", response_model=PersonMergeResponse)
-async def merge_people(request: PersonMergeRequest):
+def merge_people(request: PersonMergeRequest):
     """
     Merge multiple people into a single record.
 
@@ -823,58 +841,59 @@ async def merge_people(request: PersonMergeRequest):
     The merge is durable - merged IDs are tracked so entity resolution
     won't recreate duplicates from future syncs.
     """
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-    from scripts.merge_people import merge_people as do_merge
+    with _mutation_lock:
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+        from scripts.merge_people import merge_people as do_merge
 
-    person_store = get_person_entity_store()
-    _source_store = get_source_entity_store()  # noqa: F841
+        person_store = get_person_entity_store()
+        _source_store = get_source_entity_store()  # noqa: F841
 
-    # Validate primary exists
-    primary = person_store.get_by_id(request.primary_id)
-    if not primary:
-        raise HTTPException(status_code=404, detail=f"Primary person '{request.primary_id}' not found")
+        # Validate primary exists
+        primary = person_store.get_by_id(request.primary_id)
+        if not primary:
+            raise HTTPException(status_code=404, detail=f"Primary person '{request.primary_id}' not found")
 
-    # Validate all secondaries exist
-    for sec_id in request.secondary_ids:
-        secondary = person_store.get_by_id(sec_id)
-        if not secondary:
-            raise HTTPException(status_code=404, detail=f"Secondary person '{sec_id}' not found")
-        if sec_id == request.primary_id:
-            raise HTTPException(status_code=400, detail="Cannot merge a person into itself")
+        # Validate all secondaries exist
+        for sec_id in request.secondary_ids:
+            secondary = person_store.get_by_id(sec_id)
+            if not secondary:
+                raise HTTPException(status_code=404, detail=f"Secondary person '{sec_id}' not found")
+            if sec_id == request.primary_id:
+                raise HTTPException(status_code=400, detail="Cannot merge a person into itself")
 
-    # Perform merges
-    total_stats = {
-        'interactions_updated': 0,
-        'source_entities_updated': 0,
-        'facts_cleared': 0,
-        'emails_merged': 0,
-        'phones_merged': 0,
-        'aliases_added': 0,
-        'tags_merged': 0,
-        'notes_merged': 0,
-    }
+        # Perform merges
+        total_stats = {
+            'interactions_updated': 0,
+            'source_entities_updated': 0,
+            'facts_cleared': 0,
+            'emails_merged': 0,
+            'phones_merged': 0,
+            'aliases_added': 0,
+            'tags_merged': 0,
+            'notes_merged': 0,
+        }
 
-    merged_ids = []
-    for sec_id in request.secondary_ids:
-        try:
-            stats = do_merge(request.primary_id, sec_id, dry_run=False)
-            merged_ids.append(sec_id)
-            for key in total_stats:
-                total_stats[key] += stats.get(key, 0)
-        except Exception as e:
-            logger.error(f"Failed to merge {sec_id} into {request.primary_id}: {e}")
-            raise HTTPException(status_code=500, detail=f"Merge failed for {sec_id}: {str(e)}")
+        merged_ids = []
+        for sec_id in request.secondary_ids:
+            try:
+                stats = do_merge(request.primary_id, sec_id, dry_run=False)
+                merged_ids.append(sec_id)
+                for key in total_stats:
+                    total_stats[key] += stats.get(key, 0)
+            except Exception as e:
+                logger.error(f"Failed to merge {sec_id} into {request.primary_id}: {e}")
+                raise HTTPException(status_code=500, detail=f"Merge failed for {sec_id}: {str(e)}")
 
-    logger.info(f"Merged {len(merged_ids)} people into {request.primary_id}: {merged_ids}")
+        logger.info(f"Merged {len(merged_ids)} people into {request.primary_id}: {merged_ids}")
 
-    return PersonMergeResponse(
-        status="completed",
-        primary_id=request.primary_id,
-        merged_ids=merged_ids,
-        stats=total_stats,
-    )
+        return PersonMergeResponse(
+            status="completed",
+            primary_id=request.primary_id,
+            merged_ids=merged_ids,
+            stats=total_stats,
+        )
 
 
 # ============================================================================
@@ -1064,7 +1083,7 @@ class ContactSource(BaseModel):
 
 
 @router.get("/people/{person_id}/contact-sources")
-async def get_person_contact_sources(person_id: str):
+def get_person_contact_sources(person_id: str):
     """
     Get aggregated contact sources linked to a person.
 
@@ -1190,7 +1209,7 @@ async def get_person_contact_sources(person_id: str):
 
 
 @router.get("/people/{person_id}/source-entities")
-async def get_person_source_entities(
+def get_person_source_entities(
     person_id: str,
     limit: int = Query(default=500, ge=1, le=5000, description="Max source entities to return"),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
@@ -1277,7 +1296,7 @@ async def get_person_source_entities(
 
 
 @router.post("/people/split", response_model=PersonSplitResponse)
-async def split_person(request: PersonSplitRequest):
+def split_person(request: PersonSplitRequest):
     """
     Split source entities from one person to another.
 
@@ -1296,263 +1315,264 @@ async def split_person(request: PersonSplitRequest):
 
     If to_person_id is None, a new person is created with new_person_name.
     """
-    import uuid
-    from pathlib import Path
-    from datetime import datetime, timezone
+    with _mutation_lock:
+        import uuid
+        from pathlib import Path
+        from datetime import datetime, timezone
 
-    from api.services.link_override import get_link_override_store, LinkOverride
+        from api.services.link_override import get_link_override_store, LinkOverride
 
-    person_store = get_person_entity_store()
-    _source_store = get_source_entity_store()  # noqa: F841
+        person_store = get_person_entity_store()
+        _source_store = get_source_entity_store()  # noqa: F841
 
-    # Validate from_person exists
-    from_person = person_store.get_by_id(request.from_person_id)
-    if not from_person:
-        raise HTTPException(status_code=404, detail=f"From person '{request.from_person_id}' not found")
+        # Validate from_person exists
+        from_person = person_store.get_by_id(request.from_person_id)
+        if not from_person:
+            raise HTTPException(status_code=404, detail=f"From person '{request.from_person_id}' not found")
 
-    # Get or create to_person
-    if request.to_person_id:
-        to_person = person_store.get_by_id(request.to_person_id)
-        if not to_person:
-            raise HTTPException(status_code=404, detail=f"To person '{request.to_person_id}' not found")
-    else:
-        if not request.new_person_name:
-            raise HTTPException(status_code=400, detail="new_person_name required when to_person_id is not provided")
+        # Get or create to_person
+        if request.to_person_id:
+            to_person = person_store.get_by_id(request.to_person_id)
+            if not to_person:
+                raise HTTPException(status_code=404, detail=f"To person '{request.to_person_id}' not found")
+        else:
+            if not request.new_person_name:
+                raise HTTPException(status_code=400, detail="new_person_name required when to_person_id is not provided")
 
-        to_person = PersonEntity(
-            id=str(uuid.uuid4()),
-            canonical_name=request.new_person_name,
-            sources=[],
-            first_seen=datetime.now(timezone.utc),
-            last_seen=datetime.now(timezone.utc),
-        )
-        person_store.add(to_person)
+            to_person = PersonEntity(
+                id=str(uuid.uuid4()),
+                canonical_name=request.new_person_name,
+                sources=[],
+                first_seen=datetime.now(timezone.utc),
+                last_seen=datetime.now(timezone.utc),
+            )
+            person_store.add(to_person)
+            person_store.save()
+            logger.info(f"Created new person for split: {to_person.canonical_name} ({to_person.id})")
+
+            # Verify the person was saved correctly
+            verify_person = person_store.get_by_id(to_person.id)
+            if not verify_person:
+                logger.error(f"CRITICAL: Person {to_person.id} was not saved correctly after split creation!")
+                raise HTTPException(status_code=500, detail="Failed to save new person during split")
+
+        # Get source entity details for override creation
+        crm_db = Path(__file__).parent.parent.parent / "data" / "crm.db"
+        conn = sqlite3.connect(crm_db)
+        conn.row_factory = sqlite3.Row
+
+        placeholders = ','.join('?' * len(request.source_entity_ids))
+        cursor = conn.execute(f"""
+            SELECT id, source_type, source_id, observed_name, observed_email, observed_phone
+            FROM source_entities
+            WHERE id IN ({placeholders})
+            AND canonical_person_id = ?
+        """, request.source_entity_ids + [request.from_person_id])
+
+        source_entity_details = [dict(row) for row in cursor]
+
+        if len(source_entity_details) != len(request.source_entity_ids):
+            found_ids = {se['id'] for se in source_entity_details}
+            missing = set(request.source_entity_ids) - found_ids
+            raise HTTPException(
+                status_code=400,
+                detail=f"Some source entities not found or not linked to from_person: {missing}"
+            )
+
+        # Move source entities
+        cursor = conn.execute(f"""
+            UPDATE source_entities
+            SET canonical_person_id = ?, linked_at = ?, link_status = 'confirmed'
+            WHERE id IN ({placeholders})
+        """, [to_person.id, datetime.now(timezone.utc).isoformat()] + request.source_entity_ids)
+        source_entities_moved = cursor.rowcount
+        conn.commit()
+
+        # Move interactions - get source_types from the source entities
+        _source_types = list({se['source_type'] for se in source_entity_details})  # noqa: F841
+        source_ids = [se['source_id'] for se in source_entity_details if se['source_id']]
+
+        interactions_moved = 0
+        if source_ids:
+            int_db = Path(__file__).parent.parent.parent / "data" / "interactions.db"
+            int_conn = sqlite3.connect(int_db)
+
+            id_placeholders = ','.join('?' * len(source_ids))
+            cursor = int_conn.execute(f"""
+                UPDATE interactions
+                SET person_id = ?
+                WHERE person_id = ?
+                AND source_id IN ({id_placeholders})
+            """, [to_person.id, request.from_person_id] + source_ids)
+            interactions_moved = cursor.rowcount
+            int_conn.commit()
+            int_conn.close()
+
+        # Update source lists on both persons
+        cursor = conn.execute("""
+            SELECT DISTINCT source_type FROM source_entities
+            WHERE canonical_person_id = ?
+        """, (from_person.id,))
+        from_person.sources = [row[0] for row in cursor]
+
+        cursor = conn.execute("""
+            SELECT DISTINCT source_type FROM source_entities
+            WHERE canonical_person_id = ?
+        """, (to_person.id,))
+        to_person.sources = [row[0] for row in cursor]
+
+        # Update phone_numbers and emails based on remaining source entities
+        # Get phones/emails that were moved
+        moved_phones = {se.get('observed_phone') for se in source_entity_details if se.get('observed_phone')}
+        moved_emails = {se.get('observed_email', '').lower() for se in source_entity_details if se.get('observed_email')}
+
+        # Add moved phones/emails to to_person
+        for phone in moved_phones:
+            if phone and phone not in to_person.phone_numbers:
+                to_person.phone_numbers.append(phone)
+                if not to_person.phone_primary:
+                    to_person.phone_primary = phone
+        for email in moved_emails:
+            if email and not to_person.has_email(email):
+                to_person.emails.append(email)
+
+        # Remove phones from from_person that no longer have source entities
+        cursor = conn.execute("""
+            SELECT DISTINCT observed_phone FROM source_entities
+            WHERE canonical_person_id = ? AND observed_phone IS NOT NULL
+        """, (from_person.id,))
+        remaining_phones = {row[0] for row in cursor}
+        from_person.phone_numbers = [p for p in from_person.phone_numbers if p in remaining_phones]
+        if from_person.phone_primary and from_person.phone_primary not in remaining_phones:
+            from_person.phone_primary = from_person.phone_numbers[0] if from_person.phone_numbers else None
+
+        # Remove emails from from_person that no longer have source entities
+        cursor = conn.execute("""
+            SELECT DISTINCT LOWER(observed_email) FROM source_entities
+            WHERE canonical_person_id = ? AND observed_email IS NOT NULL
+        """, (from_person.id,))
+        remaining_emails = {row[0] for row in cursor}
+        from_person.emails = [e for e in from_person.emails if e.lower() in remaining_emails]
+
+        person_store.update(from_person)
+        person_store.update(to_person)
         person_store.save()
-        logger.info(f"Created new person for split: {to_person.canonical_name} ({to_person.id})")
 
-        # Verify the person was saved correctly
-        verify_person = person_store.get_by_id(to_person.id)
-        if not verify_person:
-            logger.error(f"CRITICAL: Person {to_person.id} was not saved correctly after split creation!")
-            raise HTTPException(status_code=500, detail="Failed to save new person during split")
+        conn.close()
 
-    # Get source entity details for override creation
-    crm_db = Path(__file__).parent.parent.parent / "data" / "crm.db"
-    conn = sqlite3.connect(crm_db)
-    conn.row_factory = sqlite3.Row
+        # Create link overrides for durability
+        overrides_created = 0
+        if request.create_overrides:
+            override_store = get_link_override_store()
 
-    placeholders = ','.join('?' * len(request.source_entity_ids))
-    cursor = conn.execute(f"""
-        SELECT id, source_type, source_id, observed_name, observed_email, observed_phone
-        FROM source_entities
-        WHERE id IN ({placeholders})
-        AND canonical_person_id = ?
-    """, request.source_entity_ids + [request.from_person_id])
+            # Group by name pattern + source_type
+            patterns = {}
+            for se in source_entity_details:
+                name = se.get('observed_name', '')
+                source_type = se.get('source_type', '')
+                source_id = se.get('source_id', '')
 
-    source_entity_details = [dict(row) for row in cursor]
+                if not name:
+                    continue
 
-    if len(source_entity_details) != len(request.source_entity_ids):
-        found_ids = {se['id'] for se in source_entity_details}
-        missing = set(request.source_entity_ids) - found_ids
-        raise HTTPException(
-            status_code=400,
-            detail=f"Some source entities not found or not linked to from_person: {missing}"
-        )
+                key = (name.lower(), source_type)
+                if key not in patterns:
+                    patterns[key] = {'name': name, 'source_type': source_type, 'contexts': set()}
 
-    # Move source entities
-    cursor = conn.execute(f"""
-        UPDATE source_entities
-        SET canonical_person_id = ?, linked_at = ?, link_status = 'confirmed'
-        WHERE id IN ({placeholders})
-    """, [to_person.id, datetime.now(timezone.utc).isoformat()] + request.source_entity_ids)
-    source_entities_moved = cursor.rowcount
-    conn.commit()
+                # Extract context patterns from source_id
+                if source_type in ('vault', 'granola') and source_id:
+                    _work = settings.current_work_path.rstrip('/')
+                    if _work in source_id:
+                        patterns[key]['contexts'].add(f'{_work}/')
+                    elif 'Work/' in source_id:
+                        patterns[key]['contexts'].add('Work/')
 
-    # Move interactions - get source_types from the source entities
-    _source_types = list({se['source_type'] for se in source_entity_details})  # noqa: F841
-    source_ids = [se['source_id'] for se in source_entity_details if se['source_id']]
-
-    interactions_moved = 0
-    if source_ids:
-        int_db = Path(__file__).parent.parent.parent / "data" / "interactions.db"
-        int_conn = sqlite3.connect(int_db)
-
-        id_placeholders = ','.join('?' * len(source_ids))
-        cursor = int_conn.execute(f"""
-            UPDATE interactions
-            SET person_id = ?
-            WHERE person_id = ?
-            AND source_id IN ({id_placeholders})
-        """, [to_person.id, request.from_person_id] + source_ids)
-        interactions_moved = cursor.rowcount
-        int_conn.commit()
-        int_conn.close()
-
-    # Update source lists on both persons
-    cursor = conn.execute("""
-        SELECT DISTINCT source_type FROM source_entities
-        WHERE canonical_person_id = ?
-    """, (from_person.id,))
-    from_person.sources = [row[0] for row in cursor]
-
-    cursor = conn.execute("""
-        SELECT DISTINCT source_type FROM source_entities
-        WHERE canonical_person_id = ?
-    """, (to_person.id,))
-    to_person.sources = [row[0] for row in cursor]
-
-    # Update phone_numbers and emails based on remaining source entities
-    # Get phones/emails that were moved
-    moved_phones = {se.get('observed_phone') for se in source_entity_details if se.get('observed_phone')}
-    moved_emails = {se.get('observed_email', '').lower() for se in source_entity_details if se.get('observed_email')}
-
-    # Add moved phones/emails to to_person
-    for phone in moved_phones:
-        if phone and phone not in to_person.phone_numbers:
-            to_person.phone_numbers.append(phone)
-            if not to_person.phone_primary:
-                to_person.phone_primary = phone
-    for email in moved_emails:
-        if email and not to_person.has_email(email):
-            to_person.emails.append(email)
-
-    # Remove phones from from_person that no longer have source entities
-    cursor = conn.execute("""
-        SELECT DISTINCT observed_phone FROM source_entities
-        WHERE canonical_person_id = ? AND observed_phone IS NOT NULL
-    """, (from_person.id,))
-    remaining_phones = {row[0] for row in cursor}
-    from_person.phone_numbers = [p for p in from_person.phone_numbers if p in remaining_phones]
-    if from_person.phone_primary and from_person.phone_primary not in remaining_phones:
-        from_person.phone_primary = from_person.phone_numbers[0] if from_person.phone_numbers else None
-
-    # Remove emails from from_person that no longer have source entities
-    cursor = conn.execute("""
-        SELECT DISTINCT LOWER(observed_email) FROM source_entities
-        WHERE canonical_person_id = ? AND observed_email IS NOT NULL
-    """, (from_person.id,))
-    remaining_emails = {row[0] for row in cursor}
-    from_person.emails = [e for e in from_person.emails if e.lower() in remaining_emails]
-
-    person_store.update(from_person)
-    person_store.update(to_person)
-    person_store.save()
-
-    conn.close()
-
-    # Create link overrides for durability
-    overrides_created = 0
-    if request.create_overrides:
-        override_store = get_link_override_store()
-
-        # Group by name pattern + source_type
-        patterns = {}
-        for se in source_entity_details:
-            name = se.get('observed_name', '')
-            source_type = se.get('source_type', '')
-            source_id = se.get('source_id', '')
-
-            if not name:
-                continue
-
-            key = (name.lower(), source_type)
-            if key not in patterns:
-                patterns[key] = {'name': name, 'source_type': source_type, 'contexts': set()}
-
-            # Extract context patterns from source_id
-            if source_type in ('vault', 'granola') and source_id:
-                _work = settings.current_work_path.rstrip('/')
-                if _work in source_id:
-                    patterns[key]['contexts'].add(f'{_work}/')
-                elif 'Work/' in source_id:
-                    patterns[key]['contexts'].add('Work/')
-
-        for (name_lower, source_type), pattern in patterns.items():
-            if pattern['contexts']:
-                for context in pattern['contexts']:
+            for (name_lower, source_type), pattern in patterns.items():
+                if pattern['contexts']:
+                    for context in pattern['contexts']:
+                        override = LinkOverride(
+                            id=str(uuid.uuid4()),
+                            name_pattern=pattern['name'],
+                            source_type=source_type,
+                            context_pattern=context,
+                            preferred_person_id=to_person.id,
+                            rejected_person_id=from_person.id,
+                            reason=f"Split via UI from {from_person.canonical_name}",
+                        )
+                        override_store.add(override)
+                        overrides_created += 1
+                else:
                     override = LinkOverride(
                         id=str(uuid.uuid4()),
                         name_pattern=pattern['name'],
                         source_type=source_type,
-                        context_pattern=context,
+                        context_pattern=None,
                         preferred_person_id=to_person.id,
                         rejected_person_id=from_person.id,
                         reason=f"Split via UI from {from_person.canonical_name}",
                     )
                     override_store.add(override)
                     overrides_created += 1
-            else:
-                override = LinkOverride(
-                    id=str(uuid.uuid4()),
-                    name_pattern=pattern['name'],
-                    source_type=source_type,
-                    context_pattern=None,
-                    preferred_person_id=to_person.id,
-                    rejected_person_id=from_person.id,
-                    reason=f"Split via UI from {from_person.canonical_name}",
-                )
-                override_store.add(override)
-                overrides_created += 1
 
-    # Recalculate stats and relationships for both persons
-    # (Consistent with merge behavior - recalculate after moving data)
-    logger.info("Recalculating stats and relationships...")
+        # Recalculate stats and relationships for both persons
+        # (Consistent with merge behavior - recalculate after moving data)
+        logger.info("Recalculating stats and relationships...")
 
-    int_db = Path(__file__).parent.parent.parent / "data" / "interactions.db"
-    int_conn_stats = sqlite3.connect(int_db)
+        int_db = Path(__file__).parent.parent.parent / "data" / "interactions.db"
+        int_conn_stats = sqlite3.connect(int_db)
 
-    # Recalculate stats for both persons
-    from_stats = _recalculate_person_stats(from_person.id, int_conn_stats, person_store)
-    to_stats = _recalculate_person_stats(to_person.id, int_conn_stats, person_store)
+        # Recalculate stats for both persons
+        from_stats = _recalculate_person_stats(from_person.id, int_conn_stats, person_store)
+        to_stats = _recalculate_person_stats(to_person.id, int_conn_stats, person_store)
 
-    if from_stats:
-        logger.info(f"  {from_person.canonical_name} stats: {from_stats['old']} -> {from_stats['new']}")
-    if to_stats:
-        logger.info(f"  {to_person.canonical_name} stats: {to_stats['old']} -> {to_stats['new']}")
+        if from_stats:
+            logger.info(f"  {from_person.canonical_name} stats: {from_stats['old']} -> {from_stats['new']}")
+        if to_stats:
+            logger.info(f"  {to_person.canonical_name} stats: {to_stats['old']} -> {to_stats['new']}")
 
-    # Recalculate relationships with my_person_id
-    my_person_id = settings.my_person_id
-    if my_person_id:
-        from_rel = _recalculate_relationship_with_me(from_person.id, my_person_id, int_conn_stats)
-        to_rel = _recalculate_relationship_with_me(to_person.id, my_person_id, int_conn_stats)
+        # Recalculate relationships with my_person_id
+        my_person_id = settings.my_person_id
+        if my_person_id:
+            from_rel = _recalculate_relationship_with_me(from_person.id, my_person_id, int_conn_stats)
+            to_rel = _recalculate_relationship_with_me(to_person.id, my_person_id, int_conn_stats)
 
-        if from_rel.get('action') != 'none':
-            logger.info(f"  {from_person.canonical_name} relationship: {from_rel}")
-        if to_rel.get('action') != 'none':
-            logger.info(f"  {to_person.canonical_name} relationship: {to_rel}")
+            if from_rel.get('action') != 'none':
+                logger.info(f"  {from_person.canonical_name} relationship: {from_rel}")
+            if to_rel.get('action') != 'none':
+                logger.info(f"  {to_person.canonical_name} relationship: {to_rel}")
 
-    int_conn_stats.close()
+        int_conn_stats.close()
 
-    # Recalculate relationship strength for both persons
-    # (also updates is_peripheral_contact; dunbar_circle requires full recalc)
-    from_strength = update_strength_for_person(from_person.id)
-    if from_strength is not None:
-        logger.info(f"  {from_person.canonical_name} strength: {from_strength}")
+        # Recalculate relationship strength for both persons
+        # (also updates is_peripheral_contact; dunbar_circle requires full recalc)
+        from_strength = update_strength_for_person(from_person.id)
+        if from_strength is not None:
+            logger.info(f"  {from_person.canonical_name} strength: {from_strength}")
 
-    to_strength = update_strength_for_person(to_person.id)
-    if to_strength is not None:
-        logger.info(f"  {to_person.canonical_name} strength: {to_strength}")
+        to_strength = update_strength_for_person(to_person.id)
+        if to_strength is not None:
+            logger.info(f"  {to_person.canonical_name} strength: {to_strength}")
 
-    person_store.save()
+        person_store.save()
 
-    logger.info(
-        f"Split {source_entities_moved} source entities from {from_person.canonical_name} "
-        f"to {to_person.canonical_name}, {interactions_moved} interactions, "
-        f"{overrides_created} overrides created"
-    )
+        logger.info(
+            f"Split {source_entities_moved} source entities from {from_person.canonical_name} "
+            f"to {to_person.canonical_name}, {interactions_moved} interactions, "
+            f"{overrides_created} overrides created"
+        )
 
-    return PersonSplitResponse(
-        status="completed",
-        from_person_id=request.from_person_id,
-        to_person_id=to_person.id,
-        source_entities_moved=source_entities_moved,
-        interactions_moved=interactions_moved,
-        overrides_created=overrides_created,
-    )
+        return PersonSplitResponse(
+            status="completed",
+            from_person_id=request.from_person_id,
+            to_person_id=to_person.id,
+            source_entities_moved=source_entities_moved,
+            interactions_moved=interactions_moved,
+            overrides_created=overrides_created,
+        )
 
 
 @router.get("/people/{person_id}/timeline", response_model=TimelineResponse)
-async def get_person_timeline(
+def get_person_timeline(
     person_id: str,
     source_type: Optional[str] = Query(
         default=None,
@@ -1634,7 +1654,7 @@ SOURCE_BADGES = {
 
 
 @router.get("/people/{person_id}/timeline/aggregated", response_model=AggregatedTimelineResponse)
-async def get_person_timeline_aggregated(
+def get_person_timeline_aggregated(
     person_id: str,
     source_type: Optional[str] = Query(
         default=None,
@@ -1798,7 +1818,7 @@ async def get_person_timeline_aggregated(
 
 
 @router.get("/people/{person_id}/connections", response_model=ConnectionsResponse)
-async def get_person_connections(
+def get_person_connections(
     person_id: str,
     relationship_type: Optional[str] = Query(default=None, description="Filter by type"),
     limit: int = Query(default=50, ge=1, le=200, description="Max results"),
@@ -1866,7 +1886,7 @@ async def get_person_connections(
 
 
 @router.get("/people/{person_id}/strength", response_model=dict)
-async def get_person_strength_breakdown(person_id: str):
+def get_person_strength_breakdown(person_id: str):
     """
     Get detailed breakdown of relationship strength components.
 
@@ -1905,7 +1925,7 @@ def _fact_to_response(fact: PersonFact) -> PersonFactResponse:
 
 
 @router.get("/people/{person_id}/facts", response_model=PersonFactsResponse)
-async def get_person_facts(person_id: str):
+def get_person_facts(person_id: str):
     """
     Get all facts about a person.
 
@@ -1965,19 +1985,27 @@ async def extract_person_facts(person_id: str, model: Optional[str] = None):
         model = PersonFactExtractor.MODEL_SONNET
     elif model == "haiku":
         model = PersonFactExtractor.MODEL_HAIKU
-    person_store = get_person_entity_store()
-    person = person_store.get_by_id(person_id)
+    # get_person_entity_store()/get_interaction_store() themselves run
+    # inside the thread hop, not just the calls made on their result: on a
+    # cold singleton they run _init_db() etc, which is exactly the blocking
+    # work this handler must keep off the event loop.
+    def _fetch_person():
+        return get_person_entity_store().get_by_id(person_id)
+
+    person = await asyncio.to_thread(_fetch_person)
 
     if not person:
         raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found")
 
     # Get ALL interactions for the person (extractor will sample strategically)
-    interaction_store = get_interaction_store()
-    interactions = interaction_store.get_for_person(
-        person_id,
-        days_back=3650,  # Look back 10 years for full history
-        limit=100000,  # No practical limit - let extractor sample
-    )
+    def _fetch_interactions():
+        return get_interaction_store().get_for_person(
+            person_id,
+            days_back=3650,  # Look back 10 years for full history
+            limit=100000,  # No practical limit - let extractor sample
+        )
+
+    interactions = await asyncio.to_thread(_fetch_interactions)
 
     if not interactions:
         return FactExtractionResponse(
@@ -2001,7 +2029,7 @@ async def extract_person_facts(person_id: str, model: Optional[str] = None):
 
     # Extract facts (use async version for proper event loop handling)
     try:
-        extractor = get_person_fact_extractor()
+        extractor = await asyncio.to_thread(get_person_fact_extractor)
         extracted_facts = await extractor.extract_facts_async(
             person_id=person_id,
             person_name=person.canonical_name,
@@ -2020,7 +2048,7 @@ async def extract_person_facts(person_id: str, model: Optional[str] = None):
 
 
 @router.put("/people/{person_id}/facts/{fact_id}", response_model=PersonFactResponse)
-async def update_person_fact(person_id: str, fact_id: str, request: FactUpdateRequest):
+def update_person_fact(person_id: str, fact_id: str, request: FactUpdateRequest):
     """
     Update a fact's value or metadata.
     """
@@ -2051,7 +2079,7 @@ async def update_person_fact(person_id: str, fact_id: str, request: FactUpdateRe
 
 
 @router.delete("/people/{person_id}/facts/{fact_id}")
-async def delete_person_fact(person_id: str, fact_id: str):
+def delete_person_fact(person_id: str, fact_id: str):
     """
     Delete a fact.
     """
@@ -2070,7 +2098,7 @@ async def delete_person_fact(person_id: str, fact_id: str):
 
 
 @router.post("/people/{person_id}/facts/{fact_id}/confirm")
-async def confirm_person_fact(person_id: str, fact_id: str):
+def confirm_person_fact(person_id: str, fact_id: str):
     """
     Mark a fact as confirmed by user.
 
@@ -2091,7 +2119,7 @@ async def confirm_person_fact(person_id: str, fact_id: str):
 
 
 @router.post("/people/{person_id}/hide")
-async def hide_person(person_id: str, request: HidePersonRequest):
+def hide_person(person_id: str, request: HidePersonRequest):
     """
     Hide a person (soft delete) and blocklist their identifiers.
 
@@ -2104,35 +2132,36 @@ async def hide_person(person_id: str, request: HidePersonRequest):
     The person is not deleted, just hidden. Hidden people won't appear
     in search results or the people list.
     """
-    person_store = get_person_entity_store()
-    person = person_store.get_by_id(person_id)
+    with _mutation_lock:
+        person_store = get_person_entity_store()
+        person = person_store.get_by_id(person_id)
 
-    if not person:
-        raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found")
+        if not person:
+            raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found")
 
-    # Check if already hidden
-    if person.hidden:
+        # Check if already hidden
+        if person.hidden:
+            return {
+                "status": "already_hidden",
+                "person_id": person_id,
+                "hidden_at": person.hidden_at.isoformat() if person.hidden_at else None,
+            }
+
+        # Hide the person
+        hidden = person_store.hide_person(person_id, request.reason)
+
         return {
-            "status": "already_hidden",
+            "status": "hidden",
             "person_id": person_id,
-            "hidden_at": person.hidden_at.isoformat() if person.hidden_at else None,
+            "name": hidden.canonical_name,
+            "emails_blocked": len(hidden.emails),
+            "phones_blocked": len(hidden.phone_numbers),
+            "reason": request.reason,
         }
-
-    # Hide the person
-    hidden = person_store.hide_person(person_id, request.reason)
-
-    return {
-        "status": "hidden",
-        "person_id": person_id,
-        "name": hidden.canonical_name,
-        "emails_blocked": len(hidden.emails),
-        "phones_blocked": len(hidden.phone_numbers),
-        "reason": request.reason,
-    }
 
 
 @router.get("/discover", response_model=DiscoverResponse)
-async def discover_connections(
+def discover_connections(
     person_id: Optional[str] = Query(default=None, description="Person to find suggestions for"),
     limit: int = Query(default=10, ge=1, le=50, description="Max suggestions"),
 ):
@@ -2230,18 +2259,23 @@ async def import_source_data(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to decode file: {e}")
 
-    source_store = get_source_entity_store()
+    # get_source_entity_store() itself runs inside the thread hop, not just
+    # the calls made on its result: on a cold singleton it runs _init_db()
+    # etc, which is exactly the blocking work this handler must keep off
+    # the event loop.
+    source_store = await asyncio.to_thread(get_source_entity_store)
 
     if source_type == "whatsapp":
         from api.services.whatsapp_import import import_whatsapp_export
-        stats = import_whatsapp_export(
+        stats = await asyncio.to_thread(
+            import_whatsapp_export,
             content_str,
             file.filename or "chat.txt",
             source_store,
         )
     else:  # signal
         from api.services.signal_import import import_signal_export
-        stats = import_signal_export(content_str, source_store)
+        stats = await asyncio.to_thread(import_signal_export, content_str, source_store)
 
     return {
         "status": "completed",
@@ -2252,28 +2286,29 @@ async def import_source_data(
 
 
 @router.post("/sources/{source_type}/sync")
-async def sync_source(source_type: str):
+def sync_source(source_type: str):
     """
     Trigger a sync for a specific data source.
     """
-    # WhatsApp has no standalone nightly sync of its own (issue #784) — its
-    # data is imported as part of the combined apple_import step, so a
-    # WhatsApp entry here belongs at the same (currently stub, see TODO
-    # below) parity level as gmail/imessage/linkedin, not below it.
-    valid_sources = {"gmail", "calendar", "slack", "contacts", "imessage", "linkedin", "vault", "whatsapp"}
-    if source_type not in valid_sources:
-        raise HTTPException(status_code=400, detail=f"Invalid source type: {source_type}")
+    with _mutation_lock:
+        # WhatsApp has no standalone nightly sync of its own (issue #784) — its
+        # data is imported as part of the combined apple_import step, so a
+        # WhatsApp entry here belongs at the same (currently stub, see TODO
+        # below) parity level as gmail/imessage/linkedin, not below it.
+        valid_sources = {"gmail", "calendar", "slack", "contacts", "imessage", "linkedin", "vault", "whatsapp"}
+        if source_type not in valid_sources:
+            raise HTTPException(status_code=400, detail=f"Invalid source type: {source_type}")
 
-    # TODO: Implement actual sync triggers
-    return {
-        "status": "queued",
-        "source_type": source_type,
-        "message": "Sync queued for processing",
-    }
+        # TODO: Implement actual sync triggers
+        return {
+            "status": "queued",
+            "source_type": source_type,
+            "message": "Sync queued for processing",
+        }
 
 
 @router.post("/relationships/discover")
-async def trigger_relationship_discovery():
+def trigger_relationship_discovery():
     """
     Trigger relationship discovery across all sources.
 
@@ -2281,32 +2316,34 @@ async def trigger_relationship_discovery():
     to discover connections between people.
     Automatically recalculates relationship strengths after discovery.
     """
-    results = run_full_discovery()
+    with _mutation_lock:
+        results = run_full_discovery()
 
-    # Automatically recalculate relationship strengths after discovery
-    strength_results = update_all_strengths()
-    results["strengths_updated"] = strength_results.get("updated", 0)
+        # Automatically recalculate relationship strengths after discovery
+        strength_results = update_all_strengths()
+        results["strengths_updated"] = strength_results.get("updated", 0)
 
-    return {
-        "status": "completed",
-        "discovered": results,
-    }
+        return {
+            "status": "completed",
+            "discovered": results,
+        }
 
 
 @router.post("/strengths/update")
-async def update_relationship_strengths():
+def update_relationship_strengths():
     """
     Update relationship strength scores for all people.
     """
-    results = update_all_strengths()
-    return {
-        "status": "completed",
-        "results": results,
-    }
+    with _mutation_lock:
+        results = update_all_strengths()
+        return {
+            "status": "completed",
+            "results": results,
+        }
 
 
 @router.get("/statistics", response_model=StatisticsResponse)
-async def get_crm_statistics():
+def get_crm_statistics():
     """
     Get comprehensive CRM statistics.
     """
@@ -2335,7 +2372,7 @@ async def get_crm_statistics():
 
 
 @router.get("/network", response_model=NetworkGraphResponse)
-async def get_network_graph(
+def get_network_graph(
     center_on: Optional[str] = Query(default=None, description="Person ID to center the graph on"),
     depth: int = Query(default=2, ge=1, le=4, description="Hops from center person"),
     min_strength: float = Query(default=0.0, ge=0.0, le=1.0, description="Minimum relationship strength"),
@@ -2521,7 +2558,7 @@ class RelationshipDetailResponse(BaseModel):
 
 
 @router.get("/relationship/{person_a_id}/{person_b_id}", response_model=RelationshipDetailResponse)
-async def get_relationship_details(person_a_id: str, person_b_id: str):
+def get_relationship_details(person_a_id: str, person_b_id: str):
     """
     Get detailed information about the relationship between two people.
 
@@ -2608,7 +2645,7 @@ async def get_relationship_details(person_a_id: str, person_b_id: str):
 # =======================
 
 @router.get("/slack/status")
-async def get_slack_status():
+def get_slack_status():
     """
     Get Slack integration status.
 
@@ -2627,7 +2664,7 @@ async def get_slack_status():
 
 
 @router.get("/slack/oauth/start")
-async def start_slack_oauth(state: Optional[str] = None):
+def start_slack_oauth(state: Optional[str] = None):
     """
     Start Slack OAuth flow.
 
@@ -2646,7 +2683,7 @@ async def start_slack_oauth(state: Optional[str] = None):
 
 
 @router.get("/slack/callback")
-async def slack_oauth_callback(code: str, state: Optional[str] = None):
+def slack_oauth_callback(code: str, state: Optional[str] = None):
     """
     Handle Slack OAuth callback.
 
@@ -2670,40 +2707,41 @@ async def slack_oauth_callback(code: str, state: Optional[str] = None):
 
 
 @router.post("/slack/sync")
-async def sync_slack_users_endpoint(workspace_id: str = "default"):
+def sync_slack_users_endpoint(workspace_id: str = "default"):
     """
     Sync Slack users to the CRM.
 
     Creates SourceEntity records for all users in the workspace.
     """
-    from api.services.slack_integration import (
-        get_slack_client,
-        sync_slack_users,
-        SlackAPIError,
-    )
-
-    client = get_slack_client()
-    if not client.is_connected(workspace_id):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Not connected to Slack workspace {workspace_id}. Complete OAuth first.",
+    with _mutation_lock:
+        from api.services.slack_integration import (
+            get_slack_client,
+            sync_slack_users,
+            SlackAPIError,
         )
 
-    source_store = get_source_entity_store()
+        client = get_slack_client()
+        if not client.is_connected(workspace_id):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not connected to Slack workspace {workspace_id}. Complete OAuth first.",
+            )
 
-    try:
-        stats = sync_slack_users(client, source_store, workspace_id)
-        return {
-            "status": "completed",
-            "workspace_id": workspace_id,
-            "stats": stats,
-        }
-    except SlackAPIError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        source_store = get_source_entity_store()
+
+        try:
+            stats = sync_slack_users(client, source_store, workspace_id)
+            return {
+                "status": "completed",
+                "workspace_id": workspace_id,
+                "stats": stats,
+            }
+        except SlackAPIError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/slack/disconnect")
-async def disconnect_slack(workspace_id: str = "default"):
+def disconnect_slack(workspace_id: str = "default"):
     """
     Disconnect a Slack workspace.
 
@@ -2724,7 +2762,7 @@ async def disconnect_slack(workspace_id: str = "default"):
 # ==================================
 
 @router.get("/contacts/status")
-async def get_contacts_status():
+def get_contacts_status():
     """
     Get Apple Contacts integration status.
 
@@ -2741,36 +2779,37 @@ async def get_contacts_status():
 
 
 @router.post("/contacts/sync")
-async def sync_contacts_endpoint():
+def sync_contacts_endpoint():
     """
     Sync Apple Contacts to the CRM.
 
     Creates SourceEntity records for all contacts.
     Requires macOS and Contacts permission.
     """
-    from api.services.apple_contacts import get_contacts_reader, sync_apple_contacts
+    with _mutation_lock:
+        from api.services.apple_contacts import get_contacts_reader, sync_apple_contacts
 
-    reader = get_contacts_reader()
-    if not reader.is_available:
-        raise HTTPException(
-            status_code=400,
-            detail="Apple Contacts not available. Requires macOS and pyobjc-framework-Contacts.",
-        )
+        reader = get_contacts_reader()
+        if not reader.is_available:
+            raise HTTPException(
+                status_code=400,
+                detail="Apple Contacts not available. Requires macOS and pyobjc-framework-Contacts.",
+            )
 
-    auth_status = reader.check_authorization()
-    if auth_status != "authorized":
-        raise HTTPException(
-            status_code=403,
-            detail=f"Contacts access not authorized: {auth_status}. Grant permission in System Preferences.",
-        )
+        auth_status = reader.check_authorization()
+        if auth_status != "authorized":
+            raise HTTPException(
+                status_code=403,
+                detail=f"Contacts access not authorized: {auth_status}. Grant permission in System Preferences.",
+            )
 
-    source_store = get_source_entity_store()
-    stats = sync_apple_contacts(source_store, reader)
+        source_store = get_source_entity_store()
+        stats = sync_apple_contacts(source_store, reader)
 
-    return {
-        "status": "completed",
-        "stats": stats,
-    }
+        return {
+            "status": "completed",
+            "stats": stats,
+        }
 
 
 # =============================
@@ -2936,7 +2975,7 @@ class FamilyInteractionsResponse(BaseModel):
 
 
 @router.get("/me/stats", response_model=MeStatsResponse)
-async def get_me_stats():
+def get_me_stats():
     """
     Get aggregate statistics for the owner's personal dashboard.
 
@@ -2963,7 +3002,7 @@ async def get_me_stats():
 
 
 @router.get("/me/timeline", response_model=TimelineResponse)
-async def get_me_timeline(
+def get_me_timeline(
     source_type: Optional[str] = Query(
         default=None,
         description="Filter by source type. Supports comma-separated values for compound "
@@ -3046,7 +3085,7 @@ async def get_me_timeline(
 
 
 @router.get("/me/interactions", response_model=MeInteractionsResponse)
-async def get_me_interactions(
+def get_me_interactions(
     days_back: int = Query(default=365, ge=1, le=3660, description="Days of history (up to 10 years)"),
     trend_period: str = Query(default="quarter", description="Trend comparison period: week, month, quarter, year"),
     health_period: str = Query(default="quarter", description="Health score history period: month, quarter, year"),
@@ -3605,7 +3644,7 @@ async def get_me_interactions(
 
 
 @router.get("/family/members", response_model=FamilyMembersResponse)
-async def get_family_members():
+def get_family_members():
     """
     Get all family members for the multi-select dropdown and visualizations.
 
@@ -3701,7 +3740,7 @@ async def get_family_members():
 
 
 @router.get("/family/stats", response_model=FamilyStatsResponse)
-async def get_family_stats(
+def get_family_stats(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs to get lifetime stats for"
@@ -3740,7 +3779,7 @@ async def get_family_stats(
 
 
 @router.get("/family/timeline", response_model=TimelineResponse)
-async def get_family_timeline(
+def get_family_timeline(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs to include in timeline"
@@ -3822,7 +3861,7 @@ async def get_family_timeline(
 
 
 @router.get("/family/interactions", response_model=FamilyInteractionsResponse)
-async def get_family_interactions(
+def get_family_interactions(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs to aggregate"
@@ -4067,7 +4106,7 @@ class CommunicationGapsResponse(BaseModel):
 
 
 @router.get("/family/communication-gaps", response_model=CommunicationGapsResponse)
-async def get_family_communication_gaps(
+def get_family_communication_gaps(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs"
@@ -4188,7 +4227,7 @@ class ChannelMixResponse(BaseModel):
 
 
 @router.get("/family/channel-mix", response_model=ChannelMixResponse)
-async def get_family_channel_mix(
+def get_family_channel_mix(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs"
@@ -4276,7 +4315,7 @@ class SyncErrorResponse(BaseModel):
 
 
 @router.get("/sync/health", response_model=list[SyncHealthResponse])
-async def get_all_sync_health():
+def get_all_sync_health():
     """
     Get health status for all sync sources.
 
@@ -4303,7 +4342,7 @@ async def get_all_sync_health():
 
 
 @router.get("/sync/health/summary", response_model=SyncHealthSummaryResponse)
-async def get_sync_health_summary():
+def get_sync_health_summary():
     """
     Get summary of sync health across all sources.
 
@@ -4318,7 +4357,7 @@ async def get_sync_health_summary():
 
 
 @router.get("/sync/health/{source}", response_model=SyncHealthResponse)
-async def get_source_sync_health(source: str):
+def get_source_sync_health(source: str):
     """
     Get health status for a specific sync source.
     """
@@ -4345,7 +4384,7 @@ async def get_source_sync_health(source: str):
 
 
 @router.get("/sync/errors", response_model=list[SyncErrorResponse])
-async def get_sync_errors(
+def get_sync_errors(
     source: Optional[str] = Query(default=None, description="Filter by source"),
     limit: int = Query(default=50, ge=1, le=200, description="Max results"),
 ):
@@ -4372,7 +4411,7 @@ async def get_sync_errors(
 
 
 @router.get("/sync/stale", response_model=list[SyncHealthResponse])
-async def get_stale_syncs():
+def get_stale_syncs():
     """
     Get list of syncs that are stale (>24 hours old).
 
@@ -4425,7 +4464,7 @@ class ReviewQueueResponse(BaseModel):
 
 
 @router.get("/review-queue", response_model=ReviewQueueResponse)
-async def get_review_queue(
+def get_review_queue(
     min_confidence: float = Query(default=0.0, ge=0.0, le=1.0, description="Minimum confidence"),
     max_confidence: float = Query(default=0.85, ge=0.0, le=1.0, description="Maximum confidence"),
     link_method: Optional[str] = Query(default=None, description="Filter by resolution method (e.g. email_exact, name_fuzzy)"),
@@ -4490,93 +4529,95 @@ async def get_review_queue(
 
 
 @router.post("/review-queue/{entity_id}/confirm")
-async def confirm_review_item(entity_id: str):
+def confirm_review_item(entity_id: str):
     """
     Confirm a low-confidence match as correct.
 
     Updates the link confidence to 1.0 and status to confirmed.
     """
-    source_store = get_source_entity_store()
-    entity = source_store.get_by_id(entity_id)
+    with _mutation_lock:
+        source_store = get_source_entity_store()
+        entity = source_store.get_by_id(entity_id)
 
-    if not entity:
-        raise HTTPException(status_code=404, detail=f"Source entity '{entity_id}' not found")
+        if not entity:
+            raise HTTPException(status_code=404, detail=f"Source entity '{entity_id}' not found")
 
-    if not entity.canonical_person_id:
-        raise HTTPException(status_code=400, detail="Source entity is not linked to any person")
+        if not entity.canonical_person_id:
+            raise HTTPException(status_code=400, detail="Source entity is not linked to any person")
 
-    # Update to confirmed status
-    source_store.link_to_person(
-        entity_id,
-        entity.canonical_person_id,
-        confidence=1.0,
-        status=LINK_STATUS_CONFIRMED,
-    )
+        # Update to confirmed status
+        source_store.link_to_person(
+            entity_id,
+            entity.canonical_person_id,
+            confidence=1.0,
+            status=LINK_STATUS_CONFIRMED,
+        )
 
-    return {"status": "confirmed", "entity_id": entity_id}
+        return {"status": "confirmed", "entity_id": entity_id}
 
 
 @router.post("/review-queue/{entity_id}/reject")
-async def reject_review_item(entity_id: str, request: LinkConfirmRequest):
+def reject_review_item(entity_id: str, request: LinkConfirmRequest):
     """
     Reject a low-confidence match.
 
     Optionally creates a new person from the source entity.
     """
-    source_store = get_source_entity_store()
-    person_store = get_person_entity_store()
-    entity = source_store.get_by_id(entity_id)
+    with _mutation_lock:
+        source_store = get_source_entity_store()
+        person_store = get_person_entity_store()
+        entity = source_store.get_by_id(entity_id)
 
-    if not entity:
-        raise HTTPException(status_code=404, detail=f"Source entity '{entity_id}' not found")
+        if not entity:
+            raise HTTPException(status_code=404, detail=f"Source entity '{entity_id}' not found")
 
-    new_person_id = None
+        new_person_id = None
 
-    if request.create_new_person:
-        if not request.new_person_name:
-            name = entity.observed_name or entity.observed_email or "Unknown"
+        if request.create_new_person:
+            if not request.new_person_name:
+                name = entity.observed_name or entity.observed_email or "Unknown"
+            else:
+                name = request.new_person_name
+
+            # Create new person
+            new_person = PersonEntity(
+                canonical_name=name,
+                display_name=name,
+                emails=[entity.observed_email] if entity.observed_email else [],
+                phone_numbers=[entity.observed_phone] if entity.observed_phone else [],
+                sources=[entity.source_type],
+                first_seen=entity.observed_at,
+                last_seen=entity.observed_at,
+                source_entity_count=1,
+            )
+            person_store.add(new_person)
+            person_store.save()
+
+            # Verify the person was saved correctly
+            verify_person = person_store.get_by_id(new_person.id)
+            if not verify_person:
+                logger.error(f"CRITICAL: Person {new_person.id} was not saved correctly after reject creation!")
+                raise HTTPException(status_code=500, detail="Failed to save new person during reject")
+
+            # Link to new person
+            source_store.link_to_person(
+                entity_id,
+                new_person.id,
+                confidence=1.0,
+                status=LINK_STATUS_CONFIRMED,
+            )
+            new_person_id = new_person.id
         else:
-            name = request.new_person_name
+            # Mark as rejected
+            entity.link_status = LINK_STATUS_REJECTED
+            entity.canonical_person_id = None
+            source_store.update(entity)
 
-        # Create new person
-        new_person = PersonEntity(
-            canonical_name=name,
-            display_name=name,
-            emails=[entity.observed_email] if entity.observed_email else [],
-            phone_numbers=[entity.observed_phone] if entity.observed_phone else [],
-            sources=[entity.source_type],
-            first_seen=entity.observed_at,
-            last_seen=entity.observed_at,
-            source_entity_count=1,
-        )
-        person_store.add(new_person)
-        person_store.save()
-
-        # Verify the person was saved correctly
-        verify_person = person_store.get_by_id(new_person.id)
-        if not verify_person:
-            logger.error(f"CRITICAL: Person {new_person.id} was not saved correctly after reject creation!")
-            raise HTTPException(status_code=500, detail="Failed to save new person during reject")
-
-        # Link to new person
-        source_store.link_to_person(
-            entity_id,
-            new_person.id,
-            confidence=1.0,
-            status=LINK_STATUS_CONFIRMED,
-        )
-        new_person_id = new_person.id
-    else:
-        # Mark as rejected
-        entity.link_status = LINK_STATUS_REJECTED
-        entity.canonical_person_id = None
-        source_store.update(entity)
-
-    return {
-        "status": "rejected",
-        "entity_id": entity_id,
-        "new_person_id": new_person_id,
-    }
+        return {
+            "status": "rejected",
+            "entity_id": entity_id,
+            "new_person_id": new_person_id,
+        }
 
 
 # ============================================================================
@@ -4585,7 +4626,7 @@ async def reject_review_item(entity_id: str, request: LinkConfirmRequest):
 
 
 @router.get("/data-health")
-async def get_data_health():
+def get_data_health():
     """
     Get comprehensive data health statistics.
 
@@ -4724,9 +4765,9 @@ async def get_data_health():
 
 
 @router.get("/data-health/summary")
-async def get_data_health_summary():
+def get_data_health_summary():
     """Get a brief summary of data health for the UI header."""
-    health = await get_data_health()
+    health = get_data_health()
 
     return {
         "total_interactions": sum(
@@ -4758,7 +4799,7 @@ class LinkOverrideResponse(BaseModel):
 
 
 @router.get("/link-overrides")
-async def get_link_overrides(person_id: Optional[str] = Query(default=None)):
+def get_link_overrides(person_id: Optional[str] = Query(default=None)):
     """
     Get all link override rules.
 
@@ -4805,7 +4846,7 @@ async def get_link_overrides(person_id: Optional[str] = Query(default=None)):
 
 
 @router.delete("/link-overrides/{override_id}")
-async def delete_link_override(override_id: str):
+def delete_link_override(override_id: str):
     """Delete a link override rule."""
     from api.services.link_override import get_link_override_store
 
@@ -4898,7 +4939,7 @@ class ToneAnalysisDetailedResponse(BaseModel):
 
 
 @router.get("/relationship/insights", response_model=RelationshipInsightsResponse)
-async def get_relationship_insights(person_id: Optional[str] = None):
+def get_relationship_insights(person_id: Optional[str] = None):
     """
     Get all relationship insights for the configured partner.
 
@@ -4939,7 +4980,7 @@ async def get_relationship_insights(person_id: Optional[str] = None):
 
 
 @router.post("/relationship/insights/generate", response_model=RelationshipInsightsResponse)
-async def generate_relationship_insights(
+def generate_relationship_insights(
     person_id: Optional[str] = None,
     category: Optional[str] = None
 ):
@@ -4995,7 +5036,7 @@ async def generate_relationship_insights(
 
 
 @router.post("/relationship/insights/{insight_id}/confirm")
-async def confirm_relationship_insight(insight_id: str):
+def confirm_relationship_insight(insight_id: str):
     """
     Mark an insight as confirmed.
 
@@ -5013,7 +5054,7 @@ async def confirm_relationship_insight(insight_id: str):
 
 
 @router.delete("/relationship/insights/{insight_id}")
-async def delete_relationship_insight(insight_id: str):
+def delete_relationship_insight(insight_id: str):
     """
     Delete/dismiss an insight.
     """
@@ -5029,7 +5070,7 @@ async def delete_relationship_insight(insight_id: str):
 
 
 @router.post("/relationship/tone-analysis", response_model=ToneAnalysisResponse)
-async def analyze_relationship_tone(person_id: Optional[str] = None, months: int = 12):
+def analyze_relationship_tone(person_id: Optional[str] = None, months: int = 12):
     """
     Analyze tone/sentiment in iMessage conversations over time.
 
@@ -5174,7 +5215,7 @@ MESSAGES:
 
 
 @router.post("/relationship/tone-analysis-detailed", response_model=ToneAnalysisDetailedResponse)
-async def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: int = 12):
+def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: int = 12):
     """
     Analyze tone/sentiment separately for the user and their partner in iMessage conversations.
 
