@@ -329,7 +329,7 @@ export function initGraph() {
     // precedence list, so it needs the identical guard or the raw id leaks
     // through one slot higher. Never emits '?'.
     const candidates = [
-      d.custom_label,
+      isRawIdValue(d, d.custom_label) ? '' : d.custom_label,
       isRawIdValue(d, d.short_label) ? '' : d.short_label,
       isRawIdValue(d, d.label) ? '' : d.label,
       d.prompt_preview,
@@ -655,7 +655,7 @@ export function initGraph() {
   // Title for a dropdown result: the matched field's own value, unless that
   // value is a raw id (`isRawIdValue`) — then the display name.
   function searchResultTitle(s, field) {
-    const own = field === 'label' ? s.label : field === 'short_label' ? s.short_label : '';
+    const own = field === 'label' ? (s.custom_label || s.label) : field === 'short_label' ? s.short_label : '';
     return (isRawIdValue(s, own) ? '' : own) || sessionDisplayName(s);
   }
 

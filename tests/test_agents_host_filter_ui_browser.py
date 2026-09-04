@@ -22,6 +22,13 @@ markup and aren't wired up until `initGraph()` runs.
 (completed + ended), the route filter's `hermes`/`ask` options, and that no
 rendered node label is a literal '?' — using a second synthetic snapshot
 (`SNAPSHOT2`) on a single host so the host filter doesn't interfere.
+
+`TestSearchDropdownRawIdGuard` exercises the search dropdown's raw-id guard
+using a third synthetic snapshot (`SNAPSHOT3`) of sessions whose labels are
+raw identifiers under each of the ways `isRawIdValue` recognizes one.
+`TestSearchDropdownLabelSourcePrecedence` covers `custom_label` precedence
+and the `short_label`/summary match tiers, including a stubbed summary
+search response, using a fourth synthetic snapshot (`SNAPSHOT4`).
 """
 import http.server
 import json
@@ -730,3 +737,133 @@ class TestSearchDropdownRawIdGuard:
         }
         assert all(title not in raw_ids for title in titles)
         assert set(titles) == {"Local", "fix the synthetic widget parser", "dropdowntest-real-title"}
+
+
+def _bare_session(session_id, task_id, **overrides):
+    base = {
+        "session_id": session_id,
+        "task_id": task_id,
+        "status": "running",
+        "status_inferred": False,
+        "routing": "local",
+        "source": "lifeos_agent",
+        "host": "host-1",
+        "started_at": 1000,
+        "last_activity_at": 2000,
+        "total_input_tokens": 5,
+        "total_output_tokens": 5,
+        "total_dollars": 0.0,
+        "spawn_depth": 0,
+        "label": "",
+        "short_label": "",
+        "model_label": "Local",
+        "decoded_cwd": "/home/synthetic/proj-a",
+    }
+    base.update(overrides)
+    return base
+
+
+SNAPSHOT4 = {
+    "sessions": [
+        _bare_session(
+            "custlblid-001", "task-001",
+            custom_label="custlblid-001",
+        ),
+        _bare_session(
+            "sess-custom-real", "task-002",
+            custom_label="dropdowntest-custom-name",
+            label="dropdowntest-stale-label",
+        ),
+        _bare_session(
+            "sess-shortlabel-distinct", "task-003",
+            label="dropdowntest-long-label",
+            short_label="dropdowntest-short",
+        ),
+        _bare_session(
+            "sess-rawid-shortlabel-only", "task-004",
+            short_label="sess-rawid-shortlabel-only",
+        ),
+        _bare_session(
+            "sess-summary-match-only", "task-005",
+        ),
+    ],
+    "edges": [],
+    "generated_at": 1234567890,
+}
+
+
+def _open_agents4(page: Page, base_url, search_matches=None):
+    def handler(route):
+        if "/stream" in route.request.url:
+            route.fulfill(status=200, content_type="text/event-stream", body="")
+            return
+        if "/api/agents/snapshot" in route.request.url:
+            body = SNAPSHOT4
+        elif "/api/agents/board" in route.request.url:
+            body = {"lanes": {}, "generated_at": 0}
+        elif "/api/agents/search" in route.request.url:
+            body = {"matches": search_matches or []}
+        else:
+            body = {}
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(body))
+
+    page.route("**/api/**", handler)
+    page.goto(f"{base_url}/agents")
+    page.click('[data-tab="graph"]')
+    page.wait_for_selector("#filter-route")
+    page.select_option("#filter-recency", "all")
+    page.locator("#filter-terminal").check()
+    page.wait_for_timeout(400)
+
+
+class TestSearchDropdownLabelSourcePrecedence:
+    """The label-tier title comes from the matched field's own value
+    (`custom_label || label`), guarded by `isRawIdValue` the same way the
+    node's `custom_label` slot now is, and distinct from `sessionDisplayName`
+    (`nodeLabel`)'s separate precedence order — using a fourth synthetic
+    snapshot (`SNAPSHOT4`) built for these cases specifically."""
+
+    def test_custom_label_equal_to_session_id_never_titles_the_result(self, page: Page, agents_base_url):
+        _open_agents4(page, agents_base_url)
+        page.locator("#search-input").fill("custlblid-001")
+        result = page.locator(".search-result", has_text="Local")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "Local"
+        assert "custlblid-001" not in title
+
+    def test_custom_label_wins_over_stale_label_in_label_tier_title(self, page: Page, agents_base_url):
+        _open_agents4(page, agents_base_url)
+        page.locator("#search-input").fill("dropdowntest-custom")
+        result = page.locator(".search-result", has_text="dropdowntest-custom-name")
+        expect(result).to_be_visible()
+        name_el = result.locator(".sr-name")
+        assert name_el.inner_text() == "dropdowntest-custom-name"
+        assert "dropdowntest-stale-label" not in name_el.inner_text()
+        assert name_el.locator("mark").count() > 0
+
+    def test_label_tier_title_uses_matched_fields_own_value_not_short_label(self, page: Page, agents_base_url):
+        _open_agents4(page, agents_base_url)
+        page.locator("#search-input").fill("dropdowntest-long")
+        result = page.locator(".search-result", has_text="dropdowntest-long-label")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "dropdowntest-long-label"
+        assert title != "dropdowntest-short"
+
+    def test_short_label_and_summary_tier_titles_are_guarded_via_stubbed_search(self, page: Page, agents_base_url):
+        matches = [
+            {"session_id": "sess-rawid-shortlabel-only", "field": "short_label", "snippet": "rawid short label match"},
+            {"session_id": "sess-summary-match-only", "field": "summary", "snippet": "a synthetic summary match"},
+        ]
+        _open_agents4(page, agents_base_url, search_matches=matches)
+        page.locator("#search-input").fill("zz")
+        page.wait_for_timeout(400)
+        results = page.locator(".search-result")
+        expect(results).to_have_count(2)
+        titles = results.locator(".sr-name").all_inner_texts()
+        badges = results.locator(".sr-badge").all_inner_texts()
+        assert all(title == "Local" for title in titles)
+        assert "sess-rawid-shortlabel-only" not in titles
+        assert {b.lower() for b in badges} == {"label", "summary"}
