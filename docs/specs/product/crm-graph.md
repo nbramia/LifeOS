@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-05-27
+**Last Updated:** 2026-09-04
 
 The D3 force-directed graph at `/crm` plus the multi-source `Relationship` model that backs it. Covers connection discovery, edge-weight calculation, source-filter UI, and the graph rendering itself.
 
@@ -83,7 +83,44 @@ D3-based force-directed graph that renders the selected person's network.
 - Clicking a node navigates to that person; hovering shows a tooltip with name and company.
 - Toggle the labels and reset-zoom controls in the toolbar.
 - Re-renders when the person selection changes.
-- Renders < 2s for ~30 nodes.
+- Renders in well under a second regardless of how large the underlying contact
+  graph is, because the server returns a bounded neighborhood rather than the
+  full relationship set (see Bounded Neighborhood below); the client-side
+  strength slider then further narrows that bounded set to the ~25 first-degree
+  nodes the graph is designed to display at once.
+
+### Bounded Neighborhood
+
+`GET /api/crm/network?center_on=<id>` (used by the Graph tab) never loads
+every relationship. Instead it selects:
+
+1. The center person (degree 0).
+2. Up to `max_nodes - 1` of the center's strongest first-degree connections
+   (default `max_nodes=150`), ranked by an indexed per-person query.
+3. For `depth=2` (the Graph tab's default), up to
+   `max_second_degree_per_node` (default `10`) of each first-degree node's
+   own strongest connections, added in first-degree strength order until
+   `max_nodes` is reached.
+
+Edges returned are the induced subgraph among exactly the selected nodes —
+every edge's endpoints are both present in the response, the center is
+always present, and every first-degree node has an edge to the center.
+"Strongest" for node *selection* is the sum of the relationship's
+shared-interaction counts (a cheap ranking proxy); the edge weight and
+strength values in the response are unchanged — computed the same way they
+always were.
+
+Query parameters:
+
+| Parameter | Range | Default | Meaning |
+|---|---|---|---|
+| `max_nodes` | 1–500 | 150 | Total nodes in the response, including the center |
+| `max_second_degree_per_node` | 0–50 | 10 | Second-(and deeper-)degree neighbors added per node at the previous depth |
+| `allow_full_graph` | bool | false | Opt-in to load every person and relationship (no `center_on`); ignores the two caps above |
+
+The Graph tab always passes `max_nodes` and `max_second_degree_per_node`
+explicitly at their defaults, so the bounded contract is visible in the
+request rather than implicit.
 
 **Graph enhancements:**
 
@@ -170,7 +207,7 @@ class RelationshipDetailResponse(BaseModel):
     weight: int = 0
 ```
 
-The network endpoint (`/api/crm/people/{id}/network`) includes the same breakdown per edge so the graph can filter and re-weight client-side.
+The network endpoint (`GET /api/crm/network?center_on={id}`) includes the same breakdown per edge so the graph can filter and re-weight client-side.
 
 ---
 

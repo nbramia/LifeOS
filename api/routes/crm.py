@@ -2526,6 +2526,14 @@ def get_network_graph(
     depth: int = Query(default=2, ge=1, le=4, description="Hops from center person"),
     min_strength: float = Query(default=0.0, ge=0.0, le=1.0, description="Minimum relationship strength"),
     category: Optional[str] = Query(default=None, description="Filter by category"),
+    max_nodes: int = Query(
+        default=150, ge=1, le=500,
+        description="Maximum nodes to return for a centered request (ignored with allow_full_graph)",
+    ),
+    max_second_degree_per_node: int = Query(
+        default=10, ge=0, le=50,
+        description="Maximum second-(and deeper-)degree neighbors to add per node at the previous depth",
+    ),
     allow_full_graph: bool = Query(
         default=False,
         description="Required to load full graph without center_on (expensive operation)"
@@ -2537,10 +2545,19 @@ def get_network_graph(
     Returns nodes (people) and edges (relationships) for rendering
     an interactive force-directed network graph.
 
-    If center_on is provided, only returns people within 'depth' hops
-    of the center person. Otherwise, returns all people and relationships.
+    If center_on is provided, this returns a bounded neighborhood: the
+    strongest `max_nodes` connections reachable within `depth` hops, capped
+    at `max_second_degree_per_node` new neighbors per node at each hop
+    beyond the first. Node selection uses indexed per-person queries
+    (RelationshipStore.get_top_neighbors), ranking neighbors by the sum of
+    their shared-interaction count columns as a cheap proxy for strength —
+    the full 500k+-row relationship table is never loaded for a centered
+    request. Edges are then the induced subgraph among the selected nodes
+    (RelationshipStore.get_edges_among), still using the real
+    strength/weight formula on `Relationship`.
 
-    PERFORMANCE: Without center_on, this loads ALL relationships (5000+ edges).
+    Without center_on, this loads ALL relationships (500k+ edges) and all
+    people; `max_nodes`/`max_second_degree_per_node` do not apply.
     Set allow_full_graph=true to explicitly opt-in to this expensive operation.
 
     Each node includes a 'degree' field:
@@ -2566,7 +2583,6 @@ def get_network_graph(
     node_degrees: dict[str, int] = {}
 
     if center_on:
-        # BFS to find people within depth hops of center, tracking degree
         center_person = person_store.get_by_id(center_on)
         if not center_person:
             raise HTTPException(status_code=404, detail=f"Person '{center_on}' not found")
@@ -2576,34 +2592,51 @@ def get_network_graph(
         my_person_id = settings.my_person_id
         is_viewing_self = (center_on == my_person_id)
 
-        # BFS traversal with degree tracking - use batch queries
-        node_degrees[center_on] = 0  # Center is degree 0
-        current_level: set[str] = {center_on}
+        # Center is degree 0. Pick the strongest first-degree neighbors via
+        # the indexed per-person lookup, up to max_nodes total (minus the
+        # center itself) - never the full relationship table.
+        node_degrees[center_on] = 0
+        frontier: list[str] = []
+        if max_nodes > 1:
+            for rel in rel_store.get_top_neighbors(center_on, limit=max_nodes - 1):
+                other_id = rel.other_person(center_on)
+                if other_id and other_id not in node_degrees:
+                    node_degrees[other_id] = 1
+                    frontier.append(other_id)
 
-        for current_depth in range(1, depth + 1):
-            if not current_level:
+        # For depth >= 2, expand each frontier node's strongest neighbors
+        # (up to max_second_degree_per_node each), stopping once max_nodes
+        # is reached.
+        for current_depth in range(2, depth + 1):
+            if not frontier or len(node_degrees) >= max_nodes:
                 break
-            # Batch query for all people at this level
-            level_relationships = rel_store.get_for_people_batch(current_level)
-            next_level: set[str] = set()
-            for person_id in current_level:
-                # Skip "me" as a bridge for 2nd+ degree when not viewing self
-                # This prevents everyone appearing as 2nd-degree through me
-                if not is_viewing_self and current_depth > 1 and person_id == my_person_id:
+            next_frontier: list[str] = []
+            for node_id in frontier:
+                if len(node_degrees) >= max_nodes:
+                    break
+                # Skip "me" as a bridge for 2nd+ degree when not viewing
+                # self - this prevents everyone appearing as 2nd-degree
+                # through me (same rationale as the original BFS).
+                if not is_viewing_self and node_id == my_person_id:
                     continue
-                for rel in level_relationships.get(person_id, []):
-                    other_id = rel.other_person(person_id)
+                if max_second_degree_per_node <= 0:
+                    continue
+                for rel in rel_store.get_top_neighbors(node_id, limit=max_second_degree_per_node):
+                    if len(node_degrees) >= max_nodes:
+                        break
+                    other_id = rel.other_person(node_id)
                     if other_id and other_id not in node_degrees:
-                        next_level.add(other_id)
                         node_degrees[other_id] = current_depth
-            current_level = next_level
+                        next_frontier.append(other_id)
+            frontier = next_frontier
+
+        # Batch lookup only the selected people - never get_all().
+        all_people_dict = person_store.get_by_ids(node_degrees.keys())
     else:
         # Get all people (no center, all are degree 1)
         all_people = person_store.get_all()
         node_degrees = {p.id: 1 for p in all_people}
-
-    # Get all people in one pass (avoid N+1 lookups)
-    all_people_dict = {p.id: p for p in person_store.get_all()}
+        all_people_dict = {p.id: p for p in all_people}
 
     # Filter by category and strength, then build nodes
     for person_id, degree in node_degrees.items():
@@ -2631,8 +2664,12 @@ def get_network_graph(
     # Build a set of valid node IDs after filtering
     valid_node_ids = {n.id for n in nodes}
 
-    # Get all edges in one query instead of per-node queries
-    all_relationships = rel_store.get_all_relationships()
+    # Centered requests get only the induced subgraph among the selected
+    # nodes (indexed); the full-graph opt-in still loads every relationship.
+    if center_on:
+        all_relationships = rel_store.get_edges_among(valid_node_ids)
+    else:
+        all_relationships = rel_store.get_all_relationships()
     seen_edges: set[tuple[str, str]] = set()
 
     # Get owner ID for determining edge weight source

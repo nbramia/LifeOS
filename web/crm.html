@@ -16950,8 +16950,11 @@
             container.innerHTML = '<div class="loading">Loading graph...</div>';
 
             try {
-                // Use the network endpoint with depth=2 for second-degree connections
-                const data = await api(`/network?center_on=${personId}&depth=2`);
+                // Use the network endpoint with depth=2 for second-degree connections.
+                // max_nodes/max_second_degree_per_node are passed explicitly at their
+                // server-side defaults so the bounded neighborhood contract is visible
+                // here rather than implicit (#870).
+                const data = await api(`/network?center_on=${personId}&depth=2&max_nodes=150&max_second_degree_per_node=10`);
 
                 if (!data.nodes || data.nodes.length === 0) {
                     container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🔗</div><p>No connections to visualize</p></div>';

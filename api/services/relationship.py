@@ -786,6 +786,96 @@ class RelationshipStore:
         finally:
             conn.close()
 
+    def get_top_neighbors(self, person_id: str, limit: int) -> list["Relationship"]:
+        """
+        Get a person's strongest relationships without scanning the full table.
+
+        Uses the person_a_id/person_b_id indexes (WHERE ... OR ...) to fetch
+        only rows involving person_id, then orders that small set by the sum
+        of the shared-interaction count columns as a cheap proxy for
+        relationship strength. This is NOT the same as `Relationship.pair_strength`
+        / `edge_weight` (which factor in recency and diversity too) — it's a
+        server-side ranking heuristic for picking which neighbors to include
+        in a bounded graph; the real strength formula is still used for the
+        edges actually returned.
+
+        Args:
+            person_id: Canonical person ID
+            limit: Maximum relationships to return (strongest first)
+
+        Returns:
+            List of relationships, strongest (by the count-sum proxy) first
+        """
+        if limit <= 0:
+            return []
+
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute("""
+                SELECT *,
+                    (shared_events_count + shared_threads_count + shared_messages_count +
+                     shared_whatsapp_count + shared_slack_count + shared_phone_calls_count +
+                     shared_photos_count) AS _rank_score
+                FROM relationships
+                WHERE person_a_id = ? OR person_b_id = ?
+                ORDER BY _rank_score DESC
+                LIMIT ?
+            """, (person_id, person_id, limit))
+            # Drop the trailing _rank_score column before handing the row to
+            # from_row(), which indexes columns positionally.
+            return [Relationship.from_row(row[:-1]) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_edges_among(self, person_ids) -> list["Relationship"]:
+        """
+        Get the induced subgraph among a set of person IDs: every relationship
+        where BOTH endpoints are in person_ids.
+
+        Runs one indexed IN (...) query per chunk of ids against each of
+        person_a_id and person_b_id (chunking to stay under SQLite's
+        bound-parameter limit for large id sets), confirms in Python that
+        both endpoints of each returned row are actually in the requested
+        set (a row matching on one indexed column isn't guaranteed to match
+        on the other), and dedups by unordered pair.
+
+        Args:
+            person_ids: IDs to restrict the subgraph to
+
+        Returns:
+            Deduplicated list of relationships, each unordered pair once
+        """
+        ids_set = set(person_ids)
+        if not ids_set:
+            return []
+
+        ids_list = list(ids_set)
+        chunk_size = 500  # comfortably under SQLite's older 999-variable limit
+        conn = self._get_connection()
+        try:
+            seen: set[tuple[str, str]] = set()
+            results: list[Relationship] = []
+            for column in ("person_a_id", "person_b_id"):
+                for i in range(0, len(ids_list), chunk_size):
+                    chunk = ids_list[i:i + chunk_size]
+                    placeholders = ",".join("?" * len(chunk))
+                    cursor = conn.execute(
+                        f"SELECT * FROM relationships WHERE {column} IN ({placeholders})",
+                        chunk,
+                    )
+                    for row in cursor.fetchall():
+                        rel = Relationship.from_row(row)
+                        if rel.person_a_id not in ids_set or rel.person_b_id not in ids_set:
+                            continue
+                        key = (rel.person_a_id, rel.person_b_id)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        results.append(rel)
+            return results
+        finally:
+            conn.close()
+
     def get_all_relationships(self, limit: Optional[int] = None) -> list["Relationship"]:
         """
         Get all relationships.

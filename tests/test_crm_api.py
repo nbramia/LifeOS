@@ -396,6 +396,145 @@ class TestNetworkGraph:
         assert response.status_code == 200
 
 
+class TestNetworkGraphPruning:
+    """Tests for the bounded/pruned centered neighborhood (#870)."""
+
+    def test_max_nodes_validation(self, client, sample_person_id):
+        """max_nodes outside 1..500 is rejected.
+
+        api/main.py's app-wide RequestValidationError handler converts
+        FastAPI's default 422 to 400 for all endpoints.
+        """
+        for value in (0, 501):
+            response = client.get(
+                f"/api/crm/network?center_on={sample_person_id}&max_nodes={value}"
+            )
+            assert response.status_code == 400
+
+    def test_max_second_degree_per_node_validation(self, client, sample_person_id):
+        """max_second_degree_per_node outside 0..50 is rejected (see above:
+        validation errors surface as 400, not 422, app-wide)."""
+        for value in (-1, 51):
+            response = client.get(
+                f"/api/crm/network?center_on={sample_person_id}"
+                f"&max_second_degree_per_node={value}"
+            )
+            assert response.status_code == 400
+
+    def test_response_never_exceeds_max_nodes(self, client, sample_person_id):
+        """The returned node count never exceeds max_nodes."""
+        response = client.get(
+            f"/api/crm/network?center_on={sample_person_id}&depth=2"
+            f"&max_nodes=20&max_second_degree_per_node=5"
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["nodes"]) <= 20
+
+    def test_first_degree_nodes_are_strongest(self, client, sample_person_id):
+        """When a center has more first-degree connections than fit, the
+        returned first-degree nodes are the strongest ones."""
+        from api.services.relationship import get_relationship_store
+
+        rel_store = get_relationship_store()
+        top = rel_store.get_top_neighbors(sample_person_id, limit=3)
+        if len(top) < 3:
+            pytest.skip("Person has fewer than 3 relationships; can't test ordering")
+        expected_ids = {rel.other_person(sample_person_id) for rel in top}
+
+        response = client.get(
+            f"/api/crm/network?center_on={sample_person_id}&depth=1&max_nodes=4"
+        )
+        assert response.status_code == 200
+        data = response.json()
+        returned_first_degree = {n["id"] for n in data["nodes"] if n["degree"] == 1}
+        assert returned_first_degree == expected_ids
+
+    def test_edge_closure_invariants(self, client, sample_person_id):
+        """Center present; every edge's endpoints are both in the node set;
+        every first-degree node has an edge to the center."""
+        response = client.get(
+            f"/api/crm/network?center_on={sample_person_id}&depth=2"
+            f"&max_nodes=50&max_second_degree_per_node=5"
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        node_ids = {n["id"] for n in data["nodes"]}
+        assert sample_person_id in node_ids
+
+        edge_pairs = set()
+        for edge in data["edges"]:
+            assert edge["source"] in node_ids
+            assert edge["target"] in node_ids
+            edge_pairs.add(frozenset((edge["source"], edge["target"])))
+
+        first_degree_ids = {n["id"] for n in data["nodes"] if n["degree"] == 1}
+        for fid in first_degree_ids:
+            assert frozenset((sample_person_id, fid)) in edge_pairs
+
+    def test_centered_request_never_loads_all_relationships(
+        self, client, sample_person_id, monkeypatch
+    ):
+        """A centered request must use the indexed neighbor/edge queries,
+        never RelationshipStore.get_all_relationships() (the 5+ second,
+        546k-row scan this issue exists to avoid)."""
+        from api.services.relationship import RelationshipStore
+
+        def _must_not_be_called(self, limit=None):
+            raise AssertionError(
+                "get_all_relationships() must not be called for a centered request"
+            )
+
+        monkeypatch.setattr(RelationshipStore, "get_all_relationships", _must_not_be_called)
+
+        response = client.get(f"/api/crm/network?center_on={sample_person_id}&depth=2")
+        assert response.status_code == 200
+
+    def test_allow_full_graph_still_calls_get_all_relationships(self, monkeypatch):
+        """The opt-in full-graph path is untouched: it still loads everything."""
+        from fastapi.testclient import TestClient
+        from api.services.relationship import RelationshipStore
+
+        calls = []
+        original = RelationshipStore.get_all_relationships
+
+        def _tracked(self, limit=None):
+            calls.append(1)
+            return original(self, limit=limit)
+
+        monkeypatch.setattr(RelationshipStore, "get_all_relationships", _tracked)
+
+        from api.main import app
+        response = TestClient(app).get("/api/crm/network?allow_full_graph=true")
+        assert response.status_code == 200
+        assert calls, "allow_full_graph=true should still call get_all_relationships()"
+
+
+class TestNetworkGraphLatency:
+    """Latency regression test for #870 - skips cleanly on a small/fresh dataset."""
+
+    def test_centered_depth2_under_500ms(self, client, sample_person_id):
+        """A centered depth=2 request completes in well under 500ms on the
+        production-sized dataset (the pre-#870 endpoint took 10+ seconds)."""
+        import time
+        from api.services.relationship import get_relationship_store
+
+        rel_store = get_relationship_store()
+        if rel_store.count() < 10000:
+            pytest.skip(
+                "Relationship table is too small to be a meaningful latency "
+                "check (not the production dataset)"
+            )
+
+        start = time.monotonic()
+        response = client.get(f"/api/crm/network?center_on={sample_person_id}&depth=2")
+        elapsed_ms = (time.monotonic() - start) * 1000
+
+        assert response.status_code == 200
+        assert elapsed_ms < 500, f"network graph took {elapsed_ms:.1f}ms (limit 500ms)"
+
+
 class TestRelationshipDetail:
     """Tests for relationship detail endpoint."""
 

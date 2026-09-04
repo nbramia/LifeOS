@@ -315,3 +315,105 @@ class TestRelationshipStore:
         assert stats["by_type"][TYPE_COWORKER] == 1
         assert stats["by_type"][TYPE_FRIEND] == 1
         assert stats["avg_shared_interactions"] > 0
+
+
+class TestGetTopNeighbors:
+    """Tests for RelationshipStore.get_top_neighbors() (#870)."""
+
+    def test_orders_by_summed_shared_counts_desc(self, store):
+        """Strongest neighbor (highest summed shared counts) comes first."""
+        store.add(Relationship(person_a_id="center", person_b_id="weak", shared_events_count=1))
+        store.add(Relationship(person_a_id="center", person_b_id="strong", shared_events_count=20))
+        store.add(Relationship(person_a_id="center", person_b_id="medium", shared_messages_count=5))
+
+        neighbors = store.get_top_neighbors("center", limit=10)
+
+        assert [r.other_person("center") for r in neighbors] == ["strong", "medium", "weak"]
+
+    def test_works_regardless_of_person_a_or_b_position(self, store):
+        """A neighbor stored as person_a_id or person_b_id is found either way."""
+        # "center" ends up as person_a_id or person_b_id depending on
+        # lexicographic order - both must be found.
+        store.add(Relationship(person_a_id="aaa_center", person_b_id="zzz_other", shared_events_count=3))
+        store.add(Relationship(person_a_id="000_other", person_b_id="aaa_center", shared_events_count=7))
+
+        neighbors = store.get_top_neighbors("aaa_center", limit=10)
+
+        others = {r.other_person("aaa_center") for r in neighbors}
+        assert others == {"zzz_other", "000_other"}
+
+    def test_respects_limit(self, store):
+        """Only the top `limit` neighbors are returned."""
+        for i in range(5):
+            store.add(Relationship(
+                person_a_id="center", person_b_id=f"p{i}", shared_events_count=i + 1,
+            ))
+
+        neighbors = store.get_top_neighbors("center", limit=2)
+
+        assert len(neighbors) == 2
+        # Highest shared_events_count values are p4 (5) then p3 (4).
+        assert {r.other_person("center") for r in neighbors} == {"p4", "p3"}
+
+    def test_limit_zero_returns_empty(self, store):
+        """limit=0 (or negative) returns no rows without querying."""
+        store.add(Relationship(person_a_id="center", person_b_id="other", shared_events_count=1))
+
+        assert store.get_top_neighbors("center", limit=0) == []
+        assert store.get_top_neighbors("center", limit=-1) == []
+
+    def test_no_relationships_returns_empty(self, store):
+        """A person with no relationships returns an empty list."""
+        assert store.get_top_neighbors("lonely", limit=10) == []
+
+
+class TestGetEdgesAmong:
+    """Tests for RelationshipStore.get_edges_among() (#870)."""
+
+    def test_returns_only_edges_with_both_endpoints_in_set(self, store):
+        """An edge is included only when both its endpoints are in the set."""
+        store.add(Relationship(person_a_id="a", person_b_id="b"))  # both in set
+        store.add(Relationship(person_a_id="a", person_b_id="outside"))  # one in set
+        store.add(Relationship(person_a_id="outside1", person_b_id="outside2"))  # none in set
+
+        edges = store.get_edges_among({"a", "b"})
+
+        pairs = {(r.person_a_id, r.person_b_id) for r in edges}
+        assert pairs == {("a", "b")}
+
+    def test_empty_input_returns_empty(self, store):
+        """An empty id set returns no edges without querying."""
+        store.add(Relationship(person_a_id="a", person_b_id="b"))
+        assert store.get_edges_among(set()) == []
+
+    def test_dedupes_by_unordered_pair(self, store):
+        """Each unordered pair appears at most once even though the method
+        queries both person_a_id and person_b_id."""
+        store.add(Relationship(person_a_id="a", person_b_id="b"))
+
+        edges = store.get_edges_among({"a", "b"})
+
+        assert len(edges) == 1
+
+    def test_chunks_beyond_sqlite_variable_limit(self, store):
+        """Correct results when the id set is larger than SQLite's default
+        999-variable limit, forcing the method to chunk its IN (...) queries."""
+        num_people = 1200
+        ids = [f"person{i}" for i in range(num_people)]
+
+        # Chain them: person0-person1, person1-person2, ... so there are
+        # num_people - 1 edges, every one of which has both endpoints in `ids`.
+        for i in range(num_people - 1):
+            store.add(Relationship(person_a_id=ids[i], person_b_id=ids[i + 1]))
+
+        # Also add an edge to someone outside the set - must be excluded.
+        store.add(Relationship(person_a_id=ids[0], person_b_id="outsider"))
+
+        edges = store.get_edges_among(ids)
+
+        assert len(edges) == num_people - 1
+        pairs = {(r.person_a_id, r.person_b_id) for r in edges}
+        for i in range(num_people - 1):
+            a, b = sorted([ids[i], ids[i + 1]])
+            assert (a, b) in pairs
+        assert not any("outsider" in pair for pair in pairs)
