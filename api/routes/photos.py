@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from api.routes.crm import _mutation_lock
 from config.settings import settings
 
 router = APIRouter(prefix="/api/photos", tags=["photos"])
@@ -271,39 +272,40 @@ def trigger_photo_sync(
     Creates SourceEntity and Interaction records for matched people
     in Photos face recognition data.
     """
-    _check_photos_enabled()
+    with _mutation_lock:
+        _check_photos_enabled()
 
-    from api.services.apple_photos_sync import sync_apple_photos
+        from api.services.apple_photos_sync import sync_apple_photos
 
-    try:
-        # For now, always do full sync (incremental requires tracking state)
-        stats = sync_apple_photos(since=None)
+        try:
+            # For now, always do full sync (incremental requires tracking state)
+            stats = sync_apple_photos(since=None)
 
-        return SyncResponse(
-            success=True,
-            stats=stats,
-            message=f"Synced {stats.get('person_matches', 0)} people, "
-                    f"created {stats.get('interactions_created', 0)} interactions"
-        )
-    except Exception as e:
-        # A plain JSONResponse, not a SyncResponse, so a top-level "error"
-        # key can ride alongside the existing fields instead of being
-        # filtered out by response_model validation. #609 made this legible
-        # (top-level "error" key); #614 decided a total failure must also
-        # be non-2xx, since a consumer that only checks HTTP status
-        # (`raise_for_status()`) should get correct behavior without
-        # knowing about the body convention. 500 because this is an
-        # unhandled exception, not a classified upstream/dependency
-        # failure. The "error" key stays as additive defense —
-        # `mcp_server.py: dispatch()` and the agent worker's ToolRegistry
-        # already flag any tool result as an error generically whenever the
-        # body carries a top-level "error" key.
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "stats": {"error": str(e)},
-            "message": f"Sync failed: {e}",
-            "error": str(e),
-        })
+            return SyncResponse(
+                success=True,
+                stats=stats,
+                message=f"Synced {stats.get('person_matches', 0)} people, "
+                        f"created {stats.get('interactions_created', 0)} interactions"
+            )
+        except Exception as e:
+            # A plain JSONResponse, not a SyncResponse, so a top-level "error"
+            # key can ride alongside the existing fields instead of being
+            # filtered out by response_model validation. #609 made this legible
+            # (top-level "error" key); #614 decided a total failure must also
+            # be non-2xx, since a consumer that only checks HTTP status
+            # (`raise_for_status()`) should get correct behavior without
+            # knowing about the body convention. 500 because this is an
+            # unhandled exception, not a classified upstream/dependency
+            # failure. The "error" key stays as additive defense —
+            # `mcp_server.py: dispatch()` and the agent worker's ToolRegistry
+            # already flag any tool result as an error generically whenever the
+            # body carries a top-level "error" key.
+            return JSONResponse(status_code=500, content={
+                "success": False,
+                "stats": {"error": str(e)},
+                "message": f"Sync failed: {e}",
+                "error": str(e),
+            })
 
 
 def _get_thumbnail_path(uuid: str) -> Path | None:

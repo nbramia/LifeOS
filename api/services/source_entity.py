@@ -10,6 +10,7 @@ their linkage to canonical person records with confidence scores.
 """
 import sqlite3
 import json
+import threading
 import uuid
 import logging
 from dataclasses import dataclass, field, asdict
@@ -1280,6 +1281,11 @@ class SourceEntityStore:
 
 # Singleton instance
 _source_entity_store: Optional[SourceEntityStore] = None
+# #868 moved CRM/people/photos handlers off the event loop and onto worker
+# threads, so two first-requests after a restart can now race this
+# check-and-set. Double-checked locking: the lock is only taken while
+# _source_entity_store is still None, so it costs nothing once constructed.
+_source_entity_store_lock = threading.Lock()
 
 
 def get_source_entity_store(db_path: Optional[str] = None) -> SourceEntityStore:
@@ -1294,7 +1300,9 @@ def get_source_entity_store(db_path: Optional[str] = None) -> SourceEntityStore:
     """
     global _source_entity_store
     if _source_entity_store is None:
-        _source_entity_store = SourceEntityStore(db_path)
+        with _source_entity_store_lock:
+            if _source_entity_store is None:
+                _source_entity_store = SourceEntityStore(db_path)
     return _source_entity_store
 
 

@@ -46,8 +46,7 @@ class TestMeStatsEndpoint:
         store.get_all.return_value = people
         return store
 
-    @pytest.mark.asyncio
-    async def test_returns_aggregate_stats(self, mock_person_store):
+    def test_returns_aggregate_stats(self, mock_person_store):
         """Stats endpoint should return totals across all people."""
         from api.routes.crm import get_me_stats
 
@@ -60,8 +59,7 @@ class TestMeStatsEndpoint:
         assert result.total_meetings == 35  # 20 + 10 + 5
         assert result.total_messages == 800  # 500 + 200 + 100
 
-    @pytest.mark.asyncio
-    async def test_handles_empty_database(self):
+    def test_handles_empty_database(self):
         """Stats endpoint should handle empty database gracefully."""
         from api.routes.crm import get_me_stats
 
@@ -141,8 +139,7 @@ class TestMeInteractionsEndpoint:
 
         return person_store, interaction_store
 
-    @pytest.mark.asyncio
-    async def test_returns_aggregated_data(self, mock_stores):
+    def test_returns_aggregated_data(self, mock_stores):
         """Interactions endpoint should return aggregated data for dashboard."""
         from api.routes.crm import get_me_interactions
 
@@ -167,8 +164,7 @@ class TestMeInteractionsEndpoint:
         # Check source breakdown
         assert 'imessage' in result.by_source
 
-    @pytest.mark.asyncio
-    async def test_excludes_self_interactions(self, mock_stores):
+    def test_excludes_self_interactions(self, mock_stores):
         """Interactions should not include self-interactions (via get_all_in_range exclude)."""
         from api.routes.crm import get_me_interactions
 
@@ -183,8 +179,7 @@ class TestMeInteractionsEndpoint:
         call_args = interaction_store.get_all_in_range.call_args
         assert MY_PERSON_ID in call_args.kwargs.get('exclude_person_ids', [])
 
-    @pytest.mark.asyncio
-    async def test_filters_by_date_range(self):
+    def test_filters_by_date_range(self):
         """Date filtering is done by get_all_in_range method."""
         from api.routes.crm import get_me_interactions
 

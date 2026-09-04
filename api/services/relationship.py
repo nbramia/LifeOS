@@ -9,6 +9,7 @@ Relationships are discovered by analyzing shared contexts:
 """
 import sqlite3
 import json
+import threading
 import uuid
 import logging
 from dataclasses import dataclass, field, asdict
@@ -844,6 +845,11 @@ class RelationshipStore:
 
 # Singleton instance
 _relationship_store: Optional[RelationshipStore] = None
+# #868 moved CRM/people/photos handlers off the event loop and onto worker
+# threads, so two first-requests after a restart can now race this
+# check-and-set. Double-checked locking: the lock is only taken while
+# _relationship_store is still None, so it costs nothing once constructed.
+_relationship_store_lock = threading.Lock()
 
 
 def get_relationship_store(db_path: Optional[str] = None) -> RelationshipStore:
@@ -858,5 +864,7 @@ def get_relationship_store(db_path: Optional[str] = None) -> RelationshipStore:
     """
     global _relationship_store
     if _relationship_store is None:
-        _relationship_store = RelationshipStore(db_path)
+        with _relationship_store_lock:
+            if _relationship_store is None:
+                _relationship_store = RelationshipStore(db_path)
     return _relationship_store
