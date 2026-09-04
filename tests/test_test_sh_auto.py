@@ -115,20 +115,22 @@ def test_frontend_fixture_paths_exist(path):
 # scripts/test.sh holds no PID for the server it starts -- not in a file, not
 # in a variable. scripts/server.sh owns the server's whole lifecycle and
 # identifies the process by port (`get_server_pid` via `lsof -ti :$PORT`), so
-# there is nothing for test.sh to track, and a fixed PID path under /tmp
-# would be shared by every worktree and agent on the box: two concurrent
-# test.sh runs could clobber each other's PID or kill each other's server.
-# These two guards keep that shape out of test.sh: a fixed shared path, or a
-# PID-tracking helper appearing while server.sh's port-based lifecycle
-# management still makes it unnecessary.
+# there is nothing for test.sh to track. These two guards keep that shape out
+# of test.sh: a fixed shared path, or a PID-tracking helper appearing while
+# server.sh's port-based lifecycle management still makes it unnecessary.
 @pytest.mark.unit
 def test_no_fixed_shared_pid_path():
     text = SCRIPT.read_text()
     assert "/tmp/lifeos_test_server" not in text, (
-        "scripts/test.sh contains a fixed shared /tmp PID path: concurrent "
-        "test.sh runs from different worktrees would clobber or kill each "
-        "other's server process. If a PID file is genuinely needed, key it "
-        "per-run the way scripts/pre-push keys its log path, never a fixed path."
+        "scripts/test.sh contains a fixed shared /tmp PID path, which is "
+        "unnecessary: server.sh identifies and owns the test server by port, "
+        "not by PID, so test.sh has nothing to track. (The server itself "
+        "stays one shared resource on one machine -- server.sh's `start` "
+        "kills and replaces whatever is on its port, so two test.sh runs "
+        "that both need a server still contend for it; that is server.sh's "
+        "contract, not something a PID path changes.) If a PID file is "
+        "genuinely needed, key it per-run the way scripts/pre-push keys its "
+        "log path, never a fixed path."
     )
     assert "stop_test_server" not in text, (
         "scripts/test.sh contains a PID-tracking function: confirm it is "

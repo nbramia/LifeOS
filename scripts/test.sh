@@ -219,13 +219,14 @@ run_changed_test_files() {
 # get_server_pid() identifies the server by port (`lsof -ti :$PORT`), not by
 # a PID handed to it, and it owns the whole start/stop lifecycle
 # (kill_server, health-check wait, etc.) -- so test.sh has nothing to track.
-# A fixed PID path shared across every worktree and branch on this box would
-# let two concurrent test.sh runs clobber or kill each other's server, and a
-# per-run path is only worth having for a file something actually writes.
-# test.sh deliberately leaves the started server running after the run:
-# server.sh's `start` kills and replaces whatever is on the port before
-# launching, so a leftover server from a previous run is cleaned up the next
-# time any `start_server_background` call happens, not on this script's exit.
+# The server itself is one shared resource on a single hardcoded port:
+# server.sh's `start` kills and replaces whatever is listening there before
+# launching, so two test.sh runs that both need a server contend for that
+# one port regardless of any PID file -- that is server.sh's contract, not
+# something a PID path, fixed or per-run, could change. test.sh deliberately
+# leaves the started server running after the run: a leftover server from a
+# previous run is cleaned up the next time any `start_server_background`
+# call happens, not on this script's exit.
 start_server_background() {
     log_info "Starting server for tests (takes 30-60s for ML model loading)..."
 

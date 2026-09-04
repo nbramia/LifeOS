@@ -936,11 +936,16 @@ def _no_local_telegram_bots_override(tmp_path_factory, monkeypatch):
 # test file the worker runs afterward -- and the next `async def` test on
 # that worker (pytest-asyncio, `asyncio_mode = "auto"`) fails with
 # `RuntimeError: Runner.run() cannot be called from a running event loop`
-# despite having nothing to do with Playwright. `--dist loadscope` hands out
-# scope groups per test class (not per file), in collection order, so a
-# worker can run a browser file's class and then an unrelated file's async
-# test in the same process. The failure that module scope prevents is
-# reproducible against the session-scoped upstream fixtures with:
+# despite having nothing to do with Playwright. `--dist loadscope` groups tests
+# by class for tests inside a class, by module for top-level functions, and
+# hands scope groups out to workers in collection order, so a worker can run
+# a browser file's scope group and then an unrelated file's async test in the
+# same process. The minimal, deterministic reproducer needs no xdist at all
+# -- a single process running a browser file before an `async def` test:
+#   pytest tests/test_voice_mic_block_ui_browser.py tests/test_agents_board_api.py::TestBoardStream -q
+# The failure that module scope prevents is also reproducible against the
+# session-scoped upstream fixtures the way it actually showed up in the full
+# suite, under real parallelism:
 #   pytest tests/test_agents_assignment_ui_browser.py tests/test_agents_board_ui_browser.py \
 #          tests/test_agents_host_filter_ui_browser.py tests/test_agents_board_api.py -n 4
 # -- the browser files must be listed BEFORE test_agents_board_api.py, since
