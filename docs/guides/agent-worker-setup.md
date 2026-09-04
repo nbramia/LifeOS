@@ -544,7 +544,7 @@ The Apple Data Agent's own export/import pipeline
 ([operations.md](operations.md)) is the supported path for cross-machine
 Apple data, not this mechanism.
 
-## Working directory: run a local or cloud card in an isolated checkout (#925)
+## Working directory: run a local or cloud card in an isolated checkout
 
 By default the local (`#local`) and remote (`#cloud`) routes run wherever
 the worker process itself lives — on a normal install, the canonical
@@ -563,8 +563,8 @@ inline `[key:: value]` field on the task line:
 
 **Guardrails, checked before the model ever runs:**
 
-- No `working_dir` named → unchanged: the executor runs in the worker
-  process's own working directory, exactly as before #925.
+- No `working_dir` named → the executor runs in the worker
+  process's own working directory.
 - A path that doesn't exist, or isn't a directory, fails the card closed
   (`#agent-failed`, reason naming the path) — no model call is made.
 - A path that resolves to the worker's own checkout, or anywhere inside

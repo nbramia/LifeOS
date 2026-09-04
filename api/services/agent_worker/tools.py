@@ -14,7 +14,7 @@ No sandboxing per the user's design decision: the worker runs with the
 operator's full filesystem and shell access. This is intentional and is
 called out in `AGENTS.md` and the setup guide.
 
-(#925) When a task names a working directory, Read/Write/Edit resolve
+When a task names a working directory, Read/Write/Edit resolve
 `file_path` against it and reject anything that escapes via `..`
 traversal or a symlink (`_resolve_within_base`), and Bash runs with it as
 `cwd`. That's a path-resolution guard, not a sandbox: a Bash command can
@@ -155,8 +155,7 @@ def _resolve_within_base(file_path: str, base_dir: str | None) -> tuple[Path | N
     collapses `..`), so a path that only *looks* contained is caught here.
 
     `base_dir=None` (no working directory named on the task) is a no-op —
-    `file_path` resolves exactly as it always has, byte-identical to
-    before #925.
+    `file_path` resolves exactly as passed in.
     """
     p = Path(file_path)
     if base_dir is None:
@@ -250,10 +249,9 @@ def _tool_bash(args: dict, base_dir: str | None = None) -> ToolResult:
             text=True,
             timeout=timeout,
             # None (no working directory named) is subprocess.run's own
-            # default — byte-identical to before #925 in that case. A
-            # named `cwd` only bounds the command's *starting* directory;
-            # the command itself can still `cd` elsewhere or touch an
-            # absolute path outside it (see module docstring).
+            # default. A named `cwd` only bounds the command's *starting*
+            # directory; the command itself can still `cd` elsewhere or
+            # touch an absolute path outside it (see module docstring).
             cwd=base_dir,
         )
     except subprocess.TimeoutExpired:
@@ -346,7 +344,7 @@ class ToolRegistry:
     def dispatch(self, name: str, arguments: dict, base_dir: str | None = None) -> ToolResult:
         """Run one tool call. Returns a ToolResult.
 
-        `base_dir` (#925) is the task's named working directory, if any —
+        `base_dir` is the task's named working directory, if any —
         forwarded only to the standard Read/Write/Edit/Bash/WebFetch/
         WebSearch handlers (see their signatures); MCP and inter-agent
         tools reach the filesystem only through `settings.vault_path` via

@@ -317,19 +317,19 @@ def _worker_repo_root():
     """Repository root containing the `api/` package this worker process
     is running from — derived from this file's own location, never a
     configured or hardcoded path, so it tracks wherever the install
-    actually lives (dev worktree, canonical checkout, etc.). Used to
+    actually lives (dev worktree, canonical checkout, etc.). Consulted to
     refuse a named working directory that resolves to, lives inside, or
-    would contain the worker's own checkout (#925). Module-level for test
+    would contain the worker's own checkout. Module-level for test
     override, same idiom as `_today()`."""
     from pathlib import Path
     return Path(__file__).resolve().parents[3]
 
 
 def _resolve_task_working_dir(task: dict) -> tuple[str | None, str | None]:
-    """Extract and validate `task["fields"]["working_dir"]` (#925) — the
+    """Extract and validate `task["fields"]["working_dir"]` — the
     same `[key:: value]` inline-field convention `assignment.py` uses for
     `host`/`model`/`effort`. Shared by both routes this executor serves
-    (`local` and the #809 remote-forced route): neither guesses a
+    (`local` and the remote-forced route): neither guesses a
     directory from the task title the way the CLI routes'
     `directory_resolver` does — unset stays unset.
 
@@ -520,7 +520,7 @@ class LocalExecutor:
         budget = session.budget or {}
         self.session_store.update_status(session.task_id, STATUS_RUNNING)
 
-        # (#925) Working-directory guard — before any conversation seeding
+        # Working-directory guard — runs before any conversation seeding
         # or LLM call, so a refused directory never reaches the model.
         working_dir, wd_error = _resolve_task_working_dir(task)
         if wd_error:
