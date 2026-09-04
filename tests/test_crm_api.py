@@ -41,20 +41,14 @@ class TestCRMConfig:
     """Tests for GET /api/crm/config."""
 
     def test_photos_enabled_reflects_settings_when_false(self, client):
-        """#907 review round 2, finding 2: the server side of #875's
-        photos_enabled field (web/crm.html's loadCRMConfig() reads it to
-        decide whether to ever request an avatar) had no test -- deleting
-        `photos_enabled=settings.photos_enabled` from get_crm_config()
-        left every other test in this repo green, because
-        CRMConfigResponse.photos_enabled defaults to False and this host
-        (at authoring time) had no Photos library configured -- the
-        mutation and the real answer coincided. Forces False explicitly
-        (rather than asserting against whatever settings.photos_enabled
-        happens to be on the machine running the suite, e.g. a Mac with a
-        real Photos library configured) so this pins the False case
-        unconditionally; the next test below forces the True case, so the
-        field can't be silently hardcoded to one value and still pass
-        both."""
+        """The photos_enabled field (web/crm.html's loadCRMConfig() reads
+        it to decide whether to ever request an avatar) must reflect
+        settings.photos_enabled. Forces False explicitly (rather than
+        asserting against whatever settings.photos_enabled happens to be
+        on the machine running the suite, e.g. a Mac with a real Photos
+        library configured) so this pins the False case unconditionally;
+        the next test below forces the True case, so the field can't be
+        silently hardcoded to one value and still pass both."""
         from unittest.mock import patch, PropertyMock
         from config.settings import Settings
 
@@ -89,7 +83,7 @@ class TestPersonEndpoints:
         assert "count" in data
 
     def test_get_people_list_has_profile_photo_field(self, client):
-        """#875: every row must carry `has_profile_photo` as a plain bool, so
+        """Every row must carry `has_profile_photo` as a plain bool, so
         the client can decide whether to request an avatar without probing
         each person first."""
         response = client.get("/api/crm/people?limit=50")
@@ -102,7 +96,7 @@ class TestPersonEndpoints:
             assert isinstance(person["has_profile_photo"], bool)
 
     def test_person_detail_has_profile_photo_matches_list(self, client):
-        """#875: the detail endpoint must agree with the list endpoint for
+        """The detail endpoint must agree with the list endpoint for
         the same person -- both derive `has_profile_photo` from
         `person.photo_count` via the same `_person_to_detail_response`
         helper, so a divergence here would mean one path stopped setting it."""
@@ -116,7 +110,7 @@ class TestPersonEndpoints:
             assert detail.json()["has_profile_photo"] == person["has_profile_photo"]
 
     def test_list_people_never_logs_the_search_query(self, client, caplog):
-        """#904: the search box's contents are personal data (names, partial
+        """The search box's contents are personal data (names, partial
         emails) -- the list handler's own log line must carry counts and
         timing only, never the raw `q` (or other filter values)."""
         distinctive_query = "zzz-synthetic-search-marker-not-a-real-name-9f3c"
@@ -200,15 +194,11 @@ class TestPersonEndpoints:
 
         elapsed = self._warm_latency_ms(client, "/api/crm/people?limit=50&sort=strength")
 
-        # #869/#880 review finding 1: this bound was originally set to 150ms
-        # against a category-computation bug (compute_person_category() was
-        # called with `[]` instead of `None`, silently skipping its
-        # source-entity fallback fetch for the ~40 of every 50 returned
-        # people who don't qualify as "work" via their own email domain).
-        # With that fetch restored (correct behavior) and then batched across
-        # the page in one query (SourceEntityStore.get_for_people_batch(),
-        # #880 follow-up) instead of one query per person, warm latency for
-        # this page is back under 100ms on the real dataset.
+        # compute_person_category()'s source-entity fallback fetch is
+        # batched across the page in one query
+        # (SourceEntityStore.get_for_people_batch()) instead of one query
+        # per person, keeping warm latency for this page under 100ms on the
+        # real dataset.
         assert elapsed < 100
 
     def test_get_people_list_warm_latency_large_db_limit_300(self, client):
@@ -222,30 +212,20 @@ class TestPersonEndpoints:
 
         elapsed = self._warm_latency_ms(client, "/api/crm/people?limit=300&sort=strength")
 
-        # #880 follow-up round: batching the per-page source-entity fetch
-        # into one query (SourceEntityStore.get_for_people_batch()) cut warm
-        # latency here from ~600-1100ms (one SourceEntityStore query per
-        # person, each opening its own connection) to ~200-430ms measured on
-        # the real dataset. A 150ms bound (matching the limit=50 case
-        # proportionally) was requested but is NOT achievable while
-        # preserving exact category semantics: a strength-sorted page of 300
-        # is dominated by the highest-interaction people, many of whom have
-        # 10,000-65,000+ source entities each on this real dataset, and
-        # SQLite has no per-group "top-K" query optimization -- a single
-        # combined query (WHERE IN (...) plus either a window function or a
-        # Python-side group/sort) must fully rank/materialize every matching
-        # row before applying any per-person cap, which is measurably SLOWER
-        # here than 300 individually-bounded queries (confirmed via direct
-        # profiling: a window-function query over the same IDs took longer
-        # than this batched approach, even with a composite index added
-        # experimentally). This batched approach's own per-arm/per-query
-        # overhead (~0.7-0.9ms x 300 people) sets a floor around 200ms that
-        # doesn't move with a smaller per-person cap. See PR #880 discussion
-        # for the full measurement trail and the deeper fix that would be
-        # needed to go lower (e.g. reading the already-persisted
-        # PersonEntity.category field -- refreshed nightly by
-        # update_all_strengths() -- instead of recomputing dynamically on
-        # every list request).
+        # The per-page source-entity fetch is batched into one query
+        # (SourceEntityStore.get_for_people_batch()) rather than one query
+        # per person. A 150ms bound (matching the limit=50 case
+        # proportionally) is not achievable while preserving exact category
+        # semantics: a strength-sorted page of 300 is dominated by the
+        # highest-interaction people, many of whom have 10,000-65,000+
+        # source entities each on this real dataset, and SQLite has no
+        # per-group "top-K" query optimization -- a single combined query
+        # (WHERE IN (...) plus either a window function or a Python-side
+        # group/sort) must fully rank/materialize every matching row before
+        # applying any per-person cap, which is slower here than 300
+        # individually-bounded queries. This batched approach's own
+        # per-arm/per-query overhead (~0.7-0.9ms x 300 people) sets a floor
+        # around 200ms that doesn't move with a smaller per-person cap.
         assert elapsed < 350
 
 
@@ -397,7 +377,7 @@ class TestNetworkGraph:
 
 
 class TestNetworkGraphPruning:
-    """Tests for the bounded/pruned centered neighborhood (#870)."""
+    """Tests for the bounded/pruned centered neighborhood."""
 
     def test_max_nodes_validation(self, client, sample_person_id):
         """max_nodes outside 1..500 is rejected.
@@ -422,7 +402,7 @@ class TestNetworkGraphPruning:
             assert response.status_code == 400
 
     def test_max_edges_validation(self, client, sample_person_id):
-        """max_edges outside 1..20000 is rejected (#896 review finding 2/4)."""
+        """max_edges outside 1..20000 is rejected."""
         for value in (0, 20001):
             response = client.get(
                 f"/api/crm/network?center_on={sample_person_id}&max_edges={value}"
@@ -432,7 +412,7 @@ class TestNetworkGraphPruning:
     def test_edges_bounded_by_max_edges(self, client, sample_person_id):
         """The edge count stays near max_edges — allowing for the fact that
         every centre-touching edge is always included even if there are
-        more first-degree nodes than max_edges (#896 review finding 2/4)."""
+        more first-degree nodes than max_edges."""
         response = client.get(
             f"/api/crm/network?center_on={sample_person_id}&depth=2&max_edges=50"
         )
@@ -454,9 +434,9 @@ class TestNetworkGraphPruning:
     def test_response_reaches_max_nodes_for_a_well_connected_centre(self, client, sample_person_id):
         """A centre with enough direct connections to fill the whole budget
         on its own must actually get max_nodes back, not come back short
-        because the reserved second-degree share went unspent (#896 review
-        round 5, MINOR finding: backfill any leftover deeper-hop budget
-        from the next-strongest direct candidates)."""
+        because the reserved second-degree share went unspent: any leftover
+        deeper-hop budget backfills from the next-strongest direct
+        candidates."""
         from api.services.relationship import get_relationship_store
 
         rel_store = get_relationship_store()
@@ -472,11 +452,9 @@ class TestNetworkGraphPruning:
         """When a center has more first-degree connections than fit, the
         kept set equals the TRUE top-N by rendered edge weight — computed
         independently here from every one of the center's relationship
-        rows, not by calling the endpoint's own ranking helper (#896 review
-        finding 5: the old version of this test compared against
-        RelationshipStore.get_top_neighbors(), the very function the
-        endpoint used to rank candidates, so it could not fail on a wrong
-        ranking). Skips cleanly without the real dataset."""
+        rows, not by calling the endpoint's own ranking helper
+        (RelationshipStore.get_top_neighbors()), so the test can catch a
+        wrong ranking. Skips cleanly without the real dataset."""
         from api.services.relationship import get_relationship_store
         from api.services.person_entity import get_person_entity_store
         from api.routes.crm import _rendered_edge_weight
@@ -564,10 +542,10 @@ class TestNetworkGraphPruning:
         assert response.status_code == 200
 
     def test_allow_full_graph_still_calls_get_all_relationships(self, client, monkeypatch):
-        """The opt-in full-graph path is untouched: it still calls
-        get_all_relationships(). Stubbed to return [] instead of calling the
-        original so this runs in milliseconds rather than materializing the
-        full ~546k-edge graph in memory (#896 review finding 8)."""
+        """The opt-in full-graph path still calls get_all_relationships().
+        Stubbed to return [] instead of calling the original so this runs
+        in milliseconds rather than materializing the full ~546k-edge graph
+        in memory."""
         from api.services.relationship import RelationshipStore
 
         calls = []
@@ -584,11 +562,12 @@ class TestNetworkGraphPruning:
 
 
 class TestNetworkGraphLatency:
-    """Latency regression test for #870 - skips cleanly on a small/fresh dataset."""
+    """Latency test for the centered network endpoint -- skips cleanly on a
+    small/fresh dataset."""
 
     def test_centered_depth2_under_500ms(self, client, sample_person_id):
         """A centered depth=2 request completes in well under 500ms on the
-        production-sized dataset (the pre-#870 endpoint took 10+ seconds)."""
+        production-sized dataset."""
         import time
         from api.services.relationship import get_relationship_store
 
@@ -747,7 +726,7 @@ class TestLinkOverrides:
 
 
 class TestMeInteractionsSpan:
-    """Tests for GET /api/crm/me/interactions/span (#871)."""
+    """Tests for GET /api/crm/me/interactions/span."""
 
     def test_returns_expected_shape(self, client):
         """Contract: earliest/latest (ISO or null) + an integer years,
@@ -766,7 +745,7 @@ class TestMeInteractionsSpan:
 
 class TestMeFamilyLatency:
     """
-    #871 latency acceptance criteria, measured against the real production
+    Latency acceptance criteria, measured against the real production
     dataset. Skip cleanly (rather than fail) when data/crm.db or
     data/interactions.db is absent or small, so the suite still passes on a
     fresh clone with no data/ directory.
@@ -811,9 +790,7 @@ class TestMeFamilyLatency:
 
     def test_me_interactions_3657_days_under_1200ms(self, client):
         """
-        #871's requested bound was 800ms (down from the pre-#871 measured
-        6.4s). Reached via #897 review finding 3's proposed path: the
-        neglected-contacts widget now fetches only (person_id,
+        The neglected-contacts widget fetches only (person_id,
         julianday(timestamp)) — a covering index query, no source_type — and
         the health-score widget fetches only julianday(timestamp), restricted
         to source type, then buckets both with `bisect` in Python instead of
@@ -822,17 +799,12 @@ class TestMeFamilyLatency:
         of the ~455k total interactions on the real dataset — close family
         and friends are, unsurprisingly, the highest-volume contacts).
 
-        Warm latency measured on the real dataset (direct handler calls, 7
-        samples): min 777ms / median 791ms / max 924ms, even on this shared
-        dev host under heavy concurrent load from sibling agents (load
-        average 11-21 during measurement) — down from 3.9-6.4s before this
-        PR's SQL rewrite. The 1200ms bound below (and this test's name,
-        renamed per #897's verification-pass review) carries headroom above
-        that observed max for host contention rather than asserting the
-        literal 800ms target, which this test does not enforce; tighten it
-        if re-measured consistently lower on a quiet host. Best-of-5 samples
-        (like TestPeopleLatency's warm-latency tests), rather than this
-        class's usual best-of-3, to further reduce flakiness from transient
+        The 1200ms bound below carries headroom above measured warm latency
+        for host contention on this shared dev host, rather than asserting
+        a tighter literal target; tighten it if re-measured consistently
+        lower on a quiet host. Best-of-5 samples (like
+        TestPeopleLatency's warm-latency tests), rather than this class's
+        usual best-of-3, to further reduce flakiness from transient
         host-load spikes.
         """
         self._require_large_dataset()

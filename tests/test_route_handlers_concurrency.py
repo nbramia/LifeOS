@@ -1,14 +1,10 @@
 """
-Concurrency regression: a slow CRM request must not stall an unrelated fast
-one (#868).
+A slow CRM request must not stall an unrelated fast one.
 
-Before this fix, every CRM/people handler ran `async def` with no `await`,
-so FastAPI ran it inline on the single event loop instead of dispatching it
-to the worker threadpool. A slow request (a full people-list scan, a
-relationship tone analysis) then blocked every other request on the process
-until it finished — measured on production as a 3 ms request taking 3.4 s
-behind four people-list calls, or 14.1 s behind a tone analysis. The issue's
-acceptance criteria give both scenarios an explicit bound: `GET
+Every CRM/people handler with no `await` runs as a plain `def`, so FastAPI
+dispatches it to the worker threadpool instead of running it inline on the
+single event loop. A slow request (a full people-list scan, a relationship
+tone analysis) must not block other requests on the process: `GET
 /api/crm/config` must complete in under 100 ms while either is in flight.
 
 This builds a router-only app (`FastAPI()` + `include_router(crm_router)`)

@@ -1,15 +1,13 @@
-"""Server-free browser test for the Graph tab's threshold auto-selection
-(#896 review round 3, blocker 1).
+"""Server-free browser test for the Graph tab's threshold auto-selection.
 
-`calculateOptimalEdgeThreshold()` used to pick a threshold that hid every
-first-degree node whenever every first-degree edge shared exactly one
-weight: forcing a minimum weightRange of 1 when maxWeight == minWeight made
-even the first non-zero sweep step (5%) exclude every edge. Bounding the
-returned edge set (#870/#896) made every returned edge cluster into a
-narrower set of weight values, so this pre-existing bug started firing for
-a real, common shape of response instead of a rare one -- a real person's
-Graph tab loaded and immediately showed "No connections match current
-filters" with zero user interaction.
+`calculateOptimalEdgeThreshold()` must not pick a threshold that hides every
+first-degree node when every first-degree edge shares exactly one weight:
+forcing a minimum weightRange of 1 when maxWeight == minWeight must not make
+even the first non-zero sweep step (5%) exclude every edge. This shape
+(every returned edge clustered into a narrow set of weight values) is
+common enough that a real person's Graph tab can hit it, so a wrong
+threshold here means "No connections match current filters" with zero user
+interaction.
 
 Unlike the rest of the browser suite this serves `web/` itself from an
 ephemeral port rather than pointing at a running API, because the
@@ -17,7 +15,7 @@ assertion is about the JS in *this* checkout and every API call the page
 makes is intercepted anyway. That is why it carries no `requires_server`
 marker, and so runs at pre-push (`browser and not requires_server`). Keep
 it that way -- reaching for a live server here would silently drop this
-regression from the push gate.
+case from the push gate.
 """
 import http.server
 import json
@@ -141,7 +139,7 @@ def test_calculate_optimal_edge_threshold_flat_weight_returns_zero(page: Page, c
     assert threshold == 0
 
     # Sanity: a varied weight distribution over the same shape still picks
-    # a non-trivial threshold - the fix isn't just "always return 0".
+    # a non-trivial threshold, not just "always return 0".
     varied_threshold = page.evaluate("""
         () => {
             const links = [];
@@ -155,24 +153,24 @@ def test_calculate_optimal_edge_threshold_flat_weight_returns_zero(page: Page, c
 
 
 # 200 first-degree weights, evenly spread across 9-35 (integers, so some
-# repeat) -- with this many candidates spread this way, the OLD
-# first-degree-only threshold search settles on percent=85 (verified by
-# simulating the algorithm directly), which maps to threshold 9+90*0.85=
-# 85.5 against the full 9-99 range used elsewhere -- excluding every one
-# of these edges (max is 35). The 27-edges-in-a-row fixture used earlier
-# in this file settles on a much lower percent and doesn't reproduce the
-# bug; this distribution is what actually triggers it, matching the
-# reviewer's real-data report (#896 review round 4, MINOR finding 3).
+# repeat). A first-degree-only threshold search over this many candidates
+# spread this way settles on percent=85 (verified by simulating the
+# algorithm directly), which maps to threshold 9+90*0.85=85.5 against the
+# full 9-99 range used elsewhere -- excluding every one of these edges
+# (max is 35). The 27-edges-in-a-row fixture used earlier in this file
+# settles on a much lower percent and doesn't reproduce the case; this
+# distribution is what actually triggers it.
 _DIVERGING_FIRST_DEGREE_WEIGHTS = [round(9 + (35 - 9) * i / 199) for i in range(200)]
 
 
 def _diverging_weight_range_fixture():
     """First-degree edges span 9-35 (200 of them, see above), but a
     second-degree edge in the same response goes up to 99.
-    calculateOptimalEdgeThreshold() used to compute its weight range from
-    first-degree edges only, so the percent it chose could still exclude
-    every first-degree edge once applyGraphFilters() applied that same
-    percent against the FULL edge range."""
+    calculateOptimalEdgeThreshold() must compute its weight range from the
+    full edge set, not first-degree edges only -- otherwise the percent it
+    chose could still exclude every first-degree edge once
+    applyGraphFilters() applied that same percent against the FULL edge
+    range."""
     nodes = [{
         "id": CENTER_ID, "name": "Center", "category": "personal",
         "strength": 50, "interaction_count": 10, "degree": 0,
@@ -291,9 +289,9 @@ def test_apply_graph_filters_falls_back_when_manual_slider_would_blank_the_tab(p
     page.evaluate("(id) => window.loadGraph(id)", CENTER_ID)
     # updateEdgeVisibility debounces applyGraphFilters() by 500ms, so the
     # slider-input handler below doesn't actually run applyGraphFilters()
-    # until ~500ms after the dispatched event - 300ms was too short and
-    # read the pre-change render, silently not exercising the fallback at
-    # all (#896 review round 5 nit). 1200ms gives comfortable margin.
+    # until ~500ms after the dispatched event; too short a wait here reads
+    # the pre-change render and silently skips exercising the fallback at
+    # all. 1200ms gives comfortable margin.
     page.wait_for_timeout(1200)
 
     page.evaluate("""

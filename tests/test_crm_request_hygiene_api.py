@@ -1,4 +1,4 @@
-"""API tests for CRM request hygiene (#874):
+"""API tests for CRM request hygiene:
 
 - `GZipMiddleware` is scoped to `/api/crm/*`, `/api/people/*`, and the CRM
   page routes (`/crm`, `/me`, `/family`, `/birthdays`, `/relationship`, and
@@ -140,10 +140,10 @@ class TestGzipScoping:
 
     def test_chat_stream_route_is_never_gzipped(self, client):
         """The SSE chat endpoint sits outside every gzip-scoped prefix, so
-        this middleware never touches it — belt-and-suspenders alongside
-        Starlette's own refusal to compress `text/event-stream` responses
-        at all (`DEFAULT_EXCLUDED_CONTENT_TYPES` in
-        `starlette.middleware.gzip`, independent of this app's scoping)."""
+        this middleware never touches it. Starlette also refuses to
+        compress `text/event-stream` responses at all
+        (`DEFAULT_EXCLUDED_CONTENT_TYPES` in `starlette.middleware.gzip`,
+        independent of this app's scoping)."""
         with patch('api.routes.chat.VectorStore') as mock_vs:
             mock_vs.return_value.search.return_value = []
             with patch('api.routes.chat.get_synthesizer') as mock_synth:
@@ -163,7 +163,7 @@ class TestGzipScoping:
 
 class TestCrmPageCacheControl:
     """Page routes serving crm.html send a short revalidation Cache-Control
-    and honor If-None-Match with a 304 (#874)."""
+    and honor If-None-Match with a 304."""
 
     pytestmark = pytest.mark.slow
 

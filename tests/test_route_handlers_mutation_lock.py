@@ -1,18 +1,15 @@
 """
-Concurrent merges must serialize (#868 review finding 3).
+Concurrent merges must serialize.
 
-Converting the CRM/people/photos handlers from `async def` with no `await`
-to plain `def` (#868) restored fairness by dispatching them to the worker
-threadpool instead of running them start-to-finish inline on the event
-loop — but that inline run was also, incidentally, every mutating
-handler's only serialization against every other request. `merge_people`
-delegates to `scripts/merge_people.merge_people`, which keeps a single
-global merge-intent log and does a read-modify-write of the merged-ids
-file; two concurrent merges interleaving there can corrupt that
-bookkeeping. `api/routes/crm.py` now holds `_mutation_lock` (a module-level
-`threading.Lock`) across `merge_people` and the other write handlers named
-in the review (split, hide, review-queue confirm/reject, the sync-trigger
-POSTs) to restore that serialization explicitly.
+`merge_people` delegates to `scripts/merge_people.merge_people`, which
+keeps a single global merge-intent log and does a read-modify-write of the
+merged-ids file; two concurrent merges interleaving there can corrupt that
+bookkeeping. `api/routes/crm.py` holds `_mutation_lock` (a module-level
+`threading.Lock`) across `merge_people` and the other write handlers
+(split, hide, review-queue confirm/reject, the sync-trigger POSTs) to
+serialize them explicitly, since the CRM/people/photos handlers run as
+plain `def` dispatched to the worker threadpool rather than start-to-finish
+inline on the event loop.
 
 This test proves the lock actually works: it patches the merge function
 `merge_people` calls (`scripts.merge_people.merge_people`, imported locally

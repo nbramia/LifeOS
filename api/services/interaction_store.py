@@ -795,8 +795,8 @@ class InteractionStore:
         stale months -- rather than a capped, newest-first sample that
         silently truncates the oldest months once total volume exceeds the
         cap (worse, that truncation point drifts with every new message, so
-        an old month's apparent count kept changing even though nothing
-        about that month did -- #899 review finding 5). For a cheap
+        an old month's apparent count would keep changing even though
+        nothing about that month did). For a cheap
         freshness *count* check that must not pay the cost of loading every
         row, see get_monthly_interaction_counts_in_range() below.
 
@@ -848,10 +848,9 @@ class InteractionStore:
         every interaction just to compare counts: CRM tone analysis
         (api/routes/crm.py) calls this first on every request, and only
         falls through to the row-loading get_for_person_in_range() when at
-        least one month is actually stale -- a fully-cached response used
-        to take ~0.3s on a heavy relationship because it loaded and
-        bucketed every row in the window just to compute a count comparison
-        (#899 review finding N1).
+        least one month is actually stale -- loading and bucketing every
+        row in the window on a heavy relationship just to compute a count
+        comparison is expensive even when the response is fully cached.
 
         Month grouping relies on every `timestamp` being stored with a
         `+00:00` offset (true for every writer in this codebase today,
@@ -863,8 +862,8 @@ class InteractionStore:
         (`api/routes/crm.py`'s `_bucket_interactions_by_month_and_week`)
         mirrors that by converting to UTC itself (`dt.astimezone(timezone.utc)`)
         rather than trusting `dt`'s own offset, so the two sides agree even
-        if a row were ever stored with a non-UTC offset (#899 review,
-        second pass, nit 1) -- see `test_month_grouping_is_utc_normalized...`
+        if a row were ever stored with a non-UTC offset -- see
+        `test_month_grouping_is_utc_normalized...`
         in tests/test_interaction_store.py, which pins this directly rather
         than relying on production data happening to already be UTC.
 
@@ -1201,7 +1200,7 @@ class InteractionStore:
         finally:
             conn.close()
 
-    # ---- Aggregate queries for the Me/Family dashboards (#871) ----
+    # ---- Aggregate queries for the Me/Family dashboards ----
     #
     # These return plain tuples/dicts instead of hydrated Interaction objects,
     # so a 10-year dashboard window doesn't require constructing (and
@@ -1249,28 +1248,21 @@ class InteractionStore:
         precision window (`exact=True`) that must still be clipped to a
         wider day-granular "pool" — e.g. a trend-period comparison whose
         window can be longer than half of the dashboard's own `days_back`.
-        The original Python implementation combined exactly these two
-        things: an outer `all_interactions` fetch bounded to `days_back`
-        (day-string, matching `get_all_in_range`), then a precise per-item
-        comparison within it — so a trend window that reached further back
-        than `days_back` was silently clipped by the outer fetch. Passing
-        only `start_date`/`end_date` with `exact=True` does NOT reproduce
-        that clipping (its own bound is a same-or-wider index-narrowing
-        margin around the exact window, not the outer pool), which is what
-        made `warming`/`cooling` diverge from the original whenever
-        `2 * trend_days > days_back` (#897 review finding 1).
+        Passing only `start_date`/`end_date` with `exact=True` does NOT
+        bound the result to `days_back`: its own margin is a same-or-wider
+        index-narrowing window around the exact bound, not the day-granular
+        pool. Whenever `2 * trend_days > days_back`, that margin extends
+        further back than `days_back`, so `pool_start_date`/`pool_end_date`
+        must be passed explicitly to keep `warming`/`cooling` bounded to
+        the intended pool.
 
         Note on the end-date convention (day-string bounds, `pool_end_date`
         included): comparing an ISO timestamp string (`...T23:59:59+00:00`)
         against `'<end> 23:59:59'` (a space, not `T`, before the time)
         lexically excludes every row dated exactly on `end_date`'s calendar
         day — `'T' > ' '` in ASCII, so any same-day row sorts as "greater
-        than" the bound. This is `get_all_in_range`'s existing convention
-        (unchanged by this method), not something introduced here; the
-        practical effect is that a window's own end day never contributes
-        to the non-`exact` aggregates. Fixing it is out of scope for this
-        change (#897 review finding 8) — noted so the next reader doesn't
-        trust the boundary as exact.
+        than" the bound. A window's own end day never contributes to the
+        non-`exact` aggregates; do not treat this boundary as exact.
         """
         clauses: list[str] = []
         params: list = []
@@ -1320,8 +1312,8 @@ class InteractionStore:
             params.extend(types)
 
         if gmail_sent_only:
-            # Matches the "Me" dashboard's historical rule of only counting
-            # sent email (title prefix "→ "), never received/cc'd email.
+            # Matches the "Me" dashboard's rule: counts only sent email
+            # (title prefix "→ "), never received/cc'd email.
             clauses.append("(source_type != 'gmail' OR title LIKE '→%')")
 
         return (" AND ".join(clauses) if clauses else "1=1"), params
@@ -1386,9 +1378,9 @@ class InteractionStore:
 
         `day` is the literal "YYYY-MM-DD" prefix of the stored timestamp
         string (via `substr`, not SQLite's `date()`, which would convert to
-        UTC first) — this matches the historical behavior of parsing the ISO
-        string into an aware datetime and formatting its own date fields
-        as-is, which never shifts across the stored offset.
+        UTC first) — this matches parsing the ISO string into an aware
+        datetime and formatting its own date fields as-is, which never
+        shifts across the stored offset.
         """
         where, params = self._range_predicate(
             start_date, end_date, person_ids, exclude_person_ids, source_types, gmail_sent_only,
@@ -1618,8 +1610,8 @@ class InteractionStore:
         Julian day number for a given datetime, computed the same way
         SQLite's julianday() computes it for a UTC or UTC-offset ISO8601
         string (days since the Julian epoch, with 1970-01-01T00:00:00Z =
-        2440587.5) — avoids opening a connection to evaluate one scalar
-        (#897 review nit 3). A naive dt is treated as UTC, matching
+        2440587.5) — avoids opening a connection to evaluate one scalar.
+        A naive dt is treated as UTC, matching
         SQLite's own treatment of an offset-less timestamp string.
         """
         if dt.tzinfo is None:
@@ -2106,10 +2098,10 @@ class InteractionStore:
 
 # Singleton instance
 _interaction_store: Optional[InteractionStore] = None
-# #868 moved CRM/people/photos handlers off the event loop and onto worker
-# threads, so two first-requests after a restart can now race this
-# check-and-set. Double-checked locking: the lock is only taken while
-# _interaction_store is still None, so it costs nothing once constructed.
+# CRM/people/photos handlers run on worker threads, not the event loop, so
+# two first-requests after a restart can race this check-and-set.
+# Double-checked locking: the lock is only taken while _interaction_store
+# is still None, so it costs nothing once constructed.
 _interaction_store_lock = threading.Lock()
 
 

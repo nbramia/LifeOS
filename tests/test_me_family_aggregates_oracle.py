@@ -1,36 +1,34 @@
 """
-Oracle tests for #871: the Me/Family dashboard handlers were rewritten to
-aggregate interactions in SQL instead of hydrating every interaction in the
-window into a Python object and looping over them.
+Oracle tests for the Me/Family dashboard handlers, which aggregate
+interactions in SQL rather than hydrating every interaction in the window
+into a Python object and looping over them.
 
-Each oracle function below is the pre-#871 algorithm, copied verbatim from
-`api/routes/crm.py` (only variable sourcing was changed: stores are passed in
-as parameters instead of being fetched at module scope), operating on the
-SAME real store methods the new handlers still use for fetching
-(`get_all_in_range`, `get_all`, `get_first_interaction_dates` are unchanged
-by #871). Running both the oracle and the actual endpoint against the same
-synthetic SQLite-backed stores and comparing their output is the strongest
-available guarantee that the SQL rewrite preserves exact behavior.
+Each oracle function below is an independent per-item Python implementation
+of the same aggregation, copied from `api/routes/crm.py` with only its
+store-parameter wiring changed (stores are passed in as parameters instead
+of being fetched at module scope). It operates on the SAME real store
+methods the SQL handlers use for fetching (`get_all_in_range`, `get_all`,
+`get_first_interaction_dates`). Running both the oracle and the actual
+endpoint against the same synthetic SQLite-backed stores and comparing
+their output is the strongest available guarantee that the SQL aggregation
+matches a straightforward per-item computation.
 
-One deliberate exception: `oracle_me_interactions`'s "Build messaging list"
-block renames its per-month `by_circle` local to `by_circle_m`. The original
-code reused the bare name `by_circle` there, silently shadowing the
-response-level `by_circle` dict computed earlier in the same function — so
-production's `/me/interactions` `by_circle` field (and the Me page's "By
-Dunbar Circle" chart, which renders it) was actually showing whatever the
-LAST processed messaging month's iMessage/WhatsApp-only breakdown happened to
-be, not the true full-window, all-sources total the field is documented to
-be. This oracle intentionally reproduces the CORRECT (fixed) behavior — see
-the matching fix and comment in `get_me_interactions()` — so this test
-verifies the fix rather than pinning the bug.
+One deliberate difference: `oracle_me_interactions`'s "Build messaging
+list" block renames its per-month `by_circle` local to `by_circle_m`, since
+the bare name `by_circle` would silently shadow the response-level
+`by_circle` dict computed earlier in the same function -- production's
+`/me/interactions` `by_circle` field (and the Me page's "By Dunbar Circle"
+chart, which renders it) must reflect the true full-window, all-sources
+total, not just the last processed messaging month's iMessage/
+WhatsApp-only breakdown.
 
-List-valued fields that the real code explicitly sorts by count (top_contacts,
-warming, cooling) are compared as sets of dicts rather than ordered lists:
-ties in count are broken by iteration order over a dict, which isn't
-guaranteed identical between hydrating interactions one-by-one (old) and a
-SQL GROUP BY (new) — so the synthetic dataset below gives every compared
-person a distinct count, and the set comparison is a belt-and-suspenders
-safety net on top of that.
+List-valued fields that the real code explicitly sorts by count
+(top_contacts, warming, cooling) are compared as sets of dicts rather than
+ordered lists: ties in count are broken by iteration order over a dict,
+which isn't guaranteed identical between a per-item Python loop and a SQL
+GROUP BY -- so the synthetic dataset below gives every compared person a
+distinct count, and the set comparison is a defensive check on top of
+that.
 """
 import uuid
 from collections import defaultdict
@@ -54,14 +52,14 @@ MY_PERSON_ID = "oracle-self"
 
 
 # ============================================================================
-# Oracle: pre-#871 /me/interactions algorithm
+# Oracle: independent /me/interactions algorithm
 # ============================================================================
 
 def oracle_me_interactions(
     interaction_store, person_store, my_person_id, days_back=365,
     trend_period="quarter", health_period="quarter",
 ):
-    """Verbatim copy of the pre-#871 get_me_interactions() body."""
+    """Independent per-item implementation of get_me_interactions()'s aggregation."""
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
@@ -383,14 +381,14 @@ def oracle_me_interactions(
 
 
 # ============================================================================
-# Oracle: pre-#871 /family/interactions algorithm
+# Oracle: independent /family/interactions algorithm
 # ============================================================================
 
 def oracle_family_interactions(
     interaction_store, person_store, my_person_id, selected_ids,
     days_back=365, trend_period="quarter", health_period="quarter",
 ):
-    """Verbatim copy of the pre-#871 get_family_interactions() body."""
+    """Independent per-item implementation of get_family_interactions()'s aggregation."""
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
@@ -650,16 +648,16 @@ def _seed_synthetic_dataset(istore, pstore):
     # P_OLD_FRIEND: personal, circle 4 — interactions older than 365 days,
     # so a trend_period="year" window (previous bucket 365-730 days ago)
     # reaching further back than a days_back=365 pool must NOT surface them
-    # (#897 review finding 1's exact repro case: 2 * trend_days > days_back).
+    # (2 * trend_days > days_back).
     _add_person(pstore, "p-old-friend", "Old Friend", category="personal", circle=4, strength=30)
     for days_ago in (400, 420, 450):
         _add_interaction(istore, "p-old-friend", days_ago=days_ago, source_type="imessage")
 
-    # A "today" interaction, to pin the pre-existing end-date exclusion
-    # quirk (#897 review finding 8): the day-string `<=` bound against
-    # `'<end> 23:59:59'` lexically excludes any row dated exactly on the
-    # end day, so this must never show up in daily/top_contacts/trend
-    # output even though it's within every window tested here.
+    # A "today" interaction, to pin the end-date exclusion quirk: the
+    # day-string `<=` bound against `'<end> 23:59:59'` lexically excludes
+    # any row dated exactly on the end day, so this must never show up in
+    # daily/top_contacts/trend output even though it's within every window
+    # tested here.
     _add_interaction(istore, "p-healthy", days_ago=0, source_type="imessage")
 
 
@@ -697,12 +695,10 @@ class TestMeInteractionsOracle:
         _assert_me_interactions_matches_oracle(result, expected)
 
     def test_matches_oracle_when_trend_window_exceeds_days_back_quarter(self, monkeypatch, stores):
-        """#897 review finding 1: days_back=30 with the default
-        trend_period="quarter" (90-day trend windows) means
-        2 * trend_days (180) > days_back (30) — the trend/top-contact
-        queries must clip to the days_back pool exactly like the original
-        Python implementation's `all_interactions` fetch did, not reach
-        further back than days_back on their own."""
+        """days_back=30 with the default trend_period="quarter" (90-day
+        trend windows) means 2 * trend_days (180) > days_back (30) — the
+        trend/top-contact queries must clip to the days_back pool, not
+        reach further back than days_back on their own."""
         istore, pstore = stores
         _seed_synthetic_dataset(istore, pstore)
 
@@ -717,23 +713,21 @@ class TestMeInteractionsOracle:
 
         _assert_me_interactions_matches_oracle(result, expected)
         # p-friend's "previous" trend interactions (100-140 days ago) exist
-        # but are outside the 30-day pool, so they must not count — without
-        # the pool clamp, previous_count would be 5 (cooling); clamped,
-        # it's 0 (warming, since the pool's own 2 recent-window rows still
-        # count). A regression here would mean either the test dataset
-        # stopped exercising the clamp, or the clamp itself broke.
+        # but are outside the 30-day pool, so they must not count: with the
+        # pool clamp applied, previous_count is 0 (warming, since the
+        # pool's own 2 recent-window rows still count) rather than 5
+        # (cooling).
         friend_warming = next((w for w in result.warming if w.person_id == "p-friend"), None)
         assert friend_warming is not None, "p-friend should warm once the 90-180 day pool is clipped away"
         assert friend_warming.previous_count == 0
         assert not any(c.person_id == "p-friend" for c in result.cooling)
 
     def test_matches_oracle_when_trend_window_exceeds_days_back_year(self, monkeypatch, stores):
-        """#897 review finding 1's exact reproduction: days_back=365 with
-        trend_period="year" (365-day trend windows) means
-        2 * trend_days (730) > days_back (365) — the "previous" bucket
-        would otherwise reach back to 730 days and pick up p-old-friend's
-        400-450-day-old interactions, which the original algorithm's
-        365-day-bounded pool never contained."""
+        """days_back=365 with trend_period="year" (365-day trend windows)
+        means 2 * trend_days (730) > days_back (365) — the "previous"
+        bucket must clip to the days_back=365-bounded pool, not reach back
+        to 730 days and pick up p-old-friend's 400-450-day-old
+        interactions."""
         istore, pstore = stores
         _seed_synthetic_dataset(istore, pstore)
 
@@ -885,11 +879,9 @@ class TestFamilyInteractionsOracle:
         _assert_family_interactions_matches_oracle(result, expected)
 
     def test_matches_oracle_when_trend_window_exceeds_days_back(self, monkeypatch, stores):
-        """#897 review finding 1 also applies to /family/interactions: a
-        trend window longer than half of days_back must clip to the
-        days_back pool, matching the original algorithm's `all_interactions`
-        fetch (bounded to days_back) rather than reaching further back on
-        its own."""
+        """For /family/interactions too, a trend window longer than half of
+        days_back must clip to the days_back pool rather than reaching
+        further back on its own."""
         istore, pstore = stores
         _seed_synthetic_dataset(istore, pstore)
         selected_ids = ["p-friend", "p-old-friend"]
@@ -944,10 +936,9 @@ class TestFamilyInteractionsOracle:
 
 class TestFamilyTimeline:
     """
-    #871's family/timeline acceptance criterion: filter by person_id IN (...)
-    in SQL rather than loading every interaction in the window and filtering
-    in Python. These use the same synthetic dataset as the aggregate oracle
-    tests above.
+    /family/timeline filters by person_id IN (...) in SQL rather than loading
+    every interaction in the window and filtering in Python. These use the
+    same synthetic dataset as the aggregate oracle tests above.
     """
 
     def test_restricts_to_selected_ids_via_sql(self, monkeypatch, stores):
@@ -961,7 +952,7 @@ class TestFamilyTimeline:
         # This call and test_excludes_non_selected_people()'s below share the
         # exact same parameters against the same seeded dataset shape -- they
         # only get independent results because the CRM aggregate response
-        # cache (#917) is cleared between every test (autouse
+        # cache is cleared between every test (autouse
         # reset_aggregate_cache() in tests/reset_singletons.py), not because
         # anything here makes the calls distinguishable to it.
         result = get_family_timeline(person_ids="p-close", source_type=None, days_back=365, date=None, offset=0, limit=100)

@@ -18,9 +18,9 @@ from api.routes.crm import MY_PERSON_ID
 class TestMeStatsEndpoint:
     """Tests for GET /api/crm/me/stats endpoint.
 
-    #871 replaced the "load every PersonEntity and sum in Python" approach
-    with a single SQL SUM (PersonEntityStore.get_totals()), so these mock the
-    new method's return value instead of get_all().
+    The endpoint sums totals via a single SQL SUM
+    (PersonEntityStore.get_totals()), so these mock that method's return
+    value.
     """
 
     @pytest.fixture
@@ -73,19 +73,16 @@ class TestMeStatsEndpoint:
 class TestMeInteractionsEndpoint:
     """Tests for GET /api/crm/me/interactions endpoint (aggregated data).
 
-    #871 moved the heatmap/breakdown/by_circle/messaging aggregation from a
-    Python loop over every hydrated Interaction in the window to a single SQL
-    GROUP BY query (get_daily_person_source_counts, grouped by day + person +
-    source and filtered in Python instead of via a SQL exclude list — see
-    that method's docstring for why). #897's review follow-up moved the
-    health-score and neglected-contacts widgets to SQL too:
-    get_bucketed_counts (a CASE-per-bucket SUM, replacing a fetch +
-    _bucket_counts_by_period) and get_person_julianday_timestamps (a
-    covering person_id+timestamp query, replacing get_person_timestamps).
-    These tests mock those new methods directly; full correctness of the
-    aggregation math itself (identical output to the pre-#871
-    implementation) is covered by the oracle tests in
-    tests/test_me_family_aggregates_oracle.py against a real synthetic DB.
+    The heatmap/breakdown/by_circle/messaging aggregation runs as a single
+    SQL GROUP BY query (get_daily_person_source_counts, grouped by day +
+    person + source and filtered in Python instead of via a SQL exclude
+    list — see that method's docstring for why). The health-score and
+    neglected-contacts widgets run in SQL too: get_bucketed_counts (a
+    CASE-per-bucket SUM) and get_person_julianday_timestamps (a covering
+    person_id+timestamp query). These tests mock those methods directly;
+    full correctness of the aggregation math itself is covered by the oracle
+    tests in tests/test_me_family_aggregates_oracle.py against a real
+    synthetic DB.
     """
 
     @pytest.fixture
@@ -206,9 +203,9 @@ class TestMeInteractionsEndpoint:
 
     def test_get_all_not_called_more_than_once(self, mock_stores):
         """None of the Me handlers may call the load-all-people store method
-        more than once per request (#871 acceptance criterion).
+        more than once per request.
 
-        Asserts exactly 1, not <= 1: the CRM aggregate response cache (#917)
+        Asserts exactly 1, not <= 1: the CRM aggregate response cache
         sits outside these mocked stores and is cleared before every test
         (see reset_aggregate_cache() in tests/reset_singletons.py), so a hit
         (0 calls) is not a possibility here -- `== 1` still distinguishes

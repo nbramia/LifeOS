@@ -54,18 +54,14 @@ router = APIRouter(prefix="/api/crm", tags=["crm"])
 
 # Serializes the mutating handlers below (merge, split, hide, review-queue
 # confirm/reject, and the sync-trigger POSTs — plus photos.py's own sync
-# trigger, which imports this lock).  #868 converted these from `async def`
-# with no `await` to plain `def`, which restores fairness by dispatching
-# them to the worker threadpool instead of running them start-to-finish
-# inline on the event loop — but that inline run was also, incidentally,
-# every mutating handler's only serialization against every other request.
-# Off the loop, two of these can now genuinely interleave; several
-# (`merge_people` in particular, via `scripts/merge_people.py`'s single
-# global intent log and merged-id read-modify-write) are not safe under
-# that interleaving. This is a single coarse lock rather than one per
-# handler because they can mutate overlapping state (a merge and a split
-# both touch person_store); a single-user host pays essentially nothing for
-# serializing writes that used to be serialized anyway.
+# trigger, which imports this lock). These handlers run on the worker
+# threadpool rather than the event loop, so two of them can genuinely
+# interleave; several (`merge_people` in particular, via
+# `scripts/merge_people.py`'s single global intent log and merged-id
+# read-modify-write) are not safe under that interleaving. A single coarse
+# lock rather than one per handler, because they can mutate overlapping
+# state (a merge and a split both touch person_store); a single-user host
+# pays essentially nothing for serializing these writes.
 _mutation_lock = threading.Lock()
 
 # Work email domain for category detection (loaded from settings)
@@ -96,8 +92,8 @@ def _me_exclude_ids(person_store, all_people: Optional[list] = None) -> list[str
     `is_peripheral_contact = 1` query — the lightweight path
     /me/interactions/span uses to stay well under its own latency budget.
     Merged-secondary ids are normally already hidden (merge_people.py sets
-    hidden=1 on the secondary), so including them here is mostly a
-    defensive belt-and-suspenders exclusion (#897 review finding 6).
+    hidden=1 on the secondary); including them here is a defensive
+    exclusion for the case where they aren't.
     """
     hidden_ids = person_store.get_hidden_ids()
     if all_people is not None:
@@ -641,8 +637,7 @@ class CRMConfigResponse(BaseModel):
     # GET /api/photos/stats, which runs several full-library aggregate
     # queries when Photos *is* configured). The client uses this to decide
     # whether to request avatar/profile photos at all, so a Photos-less
-    # install never issues a request that would otherwise 503 (#875, #907
-    # review finding 2).
+    # install never issues a request that would otherwise 503.
     photos_enabled: bool = False
 
 
@@ -753,8 +748,7 @@ def _people_cache_eligible(kwargs: dict) -> bool:
     (no search text, a bounded page size) is worth caching -- a per-keystroke
     search query or a `limit=10000` export is requested once and never
     again, so caching it only spends memory and a measurable
-    jsonable_encoder()/json.dumps() pass on every miss for no reuse (#917
-    review finding 6)."""
+    jsonable_encoder()/json.dumps() pass on every miss for no reuse."""
     return not kwargs.get("q") and kwargs.get("limit", 50) <= 300
 
 
@@ -878,7 +872,7 @@ def list_people(
         has_more=has_more,
     )
 
-    # #904: never log the raw search text or other filter values here -- the
+    # Never log the raw search text or other filter values here -- the
     # CRM search box's contents (names, partial emails) are personal data.
     # Counts and timing only.
     elapsed = (time.time() - start_time) * 1000
@@ -2455,7 +2449,7 @@ def sync_source(source_type: str):
     Trigger a sync for a specific data source.
     """
     with _mutation_lock:
-        # WhatsApp has no standalone nightly sync of its own (issue #784) — its
+        # WhatsApp has no standalone nightly sync of its own -- its
         # data is imported as part of the combined apple_import step, so a
         # WhatsApp entry here belongs at the same (currently stub, see TODO
         # below) parity level as gmail/imessage/linkedin, not below it.
@@ -2552,8 +2546,7 @@ def _rendered_edge_weight(
     Relationship row's own person_a_id/person_b_id can be a legacy
     (merged-away) id, and `people_by_id` must be keyed by canonical id (e.g.
     `PersonEntityStore.get_all()`) or the "other person" lookup silently
-    misses and falls back to pair_strength (#896 review finding 1 — this is
-    the exact bug that made one real edge's weight 90 before vs 96 after).
+    misses and falls back to pair_strength.
     """
     if a_canonical == my_person_id or b_canonical == my_person_id:
         other_canonical = b_canonical if a_canonical == my_person_id else a_canonical
@@ -2669,15 +2662,14 @@ def get_network_graph(
     # Map person_id -> degree (distance from center); center_edges maps a
     # first-degree canonical id to the exact Relationship row that selected
     # it, so the center-to-first-degree edges never depend on get_edges_among
-    # re-finding them by id (#896 review finding 1).
+    # re-finding them by id.
     node_degrees: dict[str, int] = {}
     center_edges: dict[str, Relationship] = {}
 
-    # #880: cached and cheap. Also serves as the canonical-id-keyed strength
-    # lookup used to rank first-degree candidates by the real rendered edge
-    # weight (finding 5), and as the final node-building/edge-weight lookup
-    # (already canonical-keyed, so no separate batch-by-id call is needed —
-    # finding 1's third consequence was exactly a requested-id-keyed dict).
+    # Cached and cheap. Canonical-id-keyed, so it serves both as the
+    # strength lookup used to rank first-degree candidates by the real
+    # rendered edge weight, and as the final node-building/edge-weight
+    # lookup with no separate batch-by-id call needed.
     all_people_dict = {p.id: p for p in person_store.get_all()}
 
     my_person_id = person_store.get_canonical_id(settings.my_person_id)
@@ -2690,8 +2682,7 @@ def get_network_graph(
         # person (get_by_id() above already followed the merge chain to
         # fetch it) - without this, `all_people_dict` (canonical-keyed)
         # never has an entry for the raw requested id, so the center
-        # silently drops out of the response even though it "exists"
-        # (#896 review round 3, not-verified note).
+        # would silently drop out of the response even though it "exists".
         center_on = center_person.id
 
         # Exclude the CRM owner from 2nd+ degree traversal since they're
@@ -2703,16 +2694,15 @@ def get_network_graph(
         # Ids whose category match was already confirmed during selection
         # (via compute_person_category, possibly with batched source
         # entities) - the node-building filter below trusts these instead
-        # of re-checking with a cheaper/different computation, which is
-        # what let a node be selected under one category decision and then
-        # dropped (or kept) under a different one (#896 review round 3
-        # finding 5).
+        # of re-checking with a cheaper/different computation, which could
+        # select a node under one category decision and then drop (or
+        # keep) it under a different one.
         category_confirmed_ids: set[str] = set()
 
         # depth == 1 has no deeper tier, so first-degree gets the full
         # remaining budget; depth >= 2 reserves ~25% of max_nodes for
         # second-(and deeper-)degree hops instead of consuming the whole
-        # budget on first-degree alone (#896 review finding 3).
+        # budget on first-degree alone.
         first_degree_limit = 0
         if max_nodes > 1:
             first_degree_limit = (max_nodes - 1) if depth < 2 else max(1, int(max_nodes * 0.75))
@@ -2722,16 +2712,16 @@ def get_network_graph(
         # first_degree_limit cut) - used both to rank first-degree
         # candidates and, after selection, to relabel any node that has a
         # genuine direct center relationship as degree 1 even if it was
-        # only re-discovered through a friend (#896 review round 3
-        # finding 4: capping first-degree selection means a real direct
-        # connection can miss the cut and re-enter as a "second-degree"
-        # node, which is misleading and makes the degree filter lie).
+        # only re-discovered through a friend. Capping first-degree
+        # selection alone would let a real direct connection miss the cut
+        # and re-enter as a "second-degree" node, which would be
+        # misleading and make the degree filter lie.
         all_direct_candidates: dict[str, Relationship] = {}
         # The full ranked (and, if category is set, category-filtered) list
         # of direct candidates first-degree selection drew from - kept so
         # any part of the deeper-hop budget that goes unspent can be
         # backfilled from the next-strongest direct candidates instead of
-        # coming back under max_nodes (#896 review round 5, MINOR finding).
+        # coming back under max_nodes.
         selection_pool: list[tuple[str, Relationship]] = []
 
         with contextlib.closing(rel_store.open_connection()) as conn:
@@ -2740,7 +2730,7 @@ def get_network_graph(
 
                 # Canonicalise every neighbor id and de-dup, keeping the
                 # higher-weight relationship row when more than one raw row
-                # resolves to the same canonical id (#896 finding 1).
+                # resolves to the same canonical id.
                 for rel in raw_rels:
                     other_raw = rel.other_person(center_on)
                     if not other_raw:
@@ -2759,7 +2749,7 @@ def get_network_graph(
                     all_direct_candidates[other_canonical] = rel
 
                 # Rank by the real rendered edge weight (not a proxy),
-                # deterministic tiebreak by canonical id (#896 finding 5/9).
+                # deterministic tiebreak by canonical id.
                 ranked = sorted(
                     all_direct_candidates.items(),
                     key=lambda kv: (
@@ -2773,10 +2763,10 @@ def get_network_graph(
                     # candidates, compute categories via one batched
                     # source-entity fetch (same pattern as GET /people),
                     # filter, then take the top first_degree_limit of the
-                    # still-ranked survivors (#896 finding 6). Every id that
-                    # passes is recorded so the node-building filter below
-                    # trusts this decision instead of re-deriving a
-                    # possibly different one (#896 review round 3 finding 5).
+                    # still-ranked survivors. Every id that passes is
+                    # recorded so the node-building filter below trusts
+                    # this decision instead of re-deriving a possibly
+                    # different one.
                     window = ranked[:min(len(ranked), 3 * max_nodes)]
                     source_store = get_source_entity_store()
                     cat_sources_by_id = source_store.get_for_people_batch(
@@ -2832,10 +2822,10 @@ def get_network_graph(
                             # second-degree people instead of being spent
                             # (and then immediately relabeled back to
                             # degree 1 below) on centre connections that
-                            # merely missed the first-degree cut (#896
-                            # review round 4, MAJOR finding: this reclaimed
-                            # the whole reserved budget for dense centres,
-                            # collapsing the second-degree tier again).
+                            # merely missed the first-degree cut. Without
+                            # this skip, a dense centre's reserved budget
+                            # would be reclaimed entirely, collapsing the
+                            # second-degree tier.
                             continue
                         if category:
                             # Cheap best-effort check (no batched
@@ -2849,12 +2839,12 @@ def get_network_graph(
                 frontier = next_frontier
 
         # A node that has a genuine direct relationship to the center is
-        # relabeled degree 1 even if it was only added above via a friend
-        # (#896 review round 3 finding 4) - and gets its guaranteed center
-        # edge, same as any other first-degree node. The skip above means
-        # this shouldn't fire in practice any more (a direct candidate is
-        # never added as a deeper-hop node in the first place), but it's
-        # kept as a correctness backstop rather than relied upon.
+        # relabeled degree 1 even if it was only added above via a friend,
+        # and gets its guaranteed center edge, same as any other
+        # first-degree node. The skip above means this shouldn't fire in
+        # practice (a direct candidate is never added as a deeper-hop node
+        # in the first place), but it's kept as a correctness backstop
+        # rather than relied upon.
         for node_id, rel in all_direct_candidates.items():
             if node_degrees.get(node_id, 0) > 1:
                 node_degrees[node_id] = 1
@@ -2865,10 +2855,9 @@ def get_network_graph(
         # friends-of-friends once direct connections are excluded from it
         # above), so backfill any leftover slots with the next-strongest
         # direct candidates that missed the first-degree cut - they're
-        # real first-degree people, and every prior version of this
-        # endpoint showed them. Without this, a dense centre's response
-        # came back well under max_nodes even though its own network had
-        # more to show (#896 review round 5, MINOR finding).
+        # real first-degree people. Without this, a dense centre's
+        # response would come back well under max_nodes even though its
+        # own network has more to show.
         if len(node_degrees) < max_nodes and len(selection_pool) > first_degree_limit:
             for canonical_other, rel in selection_pool[first_degree_limit:]:
                 if len(node_degrees) >= max_nodes:
@@ -2878,7 +2867,7 @@ def get_network_graph(
                 node_degrees[canonical_other] = 1
                 center_edges[canonical_other] = rel
     else:
-        # Get all people (no center, all are degree 1) - unchanged full-graph path.
+        # Get all people (no center, all are degree 1) - the full-graph path.
         node_degrees = {p.id: 1 for p in all_people_dict.values()}
 
     # Filter by category and strength, then build nodes. category_confirmed_ids
@@ -2895,10 +2884,10 @@ def get_network_graph(
         # The exact category this node will be labeled with - also the
         # single predicate used for the filter below, so a node can never
         # be selected under one category decision and dropped (or kept)
-        # under a different one (#896 review round 3 finding 5). An id
-        # already confirmed during selection (possibly via a batched,
-        # more-accurate source-entity lookup) is trusted as-is instead of
-        # being re-derived from this cheaper per-node call.
+        # under a different one. An id already confirmed during selection
+        # (possibly via a batched, more-accurate source-entity lookup) is
+        # trusted as-is instead of being re-derived from this cheaper
+        # per-node call.
         computed_category = compute_person_category(person, [])
         if category and person_id not in category_confirmed_ids and computed_category != category:
             continue
@@ -2925,11 +2914,10 @@ def get_network_graph(
         # Every edge touching the center is unconditionally included -
         # these are exactly the relationship rows used to select each
         # first-degree node, so this edge is never missing even for a
-        # legacy/merged neighbor id (#896 findings 1 and 2) - UNLESS the
-        # center itself didn't survive the category/min_strength filter
-        # above, in which case it's not in the response at all and an edge
-        # naming it would violate "every edge's endpoints are both present"
-        # (#896 review round 3 finding 3).
+        # legacy/merged neighbor id - UNLESS the center itself didn't
+        # survive the category/min_strength filter above, in which case
+        # it's not in the response at all and an edge naming it would
+        # violate "every edge's endpoints are both present".
         if center_on in valid_node_ids:
             for neighbor_id, rel in center_edges.items():
                 if neighbor_id not in valid_node_ids:
@@ -2939,7 +2927,7 @@ def get_network_graph(
                 edges_by_pair[pair] = _build_network_edge(rel, center_on, neighbor_id, weight)
 
         # Fill the remaining edge budget with the strongest non-center
-        # edges among the selected nodes (#896 findings 2 and 4).
+        # edges among the selected nodes.
         remaining_budget = max_edges - len(edges_by_pair)
         if remaining_budget > 0 and len(valid_node_ids) > 1:
             scored: list[tuple[int, tuple[str, str], Relationship, str, str]] = []
@@ -3550,12 +3538,13 @@ def get_me_interactions(
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
-    # Single full-person-list load. Cheap (#880 caches this), and genuinely
-    # needed here (unlike the other Me/Family handlers): the health-score
-    # widget's "top 25 family/personal contacts" is chosen by
-    # relationship_strength across ALL people regardless of whether they have
-    # interactions in this window, so it can't be derived from a
-    # window-scoped aggregate the way daily/top_contacts/trends can.
+    # Single full-person-list load. Cheap (PersonEntityStore.get_all() is
+    # cached), and genuinely needed here (unlike the other Me/Family
+    # handlers): the health-score widget's "top 25 family/personal
+    # contacts" is chosen by relationship_strength across ALL people
+    # regardless of whether they have interactions in this window, so it
+    # can't be derived from a window-scoped aggregate the way
+    # daily/top_contacts/trends can.
     all_people = person_store.get_all()
     person_lookup = {p.id: p for p in all_people}
 
@@ -3571,8 +3560,7 @@ def get_me_interactions(
     }
 
     # Self + hidden + peripheral + merged-secondary — shared with
-    # /me/interactions/span so both exclude the same population (#897
-    # review finding 6).
+    # /me/interactions/span so both exclude the same population.
     exclude_ids = _me_exclude_ids(person_store, all_people)
     # A separate set for Python-side `in` checks (e.g. filtering window_rows
     # below): `exclude_ids` itself stays a list because SQL query building
@@ -3609,15 +3597,12 @@ def get_me_interactions(
     # grouped — the per-row membership check against ~9,500 ids dominates,
     # not the grouping itself), so exclusion happens here in Python as a
     # `set` lookup against the already-small GROUPED rows instead — free
-    # since every widget below iterates them anyway. This also folds in the
-    # same "known (non-orphaned) person id" check the old code applied via
-    # `if i.person_id in person_lookup`, and what used to be three separate
-    # full-window queries (one each for day-level, person-level, and
-    # per-month breakdowns) into one.
+    # since every widget below iterates them anyway. This also folds the
+    # "known (non-orphaned) person id" check (`if i.person_id in
+    # person_lookup`) and the day-level, person-level, and per-month
+    # breakdowns into a single query.
     # "Only count SENT emails" is the /me dashboard's one global rule
-    # (gmail_sent_only=True), matching the single upstream
-    # `if source == 'gmail' ... continue` the old code applied once to a
-    # shared all_interactions list.
+    # (gmail_sent_only=True), applied once here rather than per widget.
     window_rows = interaction_store.get_daily_person_source_counts(
         start_date, end_date, gmail_sent_only=True,
     )
@@ -3660,15 +3645,14 @@ def get_me_interactions(
     ]
 
     # ---- Top contacts (last 30 days) ----
-    # `pool_start_date`/`pool_end_date` reproduce the original algorithm's
-    # outer `all_interactions` pool (bounded to `days_back`, day-string,
-    # including its end-date exclusion quirk — see _range_predicate) ANDed
-    # with the exact "last 30 days" lower-bound check the old Python code
-    # applied within it. Without the pool bound, this query would look
-    # further back than `days_back` whenever the caller asks for a shorter
-    # window than 30 days (#897 review finding 1). There is no exact upper
-    # bound here — the old `if ts >= thirty_days_ago:` check had none of its
-    # own either, relying entirely on the pool's own end_date.
+    # `pool_start_date`/`pool_end_date` bound the query to the outer
+    # `all_interactions` pool (bounded to `days_back`, day-string,
+    # including its end-date exclusion quirk — see _range_predicate),
+    # ANDed with the exact "last 30 days" lower-bound check. Without the
+    # pool bound, this query would look further back than `days_back`
+    # whenever the caller asks for a shorter window than 30 days. There is
+    # no exact upper bound here, relying entirely on the pool's own
+    # end_date.
     top_counts = interaction_store.get_person_counts(
         thirty_days_ago, None, exclude_person_ids=exclude_ids, gmail_sent_only=True, exact=True,
         pool_start_date=start_date, pool_end_date=end_date,
@@ -3685,13 +3669,11 @@ def get_me_interactions(
     # ---- Trend data (warming and cooling) ----
     # Same pool-clamping as top_contacts above: a trend period longer than
     # half of `days_back` (e.g. trend_period="year" with a short
-    # `days_back`) must not reach further back than the outer window did in
-    # the original algorithm (#897 review finding 1).
+    # `days_back`) must not reach further back than the outer window.
     # The "previous" bucket also excludes its upper edge so it never
-    # double-counts the exact instant where the "recent" bucket begins
-    # (matching the old `if ts >= trend_recent_start: ... elif ts >=
-    # trend_previous_start:`) — that boundary is unrelated to the pool and
-    # stays an exact julianday comparison.
+    # double-counts the exact instant where the "recent" bucket begins —
+    # that boundary is unrelated to the pool and stays an exact julianday
+    # comparison.
     recent_counts = interaction_store.get_person_counts(
         trend_recent_start, None, exclude_person_ids=exclude_ids, gmail_sent_only=True, exact=True,
         pool_start_date=start_date, pool_end_date=end_date,
@@ -3765,18 +3747,15 @@ def get_me_interactions(
     time_points = [now - timedelta(days=int(i * total_days / (num_points - 1))) for i in range(num_points)]
     time_points = sorted(time_points)  # oldest first
 
-    # SQL-side bucket counts for the health score (#897 review finding 3):
-    # one SUM(CASE ...) per time-point bucket over the top-25 population,
-    # instead of fetching every one of their interactions and bisecting in
-    # Python. On the production dataset "top 25 by relationship strength"
-    # still means hundreds of thousands of interactions (the closest
-    # family/friends are, unsurprisingly, the highest-volume contacts), so
-    # this is the difference between returning ~13 numbers and
-    # hydrating/parsing every row. `pool_start_date`/`pool_end_date`
-    # reproduce the original algorithm's outer `all_interactions` pool
-    # bound (day-string, matching get_all_in_range), since the old
-    # `personal_interactions` this fed from was filtered from that same
-    # pool.
+    # SQL-side bucket counts for the health score: one SUM(CASE ...) per
+    # time-point bucket over the top-25 population, instead of fetching
+    # every one of their interactions and bisecting in Python. On the
+    # production dataset "top 25 by relationship strength" still means
+    # hundreds of thousands of interactions (the closest family/friends
+    # are, unsurprisingly, the highest-volume contacts), so this is the
+    # difference between returning ~13 numbers and hydrating/parsing every
+    # row. `pool_start_date`/`pool_end_date` bound the query to the outer
+    # `all_interactions` pool (day-string, matching get_all_in_range).
     health_raw_counts = interaction_store.get_bucketed_counts(
         time_points, person_ids=top_25_ids, exclude_person_ids=exclude_ids,
         source_types=HEALTH_INTERACTION_TYPES,
@@ -3788,16 +3767,16 @@ def get_me_interactions(
 
     # A covering (person_id, timestamp)-index query — no source_type, since
     # neglected-contacts considers every interaction type, unlike health
-    # score — restricted to a small, specifically named set of people
-    # (#897 review finding 3). Returns julian-day floats directly so the
-    # gap-median calculation below is plain float subtraction (1.0 == one
-    # day) instead of building a datetime per row.
+    # score — restricted to a small, specifically named set of people.
+    # Returns julian-day floats directly so the gap-median calculation
+    # below is plain float subtraction (1.0 == one day) instead of
+    # building a datetime per row.
     # No exclude_person_ids here: neglect_candidate_ids already excludes
     # self and peripheral explicitly above, and hidden implicitly (it's
     # built from circle_map, which is derived from all_people —
     # get_all()'s default already excludes hidden) — measured ~120ms faster
     # without a redundant `NOT IN (~9,500)` clause on a query already
-    # restricted to a couple dozen people (#897 review finding 3).
+    # restricted to a couple dozen people.
     neglect_jd_rows = interaction_store.get_person_julianday_timestamps(
         start_date, end_date, person_ids=neglect_candidate_ids,
     ) if neglect_candidate_ids else []
@@ -3920,14 +3899,9 @@ def get_me_interactions(
     # second full-window query needed here.
 
     # Build messaging list (based on days_back)
-    # NOTE (#871 bugfix): this loop used to reassign the *outer* `by_circle`
-    # dict (the full-window, all-sources total returned by the response's
-    # own `by_circle` field) to `dict(data["by_circle"])` on every iteration,
-    # so after the loop it silently held only the LAST processed month's
-    # iMessage/WhatsApp-only breakdown instead of the true window total —
-    # the Me page's "By Dunbar Circle" chart was rendering that stale,
-    # wrong-in-scope data. Renamed to `month_by_circle` so it can no longer
-    # shadow the response-level `by_circle` variable computed above.
+    # `month_by_circle` is deliberately named differently from the
+    # response-level `by_circle` computed above (the full-window,
+    # all-sources total): this per-month loop variable must not shadow it.
     messaging_by_circle = []
     for month in sorted(monthly_messaging.keys()):
         if month >= chart_months_cutoff:
@@ -4107,7 +4081,7 @@ def get_me_interactions_span():
     Get the earliest and latest interaction dates, excluding self, hidden,
     peripheral, and merged-secondary people — the same population
     /me/interactions aggregates (both use the shared `_me_exclude_ids`
-    helper, #897 review finding 6).
+    helper).
 
     The Me dashboard calls this first to size its heatmap window from the
     actual span of data, instead of requesting a fixed 10 years and shrinking
@@ -4432,9 +4406,8 @@ def get_family_interactions(
 
     # ---- Top contacts (last 30 days) ----
     # `pool_start_date`/`pool_end_date` clip this to the outer `days_back`
-    # window, matching the original algorithm's `all_interactions` pool
-    # (#897 review finding 1 — same fix as /me/interactions). No exact upper
-    # bound: the old `if ts >= thirty_days_ago:` check had none of its own.
+    # window, matching the `all_interactions` pool (same as
+    # /me/interactions). No exact upper bound of its own.
     top_counts = interaction_store.get_person_counts(
         thirty_days_ago, None, person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID],
         exact=True, pool_start_date=start_date, pool_end_date=end_date,
@@ -4449,7 +4422,7 @@ def get_family_interactions(
         ))
 
     # ---- Trends (warming and cooling) ----
-    # Same pool-clamping as top_contacts above (#897 review finding 1).
+    # Same pool-clamping as top_contacts above.
     recent_counts = interaction_store.get_person_counts(
         trend_recent_start, None, person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID],
         exact=True, pool_start_date=start_date, pool_end_date=end_date,
@@ -5674,30 +5647,27 @@ MESSAGES:
 
 
 # Stored tone results older than this are recomputed even if the
-# interaction count for that month hasn't changed (#873).
+# interaction count for that month hasn't changed.
 TONE_FRESHNESS_DAYS = 30
 
-# Cap on how many stale months go into a single LLM call. The prompt is
-# still one call per chunk rather than one call per month (#899 review
-# finding 4), but capping the chunk size means a single slow/timed-out call
-# only blanks a few months' worth of recompute instead of the whole window
-# -- a 12-month first-ever load used to be all-or-nothing (#899 review
-# finding N2: a single stuck 12-month call turned every month to
-# status="error" at once, discarding whatever was already stored for them).
+# Cap on how many stale months go into a single LLM call. One call per
+# chunk rather than one call per month; capping the chunk size means a
+# single slow/timed-out call only blanks a few months' worth of recompute
+# instead of the whole window.
 TONE_MAX_MONTHS_PER_LLM_CALL = 4
 
 # How long a request waits to acquire the per-person lock below before
-# falling through to a storage-only response (#899 review finding N3): the
-# lock has no timeout otherwise, so one slow/stuck computation for a person
-# would stall every other request for that same person indefinitely, each
-# holding a threadpool worker.
+# falling through to a storage-only response: the lock has no timeout
+# otherwise, so one slow/stuck computation for a person would stall every
+# other request for that same person indefinitely, each holding a
+# threadpool worker.
 TONE_LOCK_TIMEOUT_SECONDS = 5
 
 # Per-person locks serializing concurrent tone-analysis requests for the same
-# person, so a double-clicked refresh or two open tabs don't both pay for the
-# same LLM call (#899 review finding 9). Keyed by person_id; created lazily
-# and never removed (bounded by the number of distinct people ever analyzed,
-# which is small). `_tone_analysis_locks_meta_lock` only guards the dict
+# person, so a double-clicked refresh or two open tabs don't both pay for
+# the same LLM call. Keyed by person_id; created lazily and never removed
+# (bounded by the number of distinct people ever analyzed, which is
+# small). `_tone_analysis_locks_meta_lock` only guards the dict
 # itself, held for the instant it takes to look up or create one entry --
 # the actual tone-analysis work happens under the per-person lock it returns,
 # acquired with TONE_LOCK_TIMEOUT_SECONDS rather than blocking forever.
@@ -5719,11 +5689,11 @@ def _derive_trend(scores: list) -> str:
     """Derive a trend label from a chronological list of monthly scores.
 
     Heuristic, computed from already-scored data -- not the LLM's own
-    trend text. Needed because a response can now be assembled from a mix
-    of stored months (scored in earlier, separate calls) and freshly
-    recomputed ones, so no single LLM call sees the whole window anymore.
+    trend text. Needed because a response can be assembled from a mix of
+    stored months (scored in earlier, separate calls) and freshly
+    recomputed ones, so no single LLM call sees the whole window.
     Compares the average of the first half of the window to the second
-    half; options mirror the ones the prompt used to ask the LLM for.
+    half; options mirror the ones the prompt asks the LLM for.
     """
     if len(scores) < 2:
         return "insufficient-data"
@@ -5756,12 +5726,10 @@ def _compute_tone_for_months(
     per person per month. Returns (results_by_month, model_name), where
     `results_by_month` holds an entry only for the months the parsed
     response actually covers -- a month present in `stale_months` but
-    absent from the result means the LLM omitted it. The original version
-    made one call per stale month (up to `months` sequential calls on a
-    first load or a refresh, each several seconds to minutes on a local
-    model); batching restores something close to a "one call per request"
-    cost while capping how much a single slow/timed-out call can affect
-    (#899 review findings 4 and N2).
+    absent from the result means the LLM omitted it. Batching multiple
+    months into one call keeps the LLM cost close to "one call per
+    request" while capping how much a single slow/timed-out call can
+    affect.
 
     Raises only if the call itself fails or the response can't be parsed at
     all -- the caller treats every month in this chunk as missing in that
@@ -5769,12 +5737,11 @@ def _compute_tone_for_months(
     `status="error"` (if not), never failing the request.
 
     Messages are still presented to the LLM grouped by week within each
-    month (each (month, week) pair holds only that month's own messages --
-    see the handler's bucketing, which fixes #899 review finding 1), purely
-    for readability in the prompt; the requested output is one score per
-    month, not per week, since nothing downstream needs week-level
-    resolution (trend is now derived locally from the monthly scores, see
-    _derive_trend).
+    month (each (month, week) pair holds only that month's own messages),
+    purely for readability in the prompt; the requested output is one
+    score per month, not per week, since nothing downstream needs
+    week-level resolution (trend is derived locally from the monthly
+    scores, see _derive_trend).
     """
     def format_month_samples(by_month_week: dict, person_name: str) -> str:
         lines = []
@@ -5870,12 +5837,10 @@ def _tone_analysis_window_start(now, months: int):
     cutoff drifts by a fraction of a day with every request, so the oldest
     retained month's messages (and therefore its "current" interaction
     count) shift purely from wall-clock time passing, forcing a needless
-    recompute on every load even though nothing about that month changed
-    (#899 review finding 5). Extracted as its own function so this exact
-    property is directly testable rather than only observable end-to-end
-    through a synthetic fixture that happens to sit inside either window
-    (#899 review finding N4 -- the original drift-regression test didn't
-    actually distinguish this from a reverted rolling window).
+    recompute on every load even though nothing about that month changed.
+    Extracted as its own function so this exact property is directly
+    testable rather than only observable end-to-end through a synthetic
+    fixture that happens to sit inside either window.
     """
     current_month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     year, month = current_month_start.year, current_month_start.month - (months - 1)
@@ -5887,13 +5852,10 @@ def _tone_analysis_window_start(now, months: int):
 
 def _bucket_interactions_by_month_and_week(interactions: list) -> tuple:
     """Bucket messages by their own calendar month first, then by week
-    within that month -- never by week alone. A week that straddles a
-    month boundary used to be looked up in one week-keyed dict shared
-    across both months, so both months' LLM prompts got the *other*
-    month's messages too and both months' sample counts roughly doubled
-    (#899 review finding 1). Keying week dicts under their month first
-    makes that impossible: each message lands under exactly one
-    (month, week) pair.
+    within that month -- never by week alone. Keying week dicts under
+    their month first guarantees each message lands under exactly one
+    (month, week) pair, so a week that straddles a month boundary can't
+    leak into the wrong month's LLM prompt or sample count.
 
     The month key is computed from the UTC-normalized instant
     (`dt.astimezone(timezone.utc)`), not `dt`'s own stored offset, to match
@@ -5905,7 +5867,7 @@ def _bucket_interactions_by_month_and_week(interactions: list) -> tuple:
     non-UTC offset would land in a different month here than in that
     count query -- and a month whose bucketed count permanently disagrees
     with its stored `interaction_count` would recompute on every single
-    load (#899 review, second pass, nit 1).
+    load.
 
     Returns (user_by_month_week, partner_by_month_week).
     """
@@ -5946,13 +5908,12 @@ def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: 
     Freshness is decided from a lightweight per-month COUNT query
     (`get_monthly_interaction_counts_in_range`) that never loads a single
     interaction row -- a fully-cached response touches storage only, no
-    row scan and no LLM call (#899 review finding N1). Only when at least
-    one month is stale does the handler fetch and bucket the actual
-    messages (by calendar month first, then by week within that month --
-    #899 review finding 1) to build LLM prompts, chunked at
-    `TONE_MAX_MONTHS_PER_LLM_CALL` months per call so one slow or timed-out
-    call can't blank the whole window (#899 review finding N2). Results
-    are persisted per person/month in `tone_analysis_results`
+    row scan and no LLM call. Only when at least one month is stale does
+    the handler fetch and bucket the actual messages (by calendar month
+    first, then by week within that month) to build LLM prompts, chunked
+    at `TONE_MAX_MONTHS_PER_LLM_CALL` months per call so one slow or
+    timed-out call can't blank the whole window. Results are persisted per
+    person/month in `tone_analysis_results`
     (api/services/tone_analysis_store.py): a month is served from storage
     when its stored interaction count still matches the current count and
     the result is within the freshness window (`TONE_FRESHNESS_DAYS`).
@@ -5963,8 +5924,8 @@ def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: 
     failure or unavailability: a stale month that couldn't be recomputed
     this request is returned with its last stored score and
     `status="stale"` if one exists, or `status="error"` only if nothing
-    was ever stored for it (#899 review finding N2; ADR-025 fallback
-    preserved via get_anthropic_llm).
+    was ever stored for it (ADR-025 fallback preserved via
+    get_anthropic_llm).
     """
     from api.services.llm_client import get_anthropic_llm
     from api.services.tone_analysis_store import get_tone_analysis_store
@@ -5977,9 +5938,9 @@ def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: 
     now = datetime.now(timezone.utc)
     start_date = _tone_analysis_window_start(now, months)
 
-    # Cheap freshness check: counts only, no rows loaded (#899 review
-    # finding N1). get_for_person_in_range (which loads every row) is only
-    # called below once stale_months is known to be non-empty.
+    # Cheap freshness check: counts only, no rows loaded.
+    # get_for_person_in_range (which loads every row) is only called below
+    # once stale_months is known to be non-empty.
     month_interaction_counts = interaction_store.get_monthly_interaction_counts_in_range(
         person_id=target_id,
         start_date=start_date,
@@ -6020,14 +5981,14 @@ def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: 
     stale_months = _compute_stale_months(stored_by_month)
 
     # Serialize same-person requests: two concurrent tabs or a double-clicked
-    # refresh must not both pay for the same LLM call (#899 review finding
-    # 9). Bounded to TONE_LOCK_TIMEOUT_SECONDS (#899 review finding N3): a
-    # request that can't get the lock in time falls through to a
-    # storage-only response (marking anything stale as such) rather than
-    # blocking on someone else's in-flight computation and tying up a
-    # threadpool worker indefinitely. This only affects the *same* person --
-    # other people and unrelated endpoints (e.g. GET /api/crm/config) are
-    # unaffected, since the handler still runs off the event loop.
+    # refresh must not both pay for the same LLM call. Bounded to
+    # TONE_LOCK_TIMEOUT_SECONDS: a request that can't get the lock in time
+    # falls through to a storage-only response (marking anything stale as
+    # such) rather than blocking on someone else's in-flight computation
+    # and tying up a threadpool worker indefinitely. This only affects the
+    # *same* person -- other people and unrelated endpoints (e.g. GET
+    # /api/crm/config) are unaffected, since the handler still runs off
+    # the event loop.
     results_by_month: dict = {}
     model_name = ""
     if stale_months:
@@ -6051,13 +6012,12 @@ def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: 
                     )
 
                     # One LLM call per chunk of at most TONE_MAX_MONTHS_PER_LLM_CALL
-                    # months, not one call for the whole window (#899 review
-                    # finding N2) and not one call per month (#899 review
-                    # finding 4) -- each chunk's result is upserted as soon as
-                    # it completes, so a later chunk's failure or timeout
-                    # (bounded by the LLM client's own configured timeout;
-                    # see api/services/llm_client.py) can't undo an earlier
-                    # chunk's success.
+                    # months -- neither one call for the whole window nor one
+                    # call per month -- and each chunk's result is upserted
+                    # as soon as it completes, so a later chunk's failure or
+                    # timeout (bounded by the LLM client's own configured
+                    # timeout; see api/services/llm_client.py) can't undo an
+                    # earlier chunk's success.
                     for chunk in _chunked(stale_months, TONE_MAX_MONTHS_PER_LLM_CALL):
                         try:
                             client = get_anthropic_llm()
@@ -6097,8 +6057,7 @@ def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: 
                 # months while this request waited, and without this
                 # re-read they'd still be reported "stale" from the
                 # pre-wait snapshot for the rest of this response, even
-                # though a fresh score already landed (#899 review, second
-                # pass, nit 2).
+                # though a fresh score already landed.
                 stored_by_month = {r.period_key: r for r in tone_store.get_for_person(target_id)}
                 stale_months = _compute_stale_months(stored_by_month)
         finally:
@@ -6109,7 +6068,7 @@ def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: 
     # wasn't freshly computed this request (chunk failed, response omitted
     # it, or the lock couldn't be acquired) is served its last stored score
     # marked status="stale" -- never discarded -- or status="error" only if
-    # nothing was ever stored for it (#899 review finding N2).
+    # nothing was ever stored for it.
     monthly_tones = []
     all_user_scores = []
     all_partner_scores = []

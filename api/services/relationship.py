@@ -32,8 +32,7 @@ TYPE_INFERRED = "inferred"  # Discovered through shared contexts
 # Explicit column list matching Relationship.from_row()'s expected positional
 # order (see its "Row order" comment). Named rather than `SELECT *` so a
 # query using it doesn't silently depend on the table's physical column
-# order, and doesn't couple to a query adding its own extra columns
-# (#896 review finding 10 / round 3 blocker 2).
+# order, and doesn't couple to a query adding its own extra columns.
 _RELATIONSHIP_COLUMNS = (
     "id, person_a_id, person_b_id, relationship_type, shared_contexts, "
     "shared_events_count, shared_threads_count, first_seen_together, "
@@ -806,7 +805,7 @@ class RelationshipStore:
         RelationshipStore calls in one pass (e.g. selecting a bounded graph
         neighborhood: one `get_all_for_person()` plus one `get_top_neighbors()`
         per intermediate node) and wants to share a single connection instead
-        of paying a connect/close cost on every call (#896 review finding 11).
+        of paying a connect/close cost on every call.
 
         Pass the returned connection as `conn` to `get_all_for_person()` /
         `get_top_neighbors()`; the caller owns it and must close it (e.g. via
@@ -865,23 +864,14 @@ class RelationshipStore:
         for picking which neighbors to include in a bounded graph; the real
         strength formula is still used for the edges actually returned.
 
-        An earlier version of this method fetched every relationship for
-        person_id via `get_all_for_person()` and ranked/limited in Python.
-        That fixed the tiebreak and removed a positional-`SELECT *`-plus-
-        computed-column coupling, but turned a bounded fetch into an
-        unbounded one on the hottest path in the network-graph endpoint's
-        selection loop: for a person with hundreds of relationships of
-        their own (a first-degree node during second-degree expansion,
-        not just the center), every one of those rows was hydrated just to
-        keep the top handful. Measured (#896 review round 3): 48
-        `get_top_neighbors` calls for one request pulled ~39,600
-        `Relationship.from_row()` constructions total, at ~9µs each
-        (JSON-decoding `shared_contexts` plus four `fromisoformat` calls) —
-        0.356s of a 0.549s request. Ranking and limiting in SQL again (with
-        an explicit column list, never `SELECT *`, so there's still no
-        positional coupling to a computed or reordered column) keeps both
-        of that version's fixes while hydrating only the rows actually
-        returned.
+        Ranking in Python instead -- fetching every relationship for
+        person_id via `get_all_for_person()` and ranking/limiting in
+        memory -- would hydrate every one of those rows into a
+        `Relationship` object just to keep the top handful. That's
+        expensive for a person with hundreds of relationships of their own
+        (a first-degree node during second-degree expansion, not just the
+        center), since each `Relationship.from_row()` construction decodes
+        `shared_contexts` as JSON and parses four ISO timestamps.
 
         Args:
             person_id: Canonical person ID
@@ -924,16 +914,16 @@ class RelationshipStore:
         where BOTH endpoints are in person_ids.
 
         Loads person_ids into a temp table and joins it against `relationships`
-        twice (once per endpoint column). This avoids the two-pass
-        `person_a_id IN (...)` / `person_b_id IN (...)` approach's blowup when
-        one of the ids has many relationships overall (e.g. the CRM owner in a
-        150-node selection still has thousands of total relationships, most
-        of which don't have their OTHER endpoint in the set) — measured on
-        the real dataset, that approach fetched and Python-filtered ~48k rows
-        for a 150-node owner-centered request; this join returns only the
-        ~2.4k that actually match, in about a third of the time. Avoids
-        SQLite's bound-parameter limit entirely (no `IN (...)` list at all),
-        so there's no chunking to reason about regardless of person_ids' size.
+        twice (once per endpoint column), rather than a two-pass
+        `person_a_id IN (...)` / `person_b_id IN (...)` scan. A two-pass IN
+        scan degrades when one of the ids has many relationships overall but
+        few with their OTHER endpoint in the set (e.g. the CRM owner in a
+        selection of a few hundred people still has thousands of total
+        relationships) — it fetches and Python-filters every row touching
+        that id. The join instead only returns rows where both endpoints are
+        in the set. It also avoids SQLite's bound-parameter limit entirely
+        (no `IN (...)` list at all), so there's no chunking to reason about
+        regardless of person_ids' size.
 
         Args:
             person_ids: IDs to restrict the subgraph to
@@ -976,7 +966,7 @@ class RelationshipStore:
         finally:
             # If the connection is already in a bad state, letting this
             # raise would mask whatever exception got us into `finally` in
-            # the first place (#896 review round 3 finding 6).
+            # the first place.
             with contextlib.suppress(sqlite3.Error):
                 conn.execute("DROP TABLE IF EXISTS _network_edge_ids")
             if owns_conn:
@@ -1041,9 +1031,9 @@ class RelationshipStore:
 
 # Singleton instance
 _relationship_store: Optional[RelationshipStore] = None
-# #868 moved CRM/people/photos handlers off the event loop and onto worker
-# threads, so two first-requests after a restart can now race this
-# check-and-set. Double-checked locking: the lock is only taken while
+# CRM/people/photos handlers run on worker threads, not the event loop, so
+# two first-requests after a restart can race this check-and-set.
+# Double-checked locking: the lock is only taken while
 # _relationship_store is still None, so it costs nothing once constructed.
 _relationship_store_lock = threading.Lock()
 

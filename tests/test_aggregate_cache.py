@@ -1,5 +1,5 @@
 """
-Tests for the CRM aggregate response cache (#876, #917).
+Tests for the CRM aggregate response cache.
 
 `AggregateCache` memoizes a route handler's return value, keyed on its
 resolved query parameters, invalidated whenever either watched database's
@@ -60,8 +60,8 @@ def _commit_external_write(db_path: str) -> None:
 
 def _best_of(fn, n=3):
     """Fastest of `n` timed calls to `fn()`, in milliseconds -- reduces
-    flakiness from an occasional scheduling hiccup on a loaded box (#917
-    review finding 10) versus asserting on a single sample."""
+    flakiness from an occasional scheduling hiccup on a loaded box versus
+    asserting on a single sample."""
     best = None
     result = None
     for _ in range(n):
@@ -179,7 +179,7 @@ class TestDataVersionInvalidation:
         """The data_version pair is a generation stamp, not part of the
         cache key: a write must clear stale entries immediately rather than
         leaving them counted against the entry/byte bounds until LRU
-        pressure happens to reclaim them (#917 review finding 8)."""
+        pressure happens to reclaim them."""
         @cache.cached()
         def endpoint_a(x: int):
             return {"x": x}
@@ -293,8 +293,7 @@ class TestBounds:
 
     def test_entry_larger_than_cap_is_skipped_not_flushed(self, tmp_path):
         """An entry that alone exceeds the byte cap must be skipped, not
-        stored at the cost of evicting everything else already cached
-        (#917 review finding 8)."""
+        stored at the cost of evicting everything else already cached."""
         crm_db = _make_db(tmp_path / "crm.db")
         interactions_db = _make_db(tmp_path / "interactions.db")
         cache = AggregateCache(crm_db_paths=[crm_db], interactions_db_path=interactions_db,
@@ -326,7 +325,7 @@ class TestBounds:
 class TestMutationSafety:
     """A caller mutating its own returned object can never poison the cache
     for a later caller, and a cache hit can never hand out a reference a
-    concurrent caller could poison either (#917 review finding 5)."""
+    concurrent caller could poison either."""
 
     def test_mutating_a_returned_dict_does_not_poison_the_cache(self, cache):
         @cache.cached()
@@ -358,7 +357,7 @@ class TestVersionReadFailure:
     """A PRAGMA data_version read failure (missing file, mid-replacement
     file, any other sqlite3.Error) must never turn a request that would
     otherwise succeed into a failure -- it falls through to computing
-    uncached (#917 review finding 1)."""
+    uncached."""
 
     def test_missing_crm_db_directory_falls_through_to_uncached(self, tmp_path):
         missing_path = str(tmp_path / "does" / "not" / "exist" / "crm.db")
@@ -417,8 +416,7 @@ class TestMultipleCrmPaths:
     RelationshipStore) resolve crm.db through `get_crm_db_path()`, while
     `PersonEntityStore` uses a hardcoded path -- the two are the same file
     by default but can diverge under a non-default `LIFEOS_CHROMA_PATH`.
-    When they do, a write through *either* must invalidate (#917 review
-    finding 2)."""
+    When they do, a write through *either* must invalidate."""
 
     def test_write_through_either_watched_crm_path_invalidates(self, tmp_path):
         crm_db_a = _make_db(tmp_path / "crm_a.db")
@@ -480,7 +478,7 @@ class TestMultipleCrmPaths:
 
 class TestSingleFlight:
     """Concurrent misses for the same key compute once; the rest wait for
-    the first caller and reuse its result (#917 review finding 9)."""
+    the first caller and reuse its result."""
 
     def test_concurrent_misses_for_the_same_key_compute_once(self, cache):
         calls = []
@@ -518,21 +516,15 @@ class TestSingleFlight:
 class TestGenerationRaceDuringCompute:
     """A commit that lands while the leader is still computing must never
     get that leader's pre-write result cached under the post-write
-    generation (#917 review finding 11, introduced by finding 8's
-    generation-stamp redesign: the old version-in-key design was immune,
-    since a pre-write result stored under the pre-write key was simply
-    never looked up again once the generation moved on).
+    generation.
 
-    Reproduction shape, matching the review: request 1 starts computing
-    (reads the pre-write generation), an external commit lands, request 2
-    arrives (reads the post-write generation, becomes a single-flight
-    follower of request 1 since nothing is cached yet), request 1 finishes
-    and attempts its store. Without the fix, that store succeeds --
-    unconditionally -- so request 2 (waking as a follower) and any later
-    request both get the stale pre-write value from the cache. With the
-    fix, the store is skipped (the generation moved since request 1 read
-    it), so request 2 falls back to computing its own fresh result, and a
-    later request 3 gets a fresh (correct) cache entry from its own
+    Reproduction shape: request 1 starts computing (reads the pre-write
+    generation), an external commit lands, request 2 arrives (reads the
+    post-write generation, becomes a single-flight follower of request 1
+    since nothing is cached yet), request 1 finishes and attempts its
+    store. The store is skipped because the generation moved since request
+    1 read it, so request 2 falls back to computing its own fresh result,
+    and a later request 3 gets a fresh (correct) cache entry from its own
     computation."""
 
     def test_write_during_leader_compute_is_not_served_stale(self, cache):

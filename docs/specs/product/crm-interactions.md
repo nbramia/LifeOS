@@ -80,7 +80,7 @@ Behavior:
 - Source-type filter dropdown narrows the list.
 - Clicking an interaction opens the source link — `mailto:` / Google Calendar URL / `obsidian://` / `imessage://` etc.
 - Infinite scroll loads older interactions.
-- On the Me and Family timelines (`/me`, `/family` — see [crm-analytics.md](crm-analytics.md)), an interaction still attributed to a person id that was later merged into another person displays under the surviving person's name, following the merge chain the same way a direct person lookup does. Previously such rows displayed "Unknown".
+- On the Me and Family timelines (`/me`, `/family` — see [crm-analytics.md](crm-analytics.md)), an interaction still attributed to a person id that was merged into another person displays under the surviving person's name, following the merge chain the same way a direct person lookup does.
 
 ---
 

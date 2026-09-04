@@ -1,19 +1,18 @@
 """
-Short-lived response cache for the CRM's heaviest read aggregates (#876).
+Short-lived response cache for the CRM's heaviest read aggregates.
 
 `/me/interactions`, `/me/timeline`, `/family/interactions`, `/family/timeline`,
 `/birthdays/all`, `/statistics`, and the default-parameter `/people` list all
 recompute from scratch on every request even when nothing in crm.db or
-interactions.db has changed since the last call -- #871/#880 made each of
-those individually fast, but a dashboard switch or a page refresh still pays
-the full cost every time. `AggregateCache.cached()` memoizes a route
-handler's return value for a short TTL, keyed on its resolved query
-parameters, invalidated whenever either database's `PRAGMA data_version`
-counter changes -- the same invalidation signal `PersonEntityStore`'s own
-`get_all()` cache uses (see api/services/person_entity.py) -- so a write to
-either database, from this process or any other, drops every cached entry
-before the next request. The TTL is a backstop bound on entry lifetime, not
-the primary invalidation path.
+interactions.db has changed since the last call, so a dashboard switch or a
+page refresh still pays the full cost every time. `AggregateCache.cached()`
+memoizes a route handler's return value for a short TTL, keyed on its
+resolved query parameters, invalidated whenever either database's `PRAGMA
+data_version` counter changes -- the same invalidation signal
+`PersonEntityStore`'s own `get_all()` cache uses (see
+api/services/person_entity.py) -- so a write to either database, from this
+process or any other, drops every cached entry before the next request. The
+TTL is a backstop bound on entry lifetime, not the primary invalidation path.
 
 Structured as a class (rather than bare module globals) so a test can
 construct an isolated `AggregateCache` pointed at temporary databases, the
@@ -22,35 +21,35 @@ instead of fighting the process-wide singleton -- see `get_aggregate_cache()`
 below for the singleton `api/routes/crm.py` actually decorates its handlers
 with.
 
-#917 review findings addressed here (see each method's docstring for detail):
-1. A `PRAGMA data_version` read failure never fails the request -- it falls
-   through to computing uncached and the connection is reopened next call.
-2. `crm.db` is resolved through both `PersonEntityStore.CRM_DB_PATH` and
-   `api.utils.db_paths.get_crm_db_path()` (deduped by `os.path.realpath`),
-   since the stores backing `/statistics` and `/people` use the latter and
-   the two can diverge under a non-default `LIFEOS_CHROMA_PATH`. Connections
-   open read-only with a `mode=ro` URI so a missing file is never silently created.
-4. The byte bound tracks serialized JSON size, which understates real
-   retained heap by roughly 7x (measured) -- `MAX_TOTAL_BYTES` is scaled down
-   by that ratio so it targets a real ~50 MB heap ceiling, not a 20 MB one.
-5. A cache hit returns a deep copy, and a miss stores a deep copy of what it
-   returns, so a caller mutating their own result can never poison the entry
-   another caller (or the same one, later) receives.
-8. The data_version pair is a generation stamp, not part of the key: a
-   change clears every entry outright instead of leaving old-generation
-   entries as unreachable dead weight inside the byte/entry bounds. An entry
-   larger than the byte cap is skipped rather than flushing the cache to
-   make room for it.
-9. Concurrent misses for the same key single-flight behind a per-key
-   `threading.Event`: the first caller computes, the rest wait for it and
-   reuse its result (falling back to computing themselves only if the
-   leader's call raised).
-11. A store re-checks that the generation it read before computing is still
-    current: finding 8's generation-stamp redesign otherwise let a commit
-    that lands while a handler is running get that handler's pre-write
-    result cached under the post-write generation, served stale for the
-    full TTL. A mismatch at store time skips caching -- the next request
-    for that key simply misses and recomputes against the new generation.
+Invariants (see each method's docstring for detail):
+- A `PRAGMA data_version` read failure never fails the request -- it falls
+  through to computing uncached and the connection is reopened next call.
+- `crm.db` is resolved through both `PersonEntityStore.CRM_DB_PATH` and
+  `api.utils.db_paths.get_crm_db_path()` (deduped by `os.path.realpath`),
+  since the stores backing `/statistics` and `/people` use the latter and
+  the two can diverge under a non-default `LIFEOS_CHROMA_PATH`. Connections
+  open read-only with a `mode=ro` URI so a missing file is never silently created.
+- The byte bound tracks serialized JSON size, which understates real
+  retained heap by roughly 7x (measured) -- `MAX_TOTAL_BYTES` is scaled down
+  by that ratio so it targets a real ~50 MB heap ceiling, not a 20 MB one.
+- A cache hit returns a deep copy, and a miss stores a deep copy of what it
+  returns, so a caller mutating their own result can never poison the entry
+  another caller (or the same one, later) receives.
+- The data_version pair is a generation stamp, not part of the key: a
+  change clears every entry outright instead of leaving old-generation
+  entries as unreachable dead weight inside the byte/entry bounds. An entry
+  larger than the byte cap is skipped rather than flushing the cache to
+  make room for it.
+- Concurrent misses for the same key single-flight behind a per-key
+  `threading.Event`: the first caller computes, the rest wait for it and
+  reuse its result (falling back to computing themselves only if the
+  leader's call raised).
+- A store re-checks that the generation it read before computing is still
+  current, since a commit that lands while a handler is running could
+  otherwise get that handler's pre-write result cached under the post-write
+  generation, served stale for the full TTL. A mismatch at store time skips
+  caching -- the next request for that key simply misses and recomputes
+  against the new generation.
 """
 import copy
 import functools
@@ -76,12 +75,12 @@ DEFAULT_TTL_SECONDS = 300
 MAX_ENTRIES = 200
 
 # How long a follower waits for the leader computing its key before giving
-# up and computing itself. Deliberately far shorter than DEFAULT_TTL_SECONDS
-# (which used to also gate this wait): a real handler realistically takes at
-# most a few seconds even on the largest aggregate, so waiting a full 300s
-# would just hold a threadpool worker thread hostage to whatever went wrong
-# with the leader (an unexpected hang, not merely a slow query) far longer
-# than any request should ever legitimately take (#917 review nit).
+# up and computing itself. Deliberately far shorter than DEFAULT_TTL_SECONDS:
+# a real handler realistically takes at most a few seconds even on the
+# largest aggregate, so waiting a full 300s would just hold a threadpool
+# worker thread hostage to whatever went wrong with the leader (an
+# unexpected hang, not merely a slow query) far longer than any request
+# should ever legitimately take.
 FOLLOWER_WAIT_TIMEOUT_SECONDS = 30
 
 # A ~7 MB serialized-JSON entry was measured to retain ~51 MB of actual
@@ -113,9 +112,8 @@ def _default_crm_db_paths() -> list:
     and `RelationshipStore` (which back `/statistics`'s and `/people`'s
     category computation) resolve through `get_crm_db_path()`, derived from
     `settings.chroma_path`. The two are the same file by default but diverge
-    under a non-default `LIFEOS_CHROMA_PATH` -- watching only one left writes
-    through the other invisible to this cache, bounded only by the TTL
-    (#917 review finding 2).
+    under a non-default `LIFEOS_CHROMA_PATH` -- watching only one would leave
+    writes through the other invisible to this cache, bounded only by the TTL.
     """
     return _dedupe_paths([str(PersonEntityStore.CRM_DB_PATH), get_crm_db_path()])
 
@@ -126,8 +124,8 @@ def _open_existing_db(path: str) -> sqlite3.Connection:
     Plain `sqlite3.connect(path)` silently creates a 0-byte (and therefore
     permanently `data_version`-static) file if `path` doesn't exist yet --
     exactly the wrong failure mode for a path this cache merely *watches*
-    and never writes to (#917 review finding 2). The `mode=ro` URI param
-    makes SQLite raise instead of creating it, and -- verified against a
+    and never writes to. The `mode=ro` URI param makes SQLite raise instead
+    of creating it, and -- verified against a
     WAL-mode database, which every store here uses -- a read-only
     connection still sees `PRAGMA data_version` change correctly after an
     external write, so there is no need for `mode=rw` (which would also
@@ -202,8 +200,8 @@ class AggregateCache:
 
         A missing file, a file mid-replacement (e.g. a backup-restore
         swap), or any other `sqlite3.Error` must never turn a request that
-        would otherwise succeed into a 500 (#917 review finding 1) -- the
-        caller falls through to computing uncached on `None`. Every open
+        would otherwise succeed into a 500 -- the caller falls through to
+        computing uncached on `None`. Every open
         connection is dropped on failure so the *next* call opens fresh
         (the file may appear, or be restored, in the meantime); logs once
         per outage rather than once per request.
@@ -237,8 +235,7 @@ class AggregateCache:
         Keeping the version pair as a generation stamp rather than inside
         each entry's key means a write drops stale entries outright instead
         of merely making them unreachable while they still count against
-        the entry/byte bounds until LRU pressure happens to reclaim them
-        (#917 review finding 8).
+        the entry/byte bounds until LRU pressure happens to reclaim them.
         """
         if self._generation is not None and self._generation != versions:
             self._cache.clear()
@@ -275,8 +272,7 @@ class AggregateCache:
         `should_cache`, if given, is called with the resolved kwargs dict
         before anything else; a `False` return bypasses the cache entirely
         for that call (no read, no store) -- used to keep `/people` search
-        text and unbounded-`limit` pages out of a long-lived in-memory key
-        (#917 review finding 6).
+        text and unbounded-`limit` pages out of a long-lived in-memory key.
 
         Intended for a FastAPI route handler, applied directly under
         `@router.get(...)` (i.e. as the innermost decorator) so FastAPI still
@@ -292,7 +288,7 @@ class AggregateCache:
         The returned value is always a deep copy, on both a hit and a miss:
         a caller that mutates its own result in place can never poison the
         cache, and a caller receiving a hit can never be poisoned by a
-        previous caller's mutation (#917 review finding 5).
+        previous caller's mutation.
         """
         def decorator(func: Callable) -> Callable:
             identity = f"{func.__module__}.{func.__qualname__}"
@@ -343,7 +339,7 @@ class AggregateCache:
                 if not is_leader:
                     # A concurrent call is already computing this exact key;
                     # wait for it and reuse its result instead of also
-                    # computing (#917 review finding 9).
+                    # computing.
                     event.wait(timeout=FOLLOWER_WAIT_TIMEOUT_SECONDS)
                     with self._lock:
                         cached = self._cache.get(key)
@@ -376,15 +372,15 @@ class AggregateCache:
                     # Deep-copy what's stored (and returned): the caller of
                     # this very call could still mutate `result` in place,
                     # but that must never reach the cached entry another
-                    # caller receives later (#917 review finding 5). This
-                    # roughly doubles a warm hit's CPU cost relative to a
-                    # shallow return (measured: a 235 KB /me/timeline page
-                    # went from ~2.5ms to ~4.6ms of *added* work over real
-                    # HTTP -- still far under the 20ms target, but worth
-                    # knowing if a response size this decorates grows a lot
-                    # further). jsonable_encoder is used only to measure a
-                    # byte size for the cache's bounds; it never replaces
-                    # what's actually stored/returned.
+                    # caller receives later. This roughly doubles a warm
+                    # hit's CPU cost relative to a shallow return (measured:
+                    # a 235 KB /me/timeline page costs ~4.6ms of *added*
+                    # work over real HTTP -- still far under the 20ms
+                    # target, but worth knowing if a response size this
+                    # decorates grows a lot further). jsonable_encoder is
+                    # used only to measure a byte size for the cache's
+                    # bounds; it never replaces what's actually
+                    # stored/returned.
                     stored = copy.deepcopy(result)
                     size = len(json.dumps(jsonable_encoder(stored)).encode("utf-8"))
 
@@ -397,18 +393,12 @@ class AggregateCache:
                         # storing unconditionally would cache a pre-write
                         # result under the post-write generation and serve
                         # it for the full TTL -- exactly the staleness this
-                        # cache exists to prevent (#917 review finding 11,
-                        # introduced by finding 8's generation-stamp
-                        # redesign: the old version-in-key design was
-                        # immune, since a V1-computed entry stored under a
-                        # V1 key was simply never looked up again once the
-                        # generation moved to V2).
+                        # cache exists to prevent.
                         if self._generation != versions:
                             pass
                         elif size > self.max_total_bytes:
                             # Too big to ever fit -- skip caching it rather
-                            # than evicting everything else to make room
-                            # (#917 review finding 8).
+                            # than evicting everything else to make room.
                             pass
                         else:
                             if key in self._cache:
@@ -427,9 +417,9 @@ class AggregateCache:
                     # a second, fully redundant computation rather than
                     # falling into the (already-set, so non-blocking)
                     # follower path and getting the same "compute it
-                    # myself" fallback that path already has (#917 review
-                    # nit: single-flight is best-effort, not exact, but this
-                    # ordering narrows the gap).
+                    # myself" fallback that path already has. Single-flight
+                    # is best-effort, not exact, but this ordering narrows
+                    # the gap.
                     event.set()
                     with self._lock:
                         self._in_flight.pop(key, None)

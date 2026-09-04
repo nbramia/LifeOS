@@ -1,11 +1,10 @@
 """
 Unit tests for GET /api/crm/network's centered-neighborhood selection logic
 (api/routes/crm.py::get_network_graph), using hand-built fixtures and
-patched stores rather than a running server or real data (#896 adversarial
-review of #870/PR #896).
+patched stores rather than a running server or real data.
 
 These call the route handler function directly (bypassing HTTP), following
-the pattern established in test_crm_people_list_batching.py for #880.
+the pattern established in test_crm_people_list_batching.py.
 """
 from unittest.mock import patch
 
@@ -105,10 +104,10 @@ def _call_network_graph(person_store, rel_store, source_store=None, **overrides)
 
 
 class TestLegacyIdNeighbor:
-    """#896 review finding 1: a relationship row whose neighbor endpoint is
-    a merged-away (legacy) id must not produce a duplicate node id, must
-    still connect to the centre, and must compute the same edge weight as
-    the pre-#870 formula would for the same real-world pair."""
+    """A relationship row whose neighbor endpoint is a merged-away (legacy)
+    id must not produce a duplicate node id, must still connect to the
+    centre, and must compute its edge weight by resolving the neighbor to
+    its canonical id first."""
 
     def test_unique_node_and_centre_edge_for_non_owner_pair(self, monkeypatch):
         monkeypatch.setattr(settings, "my_person_id", "owner-not-in-graph")
@@ -139,19 +138,18 @@ class TestLegacyIdNeighbor:
         edge_pairs = {frozenset((e.source, e.target)) for e in result.edges}
         assert frozenset(("center", "canonical-neighbor")) in edge_pairs
 
-        # Neither side is the owner, so the OLD formula (and the fixed one)
-        # both use pair_strength here - this pins that the edge is present
-        # and correctly weighted, not silently dropped.
+        # Neither side is the owner, so this edge is weighted by
+        # pair_strength; pins that it's present and correctly weighted,
+        # not silently dropped.
         matching = [e for e in result.edges
                     if frozenset((e.source, e.target)) == frozenset(("center", "canonical-neighbor"))]
         assert len(matching) == 1
         assert matching[0].weight == legacy_rel.pair_strength
 
     def test_owner_edge_weight_uses_canonical_relationship_strength(self, monkeypatch):
-        """The specific numeric bug from the review: looking up the OTHER
-        person by their legacy id in a canonical-keyed people dict misses
-        and silently falls back to pair_strength instead of their real
-        relationship_strength."""
+        """Looking up the other person by their legacy id in a
+        canonical-keyed people dict must resolve to their real
+        relationship_strength, not silently fall back to pair_strength."""
         monkeypatch.setattr(settings, "my_person_id", "owner-id")
 
         owner = PersonEntity(id="owner-id", canonical_name="Owner")
@@ -181,9 +179,9 @@ class TestLegacyIdNeighbor:
 
 
 class TestSecondDegreeTier:
-    """#896 review finding 3: depth>=2 must still surface second-degree
-    nodes for a well-connected centre, instead of first-degree selection
-    silently consuming the whole max_nodes budget."""
+    """depth>=2 must still surface second-degree nodes for a well-connected
+    centre, instead of first-degree selection consuming the whole
+    max_nodes budget."""
 
     def test_second_degree_nodes_appear_for_well_connected_centre(self, monkeypatch):
         monkeypatch.setattr(settings, "my_person_id", "nobody")
@@ -216,13 +214,13 @@ class TestSecondDegreeTier:
 
         first_degree_count = sum(1 for n in result.nodes if n.degree == 1)
         # 75% of max_nodes=10 -> 7, so first-degree must not consume all 9
-        # non-centre slots the old code would have given it.
+        # non-centre slots.
         assert first_degree_count <= 7
 
     def test_depth_one_uses_full_budget_for_first_degree(self, monkeypatch):
-        """depth=1 has no deeper tier, so it should NOT apply the 75% split
-        -- first-degree gets the full remaining budget, matching pre-#896
-        behavior for a one-hop request."""
+        """depth=1 has no deeper tier, so it must not apply the 75% split --
+        first-degree gets the full remaining budget for a one-hop
+        request."""
         monkeypatch.setattr(settings, "my_person_id", "nobody")
 
         people = {"center": PersonEntity(id="center", canonical_name="Center")}
@@ -243,27 +241,23 @@ class TestSecondDegreeTier:
         assert first_degree_count == 9  # all 9 candidates fit max_nodes-1
 
     def test_dense_centre_still_returns_genuine_second_degree_nodes(self, monkeypatch):
-        """#896 review round 4, MAJOR finding: the reserved second-degree
-        budget was being reclaimed by direct connections that missed the
-        first-degree cut (re-discovered through a friend, then promoted
-        back to degree 1 by the finding-4 relabelling), leaving nothing
-        for genuine friends-of-friends on a dense centre. Fixed by skipping
-        ids already in all_direct_candidates during deeper-hop expansion.
+        """Deeper-hop expansion must skip ids already in
+        all_direct_candidates, so the reserved second-degree budget can't
+        be consumed by direct connections that missed the first-degree cut
+        (re-discovered through a friend, then relabeled to degree 1),
+        leaving nothing for genuine friends-of-friends on a dense centre.
 
-        `max_second_degree_per_node=1` here is deliberate (#896 review round
-        5 nit): with a larger limit, a genuine friend can slip in on the
-        same first-degree node's turn even without the skip, since that
-        node's own budget covers both candidates - the earlier version of
-        this test passed regardless of whether the skip existed. With
-        limit=1, only ONE second-degree slot is even fetched per
-        first-degree node, so which one it is matters: the first 5
-        first-degree nodes here only know a "missed" direct candidate, and
-        the last 2 only know a genuine friend. Without the skip, the first
-        5 nodes' "missed" additions (later relabeled to degree 1, but only
-        after they've already occupied the reserved budget during
-        traversal) exhaust the 2-slot reserved budget before the 2
-        friend-only nodes are ever reached - so this only passes when the
-        skip is actually skipping."""
+        `max_second_degree_per_node=1` here is deliberate: with a larger
+        limit, a genuine friend can slip in on the same first-degree node's
+        turn even without the skip, since that node's own budget covers
+        both candidates. With limit=1, only ONE second-degree slot is even
+        fetched per first-degree node, so which one it is matters: the
+        first 5 first-degree nodes here only know a "missed" direct
+        candidate, and the last 2 only know a genuine friend. Without the
+        skip, the first 5 nodes' "missed" additions (later relabeled to
+        degree 1, but only after they've already occupied the reserved
+        budget during traversal) exhaust the 2-slot reserved budget before
+        the 2 friend-only nodes are ever reached."""
         monkeypatch.setattr(settings, "my_person_id", "nobody")
 
         people = {"center": PersonEntity(id="center", canonical_name="Center")}
@@ -279,9 +273,9 @@ class TestSecondDegreeTier:
             ))
 
         # first0..first4 each know only ONE of the "missed" direct
-        # candidates (the old bug's re-entry path) - no genuine friend at
-        # all. first5/first6 each know only ONE genuine friend-of-friend
-        # who has no relationship with the centre at all.
+        # candidates - no genuine friend at all. first5/first6 each know
+        # only ONE genuine friend-of-friend who has no relationship with
+        # the centre at all.
         neighbor_rels_by_id = {}
         for i in range(5):
             first_id = f"first{i}"
@@ -314,12 +308,13 @@ class TestSecondDegreeTier:
 
 
 class TestFirstDegreeRankedByRenderedWeight:
-    """#896 review finding 5: replaces the old circular test (which compared
-    the endpoint's output against get_top_neighbors, the very function it
-    used to rank candidates, so it could not fail on a wrong ranking).
-    Uses a hand-built fixture with a KNOWN correct order by the real
-    rendered edge weight, deliberately opposite the shared-count-sum proxy's
-    order, so a proxy-based implementation would fail this test."""
+    """First-degree ranking must be verifiable against an independent
+    expected order, not the same function (get_top_neighbors) the endpoint
+    itself uses to rank candidates, so a wrong ranking can actually fail
+    this test. Uses a hand-built fixture with a KNOWN correct order by the
+    real rendered edge weight, deliberately opposite the
+    shared-count-sum proxy's order, so a proxy-based implementation would
+    fail this test."""
 
     def test_ranks_by_pair_strength_not_shared_count_sum(self, monkeypatch):
         from datetime import datetime, timedelta, timezone
@@ -362,9 +357,9 @@ class TestFirstDegreeRankedByRenderedWeight:
 
 
 class TestMaxEdgesAlwaysIncludesCentreEdges:
-    """#896 review findings 2 and 4: max_edges bounds the TOTAL edges
-    returned, but every edge touching the centre is unconditionally
-    included even if that alone exceeds max_edges."""
+    """max_edges bounds the TOTAL edges returned, but every edge touching
+    the centre is unconditionally included even if that alone exceeds
+    max_edges."""
 
     def test_centre_edges_survive_a_tiny_max_edges(self, monkeypatch):
         monkeypatch.setattr(settings, "my_person_id", "nobody")
@@ -426,10 +421,9 @@ class TestMaxEdgesAlwaysIncludesCentreEdges:
 
 
 class TestCentreEdgeSkippedWhenCentreFiltered:
-    """#896 review round 3, MAJOR finding 3: emitting centre edges
-    unconditionally after only checking the OTHER endpoint broke edge
-    closure whenever the centre itself didn't survive the category/
-    min_strength filter."""
+    """A centre edge must not be emitted after checking only the OTHER
+    endpoint: edge closure requires the centre itself to also survive the
+    category/min_strength filter."""
 
     def test_no_edge_names_the_filtered_out_centre(self, monkeypatch):
         monkeypatch.setattr(settings, "my_person_id", "nobody")
@@ -460,31 +454,20 @@ class TestCentreEdgeSkippedWhenCentreFiltered:
 
 
 class TestDegreeRelabeling:
-    """#896 review round 3, MINOR finding 4, refined by rounds 4 and 5:
-    `degree` must mean "has a direct edge to the centre."
+    """`degree` must mean "has a direct edge to the centre."
 
-    Round 3 achieved this by relabelling a direct connection that missed
-    the first-degree cut back to degree 1 if a friend happened to
-    re-introduce it as "second-degree" - but round 4 found that re-entry
-    path was reclaiming the whole budget reserved for genuine
-    friends-of-friends on a dense centre, so deeper-hop expansion was
-    changed to skip any id already known to be a direct connection of the
-    centre (see TestSecondDegreeTier's dense-centre test) instead of
-    relying on relabelling to clean it up afterward.
-
-    Round 5 found that skip alone made a missed-cut direct connection
-    disappear from the response entirely whenever the reserved tier didn't
-    have a genuine friend-of-friend to spend its budget on - a real
-    first-degree person, shown by every prior version of this endpoint,
-    now simply absent even though there was room for them. The fix
-    backfills any leftover budget from the next-strongest direct
-    candidates (ranked, category-filtered the same way first-degree
-    selection was) instead of leaving those slots unused. `all_direct_candidates`'s
-    relabelling loop is kept in `api/routes/crm.py` as a backstop that
-    should no longer be reachable in practice; this test locks down the
-    backfill as the mechanism that brings a missed-cut direct connection
-    back, with degree 1 and its own centre edge - not a "second-degree"
-    relabel."""
+    Deeper-hop expansion skips any id already known to be a direct
+    connection of the centre (see TestSecondDegreeTier's dense-centre
+    test), so a direct connection that missed the first-degree cut doesn't
+    consume the second-degree budget reserved for genuine
+    friends-of-friends. Any budget that tier leaves unused is backfilled
+    from the next-strongest direct candidates (ranked, category-filtered
+    the same way first-degree selection is), which is how a missed-cut
+    direct connection comes back -- with degree 1 and its own centre edge,
+    not a "second-degree" relabel. `all_direct_candidates`'s relabelling
+    loop stays in `api/routes/crm.py` as a backstop that should not be
+    reachable in practice; this test locks down the backfill as the
+    mechanism that actually restores such a connection."""
 
     def test_direct_neighbor_that_missed_the_cut_is_backfilled_as_degree_one(self, monkeypatch):
         monkeypatch.setattr(settings, "my_person_id", "nobody")
@@ -544,13 +527,12 @@ class TestDegreeRelabeling:
 
 
 class TestCategoryPredicateConsistency:
-    """#896 review round 3, MINOR finding 5: selection used
-    compute_person_category() with batched source entities, while the
-    node-building filter re-checked with a different (raw attribute)
-    predicate -- a candidate could be selected under one decision and then
-    dropped under another. Fixed by having the node-building filter trust
-    an id already confirmed during selection instead of re-deriving a
-    possibly different answer."""
+    """The node-building filter must trust an id already confirmed during
+    selection instead of re-deriving a possibly different answer: selection
+    uses compute_person_category() with batched source entities, so a
+    node-building filter that re-checked with a different (raw attribute)
+    predicate could drop a candidate that was selected under the batched
+    decision."""
 
     def test_candidate_confirmed_via_batched_sources_is_not_dropped_by_the_cheap_check(self, monkeypatch):
         from api.services.source_entity import SourceEntity

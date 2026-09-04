@@ -1,5 +1,5 @@
 """
-Tests for the per-route request timing middleware and summary (#877).
+Tests for the per-route request timing middleware and summary.
 
 Deliberately built against a *tiny* FastAPI app rather than `from api.main
 import app` -- importing the real app pulls in chromadb/sentence-transformers
@@ -30,7 +30,7 @@ def _reset_route_timing_store():
     regardless of which FastAPI app instance it attaches to. Resetting
     before *and* after each test keeps assertions against that singleton
     order-independent, rather than relying on file/class ordering or
-    scattered inline `store.reset()` calls (#877 review)."""
+    scattered inline `store.reset()` calls."""
     store = get_route_timing_store()
     store.reset()
     yield
@@ -172,7 +172,7 @@ class TestExceptionPath:
     ):
         """A generator that raises after its first chunk has already sent a
         200 -- the client saw 200, so the log must say 200, not 500, and
-        must mark the response as aborted (#877 review, finding 5)."""
+        must mark the response as aborted."""
         monkeypatch.setattr(settings, "slow_request_ms", 0)
         app = _build_app()
         client = TestClient(app, raise_server_exceptions=False)
@@ -219,10 +219,10 @@ class TestStreaming:
 
 class TestSSEExclusion:
     """A `text/event-stream` response is tracked separately from every other
-    route (#877 review, finding 1): it never appears in `summary()`, never
-    counts toward `slow_count`, and never fires the slow-request log --
-    an SSE connection's duration is however long the client kept it open,
-    not a latency measurement."""
+    route: it never appears in `summary()`, never counts toward
+    `slow_count`, and never fires the slow-request log -- an SSE
+    connection's duration is however long the client kept it open, not a
+    latency measurement."""
 
     def test_sse_response_excluded_from_routes_summary_and_log(self, monkeypatch, caplog):
         # A near-zero threshold would make an ordinary route log on every
@@ -293,7 +293,7 @@ class TestPathsend:
     """`http.response.pathsend` (zero-copy file responses, e.g. `FileResponse`
     when the ASGI server advertises the extension) is accounted for from the
     preceding `http.response.start`'s Content-Length header, without
-    stat'ing the file again on the event loop (#877 review, finding 6).
+    stat'ing the file again on the event loop.
 
     Driven directly against the middleware with a fake inner ASGI app,
     since neither `TestClient`'s transport nor uvicorn on this host
@@ -491,8 +491,7 @@ class TestOverhead:
     than as two sequential phases -- a sequential measurement puts any
     change in host load between the phases entirely into the delta, which
     fails ~50% of the time on a busy shared host even though the
-    middleware's actual overhead is well under budget (#877 review,
-    finding 2)."""
+    middleware's actual overhead is well under budget."""
 
     def test_overhead_under_1ms_median_paired(self, monkeypatch):
         monkeypatch.setattr(settings, "slow_request_ms", 100_000)  # never log
@@ -542,8 +541,8 @@ class TestOverhead:
 class TestExclusionAllowlist:
     """Health and static routes are excluded from the summary entirely, and
     only as a full path segment -- a route that merely starts with the same
-    characters (e.g. `/healthz-admin`) is not swept in (#877 review,
-    finding 7, matching the `_in_gzip_scope` convention in api/main.py)."""
+    characters (e.g. `/healthz-admin`) is not swept in (matching the
+    `_in_gzip_scope` convention in api/main.py)."""
 
     def test_health_and_static_are_excluded(self, monkeypatch):
         monkeypatch.setattr(settings, "slow_request_ms", 100_000)

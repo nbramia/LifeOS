@@ -412,6 +412,7 @@ Full standards in [docs/AGENTS.md](docs/AGENTS.md). Key rules:
 - **No task lists in specs.** Specs describe target state. Tasks go in `docs/plans/` or GitHub issues.
 - **Synthetic data only** in all examples and test fixtures.
 - **Completed plans** must be moved to `docs/plans/archive/`.
+- **Current behavior only, everywhere.** Docs, code comments, docstrings, and test docstrings describe the system as it is — no "before/now", review rounds, findings, or issue/PR numbers cited as history. Git history holds that narrative.
 
 ---
 

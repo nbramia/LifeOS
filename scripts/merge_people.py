@@ -134,7 +134,7 @@ def _tone_analysis_results_table_exists(conn: sqlite3.Connection) -> bool:
     lazily by ToneAnalysisStore on its first use
     (api/services/tone_analysis_store.py) rather than always being
     present, so a crm.db where tone analysis has never run doesn't have it
-    yet (#910).
+    yet.
     """
     return conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='tone_analysis_results'"
@@ -549,8 +549,8 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
             )
         logger.info(f"   Facts cleared: {stats['facts_cleared']}")
 
-        # 4b-2. Remove tone analysis results for the absorbed person only
-        # (#910). Unlike facts (cleared for *both* ids, above), the
+        # 4b-2. Remove tone analysis results for the absorbed person only.
+        # Unlike facts (cleared for *both* ids, above), the
         # primary's own tone_analysis_results rows are deliberately left
         # alone: each row's freshness is already keyed to a stored
         # interaction_count compared against the person's *current*

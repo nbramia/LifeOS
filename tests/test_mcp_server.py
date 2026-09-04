@@ -467,7 +467,7 @@ def test_call_api_skips_cache_when_session_id_missing():
 
 
 # ---------------------------------------------------------------------------
-# lifeos_people_search limit (#872)
+# lifeos_people_search limit
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -528,8 +528,8 @@ def test_people_search_tool_schema_advertises_limit_default_and_cap(openapi_spec
     and max (50) even though the API itself defaults to 20 with a 200 cap.
 
     Builds the server against the in-process OpenAPI spec (this checkout's
-    code), not whatever's live on localhost:8000 — a running server may
-    still be on pre-#872 code and wouldn't have the `limit` param yet.
+    code), not whatever's live on localhost:8000 — a running server may be
+    on older code and wouldn't have the `limit` param yet.
     """
     import importlib.util
     spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
@@ -573,11 +573,11 @@ def _synthetic_people(n):
 
 @pytest.mark.unit
 def test_people_search_formatter_header_reports_total_not_page_size():
-    """#872 review finding 3: with `limit` now bounding the page, the header
-    must report the true match count (`total`), not just how many rows are
-    in this page -- otherwise a broad query silently looks exhaustive and
-    the caller loses the "there are many more, narrow your query" signal.
-    The ten person blocks themselves must stay byte-identical either way."""
+    """With `limit` bounding the page, the header must report the true
+    match count (`total`), not just how many rows are in this page --
+    otherwise a broad query silently looks exhaustive and the caller loses
+    the "there are many more, narrow your query" signal. The ten person
+    blocks themselves must stay byte-identical either way."""
     import importlib.util
     spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -602,7 +602,7 @@ def test_people_search_formatter_header_reports_total_not_page_size():
 @pytest.mark.unit
 def test_people_search_formatter_falls_back_to_page_size_without_total():
     """A response with no `total` field must not crash and should fall back
-    to the page size, matching the pre-#872 header exactly."""
+    to reporting the page size as the count."""
     import importlib.util
     spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
     module = importlib.util.module_from_spec(spec)

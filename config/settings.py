@@ -322,9 +322,9 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, alias="LIFEOS_PORT")
     host: str = Field(default="0.0.0.0", alias="LIFEOS_HOST")
 
-    # Observability (#877): threshold for the request-timing middleware's
-    # slow-request warning log and the slow_count field in
-    # GET /api/perf/routes. Milliseconds, wall-clock, per request.
+    # Threshold for the request-timing middleware's slow-request warning log
+    # and the slow_count field in GET /api/perf/routes. Milliseconds,
+    # wall-clock, per request.
     slow_request_ms: int = Field(
         default=500,
         alias="LIFEOS_SLOW_REQUEST_MS",

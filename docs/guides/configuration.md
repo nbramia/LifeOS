@@ -20,7 +20,7 @@ Each section corresponds roughly to a section in [`config/settings.py`](../../co
 |---|---|---|---|
 | `LIFEOS_HOST` | str | `0.0.0.0` | API server bind address. Keep `0.0.0.0` for Tailscale access; `127.0.0.1` to restrict to localhost only. |
 | `LIFEOS_PORT` | int | `8000` | API server port. |
-| `LIFEOS_SLOW_REQUEST_MS` | int | `500` | Threshold (ms) above which `RouteTimingMiddleware` logs one WARNING for a request and counts it toward `slow_count` in `GET /api/perf/routes` (#877). See [Observability](../specs/technical/observability.md#route-timing). |
+| `LIFEOS_SLOW_REQUEST_MS` | int | `500` | Threshold (ms) above which `RouteTimingMiddleware` logs one WARNING for a request and counts it toward `slow_count` in `GET /api/perf/routes`. See [Observability](../specs/technical/observability.md#route-timing). |
 | `LIFEOS_SERVER_HOSTNAME` | str | — | Hostname of the one machine designated to run the LifeOS API server (e.g. `<your-host>`, matching `hostname`/`socket.gethostname()` there). Empty (default) disables the guard so a fresh clone is never blocked. When set, `api/main.py` and `scripts/server.sh` refuse to start on any other machine — other machines should point at the designated host via `LIFEOS_API_URL` instead of running their own server (#506). |
 | `LIFEOS_CHROMA_URL` | str | `http://localhost:8001` | ChromaDB server endpoint the API connects to. |
 | `LIFEOS_CHROMA_PATH` | path | `./data/chromadb` | Where ChromaDB persists its data. |

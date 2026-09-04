@@ -82,7 +82,7 @@ curl "http://localhost:8000/api/perf/traces?limit=10" | jq        # Recent trace
 curl http://localhost:8000/api/perf/traces/{trace_id} | jq        # Single trace
 ```
 
-### What's slow right now (#877)
+### What's slow right now
 
 Every HTTP request (not just chat turns) is timed by `RouteTimingMiddleware`. Sorted by p95 descending, so the slowest routes are at the top:
 

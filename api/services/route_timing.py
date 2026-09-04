@@ -1,12 +1,11 @@
 """
-Per-route request timing (#877).
+Per-route request timing.
 
 Complements `api/services/perf_trace.py` (which records LLM/chat-turn spans
 for a conversation) with an always-on summary of every HTTP request: how
 long it took, whether it counted as slow, and how large the response was.
 This is a live "what's slow right now" signal -- process-local, bounded, and
-reset on restart, not a persisted history (#733 covers persisted rollups
-that this can feed).
+reset on restart, not a persisted history.
 
 Usage:
     from api.services.route_timing import RouteTimingMiddleware, get_route_timing_store
@@ -38,7 +37,7 @@ _WINDOW_SIZE = 200
 # are exactly what an operator wants visible in the summary.
 #
 # Matched as a full path segment, not a bare prefix (same convention as
-# `_in_gzip_scope` in api/main.py, #895) -- so a future `/healthz-admin` or
+# `_in_gzip_scope` in api/main.py) -- so a future `/healthz-admin` or
 # `/staticmaps` route isn't silently swept into the exclusion.
 _EXCLUDED_ROUTES = ("/health", "/static")
 
@@ -77,9 +76,9 @@ class RouteTimingStore:
     Long-lived streaming responses (SSE) are tracked separately in
     `stream_summary()` -- see `record_stream()` for why: a duration that
     equals "how long the browser tab was open" is not a latency signal and
-    must never dominate this summary or the slow-request log (#877 review).
+    must never dominate this summary or the slow-request log.
 
-    Handlers run in FastAPI's threadpool (#868), so recording must be safe
+    Handlers run in FastAPI's threadpool, so recording must be safe
     under concurrent calls from multiple threads; a single lock around the
     small dict/deque mutations is cheap enough not to matter for overhead.
     """
@@ -197,7 +196,7 @@ def _header_value(headers: List[Tuple[bytes, bytes]], name: bytes) -> Optional[b
 
 
 class RouteTimingMiddleware:
-    """Pure-ASGI middleware timing every HTTP request (#877).
+    """Pure-ASGI middleware timing every HTTP request.
 
     Records duration, status, and response size into `RouteTimingStore`,
     keyed by (method, route template) read from `scope["route"]` once

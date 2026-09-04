@@ -1,12 +1,10 @@
 """
 Tests for scripts/cleanup_orphaned_records.py's tone_analysis_results
-handling (#910).
+handling.
 
-No test file previously existed for this script at all. `cleanup_orphaned_records`
-reads/writes `data/people_entities.json`, `data/crm.db`, and `data/interactions.db`
-via hardcoded relative paths -- deliberately not something #910 should change
-(the script has always worked this way, for every other table it covers) --
-so these tests `monkeypatch.chdir` into a temp directory shaped like a real
+`cleanup_orphaned_records` reads/writes `data/people_entities.json`,
+`data/crm.db`, and `data/interactions.db` via hardcoded relative paths, so
+these tests `monkeypatch.chdir` into a temp directory shaped like a real
 `data/` tree rather than patching the function's internals.
 """
 import json

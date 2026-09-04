@@ -1,12 +1,11 @@
 """
-Regression test for the #869/#880 follow-up: GET /api/crm/people (and
-GET /birthdays/today) must batch the per-page source-entity fetch that
-compute_person_category()'s include_related=False fallback needs, via
-SourceEntityStore.get_for_people_batch(), instead of calling
-SourceEntityStore.get_for_person() once per person on the page.
+GET /api/crm/people (and GET /birthdays/today) must batch the per-page
+source-entity fetch that compute_person_category()'s include_related=False
+fallback needs, via SourceEntityStore.get_for_people_batch(), instead of
+calling SourceEntityStore.get_for_person() once per person on the page.
 
-The bug this guards against: fetching source entities per person (even
-through PersonEntityStore.get_all()'s hydration cache) makes list_people()'s
+Fetching source entities per person (even through
+PersonEntityStore.get_all()'s hydration cache) would make list_people()'s
 warm latency scale with the number of returned people, defeating the point
 of caching get_all() -- a strength-sorted CRM page is dominated by the
 highest-interaction people, many of whom have very large source-entity

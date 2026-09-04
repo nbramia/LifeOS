@@ -1,25 +1,19 @@
 """
 Static guard: CRM, people, and photos route handlers run off the event loop
-when they can (#868).
+when they can.
 
-Every request to these routers used to run as `async def` even when its body
-did no async work at all, so FastAPI dispatched it straight onto the single
-event loop instead of the worker threadpool. One slow handler (a full
-people-list scan, a relationship tone analysis) then blocked every other
-request on the process — chat, Telegram, voice, MCP, and other CRM tabs —
-until it finished. A plain `def` handler is dispatched to the threadpool
-automatically; an `async def` handler with nothing to await gets none of
-that and instead runs inline on the loop.
+A plain `def` handler is dispatched to the threadpool automatically; an
+`async def` handler with nothing to await gets none of that and instead
+runs inline on the event loop, so one slow handler (a full people-list
+scan, a relationship tone analysis) can block every other request on the
+process — chat, Telegram, voice, MCP, and other CRM tabs — until it
+finishes.
 
 This walks the CRM, people, and photos routers and fails if any handler is a
 coroutine function whose own body contains no `await`/`async for`/`async
-with` — the exact regression this issue fixes. This scope is deliberate:
-the same convention applies project-wide (see
-docs/specs/standards/python-conventions.md), but an AST scan of the rest of
-`api/routes/` at review time found 95 more `async def` handlers with no
-`await` across 23 other modules — converting those is out of scope for
-#868, so this guard, like the docs it enforces, is scoped to the three
-routers this issue actually changed.
+with`. This scope is deliberate: the same convention applies project-wide
+(see docs/specs/standards/python-conventions.md), but this guard is
+scoped to these three routers.
 
 The check is AST-based rather than a substring search on the source text:
 `"await" not in source` would pass vacuously for a handler whose docstring

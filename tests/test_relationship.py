@@ -318,7 +318,7 @@ class TestRelationshipStore:
 
 
 class TestGetTopNeighbors:
-    """Tests for RelationshipStore.get_top_neighbors() (#870)."""
+    """Tests for RelationshipStore.get_top_neighbors()."""
 
     def test_orders_by_summed_shared_counts_desc(self, store):
         """Strongest neighbor (highest summed shared counts) comes first."""
@@ -369,7 +369,7 @@ class TestGetTopNeighbors:
     def test_tied_scores_break_deterministically_by_id(self, store):
         """Two relationships tied on the count-sum proxy resolve to a stable
         order (by relationship id), not whatever order SQLite happens to
-        return (#896 review finding 9)."""
+        return."""
         r1 = store.add(Relationship(person_a_id="center", person_b_id="tied1", shared_events_count=5))
         r2 = store.add(Relationship(person_a_id="center", person_b_id="tied2", shared_events_count=5))
         expected_order = sorted([r1.id, r2.id])
@@ -382,7 +382,7 @@ class TestGetTopNeighbors:
 
     def test_shares_a_passed_in_connection(self, store):
         """A caller-supplied `conn` is used (and left open) instead of the
-        store opening and closing its own (#896 review finding 11)."""
+        store opening and closing its own."""
         store.add(Relationship(person_a_id="center", person_b_id="other", shared_events_count=1))
 
         conn = store.open_connection()
@@ -397,12 +397,8 @@ class TestGetTopNeighbors:
     def test_only_hydrates_up_to_limit_relationships(self, store, monkeypatch):
         """The ranking and LIMIT happen in SQL, so from_row() is called at
         most `limit` times -- not once per relationship touching the
-        person. An earlier version of this method fetched every
-        relationship for the person via get_all_for_person() and ranked in
-        Python, which fixed the tiebreak but turned a bounded fetch into an
-        unbounded one on the network-graph endpoint's hottest path (#896
-        review round 3, BLOCKER 2: measured at ~39,600 Relationship
-        constructions for one real request, ~0.356s of a 0.549s response)."""
+        person, which would be an unbounded fetch on the network-graph
+        endpoint's hottest path."""
         for i in range(50):
             store.add(Relationship(person_a_id="center", person_b_id=f"p{i}", shared_events_count=i))
 
@@ -422,7 +418,7 @@ class TestGetTopNeighbors:
 
 
 class TestGetAllForPerson:
-    """Tests for RelationshipStore.get_all_for_person() (#896 review finding 5/10)."""
+    """Tests for RelationshipStore.get_all_for_person()."""
 
     def test_returns_every_relationship_for_person_unordered(self, store):
         """All relationships touching person_id come back, regardless of
@@ -451,7 +447,7 @@ class TestGetAllForPerson:
 
 
 class TestGetEdgesAmong:
-    """Tests for RelationshipStore.get_edges_among() (#870)."""
+    """Tests for RelationshipStore.get_edges_among()."""
 
     def test_returns_only_edges_with_both_endpoints_in_set(self, store):
         """An edge is included only when both its endpoints are in the set."""
@@ -480,10 +476,9 @@ class TestGetEdgesAmong:
 
     def test_correct_with_more_ids_than_sqlite_variable_limit(self, store):
         """Correct results when the id set is larger than SQLite's default
-        999-variable limit. The temp-table join this method uses (#896
-        review finding 4) has no `IN (...)` list at all, so there's no
-        chunking to reason about -- this just pins that a large id set
-        still works."""
+        999-variable limit. The temp-table join this method uses has no
+        `IN (...)` list at all, so there's no chunking to reason about --
+        this just pins that a large id set still works."""
         num_people = 1200
         ids = [f"person{i}" for i in range(num_people)]
 
@@ -506,7 +501,7 @@ class TestGetEdgesAmong:
 
     def test_shares_a_passed_in_connection(self, store):
         """A caller-supplied `conn` is used (and left open) instead of the
-        store opening and closing its own (#896 review finding 11)."""
+        store opening and closing its own."""
         store.add(Relationship(person_a_id="a", person_b_id="b"))
 
         conn = store.open_connection()

@@ -738,7 +738,7 @@ class TestPersonEntityStore:
 
 
 class TestMeFamilyAggregates:
-    """Tests for the person-store helpers #871 adds for the Me/Family
+    """Tests for the person-store helpers backing the Me/Family
     dashboards: get_by_ids, get_hidden_ids, get_ids_where, get_totals."""
 
     @pytest.fixture

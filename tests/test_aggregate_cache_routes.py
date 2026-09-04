@@ -1,8 +1,8 @@
 """
-Static + integration guard: the seven endpoints #876/#917 promise to cache
-actually carry the `AggregateCache` wrapper, and at least one of them
-demonstrably invalidates through a real `TestClient` request when an
-external connection commits to a temporary `crm.db` (#917 review finding 3).
+Static + integration guard: the seven cached CRM endpoints actually carry
+the `AggregateCache` wrapper, and at least one of them demonstrably
+invalidates through a real `TestClient` request when an external
+connection commits to a temporary `crm.db`.
 
 `tests/test_aggregate_cache.py` only ever decorates synthetic local
 functions with `AggregateCache.cached()` directly -- deleting
@@ -19,7 +19,7 @@ from api.routes.crm import router as crm_router
 
 pytestmark = pytest.mark.unit
 
-# The seven (method, path) pairs #876/#917 cache. Kept as a literal set
+# The seven (method, path) pairs that are cached. Kept as a literal set
 # (rather than re-deriving it from the router) so a change to what's cached
 # is a deliberate edit here too, not just a silent pass-through.
 CACHED_ROUTES = {
@@ -91,7 +91,7 @@ class TestRealRouteInvalidatesThroughTestClient:
     """A real HTTP request to a real decorated route hits the cache, and an
     external commit to a temporary crm.db (substituted for the process-wide
     singleton's watched path) forces a recompute -- proven through
-    TestClient, not a synthetic function (#917 review finding 3)."""
+    TestClient, not a synthetic function."""
 
     def test_birthdays_all_recomputes_after_an_external_crm_db_commit(
         self, tmp_path, monkeypatch,
