@@ -1,4 +1,4 @@
-"""Guard for tests/conftest.py's module-scoped UI-driver fixture overrides (#916).
+"""Guard for tests/conftest.py's module-scoped UI-driver fixture overrides.
 
 conftest.py redefines pytest-playwright's `playwright`/`browser_type`/
 `browser_context_args`/`launch_browser`/`browser` fixtures at module scope
@@ -50,13 +50,13 @@ _UI_DRIVER_FIXTURE_IDS = ["pw-driver", "pw-engine-type", "pw-context-args", "pw-
 )
 def test_upstream_ui_driver_fixture_signatures_unchanged(fixture_name, expected_params):
     assert hasattr(_pw_plugin, fixture_name), (
-        f"pytest_playwright.pytest_playwright no longer defines `{fixture_name}` -- "
-        "tests/conftest.py's module-scoped override (#916) delegates to it via "
+        f"pytest_playwright.pytest_playwright does not define `{fixture_name}` -- "
+        "tests/conftest.py's module-scoped override delegates to it via "
         "`.__wrapped__` and needs updating to match."
     )
     upstream = getattr(_pw_plugin, fixture_name)
     assert hasattr(upstream, "__wrapped__"), (
-        f"pytest_playwright.pytest_playwright.{fixture_name} no longer exposes "
+        f"pytest_playwright.pytest_playwright.{fixture_name} does not expose "
         "`.__wrapped__` -- a pytest-playwright or pytest version bump changed how "
         "`@pytest.fixture` wraps functions; update the delegation in tests/conftest.py."
     )

@@ -112,32 +112,29 @@ def test_frontend_fixture_paths_exist(path):
         f"test's fixtures are out of sync with the repo layout")
 
 
-# #919: test.sh used to read/write/rm a fixed, shared /tmp/lifeos_test_server.pid
-# from a stop_test_server() function — the same cross-worktree collision class
-# as #908 (fixed for scripts/pre-push in #913): two concurrent test.sh runs on
-# this box would clobber or kill each other's server via that shared path.
-# Investigation found the actual defect was narrower than that: nothing in the
-# repo ever wrote that file, and stop_test_server() was never called from
-# anywhere, so the fix is removal, not a per-run path (see the comment above
-# start_server_background() in scripts/test.sh). These two guards cover both
-# ways that bug could come back: the fixed shared path itself, and a
-# PID-tracking function reappearing without server.sh's port-based lifecycle
-# management (get_server_pid/lsof) actually needing one.
+# scripts/test.sh holds no PID for the server it starts -- not in a file, not
+# in a variable. scripts/server.sh owns the server's whole lifecycle and
+# identifies the process by port (`get_server_pid` via `lsof -ti :$PORT`), so
+# there is nothing for test.sh to track, and a fixed PID path under /tmp
+# would be shared by every worktree and agent on the box: two concurrent
+# test.sh runs could clobber each other's PID or kill each other's server.
+# These two guards keep that shape out of test.sh: a fixed shared path, or a
+# PID-tracking helper appearing while server.sh's port-based lifecycle
+# management still makes it unnecessary.
 @pytest.mark.unit
 def test_no_fixed_shared_pid_path():
     text = SCRIPT.read_text()
     assert "/tmp/lifeos_test_server" not in text, (
-        "scripts/test.sh reintroduced a fixed shared /tmp PID path — this is "
-        "the #908/#913 collision class: concurrent test.sh runs from "
-        "different worktrees would clobber or kill each other's server "
-        "process. If a PID file is genuinely needed again, key it per-run "
-        "the way scripts/pre-push does (see PR #913), not on a fixed path."
+        "scripts/test.sh contains a fixed shared /tmp PID path: concurrent "
+        "test.sh runs from different worktrees would clobber or kill each "
+        "other's server process. If a PID file is genuinely needed, key it "
+        "per-run the way scripts/pre-push keys its log path, never a fixed path."
     )
     assert "stop_test_server" not in text, (
-        "scripts/test.sh reintroduced a PID-tracking function — confirm it "
-        "is actually called from somewhere (server.sh already owns the test "
-        "server's lifecycle and identifies it by port), and if it's still "
-        "unreachable, remove it rather than leaving dead code behind."
+        "scripts/test.sh contains a PID-tracking function: confirm it is "
+        "actually called from somewhere (server.sh owns the test server's "
+        "lifecycle and identifies it by port), and if it is unreachable, "
+        "remove it rather than leaving dead code behind."
     )
 
 
@@ -145,7 +142,7 @@ def test_no_fixed_shared_pid_path():
 def test_server_owns_lifecycle_by_port():
     """server.sh -- not test.sh -- identifies and manages the test server,
     and it does so by port (lsof), never a PID file. That's why test.sh
-    doesn't need to track a PID of its own at all (see #919)."""
+    doesn't need to track a PID of its own at all."""
     server_sh = (REPO / "scripts" / "server.sh").read_text()
     assert "get_server_pid()" in server_sh
     assert "lsof -ti" in server_sh
