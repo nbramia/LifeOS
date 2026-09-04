@@ -16887,16 +16887,23 @@
 
             if (firstDegreeEdges.length === 0) return 0;
 
-            // Get weights of first-degree edges
-            const weights = firstDegreeEdges.map(l => l.weight);
+            // Weight range comes from ALL links (matching getGraphWeightStats(),
+            // which is what applyGraphFilters() actually turns a percent back
+            // into a threshold with), not just the first-degree ones. Picking a
+            // percent against a narrower first-degree-only range and then
+            // applying it against the full range is how a real response (e.g.
+            // first-degree weights 9-35 but other edges up to 99) could still
+            // pick a percent that excludes every first-degree edge once
+            // applied (#896 review round 4, MINOR finding 3).
+            const weights = links.map(l => l.weight);
             const maxWeight = weights.reduce((a, b) => Math.max(a, b), 1);
             const minWeight = weights.reduce((a, b) => Math.min(a, b), Infinity);
 
-            // Every first-degree edge shares one weight - there's no
-            // discriminating threshold to pick, and forcing a minimum
-            // weightRange of 1 below would make even a 5% step exclude
-            // every edge (weight >= minWeight + 0.05), blanking the whole
-            // tab (#896 review round 3 finding 1).
+            // Every edge shares one weight - there's no discriminating
+            // threshold to pick, and forcing a minimum weightRange of 1 below
+            // would make even a 5% step exclude every edge (weight >=
+            // minWeight + 0.05), blanking the whole tab (#896 review round 3
+            // finding 1).
             if (maxWeight === minWeight) return 0;
 
             const weightRange = Math.max(1, maxWeight - minWeight);
@@ -18222,8 +18229,29 @@
                 // Get memoized weight stats from FULL dataset (avoids recalculating on every filter change)
                 const weightStats = getGraphWeightStats();
                 const { maxWeight, minWeight, weightRange } = weightStats;
-                const threshold = minWeight + (weightRange * (thresholdPercent / 100));
+                let threshold = minWeight + (weightRange * (thresholdPercent / 100));
                 const secondThreshold = minWeight + (weightRange * (secondThresholdPercent / 100));
+
+                // Safety net, independent of calculateOptimalEdgeThreshold()'s
+                // own correctness: if the threshold this slider position maps
+                // to would exclude every first-degree edge (e.g. the slider
+                // was dragged manually, or the first-degree and full weight
+                // ranges still diverge for some case not accounted for), fall
+                // back to showing everything rather than rendering a blank
+                // tab (#896 review round 4, MINOR finding 3).
+                const firstDegreeEdgesAll = graphLinksAll.filter(l => {
+                    if (!l) return false;
+                    const isFirstDegree = l.source === graphCenterId || l.target === graphCenterId;
+                    return isFirstDegree && edgeHasSelectedSource(l, selectedSources);
+                });
+                if (firstDegreeEdgesAll.length > 0 && !firstDegreeEdgesAll.some(l => l.weight >= threshold)) {
+                    threshold = minWeight;
+                    if (slider) {
+                        slider.value = 0;
+                        const sliderLabel = document.getElementById('edgeStrengthValue');
+                        if (sliderLabel) sliderLabel.textContent = '0%';
+                    }
+                }
 
                 // Build node lookup by ID from ORIGINAL data
                 const nodeById = {};

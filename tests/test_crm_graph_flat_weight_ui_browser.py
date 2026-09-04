@@ -152,3 +152,153 @@ def test_calculate_optimal_edge_threshold_flat_weight_returns_zero(page: Page, c
         }
     """)
     assert varied_threshold > 0
+
+
+# 200 first-degree weights, evenly spread across 9-35 (integers, so some
+# repeat) -- with this many candidates spread this way, the OLD
+# first-degree-only threshold search settles on percent=85 (verified by
+# simulating the algorithm directly), which maps to threshold 9+90*0.85=
+# 85.5 against the full 9-99 range used elsewhere -- excluding every one
+# of these edges (max is 35). The 27-edges-in-a-row fixture used earlier
+# in this file settles on a much lower percent and doesn't reproduce the
+# bug; this distribution is what actually triggers it, matching the
+# reviewer's real-data report (#896 review round 4, MINOR finding 3).
+_DIVERGING_FIRST_DEGREE_WEIGHTS = [round(9 + (35 - 9) * i / 199) for i in range(200)]
+
+
+def _diverging_weight_range_fixture():
+    """First-degree edges span 9-35 (200 of them, see above), but a
+    second-degree edge in the same response goes up to 99.
+    calculateOptimalEdgeThreshold() used to compute its weight range from
+    first-degree edges only, so the percent it chose could still exclude
+    every first-degree edge once applyGraphFilters() applied that same
+    percent against the FULL edge range."""
+    nodes = [{
+        "id": CENTER_ID, "name": "Center", "category": "personal",
+        "strength": 50, "interaction_count": 10, "degree": 0,
+    }]
+    edges = []
+    for i, weight in enumerate(_DIVERGING_FIRST_DEGREE_WEIGHTS):
+        node_id = f"n{i}"
+        nodes.append({
+            "id": node_id, "name": f"Person {i}", "category": "personal",
+            "strength": 50, "interaction_count": 5, "degree": 1,
+        })
+        edges.append({
+            "source": CENTER_ID, "target": node_id, "weight": weight,
+            "type": "inferred",
+            "shared_events_count": 1, "shared_threads_count": 0, "shared_messages_count": 0,
+            "shared_whatsapp_count": 0, "shared_slack_count": 0, "shared_phone_calls_count": 0,
+            "shared_photos_count": 0, "is_linkedin_connection": False,
+        })
+    # A second-degree node connected to a first-degree one by a much
+    # stronger edge - widens the FULL weight range to 99 without adding
+    # any first-degree edge above 35.
+    nodes.append({
+        "id": "second0", "name": "Second", "category": "personal",
+        "strength": 50, "interaction_count": 5, "degree": 2,
+    })
+    edges.append({
+        "source": "n0", "target": "second0", "weight": 99, "type": "inferred",
+        "shared_events_count": 1, "shared_threads_count": 0, "shared_messages_count": 0,
+        "shared_whatsapp_count": 0, "shared_slack_count": 0, "shared_phone_calls_count": 0,
+        "shared_photos_count": 0, "is_linkedin_connection": False,
+    })
+    return {"nodes": nodes, "edges": edges}
+
+
+def test_diverging_weight_ranges_still_renders_first_degree_nodes(page: Page, crm_base_url):
+    """First-degree edges (9-35) and the full edge set (9-99) diverge -
+    the auto-selected threshold must still leave first-degree nodes
+    visible on load, not just the centre."""
+    fixture = _diverging_weight_range_fixture()
+
+    def handler(route):
+        if "/api/crm/network" in route.request.url:
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps(fixture))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    page.route("**/api/**", handler)
+    page.goto(f"{crm_base_url}/crm/{CENTER_ID}/graph")
+    page.wait_for_selector("#graphContainer")
+
+    page.evaluate("(id) => window.loadGraph(id)", CENTER_ID)
+    page.wait_for_timeout(300)
+
+    circle_count = page.locator("#graphContainer svg circle").count()
+    assert circle_count > 1, "expected first-degree nodes to render, not just the centre"
+
+
+def test_calculate_optimal_edge_threshold_uses_full_range_not_first_degree_only(page: Page, crm_base_url):
+    """The percent calculateOptimalEdgeThreshold() picks must remain valid
+    once applied against the SAME full-edge weight range
+    applyGraphFilters() actually uses - not a narrower first-degree-only
+    range computed internally and then discarded."""
+    page.goto(f"{crm_base_url}/crm/{CENTER_ID}/graph")
+    page.wait_for_function("typeof window.calculateOptimalEdgeThreshold === 'function'")
+
+    result = page.evaluate("""
+        (firstDegreeWeights) => {
+            const links = firstDegreeWeights.map((weight, i) => (
+                { source: 'center', target: 'n' + i, weight }
+            ));
+            links.push({ source: 'n0', target: 'second0', weight: 99 });
+
+            const percent = window.calculateOptimalEdgeThreshold([], links, 'center', 25);
+
+            // Reproduce applyGraphFilters()'s own threshold formula against
+            // the FULL edge set (matching getGraphWeightStats()) to check
+            // the chosen percent is actually usable.
+            const weights = links.map(l => l.weight);
+            const maxWeight = weights.reduce((a, b) => Math.max(a, b), 1);
+            const minWeight = weights.reduce((a, b) => Math.min(a, b), Infinity);
+            const weightRange = Math.max(1, maxWeight - minWeight);
+            const threshold = minWeight + weightRange * (percent / 100);
+
+            const firstDegreeEdges = links.filter(l => l.source === 'center' || l.target === 'center');
+            const visibleCount = firstDegreeEdges.filter(l => l.weight >= threshold).length;
+
+            return { percent, visibleCount };
+        }
+    """, _DIVERGING_FIRST_DEGREE_WEIGHTS)
+
+    assert result["visibleCount"] > 0, (
+        f"threshold derived from percent={result['percent']} excludes every first-degree edge"
+    )
+
+
+def test_apply_graph_filters_falls_back_when_manual_slider_would_blank_the_tab(page: Page, crm_base_url):
+    """Even if some future case still lets a bad percent through,
+    applyGraphFilters() itself must not render zero first-degree nodes -
+    dragging the slider to a percent that would exclude every first-degree
+    edge (100%, against the diverging 9-99 full range) must fall back to
+    showing everything instead."""
+    fixture = _diverging_weight_range_fixture()
+
+    def handler(route):
+        if "/api/crm/network" in route.request.url:
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps(fixture))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    page.route("**/api/**", handler)
+    page.goto(f"{crm_base_url}/crm/{CENTER_ID}/graph")
+    page.wait_for_selector("#graphContainer")
+
+    page.evaluate("(id) => window.loadGraph(id)", CENTER_ID)
+    page.wait_for_timeout(300)
+
+    page.evaluate("""
+        () => {
+            const slider = document.getElementById('edgeStrengthSlider');
+            slider.value = 100;
+            slider.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+    """)
+    page.wait_for_timeout(300)
+
+    circle_count = page.locator("#graphContainer svg circle").count()
+    assert circle_count > 1, "applyGraphFilters() did not fall back to threshold 0"

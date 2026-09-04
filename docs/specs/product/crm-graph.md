@@ -175,6 +175,14 @@ The Graph tab sends only `center_on` and `depth`, leaving the caps above at
 their server defaults so a future default change reaches the tab without a
 frontend edit.
 
+`allow_full_graph=true` combined with `category` now filters every person by
+the same dynamically-computed category the response displays for them
+(`compute_person_category(person, [])`), rather than their raw stored
+`category` field — more self-consistent than before (a person's displayed
+category and whether a category filter kept them can no longer disagree),
+and the only externally-visible change to the full-graph path from this
+issue's otherwise-untouched behavior.
+
 **Graph enhancements:**
 
 - **Fullscreen mode** — toggle expands the graph to the viewport (mobile + desktop).

@@ -242,6 +242,56 @@ class TestSecondDegreeTier:
         first_degree_count = sum(1 for n in result.nodes if n.degree == 1)
         assert first_degree_count == 9  # all 9 candidates fit max_nodes-1
 
+    def test_dense_centre_still_returns_genuine_second_degree_nodes(self, monkeypatch):
+        """#896 review round 4, MAJOR finding: the reserved second-degree
+        budget was being reclaimed by direct connections that missed the
+        first-degree cut (re-discovered through a friend, then promoted
+        back to degree 1 by the finding-4 relabelling), leaving nothing
+        for genuine friends-of-friends on a dense centre. Fixed by skipping
+        ids already in all_direct_candidates during deeper-hop expansion."""
+        monkeypatch.setattr(settings, "my_person_id", "nobody")
+
+        people = {"center": PersonEntity(id="center", canonical_name="Center")}
+        center_rels = []
+        # 12 genuine direct candidates - max_nodes=10 with depth>=2 caps
+        # first-degree at 7 (75%), so 5 of them ("missed0".."missed4")
+        # are real direct connections that just didn't rank high enough.
+        for i in range(12):
+            pid = f"first{i}" if i < 7 else f"missed{i - 7}"
+            people[pid] = PersonEntity(id=pid, canonical_name=pid)
+            center_rels.append(Relationship(
+                person_a_id="center", person_b_id=pid, shared_events_count=30 - i,
+            ))
+
+        # Each selected first-degree node also knows one of the "missed"
+        # direct candidates (the old bug's re-entry path) AND one genuine
+        # friend-of-friend who has no relationship with the centre at all.
+        neighbor_rels_by_id = {}
+        for i in range(7):
+            first_id = f"first{i}"
+            missed_id = f"missed{i % 5}"
+            friend_id = f"genuine_friend{i}"
+            people[friend_id] = PersonEntity(id=friend_id, canonical_name=friend_id)
+            neighbor_rels_by_id[first_id] = [
+                Relationship(person_a_id=first_id, person_b_id=missed_id, shared_events_count=10),
+                Relationship(person_a_id=first_id, person_b_id=friend_id, shared_events_count=9),
+            ]
+
+        person_store = _FakePersonStore(people_by_id=people)
+        rel_store = _FakeRelationshipStore(center_rels=center_rels, neighbor_rels_by_id=neighbor_rels_by_id)
+
+        result = _call_network_graph(
+            person_store, rel_store, depth=2, max_nodes=10, max_second_degree_per_node=5,
+        )
+
+        degree2_ids = {n.id for n in result.nodes if n.degree == 2}
+        assert degree2_ids, "expected at least one genuine second-degree node"
+        assert not any(nid.startswith("missed") for nid in degree2_ids), (
+            "a direct connection that missed the first-degree cut must never "
+            "be labeled degree 2"
+        )
+        assert any(nid.startswith("genuine_friend") for nid in degree2_ids)
+
 
 class TestFirstDegreeRankedByRenderedWeight:
     """#896 review finding 5: replaces the old circular test (which compared
@@ -390,13 +440,22 @@ class TestCentreEdgeSkippedWhenCentreFiltered:
 
 
 class TestDegreeRelabeling:
-    """#896 review round 3, MINOR finding 4: a node with a genuine direct
-    relationship to the centre must be labeled degree 1 (and get its centre
-    edge) even if the first-degree budget cut it and it was only
-    re-discovered through a friend -- `degree` must mean "has a direct edge
-    to the centre," not "was found in the first selection pass."""
+    """#896 review round 3, MINOR finding 4, as refined by round 4: `degree`
+    must mean "has a direct edge to the centre." Round 3 achieved this by
+    relabelling a direct connection that missed the first-degree cut back
+    to degree 1 if a friend happened to re-introduce it as "second-degree" -
+    but round 4 found that re-entry path was reclaiming the whole budget
+    reserved for genuine friends-of-friends on a dense centre. The deeper-hop
+    expansion now skips any id that's already a known direct connection of
+    the centre (see TestSecondDegreeTier's dense-centre test), so a missed
+    direct connection is no longer re-discoverable at all - it's simply
+    absent from a budget-constrained response, exactly like any other
+    candidate that didn't make the cut. `all_direct_candidates` is kept in
+    `api/routes/crm.py` as a relabelling backstop that should no longer be
+    reachable in practice; this test locks down the now-correct behavior
+    (absence, not relabelling) for the exact scenario round 3's test used."""
 
-    def test_direct_neighbor_that_missed_the_cut_is_relabeled_degree_one(self, monkeypatch):
+    def test_direct_neighbor_that_missed_the_cut_is_simply_absent(self, monkeypatch):
         monkeypatch.setattr(settings, "my_person_id", "nobody")
 
         people = {"center": PersonEntity(id="center", canonical_name="Center")}
@@ -413,8 +472,8 @@ class TestDegreeRelabeling:
             ))
 
         # first0 (the strongest, definitely selected) is also directly
-        # connected to "missed" - this is how "missed" gets re-discovered
-        # as a second-degree candidate.
+        # connected to "missed" - this is the round-3 re-entry path, which
+        # must now be skipped rather than followed.
         friend_rel = Relationship(person_a_id="first0", person_b_id="missed", shared_events_count=3)
 
         person_store = _FakePersonStore(people_by_id=people)
@@ -427,11 +486,11 @@ class TestDegreeRelabeling:
             person_store, rel_store, depth=2, max_nodes=10, max_second_degree_per_node=5,
         )
 
-        missed_node = next(n for n in result.nodes if n.id == "missed")
-        assert missed_node.degree == 1
+        node_ids = {n.id for n in result.nodes}
+        assert "missed" not in node_ids
 
         edge_pairs = {frozenset((e.source, e.target)) for e in result.edges}
-        assert frozenset(("center", "missed")) in edge_pairs
+        assert frozenset(("center", "missed")) not in edge_pairs
 
 
 class TestCategoryPredicateConsistency:

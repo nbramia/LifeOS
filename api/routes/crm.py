@@ -2804,6 +2804,18 @@ def get_network_graph(
                         other_canonical = person_store.get_canonical_id(other_raw)
                         if other_canonical in node_degrees:
                             continue
+                        if other_canonical in all_direct_candidates:
+                            # A genuine direct connection of the center
+                            # isn't a friend-of-friend - skip it here so the
+                            # budget reserved for deeper hops goes to actual
+                            # second-degree people instead of being spent
+                            # (and then immediately relabeled back to
+                            # degree 1 below) on centre connections that
+                            # merely missed the first-degree cut (#896
+                            # review round 4, MAJOR finding: this reclaimed
+                            # the whole reserved budget for dense centres,
+                            # collapsing the second-degree tier again).
+                            continue
                         if category:
                             # Cheap best-effort check (no batched
                             # source-entity fetch per intermediate node).
@@ -2818,7 +2830,10 @@ def get_network_graph(
         # A node that has a genuine direct relationship to the center is
         # relabeled degree 1 even if it was only added above via a friend
         # (#896 review round 3 finding 4) - and gets its guaranteed center
-        # edge, same as any other first-degree node.
+        # edge, same as any other first-degree node. The skip above means
+        # this shouldn't fire in practice any more (a direct candidate is
+        # never added as a deeper-hop node in the first place), but it's
+        # kept as a correctness backstop rather than relied upon.
         for node_id, rel in all_direct_candidates.items():
             if node_degrees.get(node_id, 0) > 1:
                 node_degrees[node_id] = 1
