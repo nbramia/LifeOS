@@ -682,7 +682,11 @@ def to_session_dict(meta: SessionMeta) -> dict[str, Any]:
     # cache_read so the existing UI columns line up.
     return {
         "session_id": meta.session_id,
-        "task_id": meta.raw_session_id,
+        # (#863) `raw_session_id` is the Codex rollout UUID, not a LifeOS
+        # task id — it poisoned `_build_board`'s task join. `SessionMeta`
+        # carries no LifeOS task link of its own; a hook-registered session
+        # gets one overlaid afterwards by `_apply_cli_session_to_dict`.
+        "task_id": None,
         "status": meta.status,
         "routing": "codex",
         "parent_session_id": None,

@@ -300,12 +300,28 @@ export function initGraph() {
 
   function nodeLabel(d) {
     // (#863) Precedence, first non-empty wins. `label` is skipped when it's
-    // just the session id (or a prefix of it) — that's not a human label,
-    // it's the id we fall back to at the very end anyway. Never emits '?'.
+    // not a human label but the raw identifier the row fell back to — the
+    // session id itself, that id with a known CLI prefix ("cc:"/"cx:")
+    // stripped, or the row's task_id — since both ingests and
+    // `_label_for_session` fall back to exactly those values when there's
+    // no real title. Compared by equality (after trimming), not by
+    // `startsWith`: a `startsWith` check never matches a prefixed session id
+    // ("cc:<uuid>".startsWith("<uuid>") is false), which let raw ids through
+    // as labels. Never emits '?'.
+    const norm = (v) => (v || '').toString().trim();
+    const label = norm(d.label);
+    const sessionId = norm(d.session_id);
+    const bareSessionId = sessionId.replace(/^(cc|cx):/, '');
+    const taskId = norm(d.task_id);
+    const labelIsRawId = !!label && (
+      label === sessionId ||
+      label === bareSessionId ||
+      (!!taskId && label === taskId)
+    );
     const candidates = [
       d.custom_label,
       d.short_label,
-      (d.label && d.session_id && d.session_id.startsWith(d.label)) ? '' : d.label,
+      labelIsRawId ? '' : d.label,
       d.prompt_preview,
       d.model_label,
       routingLabel(d.routing),

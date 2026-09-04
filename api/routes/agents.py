@@ -211,7 +211,7 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "total_active_seconds": round(s.total_active_seconds, 3),
         "expected_output": s.expected_output,
         "label": _label_for_session(s, events),
-        "model_label": _model_label_for_routing(s.routing, getattr(s, "model", None)),
+        "model_label": _model_label_for_routing(s.routing),
         # (#863) board-assignment + identity fields, passed through so the
         # panel and filters can surface them without re-deriving.
         "model": getattr(s, "model", None),
@@ -466,7 +466,7 @@ def _build_snapshot() -> dict[str, Any]:
     }
 
 
-def _model_label_for_routing(routing: str | None, model: str | None = None) -> str:
+def _model_label_for_routing(routing: str | None) -> str:
     if (routing or "local") == "local":
         return "Local"
     if routing == "ask":
@@ -487,10 +487,26 @@ def _model_label_for_routing(routing: str | None, model: str | None = None) -> s
         # (#850) Hermes sessions used to fall through to the Claude-model-name
         # guess below and get mislabeled "Claude" — Hermes runs its own
         # DeepSeek-backed engine, not an Anthropic model.
-        # (#863) When the session's `model` column is populated, surface it
-        # alongside "Hermes" — nothing else records what Hermes last used.
-        if model:
-            return f"Hermes · {model}"
+        # (#863 review) An earlier version of this suffix read `Session.model`
+        # — that column is written only by the board's operator-chosen model
+        # *picker* (`SessionStore.set_assignment`); `HermesExecutor` never
+        # reads or writes it, and a conversation-rooted Hermes session (the
+        # dominant path) passes no `model` at all, so the branch was
+        # unreachable there and, when it did fire, asserted a model Hermes
+        # was never actually told to use. `model_readout.py`'s
+        # `_last_observed_hermes_chat_model` is the one thing that DOES
+        # record what Hermes reported running — parsed from a real Hermes
+        # chat turn's `usage` event by `hermes_proxy.py`'s
+        # `_HermesTurnPersister`. It's a process-wide "last observed" value,
+        # not a per-session attribution — read defensively so a lookup
+        # failure just degrades to the plain "Hermes" label.
+        try:
+            from api.services.model_readout import _last_observed_hermes_chat_model
+            observed_model, _observed_at = _last_observed_hermes_chat_model()
+        except Exception:  # noqa: BLE001
+            observed_model = None
+        if observed_model:
+            return f"Hermes · {observed_model}"
         return "Hermes"
     if routing in ("claude_code", "code"):
         return "Claude Code"

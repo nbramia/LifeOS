@@ -129,20 +129,57 @@ class TestGetBoard:
         assert pq["question"] == "Which environment — staging or prod?"
         assert pq["session_id"] == session.session_id
 
-    def test_locally_scanned_cc_session_does_not_bogus_link_to_a_task(self, client, stores, monkeypatch):
+    def test_locally_scanned_cc_session_does_not_bogus_link_to_a_task(
+        self, client, stores, monkeypatch, tmp_path: Path,
+    ):
         """#863: `to_session_dict`'s `task_id` used to be the Claude Code
         UUID, so `_build_board`'s `sessions_by_task` join (keyed purely on
         truthiness) treated every locally scanned CC session as if it had a
         real LifeOS task link. A session with no real link (`task_id: None`,
-        the corrected shape) must not surface on any task's card."""
+        the corrected shape) must not surface on any task's card.
+
+        (#863 review) A prior version of this test monkeypatched
+        `_claude_code_snapshot` to return a literal dict with `task_id: None`
+        hardcoded, so `to_session_dict` never ran and the test passed
+        identically on the pre-fix code that leaked `raw_session_id` into
+        `task_id`. Drive a real `cc.build_snapshot` over a synthetic on-disk
+        transcript instead, so production code supplies the field."""
+        from api.services.claude_code import session_ingest as cc
+
         task_manager, *_ = stores
         task = task_manager.create("Ping the vendor", context="Work", tags=["me"])
+
+        projects_dir = tmp_path / "cc_projects"
+        proj = projects_dir / "-home-synthetic-unrelated-proj"
+        proj.mkdir(parents=True)
+        # No custom title, no AI title, no user text, no cwd basename to key
+        # off of — the shape that falls back to `label = raw_session_id`
+        # (session_ingest.py) and, pre-fix, `task_id = raw_session_id` too.
+        (proj / "cc-unrelated-raw-uuid.jsonl").write_text(
+            json.dumps({
+                "type": "assistant",
+                "timestamp": "2026-05-30T10:41:38Z",
+                "message": {
+                    "role": "assistant", "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_creation_input_tokens": 0,
+                              "cache_read_input_tokens": 0},
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        cc.invalidate_cache()
+        cc_sessions, cc_edges = cc.build_snapshot(
+            projects_dir=projects_dir, cache_ttl=0,
+        )
+        assert len(cc_sessions) == 1
+        assert cc_sessions[0]["task_id"] is None  # sanity: production code agrees
+
         monkeypatch.setattr(
             agents_route, "_claude_code_snapshot",
-            lambda: ([{
-                "session_id": "cc:unrelated-raw-uuid", "task_id": None,
-                "status": "running", "last_activity_at": 200,
-            }], []),
+            lambda: (cc_sessions, cc_edges),
         )
         r = client.get("/api/agents/board")
         assigned = r.json()["lanes"]["assigned"]

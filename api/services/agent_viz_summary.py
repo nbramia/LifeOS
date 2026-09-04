@@ -71,6 +71,12 @@ _TERMINAL_STATUSES_CACHE: frozenset[str] | None = None
 # `cli_sessions` / the transcript scan's file-age guess, not worker session
 # statuses. Without this a CLI session's fallback label was never cached and
 # the prefetcher retried it on every tick forever (#863).
+#
+# `inactive` is deliberately included here even though it's NOT truly frozen
+# (see `_is_frozen` below) — this set answers "should a fallback/no-content
+# summary be cached for this session so the prefetcher stops retrying it?"
+# (acceptance criterion 7), which is a different question from "is it safe
+# to keep serving that cache once activity moves?" (`_is_fresh_enough`).
 _CLI_TERMINAL_STATUSES = frozenset({"ended", "inactive"})
 
 
@@ -87,18 +93,43 @@ def _is_terminal(status: str) -> bool:
     return (status or "") in _TERMINAL_STATUSES_CACHE
 
 
+# Strict subset of `_is_terminal` whose `last_activity_at` is genuinely
+# frozen — the session cannot produce more transcript content, so a cache
+# for it is valid forever no matter what a later read reports. `inactive`
+# is deliberately excluded (#863 review): it's the transcript scan's
+# file-age guess for a Claude Code session idle >30 min, not a real
+# terminal event, and `web/agents/panel.js`'s `TERMINAL` set explicitly
+# agrees — "'idle' is a live cli session waiting for input — it must NOT be
+# treated as terminal. Only 'ended' … is." A session reported `inactive`
+# can resume (new activity), and its cache — possibly only a failure
+# fallback cached to satisfy acceptance criterion 7 above — must not be
+# trusted "regardless of new activity" the way a truly frozen session's
+# can.
+def _is_frozen(status: str) -> bool:
+    return _is_terminal(status) and status != "inactive"
+
+
 def _is_fresh_enough(cached_activity: float, cached_created_at: float,
                      new_activity: float, status: str) -> bool:
     """True iff the cached summary can be served even though the session
-    may have advanced. Terminal: always (activity is frozen). Live: only
-    if the cache is within the grace window AND we haven't already
-    invalidated it via the activity timestamp."""
+    may have advanced. Frozen (`_is_frozen`): always, regardless of new
+    activity — the status guarantees nothing more will happen. Everything
+    else (a genuinely live session, or `inactive` whose activity really did
+    move — i.e. it resumed) only gets served within the live grace window,
+    same as any other unsettled session."""
     # Exact match on activity → never stale regardless of status.
     if cached_activity >= new_activity:
         return True
-    # Activity moved forward. Terminal sessions shouldn't reach here
-    # (activity is frozen), but if status is somehow misreported treat
-    # them as not-fresh and re-summarize.
+    # Activity moved forward despite a frozen status — that shouldn't
+    # happen, but if it does, trust the cache rather than treat a stray
+    # timestamp nudge as meaningful new content: frozen statuses are valid
+    # "regardless of new activity" by definition.
+    if _is_frozen(status):
+        return True
+    # Everything not frozen falls to the grace window below, EXCEPT the
+    # extended-but-not-frozen bucket (currently just `inactive`): that
+    # status moving is the resumption signal itself, so don't extend it the
+    # same leniency a genuinely live session gets — re-summarize now.
     if _is_terminal(status):
         return False
     # Live session: cached entry stays valid for the grace window.

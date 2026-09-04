@@ -46,7 +46,12 @@ def client():
 def _fake_cc_transcript_row(session_id="cc:merge-target", **overrides):
     row = {
         "session_id": session_id,
-        "task_id": session_id.split(":", 1)[1],
+        # (#863 review) `to_session_dict` always sets `task_id: None` for a
+        # locally scanned session now — a real LifeOS task link only ever
+        # arrives via `_apply_cli_session_to_dict`'s overlay below. This
+        # fixture used to build the pre-#863 shape (the raw session id
+        # leaking into `task_id`), which no production code emits any more.
+        "task_id": None,
         "status": "inactive",
         "routing": "claude_code",
         "parent_session_id": None,

@@ -65,7 +65,12 @@ def _candidate_sessions() -> list[dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("prefetch snapshot build failed: %s", exc)
         return []
-    from api.services.agent_worker.session_store import TERMINAL_STATUSES
+    # (#863) Use the same terminal definition `summarize_session`/
+    # `_cache_if_terminal` cache against — `TERMINAL_STATUSES` from
+    # `session_store` doesn't know about the CLI statuses ("ended",
+    # "inactive"), so sorting with it disagreed with `_is_terminal` and put
+    # sessions this module *will* cache forever into the "live" bucket.
+    from api.services.agent_viz_summary import _is_terminal
 
     pending: list[dict[str, Any]] = []
     for s in snap.get("sessions", []):
@@ -76,7 +81,7 @@ def _candidate_sessions() -> list[dict[str, Any]]:
             continue
         pending.append(s)
     pending.sort(key=lambda s: (
-        0 if s.get("status") in TERMINAL_STATUSES else 1,  # terminal first
+        0 if _is_terminal(s.get("status") or "") else 1,  # terminal first
         -(s.get("last_activity_at") or 0),                  # recent within bucket
     ))
     return pending
@@ -92,21 +97,37 @@ async def _summarize_one(session: dict[str, Any]) -> bool:
     # three-way dispatch (cc: / cx: / everything else) so Codex sessions
     # get summarized too (#863 — Codex ids used to fall through to the
     # LifeOS TranscriptStore, which returns [] for them).
+    #
+    # `_build_snapshot` emits a synthetic `cli_sessions` row (a hook-
+    # registered session on another host) unconditionally — it isn't gated
+    # by `claude_code_viz_enabled` / `codex_viz_enabled`. So when the engine
+    # is disabled we can't read its transcript, but the row is still a
+    # prefetch candidate; returning False here (as an earlier version of
+    # this fix did) meant `summarize_session` never ran and the fallback
+    # was never cached, so the row was re-picked and retried every cooldown
+    # window forever — the exact failure mode this module exists to remove
+    # (#863 review). Falling through to an empty event list instead lets
+    # `summarize_session` take its deterministic no-content path, which
+    # caches the fallback for a terminal session (matching the base-branch
+    # behavior, where a disabled/unreachable engine's reader also just
+    # returns `[]` rather than raising).
     try:
         if sid.startswith("cc:"):
             from api.routes.agents import _claude_code_enabled
-            if not _claude_code_enabled():
-                return False
-            from config.settings import settings
-            from api.services.claude_code import session_ingest as cc
-            events = cc.read_normalized_events(sid, settings.claude_code_projects_dir)
+            if _claude_code_enabled():
+                from config.settings import settings
+                from api.services.claude_code import session_ingest as cc
+                events = cc.read_normalized_events(sid, settings.claude_code_projects_dir)
+            else:
+                events = []
         elif sid.startswith("cx:"):
             from api.routes.agents import _codex_enabled
-            if not _codex_enabled():
-                return False
-            from config.settings import settings
-            from api.services.codex import session_ingest as cx
-            events = cx.read_normalized_events(sid, settings.codex_sessions_dir)
+            if _codex_enabled():
+                from config.settings import settings
+                from api.services.codex import session_ingest as cx
+                events = cx.read_normalized_events(sid, settings.codex_sessions_dir)
+            else:
+                events = []
         else:
             from api.services.agent_worker.transcript_store import TranscriptStore
             events = TranscriptStore().read(sid)

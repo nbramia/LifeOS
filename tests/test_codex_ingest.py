@@ -283,6 +283,23 @@ def test_parse_session_handles_malformed_lines(tmp_path):
     assert any(e["kind"] == "user_message" for e in events)
 
 
+@pytest.mark.unit
+def test_to_session_dict_task_id_is_none_for_locally_scanned_session(tmp_path):
+    """A locally scanned Codex session's `raw_session_id` (the rollout UUID)
+    used to leak into `task_id`, poisoning the board's `sessions_by_task`
+    join — every locally scanned session looked like it had a real LifeOS
+    task link (#863). Mirrors the Claude Code fix in
+    `test_to_session_dict_task_id_is_none_for_locally_scanned_session`
+    (tests/test_claude_code_ingest.py)."""
+    root = tmp_path / "sessions"
+    _write_rollout(root, "session-notask", [_session_meta()])
+    metas = cx.discover_sessions(sessions_dir=root)
+    parsed, _ = cx.parse_session(metas[0])
+    d = cx.to_session_dict(parsed)
+    assert d["task_id"] is None
+    assert parsed.raw_session_id  # sanity: the UUID exists, it's just not leaked
+
+
 # ---------------------------------------------------------------------------
 # Status inference
 # ---------------------------------------------------------------------------

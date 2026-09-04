@@ -257,7 +257,17 @@ SNAPSHOT2 = {
             "decoded_cwd": "/home/synthetic/proj-a",
         },
         {
-            "session_id": "cc:label-ended-no-label",
+            # (#863) Shape a locally-scanned CC session actually ingests as:
+            # no custom title / AI title / user text / cwd basename, so
+            # `claude_code/session_ingest.py` falls `meta.label` back to the
+            # bare raw session id, while `session_id` carries the "cc:"
+            # prefix (`CC_PREFIX + raw_id`). A prior fixture here omitted
+            # `label` entirely, a shape the ingest never produces. This row
+            # also has a real `prompt_preview` — the node label must prefer
+            # that over the raw-id `label` (leak shape 1 below), and with
+            # neither present it must still never fall through to a literal
+            # '?' (the pre-#863 CLI-model-label special case).
+            "session_id": "cc:0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
             "task_id": None,
             "status": "ended",
             "status_inferred": False,
@@ -270,9 +280,32 @@ SNAPSHOT2 = {
             "total_output_tokens": 20,
             "total_dollars": 0.01,
             "spawn_depth": 0,
-            # Deliberately no label/short_label/prompt_preview — the shape
-            # that used to fall through to a literal '?' node label.
+            "label": "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "prompt_preview": "fix the synthetic widget parser",
             "model_label": "Claude Code",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            # (#863) An orphaned worker row: `_label_for_session` falls back
+            # to `s.task_id` when the task lookup finds no description (e.g.
+            # the vault task file was deleted while the `sessions` row
+            # survived), so `label` equals `task_id` verbatim. That raw id
+            # must not render as the node label (leak shape 2 below).
+            "session_id": "sess_label_orphan",
+            "task_id": "t-orphan-deleted",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "local",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "t-orphan-deleted",
+            "model_label": "Local",
             "decoded_cwd": "/home/synthetic/proj-a",
         },
         {
@@ -386,17 +419,65 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
         expect(page.locator(".node")).to_have_count(1)
 
     def test_no_node_label_is_a_literal_question_mark(self, page: Page, agents_base_url):
+        """The node label is an SVG `<text class="node-label">` whose text
+        lives in appended `<tspan>` children (graph.js's `renderNodeLabel`).
+        SVG `<text>` has no `innerText`, so Playwright's `all_inner_texts()`
+        (which reads `innerText`) returns `None` for every element here and
+        this assertion was vacuously true even against the pre-#863
+        `nodeLabel` that really does render a literal '?' (#863 review).
+        Read `textContent` instead, which SVG supports."""
         errors = []
         page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
 
         _open_agents2(page, agents_base_url)
-        expect(page.locator(".node")).to_have_count(5)
+        expect(page.locator(".node")).to_have_count(6)
         # Let the force-layout / label-render tick settle before reading text.
         page.wait_for_timeout(300)
-        labels = page.locator("text.node-label").all_inner_texts()
-        assert len(labels) == 5
+        labels = page.eval_on_selector_all(
+            "text.node-label", "els => els.map(e => e.textContent)"
+        )
+        assert len(labels) == 6
         assert all((label or "").strip() != "?" for label in labels)
+        assert all((label or "").strip() != "" for label in labels)
         assert errors == []
+
+    def test_node_label_prefers_prompt_preview_over_a_raw_id_label(self, page: Page, agents_base_url):
+        """(#863) `nodeLabel`'s precedence guard used to compare with
+        `session_id.startsWith(label)`, which never matches a prefixed CLI
+        session id ("cc:<uuid>".startsWith("<uuid>") is false) — so the raw
+        id `label` the ingest falls back to shadowed the far more useful
+        `prompt_preview`. Fixed by comparing equality against the session id
+        with its "cc:"/"cx:" prefix stripped."""
+        _open_agents2(page, agents_base_url)
+        page.wait_for_timeout(300)
+        rows = page.evaluate(
+            "() => Array.from(document.querySelectorAll('.node')).map(el => ({"
+            "session_id: el.__data__.session_id,"
+            "label: el.querySelector('text.node-label').textContent,"
+            "}))"
+        )
+        by_id = {r["session_id"]: r["label"] for r in rows}
+        # Long labels wrap across multiple <tspan> children (renderNodeLabel
+        # in graph.js) without preserving the inter-word space, so compare
+        # with whitespace collapsed rather than the raw textContent.
+        rendered = (by_id["cc:0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42"] or "").replace(" ", "")
+        assert rendered == "fix the synthetic widget parser".replace(" ", "")
+
+    def test_node_label_suppresses_a_worker_label_that_equals_its_task_id(self, page: Page, agents_base_url):
+        """(#863) An orphaned worker row's `label` falls back to its bare
+        `task_id` in `_label_for_session`; the node label must not render
+        that raw id and must fall through to the next real candidate
+        (`model_label` here, since there's no `prompt_preview`)."""
+        _open_agents2(page, agents_base_url)
+        page.wait_for_timeout(300)
+        rows = page.evaluate(
+            "() => Array.from(document.querySelectorAll('.node')).map(el => ({"
+            "session_id: el.__data__.session_id,"
+            "label: el.querySelector('text.node-label').textContent,"
+            "}))"
+        )
+        by_id = {r["session_id"]: r["label"] for r in rows}
+        assert by_id["sess_label_orphan"] == "Local"
 
     def test_panel_routing_badge_says_ask_not_a_model_name(self, page: Page, agents_base_url):
         """panel.js's routingLabel() gains an `ask` arm (#863) — the side

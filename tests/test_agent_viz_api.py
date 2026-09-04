@@ -378,18 +378,68 @@ def test_model_label_remote_routing_falls_back_when_label_unset(client, stores, 
 
 
 @pytest.mark.unit
-def test_model_label_hermes_routing_with_and_without_model(client, stores):
+def test_model_label_hermes_routing_says_plain_hermes_without_an_observed_turn(client, stores):
     session_store, _ = stores
     session_store.create(task_id="t-herm-bare", status=STATUS_RUNNING, routing="hermes")
     sess = client.get("/api/agents/snapshot").json()["sessions"][0]
     assert sess["model_label"] == "Hermes"
 
+
+@pytest.mark.unit
+def test_model_label_hermes_routing_ignores_the_board_model_picker(client, stores):
+    """(#863 review) `Session.model` is the board's operator-chosen model
+    *picker* value (`SessionStore.set_assignment`) — `HermesExecutor` never
+    reads or writes it, so it must not drive the `Hermes · <model>` badge.
+    A session with a picker `model` set but no observed Hermes chat turn
+    still reads plain "Hermes"."""
+    session_store, _ = stores
     session_store.create(
-        task_id="t-herm-model", status=STATUS_RUNNING, routing="hermes",
+        task_id="t-herm-picker", status=STATUS_RUNNING, routing="hermes",
         model="deepseek-v4-flash",
     )
-    sessions = {s["task_id"]: s for s in client.get("/api/agents/snapshot").json()["sessions"]}
-    assert sessions["t-herm-model"]["model_label"] == "Hermes · deepseek-v4-flash"
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["model_label"] == "Hermes"
+
+
+@pytest.mark.unit
+def test_model_label_hermes_routing_surfaces_the_last_observed_chat_model(
+    client, stores, monkeypatch,
+):
+    """The suffix comes from `model_readout._last_observed_hermes_chat_model`
+    — the model actually reported on the most recent real Hermes chat turn
+    in this process, written by `hermes_proxy.py`'s `_HermesTurnPersister`
+    (#658) — not from the board's model picker."""
+    from api.services import model_readout
+
+    monkeypatch.setattr(model_readout, "_hermes_chat_last_model", "deepseek-v4-flash")
+    monkeypatch.setattr(model_readout, "_hermes_chat_last_observed_at", "2026-08-01T00:00:00Z")
+
+    session_store, _ = stores
+    session_store.create(task_id="t-herm-observed", status=STATUS_RUNNING, routing="hermes")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["model_label"] == "Hermes · deepseek-v4-flash"
+
+
+@pytest.mark.unit
+def test_model_label_hermes_routing_degrades_gracefully_on_readout_failure(
+    client, stores, monkeypatch,
+):
+    """A `model_readout` import/read failure must degrade to plain "Hermes",
+    never raise into the snapshot response."""
+    def _raise():
+        raise RuntimeError("synthetic readout failure")
+
+    import api.services.model_readout as model_readout_module
+    monkeypatch.setattr(
+        model_readout_module, "_last_observed_hermes_chat_model", _raise,
+    )
+
+    session_store, _ = stores
+    session_store.create(task_id="t-herm-broken-readout", status=STATUS_RUNNING, routing="hermes")
+    r = client.get("/api/agents/snapshot")
+    assert r.status_code == 200
+    sess = r.json()["sessions"][0]
+    assert sess["model_label"] == "Hermes"
 
 
 @pytest.mark.unit
@@ -658,6 +708,78 @@ def test_raising_summarizer_not_cached_for_live_session(summary_db, monkeypatch)
     assert avs.get_cached_summary(sid, 1000.0, status=STATUS_RUNNING) is None
 
 
+@pytest.mark.unit
+def test_inactive_session_fallback_caches_but_is_not_served_stale_after_resuming(
+    summary_db, monkeypatch,
+):
+    """(#863 review) `inactive` is in the extended terminal set so a
+    session's fallback gets cached — otherwise the prefetcher would retry
+    it every tick forever (AC 7). But `inactive` is NOT truly frozen
+    (`web/agents/panel.js`'s `TERMINAL` set explicitly excludes it — a
+    Claude Code session idle >30 min can resume), so once its
+    `last_activity_at` actually advances, the cached fallback must not be
+    served as if the session were still exactly where it was."""
+    import asyncio
+    from api.services import agent_viz_summary as avs
+
+    calls = {"n": 0}
+
+    async def _raise(*args, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("synthetic LLM failure")
+
+    monkeypatch.setattr(avs, "generate_text", _raise)
+
+    sid = "cc:resumes-after-inactive"
+    events = [
+        {"kind": "user_message", "payload": {"text": "do the thing"}},
+        {"kind": "assistant_message", "payload": {"text": "done"}},
+    ]
+    first = asyncio.run(avs.summarize_session(
+        sid, label="Some Task", last_activity_at=1000.0, events=events, status="inactive",
+    ))
+    assert "Summary unavailable" in first.summary
+    assert calls["n"] == 1
+    # AC 7: the fallback is cached so a repeat query at the same activity
+    # doesn't re-invoke the summarizer.
+    assert avs.get_cached_summary(sid, 1000.0, status="inactive") is not None
+    assert calls["n"] == 1
+
+    # The session resumes: last_activity_at advances. Even a query that
+    # still reports "inactive" (e.g. a stale status label racing the
+    # transcript rescan) must not serve the old cache as fresh.
+    assert avs.get_cached_summary(sid, 2000.0, status="inactive") is None
+
+    # And an explicit re-summarize call actually re-invokes the summarizer
+    # rather than trusting the stale entry.
+    second = asyncio.run(avs.summarize_session(
+        sid, label="Some Task", last_activity_at=2000.0, events=events, status="inactive",
+    ))
+    assert calls["n"] == 2
+    assert "Summary unavailable" in second.summary
+
+
+@pytest.mark.unit
+def test_frozen_status_cache_valid_regardless_of_new_activity(summary_db):
+    """(#863 review) `_is_frozen` (worker-terminal statuses + `ended`,
+    deliberately excluding `inactive`) is the strict set consulted by
+    `_is_fresh_enough` for "is this cache valid no matter what a later read
+    reports" — as opposed to `_is_terminal`'s broader "should a fallback be
+    cached at all" question used by `_cache_if_terminal`. A frozen status's
+    activity genuinely can't advance again, so even a stray/misreported
+    higher `last_activity_at` must not force a pointless re-summarize."""
+    import time as time_mod
+    from api.services import agent_viz_summary as avs
+
+    assert avs._is_frozen("completed") is True
+    assert avs._is_frozen("ended") is True
+    assert avs._is_frozen("inactive") is False
+    assert avs._is_frozen("running") is False
+
+    assert avs._is_fresh_enough(1000.0, time_mod.time(), 2000.0, "completed") is True
+    assert avs._is_fresh_enough(1000.0, time_mod.time(), 2000.0, "inactive") is False
+
+
 # ---------------------------------------------------------------------------
 # #863 — the prefetcher used to dispatch only `cc:`/other; a `cx:` id fell
 # through to the LifeOS TranscriptStore (which returns [] for a Codex id),
@@ -689,16 +811,22 @@ def test_prefetch_summarizes_codex_session_and_snapshot_carries_short_label(
     monkeypatch.setattr(agents_route, "_claude_code_snapshot", lambda: ([], []))
     agents_route._label_cache.clear()
 
+    # (#863 review) A bare `session_meta`-only rollout produces an empty
+    # `_extract_context` result regardless of whether events came from the
+    # `cx:` dispatch branch or fell through to the LifeOS TranscriptStore
+    # (which returns `[]` for a Codex id) — so every assertion below held
+    # identically with the `cx:` branch removed, and the test proved
+    # nothing about acceptance criterion 6. Give the rollout a real
+    # user/assistant turn and assert the transcript text actually reaches
+    # the summarizer's prompt, which only happens if `_summarize_one`
+    # genuinely dispatched via `cx.read_normalized_events`.
+    SYNTHETIC_MARKER = "synthetic-widget-parser-xyzzy"
     codex_dir = tmp_path / "codex_sessions"
     sub = codex_dir / "2026" / "05" / "30"
     sub.mkdir(parents=True)
     raw_id = "prefetch-target"
     rollout = sub / f"rollout-2026-05-30T10-41-38-{raw_id}.jsonl"
     with rollout.open("w", encoding="utf-8") as f:
-        # A bare session_meta line — no user/agent messages — is enough for
-        # discover_sessions/parse_session to find the session; content-free
-        # events also mean summarize_session takes the deterministic
-        # fallback path, so this test needs no LLM mock.
         f.write(json.dumps({
             "timestamp": "2026-05-30T10:41:38Z",
             "type": "session_meta",
@@ -707,6 +835,19 @@ def test_prefetch_summarizes_codex_session_and_snapshot_carries_short_label(
                 "cli_version": "0.135.0", "source": "exec", "model_provider": "openai",
             },
         }) + "\n")
+        f.write(json.dumps({
+            "timestamp": "2026-05-30T10:41:39Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message",
+                        "message": f"please {SYNTHETIC_MARKER} in the parser"},
+        }) + "\n")
+        f.write(json.dumps({
+            "timestamp": "2026-05-30T10:41:40Z",
+            "type": "event_msg",
+            "payload": {"type": "agent_message",
+                        "message": f"done, the {SYNTHETIC_MARKER} is fixed",
+                        "phase": "final_answer"},
+        }) + "\n")
 
     monkeypatch.setattr(settings_obj, "codex_sessions_dir", str(codex_dir))
     cx.invalidate_cache()
@@ -714,18 +855,130 @@ def test_prefetch_summarizes_codex_session_and_snapshot_carries_short_label(
     cx_sessions, _ = cx.build_snapshot(sessions_dir=codex_dir, lookback_days=7)
     target = next(s for s in cx_sessions if s["session_id"] == "cx:prefetch-target")
 
+    captured_prompts: list[str] = []
+
+    async def _fake_generate_text(prompt, **kwargs):
+        captured_prompts.append(prompt)
+        return json.dumps({
+            "short_label": "Synthetic Widget Fix",
+            "summary": "Fixed the synthetic widget parser.",
+        })
+
+    monkeypatch.setattr(avs, "generate_text", _fake_generate_text)
+
     ok = asyncio.run(prefetch._summarize_one(dict(target, status="completed")))
     assert ok is True
+    # Proves events reached `_extract_context` via the `cx:` branch rather
+    # than the deterministic no-content fallback, which never calls
+    # `generate_text` at all.
+    assert captured_prompts, (
+        "generate_text was never called — no transcript content reached "
+        "the summarizer, so the cx: dispatch branch isn't being exercised"
+    )
+    assert SYNTHETIC_MARKER in captured_prompts[0]
+
     cached = avs.get_cached_summary(
         target["session_id"], target["last_activity_at"], status="completed",
     )
     assert cached is not None
-    assert cached.short_label
+    assert cached.short_label == "Synthetic Widget Fix"
 
     r = client.get("/api/agents/snapshot")
     assert r.status_code == 200
     sessions = {s["session_id"]: s for s in r.json()["sessions"]}
     assert sessions["cx:prefetch-target"]["short_label"] == cached.short_label
+
+
+@pytest.mark.unit
+def test_prefetch_with_engine_disabled_still_caches_fallback_and_drops_out(
+    tmp_path: Path, monkeypatch
+):
+    """(#863 review — regression) `_build_snapshot` emits a synthetic
+    `cli_sessions` row for a hook-registered session on another host
+    *unconditionally* — it's never gated by `codex_viz_enabled` /
+    `claude_code_viz_enabled`. With the engine disabled, `_summarize_one`
+    can't read the transcript, but an earlier version of this fix returned
+    False before `summarize_session` ever ran, so the fallback was never
+    cached and the row was re-picked as a prefetch candidate forever — the
+    exact "retried every tick forever" failure mode this PR set out to
+    remove. It must instead fall through to an empty event list so the
+    no-content path caches a fallback and the row drops out of the
+    candidate list, same as the base-branch behavior for an
+    unreachable/malformed session."""
+    import asyncio
+    from api.services import agent_viz_summary as avs
+    from api.services import agent_viz_summary_prefetch as prefetch
+    from api.routes import agents as agents_route
+    from api.services.agent_worker.session_store import SessionStore
+    from api.services.agent_worker.transcript_store import TranscriptStore
+    from config.settings import settings as settings_obj
+
+    monkeypatch.setattr(avs, "_DB_PATH", str(tmp_path / "summaries.db"))
+    avs._init_db()
+    avs.reset_cache()
+
+    session_store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcript_store = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    monkeypatch.setattr(agents_route, "_session_store", session_store)
+    monkeypatch.setattr(agents_route, "_transcript_store", transcript_store)
+    agents_route._label_cache.clear()
+
+    # A hook-registered Codex session on a different host — no local rollout
+    # to read, which is exactly the row shape that leaked through the flag
+    # guard unconditionally.
+    session_store.record_cli_session_event(
+        engine="codex", event="session_end", session_id="remote-cx-1",
+        host="a-different-synthetic-host", cwd="/home/synthetic/proj",
+        prompt="refactor the synthetic widget",
+    )
+
+    monkeypatch.setattr(settings_obj, "codex_viz_enabled", False)
+    monkeypatch.setattr(settings_obj, "codex_sessions_dir", str(tmp_path / "no-such-codex-dir"))
+
+    snap = agents_route._build_snapshot()
+    rows = [s for s in snap["sessions"] if s["session_id"].startswith("cx:")]
+    assert len(rows) == 1
+    row = rows[0]
+
+    candidates_before = [s["session_id"] for s in prefetch._candidate_sessions()]
+    assert row["session_id"] in candidates_before
+
+    for _ in range(3):
+        ok = asyncio.run(prefetch._summarize_one(row))
+        assert ok is True
+
+    cached = avs.get_cached_summary(
+        row["session_id"], row.get("last_activity_at") or 0.0,
+        status=row.get("status") or "",
+    )
+    assert cached is not None, "fallback was never cached — row will retry forever"
+
+    candidates_after = [s["session_id"] for s in prefetch._candidate_sessions()]
+    assert row["session_id"] not in candidates_after
+
+
+@pytest.mark.unit
+def test_candidate_sessions_sort_agrees_with_is_terminal(monkeypatch):
+    """(#863 review) `_candidate_sessions` used to sort with
+    `TERMINAL_STATUSES` imported straight from `session_store`, which knows
+    nothing about the CLI statuses ("ended"/"inactive") that
+    `agent_viz_summary._is_terminal` also treats as terminal — two
+    definitions of terminal disagreeing inside one feature. A CLI row with
+    status "ended" must sort ahead of a "running" one (terminal summaries
+    are cached forever, so they're the more valuable prefetch target)."""
+    from api.services import agent_viz_summary_prefetch as prefetch
+    from api.routes import agents as agents_route
+
+    sessions = [
+        {"session_id": "sess_running", "status": "running", "last_activity_at": 2000},
+        {"session_id": "cc:ended-one", "status": "ended", "last_activity_at": 1000},
+    ]
+    monkeypatch.setattr(
+        agents_route, "_build_snapshot",
+        lambda: {"sessions": sessions, "edges": [], "generated_at": 0},
+    )
+    ordered = [s["session_id"] for s in prefetch._candidate_sessions()]
+    assert ordered == ["cc:ended-one", "sess_running"]
 
 
 # ---------------------------------------------------------------------------

@@ -101,6 +101,8 @@ Shape encodes *where the agent runs*, not whether it is a subagent — a Task/Ag
 
 The simulation converges in ~8 seconds and then stops, so the graph stops jittering once it settles. New snapshots arrive every 2 seconds and only nudge nodes whose positions are now misleading.
 
+**Node label** — the text under each node, first non-empty of: an operator-pinned custom label, the AI-generated short summary, the derived label (task description for LifeOS, first non-empty user message for Claude Code) — skipped when it's not a real label but the raw id the row fell back to (the session id, that id with its `cc:`/`cx:` CLI prefix stripped, or the row's task id), the most recent prompt preview (cross-machine CLI sessions), the routing/model badge, then the session id as a last resort. A node never renders a bare `?`; in practice the routing/model badge always resolves to something, so the session-id fallback is a safety net rather than something you'll see on screen.
+
 ### Canvas controls
 
 The graph mirrors `/crm/graph`'s pointer model:
@@ -170,11 +172,11 @@ The top toolbar has six filter controls and five count chips. **Filters are AND-
 
 | Filter | Default | Notes |
 |---|---|---|
-| `include finished` checkbox | off | Off → completed / failed / budget_exceeded are hidden. On → everything shows, and the default recency window widens from 30 min to 7 days. |
+| `include finished` checkbox | off | Off → completed / failed / budget_exceeded / ended are hidden. On → everything shows, and the default recency window widens from 30 min to 7 days. |
 | `recency` dropdown | last 30 min (60 min, 6h, 24h, 7d, all) | Filters by `last_activity_at`. Re-defaults to a wider window when `include finished` is enabled, unless the operator has set it manually. |
 | `cwd` dropdown | all | Only Claude Code sessions are scoped to a cwd. Dropdown lists every unique cwd present in the current snapshot; auto-hides when empty (no Claude Code sessions visible). |
 | `host` dropdown | all | Limit to sessions running on a specific machine. Dropdown lists every unique `host` present in the current snapshot; auto-hides on a single-host deployment (nothing to distinguish). |
-| `route` dropdown | all (local / claude / claude_code / codex / hermes / ask) | Filters by where the session ran — operator's local LLM, Managed Agents cloud, Claude Code CLI, Codex CLI, Hermes, or a session parked waiting on the operator. |
+| `route` dropdown | all (local / claude / claude_code / codex / hermes / remote / ask) | Filters by where the session ran — operator's local LLM, Managed Agents cloud, Claude Code CLI, Codex CLI, Hermes, the configured remote provider, or a session parked waiting on the operator. |
 | `status` dropdown | all | Hard-filter by the status column from the table above. |
 
 ### Chips
@@ -195,13 +197,13 @@ Chips re-compute after every snapshot tick, so toggling `include finished` immed
 
 Clicking any node opens a panel on the right with that session's metadata header and a live-tailing event feed. The panel header carries:
 
-- **Label** — the node's display name, first non-empty of: an operator-pinned custom label, the AI-generated short summary, the derived label (task description for LifeOS, first non-empty user message for Claude Code), the most recent prompt preview (cross-machine CLI sessions), the routing/model badge, then the session id as a last resort — a node never renders a bare `?`. **Click it to rename:** the title becomes a text box prepopulated with the current name; Enter (or clicking away) saves, Escape cancels. A manual name is pinned durably and overrides every other source everywhere the node is named (graph node, panel, search). Saving an empty value clears the override and reverts to auto-naming.
+- **Label** — the operator-pinned custom label if set, else the derived label (task description for LifeOS, first non-empty user message for Claude Code), else the session id. The AI-generated short summary and the most recent prompt preview (cross-machine CLI sessions) are shown as their own separate rows below the header, not folded into this name — see the **Node label** precedence in [Graph tab — what you see](#graph-tab--what-you-see) for the fuller chain the *graph node* uses instead. **Click it to rename:** the title becomes a text box prepopulated with the current name; Enter (or clicking away) saves, Escape cancels. A manual name is pinned durably and overrides every other source everywhere the node is named (graph node, panel, search). Saving an empty value clears the override and reverts to auto-naming.
 - **cwd** — Claude Code only; the project directory the session was opened in.
 - **Branch** — the git branch of that cwd, when a registration event supplied one. Blank for sessions with no cross-machine registration (e.g. a local Claude Code transcript with no hook installed).
 - **Status badge** — same status the node is colored by, with `(inferred)` if applicable.
 - **Source** — `LifeOS agent` or `Claude Code`.
 - **Host badge** — the machine the session is running on.
-- **Routing** — `Local`, `Claude Code`, `Codex`, `Remote` (or the configured remote provider's own label), `Hermes` (with the model it last used, when known), `Waiting on you` (parked on `ask`, no model running), or `Claude`.
+- **Routing** — a plain badge, one of `Local`, `Claude Code`, `Codex`, `Remote`, `Hermes`, `Ask` (parked waiting on the operator, no model running), or `Claude` — never a model name. (#863 review) The graph node's `model_label` badge is the richer one — `Remote` becomes the configured remote provider's own label, and `Hermes` gains its last-observed model as `Hermes · <model>` when known; see **Node label** in [Graph tab — what you see](#graph-tab--what-you-see).
 - **Cost** — `total_dollars` to 4 decimals. For Claude Code, this is cache-aware accounting (separately tracking input, output, cache_creation @ 1.25× and cache_read @ 0.10×).
 - **Tokens** — `input↓ / output↑`.
 - **Depth badge** — if the session is a child, shows spawn depth.
