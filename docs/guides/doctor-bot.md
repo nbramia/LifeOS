@@ -1,7 +1,7 @@
 # Doctor Bot — Self-Repair Surface
 
 **Status:** Complete
-**Last Updated:** 2026-08-28
+**Last Updated:** 2026-09-03
 **Audience:** Operator
 
 The **doctor** bot's only job is fixing LifeOS itself. You message it when you notice LifeOS misbehaving or missing something; it converses with you to define the **goal**, locks that goal, then — on your approval — orchestrates the work end to end and reports back. It is a **goal-first orchestrator**: it supervises the implementation (subagents do the coding via `/implement`) rather than hand-coding inline, and every change lands through a reviewed, tested PR — never a direct push to `main`.
@@ -24,6 +24,8 @@ This is the operator's-eye summary; the exact contract the session runs lives in
    - **Small goal:** one branch → `/implement` → one PR → `main`.
    - **Multi-part goal:** an **integration branch** off `main`, each part landed as a sub-PR onto it (`/implement <issue> --base <integration-branch>`), then one PR integration→`main`, then cleanup.
 5. **Confirm.** It brings the canonical checkout to merged `main`, restarts (the right way — see Autonomy and safety), and confirms with the revert handle: _"Shipped: PR #N merged, server restarted. Revert with: gh pr revert N."_
+
+Once you install the [Human queue](human-queue.md) instruction paragraph in the doctor's instruction files, a repair that turns up something only you can do files a card instead of stalling, and resolves it once it observes the thing done.
 
 ## Setup
 
@@ -64,6 +66,7 @@ The doctor's machinery is generic. To add another orchestration surface, add an 
 - [Configuration](configuration.md) — `TELEGRAM_DOCTOR_*` and the specialized-bot env vars.
 - [Claude Code Orchestration](claude-code-orchestration.md) — Claude Code install/auth on the server, shared by the doctor.
 - [Agent Worker Setup](agent-worker-setup.md) — The worker that runs the doctor's sessions.
+- [Human Queue](human-queue.md) — Where the doctor files what it can't do itself
 
 ### Code References
 - [`config/telegram_bots.json`](../../config/telegram_bots.json) — Bot registry (the `doctor` entry, `orchestrates: true`).

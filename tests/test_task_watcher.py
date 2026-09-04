@@ -78,6 +78,39 @@ class TestHandlerScheduling:
         time.sleep(0.2)
         assert calls == []
 
+    def test_skips_sync_conflict_file(self):
+        """#853: a Syncthing conflict copy is never a reindex source."""
+        calls = []
+        handler = _TaskFileHandler(lambda p: calls.append(p))
+        handler.on_modified(_FakeEvent("/x/Tasks/Inbox.sync-conflict-20260101-120000-ABCDEFG.md"))
+        time.sleep(0.2)
+        assert calls == []
+
+    def test_skips_syncthing_temp_file(self):
+        """#853: a Syncthing in-progress temp file is never a reindex source.
+
+        This particular path is dropped by `on_modified`'s `.endswith(".md")`
+        check before `is_conflict_file` ever runs — kept as-is because it
+        documents that suffix filter. `test_schedule_skips_syncthing_temp_file_directly`
+        below exercises the `is_conflict_file` guard inside `_schedule` itself.
+        """
+        calls = []
+        handler = _TaskFileHandler(lambda p: calls.append(p))
+        handler.on_modified(_FakeEvent("/x/Tasks/.syncthing.Inbox.md.tmp"))
+        time.sleep(0.2)
+        assert calls == []
+
+    def test_schedule_skips_syncthing_temp_file_directly(self):
+        """Calls `_schedule` directly with a path `on_modified` would never
+        forward (no `.md` suffix), so this actually exercises the
+        `is_conflict_file` guard at `task_watcher.py`'s top of `_schedule` —
+        the previous test above never reaches it."""
+        calls = []
+        handler = _TaskFileHandler(lambda p: calls.append(p))
+        handler._schedule("/x/Tasks/.syncthing.Inbox.md.tmp")
+        time.sleep(0.2)
+        assert calls == []
+
     def test_move_event_fires_for_both_paths(self):
         calls = []
         done = threading.Event()

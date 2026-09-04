@@ -358,9 +358,10 @@ TOOL_DEFINITIONS = [
         "name": "manage_tasks",
         "description": (
             "Manage Obsidian tasks. Actions: 'create' (new task — always lands in "
-            "Inbox; do not pass a context), 'list' (filter tasks; supports the "
-            "context filter for already-categorized tasks), 'complete' (mark task "
-            "done), 'update' (edit any field on an existing task, including tags or "
+            "Inbox; do not pass a context — status/notes/fields are accepted), "
+            "'list' (filter tasks; supports the context filter for already-"
+            "categorized tasks), 'complete' (mark task done), 'update' (edit any "
+            "field on an existing task, including tags, notes, operator fields, or "
             "moving the task to a different context), 'tags' (list every distinct "
             "tag across all tasks with usage counts — the same list is already in "
             "the system prompt; call this action only if the user explicitly asks "
@@ -429,14 +430,69 @@ TOOL_DEFINITIONS = [
                         "'urgent'. Omitting it returns tasks of EVERY status, and in an "
                         "established vault most tasks are done or cancelled — so pass "
                         "'todo' for open/outstanding work rather than listing unfiltered "
-                        "and sorting it out afterwards. Also accepted on update to change "
-                        "status."
+                        "and sorting it out afterwards. Also accepted on create (initial "
+                        "status; defaults to 'todo') and update (to change status)."
                     ),
                 },
                 "query": {
                     "type": "string",
                     "description": "Search within task descriptions (for list).",
                 },
+                "notes": {
+                    "type": "string",
+                    "description": (
+                        "Multi-line notes body for the task (create or update). "
+                        "Stored beneath the task line; replaces the existing body on update."
+                    ),
+                },
+                "fields": {
+                    "type": "object",
+                    "additionalProperties": {"type": ["string", "null"]},
+                    "description": (
+                        "Operator-editable fields (e.g. host, effort, model, key) to set on "
+                        "the task (create or update). On update, a null value removes that "
+                        "field; other fields not mentioned are left alone."
+                    ),
+                },
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "manage_human_queue",
+        "description": (
+            "File, list, or resolve Human-queue cards — things only the operator "
+            "can do (e.g. re-authenticate an expired login), which the conversation "
+            "itself can't finish. Actions: 'add' (file a card; never file work you "
+            "can do yourself), 'list' (open cards — use for 'what's waiting on "
+            "me'), 'resolve' (mark a card done once you've observed the thing is "
+            "actually done)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "list", "resolve"],
+                    "description": "Action to perform.",
+                },
+                "title": {"type": "string", "description": "Card title (for add)."},
+                "notes": {"type": "string", "description": "What needs doing and why (for add)."},
+                "key": {
+                    "type": "string",
+                    "description": "Dedupe key (for add). Letters, digits, '.', ':', '-', '_' "
+                                   "only. Filing again with an already-open key updates that "
+                                   "card's notes instead of duplicating it.",
+                },
+                "done_when": {
+                    "type": "object",
+                    "description": "Optional auto-resolve check (for add): "
+                                   "{type: 'endpoint', path, pointer, equals} or "
+                                   "{type: 'file_exists', path}. For 'endpoint', path must "
+                                   "start with '/' (not '//').",
+                },
+                "id_or_key": {"type": "string", "description": "Card id or dedupe key (for resolve)."},
+                "note": {"type": "string", "description": "Resolution note (for resolve)."},
             },
             "required": ["action"],
         },
@@ -900,7 +956,7 @@ async def execute_tool(name: str, tool_input: dict) -> str:
 
 
 # Sync handlers to wrap in to_thread for parallel execution
-_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_reminders", "manage_schedules", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
+_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_human_queue", "manage_reminders", "manage_schedules", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
 
 
 async def execute_tool_parallel(name: str, tool_input: dict) -> str:
@@ -2133,11 +2189,15 @@ def _tool_person_info(inp: dict):
 def _task_create(inp: dict) -> str:
     from api.services.task_manager import get_task_manager
     tm = get_task_manager()
+    fields = {k: v for k, v in (inp.get("fields") or {}).items() if v is not None}
     task = tm.create(
         description=inp["description"],
+        status=inp.get("status") or "todo",
         priority=inp.get("priority", ""),
         due_date=inp.get("due_date"),
         tags=inp.get("tags"),
+        notes=inp.get("notes"),
+        fields=fields,
     )
     due = f", due {task.due_date}" if task.due_date else ""
     return f"Task created: \"{task.description}\" (id: {task.id}{due})"
@@ -2184,7 +2244,7 @@ def _task_complete(inp: dict) -> str:
     return f"Task completed: \"{task.description}\""
 
 
-_UPDATABLE_FIELDS = ("description", "status", "context", "priority", "due_date", "tags")
+_UPDATABLE_FIELDS = ("description", "status", "context", "priority", "due_date", "tags", "notes", "fields")
 
 
 def _task_update(inp: dict) -> str:
@@ -2195,7 +2255,10 @@ def _task_update(inp: dict) -> str:
     tm = get_task_manager()
     updates = {k: inp[k] for k in _UPDATABLE_FIELDS if k in inp and inp[k] is not None}
     if not updates:
-        return "Error: no updatable fields provided (description, status, context, priority, due_date, tags)."
+        return (
+            "Error: no updatable fields provided (description, status, context, "
+            "priority, due_date, tags, notes, fields)."
+        )
     task = tm.update(task_id, **updates)
     if not task:
         return f"Error: Task '{task_id}' not found."
@@ -2224,6 +2287,61 @@ def _tool_manage_tasks(inp: dict):
     elif action == "tags":
         return _task_tags(inp)
     return f"Error: Unknown manage_tasks action '{action}'"
+
+
+# -- Human queue helpers (#852) --
+
+def _human_queue_add(inp: dict) -> str:
+    from api.services import human_queue
+    title = inp.get("title")
+    if not title:
+        return "Error: 'title' is required for add."
+    try:
+        task = human_queue.add_card(
+            title=title,
+            notes=inp.get("notes"),
+            key=inp.get("key"),
+            done_when=inp.get("done_when"),
+        )
+    except (human_queue.DoneWhenError, ValueError) as e:
+        return f"Error: {e}"
+    return f"Human-queue card filed: \"{task.description}\" (id: {task.id})"
+
+
+def _human_queue_list(_inp: dict) -> str:
+    from api.services import human_queue
+    cards = human_queue.list_open_cards()
+    if not cards:
+        return "No open Human-queue cards."
+    lines = []
+    for c in cards:
+        age = c.get("age_hours")
+        age_str = f"{age:.1f}h old" if age is not None else "age unknown"
+        key = f" key:{c['key']}" if c.get("key") else ""
+        lines.append(f"- {c['title']} ({age_str}) [id:{c['id']}]{key}")
+    return "\n".join(lines)
+
+
+def _human_queue_resolve(inp: dict) -> str:
+    from api.services import human_queue
+    id_or_key = inp.get("id_or_key")
+    if not id_or_key:
+        return "Error: 'id_or_key' is required for resolve."
+    task = human_queue.resolve_card(id_or_key, note=inp.get("note"))
+    if not task:
+        return f"Error: no open Human-queue card matching '{id_or_key}'."
+    return f"Human-queue card resolved: \"{task.description}\" (id: {task.id})"
+
+
+def _tool_manage_human_queue(inp: dict) -> str:
+    action = inp["action"]
+    if action == "add":
+        return _human_queue_add(inp)
+    elif action == "list":
+        return _human_queue_list(inp)
+    elif action == "resolve":
+        return _human_queue_resolve(inp)
+    return f"Error: Unknown manage_human_queue action '{action}'"
 
 
 # -- Reminder helpers --
@@ -3468,6 +3586,7 @@ _TOOL_HANDLERS = {
     "get_message_history": _tool_get_message_history,
     "person_info": _tool_person_info,
     "manage_tasks": _tool_manage_tasks,
+    "manage_human_queue": _tool_manage_human_queue,
     "manage_reminders": _tool_manage_reminders,
     "manage_schedules": _tool_manage_schedules,
     "manage_workouts": _tool_manage_workouts,
@@ -3500,6 +3619,10 @@ TOOL_STATUS_MESSAGES = {
     "manage_tasks.complete": "Completing task...",
     "manage_tasks.update": "Updating task...",
     "manage_tasks.tags": "Loading tag list...",
+    "manage_human_queue": "Managing Human queue...",
+    "manage_human_queue.add": "Filing Human-queue card...",
+    "manage_human_queue.list": "Loading Human queue...",
+    "manage_human_queue.resolve": "Resolving Human-queue card...",
     "manage_reminders": "Managing reminders...",
     "manage_reminders.create": "Setting reminder...",
     "manage_reminders.list": "Loading reminders...",

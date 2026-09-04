@@ -193,7 +193,11 @@ export async function loadConversation(id) {
   stopPendingQuestionPolling();
 
   try {
-    const response = await fetch(`${endpoints.conversations}/${id}`);
+    // (round 1, finding #5) encodeURIComponent — `id` can arrive from the
+    // `?conversation=` deep link (main.js's maybeOpenDeepLinkedConversation),
+    // an unencoded URL query param, same as every other conversation-id
+    // fetch site (ask-stream.js, pending-question.js).
+    const response = await fetch(`${endpoints.conversations}/${encodeURIComponent(id)}`);
     if (response.ok) {
       const data = await response.json();
       elements.chatTitle.textContent = data.title || 'Conversation';

@@ -45,6 +45,31 @@
             touch-action: manipulation;  /* Disable iOS double-tap delay globally */
         }
 
+        * {
+            scrollbar-width: thin;
+            scrollbar-color: var(--border) transparent;
+        }
+
+        *::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+
+        *::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        *::-webkit-scrollbar-thumb {
+            background-color: var(--border);
+            border-radius: 6px;
+            border: 2px solid transparent;
+            background-clip: padding-box;
+        }
+
+        *::-webkit-scrollbar-thumb:hover {
+            background-color: var(--text-muted);
+        }
+
         html, body {
             height: 100vh;   /* fallback for browsers without dvh */
             height: 100dvh;  /* track the mobile browser's dynamic chrome (address bar / keyboard) so the composer stays reachable */

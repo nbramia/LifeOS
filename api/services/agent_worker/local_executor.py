@@ -518,7 +518,7 @@ class LocalExecutor:
 
             turn_start = time.time()
             try:
-                response = self._call_llm(sid)
+                response = self._call_llm(sid, effort=session.effort)
             except Exception as exc:
                 logger.exception("local executor LLM call failed: %s", exc)
                 # Charge the time we spent trying so the budget reflects real
@@ -633,7 +633,7 @@ class LocalExecutor:
         self.session_store.append_message(sid, "user", _user_message_for(task))
         self.transcript_store.append(sid, "seed", {"task_id": session.task_id})
 
-    def _call_llm(self, session_id: str):
+    def _call_llm(self, session_id: str, effort: str | None = None):
         history = self.session_store.get_messages(session_id)
         # Separate the system message from the user/assistant/tool history.
         system_text = ""
@@ -644,6 +644,37 @@ class LocalExecutor:
                 system_text = content if isinstance(content, str) else json.dumps(content)
             else:
                 messages_for_llm.append(entry)
+
+        # (#851) Per-session thinking override. `effort` is the board's
+        # assignment field (`low|medium|high|max`); `high`/`max` turns
+        # thinking on, `low`/`medium` turns it off, and unset/unrecognized
+        # falls back to `settings.local_agent_enable_thinking` — same
+        # mapping `agent_loop.run_agent_loop` uses for the chat surface,
+        # applied here per-SESSION instead of via the global setting so
+        # concurrent agent-worker sessions with different assigned efforts
+        # don't race each other over one process-wide flag.
+        #
+        # Gated on `isinstance(self.llm, LocalLLMClient)` — the exact same
+        # check `run_agent_loop` uses — for two independent reasons: (1) the
+        # #809 remote-forced route (`self.is_remote`) is ALSO a LocalLLMClient
+        # instance (same OpenAI-compatible plumbing) but isn't llama-server —
+        # it doesn't understand llama-server's `chat_template_kwargs` switch,
+        # so `enable_thinking` must never reach it (mirrors `run_agent_loop`'s
+        # `not force_remote` gate); an isinstance check alone wouldn't exclude
+        # it, so `self.is_remote` is checked too. (2) a test-injected fake LLM
+        # client's `create()` may not accept `enable_thinking` at all — gating
+        # on the concrete class keeps every existing fake-client test
+        # byte-identical.
+        create_kwargs: dict = {}
+        from api.services.llm_client import LocalLLMClient
+        if isinstance(self.llm, LocalLLMClient) and not self.is_remote:
+            from api.services.agent_worker.assignment import local_thinking_for_effort
+            from config.settings import settings as _settings
+            override = local_thinking_for_effort(effort)
+            enable_thinking = override if override is not None else (
+                None if _settings.local_agent_enable_thinking else False
+            )
+            create_kwargs["enable_thinking"] = enable_thinking
 
         # Retry transient connection drops. llama-server occasionally
         # disconnects mid-request under memory pressure ("Server
@@ -659,6 +690,7 @@ class LocalExecutor:
                     system=system_text or None,
                     max_tokens=PER_TURN_MAX_TOKENS,
                     tools=self.tools.definitions(),
+                    **create_kwargs,
                 )
             except Exception as exc:
                 if not _is_transient_llm_error(exc) or attempt == LLM_RETRY_ATTEMPTS - 1:

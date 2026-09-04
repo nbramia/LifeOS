@@ -428,6 +428,30 @@ class _HermesTurnPersister:
         # instead of a locally-created row.
         self._turn = None
 
+    @property
+    def conversation_id(self) -> Optional[str]:
+        """The conversation id observed on this turn, or None if the
+        `conversation_id` event never arrived (or arrived over-length —
+        see `_handle_event`). Read by `HermesExecutor` (#851) after
+        `finalize()` so it can record the same id LifeOS's own store
+        persisted the turn under."""
+        return self._conversation_id
+
+    @property
+    def content_text(self) -> str:
+        """The assistant reply text accumulated from `content` events,
+        joined in arrival order. Read by `HermesExecutor` (#851) as the
+        session's `final_text` — the same text `finalize()` persists to
+        the conversation store, so the two never diverge."""
+        return "".join(self._content_parts)
+
+    @property
+    def done_seen(self) -> bool:
+        """Whether a `done` event was observed before the stream ended —
+        see the class docstring's #611 paragraph. Read by `HermesExecutor`
+        (#851) to tell a normal completion apart from a truncated one."""
+        return self._done_seen
+
     def bind_turn(self, turn) -> None:
         """Hook `_proxy.py`'s detached pump calls once it creates this
         turn's `ChatTurn` — see the class docstring. If a `conversation_id`

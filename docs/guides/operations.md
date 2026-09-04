@@ -38,6 +38,10 @@ Auth uses a cached session token at `data/monarch_session.pickle`. Monthly sync 
 Re-authenticate when the token expires (401/525), or when the nightly sync warns
 that the session is old. Run from the project root — the session path is relative.
 
+An expired or missing session also files a [Human queue](human-queue.md)
+card keyed `monarch-reauth`; the worker's next poll resolves it
+automatically once re-auth succeeds.
+
 **Preferred (works in any shell, including agent/non-TTY sessions):** reads
 `MONARCH_EMAIL` / `MONARCH_PASSWORD` from `.env` and takes the MFA code as an
 argument. TOTP codes expire in ~30s, so read the code and run promptly.
@@ -236,3 +240,5 @@ value dressed up as confirmed-live.
 - [Data & Sync](../specs/technical/data-and-sync.md) — Nightly sync pipeline phases
 - [Troubleshooting](troubleshooting.md) — General operational troubleshooting
 - [Scripts Reference](scripts.md) — `auto-deploy.sh` / `auto-update-macos.sh` / `setup-launchd.sh` usage and flags
+- [Human Queue](human-queue.md) — Auto-filed `monarch-reauth` card on an expired/missing session
+- [Agent Worker Setup](agent-worker-setup.md#card-assignment-running-a-card-on-another-machine-851) — Remote-host card assignment over ssh, and why it can't reach Apple-data tasks (the FDA limitation this doc's section above documents)

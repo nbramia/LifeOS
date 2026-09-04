@@ -65,8 +65,11 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | How is perf traced and monitored? | [specs/technical/observability.md](docs/specs/technical/observability.md) |
 | What does `#agent` do? | [specs/product/agent-worker.md](docs/specs/product/agent-worker.md) |
 | How does the agent worker work internally? | [specs/technical/agent-worker.md](docs/specs/technical/agent-worker.md) |
+| How does the task store work internally (id-addressed writes, notes body, conflict files)? | [specs/technical/task-management.md](docs/specs/technical/task-management.md) |
+| What can I do with tasks (statuses, API, chat)? | [specs/product/task-management.md](docs/specs/product/task-management.md) |
 | How do I set up the agent worker? | [guides/agent-worker-setup.md](docs/guides/agent-worker-setup.md) |
 | How does the doctor self-repair bot work? | [guides/doctor-bot.md](docs/guides/doctor-bot.md) |
+| How do agents hand work to the human? | [guides/human-queue.md](docs/guides/human-queue.md) |
 | How do schedules (triggers + actions) work? | [guides/scheduler.md](docs/guides/scheduler.md) |
 | How do I import Apple Health/Fitness data? | [guides/apple-health.md](docs/guides/apple-health.md) |
 | How do I configure a capture device (e.g. the Pebble Index ring) to feed the journal persona? | [guides/journal-ring-ingest.md](docs/guides/journal-ring-ingest.md) |
@@ -229,7 +232,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | `api/services/perf_trace.py` | Request-level performance tracing (spans, SQLite) |
 | `api/routes/perf.py` | Performance trace query API |
 | `api/services/agent_worker/` | Autonomous worker for `#agent`-tagged tasks (local Gemma or cloud Claude via Managed Agents) |
-| `mcp_server.py` | MCP server — stdio for Claude Code + HTTP transport for Managed Agents (64 tools: 56 from `CURATED_ENDPOINTS` plus 8 `lifeos_agent_*` tools registered separately by `_register_inter_agent_tools()` from `INTER_AGENT_TOOL_SCHEMAS`) |
+| `mcp_server.py` | MCP server — stdio for Claude Code + HTTP transport for Managed Agents (67 tools: 59 from `CURATED_ENDPOINTS` plus 8 `lifeos_agent_*` tools registered separately by `_register_inter_agent_tools()` from `INTER_AGENT_TOOL_SCHEMAS`) |
 | `tests/test_perf_benchmark.py` | Benchmark suite for query performance and quality |
 
 | Script | Purpose |

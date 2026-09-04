@@ -34,11 +34,13 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from api.services.agent_worker.completion_signal import has_positive_completion_signal
+from api.services.agent_worker.assignment import extract_assignment
 from api.services.agent_worker.preflight import (
     ROUTE_ASK,
     ROUTE_CLAUDE,
     ROUTE_CLAUDE_CODE,
     ROUTE_CODEX,
+    ROUTE_HERMES,
     ROUTE_LOCAL,
     ROUTE_REMOTE,
     PreflightResult,
@@ -265,6 +267,25 @@ def _split_frontmatter(text: str) -> tuple[str, str]:
     return text[: m.end()], text[m.end():]
 
 
+def _resolve_json_pointer(doc: Any, pointer: str) -> Any:
+    """Minimal RFC 6901 JSON Pointer resolver — enough for `done_when`'s
+    `pointer` field (`/status`, `/nested/field`), no external dependency.
+    An empty pointer (or `/`) returns `doc` itself. Raises `KeyError`/
+    `IndexError`/`TypeError` for a pointer that doesn't resolve, same as
+    dict/list indexing would — the worker's tick treats that as a failed
+    check for this card, not a crash."""
+    if not pointer or pointer == "/":
+        return doc
+    cur = doc
+    for raw_part in pointer.lstrip("/").split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(cur, list):
+            cur = cur[int(part)]
+        else:
+            cur = cur[part]
+    return cur
+
+
 def _worker_label(routing: str | None, served_by: str = "") -> str:
     """Telegram-message prefix that names the route — operator wants to
     know at a glance whether a result came from local Gemma or cloud
@@ -289,6 +310,8 @@ def _worker_label(routing: str | None, served_by: str = "") -> str:
         return label
     if routing == ROUTE_CLAUDE:
         return "Cloud agent worker"
+    if routing == ROUTE_HERMES:
+        return "Hermes agent worker"
     return "Agent worker"
 
 
@@ -300,6 +323,7 @@ _ENGINE_LABELS = {
     "claude": "cloud Claude",
     "local": "local Gemma",
     "remote": "remote provider",
+    "hermes": "Hermes",
 }
 
 
@@ -411,6 +435,7 @@ class Worker:
         managed_executor=None,    # injectable ManagedExecutor for tests
         claude_code_executor=None,  # injectable ClaudeCodeExecutor for tests
         codex_executor=None,        # injectable CodexExecutor for tests
+        hermes_executor=None,       # injectable HermesExecutor for tests (#851)
         cli_pool=None,              # injectable dispatch pool; tests pass _SynchronousPool
     ) -> None:
         self.api_base = (api_base or os.environ.get("LIFEOS_API_URL", "http://localhost:8000")).rstrip("/")
@@ -440,6 +465,11 @@ class Worker:
         )
         self._owns_http_client = http_client is None
         self._http = http_client or httpx.Client(timeout=10.0)
+        # Human-queue done_when poll (#852) — throttled independently of the
+        # main tick interval, which runs far more often (60s) than the
+        # default human-queue poll (300s). 0.0 so the very first tick always
+        # checks.
+        self._last_human_queue_check = 0.0
         self._preflight_caller = preflight_caller  # None → use Anthropic SDK by default
         self._local_executor = local_executor  # lazily instantiated on first use
         self._remote_executor = remote_executor  # lazily instantiated on first #cloud task (#809)
@@ -451,6 +481,7 @@ class Worker:
         # bot. Bypassed entirely when a test injects `_claude_code_executor`.
         self._claude_code_executors: dict[str, object] = {}
         self._codex_executor = codex_executor  # lazily instantiated on first /codex task
+        self._hermes_executor = hermes_executor  # lazily instantiated on first hermes task (#851)
         # CLI dispatches (claude_code/codex) are long-running subprocesses — both
         # spawned children/operator root-spawns AND top-level #agent tasks routed
         # to a CLI engine (#753) go through this pool via _submit_cli_dispatch.
@@ -656,6 +687,12 @@ class Worker:
 
     def tick(self) -> int:
         """Process one poll cycle. Returns the number of tasks handled (for tests)."""
+        # Resolve Human-queue cards whose done_when condition now passes.
+        # Runs before the spend-cap guard below: it never starts a new
+        # task or spends money, so it must not stop just because the
+        # worker is paused or near its daily cap (#852 R2).
+        self._process_human_queue()
+
         # Use the configured per-task default budget as the "can I afford to
         # start the cheapest task right now?" estimate. Calling with 0.0 would
         # let claims through even at cap=0 — see SpendTracker.can_start_task
@@ -1302,6 +1339,72 @@ class Worker:
                 f"(Task remains at #{BLOCKED_TAG}. Reply to the original "
                 f"question to unblock, or re-tag with #{AGENT_TAG} to retry.)"
             )
+
+    def _process_human_queue(self) -> None:
+        """Resolve open Human-queue cards whose `done_when` check now passes
+        (#852). Throttled to `settings.human_queue_poll_seconds` — `tick()`
+        itself may run far more often. Talks to the store through the HTTP
+        API, not the in-process TaskManager, matching every other cross-
+        process access in this worker (the worker and the API may run on
+        different hosts). Never raises: a listing failure, a single card's
+        check failure/error, or a resolve failure is logged and skipped —
+        the untouched card is picked up again next tick.
+        """
+        now = time.time()
+        if now - self._last_human_queue_check < settings.human_queue_poll_seconds:
+            return
+        self._last_human_queue_check = now
+
+        try:
+            resp = self._http.get(f"{self.api_base}/api/tasks/human-queue")
+            resp.raise_for_status()
+            cards = resp.json().get("cards", [])
+        except Exception as exc:
+            logger.warning("human-queue tick: failed to list cards: %s", exc)
+            return
+
+        for card in cards:
+            done_when = card.get("done_when")
+            if not done_when:
+                continue
+            try:
+                passed, check_desc = self._check_human_queue_done_when(done_when)
+            except Exception as exc:
+                logger.warning(
+                    "human-queue tick: done_when check errored for %s: %s", card.get("id"), exc
+                )
+                continue
+            if not passed:
+                continue
+            try:
+                resp = self._http.put(
+                    f"{self.api_base}/api/tasks/human-queue/{card['id']}/resolve",
+                    json={"note": f"Auto-resolved: {check_desc}"},
+                )
+                resp.raise_for_status()
+            except Exception as exc:
+                logger.warning("human-queue tick: failed to resolve %s: %s", card.get("id"), exc)
+                continue
+            logger.info("human-queue: resolved %s (%s)", card.get("id"), check_desc)
+
+    def _check_human_queue_done_when(self, done_when: dict) -> tuple[bool, str]:
+        """Evaluate one card's `done_when`. Returns `(passed, description)`;
+        raises on a malformed check or a request/IO error — the caller
+        treats that the same as a failed check (card left untouched)."""
+        dw_type = done_when.get("type")
+        if dw_type == "endpoint":
+            path = done_when["path"]
+            pointer = done_when.get("pointer", "")
+            equals = done_when.get("equals")
+            resp = self._http.get(f"{self.api_base}{path}", timeout=5.0)
+            resp.raise_for_status()
+            value = _resolve_json_pointer(resp.json(), pointer)
+            desc = f"endpoint {path}{pointer} == {equals!r}"
+            return value == equals, desc
+        if dw_type == "file_exists":
+            path = done_when["path"]
+            return os.path.exists(path), f"file_exists {path}"
+        raise ValueError(f"unsupported done_when type {dw_type!r}")
 
     def ask_user_via_telegram(
         self,
@@ -2418,6 +2521,18 @@ class Worker:
         )
         return self._codex_executor
 
+    def _get_hermes_executor(self):
+        """Lazy-construct the HermesExecutor for board-assigned #hermes
+        sessions (#851)."""
+        if self._hermes_executor is not None:
+            return self._hermes_executor
+        from api.services.agent_worker.hermes_executor import HermesExecutor
+        self._hermes_executor = HermesExecutor(
+            session_store=self.session_store,
+            transcript_store=self.transcript_store,
+        )
+        return self._hermes_executor
+
     def _fetch_task(self, task_id: str) -> dict[str, Any] | None:
         try:
             resp = self._http.get(f"{self.api_base}/api/tasks/{task_id}")
@@ -2494,6 +2609,17 @@ class Worker:
             budget=budget_json,
             expected_output=pre.expected_output,
             preset_class=pre.preset_class,
+        )
+        # (#851) Board-assignment fields — model/effort/host, plus
+        # assigned_by (bookkeeping only; routing itself already comes from
+        # the assignee tag, see assignment.py's module docstring and
+        # preflight's `_apply_route_corroboration`, which never
+        # second-guesses a tagged route). Set unconditionally: an
+        # untagged/non-board task's fields are simply empty, so this is a
+        # no-op write of NULLs for every pre-#851 task shape.
+        assignment = extract_assignment(task.get("fields"))
+        self.session_store.set_assignment(
+            task_id, host=assignment.host, model=assignment.model, effort=assignment.effort,
         )
         session = self.session_store.get(task_id)  # refresh
 
@@ -2608,6 +2734,22 @@ class Worker:
             # `_poll_managed_sessions` in the next tick will pick it up.
             if outcome.status == STATUS_FAILED:
                 self._handle_outcome(session, task, outcome)
+            return
+
+        # (#851) Hermes route: open a Hermes conversation with the card's
+        # title/notes as the opening turn. A single HTTP round trip to the
+        # configured backend — short enough (unlike the CLI routes below)
+        # to run inline on the tick thread rather than through the CLI
+        # dispatch pool.
+        if pre.routing == ROUTE_HERMES:
+            hermes = self._get_hermes_executor()
+            try:
+                outcome = hermes.execute(session, task)
+            except Exception as exc:
+                logger.exception("hermes executor crashed for %s: %s", task_id, exc)
+                self._mark_failed(session, task, f"executor crashed: {exc}")
+                return
+            self._handle_outcome(session, task, outcome)
             return
 
         # CLI routes (#claude → Claude Code, #codex → Codex). Synthesize the

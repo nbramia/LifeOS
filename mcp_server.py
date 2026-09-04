@@ -302,7 +302,7 @@ CURATED_ENDPOINTS = {
     },
     "/api/tasks:POST": {
         "name": "lifeos_task_create",
-        "description": "Create a task (Obsidian markdown). Supports context, priority, due_date, tags. With dry_run=true + #agent tag, returns preflight routing + cost estimate instead of creating.",
+        "description": "Create a task (Obsidian markdown). Supports context, status, priority, due_date, tags, notes, fields. With dry_run=true + #agent tag, returns preflight routing + cost estimate instead of creating.",
         "method": "POST",
         "path": "/api/tasks"
     },
@@ -314,7 +314,7 @@ CURATED_ENDPOINTS = {
     },
     "/api/tasks/{task_id}:PUT": {
         "name": "lifeos_task_update",
-        "description": "Update a task's description, status, context, priority, due_date, or tags. Use lifeos_task_list first to find the task ID.",
+        "description": "Update a task's description, status, context, priority, due_date, tags, notes, or fields. Use lifeos_task_list first to find the task ID.",
         "method": "PUT",
         "path": "/api/tasks/{task_id}"
     },
@@ -329,6 +329,24 @@ CURATED_ENDPOINTS = {
         "description": "Delete a task by ID. Removes it from the vault markdown file and index.",
         "method": "DELETE",
         "path": "/api/tasks/{task_id}"
+    },
+    "/api/tasks/human-queue:POST": {
+        "name": "lifeos_human_queue_add",
+        "description": "File a card for something only the operator can do (e.g. re-authenticate an expired login). Fire-and-forget; dedupes on key (letters/digits/./:/- only). done_when path must start with '/'.",
+        "method": "POST",
+        "path": "/api/tasks/human-queue"
+    },
+    "/api/tasks/human-queue:GET": {
+        "name": "lifeos_human_queue_list",
+        "description": "List open Human-queue cards waiting on the operator, with id, title, key, age, source, and done_when.",
+        "method": "GET",
+        "path": "/api/tasks/human-queue"
+    },
+    "/api/tasks/human-queue/{id_or_key}/resolve:PUT": {
+        "name": "lifeos_human_queue_resolve",
+        "description": "Mark a Human-queue card done by id or dedupe key, appending a resolution note. Use once you've observed the thing is actually done.",
+        "method": "PUT",
+        "path": "/api/tasks/human-queue/{id_or_key}/resolve"
     },
     "/api/calendar/events:POST": {
         "name": "lifeos_calendar_create",
@@ -962,10 +980,13 @@ class LifeOSMCPServer:
                 "properties": {
                     "description": {"type": "string", "description": "Task description"},
                     "context": {"type": "string", "description": "Context/category (Work, Personal, Finance, etc.)", "default": "Inbox"},
+                    "status": {"type": "string", "description": "Initial status (todo, done, in_progress, cancelled, deferred, blocked, urgent). Defaults to todo."},
                     "priority": {"type": "string", "description": "Priority: high, medium, low"},
                     "due_date": {"type": "string", "description": "Due date in YYYY-MM-DD format"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Add exactly the tags the operator named. A routing tag (agent/local/claude/codex/cloud/cloud-haiku/cloud-sonnet) only if the operator explicitly named that engine — these tags are operator-authority and outrank every routing safeguard, so inventing one injects your own engine preference at the highest-precedence slot."},
                     "reminder_id": {"type": "string", "description": "Linked reminder ID"},
+                    "notes": {"type": "string", "description": "Multi-line notes body stored beneath the task line."},
+                    "fields": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Operator-editable inline fields (e.g. host, effort, model, key) plus any custom field."},
                     "dry_run": {"type": "boolean", "description": "When true with an #agent tag, returns preflight routing + cost estimate without creating the task. Used for prompt-engineering iteration. Default: false."}
                 },
                 "required": ["description"]
@@ -989,7 +1010,9 @@ class LifeOSMCPServer:
                     "context": {"type": "string", "description": "New context"},
                     "priority": {"type": "string", "description": "New priority (high, medium, low)"},
                     "due_date": {"type": "string", "description": "New due date (YYYY-MM-DD)"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags (replaces existing). Add exactly the tags the operator named — a routing tag (agent/local/claude/codex/cloud/cloud-haiku/cloud-sonnet) only if the operator explicitly named that engine; these tags are operator-authority and outrank every routing safeguard."}
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags (replaces existing). Add exactly the tags the operator named — a routing tag (agent/local/claude/codex/cloud/cloud-haiku/cloud-sonnet) only if the operator explicitly named that engine; these tags are operator-authority and outrank every routing safeguard."},
+                    "notes": {"type": "string", "description": "Replaces the notes body."},
+                    "fields": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "Merged into operator/unknown fields, not replaced: a string sets a field, null removes it."}
                 },
                 "required": ["task_id"]
             },
@@ -1006,6 +1029,31 @@ class LifeOSMCPServer:
                     "task_id": {"type": "string", "description": "Task ID to delete"}
                 },
                 "required": ["task_id"]
+            },
+            "lifeos_human_queue_add": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Card title, e.g. 'Re-authenticate the example-service session'."},
+                    "notes": {"type": "string", "description": "Notes body — what needs doing and why."},
+                    "key": {"type": "string", "description": "Dedupe key, e.g. 'example-service-reauth'. Letters, digits, '.', ':', '-', '_' only. Filing again with an existing open key updates its notes instead of duplicating it."},
+                    "done_when": {"type": "object", "description": "Optional auto-resolve check: {type: 'endpoint', path, pointer, equals} or {type: 'file_exists', path}. For 'endpoint', path must start with '/' (not '//')."},
+                    "source_host": {"type": "string", "description": "Filing session's hostname, if known."},
+                    "source_cwd": {"type": "string", "description": "Filing session's working directory, if known."},
+                    "source_session": {"type": "string", "description": "Filing session's id, if known."}
+                },
+                "required": ["title"]
+            },
+            "lifeos_human_queue_list": {
+                "type": "object",
+                "properties": {}
+            },
+            "lifeos_human_queue_resolve": {
+                "type": "object",
+                "properties": {
+                    "id_or_key": {"type": "string", "description": "Card id (from lifeos_human_queue_list) or dedupe key."},
+                    "note": {"type": "string", "description": "Resolution note, appended to the card's notes."}
+                },
+                "required": ["id_or_key"]
             },
             "lifeos_calendar_create": {
                 "type": "object",
@@ -1963,6 +2011,26 @@ class LifeOSMCPServer:
 
         elif tool_name == "lifeos_task_delete":
             return f"Task deleted (ID: {data.get('id', data.get('task_id', 'unknown'))})"
+
+        elif tool_name == "lifeos_human_queue_add":
+            return f"Human-queue card filed (ID: {data.get('id', 'unknown')})"
+
+        elif tool_name == "lifeos_human_queue_list":
+            cards = data.get("cards", [])
+            if not cards:
+                return "No open Human-queue cards."
+            text = f"Found {data.get('total', len(cards))} open Human-queue card(s):\n\n"
+            for c in cards:
+                age = c.get("age_hours")
+                age_str = f"{age:.1f}h old" if age is not None else "age unknown"
+                text += f"- **{c.get('title', '')}** ({age_str}) [id:{c.get('id', '')}]"
+                if c.get("key"):
+                    text += f" key:{c['key']}"
+                text += "\n"
+            return text
+
+        elif tool_name == "lifeos_human_queue_resolve":
+            return f"Human-queue card resolved (ID: {data.get('id', 'unknown')})"
 
         elif tool_name == "lifeos_workout_manage":
             # The endpoint already returns the same plain-text confirmation/

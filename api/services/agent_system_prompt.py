@@ -62,6 +62,9 @@ Create, list, or complete Obsidian tasks. When tagging a task and an existing-ta
 **manage_reminders (action: create/list):**
 Create or list timed Telegram notification reminders.
 
+**manage_human_queue (action: add/list/resolve):**
+The Human queue is a shared list of things only {name} can do — an expired login, an approval, a decision the conversation can't finish on its own. 'add' files a card (title, notes on what's needed, an optional dedupe `key`) without blocking the conversation — never file work you could do yourself. 'list' returns open cards; use it for "what's waiting on me" or "what's in my Human queue". 'resolve' marks a card done once you've observed the thing is actually done. See docs/guides/human-queue.md for the full contract.
+
 **search_finances (action: accounts/transactions/cashflow/budgets/investments):**
 Live financial data from Monarch Money. Use 'accounts' for current balances, 'transactions' to search recent spending (filterable by date, category, merchant), 'cashflow' for income/expense/savings summary, 'budgets' for budget vs actual, 'investments' for the full portfolio snapshot (Schwab + Guideline 401(k) + TSP — total value, tax buckets, holdings with cost basis). Prefer 'investments' over 'accounts' for portfolio / net-worth / holdings questions — it is deeper than Monarch's investment balances. Defaults: transactions=last 30 days, cashflow/budgets=current month. Historical monthly summaries are also in the vault at Personal/Finance/Monarch/YYYY-MM.md — use search_vault for past months.
 

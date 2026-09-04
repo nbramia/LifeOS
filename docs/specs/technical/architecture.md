@@ -179,6 +179,7 @@ not all of them.
 
 **Task Management:**
 - `task_manager.py` - Task CRUD, markdown I/O, index persistence, fuzzy query
+- `atomic_write.py` - Shared temp-file + fsync + rename helper for atomic vault/index writes (task files, task index, scheduler store)
 
 **Background Jobs:**
 - `job_queue.py` - SQLite-backed job queue with worker thread (reindex, sync)
