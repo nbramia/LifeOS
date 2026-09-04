@@ -9314,7 +9314,31 @@
             await statsPromise;
         }
 
-        // Load people list (with search result caching)
+        // Loads/reloads the people list (with search result caching).
+        // Called both for an actual search (handleSearch/clearSearch) and
+        // for a plain reload (init(), and after hide/merge/split via
+        // `await loadPeople()`).
+        //
+        // Contract callers should know about: a call may resolve WITHOUT
+        // updating the shared `people` array or calling renderPeopleList(),
+        // if a newer call to loadPeople() started before this one's
+        // response arrived (or answered from cache) — see the identity
+        // check below. `await loadPeople()` therefore only means "this
+        // particular call finished," not "the people list is now known to
+        // be fresh." Every current caller tolerates that: init()'s
+        // `peoplePromise` is awaited only to sequence page setup, not
+        // because later code reads `people` and requires it to be current
+        // at that exact instant (the family/relationship dashboards render
+        // from their own data; the final `await statsPromise` doesn't touch
+        // `people` either), and the hide/merge/split reload calls are
+        // synchronous button actions that don't normally race a concurrent,
+        // unrelated loadPeople() call within the same instant — if one ever
+        // does, the call that actually wins (the most recent one to start)
+        // still renders the definitive state shortly after. This is a
+        // deliberate, accepted sharp edge, not a guaranteed-safe contract:
+        // a caller that truly needs "resolve only once `people` reflects
+        // this exact call" would need a dedicated path that doesn't share
+        // this cancellation/staleness guard.
         async function loadPeople() {
             const listEl = document.getElementById('peopleList');
 
@@ -9388,16 +9412,6 @@
 
                 const results = await Promise.all(fetchPromises);
 
-                // A newer search may have started (and possibly already
-                // resolved from cache) while these requests were in flight.
-                // Abort() stops the network fetch when it's still pending,
-                // but if this one had already reached the browser before
-                // being superseded, abort() is a no-op — so check identity
-                // too and drop the response rather than render or cache it.
-                if (searchController.signal.aborted || currentPeopleSearchController !== searchController) {
-                    return;
-                }
-
                 // Merge and deduplicate results by person ID
                 const seenIds = new Set();
                 for (const data of results) {
@@ -9409,8 +9423,24 @@
                     }
                 }
 
-                // Cache the raw merged results before applying dunbar circles
+                // Cache the raw merged results before applying dunbar circles.
+                // Do this even if this response turns out to be superseded
+                // below — the cache key already encodes the query, so
+                // storing a successful response here is safe (it can only
+                // help a later re-search of this exact query render
+                // instantly from cache) even though this call won't adopt
+                // it as the *current* list right now.
                 setCachedSearch(cacheKey, allPeople);
+
+                // A newer search may have started (and possibly already
+                // resolved from cache) while these requests were in flight.
+                // Abort() stops the network fetch when it's still pending,
+                // but if this one had already reached the browser before
+                // being superseded, abort() is a no-op — so check identity
+                // too and drop the response rather than render it.
+                if (searchController.signal.aborted || currentPeopleSearchController !== searchController) {
+                    return;
+                }
 
                 people = applyDunbarCircles(allPeople);
                 // Sort: self first, then by Dunbar circle, then by relationship strength
@@ -10270,7 +10300,6 @@
             // Called implicitly when renderPersonDetail populates the fields
         }
 
-
         // Update source entities section
         function updateSourceEntities(sourceEntities, count) {
             document.getElementById('sourceEntitiesCount').textContent = count.toLocaleString();
@@ -10478,16 +10507,23 @@
 
             // Source entities - show count if available, loading state for list.
             // loadPersonDetail always fetches with include_related=true, so
-            // person.source_entities is normally already present here; the
-            // branches below are a defensive fallback for a caller that
-            // doesn't.
+            // person.source_entities is normally already present here (as
+            // an array, possibly empty) — the "loading" fallback below is
+            // only reachable if some other caller renders a person object
+            // that omits the key entirely. Checking presence of the key
+            // (not its length) matters: with the old length-based check, an
+            // empty-but-present array fell through to the "loading" branch
+            // and stayed there forever (nothing re-renders it — the
+            // follow-up fetch that used to settle it, loadRelatedData(),
+            // was removed when the two-fetch flow was consolidated).
             const sourceEntityCount = person.source_entity_count || 0;
             document.getElementById('sourceEntitiesCount').textContent = sourceEntityCount.toLocaleString();
             const listEl = document.getElementById('sourceEntitiesList');
 
-            // If source_entities included (from include_related=true), render them.
-            // Otherwise show a loading state.
-            if (person.source_entities && person.source_entities.length > 0) {
+            // If source_entities is present at all (from include_related=true),
+            // render it — updateSourceEntities() itself renders "No source
+            // entities" for an empty array. Otherwise show a loading state.
+            if (person.source_entities) {
                 updateSourceEntities(person.source_entities, sourceEntityCount);
             } else if (sourceEntityCount > 0) {
                 listEl.innerHTML = '<div class="empty-state"><p>Loading source entities...</p></div>';

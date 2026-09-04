@@ -18,7 +18,7 @@ LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that subm
 | **Voice (web)** | Browser → LifeOS reverse-proxy → whisper-relay | LifeOS `/chat` + `web/chat/voice.js`; proxies `/api/voice/*` — `api/routes/voice.py` |
 | MCP / Managed Agents | stdio or HTTP MCP | Tool catalog only — `mcp_server.py` |
 
-**Response compression (#874).** `api/main.py` applies `GZipMiddleware` scoped to `/api/crm/*` and `/api/people/*` only (`minimum_size=1024`), not app-wide. No SSE route documented on this page lives under either prefix, so every stream above stays uncompressed and unbuffered by construction — there is no exclusion list to maintain, and no gzip-vs-streaming interaction for a future endpoint to worry about unless it's added under one of those two prefixes.
+**Response compression (#874).** `api/main.py` applies `GZipMiddleware` scoped to `/api/crm/*`, `/api/people/*`, and the CRM page routes (`minimum_size=1024`, `compresslevel=6`), not app-wide. This is a deliberate scoping choice, not a required safety measure: the pinned Starlette version (0.52.1) already refuses to compress `text/event-stream` responses on its own, so applying `GZipMiddleware` app-wide would not in fact risk buffering any of the SSE streams documented above. Scoping to an allow-list instead simply keeps the gzip CPU cost confined to the handful of routes large enough to be worth it, independent of a dependency default that could change.
 
 ---
 

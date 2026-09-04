@@ -53,7 +53,10 @@ PERSON_CLICKABLE = {
 PERSON_DETAIL = {
     **PERSON_CLICKABLE,
     "emails": [], "phone_numbers": [], "vault_contexts": [], "sources": [],
-    "source_entities": [], "source_entity_count": 0, "relationships": [],
+    # source_entity_count > 0 while source_entities is empty is the exact
+    # mismatch that used to hang the panel on "Loading source entities..."
+    # forever (nothing re-rendered it after loadRelatedData() was removed).
+    "source_entities": [], "source_entity_count": 3, "relationships": [],
 }
 
 EMPTY_PEOPLE_PAGE = {"people": [], "total": 0, "offset": 0, "count": 0}
@@ -212,22 +215,49 @@ class TestSearchCancellation:
         )
 
     def test_abort_error_does_not_show_failure_state(self, page: Page, crm_base_url):
-        """A cancelled request must not surface the generic error message."""
+        """A cancelled request must not surface the generic error message.
+
+        The fills below are spaced > 300ms apart (matching the sibling
+        tests above) so each one's own debounce actually fires its own
+        request — closer spacing (as an earlier version of this test had
+        it, all 100ms apart) means only the *last* fill's debounce ever
+        fires at all, so nothing is ever superseded or aborted and this
+        assertion would hold trivially, proving nothing. "one" and "two"
+        are given a long artificial delay so they are still genuinely
+        in-flight (and therefore actually get aborted, not just rendered
+        over) when the next fill starts.
+        """
         _goto_me_with_rules(page, crm_base_url, [
-            {"match": "q=", "body": {"people": [PERSON_SLOW], "total": 1,
-                                      "offset": 0, "count": 1}, "delayMs": 600},
+            {"match": "q=one", "body": {"people": [PERSON_SLOW], "total": 1,
+                                         "offset": 0, "count": 1}, "delayMs": 5000},
+            {"match": "q=two", "body": {"people": [PERSON_SLOW], "total": 1,
+                                         "offset": 0, "count": 1}, "delayMs": 5000},
+            {"match": "q=three", "body": {"people": [PERSON_FAST], "total": 1,
+                                           "offset": 0, "count": 1}, "delayMs": 0},
         ])
 
         search_input = page.locator("#searchInput")
         search_input.fill("one")
-        page.wait_for_timeout(100)
+        page.wait_for_timeout(350)
         search_input.fill("two")
-        page.wait_for_timeout(100)
+        page.wait_for_timeout(350)
         search_input.fill("three")
 
-        # None of these superseded/aborted responses should render the
-        # generic failure state.
-        page.wait_for_timeout(1200)
+        expect(page.locator(".person-card .person-name")).to_have_text(
+            "Fast Query Result", timeout=3000)
+
+        # Prove something was actually superseded/aborted before checking
+        # that it didn't surface as a failure — otherwise a version of this
+        # test that never exercises cancellation at all would pass
+        # trivially (this is exactly what #895's review caught).
+        aborted_urls = page.evaluate("window.__abortedUrls")
+        assert any("q=one" in u for u in aborted_urls), (
+            f"expected the superseded 'one' request to be aborted, got: {aborted_urls}"
+        )
+        assert any("q=two" in u for u in aborted_urls), (
+            f"expected the superseded 'two' request to be aborted, got: {aborted_urls}"
+        )
+
         expect(page.locator("#peopleList")).not_to_contain_text("Failed to load people")
 
 
@@ -254,3 +284,12 @@ class TestSinglePersonFetch:
             f"{detail_requests}"
         )
         assert "include_related=true" in detail_requests[0]
+
+        # PERSON_DETAIL carries source_entities: [] (present but empty) —
+        # renderPersonDetail() must treat that as "no source entities" and
+        # never leave the panel on the "Loading source entities..."
+        # placeholder, which nothing re-renders once loadRelatedData() (the
+        # only thing that used to settle it) was removed.
+        source_entities_text = page.locator("#sourceEntitiesList").inner_text()
+        assert "Loading source entities" not in source_entities_text
+        assert "No source entities" in source_entities_text
