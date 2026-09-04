@@ -1105,6 +1105,100 @@ class PersonEntityStore:
         finally:
             conn.close()
 
+    def count_search(self, query: str, include_hidden: bool = False) -> int:
+        """
+        Count entities matching the same predicate as search().
+
+        Cheap `COUNT(*)` companion to search() for callers that want a
+        "how many matched in total" figure without paginating through every
+        row. Note this does not exclude already-merged duplicate rows (search()
+        filters those out in Python after fetching) -- that set is normally
+        tiny relative to total matches, and re-checking it here would cost the
+        same full-table work count_search exists to avoid.
+
+        Args:
+            query: Search string, same matching as search()
+            include_hidden: If True, include hidden entities (default: False)
+
+        Returns:
+            Number of matching rows.
+        """
+        query_lower = query.lower()
+        pattern = f"%{query_lower}%"
+
+        conn = self._get_connection()
+        try:
+            conditions = [
+                "(LOWER(canonical_name) LIKE ? OR LOWER(display_name) LIKE ? "
+                "OR LOWER(emails) LIKE ? OR LOWER(aliases) LIKE ?)"
+            ]
+            params: list = [pattern, pattern, pattern, pattern]
+
+            if not include_hidden:
+                conditions.append("hidden = 0")
+
+            where = " AND ".join(conditions)
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM person_entities WHERE {where}", params
+            ).fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+    def list_recent(self, limit: int = 50, category: Optional[str] = None,
+                     include_hidden: bool = False,
+                     include_merged: bool = False) -> list[PersonEntity]:
+        """
+        List entities ordered by last_seen DESC, most recent first, in SQL.
+
+        This is the bounded counterpart to get_all() for callers (like
+        GET /api/people/list) that only need the top N by recency: it applies
+        ORDER BY / LIMIT and the category filter in SQL instead of loading
+        every entity into Python and sorting there.
+
+        Args:
+            limit: Maximum results to return
+            category: If given, filter to this category in SQL
+            include_hidden: If True, include hidden entities (default: False)
+            include_merged: If True, include entities that were merged into
+                others (default: False)
+
+        Returns:
+            List of PersonEntity objects, most recently seen first.
+        """
+        merged_ids = set(self._merged_ids.keys()) if not include_merged else set()
+
+        conn = self._get_connection()
+        try:
+            conditions = []
+            params: list = []
+
+            if not include_hidden:
+                conditions.append("hidden = 0")
+            if category:
+                conditions.append("category = ?")
+                params.append(category)
+
+            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            # Over-fetch a little when we need to filter out merged rows in
+            # Python, so the final page still has `limit` rows when possible.
+            fetch_limit = limit + len(merged_ids) if merged_ids else limit
+            sql = (f"SELECT * FROM person_entities {where} "
+                   f"ORDER BY last_seen DESC LIMIT ?")
+            rows = conn.execute(sql, params + [fetch_limit]).fetchall()
+
+            results = []
+            for row in rows:
+                if row['id'] in merged_ids:
+                    continue
+                results.append(self._row_to_entity(row))
+                if len(results) >= limit:
+                    break
+
+            return results
+        finally:
+            conn.close()
+
     def get_all(self, include_hidden: bool = False,
                 include_merged: bool = False) -> list[PersonEntity]:
         """

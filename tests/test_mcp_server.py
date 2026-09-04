@@ -467,6 +467,98 @@ def test_call_api_skips_cache_when_session_id_missing():
 
 
 # ---------------------------------------------------------------------------
+# lifeos_people_search limit (#872)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_people_search_defaults_limit_to_ten_when_absent():
+    """Omitting `limit` must still send limit=10 to the API, so the tool's
+    behavior (and the formatter's existing top-10 display) stays unchanged
+    for callers that don't know about the new param."""
+    import importlib.util
+    from unittest.mock import MagicMock
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    server = module.LifeOSMCPServer()
+    fake = MagicMock()
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.json.return_value = {"people": [], "count": 0, "query": "ada"}
+    fake_response.raise_for_status = MagicMock()
+    fake.get.return_value = fake_response
+    server.client = fake
+
+    server._call_api("lifeos_people_search", {"q": "ada"})
+
+    assert fake.get.call_count == 1
+    _, kwargs = fake.get.call_args
+    assert kwargs["params"]["limit"] == 10
+
+
+@pytest.mark.unit
+def test_people_search_passes_through_an_explicit_limit():
+    """An explicit `limit` from the caller must reach the API unchanged."""
+    import importlib.util
+    from unittest.mock import MagicMock
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    server = module.LifeOSMCPServer()
+    fake = MagicMock()
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.json.return_value = {"people": [], "count": 0, "query": "ada"}
+    fake_response.raise_for_status = MagicMock()
+    fake.get.return_value = fake_response
+    server.client = fake
+
+    server._call_api("lifeos_people_search", {"q": "ada", "limit": 30})
+
+    assert fake.get.call_count == 1
+    _, kwargs = fake.get.call_args
+    assert kwargs["params"]["limit"] == 30
+
+
+@pytest.mark.unit
+def test_people_search_tool_schema_advertises_limit_default_and_cap(openapi_spec, monkeypatch):
+    """The published schema documents the smaller MCP-facing default (10)
+    and max (50) even though the API itself defaults to 20 with a 200 cap.
+
+    Builds the server against the in-process OpenAPI spec (this checkout's
+    code), not whatever's live on localhost:8000 — a running server may
+    still be on pre-#872 code and wouldn't have the `limit` param yet.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class _FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return openapi_spec
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def get(self, *a, **k):
+            return _FakeResp()
+
+    monkeypatch.setattr(module.httpx, "Client", _FakeClient)
+    server = module.LifeOSMCPServer()
+    tool = next(t for t in server.tools if t["name"] == "lifeos_people_search")
+    limit_prop = tool["inputSchema"]["properties"]["limit"]
+    assert limit_prop["default"] == 10
+    assert limit_prop["maximum"] == 50
+
+
+# ---------------------------------------------------------------------------
 # Investments snapshot tool (#447)
 # ---------------------------------------------------------------------------
 

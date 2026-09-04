@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-08-28
+**Last Updated:** 2026-09-04
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two adjacent catalogs split out for size:
 
@@ -685,7 +685,24 @@ Get a specific person by name.
 
 ### GET /api/people/search
 
-Search people by name or email.
+Search people by name, email, alias, or display name. Matches sort exact
+canonical-name matches first, then most recently seen.
+
+**Query Parameters:**
+- `q` (string, required): Search text
+- `limit` (integer, optional, default 20, max 200): Max results to return
+
+**Response:** adds a `total` field (count of all matching people, not just
+the returned page) alongside the existing `people`/`count`/`query` fields.
+
+### GET /api/people/list
+
+List people ordered by most recently seen first, optionally filtered by
+category.
+
+**Query Parameters:**
+- `limit` (integer, optional, default 50, max 500): Max results to return
+- `category` (string, optional): Filter to this category
 
 ---
 

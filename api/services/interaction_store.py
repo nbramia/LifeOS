@@ -977,6 +977,61 @@ class InteractionStore:
         finally:
             conn.close()
 
+    def get_last_interaction_by_source_batch(
+        self, person_ids: list[str]
+    ) -> dict[str, dict[str, datetime]]:
+        """
+        Batched version of get_last_interaction_by_source() for many people.
+
+        Runs one `GROUP BY person_id, source_type` query per chunk of ids
+        (chunked at 900 to stay under SQLite's default 999 bound-parameter
+        limit) instead of one query per person, so callers that need this
+        for a page of search/list results don't pay an N+1 cost.
+
+        Args:
+            person_ids: PersonEntity IDs to fetch recency for.
+
+        Returns:
+            Dict mapping person_id to the same per-source dict that
+            get_last_interaction_by_source() would return for that person.
+            IDs with no interactions are simply absent.
+        """
+        if not person_ids:
+            return {}
+
+        # De-dupe while preserving determinism; chunk to stay under SQLite's
+        # default limit on bound parameters (999).
+        unique_ids = list(dict.fromkeys(person_ids))
+        result: dict[str, dict[str, datetime]] = {}
+        now = datetime.now(timezone.utc).isoformat()
+
+        conn = self._get_connection()
+        try:
+            chunk_size = 900
+            for i in range(0, len(unique_ids), chunk_size):
+                chunk = unique_ids[i:i + chunk_size]
+                placeholders = ",".join("?" * len(chunk))
+                cursor = conn.execute(
+                    f"""
+                    SELECT person_id, source_type, MAX(timestamp) as last_ts
+                    FROM interactions
+                    WHERE person_id IN ({placeholders}) AND timestamp <= ?
+                    GROUP BY person_id, source_type
+                    """,
+                    chunk + [now],
+                )
+                for row in cursor.fetchall():
+                    person_id = row[0]
+                    source_type = row[1]
+                    ts_str = row[2]
+                    if not ts_str:
+                        continue
+                    dt = _make_aware(datetime.fromisoformat(ts_str.replace("Z", "+00:00")))
+                    result.setdefault(person_id, {})[source_type] = dt
+            return result
+        finally:
+            conn.close()
+
     def get_first_interaction_dates(self, min_interactions: int = 1) -> dict[str, datetime]:
         """
         Get the earliest interaction timestamp for each person.
