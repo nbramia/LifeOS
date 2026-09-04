@@ -2,7 +2,7 @@
 
 > **Audience:** All AI coding agents (Claude Code, Cursor, Copilot, etc.)
 > **Status:** Complete
-> **Last Updated:** 2026-08-19
+> **Last Updated:** 2026-09-04
 
 LifeOS is a self-hosted personal AI assistant with two halves:
 
@@ -270,6 +270,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 - **Browser tests:** the web SPA is served at `/chat` (not `/`); `test.sh browser` covers only `test_ui_browser.py`, `test_e2e_flow.py`, and `test_voice_mic_block_ui_browser.py` — run new browser test files directly with pytest.
 - **What the pre-push hook skips:** a docs-only push and a deletion-only push skip the suites; everything else runs them in full. The docs-only judgement is `test.sh`'s `decide_plan`, called by the hook rather than reimplemented — so dependency manifests (`requirements*.txt`, `constraints*.txt`) still run tests despite the `.txt` extension. The hook never runs a narrowed subset: a prior failure changes test *order* (`--ff`), never which tests are selected.
 - **Server-free browser tests:** most browser tests point at a running `lifeos-api` and carry `requires_server` on top of `browser`. A browser test that serves `web/` itself on an ephemeral port and stubs every `/api/` call (see `tests/test_voice_mic_block_ui_browser.py`) omits that marker, so `browser and not requires_server` selects it. The pre-push hook runs that set alongside `unit and not slow` — it's the only gate that catches a `web/` JS regression before it reaches main, so prefer the self-contained pattern for new frontend tests.
+- **Push over HTTPS, not SSH:** `./scripts/setup-hooks.sh` points `origin`'s push URL at HTTPS (fetch stays SSH) because GitHub closes an idle SSH session after ~6 minutes while this ~9-minute gate is still running, which otherwise fails the push even after every test passed. If you push over SSH anyway, `scripts/pre-push` prints a one-line warning naming the HTTPS URL and keeps going.
 
 ---
 
