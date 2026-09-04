@@ -1180,11 +1180,11 @@ def _thread_dict(s: Session) -> dict[str, Any]:
         "total_dollars": round(s.total_dollars, 6),
         "expected_output": s.expected_output,
         "label": _label_for_session(s, []),
-        # (#892) Deliberately called with one argument: the /chat threads
-        # panel's `routeBadgeHtml` renders no badge at all for `hermes` (it
-        # doesn't consume this field for that routing), so this value is
-        # never displayed either way — left unenriched, out of #892's scope
-        # (the `/agents` snapshot row via `_session_to_dict` above).
+        # Called with one argument: the /chat threads panel's
+        # `routeBadgeHtml` renders no badge at all for `hermes` (it doesn't
+        # consume this field for that routing), so this value is never
+        # displayed either way — unlike the `/agents` snapshot row (see
+        # `_session_to_dict` above), which does pass `s.hermes_model` through.
         "model_label": _model_label_for_routing(s.routing),
         "origin": getattr(s, "origin", None),
         "resumable": s.status in TERMINAL_STATUSES,

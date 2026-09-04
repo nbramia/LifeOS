@@ -180,8 +180,8 @@ def test_http_error_fails_gracefully(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# #892 — HermesExecutor is the only writer of Session.hermes_model. It must
-# record the model Hermes reported for THIS session's OWN turn, on both the
+# HermesExecutor is the only writer of Session.hermes_model. It records the
+# model Hermes reported for THIS session's OWN turn, on both the
 # normal-completion exit path and the failure exit path (a dropped
 # connection after usage was reported still means the turn ran on that
 # model).
@@ -217,12 +217,12 @@ def test_no_usage_event_leaves_hermes_model_null(tmp_path, monkeypatch):
 
 
 def test_failed_turn_after_usage_event_still_records_the_reported_model(tmp_path, monkeypatch):
-    """(#892) The upstream connection can drop AFTER Hermes's own `usage`
+    """The upstream connection can drop AFTER Hermes's own `usage`
     event already arrived (simulated here as an `iter_bytes()` that yields
     the usage frame, then raises mid-stream, exactly like a genuine
     connection error). The turn still ran on that model, so it must still
     be recorded even though the executor's outcome is FAILED — dropping it
-    would be less honest, not more (design.md, #892)."""
+    would be less honest, not more (see `design.md`)."""
     usage_frame = _sse([
         {"type": "conversation_id", "conversation_id": "conv-model-3"},
         {"type": "usage", "model": "drop-after-usage-model", "input_tokens": 3, "output_tokens": 2, "cost_usd": 0.001},
@@ -266,13 +266,12 @@ def test_failed_turn_after_usage_event_still_records_the_reported_model(tmp_path
 
 
 # ---------------------------------------------------------------------------
-# #892 round-1 review, AR-1 — the tests above (and
-# tests/test_agent_viz_api.py's two-session / completed-session tests) each
-# create exactly ONE Hermes session, so they cannot tell "write only to my
-# own session" apart from "broadcast the model to every Hermes session" (the
-# #863 bug shape). These two exercise `HermesExecutor.execute()` — the real
-# write path — with TWO real sessions, so a broadcast mutation (see M1 in
-# the round-1 review: looping over every hermes-routed session and calling
+# The tests above (and tests/test_agent_viz_api.py's two-session /
+# completed-session tests) each create exactly ONE Hermes session, so they
+# cannot tell "write only to my own session" apart from "broadcast the
+# model to every Hermes session". These two exercise `HermesExecutor.
+# execute()` — the real write path — with TWO real sessions, so a
+# broadcast mutation (looping over every hermes-routed session and calling
 # `set_hermes_model` on each) fails them. `Turnstile` forces two real
 # `HermesExecutor.execute()` calls to interleave at the chunk level across
 # two real threads, so both turns are genuinely in flight together rather
@@ -389,7 +388,7 @@ def _real_snapshot_rows(monkeypatch, db_path, tmp_path) -> dict[str, dict]:
 def test_two_real_hermes_turns_interleaved_never_cross_attribute_on_the_real_snapshot(
     tmp_path, monkeypatch,
 ):
-    """(#892 AR-1) Two REAL `HermesExecutor.execute()` turns, different
+    """Two REAL `HermesExecutor.execute()` turns, different
     models, chunk-interleaved across two real threads so they're genuinely
     in flight together — the real snapshot must show each session its own
     model. Fails under mutation M1 (broadcast every Hermes session's row to
@@ -427,7 +426,7 @@ def test_two_real_hermes_turns_interleaved_never_cross_attribute_on_the_real_sna
 
 
 def test_completed_sessions_model_is_frozen_against_a_real_later_turn(tmp_path, monkeypatch):
-    """(#892 AR-1/AC4) Session alpha completes a REAL Hermes turn, then
+    """Session alpha completes a REAL Hermes turn, then
     session beta runs a REAL later turn on a different model — alpha's
     `model_label` must be byte-identical afterward. The AC4 test in
     tests/test_agent_viz_api.py writes `hermes_model` by hand via

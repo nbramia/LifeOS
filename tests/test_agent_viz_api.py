@@ -414,7 +414,7 @@ def test_model_label_hermes_routing_ignores_the_board_model_picker(client, store
 
 
 # ---------------------------------------------------------------------------
-# #892 — per-session Hermes-reported model. `Session.hermes_model` is
+# Per-session Hermes-reported model. `Session.hermes_model` is
 # written only by `HermesExecutor.execute` for the session it executes (see
 # tests/test_agent_worker_hermes_executor.py for that write path); these
 # tests pin the honest-attribution rules from the READ side (the snapshot's
@@ -435,11 +435,11 @@ def test_model_label_hermes_routing_shows_the_sessions_own_reported_model(client
 
 @pytest.mark.unit
 def test_model_label_hermes_two_concurrent_sessions_never_cross_attribute(client, stores):
-    """(#892 AC2) Two Hermes sessions running different models each report
-    their own — neither's badge changes when the OTHER takes a turn. This
-    is exactly the cross-session misattribution #863 found and withdrew:
-    a prior process-wide "last observed" value let session beta's turn
-    retroactively relabel session alpha."""
+    """Two Hermes sessions running different models each report
+    their own — neither's badge changes when the OTHER takes a turn. A
+    process-wide "last observed" value would let session beta's turn
+    retroactively relabel session alpha; `hermes_model` is per-session so
+    it cannot."""
     session_store, _ = stores
     session_store.create(task_id="t-herm-alpha", status=STATUS_RUNNING, routing="hermes")
     session_store.create(task_id="t-herm-beta", status=STATUS_RUNNING, routing="hermes")
@@ -465,7 +465,7 @@ def test_model_label_hermes_two_concurrent_sessions_never_cross_attribute(client
 
 @pytest.mark.unit
 def test_model_label_hermes_completed_session_is_frozen(client, stores):
-    """(#892 AC4) A completed session's reported model does not change
+    """A completed session's reported model does not change
     after the fact, even when another Hermes session takes a turn with a
     different model afterward."""
     session_store, _ = stores

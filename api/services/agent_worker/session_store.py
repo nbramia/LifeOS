@@ -126,17 +126,18 @@ class Session:
     effort: str | None = None
     conversation_id: str | None = None
     remote_pgid: int | None = None
-    # (#892) The model Hermes ITSELF reported for its most recent turn —
+    # The model Hermes ITSELF reported for its most recent turn —
     # observed from the turn's own `usage` event (`_HermesTurnPersister.
     # reported_model`), not declared. Explicitly distinct from `model`
     # above: `model` is the board's operator-chosen picker value, which
     # `HermesExecutor` never reads or writes. Written only by
     # `HermesExecutor.execute` for the session it is executing (see
     # `set_hermes_model`), so a completed session's value can never be
-    # rewritten by a later, unrelated turn — the process-wide "last
-    # observed" value `model_readout.py` keeps for `/api/health` doesn't
-    # have that property, which is exactly why #863 withdrew a badge
-    # sourced from it (see `agents.py`'s `_model_label_for_routing`).
+    # rewritten by a later, unrelated turn — unlike the process-wide "last
+    # observed" value `model_readout.py` keeps for `/api/health`, which any
+    # Hermes turn on any surface can overwrite (see `agents.py`'s
+    # `_model_label_for_routing`, which reads this column instead for a
+    # per-session badge).
     hermes_model: str | None = None
 
 
@@ -518,9 +519,10 @@ class SessionStore:
                 conn.execute("ALTER TABLE sessions ADD COLUMN conversation_id TEXT")
             if "remote_pgid" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN remote_pgid INTEGER")
-            # Idempotent migration for the per-session Hermes-reported model
-            # (#892). Old rows stay NULL — "no turn observed yet" for a
-            # pre-#892 session, same as a genuinely turn-less one.
+            # Idempotent migration for the per-session Hermes-reported model.
+            # Old rows stay NULL — "no turn observed yet" for a session
+            # created without this column, same as a genuinely turn-less
+            # one.
             if "hermes_model" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN hermes_model TEXT")
 
@@ -786,20 +788,20 @@ class SessionStore:
 
     def set_hermes_model(self, task_id: str, model: str) -> None:
         """Record the model Hermes itself reported for a turn THIS session
-        ran (#892) — mirrors `set_conversation_id` exactly. Called only by
+        ran — mirrors `set_conversation_id` exactly. Called only by
         `HermesExecutor.execute` for the session it just executed, which is
         what keeps this honest: no other writer can attribute a turn to the
         wrong session, and a completed session's value can never be
-        rewritten by a later, unrelated turn (contrast the process-wide
+        rewritten by a later, unrelated turn — unlike the process-wide
         "last observed" value `model_readout.record_hermes_chat_turn_model`
-        keeps for `/api/health`, which #863 found gets overwritten by ANY
-        Hermes turn on ANY surface). Ignores a falsy model rather than
-        clobbering a real prior observation with nothing, same rule
-        `record_hermes_chat_turn_model` follows. (round-1 review, R-4)
-        `.strip()`s before that guard so a whitespace-only model (e.g. a
-        malformed upstream `usage` event's `model` field) degrades to the
-        same "no turn observed" outcome as an empty one, instead of writing
-        a value that renders as `Hermes ·    ` — no length cap, matching
+        keeps for `/api/health`, which any Hermes turn on any surface can
+        overwrite. Ignores a falsy model rather than clobbering a real
+        prior observation with nothing, same rule
+        `record_hermes_chat_turn_model` follows. `.strip()`s before that
+        guard so a whitespace-only model (e.g. a malformed upstream
+        `usage` event's `model` field) degrades to the same "no turn
+        observed" outcome as an empty one, instead of writing a value that
+        renders as `Hermes ·    ` — no length cap, matching
         `usage_store`/`/api/health`, which take this same string verbatim."""
         if isinstance(model, str):
             model = model.strip()
