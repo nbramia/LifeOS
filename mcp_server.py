@@ -1418,11 +1418,13 @@ class LifeOSMCPServer:
                 return "No people found."
             shown = people[:10]
             # Use the API's total match count when available (falling back to
-            # the page size for older/mocked responses that lack it) so a
-            # broad query still signals "there are many more matches, narrow
-            # your query" instead of silently looking like an exhaustive
-            # result set of 10.
-            total = data.get("total", len(people))
+            # the page size for older/mocked responses that lack it, or that
+            # carry an explicit `"total": null` -- SearchResponse.total is
+            # Optional, so a sibling endpoint's response could serialize it
+            # that way) so a broad query still signals "there are many more
+            # matches, narrow your query" instead of silently looking like an
+            # exhaustive result set of 10.
+            total = data.get("total") or len(people)
             if total > len(shown):
                 text = f"Found {total} people (showing {len(shown)}):\n\n"
             else:

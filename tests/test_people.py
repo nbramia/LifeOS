@@ -748,6 +748,25 @@ class TestPersonEntityStoreSearchHelpers:
         # A limit smaller than the true count still reports the full total.
         assert len(store.search("ada", limit=2)) == 2
 
+    def test_count_search_excludes_merged_people(self, store):
+        """#872 review nit 1: count_search()'s merged-row exclusion had no
+        test -- mutating it away (`merged_ids = []`) let the whole suite
+        keep passing. Simulate a merge the same way a real merge operation's
+        durable record (merged_person_ids.json) would represent it: a
+        secondary id mapped to the primary it was merged into."""
+        now = datetime.now(timezone.utc)
+        store.add(_make_person(id="primary", canonical_name="Ada Merged Primary",
+                                emails=[], last_seen=now))
+        store.add(_make_person(id="secondary", canonical_name="Ada Merged Secondary",
+                                emails=[], last_seen=now))
+        assert store.count_search("ada merged") == 2
+
+        store._merged_ids = {"secondary": "primary"}
+
+        assert store.count_search("ada merged") == 1
+        # include_merged=True restores the pre-merge count, same as search().
+        assert store.count_search("ada merged", include_merged=True) == 2
+
     def test_list_recent_orders_and_filters_by_category(self, store):
         now = datetime.now(timezone.utc)
         store.add(_make_person(id="a", canonical_name="A", category="work",

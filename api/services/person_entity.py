@@ -26,6 +26,16 @@ from api.utils.datetime_utils import make_aware as _make_aware
 
 logger = logging.getLogger(__name__)
 
+# Chunk size for any SQL IN/NOT IN clause built from a caller-supplied list
+# of ids. SQLite's default SQLITE_MAX_VARIABLE_NUMBER has been 32766 since
+# 3.32.0 (999 was the default before that, and some builds raise it further
+# still -- this one measures 250,000). 900 has no relationship to any of
+# those numbers; it's a deliberately conservative, portable chunk size that
+# stays safely under all of them without detecting the compiled-in limit at
+# runtime. Mirrored in api/services/interaction_store.py's InteractionStore
+# (kept as a separate constant there -- no shared import for one number).
+SQL_IN_CLAUSE_CHUNK_SIZE = 900
+
 
 def _escape_like_pattern(text: str) -> str:
     """Escape SQL LIKE wildcards (`%`, `_`) and the escape character itself.
@@ -1133,9 +1143,9 @@ class PersonEntityStore:
         Cheap `COUNT(*)` companion to search() for callers that want a
         "how many matched in total" figure without paginating through every
         row. Excludes already-merged duplicate rows the same way search()
-        does, via `id NOT IN (...)` over the (small, currently in the low
-        hundreds) set of merged ids -- comfortably under SQLite's default
-        999-bound-parameter limit, and cheap relative to the LIKE scan this
+        does, via one `id NOT IN (...)` clause per SQL_IN_CLAUSE_CHUNK_SIZE
+        chunk of merged ids (currently in the low hundreds, so this is a
+        single chunk in practice) -- cheap relative to the LIKE scan this
         query already has to do.
 
         Args:
@@ -1162,10 +1172,15 @@ class PersonEntityStore:
             if not include_hidden:
                 conditions.append("hidden = 0")
 
-            if merged_ids:
-                placeholders = ",".join("?" * len(merged_ids))
+            # One NOT IN clause per chunk (ANDed together) rather than a
+            # single unbounded one, matching InteractionStore's batch-query
+            # chunking so a future spike in merged people can't turn this
+            # into "too many SQL variables".
+            for i in range(0, len(merged_ids), SQL_IN_CLAUSE_CHUNK_SIZE):
+                chunk = merged_ids[i:i + SQL_IN_CLAUSE_CHUNK_SIZE]
+                placeholders = ",".join("?" * len(chunk))
                 conditions.append(f"id NOT IN ({placeholders})")
-                params.extend(merged_ids)
+                params.extend(chunk)
 
             where = " AND ".join(conditions)
             row = conn.execute(
