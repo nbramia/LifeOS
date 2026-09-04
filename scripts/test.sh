@@ -214,6 +214,24 @@ run_changed_test_files() {
 }
 
 # Start server in background for tests using server.sh
+#
+# #919: this deliberately holds no PID anywhere, file or variable.
+# server.sh's own get_server_pid() identifies the server by port (`lsof -ti
+# :$PORT`), not by a PID we'd have to hand it, and it already owns the whole
+# start/stop lifecycle (kill_server, health-check wait, etc.) — so test.sh
+# has nothing to track. A fixed path shared across every worktree/branch on
+# this box would be the same cross-worktree collision class as #908/#913
+# (two concurrent test.sh runs clobbering or killing each other's server),
+# but this script used to hold a fixed PID-file path with no matching
+# writer: nothing in the repo ever wrote it, and the helper that read/rm'd
+# it was never called from anywhere, so it was dead since the initial
+# commit. Removed rather than reintroduced with a per-run path, since a
+# file nothing writes doesn't need a safer path — see #919. This also means
+# test.sh still deliberately leaves the started server running after the
+# run (unchanged prior behaviour) — server.sh's `start` already kills and
+# replaces whatever was on the port before launching, so a leftover server
+# from a previous run is cleaned up the next time any
+# `start_server_background` call happens, not on this script's exit.
 start_server_background() {
     log_info "Starting server for tests (takes 30-60s for ML model loading)..."
 
@@ -221,18 +239,6 @@ start_server_background() {
     if ! "$SCRIPT_DIR/server.sh" start; then
         log_error "Server failed to start. Check logs: $PROJECT_DIR/logs/server.log"
         exit 1
-    fi
-}
-
-# Stop background test server
-stop_test_server() {
-    if [ -f /tmp/lifeos_test_server.pid ]; then
-        PID=$(cat /tmp/lifeos_test_server.pid)
-        if kill -0 $PID 2>/dev/null; then
-            kill $PID
-            log_info "Stopped test server (PID: $PID)"
-        fi
-        rm /tmp/lifeos_test_server.pid
     fi
 }
 
