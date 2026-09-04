@@ -75,9 +75,20 @@ class TestProfilePhotoAvailable:
         assert response.content == b"\xff\xd8\xff\xe0fake-jpeg-bytes"
         assert response.headers["content-type"] == "image/jpeg"
 
-    def test_head_returns_200_with_no_body_and_matching_cache_header(self, client, photos_enabled, tmp_path):
+    def test_head_returns_200_with_no_body_and_full_header_parity_with_get(
+        self, client, photos_enabled, tmp_path
+    ):
         """#875: HEAD used to 405 on this route (GET-only), which is why the
-        list's avatar loader was permanently marking everyone as no-photo."""
+        list's avatar loader was permanently marking everyone as no-photo.
+
+        #907 review finding 3: a hand-rolled `if request.method == "HEAD"`
+        branch returning a bare `Response` matched status and `cache-control`
+        but dropped `etag`, `last-modified`, `accept-ranges`, and the real
+        `content-length` -- a client using HEAD to revalidate a cached avatar
+        couldn't. The route now stacks `@router.get`/`@router.head` on the
+        same function so Starlette's `FileResponse` handles HEAD natively
+        (RFC 9110 SS9.3.2: HEAD's header fields must match what GET would
+        send), so this asserts full header equality, not just cache-control."""
         thumb = tmp_path / "thumb.jpeg"
         thumb.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg-bytes")
 
@@ -87,10 +98,22 @@ class TestProfilePhotoAvailable:
             head_resp = client.request("HEAD", "/api/photos/profile/person-1")
             get_resp = client.get("/api/photos/profile/person-1")
 
-        assert head_resp.status_code == 200
+        assert head_resp.status_code == get_resp.status_code == 200
         assert head_resp.content == b""
-        assert head_resp.headers.get("cache-control") == get_resp.headers.get("cache-control")
+        assert get_resp.content  # GET actually carries the body
+
+        # Headers that must be identical between HEAD and GET (date/server
+        # excluded -- not part of this route's contract, and legitimately
+        # timing-dependent).
+        for header in ("content-length", "content-type", "cache-control", "etag", "last-modified"):
+            assert header in get_resp.headers, f"GET response missing {header!r}"
+            assert head_resp.headers.get(header) == get_resp.headers.get(header), (
+                f"{header!r} differs: HEAD={head_resp.headers.get(header)!r} "
+                f"GET={get_resp.headers.get(header)!r}"
+            )
         assert "max-age=3600" in head_resp.headers.get("cache-control", "")
+        # content-length reflects the real file size, not the (empty) HEAD body.
+        assert int(head_resp.headers["content-length"]) == len(get_resp.content)
 
 
 class TestProfilePhotoMissing:

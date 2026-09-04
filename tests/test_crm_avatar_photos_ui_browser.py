@@ -94,12 +94,24 @@ def crm_base_url():
         server.server_close()
 
 
-def _open_me_with_stubs(page: Page, crm_base_url, *, people, photos_enabled=True):
+def _open_me_with_stubs(page: Page, crm_base_url, *, people, photos_enabled=True,
+                         photo_status_for=None):
     """Loads /me with every `/api/**` call stubbed: the people list, the
-    boilerplate config/stats/birthdays calls init() also fires, the
-    photos-enabled check (`loadPhotosEnabled`), and the profile photo route
-    itself (200 for PERSON_HAS_PHOTO, 404 for PERSON_MISSING_THUMB, and it
-    must never be requested at all for PERSON_NO_PHOTO).
+    boilerplate config/statistics/birthdays calls init() also fires, and the
+    profile photo route itself.
+
+    `photos_enabled` is served from `/api/crm/config` (#907 review finding
+    2: this used to be its own round trip to `/api/photos/stats`, which is
+    not cheap when Photos *is* configured and blocked every page's first
+    render; `photos_enabled` now piggybacks on the config request `init()`
+    already awaits, and there is no separate `/api/photos/stats` call to
+    stub any more).
+
+    `photo_status_for(url) -> int | None` picks the status for a photo
+    request; the default (None) fulfills `person-has-photo` with 200 and
+    everything else with 404, matching the original 3-person fixture. A
+    caller with many flagged people (see `TestLazyLoading`) can override it
+    to fulfill every request with 200 instead.
 
     Returns (photo_requests, photo_methods, console_errors, page_errors):
     the URLs and HTTP methods of every `/api/photos/profile/*` request the
@@ -108,20 +120,22 @@ def _open_me_with_stubs(page: Page, crm_base_url, *, people, photos_enabled=True
     photo_requests = []
     photo_methods = []
 
+    def _default_photo_status(url):
+        return 200 if "person-has-photo" in url else 404
+
+    status_for = photo_status_for or _default_photo_status
+
     def handler(route):
         url = route.request.url
         if "/api/photos/profile/" in url:
             photo_requests.append(url)
             photo_methods.append(route.request.method)
-            if "person-has-photo" in url:
+            status = status_for(url)
+            if status == 200:
                 route.fulfill(status=200, content_type="image/jpeg", body=FAKE_JPEG_BYTES)
             else:
-                route.fulfill(status=404, content_type="application/json",
+                route.fulfill(status=status, content_type="application/json",
                               body=json.dumps({"detail": "not found"}))
-            return
-        if "/api/photos/stats" in url:
-            route.fulfill(status=200, content_type="application/json",
-                          body=json.dumps({"photos_enabled": photos_enabled}))
             return
         if "/api/crm/people?" in url or url.rstrip("/").endswith("/api/crm/people"):
             route.fulfill(status=200, content_type="application/json",
@@ -129,7 +143,8 @@ def _open_me_with_stubs(page: Page, crm_base_url, *, people, photos_enabled=True
                                             "offset": 0, "count": len(people)}))
             return
         if "/api/crm/config" in url:
-            route.fulfill(status=200, content_type="application/json", body="{}")
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps({"photos_enabled": photos_enabled}))
             return
         if "/api/crm/statistics" in url:
             route.fulfill(status=200, content_type="application/json",
@@ -202,6 +217,9 @@ class TestAvatarRendering:
 
         expect(_avatar(page, "person-has-photo")).to_have_class("person-avatar has-photo")
         expect(_avatar(page, "person-has-photo").locator("img")).to_have_count(1)
+        # AC 6 ("images load lazily"): mutation-checked -- deleting
+        # loading="lazy" from renderAvatarPhotoImg() must fail this.
+        expect(_avatar(page, "person-has-photo").locator("img")).to_have_attribute("loading", "lazy")
 
         # The 404 flips the optimistic has-photo render back to no-photo and
         # removes the broken <img>, leaving initials visible.
@@ -231,3 +249,39 @@ class TestPhotosDisabled:
         for person in (PERSON_HAS_PHOTO, PERSON_MISSING_THUMB, PERSON_NO_PHOTO):
             expect(_avatar(page, person["id"])).to_have_class("person-avatar no-photo")
             expect(_avatar(page, person["id"]).locator("img")).to_have_count(0)
+
+
+class TestLazyLoadingAtScale:
+    """AC 6: rendering 300 flagged people must not fire 300 image requests
+    on first paint -- `loading="lazy"` is supposed to defer the ones outside
+    (or well past) the viewport until scrolled into view. This is the
+    mutation-check the `has-photo` test's single `to_have_attribute` can't
+    provide on its own: deleting `loading="lazy"` leaves that assertion's
+    target element correct in isolation, but only this test actually proves
+    the browser behaves differently because of it -- with the attribute
+    removed, all 300 requests fire immediately instead of a small fraction."""
+
+    def test_300_flagged_rows_request_far_fewer_images_at_first_paint(
+        self, page: Page, crm_base_url
+    ):
+        people = [
+            {
+                "id": f"person-{i}", "canonical_name": f"Person {i}",
+                "category": "personal", "dunbar_circle": 3,
+                "relationship_strength": 300 - i,
+                "company": "", "tags": [], "has_profile_photo": True,
+            }
+            for i in range(300)
+        ]
+
+        photo_requests, _photo_methods, _console_errors, _page_errors = _open_me_with_stubs(
+            page, crm_base_url, people=people,
+            photo_status_for=lambda _url: 200,
+        )
+
+        assert len(people) == 300
+        assert 0 < len(photo_requests) < len(people) / 2, (
+            f"expected well under {len(people)} image requests at first paint "
+            f"(loading=\"lazy\" should defer most off-screen rows), got "
+            f"{len(photo_requests)}"
+        )

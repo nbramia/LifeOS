@@ -54,7 +54,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends, journal_ingest
-from api.services.log_redaction import configure_telegram_log_redaction
+from api.services.log_redaction import configure_telegram_log_redaction, install_query_string_redaction_filter
 from api.services.route_timing import RouteTimingMiddleware
 from config.settings import settings
 
@@ -67,6 +67,12 @@ from config.settings import settings
 # API embeds the bot token in the URL) from ever logging at INFO here (#519).
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 configure_telegram_log_redaction()
+# #904: uvicorn's own access logger writes every request's raw query string
+# to logs/server.log regardless of what a route handler logs -- this is the
+# only process that runs an HTTP server, so it's the only place this needs
+# installing (see install_query_string_redaction_filter()'s docstring for
+# why this must run at import time, not inside a route or startup event).
+install_query_string_redaction_filter()
 
 logger = logging.getLogger(__name__)
 

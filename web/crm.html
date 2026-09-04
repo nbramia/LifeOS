@@ -565,6 +565,19 @@
             background-size: cover;
             background-position: center;
         }
+        /* Inert here in practice: getAvatarStyle() sets an inline `color`
+           on every .person-avatar, and an inline style always wins over
+           this class rule, so a still-loading (optimistically has-photo)
+           avatar keeps showing its initials in full color rather than
+           hiding them -- which is what we want, since it means a slow or
+           never-resolving photo request degrades to visible initials
+           instead of a blank circle. The .avatar-photo-img overlay below
+           is what actually hides the initials, by visually covering them
+           once the image loads. `has-photo`/`no-photo` mostly serve as a
+           JS/test state marker on .person-avatar; this rule is kept
+           because it's harmless and genuinely does apply to other avatars
+           sharing this class pattern without an inline color (e.g.
+           .detail-avatar.has-photo, a separate rule, does hide its text). */
         .person-avatar.has-photo {
             color: transparent;
         }
@@ -9005,6 +9018,14 @@
                     FAMILY_DEFAULT_SELECTED_IDS = config.family_default_selected_ids;
                     console.log('[Config] Loaded family_default_selected_ids:', FAMILY_DEFAULT_SELECTED_IDS.length, 'IDs');
                 }
+                // #907 review finding 2: this used to be its own round trip
+                // to GET /api/photos/stats, which -- when Photos *is*
+                // configured -- runs several full-library aggregate queries
+                // and blocked every page's first render on it. `config`'s
+                // `photos_enabled` is just a Path.exists() check server-side
+                // and this request is already awaited before the list ever
+                // renders, so no extra request is needed.
+                photosEnabled = !!config.photos_enabled;
             } catch (error) {
                 console.warn('[Config] Failed to load CRM config:', error);
             }
@@ -9283,10 +9304,10 @@
                 return;
             }
 
-            // Load CRM config first (needed for myPersonId). Resolve whether
-            // Photos is configured at all in parallel, before the people list
-            // can render its first avatar (see loadPhotosEnabled).
-            await Promise.all([loadCRMConfig(), loadPhotosEnabled()]);
+            // Load CRM config first (needed for myPersonId, and for
+            // photosEnabled -- see loadCRMConfig -- before the people list
+            // can render its first avatar).
+            await loadCRMConfig();
 
             // Check for birthdays today (non-blocking)
             checkAndShowBirthdayToast();
@@ -9531,12 +9552,17 @@
                 return;
             }
 
-            listEl.innerHTML = filteredPeople.map(person => `
+            listEl.innerHTML = filteredPeople.map(person => {
+                // Computed once and reused for both the class name and the
+                // markup itself, rather than calling renderAvatarPhotoImg()
+                // twice per row for the same answer.
+                const avatarImg = renderAvatarPhotoImg(person);
+                return `
                 <div class="person-card ${person.id === selectedPersonId ? 'selected' : ''}"
                      onclick="selectPerson('${person.id}')">
                     <div class="person-checkbox ${selectedForMerge.has(person.id) ? 'checked' : ''}"
                          onclick="event.stopPropagation(); toggleMergeSelection('${person.id}')"></div>
-                    <div class="person-avatar ${avatarPhotoClass(person)}" data-person-id="${person.id}" style="${getAvatarStyle(person.category)}">${getInitials(person.canonical_name)}${renderAvatarPhotoImg(person)}</div>
+                    <div class="person-avatar ${avatarImg ? 'has-photo' : 'no-photo'}" data-person-id="${person.id}" style="${getAvatarStyle(person.category)}">${getInitials(person.canonical_name)}${avatarImg}</div>
                     <div class="person-info">
                         <div class="person-name">${escapeHtml(person.canonical_name)}</div>
                         <div class="person-company">${escapeHtml(person.company || '')}</div>
@@ -9546,7 +9572,8 @@
                         <div class="person-strength-bar" style="width: ${person.relationship_strength || 0}%"></div>
                     </div>
                 </div>
-            `).join('');
+            `;
+            }).join('');
 
             updateMergeToolbar();
         }
@@ -13384,22 +13411,17 @@
         const profilePhotoCache = new Map();
 
         // Whether the Photos integration is configured server-side at all
-        // (settings.photos_enabled). Resolved once in init() before the people
-        // list first renders (see loadPhotosEnabled), so an install without
-        // Photos configured issues zero photo requests instead of letting every
-        // flagged person's <img> fail with a 503. Defaults to false (no
-        // requests) until resolved.
+        // (settings.photos_enabled, cheap: a Path.exists() check). Set from
+        // GET /api/crm/config's `photos_enabled` field in loadCRMConfig(),
+        // which init() already awaits before the people list first renders --
+        // no separate request (see #907 review finding 2: this used to be
+        // its own round trip to GET /api/photos/stats, which runs several
+        // full-library aggregate queries when Photos *is* configured and
+        // blocked every page's first render on it). Defaults to false (no
+        // requests) until loadCRMConfig() resolves, so an install without
+        // Photos configured issues zero photo requests instead of letting
+        // every flagged person's <img> fail with a 503.
         let photosEnabled = false;
-
-        async function loadPhotosEnabled() {
-            try {
-                const response = await fetch('/api/photos/stats');
-                const data = await response.json();
-                photosEnabled = !!data.photos_enabled;
-            } catch {
-                photosEnabled = false;
-            }
-        }
 
         // Returns the <img> markup for a person-list avatar, or '' when no photo
         // request should be issued at all. Renders only for people the list
@@ -13434,13 +13456,6 @@
             img.remove();
         }
 
-        // Class for a person-list avatar: 'has-photo' when the list flagged the
-        // person and no earlier render already proved the thumbnail unreachable;
-        // 'no-photo' otherwise (plain initials, no photo request at all).
-        function avatarPhotoClass(person) {
-            return renderAvatarPhotoImg(person) ? 'has-photo' : 'no-photo';
-        }
-
         // Load profile photo for detail avatar
         async function loadDetailProfilePhoto(personId) {
             const avatar = document.getElementById('detailAvatar');
@@ -13448,6 +13463,16 @@
 
             // Reset classes
             avatar.classList.remove('has-photo', 'no-photo');
+
+            // #907 review finding 7: without this, an install with Photos
+            // not configured issued a photo request (and got a 503, logged
+            // to the console) every time a person was selected -- the list
+            // half of #875 already avoids this, this loader didn't.
+            if (!photosEnabled) {
+                avatar.style.backgroundImage = '';
+                avatar.classList.add('no-photo');
+                return;
+            }
 
             // Check cache first
             if (profilePhotoCache.has(personId)) {
@@ -13482,6 +13507,12 @@
         async function loadRelationshipPartnerPhoto(personId) {
             const avatar = document.getElementById('detailAvatar');
             if (!avatar || !personId) return;
+
+            // #907 review finding 7: see loadDetailProfilePhoto -- without
+            // this, a Photos-less install issued a photo request (503) every
+            // time the relationship dashboard loaded. Leave the default
+            // emoji in place, same as the "no photo" outcome below.
+            if (!photosEnabled) return;
 
             // Check cache first
             if (profilePhotoCache.has(personId)) {

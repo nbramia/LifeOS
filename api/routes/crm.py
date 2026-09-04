@@ -634,6 +634,14 @@ class CRMConfigResponse(BaseModel):
     partner_person_id: str = ""
     partner_name: str = ""
     family_default_selected_ids: list[str] = []
+    # Whether Apple Photos is configured at all (settings.photos_enabled is
+    # just Path.exists() on the library's database file -- cheap, unlike
+    # GET /api/photos/stats, which runs several full-library aggregate
+    # queries when Photos *is* configured). The client uses this to decide
+    # whether to request avatar/profile photos at all, so a Photos-less
+    # install never issues a request that would otherwise 503 (#875, #907
+    # review finding 2).
+    photos_enabled: bool = False
 
 
 def _load_family_default_selected_ids() -> list[str]:
@@ -677,6 +685,7 @@ def get_crm_config():
         partner_person_id=PARTNER_PERSON_ID,
         partner_name=_get_partner_name(),
         family_default_selected_ids=_load_family_default_selected_ids(),
+        photos_enabled=settings.photos_enabled,
     )
 
 
