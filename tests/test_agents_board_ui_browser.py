@@ -168,7 +168,7 @@ def _move_card_in_state(board_state: dict, card_id: str, target_lane: str) -> No
 def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: list, lane_status_code: list,
                   schedule_puts: list, board_stream_frames: list, stream_gate: "threading.Event | None" = None,
                   lane_response: "list | None" = None, open_calls: "list | None" = None,
-                  open_response: "dict | None" = None):
+                  open_response: "dict | None" = None, task_posts: "list | None" = None):
     """Stub d3 (offline CDN) + every /api/ call the page makes.
 
     `open_calls`: appended with each opened card id (POST
@@ -282,6 +282,31 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                 route.fulfill(status=code, content_type="application/json", body=json.dumps({"detail": "boom"}))
             return
 
+        if re.search(r"/api/tasks$", url) and method == "POST":
+            try:
+                body = json.loads(route.request.post_data or "{}")
+            except ValueError:
+                body = {}
+            if task_posts is not None:
+                task_posts.append(body)
+            new_id = f"new-{len(task_posts) if task_posts is not None else 1}"
+            tags = body.get("tags") or []
+            # Mirror derive_lane's default well enough for these UI-only
+            # tests (api/services/agent_board.py): no assignee tag ->
+            # Unassigned, an assignee tag -> Assigned. Full lane-derivation
+            # coverage lives in tests/test_agent_board.py.
+            assignee = tags[0] if tags else None
+            new_card = {
+                "kind": "task", "id": new_id, "title": body.get("description", ""),
+                "notes": body.get("notes") or "", "status": "todo",
+                "tags": tags, "assignee": assignee,
+                "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+                "session": None, "pending_question": None,
+            }
+            board_state["lanes"].setdefault("assigned" if assignee else "unassigned", []).append(new_card)
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": new_id, "description": new_card["title"]}))
+            return
+
         task_match = re.search(r"/api/tasks/([^/]+)$", url)
         if task_match and method == "PUT":
             try:
@@ -330,7 +355,7 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             return
 
         # Everything else the page might touch (pending-questions answer,
-        # session focus/kill, task creation) — a harmless empty JSON body.
+        # session focus/kill) — a harmless empty JSON body.
         route.fulfill(status=200, content_type="application/json", body="{}")
 
     page.route("**/api/**", api_handler)
@@ -338,7 +363,7 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
 
 def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_puts=None, lane_status_code=None,
                  schedule_puts=None, board_stream_frames=None, stream_gate=None, lane_response=None,
-                 open_calls=None, open_response=None):
+                 open_calls=None, open_response=None, task_posts=None):
     _stub_routes(
         page,
         board_state if board_state is not None else _board_fixture(),
@@ -351,9 +376,34 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
         lane_response,
         open_calls,
         open_response,
+        task_posts,
     )
     page.goto(f"{base_url}/agents")
     page.wait_for_selector('[data-card-id="t1"]')
+
+
+# Canonical lane order — mirrors web/agents/board.js's LANES.
+LANE_IDS = ["unassigned", "assigned", "in_progress", "human_queue", "scheduled", "review", "done"]
+DEFAULT_VISIBLE_LANE_IDS = [lane_id for lane_id in LANE_IDS if lane_id != "done"]
+
+
+def _seed_lane_storage(page: Page, raw_value: str):
+    """Pre-seed the lane-filter localStorage key (web/agents/board.js's
+    LANE_FILTER_STORAGE_KEY) before the page's own scripts run. Must be
+    called before `_open_board`/`page.goto`, since `add_init_script` only
+    affects future navigations."""
+    page.add_init_script(f"window.localStorage.setItem('lifeos.agents.board.lanes', {json.dumps(raw_value)});")
+
+
+def _check_only_lanes(page: Page, lane_ids):
+    """Drive the lane-filter dropdown to show exactly `lane_ids`, replacing
+    the old single-select `#board-filter-lane` these pre-#882 tests used."""
+    page.locator("#board-lane-filter-btn").click()
+    for cb in page.locator("#board-lane-filter-options input[type='checkbox']").all():
+        if cb.get_attribute("value") in lane_ids:
+            cb.check()
+        else:
+            cb.uncheck()
 
 
 def _wait_for(predicate, page: Page, timeout_ms=5000, interval_ms=25):
@@ -785,8 +835,11 @@ class TestFilters:
         expect(page.locator('[data-card-id="t3"]')).to_have_count(0)
 
     def test_lane_human_queue_shows_both_agent_and_human_cards(self, page: Page, agents_base_url):
+        """#882: the lane filter is now a multi-select — isolate to a single
+        lane by unchecking every other one, in place of the old single-select
+        `#board-filter-lane`."""
         _open_board(page, agents_base_url)
-        page.locator("#board-filter-lane").select_option("human_queue")
+        _check_only_lanes(page, {"human_queue"})
         expect(page.locator('[data-card-id="t3"]')).to_be_visible()
         expect(page.locator('[data-card-id="t4"]')).to_be_visible()
         expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
@@ -795,9 +848,10 @@ class TestFilters:
     def test_lane_human_queue_and_assignee_me_shows_only_human_card(self, page: Page, agents_base_url):
         """AC: 'Filtering by lane Human queue and assignee me together shows
         only #human cards.' t3 is agent-blocked/assignee=codex; t4 is the
-        #human card, tagged #me — only t4 should remain."""
+        #human card, tagged #me — only t4 should remain. #882: lane isolation
+        now goes through the multi-select checkbox dropdown."""
         _open_board(page, agents_base_url)
-        page.locator("#board-filter-lane").select_option("human_queue")
+        _check_only_lanes(page, {"human_queue"})
         page.locator("#board-filter-assignee").select_option("me")
         expect(page.locator('[data-card-id="t4"]')).to_be_visible()
         expect(page.locator('[data-card-id="t3"]')).to_have_count(0)
@@ -807,8 +861,13 @@ class TestFilters:
     def test_done_lane_visible_by_default_only_cancelled_behind_filter(self, page: Page, agents_base_url):
         """Round-1 finding 3: the "include cancelled" checkbox only hides
         cancelled cards — the Done lane itself (finished tasks) stays
-        visible whether it's checked or not."""
+        visible whether it's checked or not, once its column is shown.
+        (#882: Done is now UNCHECKED by default in the lane filter — that's
+        covered by TestLaneFilterMultiSelect; this test is about the
+        "include cancelled" filter within a shown Done column, so check
+        Done explicitly first.)"""
         _open_board(page, agents_base_url)
+        _check_only_lanes(page, set(DEFAULT_VISIBLE_LANE_IDS) | {"done"})
         expect(page.locator('[data-card-id="t5"]')).to_be_visible()
         expect(page.locator('[data-card-id="t6"]')).to_have_count(0)
         page.locator("#board-filter-done").check()
@@ -1072,3 +1131,321 @@ class TestAssignmentPickers:
         expect(page.locator(".drawer-assignment")).to_have_count(0)
         expect(page.locator(".assignment-row")).to_have_count(0)
         expect(page.get_by_role("button", name="Open")).to_have_count(0)
+
+
+class TestLaneFilterMultiSelect:
+    """#882 AC 1 & 2: a checkbox per lane, hidden lanes removed from the grid
+    entirely (not just emptied) so the rest widen, Done unchecked by default,
+    the selection persisted to and restored from localStorage, and a
+    malformed/unknown-lane stored value tolerated without blanking the
+    board. Relies on Playwright's per-test browser context giving each test
+    a fresh (empty) localStorage — no explicit clearing needed."""
+
+    def _open_lane_dropdown(self, page: Page):
+        page.locator("#board-lane-filter-btn").click()
+        expect(page.locator("#board-lane-filter-options")).to_have_class(re.compile(r"\bshow\b"))
+
+    def test_default_selection_is_every_lane_but_done(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        self._open_lane_dropdown(page)
+        boxes = page.locator("#board-lane-filter-options input[type='checkbox']")
+        expect(boxes).to_have_count(len(LANE_IDS))
+        for lane_id in LANE_IDS:
+            box = page.locator(f"#board-lane-filter-options input[value='{lane_id}']")
+            if lane_id == "done":
+                expect(box).not_to_be_checked()
+            else:
+                expect(box).to_be_checked()
+
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        for lane_id in DEFAULT_VISIBLE_LANE_IDS:
+            expect(page.locator(f'.board-lane[data-lane="{lane_id}"]')).to_be_visible()
+
+    def test_unchecking_a_lane_removes_column_and_widens_the_rest(self, page: Page, agents_base_url):
+        # Wide viewport so the visible lanes have room to grow rather than
+        # already sitting at their flex-basis/min-width overflowing the
+        # container (#board-lanes scrolls horizontally when they do).
+        page.set_viewport_size({"width": 2400, "height": 900})
+        _open_board(page, agents_base_url)
+        width_before = page.locator('.board-lane[data-lane="unassigned"]').bounding_box()["width"]
+
+        self._open_lane_dropdown(page)
+        page.locator("#board-lane-filter-options input[value='review']").uncheck()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_have_count(0)
+
+        width_after = page.locator('.board-lane[data-lane="unassigned"]').bounding_box()["width"]
+        assert width_after > width_before, (width_before, width_after)
+
+    def test_rechecking_restores_canonical_dom_order(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        self._open_lane_dropdown(page)
+        page.locator("#board-lane-filter-options input[value='in_progress']").uncheck()
+        expect(page.locator('.board-lane[data-lane="in_progress"]')).to_have_count(0)
+
+        page.locator("#board-lane-filter-options input[value='in_progress']").check()
+        expect(page.locator('.board-lane[data-lane="in_progress"]')).to_be_visible()
+
+        lane_order = page.locator(".board-lane").evaluate_all("els => els.map(el => el.dataset.lane)")
+        assert lane_order == DEFAULT_VISIBLE_LANE_IDS, lane_order
+
+    def test_selection_survives_a_reload(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        self._open_lane_dropdown(page)
+        page.locator("#board-lane-filter-options input[value='human_queue']").uncheck()
+        expect(page.locator('.board-lane[data-lane="human_queue"]')).to_have_count(0)
+
+        page.reload()
+        page.wait_for_selector('[data-card-id="t1"]')
+        expect(page.locator('.board-lane[data-lane="human_queue"]')).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="unassigned"]')).to_be_visible()
+
+    def test_unknown_stored_lane_id_is_tolerated(self, page: Page, agents_base_url):
+        """A stored id naming a lane that no longer exists is filtered out —
+        whatever's still valid is kept, and the board is never blanked.
+        Includes "unassigned" (where fixture card t1 lives) so _open_board's
+        own t1-visibility wait — needed since it stubs routes before every
+        navigation — isn't racing a lane that was deliberately excluded."""
+        _seed_lane_storage(page, json.dumps(["unassigned", "assigned", "some-retired-lane"]))
+        _open_board(page, agents_base_url)
+        expect(page.locator('.board-lane[data-lane="unassigned"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_be_visible()
+        expect(page.locator(".board-lane")).to_have_count(2)
+
+    def test_malformed_stored_value_falls_back_to_default(self, page: Page, agents_base_url):
+        _seed_lane_storage(page, "not valid json")
+        _open_board(page, agents_base_url)
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        for lane_id in DEFAULT_VISIBLE_LANE_IDS:
+            expect(page.locator(f'.board-lane[data-lane="{lane_id}"]')).to_be_visible()
+
+    def test_clear_control_restores_default(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        self._open_lane_dropdown(page)
+        page.locator("#board-lane-filter-options input[value='review']").uncheck()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="done"]')).to_be_visible()
+
+        page.locator("#board-lane-filter-clear").click()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        for lane_id in LANE_IDS:
+            box = page.locator(f"#board-lane-filter-options input[value='{lane_id}']")
+            if lane_id == "done":
+                expect(box).not_to_be_checked()
+            else:
+                expect(box).to_be_checked()
+
+    def test_unchecking_all_lanes_shows_empty_state_hint_not_a_blank_board(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        self._open_lane_dropdown(page)
+        for lane_id in LANE_IDS:
+            page.locator(f"#board-lane-filter-options input[value='{lane_id}']").uncheck()
+        expect(page.locator(".board-lane")).to_have_count(0)
+        expect(page.locator(".board-lanes-empty-hint")).to_be_visible()
+
+
+class TestLaneAddButton:
+    """#882 AC 3: a full-width '+' button per visible DIRECT lane opens the
+    composer with that lane preselected; Review and Scheduled get no
+    button (plan_lane_move rejects both — api/services/agent_board.py).
+    Creating from the Assigned lane's '+' carries the chosen assignee tag
+    through both the POST /api/tasks body and the follow-up PUT .../lane."""
+
+    def test_add_button_present_on_direct_lanes_and_absent_on_scheduled_and_review(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        for lane_id in ["unassigned", "assigned", "in_progress", "human_queue"]:
+            expect(page.locator(f'.board-lane[data-lane="{lane_id}"] .board-lane-add')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="scheduled"] .board-lane-add')).to_have_count(0)
+
+        # Review is empty in the fixture and hidden by default — check it so
+        # its absent "+" is actually observable.
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='review']").check()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="review"] .board-lane-add')).to_have_count(0)
+
+    def test_unassigned_lane_add_button_opens_composer_with_lane_preselected(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('.board-lane[data-lane="unassigned"] .board-lane-add').click()
+        expect(page.locator("#new-card-title")).to_be_visible()
+        expect(page.locator("#new-card-lane")).to_have_value("unassigned")
+
+    def test_assigned_lane_add_button_creates_with_assignee_tag_and_moves_to_assigned(self, page: Page, agents_base_url):
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.locator('.board-lane[data-lane="assigned"] .board-lane-add').click()
+        expect(page.locator("#new-card-lane")).to_have_value("assigned")
+        page.locator("#new-card-desc").fill("Triage the new alert")
+        page.locator("#new-card-assignee").select_option("codex")
+        page.locator("#new-card-create").click()
+
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Triage the new alert", "tags": ["codex"]}, task_posts
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        assert lane_calls[0] == {"lane": "assigned", "assignee": "codex"}, lane_calls
+
+        # Composer closes and the new card lands in the Assigned column.
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_contain_text("Triage the new alert")
+
+    def test_assigned_lane_requires_an_assignee(self, page: Page, agents_base_url):
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator('.board-lane[data-lane="assigned"] .board-lane-add').click()
+        page.locator("#new-card-desc").fill("No assignee yet")
+        page.locator("#new-card-create").click()
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        assert task_posts == [], task_posts
+        # Composer stays open — nothing was created.
+        expect(page.locator("#new-card-title")).to_be_visible()
+
+    def test_top_bar_new_card_button_defaults_to_unassigned_and_issues_no_lane_put(self, page: Page, agents_base_url):
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.locator("#board-new-card").click()
+        expect(page.locator("#new-card-lane")).to_have_value("unassigned")
+        page.locator("#new-card-desc").fill("Plain new card")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Plain new card"}, task_posts
+        assert lane_calls == [], lane_calls  # unassigned never triggers a lane PUT
+
+
+class TestDrawerClickOutsideClose:
+    """#882 AC 4: a click on the backdrop (board background/lane/card) closes
+    the drawer; a click inside it does not; a mousedown-inside ->
+    mouseup-outside sequence (the scrollbar-drag case) must NOT close it;
+    Escape still closes it, but not when a modal is on top of the drawer."""
+
+    def test_click_on_backdrop_closes_drawer(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-title")).to_be_visible()
+        # A point clearly outside the drawer panel, which sits at the right
+        # edge (`.board-drawer-backdrop { justify-content: flex-end }`).
+        page.locator("#board-drawer-backdrop").click(position={"x": 10, "y": 10})
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+
+    def test_click_inside_drawer_does_not_close(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-title")).to_be_visible()
+        page.locator(".drawer-label").first.click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+        expect(page.locator(".drawer-title")).to_have_value("Ship the release")
+
+    def test_mousedown_inside_mouseup_outside_does_not_close(self, page: Page, agents_base_url):
+        """The scrollbar-drag guard: a mousedown starting inside the drawer
+        whose mouseup lands on the backdrop still fires a `click` event on
+        the backdrop — must not be treated as an outside click."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        drawer_box = page.locator(".board-drawer").bounding_box()
+        backdrop_box = page.locator("#board-drawer-backdrop").bounding_box()
+
+        page.mouse.move(drawer_box["x"] + drawer_box["width"] / 2, drawer_box["y"] + 50)
+        page.mouse.down()
+        page.mouse.move(backdrop_box["x"] + 10, backdrop_box["y"] + 10, steps=5)
+        page.mouse.up()
+
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+
+    def test_escape_closes_the_drawer(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-title")).to_be_visible()
+        page.keyboard.press("Escape")
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+
+    def test_escape_does_not_close_drawer_when_a_modal_is_on_top(self, page: Page, agents_base_url):
+        """A composer/answer modal renders above the drawer
+        (`.modal-backdrop` z-index 100 > `.board-drawer-backdrop`'s 90) —
+        Escape must not fall through and close the drawer underneath it."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t3"]').click()  # t3 has a pending_question -> Answer button
+        page.get_by_role("button", name="Answer").click()
+        expect(page.locator("#answer-title")).to_be_visible()
+
+        page.keyboard.press("Escape")
+
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+        expect(page.locator("#answer-title")).to_be_visible()
+
+
+class TestNotesAutosize:
+    """#882 AC 5: the notes textarea's height tracks its content on input
+    and on open, capped at 2/3 of the viewport height, after which it
+    scrolls internally (scrollHeight keeps growing past offsetHeight)."""
+
+    def test_grows_on_open_with_existing_content(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        long_notes = "\n".join(f"note line {i}" for i in range(30))
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t2":
+                card["notes"] = long_notes
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        expect(notes).to_be_visible()
+        expect(notes).to_have_value(long_notes)
+        offset_height = notes.evaluate("el => el.offsetHeight")
+        # CSS min-height is 5rem (~80px); 30 lines must have grown well past
+        # that on open, before any input event ever fires.
+        assert offset_height > 100, offset_height
+
+    def test_grows_on_input_and_caps_at_two_thirds_viewport_height(self, page: Page, agents_base_url):
+        page.set_viewport_size({"width": 1200, "height": 600})
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        expect(notes).to_be_visible()
+
+        offset_height_empty = notes.evaluate("el => el.offsetHeight")
+        many_lines = "\n".join(f"note line {i}" for i in range(200))
+        notes.fill(many_lines)
+
+        max_height = 600 * 2 / 3
+        offset_height = notes.evaluate("el => el.offsetHeight")
+        scroll_height = notes.evaluate("el => el.scrollHeight")
+        assert offset_height > offset_height_empty, (offset_height_empty, offset_height)
+        assert offset_height <= max_height + 1, (offset_height, max_height)  # +1 for rounding
+        assert scroll_height > offset_height, (scroll_height, offset_height)  # capped — scrolls internally
+
+
+class TestNoConsoleErrorsMainFlow:
+    """Exercises the new #882 surfaces together — lane filter, per-lane add,
+    drawer click-outside-close, notes autosize — and asserts the page never
+    logs a console error or throws an uncaught exception along the way."""
+
+    def test_main_flow_produces_no_console_errors(self, page: Page, agents_base_url):
+        errors = []
+        page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
+        page.on("pageerror", lambda exc: errors.append(str(exc)))
+
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='review']").uncheck()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_have_count(0)
+        page.locator("#board-lane-filter-options input[value='review']").check()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_be_visible()
+
+        page.locator('.board-lane[data-lane="assigned"] .board-lane-add').click()
+        page.locator("#new-card-desc").fill("Follow up with the vendor")
+        page.locator("#new-card-assignee").select_option("me")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1 and len(lane_calls) == 1, page=page)
+
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        expect(notes).to_be_visible()
+        notes.fill("a longer note\nwith several\nlines of text")
+        page.locator("#board-drawer-backdrop").click(position={"x": 10, "y": 10})
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+
+        assert errors == [], errors

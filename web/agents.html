@@ -840,7 +840,8 @@
     overflow-y: hidden;
   }
   .board-lane {
-    flex: 0 0 260px;
+    flex: 1 1 260px;
+    min-width: 240px;
     display: flex;
     flex-direction: column;
     background: var(--bg-secondary);
@@ -849,6 +850,88 @@
     overflow: hidden;
   }
   .board-lane.drag-over { border-color: var(--accent); }
+  .board-lane-add {
+    display: block;
+    width: 100%;
+    background: var(--accent);
+    color: var(--bg-primary);
+    border: none;
+    padding: 0.3rem 0;
+    font-size: 0.95rem;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .board-lane-add:hover { filter: brightness(1.1); }
+  .board-lanes-empty-hint {
+    padding: 1.5rem;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+  }
+  /* Lane multi-select filter (#882) — mirrors the CRM's people-filter-*
+     checkbox dropdown (web/crm.html:640, :7410-7460), scoped to the board
+     so it can't leak into the Graph tab's own filter styles. */
+  .board-lane-filter-dropdown { position: relative; }
+  .board-lane-filter-btn {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.25rem 0.6rem;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .board-lane-filter-btn:hover { border-color: var(--accent); }
+  .board-lane-filter-arrow { font-size: 0.65rem; color: var(--text-dim); }
+  .board-lane-filter-options {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin-top: 4px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.5rem;
+    min-width: 180px;
+    max-height: 320px;
+    overflow-y: auto;
+    z-index: 100;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  }
+  .board-lane-filter-options.show { display: block; }
+  .board-lane-filter-toggles {
+    display: flex;
+    gap: 0.4rem;
+    padding: 0 0 0.4rem;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 0.3rem;
+  }
+  .board-filter-toggle-btn {
+    flex: 1;
+    padding: 0.2rem 0.4rem;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 0.7rem;
+    cursor: pointer;
+  }
+  .board-filter-toggle-btn:hover { border-color: var(--accent); }
+  .board-lane-filter-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3rem 0.4rem;
+    cursor: pointer;
+    border-radius: 4px;
+    font-size: 0.78rem;
+    white-space: nowrap;
+  }
+  .board-lane-filter-option:hover { background: var(--bg-elev); }
+  .board-lane-filter-option input { margin: 0; }
   .board-lane-header {
     padding: 0.5rem 0.75rem;
     font-size: 0.78rem;
@@ -953,6 +1036,10 @@
     font-size: 0.8rem;
   }
   .drawer-notes { min-height: 5rem; resize: vertical; }
+  /* Task-card notes only (#882) — height tracks content via JS, capped at
+     2/3 of the viewport height; the schedule drawer's message-content
+     textarea keeps the plain manual-resize behavior above, untouched. */
+  .drawer-notes-autosize { overflow-y: auto; resize: none; }
   .drawer-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
   .drawer-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.75rem; }
   .drawer-action {
@@ -1023,16 +1110,19 @@
 <div class="tab-view" id="board-view">
   <div class="board-filters" id="board-filters">
     <input type="search" id="board-search" placeholder="Search cards…" autocomplete="off" spellcheck="false" />
-    <select id="board-filter-lane" title="Lane">
-      <option value="all">all lanes</option>
-      <option value="unassigned">Unassigned</option>
-      <option value="assigned">Assigned</option>
-      <option value="in_progress">In progress</option>
-      <option value="human_queue">Human queue</option>
-      <option value="scheduled">Scheduled</option>
-      <option value="review">Review</option>
-      <option value="done">Done</option>
-    </select>
+    <div class="board-lane-filter-dropdown" id="board-lane-filter-dropdown">
+      <button type="button" class="board-lane-filter-btn" id="board-lane-filter-btn" title="Lanes">
+        <span id="board-lane-filter-label">Lanes</span>
+        <span class="board-lane-filter-arrow">&#9662;</span>
+      </button>
+      <div class="board-lane-filter-options" id="board-lane-filter-options">
+        <div class="board-lane-filter-toggles">
+          <button type="button" class="board-filter-toggle-btn" id="board-lane-filter-all">All</button>
+          <button type="button" class="board-filter-toggle-btn" id="board-lane-filter-clear" title="Reset to the default lanes (all except Done)">Clear</button>
+        </div>
+        <!-- one .board-lane-filter-option checkbox per LANES entry, injected by board.js -->
+      </div>
+    </div>
     <select id="board-filter-assignee" title="Assignee">
       <option value="all">any assignee</option>
       <option value="unassigned">unassigned</option>
