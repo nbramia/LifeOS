@@ -64,37 +64,122 @@ CHANGED_FILES=$(echo "$CHANGED_FILES" | sort -u | grep -v '^$' || true)
 # failure left `$LOG` pointing nowhere, `> "$LOG"` then failed under `set -e`,
 # and the push died reporting a fake test failure). So: try the configured
 # directory, then a fixed fallback, then a throwaway one — and say so.
+#
+# Only WRITING a log to whichever directory we land on is unconditional.
+# TIGHTENING (chmod) or PRUNING (find -delete) that directory is gated on
+# LOG_DIR_OWNED — set only when this hook itself created/manages the
+# directory it ends up using (the configured rung, the fixed-fallback rung,
+# or a throwaway `mktemp -d` directory). A directory the hook merely adopted
+# as a last resort (nothing left to try) is never chmod'd or swept: on a
+# multi-user or containerised box that directory can be the shared system
+# temp dir, and a symlinked $LOG_DIR is never trusted either — `chmod`
+# follows symlinks, so a planted one would retarget the tightening onto
+# whatever it points at.
+# Usability (may we WRITE here, and should we stop looking further) is
+# judged only by "-d && -w" — a symlink included, since writing there is
+# still fine. Ownership (may we CHMOD/PRUNE here) is judged separately,
+# after LOG_DIR is finalized below: a symlink is never owned regardless of
+# which rung produced it, so it never falls through to a further rung on
+# symlink grounds alone — that would risk skipping straight past a usable
+# configured directory onto the shared fixed-fallback path.
 _prepush_dir_usable() {
     [ -d "$1" ] && [ -w "$1" ]
 }
 
+_prepush_unusable_reason() {
+    if [ -L "$1" ]; then
+        echo "is a symlink"
+    elif [ -e "$1" ] && [ ! -d "$1" ]; then
+        echo "not a directory"
+    elif [ -d "$1" ] && [ ! -w "$1" ]; then
+        echo "not writable"
+    else
+        echo "could not be created"
+    fi
+}
+
 LOG_DIR="${TMPDIR:-/tmp}/lifeos-prepush"
-mkdir -p "$LOG_DIR" 2>/dev/null || true
+# Owned by default: everything below except the bare last-resort "/tmp" is a
+# directory this hook created/manages. Forced to 0 below if $LOG_DIR turns
+# out to be a symlink, regardless of which rung produced it.
+LOG_DIR_OWNED=1
+# -m 700 closes the window between creation and the unconditional chmod
+# below; they're complementary, not alternatives — -m only sets the mode
+# at creation, so it does nothing for a directory that already existed.
+mkdir -p -m 700 "$LOG_DIR" 2>/dev/null || true
 if ! _prepush_dir_usable "$LOG_DIR"; then
     UNUSABLE_LOG_DIR="$LOG_DIR"
+    REASON=$(_prepush_unusable_reason "$LOG_DIR")
     # LIFEOS_PREPUSH_TEST_FALLBACK_DIR lets tests exercise this fallback
     # without ever touching the real, shared /tmp/lifeos-prepush. Unset in
     # production, where the fallback is always the well-known fixed path.
-    LOG_DIR="${LIFEOS_PREPUSH_TEST_FALLBACK_DIR:-/tmp/lifeos-prepush}"
-    mkdir -p "$LOG_DIR" 2>/dev/null || true
-    if [ "$LOG_DIR" = "$UNUSABLE_LOG_DIR" ] || ! _prepush_dir_usable "$LOG_DIR"; then
-        LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lifeos-prepush.XXXXXX" 2>/dev/null \
-            || mktemp -d 2>/dev/null || echo "/tmp")
+    FALLBACK_DIR="${LIFEOS_PREPUSH_TEST_FALLBACK_DIR:-/tmp/lifeos-prepush}"
+    FALLBACK_USABLE=0
+    if [ "$FALLBACK_DIR" = "$UNUSABLE_LOG_DIR" ]; then
+        # The fixed fallback IS the directory just found unusable (the
+        # common case: TMPDIR unset, so both resolve to /tmp/lifeos-prepush).
+        # Retrying an unchanged path would fail identically — skip straight
+        # to the throwaway mktemp rung instead of a pointless retry.
+        FALLBACK_NOTE=" (same directory; not retried)"
+    else
+        mkdir -p -m 700 "$FALLBACK_DIR" 2>/dev/null || true
+        if _prepush_dir_usable "$FALLBACK_DIR"; then
+            FALLBACK_USABLE=1
+        else
+            FALLBACK_NOTE=" ($(_prepush_unusable_reason "$FALLBACK_DIR"))"
+        fi
     fi
-    echo "Pre-push: log directory $UNUSABLE_LOG_DIR is unusable; using $LOG_DIR instead"
-fi
-# mkdir -m only sets the mode on creation, so a directory left behind
-# world-writable by something else would never get tightened. Do it
-# unconditionally instead.
-chmod 700 "$LOG_DIR" 2>/dev/null || true
 
-# Prune this hook's own old logs so the directory doesn't grow unbounded.
-# GNU find's `-mtime +3` matches files whose age exceeds 3 whole days, i.e.
-# it starts deleting at the 4-day mark, not the 3-day mark. Scoped to this
-# hook's own `*.log` files so it never removes anything else that happens to
-# be in the directory. Never touches anything younger than that — a live
-# run's log, passing or failing, must survive until someone reads it.
-find "$LOG_DIR" -maxdepth 1 -type f -name '*.log' -mtime +3 -delete 2>/dev/null || true
+    if [ "$FALLBACK_USABLE" = "1" ]; then
+        LOG_DIR="$FALLBACK_DIR"
+        echo "Pre-push: log directory $UNUSABLE_LOG_DIR is unusable ($REASON); using $LOG_DIR instead"
+    else
+        LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lifeos-prepush.XXXXXX" 2>/dev/null \
+            || mktemp -d 2>/dev/null || echo "")
+        if [ -n "$LOG_DIR" ]; then
+            echo "Pre-push: log directory $UNUSABLE_LOG_DIR is unusable ($REASON); the fixed fallback ($FALLBACK_DIR)${FALLBACK_NOTE} also failed; using $LOG_DIR instead"
+        else
+            # Nothing left to try. Use the shared system temp dir to write a
+            # log (never block the push) but never own/tighten/sweep it.
+            LOG_DIR="/tmp"
+            LOG_DIR_OWNED=0
+            echo "Pre-push: log directory $UNUSABLE_LOG_DIR is unusable ($REASON); every fallback failed; using $LOG_DIR instead (not owned by this hook, so it won't be chmod'd or pruned)"
+        fi
+    fi
+fi
+
+# A symlinked LOG_DIR is never owned, whichever rung produced it: chmod
+# follows symlinks, so tightening one would retarget onto whatever it
+# actually points at rather than a directory this hook manages. This can
+# fire even when $LOG_DIR was otherwise "usable" (no prior message printed
+# above), so say so here rather than silently degrading.
+if [ -L "$LOG_DIR" ]; then
+    LOG_DIR_OWNED=0
+    echo "Pre-push: log directory $LOG_DIR is a symlink; writing there, but not tightening or pruning it"
+fi
+
+if [ "$LOG_DIR_OWNED" = "1" ]; then
+    # mkdir -m only sets the mode on creation, so a directory left behind
+    # world-writable by something else (or simply pre-existing from an
+    # older run) would never get tightened. Do it unconditionally instead —
+    # but only for a directory this hook owns (see the block comment above).
+    chmod 700 "$LOG_DIR" 2>/dev/null || true
+
+    # Prune this hook's own old logs so the directory doesn't grow unbounded.
+    # GNU find's `-mtime +3` matches files whose age exceeds 3 whole days,
+    # i.e. it starts deleting at the 4-day mark, not the 3-day mark. Scoped
+    # to this hook's own `*.log` files so it never removes anything else
+    # that happens to be in the directory. Never touches anything younger
+    # than that — a live run's log, passing or failing, must survive until
+    # someone reads it. Only for an owned directory — see above.
+    find "$LOG_DIR" -maxdepth 1 -type f -name '*.log' -mtime +3 -delete 2>/dev/null || true
+fi
+
+# A log written to the not-owned last-resort directory gets a prefix so it's
+# attributable as this hook's even though it's sitting in a shared, unswept
+# location. The normal (owned) case keeps the existing naming exactly.
+LOG_FILE_PREFIX=""
+[ "$LOG_DIR_OWNED" = "0" ] && LOG_FILE_PREFIX="lifeos-prepush-"
 
 sanitize_branch_slug() {
     # Replace everything outside [A-Za-z0-9._-] (slashes included) with "_",
@@ -118,8 +203,8 @@ else
 fi
 BRANCH_SLUG=$(sanitize_branch_slug "$BRANCH_RAW")
 
-LOG="$LOG_DIR/${BRANCH_SLUG}-$$-unit.log"
-BROWSER_LOG="$LOG_DIR/${BRANCH_SLUG}-$$-browser.log"
+LOG="$LOG_DIR/${LOG_FILE_PREFIX}${BRANCH_SLUG}-$$-unit.log"
+BROWSER_LOG="$LOG_DIR/${LOG_FILE_PREFIX}${BRANCH_SLUG}-$$-browser.log"
 
 # Test overrides: stand in for the stdin ref lines so the decision below can be
 # exercised without a real push (mirrors test.sh's LIFEOS_TEST_CHANGED_FILES).

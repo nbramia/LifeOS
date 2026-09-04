@@ -19,6 +19,7 @@ this every test in this file would create and prune directories inside the
 real, shared `/tmp/lifeos-prepush/` that other agents' live gates write to.
 """
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -115,6 +116,19 @@ def stub_python(tmp_path):
     Each pytest-invocation stage's simulated exit code/summary line is
     controllable via env vars (STUB_UNIT_EXIT/STUB_UNIT_SUMMARY,
     STUB_BROWSER_EXIT/STUB_BROWSER_SUMMARY), read by the stub at runtime.
+
+    Two more unit-stage-only modes exercise `fail()`'s other two branches
+    (round-1 review finding B), which a normal failing run can't reach
+    because bash's `> "$LOG"` redirection always creates the file before the
+    stub ever runs, even if the stub prints nothing:
+
+    - STUB_UNIT_NO_OUTPUT=1: exit 1 without printing anything, so `$LOG`
+      exists but is empty ("empty log" branch).
+    - STUB_UNIT_DELETE_LOG=1: delete the just-opened `$LOG` file (found by
+      globbing $TMPDIR/lifeos-prepush for the one `*-unit.log` this run just
+      created) before exiting, so `$LOG` doesn't exist at all when `fail()`
+      runs ("no log at all" branch). Only meaningful when the run resolves
+      to the default, unhostile log directory.
     """
     bin_dir = tmp_path / "stubbin"
     bin_dir.mkdir()
@@ -134,7 +148,13 @@ def stub_python(tmp_path):
         "    echo \"${STUB_BROWSER_SUMMARY:-1 passed in 0.01s}\"\n"
         "    exit \"${STUB_BROWSER_EXIT:-0}\"\n"
         "fi\n"
-        "echo \"${STUB_UNIT_SUMMARY:-1 passed in 0.01s}\"\n"
+        "if [ \"${STUB_UNIT_DELETE_LOG:-0}\" = \"1\" ]; then\n"
+        "    find \"${TMPDIR:-/tmp}/lifeos-prepush\" -maxdepth 1 -name '*-unit.log' -delete 2>/dev/null\n"
+        "    exit \"${STUB_UNIT_EXIT:-1}\"\n"
+        "fi\n"
+        "if [ \"${STUB_UNIT_NO_OUTPUT:-0}\" != \"1\" ]; then\n"
+        "    echo \"${STUB_UNIT_SUMMARY:-1 passed in 0.01s}\"\n"
+        "fi\n"
         "exit \"${STUB_UNIT_EXIT:-0}\"\n"
     )
     stub.chmod(0o755)
@@ -361,6 +381,10 @@ def test_console_output_names_log_path(stub_python, tmp_path):
     # The logs must contain the stubbed pytest's actual output, not just exist.
     assert unit_logs[0].read_text().strip() == "1 passed in 0.01s"
     assert browser_logs[0].read_text().strip() == "1 passed in 0.01s"
+    # Round 2 (#913 finding C): the unconditional `chmod 700` must actually
+    # land on the directory this hook owns and normally uses.
+    assert log_dir.stat().st_mode & 0o777 == 0o700, (
+        "the owned log directory must be tightened to 0700")
 
 
 @pytest.mark.unit
@@ -463,6 +487,16 @@ def _restore_writable(hostile_tmpdir: Path) -> None:
         log_dir.chmod(0o700)
 
 
+# Round-2 (#913 finding F): the fallback message must name WHY the
+# configured directory was unusable, not just that it was. One expected
+# reason string per hostile fixture above.
+_REASON_FOR_MAKER = {
+    _make_occupied_by_file: "not a directory",
+    _make_unwritable_log_dir: "not writable",
+    _make_readonly_tmpdir: "could not be created",
+}
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "make_hostile",
@@ -474,7 +508,12 @@ def test_unwritable_log_dir_push_still_completes(tmp_path, stub_python, make_hos
     review (LOG_DIR occupied by a file, LOG_DIR existing but unwritable, and
     a read-only TMPDIR) must still let a real (stubbed) test run complete and
     pass, degrading to a fallback directory instead of reporting a fake
-    `FAILED ()` for an unrelated filesystem problem.
+    `FAILED ()` for an unrelated filesystem problem. Round 2 (finding F): the
+    printed line must also say WHY the configured directory was unusable.
+    Round 2 (finding A/C): the adopted fallback directory is OWNED by this
+    hook, so it must be tightened to 0700 (positive half of the
+    owned/not-owned pair; see test_last_resort_dir_is_never_chmod_or_pruned
+    for the not-owned negative half).
 
     Uses LIFEOS_PREPUSH_TEST_FALLBACK_DIR (a test-only override, unset in
     production) to point the fallback at a scratch directory rather than the
@@ -492,13 +531,16 @@ def test_unwritable_log_dir_push_still_completes(tmp_path, stub_python, make_hos
         assert result.returncode == 0, (
             f"push blocked by an unusable log directory: "
             f"stdout={result.stdout!r} stderr={result.stderr!r}")
-        assert "is unusable; using" in result.stdout
+        expected_reason = _REASON_FOR_MAKER[make_hostile]
+        assert f"is unusable ({expected_reason}); using" in result.stdout, result.stdout
         unit_logs = list(fallback_dir.glob("*-unit.log"))
         browser_logs = list(fallback_dir.glob("*-browser.log"))
         assert len(unit_logs) == 1, f"expected one unit log in fallback dir, found {unit_logs}"
         assert len(browser_logs) == 1, (
             f"expected one browser log in fallback dir, found {browser_logs}")
         assert "passed" in result.stdout
+        assert fallback_dir.stat().st_mode & 0o777 == 0o700, (
+            "an owned fallback directory must be tightened to 0700")
     finally:
         _restore_writable(hostile_tmpdir)
 
@@ -566,3 +608,288 @@ def test_prune_only_touches_its_own_log_files(tmp_path):
 
     assert not old_log.exists(), "prune did not remove a 5-day-old log"
     assert old_other.exists(), "prune deleted a non-.log file it must not touch"
+
+
+# --- Round-2 review fixes (#913 round 2) -----------------------------------
+#
+# Finding A: never chmod/prune a directory the hook does not own (the bare
+# `/tmp` last resort, and any symlinked $LOG_DIR at any rung). Finding B:
+# `fail()`'s empty-log and no-log-at-all branches were untested. Finding C:
+# the unconditional `chmod 700` itself was untested, and needs a positive
+# (owned dir tightened) AND negative (not-owned dir left alone) pair.
+# Finding E: fallback rungs 3/4 and the equality guard were unreachable.
+# Finding F: the fallback message must name why, and say if the fixed
+# fallback also failed.
+
+
+@pytest.mark.unit
+def test_fail_reports_empty_log(stub_python, tmp_path):
+    """Finding B: `fail()`'s "empty log" branch. The redirection `> "$LOG"`
+    always creates the file even if the command writes nothing, so this is
+    the realistic way a log ends up empty: the stubbed pytest exits 1 having
+    produced no output at all. Reverting the whole `fail()` rewrite to the
+    pre-round-1 two-liner, or deleting just this branch, must fail this test.
+    """
+    result = _run_real_hook(
+        stub_python, tmp_path, local_ref="refs/heads/feat/empty-log-check",
+        extra_env={"STUB_UNIT_EXIT": "1", "STUB_UNIT_NO_OUTPUT": "1"},
+    )
+    assert result.returncode == 1
+
+    log_dir = tmp_path / "lifeos-prepush"
+    unit_logs = list(log_dir.glob("*-unit.log"))
+    assert len(unit_logs) == 1
+    assert unit_logs[0].exists()
+    assert unit_logs[0].stat().st_size == 0
+    assert "FAILED (empty log — command likely failed before producing output)" in result.stdout
+    assert f"Full output: {unit_logs[0]}" in result.stdout
+
+
+@pytest.mark.unit
+def test_fail_reports_missing_log(stub_python, tmp_path):
+    """Finding B: `fail()`'s "no log at all" branch. A previous report
+    claimed the readonly_tmpdir hostile case covered this indirectly — false,
+    since with the fallback in place that case reaches a usable directory and
+    `fail()` is never called. Simulate the log genuinely not existing by
+    having the stubbed pytest delete its own just-opened `$LOG` file (the
+    shell already created it via `> "$LOG"` redirection; the stub unlinks
+    that path before exiting), so by the time `fail()` runs, `[ -e "$LOG" ]`
+    is false.
+    """
+    result = _run_real_hook(
+        stub_python, tmp_path, local_ref="refs/heads/feat/missing-log-check",
+        extra_env={"STUB_UNIT_DELETE_LOG": "1"},
+    )
+    assert result.returncode == 1
+
+    log_dir = tmp_path / "lifeos-prepush"
+    assert not list(log_dir.glob("*-unit.log")), "the log should have been deleted by the stub"
+    assert "FAILED (no log was written to" in result.stdout
+    # The "Full output:" line is gated on the log existing — it must not
+    # print a path that doesn't exist.
+    assert "Full output:" not in result.stdout
+
+
+@pytest.mark.unit
+def test_symlinked_log_dir_is_used_but_not_owned(stub_python, tmp_path):
+    """Finding A/#6: a symlinked $LOG_DIR must still be used for writing
+    (never block the push) but must never be chmod'd or pruned, since chmod
+    follows symlinks and would retarget the tightening onto whatever the
+    symlink actually points at. It must also NOT fall through to the fixed
+    fallback — that directory is perfectly usable on its own terms, so
+    falling through anyway would, in production (no test override), risk
+    landing on the real, shared /tmp/lifeos-prepush for no reason.
+    """
+    real_target = tmp_path / "real_target"
+    real_target.mkdir()
+    real_target.chmod(0o777)
+    hostile_tmpdir = tmp_path / "hostile_tmpdir"
+    hostile_tmpdir.mkdir()
+    (hostile_tmpdir / "lifeos-prepush").symlink_to(real_target)
+
+    bin_dir = tmp_path / "recstubbin"
+    bin_dir.mkdir()
+    calls_file = tmp_path / "calls.log"
+    (bin_dir / "chmod").write_text(f'#!/bin/bash\necho "chmod $*" >> {calls_file}\nexit 0\n')
+    (bin_dir / "find").write_text(f'#!/bin/bash\necho "find $*" >> {calls_file}\nexit 0\n')
+    (bin_dir / "chmod").chmod(0o755)
+    (bin_dir / "find").chmod(0o755)
+    not_used = tmp_path / "should_not_be_used"
+
+    result = _run_real_hook(
+        stub_python, tmp_path, tmpdir=hostile_tmpdir,
+        local_ref="refs/heads/feat/symlink-check",
+        extra_env={
+            "PATH": f"{bin_dir}:{stub_python['bin_dir']}:{os.environ['PATH']}",
+            "LIFEOS_PREPUSH_TEST_FALLBACK_DIR": str(not_used),
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "is a symlink; writing there" in result.stdout
+    assert not not_used.exists(), (
+        "a symlinked (but usable) configured dir must not fall through to the fixed fallback")
+    unit_logs = list(real_target.glob("*-unit.log"))
+    assert len(unit_logs) == 1, f"expected the log inside the symlink target, found {unit_logs}"
+    assert not calls_file.exists(), "a symlinked directory must never be chmod'd or pruned"
+    assert real_target.stat().st_mode & 0o777 == 0o777, "the symlink target's mode must be untouched"
+
+
+@pytest.mark.unit
+def test_last_resort_dir_is_never_chmod_or_pruned(tmp_path):
+    """Finding A: when every fallback rung fails (configured dir occupied,
+    fixed fallback occupied, and `mktemp` itself unavailable), the hook must
+    still resolve to a usable location (the literal `/tmp`) without blocking
+    the push, but that directory is NOT owned by this hook and must never be
+    chmod'd or pruned — the negative half of the owned/not-owned pair (see
+    test_unwritable_log_dir_push_still_completes for the positive half).
+
+    Stubs `mktemp` to always fail (forcing the true last-resort literal) and
+    no-op stubs `chmod`/`find` (record-only, no real syscall) so this test —
+    and its mutation proof, which temporarily breaks the ownership gate — can
+    never actually touch a real filesystem location, however the (possibly
+    broken) gate resolves.
+    """
+    hostile_tmpdir = tmp_path / "hostile_tmpdir"
+    hostile_tmpdir.mkdir()
+    (hostile_tmpdir / "lifeos-prepush").write_text("occupied")
+    fallback_path = tmp_path / "fallback_occupied"
+    fallback_path.write_text("occupied")
+
+    bin_dir = tmp_path / "stubbin_lastresort"
+    bin_dir.mkdir()
+    (bin_dir / "mktemp").write_text("#!/bin/bash\nexit 1\n")
+    (bin_dir / "mktemp").chmod(0o755)
+    calls_file = tmp_path / "calls.log"
+    (bin_dir / "chmod").write_text(f'#!/bin/bash\necho "chmod $*" >> {calls_file}\nexit 0\n')
+    (bin_dir / "find").write_text(f'#!/bin/bash\necho "find $*" >> {calls_file}\nexit 0\n')
+    (bin_dir / "chmod").chmod(0o755)
+    (bin_dir / "find").chmod(0o755)
+
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "LIFEOS_PREPUSH_PLAN_ONLY": "1",
+        "LIFEOS_PREPUSH_CHANGED_FILES": "api/main.py",
+        "TMPDIR": str(hostile_tmpdir),
+        "LIFEOS_PREPUSH_TEST_FALLBACK_DIR": str(fallback_path),
+    }
+    result = subprocess.run(
+        ["bash", str(HOOK)], capture_output=True, text=True, env=env, cwd=str(REPO),
+        input=f"refs/heads/last-resort-check {_FAKE_SHA} refs/heads/unused {_FAKE_SHA}\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    log, browser_log = _log_paths(result.stdout)
+    assert Path(log).parent == Path("/tmp"), f"expected the literal /tmp last resort, got {log}"
+    assert "every fallback failed" in result.stdout
+    assert "not owned by this hook" in result.stdout
+    assert not calls_file.exists(), (
+        f"chmod/find must never run against the un-owned last resort: "
+        f"{calls_file.read_text() if calls_file.exists() else ''}")
+
+
+@pytest.mark.unit
+def test_equality_guard_skips_redundant_fallback_retry(tmp_path):
+    """Finding E: `[ "$FALLBACK_DIR" = "$UNUSABLE_LOG_DIR" ]` is otherwise
+    unreachable in the suite because every other fallback test points the
+    override at a distinct, fresh, writable directory. Set the override to
+    the EXACT SAME (already-known-unusable) path as the configured
+    directory — the common production shape when TMPDIR is unset, since both
+    rungs then default to the same `/tmp/lifeos-prepush` — and check the
+    printed reason: with the guard, the retry is skipped and the message
+    says so; without it, the code would retry the identical occupied path
+    and report its usual "not a directory" reason instead.
+    """
+    hostile_tmpdir = tmp_path / "hostile_tmpdir"
+    hostile_tmpdir.mkdir()
+    unusable = hostile_tmpdir / "lifeos-prepush"
+    unusable.write_text("occupied")
+
+    env = {
+        **os.environ,
+        "LIFEOS_PREPUSH_PLAN_ONLY": "1",
+        "LIFEOS_PREPUSH_CHANGED_FILES": "api/main.py",
+        "TMPDIR": str(hostile_tmpdir),
+        "LIFEOS_PREPUSH_TEST_FALLBACK_DIR": str(unusable),
+    }
+    result = subprocess.run(
+        ["bash", str(HOOK)], capture_output=True, text=True, env=env, cwd=str(REPO),
+        input=f"refs/heads/equality-guard-check {_FAKE_SHA} refs/heads/unused {_FAKE_SHA}\n",
+    )
+    assert result.returncode == 0
+    assert "(same directory; not retried)" in result.stdout, result.stdout
+    log, _ = _log_paths(result.stdout)
+    assert Path(log).parent.name.startswith("lifeos-prepush."), (
+        "expected the throwaway mktemp rung to be reached")
+
+
+@pytest.mark.unit
+def test_distinct_fixed_fallback_failure_reaches_mktemp_rung(tmp_path):
+    """Finding E/#8: rung 3 (`mktemp -d` with the templated name) was
+    previously unreachable in the suite because every fallback test pointed
+    the override at a fresh, writable directory. Make BOTH the configured
+    directory and the (distinct) fixed fallback genuinely unusable, so the
+    hook must fall all the way through to the throwaway
+    `mktemp -d ".../lifeos-prepush.XXXXXX"` rung, and assert its distinctive
+    naming shape and that the message names the fixed fallback's own reason.
+    """
+    hostile_tmpdir = tmp_path / "hostile_tmpdir"
+    hostile_tmpdir.mkdir()
+    (hostile_tmpdir / "lifeos-prepush").write_text("occupied")
+    fallback_path = tmp_path / "also_occupied_fallback"
+    fallback_path.write_text("occupied")
+
+    env = {
+        **os.environ,
+        "LIFEOS_PREPUSH_PLAN_ONLY": "1",
+        "LIFEOS_PREPUSH_CHANGED_FILES": "api/main.py",
+        "TMPDIR": str(hostile_tmpdir),
+        "LIFEOS_PREPUSH_TEST_FALLBACK_DIR": str(fallback_path),
+    }
+    result = subprocess.run(
+        ["bash", str(HOOK)], capture_output=True, text=True, env=env, cwd=str(REPO),
+        input=f"refs/heads/distinct-fallback-fail {_FAKE_SHA} refs/heads/unused {_FAKE_SHA}\n",
+    )
+    assert result.returncode == 0
+    assert "the fixed fallback" in result.stdout
+    assert f"({fallback_path})" in result.stdout
+    assert "(not a directory)" in result.stdout  # the fixed fallback's own reason
+    log, browser_log = _log_paths(result.stdout)
+    resolved_dir = Path(log).parent
+    assert resolved_dir == Path(browser_log).parent
+    assert resolved_dir.name.startswith("lifeos-prepush."), (
+        f"expected the templated mktemp naming shape, got {resolved_dir}")
+    assert resolved_dir.parent == hostile_tmpdir
+    assert resolved_dir.stat().st_mode & 0o777 == 0o700, "the mktemp rung directory is owned"
+
+
+@pytest.mark.unit
+def test_bare_mktemp_rung_reached_when_templated_mktemp_fails(tmp_path):
+    """Finding E/#8: the SECOND, bare `mktemp -d` call (no custom template)
+    is a distinct fallback rung from the templated one above, reached only
+    if the templated `mktemp -d ".../lifeos-prepush.XXXXXX"` itself fails.
+    Stub `mktemp` to fail only for calls carrying that template and delegate
+    everything else (the bare `-d` call) to the real binary, so the hook
+    must resolve to the bare-mktemp naming shape (`tmp.XXXXXXXXXX`-style,
+    not `lifeos-prepush.XXXXXX`) instead.
+    """
+    real_mktemp = shutil.which("mktemp")
+    assert real_mktemp, "this test needs a real `mktemp` on PATH"
+
+    hostile_tmpdir = tmp_path / "hostile_tmpdir"
+    hostile_tmpdir.mkdir()
+    (hostile_tmpdir / "lifeos-prepush").write_text("occupied")
+    fallback_path = tmp_path / "also_occupied_fallback"
+    fallback_path.write_text("occupied")
+
+    bin_dir = tmp_path / "stubbin_rung4"
+    bin_dir.mkdir()
+    (bin_dir / "mktemp").write_text(
+        "#!/bin/bash\n"
+        "if [[ \"$*\" == *lifeos-prepush* ]]; then\n"
+        "    exit 1\n"
+        "fi\n"
+        f"exec {real_mktemp} \"$@\"\n"
+    )
+    (bin_dir / "mktemp").chmod(0o755)
+
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "LIFEOS_PREPUSH_PLAN_ONLY": "1",
+        "LIFEOS_PREPUSH_CHANGED_FILES": "api/main.py",
+        "TMPDIR": str(hostile_tmpdir),
+        "LIFEOS_PREPUSH_TEST_FALLBACK_DIR": str(fallback_path),
+    }
+    result = subprocess.run(
+        ["bash", str(HOOK)], capture_output=True, text=True, env=env, cwd=str(REPO),
+        input=f"refs/heads/rung4-check {_FAKE_SHA} refs/heads/unused {_FAKE_SHA}\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    log, browser_log = _log_paths(result.stdout)
+    resolved_dir = Path(log).parent
+    assert resolved_dir == Path(browser_log).parent
+    assert not resolved_dir.name.startswith("lifeos-prepush"), (
+        f"expected the BARE mktemp naming shape (the templated one should "
+        f"have failed), got {resolved_dir}")
+    assert resolved_dir.parent == hostile_tmpdir, "bare `mktemp -d` should still honour TMPDIR"
+    assert resolved_dir.stat().st_mode & 0o777 == 0o700
