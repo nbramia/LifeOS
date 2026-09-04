@@ -247,6 +247,18 @@ The token above is set on the machine hosting the API. Each machine *posting* se
 |---|---|
 | `~/.config/lifeos/agent-hook.env` (override path via `$LIFEOS_AGENT_HOOK_ENV`) | Contains `LIFEOS_API_URL` and `LIFEOS_AGENT_HOOK_TOKEN` (the same token as above). Values already set in the environment take precedence over this file. Absent → the hook exits silently without posting. |
 
+## Card Assignment (`#851`, host / model / effort routing)
+
+See [guides/agent-worker-setup.md § Card assignment](agent-worker-setup.md#card-assignment-running-a-card-on-another-machine-851) for the ssh-prerequisites walkthrough and [specs/technical/agent-worker.md § Card assignment](../specs/technical/agent-worker.md#card-assignment-851) for the mechanism.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_AGENT_HOSTS` | JSON object | `{}` | `{name: ssh_target}` — maps a board-facing host name to the ssh target the worker/API connects to for it. Empty disables every remote host: a task naming a host not in this map lands at `#agent-failed`. Invalid JSON logs a warning and is treated as `{}`. Operator configuration — never committed with real values. |
+| `LIFEOS_AGENT_SSH_CONNECT_TIMEOUT` | int (seconds) | `10` | How long ssh may spend establishing a connection to a remote host before giving up. Applies to remote spawn, remote kill, and remote resume/focus alike. |
+| `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` | int (seconds) | `86400` | How long `GET /api/agents/models` caches each engine's model list before re-querying providers. |
+| `LIFEOS_CODEX_MODELS_CACHE_PATH` | str | `~/.codex/models_cache.json` | Path to the Codex CLI's own model-catalog cache, read by the model catalog endpoint for the codex engine's picker list. |
+| `LIFEOS_OPENAI_API_KEY` | str | *(empty)* | Optional OpenAI API key, used ONLY as the model-catalog fallback when `LIFEOS_CODEX_MODELS_CACHE_PATH` is missing/unreadable. Never used to run turns — Codex sessions are subscription-billed through the CLI itself, never the API. |
+
 ## Claude Code Orchestration (`/claude` Telegram command)
 
 Subprocess orchestration triggered from Telegram. See [claude-code-orchestration.md](claude-code-orchestration.md) for the operator flow.

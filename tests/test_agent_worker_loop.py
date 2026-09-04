@@ -301,6 +301,33 @@ def test_routing_ask_lands_in_blocked_with_model_question(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_ssh_failure_reason_reaches_agent_failed_notice(tmp_path: Path):
+    """Round 1, finding #4, dispatch-level half: `_handle_outcome` (the
+    wiring `outcome.reason` goes through on the way to the #agent-failed
+    Telegram notice) must surface the ssh failure text verbatim — the
+    executor-level tests only prove `outcome.reason` itself is correct,
+    not that the worker actually uses it for the card the operator sees."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "do the thing on studio", "status": "in_progress",
+         "tags": [RUNNING_TAG, "claude"]},
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED)))
+    session = w.session_store.create(task_id="t1", routing="claude_code", host="studio")
+    outcome = ExecutorOutcome(
+        status=STATUS_FAILED,
+        reason="ssh to studio failed (exit 255): ssh: connect to host studio port 22: Connection refused",
+    )
+    w._handle_outcome(session, api.tasks["t1"], outcome)
+
+    assert FAILED_TAG in api.tasks["t1"]["tags"]
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert any("Connection refused" in s for s in sent)
+    assert any("studio" in s for s in sent)
+
+
+@pytest.mark.unit
 def test_insane_task_lands_in_failed(tmp_path: Path):
     """A deterministically destructive title (matched by the code, not the
     model's prose) still fails closed — #747 must not weaken this guard."""

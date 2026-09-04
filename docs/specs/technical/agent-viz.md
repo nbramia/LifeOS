@@ -241,7 +241,7 @@ Worker (`lifeos_agent`) rows always get `host = api_host_name()` directly in `_s
 
 ### Focus / Resume and remote hosts
 
-`_check_session_host_or_409(session_id)` looks up the id's `cli_sessions` row; if one exists and its `host` differs from `api_host_name()`, both `/focus` and `/resume` (checked before any local wezterm work) return 409 with the recorded host in `detail`. A session with no `cli_sessions` row at all (never registered, or registered before this feature existed) is unaffected — it falls through to the pre-existing cache/probe resolution unchanged. Remote resume and focus themselves aren't implemented — that needs the ssh mechanism from the assignment-and-execution issue; 409 is the honest answer in the meantime, not a silent no-op or a misleading 404.
+`_check_session_host_or_409(session_id)` looks up the id's `cli_sessions` row. A session with no row at all (never registered, or registered before this feature existed) is unaffected — it falls through to the pre-existing cache/probe resolution unchanged. When a row exists and its `host` differs from `api_host_name()` (#851): a host name present in `settings.agent_hosts` resolves to its ssh target, which both `/focus` and `/resume` then use instead of 409ing — see [Card assignment](agent-worker.md#card-assignment-851) for the mechanism (ssh-wrapped launcher, cwd sourced from the `cli_sessions` row since a remote session's transcript file isn't on this host's filesystem, and `/focus`'s fallback to running the same launcher `/resume` does, since there's no cross-host pane registry to activate an existing pane against). A host name NOT in `settings.agent_hosts` still 409s, with the recorded host in `detail` — the honest answer for an operator-config gap, not a silent no-op or a misleading 404.
 
 ### Hook script and installer
 
@@ -333,6 +333,7 @@ POST /api/agents/sessions/{id}/kill   body: {"reason": "..."}
    - Emit `operator_killed` (target) or `cascade_killed` (descendants) to the transcript.
    - Call `api.services.agent_worker.inter_agent.teardown_session(...)` to actually mark the session terminal in the store and tear down the managed remote if one exists.
 4. Managed-Agents teardown uses a `ManagedAgentsDriver` instance constructed lazily from `settings.anthropic_api_key`. If the key isn't set, kill degrades to local-only and the worker's next managed poll reconciles the remote side.
+5. (#851) For a session whose `host` is set, `teardown_session` signals the process over ssh (`ssh <target> kill -- -<pgid>`, the `<pgid>` recorded from the remote executor's spawn — see [Card assignment](agent-worker.md#card-assignment-851)) instead of the local `os.killpg` path. A missing `remote_pgid` or an unregistered host degrades to a DB-only kill, the same as a missing local pid event does.
 
 Response: `{killed: [session_ids], failures: [{session_id, error}], reason: <input>}`.
 

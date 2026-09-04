@@ -441,6 +441,7 @@ The sidebar shows a conversation's persona as a subtitle suffix (`· <Persona La
 - [Chat UI](../product/chat-ui.md) — Web chat product behavior
 - [Architecture](architecture.md) — Code layout for chat routes and services
 - [Testing Standards](../standards/testing-standards.md) — Contract regression tests
+- [Agent Worker — Technical](agent-worker.md) — The `?conversation=<id>` deep link a board-assigned Hermes card's open action lands on (#851), additive to this doc's SSE contract
 
 ### Operational
 - [Voice Setup](../../guides/voice-setup.md) — Operator-facing voice mode setup, including the Hermes/Agent backend contract this doc specifies

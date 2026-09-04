@@ -476,6 +476,74 @@ Claude Code CLI (which *does* work headless on Linux), then monitor it with
 `lifeos_agent_check`. This delegation is the supported path for any task that
 needs a real browser.
 
+## Card assignment: running a card on another machine (#851)
+
+A board card (or a `#claude`/`#codex` task carrying `host` / `model` /
+`effort` fields) can name a machine other than this API host to run on.
+The worker reaches it over ssh — no worker process runs on the remote
+machine, only the API host's own worker dispatches, and it does so by
+wrapping the identical local command in an ssh call.
+
+**Configure the registry.** `LIFEOS_AGENT_HOSTS` in `.env` is a JSON object
+mapping a board-facing host name to an ssh target:
+
+```bash
+LIFEOS_AGENT_HOSTS={"laptop": "operator@laptop.example", "studio": "studio-box"}
+```
+
+`studio-box` above is a plain `~/.ssh/config` `Host` alias — either form
+works, since the value is passed straight to `ssh`. A host name not in
+this map fails the task closed (`#agent-failed`, reason naming the host)
+without ever attempting a connection; leaving `LIFEOS_AGENT_HOSTS` unset
+(the default, `{}`) disables every remote host.
+
+**ssh prerequisites, per remote machine:**
+
+- Key-based auth already working non-interactively: `ssh -o BatchMode=yes
+  <target> echo ok` must succeed with no password/passphrase prompt (an
+  agent-loaded key, or an unencrypted key referenced by `~/.ssh/config`).
+  `BatchMode=yes` is exactly what the worker itself passes, so this is the
+  real precondition, not an approximation of it.
+- The `claude` and/or `codex` CLI installed and authenticated on the
+  remote machine's own account, the same way it is on this host (see Step 4b above for Claude Code auth,
+  [Codex MCP setup](#codex-mcp-setup-codex-path) for Codex) — the remote invocation is the literal `claude`/`codex` binary on
+  that machine's `$PATH`, so whatever makes it work locally on THAT
+  machine (not this one) has to already be true there.
+- The lifeos MCP server configured for whichever CLI runs there, exactly
+  as on this host — a remote session with no `lifeos_*` tools is blind to
+  personal data the same way a local one would be.
+- For `/resume`/`/focus`/board-open's WezTerm launcher path: WezTerm
+  installed and reachable the same way it is here — this repo doesn't yet
+  replicate `_resume_env`'s local socket-discovery logic on the remote
+  side, so the remote machine's own login-shell environment has to
+  already make `wezterm cli spawn` work unassisted.
+
+The remote spawn always unsets a small canonical list of provider
+credential names (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
+`OPENAI_API_KEY`, and a few others) regardless of what this API host's own
+environment contains, but names beyond that list exported by a registered
+host's own non-interactive shell are not stripped — keep provider
+credentials out of a registered host's shell startup files.
+
+**Connect timeout.** `LIFEOS_AGENT_SSH_CONNECT_TIMEOUT` (default 10
+seconds) bounds how long ssh may spend establishing the connection before
+giving up — applies to remote spawn, remote kill, and remote resume/focus
+alike. An unreachable host fails within this window with the ssh error as
+the failure reason. A remote spawn's initial handshake read (waiting for
+the `PGID:` line that confirms the remote process actually started) is
+bounded separately, at this connect timeout plus 5 seconds — it covers an
+auth stall or a host that accepts the connection but never answers, and
+fails with its own distinct reason (`host <name> did not answer within
+<n>s`) rather than the ssh connection error above.
+
+**What doesn't work remotely:** Apple-data tasks (iMessage, Photos,
+Contacts) need Full Disk Access, which is granted per-launching-process
+and can't be inherited over ssh — see
+[agent-worker.md](../specs/technical/agent-worker.md#card-assignment-851).
+The Apple Data Agent's own export/import pipeline
+([operations.md](operations.md)) is the supported path for cross-machine
+Apple data, not this mechanism.
+
 ## Cost-aware iteration
 
 Iterating on cloud `#agent` prompts has a hidden tax: every fresh managed
@@ -528,4 +596,6 @@ suggestions to keep iteration cheap:
 - [Configuration](configuration.md) — environment variable reference
 - [Scripts](scripts.md) — `setup-systemd.sh` and other operational scripts
 - [Human Queue](human-queue.md) — `done_when` auto-resolve checks require this worker to be running
+- [Agent Worker — Technical](../specs/technical/agent-worker.md#card-assignment-851) — Host registry and ssh spawn mechanism this guide's setup section covers operationally
+- [Operations](operations.md) — Apple Data Agent export/import, the supported path for cross-machine Apple data this guide's remote-host section can't reach
 - Epic [#98](https://github.com/nbramia/LifeOS/issues/98) — full agent-worker design

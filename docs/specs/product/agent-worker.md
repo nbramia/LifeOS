@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-08-18
+> **Last Updated:** 2026-09-03
 
 LifeOS includes an external **agent worker** that picks up tasks you've tagged `#agent` and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -60,6 +60,7 @@ Optional sub-tags steer routing:
 | `#cloud-sonnet` | Forces routing to Claude Sonnet on Anthropic Managed Agents. Same connector access and billing as `#cloud-haiku`. |
 | `#claude` | Forces routing to Claude Code CLI (the same surface as `/claude`). Billed against your Claude Pro subscription rather than per-token. Good for code/filesystem/browser work where the cloud connectors aren't needed. |
 | `#codex` | Forces routing to Codex CLI (the same surface as `/codex`). Billed against your ChatGPT subscription. Same caveat as `#claude`. |
+| `#hermes` | Forces routing to the Hermes backend the persona bots use. Opens a Hermes conversation seeded with the card's title and notes; the task's cost is whatever Hermes reports, not a per-token Anthropic charge. A task routed this way shows up on the board with Open deep-linking to `/chat?conversation=<id>` rather than a terminal session. |
 
 Without an explicit routing tag, the preflight reads the title. "With local agent" / "using gemma" force local, and naming an engine, model, or "anthropic"/"api" ("use claude", "with opus", "use the anthropic api") routes there — you asked, so it dispatches. A bare "cloud" in the title no longer counts (since #809, "cloud" means the remote provider, not Anthropic) — it falls through to the confirmation question below like any other guess.
 
@@ -67,7 +68,7 @@ Without an explicit routing tag, the preflight reads the title. "With local agen
 
 To skip the question entirely for a task you know needs the remote provider, tag it `#cloud`; for one that needs Anthropic's own cloud connectors, tag it `#cloud-haiku` or `#cloud-sonnet`.
 
-Tag precedence (first match wins): `#local` → `#claude` → `#codex` → `#cloud-haiku` → `#cloud-sonnet` → `#cloud`. The CLI routes (`#claude`, `#codex`) skip the cost-confirmation gate because they're subscription-billed, and so does `#cloud` (the remote provider is priced but isn't the confirmation ceremony's Anthropic "expensive exception"); per-session dollar rollups still appear in `/agents` via the rollout ingest (the `cc:` and `cx:` session rows).
+Tag precedence (first match wins): `#local` → `#claude` → `#codex` → `#hermes` → `#cloud-haiku` → `#cloud-sonnet` → `#cloud`. The CLI routes (`#claude`, `#codex`) skip the cost-confirmation gate because they're subscription-billed, and so does `#hermes` (billed however Hermes bills, not a per-token Anthropic charge) and `#cloud` (the remote provider is priced but isn't the confirmation ceremony's Anthropic "expensive exception"); per-session dollar rollups still appear in `/agents` via the rollout ingest (the `cc:` and `cx:` session rows).
 
 ---
 

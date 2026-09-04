@@ -41,6 +41,12 @@ router = APIRouter(prefix="/api/agents", tags=["agents"])
 _session_store: SessionStore | None = None
 _transcript_store: TranscriptStore | None = None
 
+# (#851) Injectable remote-kill runner, forwarded to `teardown_session` for a
+# session whose `host` names a machine other than this API host. None (the
+# default) uses `remote_spawn.kill_remote_process_group`'s real `subprocess.run`
+# over ssh; tests monkeypatch this to a fake that records the argv.
+_remote_kill_runner = None
+
 # Labels are stable once derived from a non-fallback source, so cache to avoid
 # re-deriving on every snapshot tick. Capped to bound memory if the process
 # accumulates a lot of session IDs over a long uptime.
@@ -1031,6 +1037,7 @@ async def operator_kill_session(session_id: str, body: KillRequest | None = None
                     transcript_kind=kind,
                     transcript_payload=payload,
                     managed_driver=driver,
+                    remote_kill_runner=_remote_kill_runner,
                 )
                 killed.append(s.session_id)
                 if result.get("managed_failure"):
@@ -1175,6 +1182,24 @@ async def cli_session_event(request: Request, body: CliSessionEventRequest) -> d
             )
         except Exception as exc:  # noqa: BLE001 — pane mapping is a nice-to-have, never fail the event
             logger.warning("cc_wezterm_store upsert failed for %s: %s", cli.session_id, exc)
+
+    # (#851) A `session_start` naming a task links this CLI session to its
+    # board card and moves the card to In progress — the interactive
+    # terminal `POST /board/cards/{id}/open` (api/routes/agent_assignment.py)
+    # spawns sets `LIFEOS_TASK_ID`, the hook script already forwards it as
+    # `task_id` on every event (scripts/lifeos-agent-hook.sh), so this is
+    # the one piece #849 didn't need: turning a task_id-bearing session_start
+    # into a lane move. Best-effort — a task lookup/update failure must
+    # never break the registration event itself.
+    if body.event == "session_start" and body.task_id:
+        try:
+            from api.services.task_manager import get_task_manager
+            manager = get_task_manager()
+            task = manager.get(body.task_id)
+            if task is not None and task.status == "todo":
+                manager.update(body.task_id, status="in_progress")
+        except Exception as exc:  # noqa: BLE001 — never fail the registration event
+            logger.warning("task status update for %s failed: %s", body.task_id, exc)
 
     return {
         "registered": True,
@@ -1491,36 +1516,50 @@ def _resume_env() -> dict[str, str]:
     return env
 
 
-def _check_session_host_or_409(session_id: str) -> None:
-    """Reject /focus and /resume for a session registered on a different
-    host than this API (#849). Remote resume/focus needs the ssh mechanism
-    from the assignment-and-execution issue and isn't implemented here.
+def _check_session_host_or_409(session_id: str) -> str | None:
+    """Resolve /focus and /resume's target host for `session_id` (#849, #851).
 
-    A session_id with no `cli_sessions` row — never registered via the
-    hook, or registered before this feature existed — falls through
-    unchanged to the existing local-only resolution (cache / FD-probe).
+    Returns `None` when the session ran on THIS API host (or has no
+    `cli_sessions` row at all — never registered via the hook, or
+    registered before this feature existed — which falls through
+    unchanged to the existing local-only resolution: cache / FD-probe).
+    Returns the ssh target string when the session's host is a DIFFERENT,
+    but registered (`settings.agent_hosts`), machine — the caller then
+    runs the launcher over ssh instead of spawning it locally. Raises
+    `HTTPException(409)` when the session's host is neither this API host
+    nor a registered one.
     """
     try:
         store = _get_session_store()
         cli = store.get_cli_session(session_id)
     except Exception as exc:  # noqa: BLE001 — never block a local resume/focus on a store error
         logger.warning("cli_sessions lookup failed for %s: %s", session_id, exc)
-        return
-    if cli is not None and cli.host != api_host_name():
+        return None
+    if cli is None or cli.host == api_host_name():
+        return None
+    from config.settings import settings
+    target = settings.agent_hosts.get(cli.host)
+    if not target:
         raise HTTPException(
             status_code=409,
-            detail=f"session {session_id} is running on host {cli.host!r}, not this API host",
+            detail=f"session {session_id} is running on host {cli.host!r}, which is "
+                    f"not this API host and not in LIFEOS_AGENT_HOSTS",
         )
+    return target
 
 
 async def _resume_codex_session(
     session_id: str,
     body: "CCResumeRequest | None",
+    remote_ssh_target: str | None = None,
 ) -> dict[str, Any]:
     """Codex sibling of resume_claude_code_session.
 
     Reuses the same env / wezterm pane injection / clipboard / dock
     machinery; only the lookup, settings, and inner command differ.
+    `remote_ssh_target` (#851): the ssh target to run the launcher on when
+    the session's host isn't this API host, resolved by the caller via
+    `_check_session_host_or_409`.
     """
     import shlex
     import subprocess
@@ -1544,21 +1583,31 @@ async def _resume_codex_session(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Widen lookback for resume so older sessions are still resolvable.
-    metas = cx.discover_sessions(
-        sessions_dir=settings.codex_sessions_dir,
-        lookback_days=max(int(settings.codex_lookback_days), 365),
-    )
-    target = next((m for m in metas if m.raw_session_id == bare), None)
-    if target is None:
-        raise HTTPException(status_code=404, detail=f"session {session_id} not found")
-    # Codex stores cwd inside session_meta, populated by parse_session. The
-    # snapshot prepopulates it but on a fresh resume call we may need to
-    # re-parse to recover it (cheap — one jsonl read).
-    if not target.decoded_cwd:
-        target, _ = cx.parse_session(target)
-    if not target.decoded_cwd:
-        raise HTTPException(status_code=404, detail=f"session {session_id} has no cwd")
+    if remote_ssh_target:
+        # (#851) See the identical branch in resume_claude_code_session —
+        # a remote session's rollout file isn't under this API's local
+        # `codex_sessions_dir`; its cwd comes from the `cli_sessions` row.
+        cli = _get_session_store().get_cli_session(session_id)
+        if cli is None or not cli.cwd:
+            raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
+        from types import SimpleNamespace
+        target = SimpleNamespace(decoded_cwd=cli.cwd)
+    else:
+        # Widen lookback for resume so older sessions are still resolvable.
+        metas = cx.discover_sessions(
+            sessions_dir=settings.codex_sessions_dir,
+            lookback_days=max(int(settings.codex_lookback_days), 365),
+        )
+        target = next((m for m in metas if m.raw_session_id == bare), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail=f"session {session_id} not found")
+        # Codex stores cwd inside session_meta, populated by parse_session. The
+        # snapshot prepopulates it but on a fresh resume call we may need to
+        # re-parse to recover it (cheap — one jsonl read).
+        if not target.decoded_cwd:
+            target, _ = cx.parse_session(target)
+        if not target.decoded_cwd:
+            raise HTTPException(status_code=404, detail=f"session {session_id} has no cwd")
 
     inner_template = (settings.codex_resume_inner_cmd or "").strip()
     inner_rendered = (
@@ -1586,13 +1635,20 @@ async def _resume_codex_session(
     if body and body.extra_env:
         env.update(body.extra_env)
 
-    if "wezterm" in argv[0]:
+    if "wezterm" in argv[0] and not remote_ssh_target:
         _inject_wezterm_pane(env)
+
+    popen_argv = argv
+    popen_cwd = target.decoded_cwd
+    if remote_ssh_target:
+        from api.services.agent_worker.remote_spawn import build_remote_launcher_argv
+        popen_argv = build_remote_launcher_argv(argv, target=remote_ssh_target)
+        popen_cwd = None
 
     try:
         proc = subprocess.Popen(  # noqa: S603 — argv only, no shell=True
-            argv,
-            cwd=target.decoded_cwd,
+            popen_argv,
+            cwd=popen_cwd,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1605,9 +1661,13 @@ async def _resume_codex_session(
 
     clipboard_text = ""
     if inner_rendered:
-        clipboard_text = (
+        local_form = (
             f"cd {shlex.quote(target.decoded_cwd)} && {inner_rendered}"
             if target.decoded_cwd else inner_rendered
+        )
+        clipboard_text = (
+            f"ssh {shlex.quote(remote_ssh_target)} -- {shlex.quote(local_form)}"
+            if remote_ssh_target else local_form
         )
     clipboard_copied = False
     if clipboard_text:
@@ -1616,8 +1676,15 @@ async def _resume_codex_session(
     pane_id: int | None = None
     stdout_bytes = b""
     stderr_bytes = b""
+    # (round 1, finding #7) An ssh round trip routinely exceeds the local
+    # 1.5s budget — use the connect-timeout-derived value on the remote
+    # branch so a remote launcher doesn't spuriously degrade to
+    # `pane_id: None` before the real ssh response even arrives.
+    communicate_timeout = 1.5
+    if remote_ssh_target:
+        communicate_timeout = settings.agent_ssh_connect_timeout + 1.5
     try:
-        stdout_bytes, stderr_bytes = proc.communicate(timeout=1.5)
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=communicate_timeout)
     except subprocess.TimeoutExpired:
         return {
             "spawned": True,
@@ -1642,7 +1709,11 @@ async def _resume_codex_session(
         except ValueError:
             pane_id = None
 
-    if pane_id is not None:
+    # (round 1, finding #10) `wezterm_pid` comes from THIS host's own
+    # `_current_wezterm_pid` — on a remote resume the pane and its wezterm
+    # process live on `remote_ssh_target`, not here, so upserting would
+    # record a host-mismatched pid/pane into the LOCAL store.
+    if pane_id is not None and not remote_ssh_target:
         try:
             from api.services.cc_wezterm_store import get_default_store
             wezterm_pid = _current_wezterm_pid(env.get("XDG_RUNTIME_DIR"))
@@ -1683,19 +1754,30 @@ async def resume_claude_code_session(
     Local-network only — do not expose via Tailscale Funnel or the
     public MCP HTTP transport.
     """
-    import shlex
-    import subprocess
-
     if not session_id.startswith("cx:") and not session_id.startswith("cc:"):
         raise HTTPException(status_code=400, detail="resume is only available for Claude Code or Codex sessions")
 
-    # #849: remote resume isn't implemented yet (needs the ssh mechanism
-    # from the assignment-and-execution issue) — a session registered on a
-    # different host than this API 409s instead of silently no-op'ing.
-    _check_session_host_or_409(session_id)
+    # (#849/#851) A session registered on a different, but REGISTERED
+    # (settings.agent_hosts), host resumes over ssh; an unregistered host
+    # still 409s rather than silently no-op'ing.
+    remote_ssh_target = _check_session_host_or_409(session_id)
 
     if session_id.startswith("cx:"):
-        return await _resume_codex_session(session_id, body)
+        return await _resume_codex_session(session_id, body, remote_ssh_target=remote_ssh_target)
+    return await _resume_claude_code_launcher(session_id, body, remote_ssh_target=remote_ssh_target)
+
+
+async def _resume_claude_code_launcher(
+    session_id: str,
+    body: "CCResumeRequest | None",
+    remote_ssh_target: str | None = None,
+) -> dict[str, Any]:
+    """The `cc:`-prefixed half of `resume_claude_code_session`, factored out
+    (#851) so `/focus`'s remote fallback (no cross-host pane registry — see
+    that function) can reuse it exactly like it already reuses
+    `_resume_codex_session` for `cx:` sessions."""
+    import shlex
+    import subprocess
 
     try:
         from config.settings import settings
@@ -1719,14 +1801,26 @@ async def resume_claude_code_session(
     if ":agent:" in bare:
         bare = bare.split(":agent:", 1)[0]
 
-    # Find the matching jsonl to recover the working directory.
-    metas = cc.discover_sessions(
-        projects_dir=settings.claude_code_projects_dir,
-        lookback_days=max(int(settings.claude_code_lookback_days), 365),  # widen lookback for resume
-    )
-    target = next((m for m in metas if m.raw_session_id == bare), None)
-    if target is None or not target.decoded_cwd:
-        raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
+    if remote_ssh_target:
+        # (#851) A remote session's transcript lives on the REMOTE host, not
+        # under this API's local `claude_code_projects_dir` — the local
+        # `discover_sessions` scan below would always 404 it. Its cwd comes
+        # from the `cli_sessions` row instead (populated by the remote
+        # host's own hook script over HTTP, host-agnostic by design — #849).
+        cli = _get_session_store().get_cli_session(session_id)
+        if cli is None or not cli.cwd:
+            raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
+        from types import SimpleNamespace
+        target = SimpleNamespace(decoded_cwd=cli.cwd)
+    else:
+        # Find the matching jsonl to recover the working directory.
+        metas = cc.discover_sessions(
+            projects_dir=settings.claude_code_projects_dir,
+            lookback_days=max(int(settings.claude_code_lookback_days), 365),  # widen lookback for resume
+        )
+        target = next((m for m in metas if m.raw_session_id == bare), None)
+        if target is None or not target.decoded_cwd:
+            raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
 
     # Render the inner command first so the outer template can substitute
     # `{inner_command}` (wezterm path) AND so we can copy it to the clipboard
@@ -1772,14 +1866,27 @@ async def resume_claude_code_session(
     # no $WEZTERM_PANE and wezterm can't probe focus, so it errors out
     # ("--pane-id was not specified and $WEZTERM_PANE is not set"). Probe
     # `wezterm cli list` for an existing pane and pin its id into the env
-    # — wezterm then spawns into that pane's window.
-    if "wezterm" in argv[0]:
+    # — wezterm then spawns into that pane's window. Only meaningful for a
+    # LOCAL spawn — a remote target's own wezterm window state isn't
+    # something this process's env can probe.
+    if "wezterm" in argv[0] and not remote_ssh_target:
         _inject_wezterm_pane(env)
+
+    popen_argv = argv
+    popen_cwd = target.decoded_cwd
+    if remote_ssh_target:
+        # (#851) The rendered argv already carries `--cwd <remote path>` (or
+        # equivalent) baked in by the template above — that path is on the
+        # REMOTE filesystem, so the LOCAL ssh client must not `cwd=` into
+        # it (it likely doesn't exist locally at all).
+        from api.services.agent_worker.remote_spawn import build_remote_launcher_argv
+        popen_argv = build_remote_launcher_argv(argv, target=remote_ssh_target)
+        popen_cwd = None
 
     try:
         proc = subprocess.Popen(  # noqa: S603 — argv only, no shell=True (explicit shlex.split above)
-            argv,
-            cwd=target.decoded_cwd,
+            popen_argv,
+            cwd=popen_cwd,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1798,12 +1905,19 @@ async def resume_claude_code_session(
     # already runs with `--cwd target.decoded_cwd`), but the clipboard
     # is a backup for operator-overridden non-wezterm launchers AND
     # for the case where the wezterm tab opened off-screen and the
-    # operator just wants to run the command somewhere visible.
+    # operator just wants to run the command somewhere visible. For a
+    # remote target (#851), wrap it as a runnable ssh command instead of a
+    # bare `cd && ...` — the local clipboard's contents must be paste-able
+    # into a LOCAL terminal to be useful.
     clipboard_text = ""
     if inner_rendered:
-        clipboard_text = (
+        local_form = (
             f"cd {shlex.quote(target.decoded_cwd)} && {inner_rendered}"
             if target.decoded_cwd else inner_rendered
+        )
+        clipboard_text = (
+            f"ssh {shlex.quote(remote_ssh_target)} -- {shlex.quote(local_form)}"
+            if remote_ssh_target else local_form
         )
     clipboard_copied = False
     if clipboard_text:
@@ -1815,12 +1929,17 @@ async def resume_claude_code_session(
     #   (b) The launcher BECOMES the terminal (rare; not the default) —
     #       communicate() times out, no pane id available, return spawned=True.
     # A 1.5s timeout is plenty for (a) and short enough that the API stays
-    # snappy for (b).
+    # snappy for (b) — LOCALLY. (round 1, finding #7) An ssh round trip
+    # routinely exceeds 1.5s, so the remote branch uses the connect-
+    # timeout-derived value instead, leaving the local value untouched.
     pane_id: int | None = None
     stdout_bytes = b""
     stderr_bytes = b""
+    communicate_timeout = 1.5
+    if remote_ssh_target:
+        communicate_timeout = settings.agent_ssh_connect_timeout + 1.5
     try:
-        stdout_bytes, stderr_bytes = proc.communicate(timeout=1.5)
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=communicate_timeout)
     except subprocess.TimeoutExpired:
         # Long-running launcher — no pane id this turn, but the spawn is
         # in progress; surface what we have.
@@ -1851,7 +1970,9 @@ async def resume_claude_code_session(
         except ValueError:
             pane_id = None
 
-    if pane_id is not None:
+    # (round 1, finding #10) See the codex sibling above — a remote resume's
+    # pane and wezterm process live on `remote_ssh_target`, not here.
+    if pane_id is not None and not remote_ssh_target:
         try:
             from api.services.cc_wezterm_store import get_default_store
             wezterm_pid = _current_wezterm_pid(env.get("XDG_RUNTIME_DIR"))
@@ -2110,11 +2231,9 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
     if not session_id.startswith("cc:") and not is_cx:
         raise HTTPException(status_code=400, detail="focus is only available for Claude Code or Codex sessions")
 
-    # #849: remote focus isn't implemented yet (needs the ssh mechanism
-    # from the assignment-and-execution issue) — a session registered on a
-    # different host than this API 409s instead of trying (and failing) a
-    # local wezterm probe for a pane that doesn't exist here.
-    _check_session_host_or_409(session_id)
+    # (#849/#851) A session registered on a different, but REGISTERED host
+    # resumes over ssh; an unregistered host still 409s.
+    remote_ssh_target = _check_session_host_or_409(session_id)
 
     try:
         from config.settings import settings
@@ -2129,6 +2248,27 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
     else:
         if not getattr(settings, "cc_resume_enabled", False):
             raise HTTPException(status_code=400, detail="cc resume disabled — set LIFEOS_CC_RESUME_ENABLED=true")
+
+    if remote_ssh_target:
+        # (#851) There is no cross-host pane registry: the local
+        # `cc_wezterm_store` mapping is only ever written for a session
+        # that ran ON this API host (`cli_session_event`'s upsert guard),
+        # and the FD-probe fallback below reads a local transcript file a
+        # remote session's never has. Rather than invent a remote pane
+        # registry, "focus" a remote session by running the same launcher
+        # `/resume` does (over ssh) — same operator outcome (a terminal
+        # showing the session), degraded from "reuse the existing pane"
+        # to "open a new one", which the local path only reaches anyway
+        # once its own cache/probe both miss.
+        if is_cx:
+            result = await _resume_codex_session(session_id, None, remote_ssh_target=remote_ssh_target)
+        else:
+            result = await _resume_claude_code_launcher(session_id, None, remote_ssh_target=remote_ssh_target)
+        return {
+            "focused": True,
+            "pane_id": result.get("pane_id"),
+            "cwd": result.get("cwd"),
+        }
 
     from api.services.cc_wezterm_store import get_default_store
     from api.services import cc_pane_locate

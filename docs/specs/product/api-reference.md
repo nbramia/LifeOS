@@ -31,7 +31,8 @@ Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Thr
 15. [Job Queue Endpoints](#job-queue-endpoints)
 16. [Performance Trace Endpoints](#performance-trace-endpoints)
 17. [Admin Endpoints](#admin-endpoints)
-18. [MCP Tools — see mcp-tools.md](mcp-tools.md)
+18. [Card Assignment Endpoints](#card-assignment-endpoints-851)
+19. [MCP Tools — see mcp-tools.md](mcp-tools.md)
 
 ---
 
@@ -1026,12 +1027,28 @@ Get usage summary with stats for 24h, 7d, 30d, and all-time. Includes daily cost
 
 ---
 
+## Card Assignment Endpoints (#851)
+
+Card kill/resume/focus/registration endpoints are documented in [agent-viz.md § Endpoints](../technical/agent-viz.md#endpoints) alongside the rest of the `/agents` operator-control surface, per item 6 of this file's Table of Contents. These two are new to this issue and don't fit that page's visualization framing, so they're listed here instead — full mechanism in [agent-worker.md § Card assignment](../technical/agent-worker.md#card-assignment-851).
+
+### GET /api/agents/models
+
+Per-engine model catalog for the board's assignment pickers: `{engines: {claude: [...], codex: [...], local: [...], hermes: [...]}, refreshed_at, stale}`, each entry `{id, label, pricing}`. Cached for `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` (default 24h); `stale: true` means the last successful refresh, not this one, is being served.
+
+### POST /api/agents/board/cards/{id}/open
+
+Open an Assigned card (`status == "todo"`, a recognized assignee tag, no session already running against it) — `409` otherwise. `claude`/`codex` spawn the interactive CLI in a terminal (local, or over ssh for a registered `host` field), seeded with the card's title/notes and `LIFEOS_TASK_ID` in the environment; `hermes` returns `{open_url: "/chat?conversation=<id>"}` once the card has a Hermes conversation, else `409`.
+
+`409` also covers: a second open on the same card within a 30-second grace window after the first open claimed it but before its session has registered (`card open is already in progress` — guards a double-click racing the spawn, not a permanent lock); and a `host` field naming a value absent from `LIFEOS_AGENT_HOSTS` (`host '<name>' is not configured in LIFEOS_AGENT_HOSTS`).
+
+---
 
 ## Related Documents
 
 - [api-crm.md](api-crm.md) — `/api/crm/*` HTTP endpoints (split out from this file)
 - [mcp-tools.md](mcp-tools.md) — MCP tool catalog (the canonical home — was previously duplicated here)
 - [Agent Viz — Technical](../technical/agent-viz.md) — `/api/agents/*` endpoints in detail, including cross-machine CLI session registration
+- [Agent Worker — Technical](../technical/agent-worker.md) — Card assignment mechanism behind the Card Assignment Endpoints above
 - [Data & Sync](../technical/data-and-sync.md) — Data sources and sync pipeline
 - [Chat UI](chat-ui.md) — Chat interface product spec
 - [Client Surfaces](../technical/client-surfaces.md) — HTTP consumers and breaking-change policy

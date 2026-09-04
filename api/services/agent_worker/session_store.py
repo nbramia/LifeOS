@@ -113,6 +113,19 @@ class Session:
     # motivation as usage_store's per-row `unpriced` column from #613/#661,
     # adapted here to an accumulating total rather than one row per turn).
     unpriced: bool = False
+    # (#851) Board-assignment fields. `host` is a name from
+    # `settings.agent_hosts` ("" / None = the API host); `model` and
+    # `effort` are the board's own picker values, threaded into the
+    # executor's argv at spawn time. `conversation_id` is set only for
+    # routing="hermes" sessions (the Hermes conversation this card opened).
+    # `remote_pgid` is the process-group id a remote-spawned subprocess
+    # echoed back on its first stdout line — used by the operator kill
+    # endpoint to reach it over ssh (see `remote_spawn.py`).
+    host: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    conversation_id: str | None = None
+    remote_pgid: int | None = None
 
 
 # Engine -> storage id prefix for the `cli_sessions` table (#849). Matches
@@ -187,7 +200,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     claude_code_session_id    TEXT,  -- Claude Code (or Codex) CLI session UUID for routing="claude_code"/"codex"
     claude_code_model         TEXT,  -- Claude tier for routing="claude_code" (haiku/sonnet/opus); NULL = CLI default (opus)
     bot                       TEXT,  -- Telegram bot that owns this session's notices; NULL = primary (#348)
-    unpriced                  INTEGER NOT NULL DEFAULT 0  -- sticky: any record_spend call priced an unknown model (#669)
+    unpriced                  INTEGER NOT NULL DEFAULT 0,  -- sticky: any record_spend call priced an unknown model (#669)
+    host                      TEXT,  -- board-assigned host name (#851); NULL/"" = the API host
+    model                     TEXT,  -- board-assigned model id (#851), passed to the executor's --model flag
+    effort                    TEXT,  -- board-assigned effort level (#851): low|medium|high|max
+    conversation_id           TEXT,  -- Hermes conversation id (#851, routing='hermes' only)
+    remote_pgid               INTEGER  -- process-group id echoed by a remote-spawned subprocess (#851)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -473,6 +491,20 @@ class SessionStore:
                     "ALTER TABLE managed_cursor ADD COLUMN tool_calls_since_message "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            # Idempotent migration block for card assignment (#851): host,
+            # model, effort, conversation_id, remote_pgid. Old rows stay
+            # NULL — "no assignment recorded" for a pre-#851 session.
+            sess_cols = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+            if "host" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN host TEXT")
+            if "model" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT")
+            if "effort" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN effort TEXT")
+            if "conversation_id" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN conversation_id TEXT")
+            if "remote_pgid" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN remote_pgid INTEGER")
 
     # ------------------------------------------------------------------
     # Session CRUD
@@ -492,6 +524,9 @@ class SessionStore:
         origin: str | None = None,
         claude_code_model: str | None = None,
         bot: str | None = None,
+        host: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
     ) -> Session:
         """Insert a new session row. Raises sqlite3.IntegrityError if `task_id`
         already has a row — the caller should treat that as a lost-race signal.
@@ -502,6 +537,11 @@ class SessionStore:
 
         `origin="operator"` marks a root-spawned session (no #agent task) so
         the worker's spawned-session dispatch claims it (#235).
+
+        `host`/`model`/`effort` (#851) are the board-assignment fields
+        extracted from the task's `[key:: value]` fields — see
+        `assignment.extract_assignment()`. All three default to None
+        ("no assignment" — the routing/executor default applies).
         """
         sid = session_id or new_session_id()
         root_sid = root_session_id or sid
@@ -513,8 +553,9 @@ class SessionStore:
                     task_id, session_id, status, routing, budget_json,
                     started_at, last_activity_at,
                     expected_output, parent_session_id,
-                    root_session_id, spawn_depth, origin, claude_code_model, bot
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    root_session_id, spawn_depth, origin, claude_code_model, bot,
+                    host, model, effort
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id, sid, status, routing,
@@ -522,6 +563,7 @@ class SessionStore:
                     now, now,
                     expected_output, parent_session_id,
                     root_sid, spawn_depth, origin, claude_code_model, bot,
+                    host, model, effort,
                 ),
             )
         return Session(
@@ -539,6 +581,9 @@ class SessionStore:
             origin=origin,
             claude_code_model=claude_code_model,
             bot=bot,
+            host=host,
+            model=model,
+            effort=effort,
         )
 
     def get(self, task_id: str) -> Session | None:
@@ -687,6 +732,49 @@ class SessionStore:
                     _now(),
                     task_id,
                 ),
+            )
+
+    def set_assignment(
+        self,
+        task_id: str,
+        *,
+        host: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> None:
+        """Record the board-assignment fields (#851) onto a session row.
+        Called once at dispatch time, right after routing/budget are set,
+        so the executor reads `session.host`/`.model`/`.effort` the same
+        way it already reads `session.claude_code_model`."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET host = ?, model = ?, effort = ?, last_activity_at = ?
+                WHERE task_id = ?
+                """,
+                (host, model, effort, _now(), task_id),
+            )
+
+    def set_conversation_id(self, task_id: str, conversation_id: str) -> None:
+        """Attach a Hermes conversation id (#851, routing='hermes') to a
+        session — mirrors `set_managed_session_id`."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET conversation_id = ?, last_activity_at = ? "
+                "WHERE task_id = ?",
+                (conversation_id, _now(), task_id),
+            )
+
+    def set_remote_pgid(self, task_id: str, pgid: int) -> None:
+        """Record the process-group id a remote-spawned subprocess echoed
+        back on its first stdout line (#851) — read by the operator kill
+        endpoint to reach it over ssh (see `remote_spawn.py`)."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET remote_pgid = ?, last_activity_at = ? "
+                "WHERE task_id = ?",
+                (pgid, _now(), task_id),
             )
 
     def set_managed_session_id(self, task_id: str, managed_id: str) -> None:
@@ -1645,4 +1733,9 @@ class SessionStore:
             ),
             bot=(row["bot"] if "bot" in row.keys() else None),
             unpriced=(bool(row["unpriced"]) if "unpriced" in row.keys() else False),
+            host=(row["host"] if "host" in row.keys() else None),
+            model=(row["model"] if "model" in row.keys() else None),
+            effort=(row["effort"] if "effort" in row.keys() else None),
+            conversation_id=(row["conversation_id"] if "conversation_id" in row.keys() else None),
+            remote_pgid=(row["remote_pgid"] if "remote_pgid" in row.keys() else None),
         )

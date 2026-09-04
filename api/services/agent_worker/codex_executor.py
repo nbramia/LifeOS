@@ -31,12 +31,23 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from api.services.agent_worker.assignment import ENGINE_CODEX, map_effort_for_engine
 from api.services.agent_worker.capabilities_preamble import CAPABILITIES_PREAMBLE
 from api.services.agent_worker.claude_code_executor import (
     _ALTERNATE_AUTH_ENV_PREFIXES,
 )
 from api.services.agent_worker.delegation import delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
+from api.services.agent_worker.remote_spawn import (
+    HostResolutionError,
+    build_remote_argv,
+    env_names_matching_prefixes,
+    last_nonempty_line,
+    read_line_with_deadline,
+    read_remote_pgid_line,
+    resolve_host_target,
+)
+from api.services.agent_worker.remote_spawn import api_host_name as _api_host_name
 from api.services.agent_worker.session_store import (
     STATUS_COMPLETED,
     STATUS_FAILED,
@@ -111,6 +122,10 @@ REASON_BINARY_NOT_FOUND = "binary_not_found"
 # FAILED and signals this subprocess; we exit silently under this reason so the
 # worker skips the spurious "session failed" notice.
 REASON_KILLED = "killed"
+
+# CODEX_* env vars kept when stripping the subprocess env (see `_clean_env`
+# and `_remote_unset_env_names`) — CODEX_HOME carries `~/.codex/auth.json`.
+_CODEX_ENV_KEEP = {"CODEX_HOME"}
 
 
 @dataclass
@@ -231,6 +246,8 @@ class CodexExecutor:
         working_dir: str,
         resume_session_id: Optional[str],
         last_message_file: str,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
     ) -> list[str]:
         binary = self._binary_resolver()
         # `workspace-write` lets codex edit files inside the working dir
@@ -245,6 +262,16 @@ class CodexExecutor:
             "-C", working_dir,
             "-o", last_message_file,
         ]
+        # (#851) Board-assigned model/effort. Neither flag was previously
+        # passed at all — codex took whatever `~/.codex/config.toml` said.
+        # `--model` only when set (an unset board model keeps that
+        # behavior); effort is mapped to Codex's own
+        # minimal|low|medium|high|xhigh vocabulary via the config override.
+        if model:
+            common = ["--model", model, *common]
+        codex_effort = map_effort_for_engine(ENGINE_CODEX, effort)
+        if codex_effort:
+            common = ["-c", f"model_reasoning_effort={codex_effort}", *common]
         if resume_session_id:
             return [binary, "exec", "resume", resume_session_id, *common, prompt]
         return [binary, "exec", *common, prompt]
@@ -291,12 +318,22 @@ class CodexExecutor:
         Code session, which — like codex itself — is exempt from the per-task
         dollar cap for being subscription-billed.
         """
-        keep = {"CODEX_HOME"}
+        keep = _CODEX_ENV_KEEP
         return {
             k: v for k, v in os.environ.items()
             if (not k.startswith("CODEX_") or k in keep)
             and not k.startswith(_ALTERNATE_AUTH_ENV_PREFIXES)
         }
+
+    @staticmethod
+    def _remote_unset_env_names() -> list[str]:
+        """(#851) Env var names to `env -u` on a remote-spawned subprocess —
+        mirrors `_clean_env`'s own strip (CODEX_* except CODEX_HOME, plus
+        the alternate-auth prefixes), applied to the remote command instead
+        of the local one."""
+        names = env_names_matching_prefixes(("CODEX_",), keep=_CODEX_ENV_KEEP)
+        names += env_names_matching_prefixes(_ALTERNATE_AUTH_ENV_PREFIXES)
+        return sorted(set(names))
 
     def _run(
         self,
@@ -312,11 +349,40 @@ class CodexExecutor:
         last_msg_fd, last_msg_path = tempfile.mkstemp(prefix="codex_last_", suffix=".txt")
         os.close(last_msg_fd)
 
-        cmd = self._build_command(prompt, working_dir, resume_session_id, last_msg_path)
+        cmd = self._build_command(
+            prompt, working_dir, resume_session_id, last_msg_path,
+            model=getattr(session, "model", None),
+            effort=getattr(session, "effort", None),
+        )
+
+        # (#851) Board-assigned host: resolve BEFORE any spawn call. An
+        # unknown host name fails the task closed with no ssh invocation.
+        # NOTE: the `-o last_msg_path` fallback (below) reads a LOCAL temp
+        # file, which a remote CLI never writes to — remote sessions rely
+        # entirely on the `--json` stream's `agent_message` events for
+        # final_text (the normal, primary path); see
+        # docs/specs/technical/agent-worker.md's host registry section.
+        host = getattr(session, "host", None)
+        is_remote = False
+        try:
+            target = resolve_host_target(host, _api_host_name())
+        except HostResolutionError as exc:
+            self.transcript_store.append(sid, "codex_unknown_host", {"host": host})
+            self._cleanup_tempfile(last_msg_path)
+            return ExecutorOutcome(status=STATUS_FAILED, reason=str(exc))
+        if target is not None:
+            is_remote = True
+            cmd = build_remote_argv(
+                cmd,
+                target=target,
+                unset_env_names=self._remote_unset_env_names(),
+            )
 
         self.transcript_store.append(sid, "codex_spawn", {
             "resume": bool(resume_session_id),
             "working_dir": working_dir,
+            "host": host,
+            "remote": is_remote,
         })
 
         try:
@@ -329,7 +395,9 @@ class CodexExecutor:
                 env=self._clean_env(),
                 # #379: own process-group leader so the operator kill can
                 # `os.killpg(pgid, ...)` codex + its children without touching
-                # the worker process. Mirrors ClaudeCodeExecutor.
+                # the worker process. Mirrors ClaudeCodeExecutor. For a remote
+                # spawn this is the local `ssh` client's own group — the
+                # remote kill path (#851) reaches the real CLI over ssh.
                 start_new_session=True,
             )
         except FileNotFoundError as exc:
@@ -339,14 +407,52 @@ class CodexExecutor:
 
         self.session_store.update_status(session.task_id, STATUS_RUNNING)
 
-        # #379: record the subprocess pid + pgid so the operator kill endpoint
-        # (a separate process) can signal it via the transcript. Mirrors the
-        # claude_code path; teardown scans for `codex_pid` too.
-        try:
-            pgid = os.getpgid(proc.pid)
-        except Exception:  # pragma: no cover — defensive; fall back to the pid
-            pgid = proc.pid
-        self.transcript_store.append(sid, "codex_pid", {"pid": proc.pid, "pgid": pgid})
+        if is_remote:
+            # (#851) Strip the remote wrapper's `PGID:<n>` first stdout line
+            # — see ClaudeCodeExecutor._run for the identical mechanism.
+            #
+            # (round 1, finding #3) Bounded wait: see ClaudeCodeExecutor._run
+            # for why this read needs a deadline of its own, ahead of the
+            # wall-clock watchdog below.
+            #
+            # (round 2, finding #2) Record the pid event immediately after
+            # Popen — BEFORE this deadline-bounded read — see
+            # ClaudeCodeExecutor._run for why: it's what lets the operator-
+            # kill fallback reach a stalled local ssh client during the
+            # read's own deadline window rather than finding no pid event.
+            self.transcript_store.append(sid, "codex_pid", {
+                "pid": proc.pid, "pgid": None, "remote": True, "host": host,
+            })
+            pgid = None
+            if proc.stdout is not None:
+                deadline = settings.agent_ssh_connect_timeout + 5
+                first_line, timed_out_reading_pgid = read_line_with_deadline(proc.stdout, deadline)
+                if timed_out_reading_pgid:
+                    self._terminate_unresponsive(proc)
+                    self.transcript_store.append(sid, "codex_remote_unresponsive", {
+                        "host": host, "deadline_seconds": deadline,
+                    })
+                    self.session_store.update_status(session.task_id, STATUS_FAILED)
+                    self._cleanup_tempfile(last_msg_path)
+                    return ExecutorOutcome(
+                        status=STATUS_FAILED,
+                        reason=f"host {host} did not answer within {deadline}s",
+                    )
+                pgid = read_remote_pgid_line(first_line)
+            if pgid is not None:
+                self.session_store.set_remote_pgid(session.task_id, pgid)
+                self.transcript_store.append(sid, "codex_pid", {
+                    "pid": proc.pid, "pgid": pgid, "remote": True, "host": host,
+                })
+        else:
+            # #379: record the subprocess pid + pgid so the operator kill endpoint
+            # (a separate process) can signal it via the transcript. Mirrors the
+            # claude_code path; teardown scans for `codex_pid` too.
+            try:
+                pgid = os.getpgid(proc.pid)
+            except Exception:  # pragma: no cover — defensive; fall back to the pid
+                pgid = proc.pid
+            self.transcript_store.append(sid, "codex_pid", {"pid": proc.pid, "pgid": pgid})
 
         state = _RunState()
         timed_out = threading.Event()
@@ -449,9 +555,16 @@ class CodexExecutor:
             "returncode": proc.returncode,
             "stderr_tail": stderr_tail[-500:],
         })
+        # (round 1, finding #4) Fold the ssh failure's stderr into the
+        # reason on the remote path — see ClaudeCodeExecutor._run for why.
+        reason = f"codex exited with code {proc.returncode}"
+        if is_remote:
+            last_line = last_nonempty_line(stderr_tail)
+            if last_line:
+                reason = f"ssh to {host} failed (exit {proc.returncode}): {last_line}"
         return ExecutorOutcome(
             status=STATUS_FAILED,
-            reason=f"codex exited with code {proc.returncode}",
+            reason=reason,
         )
 
     @staticmethod
@@ -571,6 +684,24 @@ class CodexExecutor:
     # ------------------------------------------------------------------
     # Watchdog + heartbeat
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _terminate_unresponsive(proc) -> None:
+        """Best-effort terminate an ssh client that never answered the
+        `PGID:` read within its deadline (round 1, finding #3). Mirrors
+        `_on_timeout`'s terminate/wait/kill sequence minus the timed_out
+        flag (there is no watchdog running yet at this point — this read
+        happens BEFORE it starts). Mirrors ClaudeCodeExecutor's identical
+        helper."""
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning("remote pgid-wait terminate failed: %s", exc)
 
     @staticmethod
     def _on_timeout(proc, timed_out: threading.Event) -> None:
