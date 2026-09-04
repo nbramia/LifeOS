@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-08-21
+> **Last Updated:** 2026-09-04
 
 Codebase organization and module structure for efficient navigation.
 
@@ -274,6 +274,24 @@ async def endpoint_handler(
 
     return ResponseModel(...)
 ```
+
+**`def` vs. `async def` (#868).** LifeOS runs one uvicorn process with a
+single event loop; every client surface (chat, Telegram, voice, MCP, the
+agent worker, and the CRM/people UI) shares it. A handler declared `async
+def` with nothing to `await` still runs inline on that loop, so its
+synchronous DB/CPU work blocks every other in-flight request until it
+returns. A handler declared plain `def` is dispatched by FastAPI to the
+worker threadpool (via Starlette's `run_in_threadpool`, anyio's default
+capacity of 40) automatically, which restores fairness between requests.
+The CRM, people, and photos routers (`api/routes/crm.py`, `api/routes/people.py`,
+`api/routes/photos.py`) follow this rule: a handler is `async def` only if
+its own body actually awaits something (an LLM call, `await file.read()`);
+otherwise it is `def`. A handler that keeps `async def` pushes its blocking
+store or LLM calls onto a thread explicitly with `await asyncio.to_thread(...)`
+(e.g. `api/routes/investments.py`, `api/routes/crm.py`'s fact-extraction and
+source-import endpoints) rather than doing them inline. This is a fairness
+fix, not a throughput one — CPU-bound work still holds the GIL while it
+runs; per-endpoint throughput is tracked separately (issues #869-#874).
 
 ### Service Store Pattern
 

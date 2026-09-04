@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+import asyncio
 import json
 import logging
 import sqlite3
@@ -532,7 +533,7 @@ def _get_partner_name() -> str:
 
 
 @router.get("/config", response_model=CRMConfigResponse)
-async def get_crm_config():
+def get_crm_config():
     """
     Get CRM configuration values for frontend.
 
@@ -549,7 +550,7 @@ async def get_crm_config():
 
 
 @router.get("/birthdays/today")
-async def get_todays_birthdays():
+def get_todays_birthdays():
     """Get all people with birthdays today."""
     person_store = get_person_entity_store()
     people = person_store.get_all()
@@ -565,7 +566,7 @@ async def get_todays_birthdays():
 
 
 @router.get("/birthdays/all")
-async def get_all_birthdays():
+def get_all_birthdays():
     """Get all people with birthdays, grouped by date."""
     person_store = get_person_entity_store()
     people = person_store.get_all()
@@ -593,7 +594,7 @@ async def get_all_birthdays():
 
 
 @router.get("/people", response_model=PersonListResponse)
-async def list_people(
+def list_people(
     q: Optional[str] = Query(default=None, description="Search query"),
     category: Optional[str] = Query(default=None, description="Filter by category"),
     source: Optional[str] = Query(default=None, description="Filter by source"),
@@ -707,7 +708,7 @@ async def list_people(
 
 
 @router.get("/people/{person_id}", response_model=PersonDetailResponse)
-async def get_person(
+def get_person(
     person_id: str,
     include_related: bool = Query(default=False, description="Include source entities and relationships"),
     refresh_strength: bool = Query(default=False, description="Recompute relationship strength (slower)"),
@@ -746,7 +747,7 @@ async def get_person(
 
 
 @router.patch("/people/{person_id}", response_model=PersonDetailResponse)
-async def update_person(person_id: str, request: PersonUpdateRequest):
+def update_person(person_id: str, request: PersonUpdateRequest):
     """
     Update a person's notes, tags, or category.
     """
@@ -807,7 +808,7 @@ class PersonMergeResponse(BaseModel):
 
 
 @router.post("/people/merge", response_model=PersonMergeResponse)
-async def merge_people(request: PersonMergeRequest):
+def merge_people(request: PersonMergeRequest):
     """
     Merge multiple people into a single record.
 
@@ -1064,7 +1065,7 @@ class ContactSource(BaseModel):
 
 
 @router.get("/people/{person_id}/contact-sources")
-async def get_person_contact_sources(person_id: str):
+def get_person_contact_sources(person_id: str):
     """
     Get aggregated contact sources linked to a person.
 
@@ -1190,7 +1191,7 @@ async def get_person_contact_sources(person_id: str):
 
 
 @router.get("/people/{person_id}/source-entities")
-async def get_person_source_entities(
+def get_person_source_entities(
     person_id: str,
     limit: int = Query(default=500, ge=1, le=5000, description="Max source entities to return"),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
@@ -1277,7 +1278,7 @@ async def get_person_source_entities(
 
 
 @router.post("/people/split", response_model=PersonSplitResponse)
-async def split_person(request: PersonSplitRequest):
+def split_person(request: PersonSplitRequest):
     """
     Split source entities from one person to another.
 
@@ -1552,7 +1553,7 @@ async def split_person(request: PersonSplitRequest):
 
 
 @router.get("/people/{person_id}/timeline", response_model=TimelineResponse)
-async def get_person_timeline(
+def get_person_timeline(
     person_id: str,
     source_type: Optional[str] = Query(
         default=None,
@@ -1634,7 +1635,7 @@ SOURCE_BADGES = {
 
 
 @router.get("/people/{person_id}/timeline/aggregated", response_model=AggregatedTimelineResponse)
-async def get_person_timeline_aggregated(
+def get_person_timeline_aggregated(
     person_id: str,
     source_type: Optional[str] = Query(
         default=None,
@@ -1798,7 +1799,7 @@ async def get_person_timeline_aggregated(
 
 
 @router.get("/people/{person_id}/connections", response_model=ConnectionsResponse)
-async def get_person_connections(
+def get_person_connections(
     person_id: str,
     relationship_type: Optional[str] = Query(default=None, description="Filter by type"),
     limit: int = Query(default=50, ge=1, le=200, description="Max results"),
@@ -1866,7 +1867,7 @@ async def get_person_connections(
 
 
 @router.get("/people/{person_id}/strength", response_model=dict)
-async def get_person_strength_breakdown(person_id: str):
+def get_person_strength_breakdown(person_id: str):
     """
     Get detailed breakdown of relationship strength components.
 
@@ -1905,7 +1906,7 @@ def _fact_to_response(fact: PersonFact) -> PersonFactResponse:
 
 
 @router.get("/people/{person_id}/facts", response_model=PersonFactsResponse)
-async def get_person_facts(person_id: str):
+def get_person_facts(person_id: str):
     """
     Get all facts about a person.
 
@@ -1966,14 +1967,15 @@ async def extract_person_facts(person_id: str, model: Optional[str] = None):
     elif model == "haiku":
         model = PersonFactExtractor.MODEL_HAIKU
     person_store = get_person_entity_store()
-    person = person_store.get_by_id(person_id)
+    person = await asyncio.to_thread(person_store.get_by_id, person_id)
 
     if not person:
         raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found")
 
     # Get ALL interactions for the person (extractor will sample strategically)
     interaction_store = get_interaction_store()
-    interactions = interaction_store.get_for_person(
+    interactions = await asyncio.to_thread(
+        interaction_store.get_for_person,
         person_id,
         days_back=3650,  # Look back 10 years for full history
         limit=100000,  # No practical limit - let extractor sample
@@ -2020,7 +2022,7 @@ async def extract_person_facts(person_id: str, model: Optional[str] = None):
 
 
 @router.put("/people/{person_id}/facts/{fact_id}", response_model=PersonFactResponse)
-async def update_person_fact(person_id: str, fact_id: str, request: FactUpdateRequest):
+def update_person_fact(person_id: str, fact_id: str, request: FactUpdateRequest):
     """
     Update a fact's value or metadata.
     """
@@ -2051,7 +2053,7 @@ async def update_person_fact(person_id: str, fact_id: str, request: FactUpdateRe
 
 
 @router.delete("/people/{person_id}/facts/{fact_id}")
-async def delete_person_fact(person_id: str, fact_id: str):
+def delete_person_fact(person_id: str, fact_id: str):
     """
     Delete a fact.
     """
@@ -2070,7 +2072,7 @@ async def delete_person_fact(person_id: str, fact_id: str):
 
 
 @router.post("/people/{person_id}/facts/{fact_id}/confirm")
-async def confirm_person_fact(person_id: str, fact_id: str):
+def confirm_person_fact(person_id: str, fact_id: str):
     """
     Mark a fact as confirmed by user.
 
@@ -2091,7 +2093,7 @@ async def confirm_person_fact(person_id: str, fact_id: str):
 
 
 @router.post("/people/{person_id}/hide")
-async def hide_person(person_id: str, request: HidePersonRequest):
+def hide_person(person_id: str, request: HidePersonRequest):
     """
     Hide a person (soft delete) and blocklist their identifiers.
 
@@ -2132,7 +2134,7 @@ async def hide_person(person_id: str, request: HidePersonRequest):
 
 
 @router.get("/discover", response_model=DiscoverResponse)
-async def discover_connections(
+def discover_connections(
     person_id: Optional[str] = Query(default=None, description="Person to find suggestions for"),
     limit: int = Query(default=10, ge=1, le=50, description="Max suggestions"),
 ):
@@ -2234,14 +2236,15 @@ async def import_source_data(
 
     if source_type == "whatsapp":
         from api.services.whatsapp_import import import_whatsapp_export
-        stats = import_whatsapp_export(
+        stats = await asyncio.to_thread(
+            import_whatsapp_export,
             content_str,
             file.filename or "chat.txt",
             source_store,
         )
     else:  # signal
         from api.services.signal_import import import_signal_export
-        stats = import_signal_export(content_str, source_store)
+        stats = await asyncio.to_thread(import_signal_export, content_str, source_store)
 
     return {
         "status": "completed",
@@ -2252,7 +2255,7 @@ async def import_source_data(
 
 
 @router.post("/sources/{source_type}/sync")
-async def sync_source(source_type: str):
+def sync_source(source_type: str):
     """
     Trigger a sync for a specific data source.
     """
@@ -2273,7 +2276,7 @@ async def sync_source(source_type: str):
 
 
 @router.post("/relationships/discover")
-async def trigger_relationship_discovery():
+def trigger_relationship_discovery():
     """
     Trigger relationship discovery across all sources.
 
@@ -2294,7 +2297,7 @@ async def trigger_relationship_discovery():
 
 
 @router.post("/strengths/update")
-async def update_relationship_strengths():
+def update_relationship_strengths():
     """
     Update relationship strength scores for all people.
     """
@@ -2306,7 +2309,7 @@ async def update_relationship_strengths():
 
 
 @router.get("/statistics", response_model=StatisticsResponse)
-async def get_crm_statistics():
+def get_crm_statistics():
     """
     Get comprehensive CRM statistics.
     """
@@ -2335,7 +2338,7 @@ async def get_crm_statistics():
 
 
 @router.get("/network", response_model=NetworkGraphResponse)
-async def get_network_graph(
+def get_network_graph(
     center_on: Optional[str] = Query(default=None, description="Person ID to center the graph on"),
     depth: int = Query(default=2, ge=1, le=4, description="Hops from center person"),
     min_strength: float = Query(default=0.0, ge=0.0, le=1.0, description="Minimum relationship strength"),
@@ -2521,7 +2524,7 @@ class RelationshipDetailResponse(BaseModel):
 
 
 @router.get("/relationship/{person_a_id}/{person_b_id}", response_model=RelationshipDetailResponse)
-async def get_relationship_details(person_a_id: str, person_b_id: str):
+def get_relationship_details(person_a_id: str, person_b_id: str):
     """
     Get detailed information about the relationship between two people.
 
@@ -2608,7 +2611,7 @@ async def get_relationship_details(person_a_id: str, person_b_id: str):
 # =======================
 
 @router.get("/slack/status")
-async def get_slack_status():
+def get_slack_status():
     """
     Get Slack integration status.
 
@@ -2627,7 +2630,7 @@ async def get_slack_status():
 
 
 @router.get("/slack/oauth/start")
-async def start_slack_oauth(state: Optional[str] = None):
+def start_slack_oauth(state: Optional[str] = None):
     """
     Start Slack OAuth flow.
 
@@ -2646,7 +2649,7 @@ async def start_slack_oauth(state: Optional[str] = None):
 
 
 @router.get("/slack/callback")
-async def slack_oauth_callback(code: str, state: Optional[str] = None):
+def slack_oauth_callback(code: str, state: Optional[str] = None):
     """
     Handle Slack OAuth callback.
 
@@ -2670,7 +2673,7 @@ async def slack_oauth_callback(code: str, state: Optional[str] = None):
 
 
 @router.post("/slack/sync")
-async def sync_slack_users_endpoint(workspace_id: str = "default"):
+def sync_slack_users_endpoint(workspace_id: str = "default"):
     """
     Sync Slack users to the CRM.
 
@@ -2703,7 +2706,7 @@ async def sync_slack_users_endpoint(workspace_id: str = "default"):
 
 
 @router.delete("/slack/disconnect")
-async def disconnect_slack(workspace_id: str = "default"):
+def disconnect_slack(workspace_id: str = "default"):
     """
     Disconnect a Slack workspace.
 
@@ -2724,7 +2727,7 @@ async def disconnect_slack(workspace_id: str = "default"):
 # ==================================
 
 @router.get("/contacts/status")
-async def get_contacts_status():
+def get_contacts_status():
     """
     Get Apple Contacts integration status.
 
@@ -2741,7 +2744,7 @@ async def get_contacts_status():
 
 
 @router.post("/contacts/sync")
-async def sync_contacts_endpoint():
+def sync_contacts_endpoint():
     """
     Sync Apple Contacts to the CRM.
 
@@ -2936,7 +2939,7 @@ class FamilyInteractionsResponse(BaseModel):
 
 
 @router.get("/me/stats", response_model=MeStatsResponse)
-async def get_me_stats():
+def get_me_stats():
     """
     Get aggregate statistics for the owner's personal dashboard.
 
@@ -2963,7 +2966,7 @@ async def get_me_stats():
 
 
 @router.get("/me/timeline", response_model=TimelineResponse)
-async def get_me_timeline(
+def get_me_timeline(
     source_type: Optional[str] = Query(
         default=None,
         description="Filter by source type. Supports comma-separated values for compound "
@@ -3046,7 +3049,7 @@ async def get_me_timeline(
 
 
 @router.get("/me/interactions", response_model=MeInteractionsResponse)
-async def get_me_interactions(
+def get_me_interactions(
     days_back: int = Query(default=365, ge=1, le=3660, description="Days of history (up to 10 years)"),
     trend_period: str = Query(default="quarter", description="Trend comparison period: week, month, quarter, year"),
     health_period: str = Query(default="quarter", description="Health score history period: month, quarter, year"),
@@ -3605,7 +3608,7 @@ async def get_me_interactions(
 
 
 @router.get("/family/members", response_model=FamilyMembersResponse)
-async def get_family_members():
+def get_family_members():
     """
     Get all family members for the multi-select dropdown and visualizations.
 
@@ -3701,7 +3704,7 @@ async def get_family_members():
 
 
 @router.get("/family/stats", response_model=FamilyStatsResponse)
-async def get_family_stats(
+def get_family_stats(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs to get lifetime stats for"
@@ -3740,7 +3743,7 @@ async def get_family_stats(
 
 
 @router.get("/family/timeline", response_model=TimelineResponse)
-async def get_family_timeline(
+def get_family_timeline(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs to include in timeline"
@@ -3822,7 +3825,7 @@ async def get_family_timeline(
 
 
 @router.get("/family/interactions", response_model=FamilyInteractionsResponse)
-async def get_family_interactions(
+def get_family_interactions(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs to aggregate"
@@ -4067,7 +4070,7 @@ class CommunicationGapsResponse(BaseModel):
 
 
 @router.get("/family/communication-gaps", response_model=CommunicationGapsResponse)
-async def get_family_communication_gaps(
+def get_family_communication_gaps(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs"
@@ -4188,7 +4191,7 @@ class ChannelMixResponse(BaseModel):
 
 
 @router.get("/family/channel-mix", response_model=ChannelMixResponse)
-async def get_family_channel_mix(
+def get_family_channel_mix(
     person_ids: str = Query(
         ...,
         description="Comma-separated list of person IDs"
@@ -4276,7 +4279,7 @@ class SyncErrorResponse(BaseModel):
 
 
 @router.get("/sync/health", response_model=list[SyncHealthResponse])
-async def get_all_sync_health():
+def get_all_sync_health():
     """
     Get health status for all sync sources.
 
@@ -4303,7 +4306,7 @@ async def get_all_sync_health():
 
 
 @router.get("/sync/health/summary", response_model=SyncHealthSummaryResponse)
-async def get_sync_health_summary():
+def get_sync_health_summary():
     """
     Get summary of sync health across all sources.
 
@@ -4318,7 +4321,7 @@ async def get_sync_health_summary():
 
 
 @router.get("/sync/health/{source}", response_model=SyncHealthResponse)
-async def get_source_sync_health(source: str):
+def get_source_sync_health(source: str):
     """
     Get health status for a specific sync source.
     """
@@ -4345,7 +4348,7 @@ async def get_source_sync_health(source: str):
 
 
 @router.get("/sync/errors", response_model=list[SyncErrorResponse])
-async def get_sync_errors(
+def get_sync_errors(
     source: Optional[str] = Query(default=None, description="Filter by source"),
     limit: int = Query(default=50, ge=1, le=200, description="Max results"),
 ):
@@ -4372,7 +4375,7 @@ async def get_sync_errors(
 
 
 @router.get("/sync/stale", response_model=list[SyncHealthResponse])
-async def get_stale_syncs():
+def get_stale_syncs():
     """
     Get list of syncs that are stale (>24 hours old).
 
@@ -4425,7 +4428,7 @@ class ReviewQueueResponse(BaseModel):
 
 
 @router.get("/review-queue", response_model=ReviewQueueResponse)
-async def get_review_queue(
+def get_review_queue(
     min_confidence: float = Query(default=0.0, ge=0.0, le=1.0, description="Minimum confidence"),
     max_confidence: float = Query(default=0.85, ge=0.0, le=1.0, description="Maximum confidence"),
     link_method: Optional[str] = Query(default=None, description="Filter by resolution method (e.g. email_exact, name_fuzzy)"),
@@ -4490,7 +4493,7 @@ async def get_review_queue(
 
 
 @router.post("/review-queue/{entity_id}/confirm")
-async def confirm_review_item(entity_id: str):
+def confirm_review_item(entity_id: str):
     """
     Confirm a low-confidence match as correct.
 
@@ -4517,7 +4520,7 @@ async def confirm_review_item(entity_id: str):
 
 
 @router.post("/review-queue/{entity_id}/reject")
-async def reject_review_item(entity_id: str, request: LinkConfirmRequest):
+def reject_review_item(entity_id: str, request: LinkConfirmRequest):
     """
     Reject a low-confidence match.
 
@@ -4585,7 +4588,7 @@ async def reject_review_item(entity_id: str, request: LinkConfirmRequest):
 
 
 @router.get("/data-health")
-async def get_data_health():
+def get_data_health():
     """
     Get comprehensive data health statistics.
 
@@ -4724,9 +4727,9 @@ async def get_data_health():
 
 
 @router.get("/data-health/summary")
-async def get_data_health_summary():
+def get_data_health_summary():
     """Get a brief summary of data health for the UI header."""
-    health = await get_data_health()
+    health = get_data_health()
 
     return {
         "total_interactions": sum(
@@ -4758,7 +4761,7 @@ class LinkOverrideResponse(BaseModel):
 
 
 @router.get("/link-overrides")
-async def get_link_overrides(person_id: Optional[str] = Query(default=None)):
+def get_link_overrides(person_id: Optional[str] = Query(default=None)):
     """
     Get all link override rules.
 
@@ -4805,7 +4808,7 @@ async def get_link_overrides(person_id: Optional[str] = Query(default=None)):
 
 
 @router.delete("/link-overrides/{override_id}")
-async def delete_link_override(override_id: str):
+def delete_link_override(override_id: str):
     """Delete a link override rule."""
     from api.services.link_override import get_link_override_store
 
@@ -4898,7 +4901,7 @@ class ToneAnalysisDetailedResponse(BaseModel):
 
 
 @router.get("/relationship/insights", response_model=RelationshipInsightsResponse)
-async def get_relationship_insights(person_id: Optional[str] = None):
+def get_relationship_insights(person_id: Optional[str] = None):
     """
     Get all relationship insights for the configured partner.
 
@@ -4939,7 +4942,7 @@ async def get_relationship_insights(person_id: Optional[str] = None):
 
 
 @router.post("/relationship/insights/generate", response_model=RelationshipInsightsResponse)
-async def generate_relationship_insights(
+def generate_relationship_insights(
     person_id: Optional[str] = None,
     category: Optional[str] = None
 ):
@@ -4995,7 +4998,7 @@ async def generate_relationship_insights(
 
 
 @router.post("/relationship/insights/{insight_id}/confirm")
-async def confirm_relationship_insight(insight_id: str):
+def confirm_relationship_insight(insight_id: str):
     """
     Mark an insight as confirmed.
 
@@ -5013,7 +5016,7 @@ async def confirm_relationship_insight(insight_id: str):
 
 
 @router.delete("/relationship/insights/{insight_id}")
-async def delete_relationship_insight(insight_id: str):
+def delete_relationship_insight(insight_id: str):
     """
     Delete/dismiss an insight.
     """
@@ -5029,7 +5032,7 @@ async def delete_relationship_insight(insight_id: str):
 
 
 @router.post("/relationship/tone-analysis", response_model=ToneAnalysisResponse)
-async def analyze_relationship_tone(person_id: Optional[str] = None, months: int = 12):
+def analyze_relationship_tone(person_id: Optional[str] = None, months: int = 12):
     """
     Analyze tone/sentiment in iMessage conversations over time.
 
@@ -5174,7 +5177,7 @@ MESSAGES:
 
 
 @router.post("/relationship/tone-analysis-detailed", response_model=ToneAnalysisDetailedResponse)
-async def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: int = 12):
+def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: int = 12):
     """
     Analyze tone/sentiment separately for the user and their partner in iMessage conversations.
 

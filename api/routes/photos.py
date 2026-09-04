@@ -76,7 +76,7 @@ def _check_photos_enabled():
 
 
 @router.get("/stats", response_model=PhotosStatsResponse)
-async def get_photos_stats():
+def get_photos_stats():
     """
     Get statistics about the Photos library.
 
@@ -115,7 +115,7 @@ async def get_photos_stats():
 
 
 @router.get("/people", response_model=list[PhotosPersonResponse])
-async def list_photos_people(
+def list_photos_people(
     linked_only: bool = Query(
         default=True,
         description="Only return people linked to Apple Contacts"
@@ -162,7 +162,7 @@ async def list_photos_people(
 
 
 @router.get("/person/{person_id}", response_model=PhotosForPersonResponse)
-async def get_photos_for_person(
+def get_photos_for_person(
     person_id: str,
     date: Optional[str] = Query(None, description="Filter by date (YYYY-MM-DD)"),
     limit: int = Query(default=50, ge=1, le=200),
@@ -214,7 +214,7 @@ async def get_photos_for_person(
 
 
 @router.get("/shared/{person_a_id}/{person_b_id}", response_model=CoAppearanceResponse)
-async def get_shared_photos(
+def get_shared_photos(
     person_a_id: str,
     person_b_id: str,
     limit: int = Query(default=20, ge=1, le=100),
@@ -259,7 +259,7 @@ async def get_shared_photos(
 
 
 @router.post("/sync", response_model=SyncResponse)
-async def trigger_photo_sync(
+def trigger_photo_sync(
     incremental: bool = Query(
         default=True,
         description="If true, only sync new photos since last sync"
@@ -355,7 +355,7 @@ def _get_thumbnail_path(uuid: str) -> Path | None:
 
 
 @router.get("/thumbnail/{uuid}")
-async def get_photo_thumbnail(uuid: str):
+def get_photo_thumbnail(uuid: str):
     """
     Get a thumbnail for a photo by UUID.
 
@@ -407,7 +407,7 @@ async def get_photo_thumbnail(uuid: str):
 
 
 @router.get("/profile/{person_id}")
-async def get_profile_photo(person_id: str):
+def get_profile_photo(person_id: str):
     """
     Get a profile photo thumbnail for a person.
 
@@ -481,7 +481,7 @@ def _get_photo_file_path(uuid: str) -> Path | None:
 
 
 @router.get("/open/{uuid}")
-async def open_photo_in_app(uuid: str):
+def open_photo_in_app(uuid: str):
     """
     Open a specific photo in the Photos app or Preview.
 

@@ -53,7 +53,7 @@ class TestMeStatsEndpoint:
 
         with patch('api.routes.crm.get_person_entity_store', return_value=mock_person_store):
             with patch('api.routes.crm.get_interaction_store'):
-                result = await get_me_stats()
+                result = get_me_stats()
 
         assert result.total_people == 3
         assert result.total_emails == 175  # 100 + 50 + 25
@@ -70,7 +70,7 @@ class TestMeStatsEndpoint:
 
         with patch('api.routes.crm.get_person_entity_store', return_value=mock_store):
             with patch('api.routes.crm.get_interaction_store'):
-                result = await get_me_stats()
+                result = get_me_stats()
 
         assert result.total_people == 0
         assert result.total_emails == 0
@@ -150,7 +150,7 @@ class TestMeInteractionsEndpoint:
 
         with patch('api.routes.crm.get_person_entity_store', return_value=person_store):
             with patch('api.routes.crm.get_interaction_store', return_value=interaction_store):
-                result = await get_me_interactions(days_back=30)
+                result = get_me_interactions(days_back=30)
 
         # Should have total count
         assert result.total_count == 2
@@ -176,7 +176,7 @@ class TestMeInteractionsEndpoint:
 
         with patch('api.routes.crm.get_person_entity_store', return_value=person_store):
             with patch('api.routes.crm.get_interaction_store', return_value=interaction_store):
-                await get_me_interactions(days_back=365)
+                get_me_interactions(days_back=365)
 
         # Verify get_all_in_range was called with exclude_person_ids
         interaction_store.get_all_in_range.assert_called_once()
@@ -217,7 +217,7 @@ class TestMeInteractionsEndpoint:
 
         with patch('api.routes.crm.get_person_entity_store', return_value=person_store):
             with patch('api.routes.crm.get_interaction_store', return_value=interaction_store):
-                result = await get_me_interactions(days_back=30)
+                result = get_me_interactions(days_back=30)
 
         assert result.total_count == 1
         assert len(result.daily) == 1  # Should have one day with data
