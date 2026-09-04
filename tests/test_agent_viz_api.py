@@ -1260,3 +1260,65 @@ def test_put_label_sets_and_clears(client, stores, label_override_db):
     snap2 = client.get("/api/agents/snapshot").json()
     sess2 = next(x for x in snap2["sessions"] if x["session_id"] == s.session_id)
     assert sess2["custom_label"] is None
+
+
+# ---------------------------------------------------------------------------
+# _cache_put _CACHE_MAX enforcement (DS-902). Every in-process cache write
+# must funnel through _cache_put so the cap is enforced uniformly — a stray
+# direct assignment (disk-hit promotions, terminal/ttl caching) must not
+# grow the cache unbounded. When at capacity, the oldest-inserted entry
+# (dict insertion order) is evicted and the new one stored.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_cache_put_enforces_cache_max(summary_db):
+    from api.services import agent_viz_summary as avs
+
+    avs._cache.clear()
+    old_max = avs._CACHE_MAX
+    small_max = 3
+    avs._CACHE_MAX = small_max
+    try:
+        for i in range(small_max + 5):
+            avs._cache_put(
+                f"sid-{i}",
+                float(i),
+                avs.SummaryResult(short_label=f"L{i}", summary=f"S{i}"),
+            )
+        # Never exceeds the cap.
+        assert len(avs._cache) == small_max
+
+        # Oldest-inserted entries were evicted first; the newest survive.
+        for i in range(small_max + 5 - small_max, small_max + 5):
+            assert f"sid-{i}" in avs._cache
+        assert "sid-0" not in avs._cache
+    finally:
+        avs._cache.clear()
+        avs._CACHE_MAX = old_max
+
+
+@pytest.mark.unit
+def test_cache_if_terminal_evicts_at_capacity(summary_db):
+    """Sanity that _cache_if_terminal (a _cache_put caller) also stays capped."""
+    from api.services import agent_viz_summary as avs
+
+    avs._cache.clear()
+    old_max = avs._CACHE_MAX
+    small_max = 3
+    avs._CACHE_MAX = small_max
+    try:
+        for i in range(small_max + 3):
+            avs._cache_if_terminal(
+                f"t-{i}",
+                float(i),
+                STATUS_COMPLETED,
+                avs.SummaryResult(short_label=f"L{i}", summary=f"S{i}"),
+            )
+        assert len(avs._cache) == small_max
+        assert "t-0" not in avs._cache  # oldest evicted
+        for i in range(small_max + 3 - small_max, small_max + 3):
+            assert f"t-{i}" in avs._cache
+    finally:
+        avs._cache.clear()
+        avs._CACHE_MAX = old_max
