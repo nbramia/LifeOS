@@ -26,6 +26,26 @@ from api.utils.datetime_utils import make_aware as _make_aware
 
 logger = logging.getLogger(__name__)
 
+# Chunk size for any SQL IN/NOT IN clause built from a caller-supplied list
+# of ids. SQLite's default SQLITE_MAX_VARIABLE_NUMBER has been 32766 since
+# 3.32.0 (999 was the default before that, and some builds raise it further
+# still -- this one measures 250,000). 900 has no relationship to any of
+# those numbers; it's a deliberately conservative, portable chunk size that
+# stays safely under all of them without detecting the compiled-in limit at
+# runtime. Mirrored in api/services/interaction_store.py's InteractionStore
+# (kept as a separate constant there -- no shared import for one number).
+SQL_IN_CLAUSE_CHUNK_SIZE = 900
+
+
+def _escape_like_pattern(text: str) -> str:
+    """Escape SQL LIKE wildcards (`%`, `_`) and the escape character itself.
+
+    Without this, a literal `%` or `_` typed into a search box (e.g. an
+    email local part containing `_`) is interpreted as a wildcard instead of
+    a literal character. Pair with `ESCAPE '\\'` in the LIKE clause.
+    """
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
 
 @dataclass
 class PersonEntity:
@@ -1063,6 +1083,16 @@ class PersonEntityStore:
         """
         Search entities by name, email, or alias.
 
+        `%` and `_` in `query` are escaped so they match literally rather
+        than as SQL LIKE wildcards.
+
+        Known limitation (pre-existing, not introduced by the LIKE-based
+        matching added in #872): `emails` and `aliases` are stored as JSON
+        text, so a non-ASCII character inside one of those lists is stored
+        as a `\\uXXXX` escape sequence and a LIKE against the raw column
+        cannot match the literal character a caller types. `canonical_name`
+        and `display_name` are plain text columns and are unaffected.
+
         Args:
             query: Search string
             limit: Maximum results to return
@@ -1074,13 +1104,13 @@ class PersonEntityStore:
         """
         query_lower = query.lower()
         merged_ids = set(self._merged_ids.keys()) if not include_merged else set()
-        pattern = f"%{query_lower}%"
+        pattern = f"%{_escape_like_pattern(query_lower)}%"
 
         conn = self._get_connection()
         try:
             conditions = [
-                "(LOWER(canonical_name) LIKE ? OR LOWER(display_name) LIKE ? "
-                "OR LOWER(emails) LIKE ? OR LOWER(aliases) LIKE ?)"
+                "(LOWER(canonical_name) LIKE ? ESCAPE '\\' OR LOWER(display_name) LIKE ? ESCAPE '\\' "
+                "OR LOWER(emails) LIKE ? ESCAPE '\\' OR LOWER(aliases) LIKE ? ESCAPE '\\')"
             ]
             params: list = [pattern, pattern, pattern, pattern]
 
@@ -1092,6 +1122,115 @@ class PersonEntityStore:
                    f"ORDER BY last_seen DESC, canonical_name ASC")
 
             rows = conn.execute(sql, params).fetchall()
+
+            results = []
+            for row in rows:
+                if row['id'] in merged_ids:
+                    continue
+                results.append(self._row_to_entity(row))
+                if len(results) >= limit:
+                    break
+
+            return results
+        finally:
+            conn.close()
+
+    def count_search(self, query: str, include_hidden: bool = False,
+                      include_merged: bool = False) -> int:
+        """
+        Count entities matching the same predicate as search().
+
+        Cheap `COUNT(*)` companion to search() for callers that want a
+        "how many matched in total" figure without paginating through every
+        row. Excludes already-merged duplicate rows the same way search()
+        does, via one `id NOT IN (...)` clause per SQL_IN_CLAUSE_CHUNK_SIZE
+        chunk of merged ids (currently in the low hundreds, so this is a
+        single chunk in practice) -- cheap relative to the LIKE scan this
+        query already has to do.
+
+        Args:
+            query: Search string, same matching as search()
+            include_hidden: If True, include hidden entities (default: False)
+            include_merged: If True, include entities that were merged into
+                others (default: False)
+
+        Returns:
+            Number of matching rows.
+        """
+        query_lower = query.lower()
+        pattern = f"%{_escape_like_pattern(query_lower)}%"
+        merged_ids = list(self._merged_ids.keys()) if not include_merged else []
+
+        conn = self._get_connection()
+        try:
+            conditions = [
+                "(LOWER(canonical_name) LIKE ? ESCAPE '\\' OR LOWER(display_name) LIKE ? ESCAPE '\\' "
+                "OR LOWER(emails) LIKE ? ESCAPE '\\' OR LOWER(aliases) LIKE ? ESCAPE '\\')"
+            ]
+            params: list = [pattern, pattern, pattern, pattern]
+
+            if not include_hidden:
+                conditions.append("hidden = 0")
+
+            # One NOT IN clause per chunk (ANDed together) rather than a
+            # single unbounded one, matching InteractionStore's batch-query
+            # chunking so a future spike in merged people can't turn this
+            # into "too many SQL variables".
+            for i in range(0, len(merged_ids), SQL_IN_CLAUSE_CHUNK_SIZE):
+                chunk = merged_ids[i:i + SQL_IN_CLAUSE_CHUNK_SIZE]
+                placeholders = ",".join("?" * len(chunk))
+                conditions.append(f"id NOT IN ({placeholders})")
+                params.extend(chunk)
+
+            where = " AND ".join(conditions)
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM person_entities WHERE {where}", params
+            ).fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+    def list_recent(self, limit: int = 50, category: Optional[str] = None,
+                     include_hidden: bool = False,
+                     include_merged: bool = False) -> list[PersonEntity]:
+        """
+        List entities ordered by last_seen DESC, most recent first, in SQL.
+
+        This is the bounded counterpart to get_all() for callers (like
+        GET /api/people/list) that only need the top N by recency: it applies
+        ORDER BY / LIMIT and the category filter in SQL instead of loading
+        every entity into Python and sorting there.
+
+        Args:
+            limit: Maximum results to return
+            category: If given, filter to this category in SQL
+            include_hidden: If True, include hidden entities (default: False)
+            include_merged: If True, include entities that were merged into
+                others (default: False)
+
+        Returns:
+            List of PersonEntity objects, most recently seen first.
+        """
+        merged_ids = set(self._merged_ids.keys()) if not include_merged else set()
+
+        conn = self._get_connection()
+        try:
+            conditions = []
+            params: list = []
+
+            if not include_hidden:
+                conditions.append("hidden = 0")
+            if category:
+                conditions.append("category = ?")
+                params.append(category)
+
+            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            # Over-fetch a little when we need to filter out merged rows in
+            # Python, so the final page still has `limit` rows when possible.
+            fetch_limit = limit + len(merged_ids) if merged_ids else limit
+            sql = (f"SELECT * FROM person_entities {where} "
+                   f"ORDER BY last_seen DESC LIMIT ?")
+            rows = conn.execute(sql, params + [fetch_limit]).fetchall()
 
             results = []
             for row in rows:

@@ -35,6 +35,16 @@ VALID_SOURCE_TYPES = frozenset({
     "whatsapp", "contacts", "phone", "photos", "slack",
 })
 
+# Chunk size for any SQL IN/NOT IN clause built from a caller-supplied list
+# of ids. SQLite's default SQLITE_MAX_VARIABLE_NUMBER has been 32766 since
+# 3.32.0 (999 was the default before that, and some builds raise it further
+# still -- this one measures 250,000). 900 has no relationship to any of
+# those numbers; it's a deliberately conservative, portable chunk size that
+# stays safely under all of them without detecting the compiled-in limit at
+# runtime. Mirrored in api/services/person_entity.py's PersonEntityStore
+# (kept as a separate constant there -- no shared import for one number).
+SQL_IN_CLAUSE_CHUNK_SIZE = 900
+
 # Reasonable timestamp bounds
 _MIN_TIMESTAMP = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _MAX_FUTURE_DAYS = 90  # Calendar events can be up to ~30 days out; allow margin
@@ -973,6 +983,60 @@ class InteractionStore:
                 if ts_str:
                     dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                     result[source_type] = _make_aware(dt)
+            return result
+        finally:
+            conn.close()
+
+    def get_last_interaction_by_source_batch(
+        self, person_ids: list[str]
+    ) -> dict[str, dict[str, datetime]]:
+        """
+        Batched version of get_last_interaction_by_source() for many people.
+
+        Runs one `GROUP BY person_id, source_type` query per chunk of ids
+        instead of one query per person, so callers that need this for a
+        page of search/list results don't pay an N+1 cost. See
+        SQL_IN_CLAUSE_CHUNK_SIZE for why the chunk size is 900.
+
+        Args:
+            person_ids: PersonEntity IDs to fetch recency for.
+
+        Returns:
+            Dict mapping person_id to the same per-source dict that
+            get_last_interaction_by_source() would return for that person.
+            IDs with no interactions are simply absent.
+        """
+        if not person_ids:
+            return {}
+
+        # De-dupe while preserving determinism, then chunk the IN clause.
+        unique_ids = list(dict.fromkeys(person_ids))
+        result: dict[str, dict[str, datetime]] = {}
+        now = datetime.now(timezone.utc).isoformat()
+
+        conn = self._get_connection()
+        try:
+            chunk_size = SQL_IN_CLAUSE_CHUNK_SIZE
+            for i in range(0, len(unique_ids), chunk_size):
+                chunk = unique_ids[i:i + chunk_size]
+                placeholders = ",".join("?" * len(chunk))
+                cursor = conn.execute(
+                    f"""
+                    SELECT person_id, source_type, MAX(timestamp) as last_ts
+                    FROM interactions
+                    WHERE person_id IN ({placeholders}) AND timestamp <= ?
+                    GROUP BY person_id, source_type
+                    """,
+                    chunk + [now],
+                )
+                for row in cursor.fetchall():
+                    person_id = row[0]
+                    source_type = row[1]
+                    ts_str = row[2]
+                    if not ts_str:
+                        continue
+                    dt = _make_aware(datetime.fromisoformat(ts_str.replace("Z", "+00:00")))
+                    result.setdefault(person_id, {})[source_type] = dt
             return result
         finally:
             conn.close()
