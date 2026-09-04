@@ -9316,29 +9316,15 @@
 
         // Loads/reloads the people list (with search result caching).
         // Called both for an actual search (handleSearch/clearSearch) and
-        // for a plain reload (init(), and after hide/merge/split via
-        // `await loadPeople()`).
+        // for a plain reload (init(), and after hide/merge/split).
         //
-        // Contract callers should know about: a call may resolve WITHOUT
-        // updating the shared `people` array or calling renderPeopleList(),
-        // if a newer call to loadPeople() started before this one's
-        // response arrived (or answered from cache) — see the identity
-        // check below. `await loadPeople()` therefore only means "this
-        // particular call finished," not "the people list is now known to
-        // be fresh." Every current caller tolerates that: init()'s
-        // `peoplePromise` is awaited only to sequence page setup, not
-        // because later code reads `people` and requires it to be current
-        // at that exact instant (the family/relationship dashboards render
-        // from their own data; the final `await statsPromise` doesn't touch
-        // `people` either), and the hide/merge/split reload calls are
-        // synchronous button actions that don't normally race a concurrent,
-        // unrelated loadPeople() call within the same instant — if one ever
-        // does, the call that actually wins (the most recent one to start)
-        // still renders the definitive state shortly after. This is a
-        // deliberate, accepted sharp edge, not a guaranteed-safe contract:
-        // a caller that truly needs "resolve only once `people` reflects
-        // this exact call" would need a dedicated path that doesn't share
-        // this cancellation/staleness guard.
+        // Contract: a call may resolve WITHOUT updating `people` or
+        // rendering, if a newer call started first (see the identity check
+        // below) — `await loadPeople()` means "this call finished," not
+        // "the list is now fresh." Every current caller tolerates that
+        // today (none reads `people` right after awaiting in a way that
+        // requires it); a caller that needs a stricter guarantee would need
+        // a separate path that doesn't share this cancellation guard.
         async function loadPeople() {
             const listEl = document.getElementById('peopleList');
 
@@ -9429,7 +9415,11 @@
                 // storing a successful response here is safe (it can only
                 // help a later re-search of this exact query render
                 // instantly from cache) even though this call won't adopt
-                // it as the *current* list right now.
+                // it as the *current* list right now. This only helps a
+                // response that actually completed after being superseded;
+                // it does nothing for the common debounce case, where the
+                // older request is aborted outright and there's no response
+                // to cache at all.
                 setCachedSearch(cacheKey, allPeople);
 
                 // A newer search may have started (and possibly already

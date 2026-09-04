@@ -226,6 +226,20 @@ class TestSearchCancellation:
         are given a long artificial delay so they are still genuinely
         in-flight (and therefore actually get aborted, not just rendered
         over) when the next fill starts.
+
+        The failure-panel check happens between the "two" and "three"
+        fills — i.e. right when "two"'s loadPeople() call aborts "one" —
+        not after "three" has already resolved. Checking only at the end
+        (an earlier version of this test did) is not a real assertion of
+        the `AbortError` guard at all: "three"'s own successful render
+        happens after, and overwrites, anything the (correctly or
+        incorrectly handled) abort of "one"/"two" painted in between, so a
+        version of this file with the guard deleted still passes the
+        final-state check. Checking mid-race, while "two" is still
+        in-flight and nothing has resolved yet to paper over it, is what
+        actually pins the guard: without it, "one"'s abort rejection
+        overwrites "two"'s own "Loading people..." with the generic
+        failure panel on the very next microtask.
         """
         _goto_me_with_rules(page, crm_base_url, [
             {"match": "q=one", "body": {"people": [PERSON_SLOW], "total": 1,
@@ -240,7 +254,14 @@ class TestSearchCancellation:
         search_input.fill("one")
         page.wait_for_timeout(350)
         search_input.fill("two")
-        page.wait_for_timeout(350)
+        page.wait_for_timeout(350)  # "two" fires and aborts "one" here
+
+        # "one" is now aborted and "two" is still in flight (its own 5s
+        # delay hasn't elapsed) — nothing has resolved yet to overwrite a
+        # wrongly-shown failure panel. This is the moment the AbortError
+        # guard actually matters.
+        expect(page.locator("#peopleList")).not_to_contain_text("Failed to load people")
+
         search_input.fill("three")
 
         expect(page.locator(".person-card .person-name")).to_have_text(
