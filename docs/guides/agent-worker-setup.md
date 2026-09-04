@@ -1,7 +1,7 @@
 # Agent Worker Setup
 
 > **Status:** Complete
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-04
 > **Audience:** Operators
 
 One-time setup for the external agent worker that picks up `#agent`-tagged tasks and executes them via Claude (Anthropic Managed Agents) or a local Gemma model.
