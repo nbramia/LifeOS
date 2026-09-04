@@ -33,7 +33,8 @@ The `sessions.routing` column drives dispatch. Values come from preflight (for `
 | `routing` | Executor | How sessions are created |
 |-----------|----------|--------------------------|
 | `local` | `LocalExecutor` | Preflight or `#local` tag |
-| `claude` | `ManagedExecutor` | Preflight or `#cloud[-haiku\|-sonnet]` tag (Anthropic API, per-token) |
+| `remote` | `LocalExecutor` | Preflight or bare `#cloud` tag (configured remote provider, e.g. Fireworks) |
+| `claude` | `ManagedExecutor` | Preflight or `#cloud-haiku`/`#cloud-sonnet` tag (Anthropic API, per-token) |
 | `claude_code` | `ClaudeCodeExecutor` | `claude_code_spawn.spawn_claude_code_session()` (`/claude`) or `#claude` tag (Claude Code CLI, subscription-billed) |
 | `codex` | `CodexExecutor` | `codex_spawn.spawn_codex_session()` (`/codex`) or `#codex` tag (Codex CLI, subscription-billed) |
 | `ask` | — | Preflight couldn't decide; worker blocks the session and asks the operator |

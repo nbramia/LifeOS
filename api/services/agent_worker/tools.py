@@ -349,7 +349,9 @@ class ToolRegistry:
         `base_dir` (#925) is the task's named working directory, if any —
         forwarded only to the standard Read/Write/Edit/Bash/WebFetch/
         WebSearch handlers (see their signatures); MCP and inter-agent
-        tools don't touch the local filesystem and ignore it.
+        tools reach the filesystem only through `settings.vault_path` via
+        the HTTP API, never through caller-supplied paths, so `base_dir`
+        doesn't apply and is ignored.
         """
         # `sleep` is special: tell the executor to yield rather than producing
         # immediate output.
