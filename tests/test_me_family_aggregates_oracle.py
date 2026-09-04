@@ -918,6 +918,12 @@ class TestFamilyTimeline:
         monkeypatch.setattr('api.routes.crm.get_person_entity_store', lambda: pstore)
         monkeypatch.setattr('api.routes.crm.MY_PERSON_ID', MY_PERSON_ID)
 
+        # This call and test_excludes_non_selected_people()'s below share the
+        # exact same parameters against the same seeded dataset shape -- they
+        # only get independent results because the CRM aggregate response
+        # cache (#917) is cleared between every test (autouse
+        # reset_aggregate_cache() in tests/reset_singletons.py), not because
+        # anything here makes the calls distinguishable to it.
         result = get_family_timeline(person_ids="p-close", source_type=None, days_back=365, date=None, offset=0, limit=100)
         assert result.count == 5
         assert all("Close Family" in item.title for item in result.items)

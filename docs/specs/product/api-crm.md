@@ -6,7 +6,7 @@
 
 Every `/api/crm/*` HTTP endpoint. Split out of the main [api-reference.md](api-reference.md) because the CRM endpoint catalog is large enough to deserve its own file. For the consumer view of the CRM features these endpoints back, see the [CRM specs](crm-ui.md).
 
-`GET /api/crm/people`, `/statistics`, `/me/interactions`, `/me/timeline`, `/family/interactions`, `/family/timeline`, and `/birthdays/all` are backed by a short-lived, data-version-keyed response cache — see [architecture.md](../technical/architecture.md) for how it's keyed and invalidated. This is transparent to callers: response shape, status codes, and freshness (any write anywhere in the CRM data invalidates the relevant cached responses immediately) are unchanged.
+`GET /api/crm/people` (only for the default page shape — no search text, `limit` ≤ 300), `/statistics`, `/me/interactions`, `/me/timeline`, `/family/interactions`, `/family/timeline`, and `/birthdays/all` are backed by a short-lived, data-version-keyed response cache — see [architecture.md](../technical/architecture.md) for how it's keyed and invalidated. Response shape and status codes are unchanged. Freshness is bounded by a five-minute TTL rather than guaranteed immediate: a write to the CRM data invalidates a cached response well within that window, but a response can otherwise be up to five minutes old, and a time-windowed aggregate (computed from the request time) freezes "now" for the life of the cached entry that served it.
 
 ---
 

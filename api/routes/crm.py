@@ -748,8 +748,18 @@ def get_all_birthdays():
     }
 
 
+def _people_cache_eligible(kwargs: dict) -> bool:
+    """Only the parameter shape the CRM page's default load actually uses
+    (no search text, a bounded page size) is worth caching -- a per-keystroke
+    search query or a `limit=10000` export is requested once and never
+    again, so caching it only spends memory and a measurable
+    jsonable_encoder()/json.dumps() pass on every miss for no reuse (#917
+    review finding 6)."""
+    return not kwargs.get("q") and kwargs.get("limit", 50) <= 300
+
+
 @router.get("/people", response_model=PersonListResponse)
-@cached_aggregate()
+@cached_aggregate(should_cache=_people_cache_eligible)
 def list_people(
     q: Optional[str] = Query(default=None, description="Search query"),
     category: Optional[str] = Query(default=None, description="Filter by category"),

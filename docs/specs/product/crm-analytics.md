@@ -8,7 +8,7 @@ The aggregated views that sit alongside the people list: Family Dashboard (`/fam
 
 See [crm-ui.md](crm-ui.md) for the CRM index and the sibling specs that cover people, interactions, and the graph.
 
-Each dashboard's heaviest endpoint (its interactions/timeline aggregate, plus `/statistics`, `/birthdays/all`, and the default people list) is served from a short-lived server cache: a repeat request with the same parameters, from any client, returns instantly until a change is made anywhere in the CRM data — see [architecture.md](../technical/architecture.md) for how the cache is keyed and invalidated.
+Each dashboard's heaviest endpoint (its interactions/timeline aggregate, plus `/statistics`, `/birthdays/all`, and the default people list) is served from a short-lived server cache, bounded by a five-minute TTL: a repeat request with the same parameters, from any client, returns instantly and a change anywhere in the CRM data invalidates it well within that window — see [architecture.md](../technical/architecture.md) for how the cache is keyed and invalidated.
 
 ---
 

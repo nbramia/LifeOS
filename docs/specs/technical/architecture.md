@@ -109,19 +109,41 @@ before persisting changes.
 `aggregate_cache.py`'s `AggregateCache` memoizes the return value of the
 CRM's heaviest read endpoints — `/me/interactions`, `/me/timeline`,
 `/family/interactions`, `/family/timeline`, `/birthdays/all`, `/statistics`,
-and `/people` — applied via a `@cached_aggregate()` decorator directly under
-each route's `@router.get(...)`. The cache key is the route's resolved
-keyword arguments (every query parameter FastAPI resolved) plus both
-`crm.db` and `interactions.db`'s `PRAGMA data_version`, read from two
-long-lived, pragma-only connections following the same pattern as
-`PersonEntityStore`'s own data_version connection above. A commit to either
-database — from this process or another — makes the next request for an
-affected cache key recompute; a 300-second TTL is a backstop bound on entry
-lifetime, not the primary invalidation path. Entries are bounded by count
-(200) and total serialized bytes (20 MB), evicted least-recently-used; a
-raised exception (including an `HTTPException` for a non-200 response)
-propagates before the cache-store step, so error responses are never
-cached.
+and `/people` (only for its default page shape — no search text, `limit` ≤
+300; a search or a large export is requested once and never reused, so it
+bypasses the cache rather than spending memory and encode time on an entry
+that will never hit) — applied via a `@cached_aggregate()` decorator
+directly under each route's `@router.get(...)`. The cache key is the
+route's resolved keyword arguments (every query parameter FastAPI
+resolved); the data_version pair is a *generation stamp* held outside the
+key, so a commit anywhere drops every existing entry outright rather than
+merely making old-generation keys unreachable inside the bounds below.
+`crm.db` is watched at every path a CRM store actually reads it from —
+`PersonEntityStore`'s hardcoded path and `api.utils.db_paths.get_crm_db_path()`'s
+settings-derived one, deduped by `os.path.realpath` (the two are the same
+file by default, but can diverge under a non-default `LIFEOS_CHROMA_PATH`)
+— plus `interactions.db`, each read from a long-lived, pragma-only
+connection following the same pattern as `PersonEntityStore`'s own
+data_version connection above, opened with a `mode=rw` URI so a missing
+file is never silently created. A `PRAGMA data_version` read failure (a
+missing file, a file mid-replacement) never fails the request: it logs
+once and falls through to computing uncached, reopening the connection on
+the next call. A 300-second TTL is a backstop bound on entry lifetime, not
+the primary invalidation path — a response can be up to five minutes old
+with no intervening writes, and a time-windowed aggregate (computed from
+the request time) freezes "now" for the life of the entry that served it.
+Concurrent misses for the same key single-flight behind a per-key
+`threading.Event`, so only the first caller actually computes. Entries are
+bounded by count (200) and total serialized bytes (~7 MB, deliberately far
+below the 20 MB a naive reading suggests: a serialized-JSON byte undercounts
+the retained Python-object heap by roughly 7x, measured, so the bound
+targets a real ~50 MB heap ceiling rather than a 20 MB serialized one); an
+entry larger than the byte cap is skipped rather than evicting everything
+else to make room for it. The cached (and returned) value is always a deep
+copy, so a caller mutating its own result can never poison another
+caller's hit. A raised exception (including an `HTTPException` for a
+non-200 response) propagates before the cache-store step, so error
+responses are never cached.
 
 **Relationships:**
 - `relationship.py` - Relationship store

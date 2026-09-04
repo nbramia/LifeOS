@@ -206,7 +206,14 @@ class TestMeInteractionsEndpoint:
 
     def test_get_all_not_called_more_than_once(self, mock_stores):
         """None of the Me handlers may call the load-all-people store method
-        more than once per request (#871 acceptance criterion)."""
+        more than once per request (#871 acceptance criterion).
+
+        Asserts exactly 1, not <= 1: the CRM aggregate response cache (#917)
+        sits outside these mocked stores and is cleared before every test
+        (see reset_aggregate_cache() in tests/reset_singletons.py), so a hit
+        (0 calls) is not a possibility here -- `== 1` still distinguishes
+        "called once" from "the handler never ran at all," which `<= 1`
+        would silently accept."""
         from api.routes.crm import get_me_interactions
 
         person_store, interaction_store = mock_stores
@@ -215,7 +222,7 @@ class TestMeInteractionsEndpoint:
             with patch('api.routes.crm.get_interaction_store', return_value=interaction_store):
                 get_me_interactions(days_back=365)
 
-        assert person_store.get_all.call_count <= 1
+        assert person_store.get_all.call_count == 1
 
     def test_filters_by_date_range(self):
         """Date filtering is passed through to the SQL aggregate queries."""
