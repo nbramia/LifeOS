@@ -753,18 +753,24 @@ def _reset_hermes_model_readout():
     globals (`_hermes_chat_last_model`, `_hermes_chat_last_observed_at`)
     around every test (#892).
 
-    Any test that drives a real Hermes turn's `usage` event through
+    Defence-in-depth, not a fix for a currently-reproducible leak: any test
+    that drives a real Hermes turn's `usage` event through
     `_HermesTurnPersister._handle_usage` (directly, or via `HermesExecutor`/
-    the `/chat` Hermes proxy route) calls `record_hermes_chat_turn_model`
-    as a side effect and, before this fixture, never restored it —
+    the `/chat` Hermes proxy route) calls `record_hermes_chat_turn_model` as
+    a side effect and never restores it on its own —
     `tests/test_hermes_proxy.py`, `tests/test_agent_worker_hermes_executor.py`,
-    and `tests/test_usage_store.py` all do this, and already caused an
-    order-dependent failure during #863's review (a later test's `/api/health`
-    Hermes readout assertion inherited an earlier test's model instead of
-    seeing "unknown"). Kept here as ONE definition rather than three copies
-    so every current and future test gets the reset for free — it's a
-    plain module-global read/write, so the cost of running it for every
-    test (even ones that never touch Hermes) is negligible.
+    and `tests/test_usage_store.py` all do this. `tests/test_model_readout.py`
+    already carries its own independent autouse reset (pre-existing, not
+    part of this PR) that protects its own assertions regardless of run
+    order, and #892's round-1 review confirmed with the fixture removed,
+    in both directions, that no test currently observes a leak (149/149
+    passed either way). Kept here as ONE definition rather than three
+    copies so every current and future test gets the reset for free — it's
+    a plain module-global read/write, so the cost of running it for every
+    test (even ones that never touch Hermes) is negligible, and it closes
+    off the *shape* of the order-dependent failure #863's review hit
+    (before `test_model_readout.py` had its own fixture) even though that
+    specific failure is no longer reproducible today.
     """
     from api.services import model_readout
 

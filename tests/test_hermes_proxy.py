@@ -1805,9 +1805,17 @@ async def test_chat_hermes_turn_never_touches_any_agent_sessions_hermes_model(
     two match — this is what makes the mutation proof below meaningful (a
     regression that writes `hermes_model` from the turn's OWN observed
     conversation id would otherwise silently target a different, unrelated
-    session and pass vacuously)."""
+    session and pass vacuously). (round-1 review, R-3) Also seeds an
+    UNRELATED, pre-existing agent-worker Hermes session (a board-assigned
+    task, not this turn's own conversation anchor) and asserts it is
+    untouched too — proving this isn't just the anchor row's own inertness
+    but that a real `/chat` turn writes to no `SessionStore` row at all."""
     from api.services import model_readout
     from api.services.agent_worker.hermes_session import _deterministic_session_id
+
+    unrelated = agent_session_store.create(
+        task_id="t-unrelated-hermes-board-task", routing="hermes",
+    )
 
     conversation_id = "usage-conv-1"  # matches _USAGE_SSE_CHUNKS' own conversation_id event
     resp = await usage_proxy_client.post(
@@ -1824,6 +1832,8 @@ async def test_chat_hermes_turn_never_touches_any_agent_sessions_hermes_model(
     anchor = agent_session_store.get_by_session_id(anchor_id)
     assert anchor is not None
     assert anchor.hermes_model is None
+
+    assert agent_session_store.get(unrelated.task_id).hermes_model is None
 
 
 class TestHermesTurnPersisterDirect:

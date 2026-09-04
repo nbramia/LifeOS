@@ -1181,7 +1181,9 @@ def _thread_dict(s: Session) -> dict[str, Any]:
         "expected_output": s.expected_output,
         "label": _label_for_session(s, []),
         # (#892) Deliberately called with one argument: the /chat threads
-        # panel's badge stays plain "Hermes" here, out of #892's scope
+        # panel's `routeBadgeHtml` renders no badge at all for `hermes` (it
+        # doesn't consume this field for that routing), so this value is
+        # never displayed either way — left unenriched, out of #892's scope
         # (the `/agents` snapshot row via `_session_to_dict` above).
         "model_label": _model_label_for_routing(s.routing),
         "origin": getattr(s, "origin", None),

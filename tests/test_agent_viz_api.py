@@ -403,11 +403,7 @@ def test_model_label_hermes_routing_ignores_the_board_model_picker(client, store
     """`Session.model` is the board's operator-chosen model *picker* value
     (`SessionStore.set_assignment`) — `HermesExecutor` never reads or writes
     it, so it must not affect the Hermes badge. A session with a picker
-    `model` set still reads plain "Hermes": the badge is plain "Hermes"
-    unconditionally, never a `Hermes · <model>` suffix sourced from a
-    process-wide "last observed" reading, since that reading is a
-    cross-session misattribution and not merely decoupled from the
-    picker."""
+    `model` set but no turn taken yet still reads plain "Hermes"."""
     session_store, _ = stores
     session_store.create(
         task_id="t-herm-picker", status=STATUS_RUNNING, routing="hermes",
@@ -487,6 +483,26 @@ def test_model_label_hermes_completed_session_is_frozen(client, stores):
     sessions = {s["task_id"]: s for s in client.get("/api/agents/snapshot").json()["sessions"]}
     assert sessions["t-herm-done"]["model_label"] == "Hermes · model-final"
     assert sessions["t-herm-later"]["model_label"] == "Hermes · model-unrelated"
+
+
+@pytest.mark.unit
+def test_model_label_hermes_whitespace_only_model_degrades_to_plain_hermes(client, stores):
+    """(round-1 review, R-4) A whitespace-only reported model (e.g. a
+    malformed upstream `usage` event) must not render as `Hermes ·    ` —
+    `SessionStore.set_hermes_model` strips before its falsy guard, so this
+    is indistinguishable from no turn having been observed yet. A real,
+    non-empty model with incidental surrounding whitespace is still
+    recorded (stripped), proving this isn't a blanket rejection of every
+    model containing whitespace."""
+    session_store, _ = stores
+    session_store.create(task_id="t-herm-blank", status=STATUS_RUNNING, routing="hermes")
+    session_store.set_hermes_model("t-herm-blank", "   ")
+    session_store.create(task_id="t-herm-padded", status=STATUS_RUNNING, routing="hermes")
+    session_store.set_hermes_model("t-herm-padded", "  model-padded  ")
+
+    sessions = {s["task_id"]: s for s in client.get("/api/agents/snapshot").json()["sessions"]}
+    assert sessions["t-herm-blank"]["model_label"] == "Hermes"
+    assert sessions["t-herm-padded"]["model_label"] == "Hermes · model-padded"
 
 
 @pytest.mark.unit
