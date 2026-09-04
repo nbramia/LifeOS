@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from api.services.agent_worker.session_store import (
     CLI_ENGINE_PREFIXES,
     CLI_SESSION_EVENTS,
+    CLI_STATUS_ENDED,
     TERMINAL_STATUSES,
     CliSession,
     Session,
@@ -863,13 +864,25 @@ def _card_policy(task) -> dict[str, Any]:
         error = agent_board.evaluate_card_action(task.status, task.tags, action, target_lane)
         return {"allowed": error is None, "reason": error[1] if error else None}
 
+    # (#881 RC5) `lanes` lists ONLY refused lanes — an absent lane means
+    # allowed, which every client-side reader (`web/agents/board.js`'s
+    # `onCardDropped`/`renderDrawerActions`) already treats it as. Emitting
+    # every lane regardless of outcome was 555-1261 bytes per card that
+    # GET /board/stream re-serializes to compute its change signature every
+    # 0.5s, purely to say "yes" for the common case.
+    lanes_refused = {
+        lane: outcome
+        for lane in agent_board.TASK_LANES
+        if not (outcome := _outcome("lane_move", lane))["allowed"]
+    }
+
     return {
-        "claimed": agent_board.is_claimed(task.tags),
+        "claimed": agent_board.is_claimed(task.status, task.tags),
         "agent_owned": agent_board.is_agent_owned(task.tags),
         "cancel": _outcome("cancel"),
         "assignee": _outcome("assignee_change"),
         "fields": _outcome("field_edit"),
-        "lanes": {lane: _outcome("lane_move", lane) for lane in agent_board.TASK_LANES},
+        "lanes": lanes_refused,
     }
 
 
@@ -1131,6 +1144,22 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
     if task is None:
         raise HTTPException(status_code=404, detail="card not found")
 
+    # (#881 RC2) Ownership/review is checked before the idempotence
+    # short-circuit below — a `me` card or a pending-review card that
+    # somehow already carries status="cancelled" (not a state Cancel
+    # itself ever produces, since it refuses both) must still get its real
+    # refusal reason, not a misleading 200 "no-op cancel" success.
+    if agent_board.is_review_pending(task.tags):
+        raise HTTPException(
+            status_code=agent_board.REVIEW_UNRESOLVED_ERROR[0],
+            detail=agent_board.REVIEW_UNRESOLVED_ERROR[1],
+        )
+    if not agent_board.is_agent_owned(task.tags):
+        raise HTTPException(
+            status_code=agent_board.CANCEL_NOT_AGENT_OWNED_ERROR[0],
+            detail=agent_board.CANCEL_NOT_AGENT_OWNED_ERROR[1],
+        )
+
     if task.status == "cancelled":
         lane = agent_board.derive_lane(task.status, task.tags)
         return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags), "killed": [], "failures": []}
@@ -1142,12 +1171,40 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
 
     killed: list[str] = []
     failures: list[dict[str, str]] = []
-    session_dict = _find_latest_session_for_task(card_id)
-    if session_dict is not None:
-        session_store = _get_session_store()
-        target = session_store.get_by_session_id(session_dict["session_id"])
-        if target is not None and target.status not in TERMINAL_STATUSES:
-            killed, failures = await _kill_session_subtree(target, "cancelled from the board")
+    session_store = _get_session_store()
+
+    # (#881 AR1) Direct primary-key lookup — `task_id` is the `sessions`
+    # table's PRIMARY KEY — instead of `_build_snapshot()`'s 200-row,
+    # most-recently-started window (what the board's own display uses).
+    # That window silently missed a still-running session older than the
+    # 200 most recent, so Cancel would mark the task cancelled while the
+    # worker kept running and spending (round-1 finding AR1).
+    target = session_store.get(card_id)
+    if target is not None and target.status not in TERMINAL_STATUSES:
+        killed, failures = await _kill_session_subtree(target, "cancelled from the board")
+
+    # (#881 AR5) A live cc:/cx: CLI session (opened via the board's Open
+    # button) lives in the separate `cli_sessions` table, keyed by its own
+    # session_id, not task_id — the lookup above can never find it, and
+    # actually killing a CLI process is a separate issue. Cancel must not
+    # silently claim a teardown it didn't perform, so surface it as a
+    # failure instead (round-1 finding AR5).
+    try:
+        live_cli_sessions = [
+            cli for cli in session_store.list_cli_sessions_for_task(card_id)
+            if cli.status != CLI_STATUS_ENDED
+        ]
+    except Exception as exc:  # noqa: BLE001 — never block cancel on this lookup
+        logger.warning("cli_sessions lookup for cancel of %s failed: %s", card_id, exc)
+        live_cli_sessions = []
+    for cli in live_cli_sessions:
+        failures.append({
+            "session_id": cli.session_id,
+            "reason": (
+                f"a live {cli.engine} CLI session ({cli.session_id}) is still open "
+                "and can't be killed by Cancel yet — close it manually"
+            ),
+        })
 
     # Strip the tags that would otherwise keep the card out of Done —
     # `derive_lane` ranks Human queue and In progress above Done, so a
@@ -1631,18 +1688,6 @@ async def operator_kill_session(session_id: str, body: KillRequest | None = None
 
     killed, failures = await _kill_session_subtree(target, reason)
     return {"killed": killed, "failures": failures}
-
-
-def _find_latest_session_for_task(task_id: str) -> dict[str, Any] | None:
-    """The most-recently-active session linked to `task_id`, the same
-    lookup `_build_board`'s `sessions_by_task` performs for `_task_card` —
-    shared with the Cancel endpoint (#881) so it doesn't re-derive board
-    state just to find a card's live session.
-    """
-    candidates = [sd for sd in _build_snapshot()["sessions"] if sd.get("task_id") == task_id]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda s: s.get("last_activity_at") or 0)
 
 
 class CCResumeRequest(BaseModel):

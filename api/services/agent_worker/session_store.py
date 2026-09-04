@@ -1706,6 +1706,26 @@ class SessionStore:
             ).fetchall()
         return [self._row_to_cli_session(r) for r in rows]
 
+    def list_cli_sessions_for_task(self, task_id: str) -> list[CliSession]:
+        """Every `cli_sessions` row linked to `task_id`, newest first.
+
+        Unlike the main `sessions` table, `cli_sessions.task_id` isn't a
+        primary key (a card can be opened, closed, and reopened, each a
+        distinct row) — so this is a direct, unbounded query, not a lookup.
+        Added for the Cancel endpoint (#881 AR5): a live cc:/cx: CLI session
+        can't be found via `get()` (that's the `sessions` table, keyed by
+        task_id) or via the 200-row `list_sessions()` snapshot window
+        (`cli_sessions` isn't in that table at all) — Cancel needs to know
+        one exists so it can report it as un-torn-down instead of silently
+        claiming success.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cli_sessions WHERE task_id = ? ORDER BY last_event_at DESC",
+                (task_id,),
+            ).fetchall()
+        return [self._row_to_cli_session(r) for r in rows]
+
     @staticmethod
     def _row_to_cli_session(row: sqlite3.Row) -> CliSession:
         return CliSession(

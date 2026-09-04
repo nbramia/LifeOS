@@ -24,6 +24,7 @@ from api.services.task_manager import TaskManager
 from api.services.scheduler_store import SchedulerStore
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
+    STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_RUNNING,
     SessionStore,
@@ -128,8 +129,11 @@ class TestGetBoard:
         assert policy["cancel"] == {"allowed": True, "reason": None}
         assert policy["assignee"] == {"allowed": True, "reason": None}
         assert policy["fields"] == {"allowed": True, "reason": None}
-        assert policy["lanes"]["unassigned"]["allowed"] is True
-        assert policy["lanes"]["assigned"]["allowed"] is True
+        # (#881 RC5) `lanes` lists ONLY refused lanes now — the allowed
+        # ones (unassigned/assigned) are simply absent, not present-and-
+        # true, matching what onCardDropped already assumes client-side.
+        assert "unassigned" not in policy["lanes"]
+        assert "assigned" not in policy["lanes"]
         assert policy["lanes"]["in_progress"]["allowed"] is False
         assert policy["lanes"]["human_queue"]["allowed"] is False
         assert policy["lanes"]["done"]["allowed"] is False
@@ -155,8 +159,15 @@ class TestGetBoard:
             "allowed": False,
             "reason": "cancel is only available for agent-assigned cards",
         }
-        for lane in ("unassigned", "assigned", "in_progress", "human_queue", "done"):
-            assert policy["lanes"][lane]["allowed"] is True, lane
+        # (#881 RC5) Positive case: every SETTABLE lane is allowed for a
+        # plain `me` card, so only "review" appears (it 400s "cannot be set
+        # directly" for every card, unconditionally) — not
+        # `{lane: {allowed: true}}` for the other five. This is the direct
+        # proof of RC5's "absence means allowed" contract on the one card
+        # type where every real move really is allowed.
+        assert policy["lanes"] == {
+            "review": {"allowed": False, "reason": "lane 'review' cannot be set directly"},
+        }
 
     def test_claimed_card_policy_block_refuses_everything_but_cancel(self, client, stores):
         task_manager, *_ = stores
@@ -726,6 +737,169 @@ class TestCancelBoardCard:
     def test_cancel_missing_card_is_404(self, client, stores):
         r = client.post("/api/agents/board/cards/nope/cancel")
         assert r.status_code == 404
+
+    def test_cancel_finds_session_outside_the_snapshot_window(self, client, stores, monkeypatch):
+        """(#881 AR1) The session lookup is a direct primary-key read
+        (task_id is the `sessions` table's PRIMARY KEY), not bounded by the
+        200-row, most-recently-started window `_build_snapshot`'s
+        `list_sessions(limit=200)` uses for display — a session that
+        started before the 200 most recent must still be found and torn
+        down, not silently skipped."""
+        import sqlite3
+
+        task_manager, _sched, session_store, transcript_store = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Old but still running", tags=["codex", "agent-running"])
+        target = session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+
+        with sqlite3.connect(str(session_store.db_path)) as conn:
+            # Push the target far into the past, then seed 200 sessions
+            # that all sort ahead of it in `ORDER BY started_at DESC`.
+            conn.execute("UPDATE sessions SET started_at = 0 WHERE task_id = ?", (task.id,))
+            conn.commit()
+        for i in range(200):
+            session_store.create(task_id=f"padding-{i}", status=STATUS_COMPLETED, routing="claude")
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["killed"] == [target.session_id]
+        assert body["status"] == "cancelled"
+        assert session_store.get_by_session_id(target.session_id).status == STATUS_FAILED
+
+    def test_cancel_surfaces_a_live_cli_session_as_a_failure_instead_of_silent_success(
+        self, client, stores, monkeypatch,
+    ):
+        """(#881 AR5) A live cc:/cx: CLI session (opened via the board's
+        Open button) lives in the separate `cli_sessions` table, keyed by
+        its own session_id, not task_id — Cancel can't tear it down (a
+        separate issue), but it must not silently claim a teardown it
+        didn't perform. The task is still marked cancelled; the untorn-down
+        session is reported under `failures`."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        # (#881 AR4) status="in_progress" with no agent-running tag is what
+        # cli_session_event leaves behind after Open spawns a session.
+        task = task_manager.create("Opened via a CLI session", tags=["codex"], status="in_progress")
+        session_store.record_cli_session_event(
+            engine="codex", event="user_prompt_submit", session_id="live1",
+            host="some-host", prompt="do the thing", task_id=task.id,
+        )
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "cancelled"
+        assert body["killed"] == []
+        assert len(body["failures"]) == 1
+        assert body["failures"][0]["session_id"] == "cx:live1"
+        assert "cx:live1" in body["failures"][0]["reason"]
+
+    def test_cancel_ignores_an_already_ended_cli_session(self, client, stores, monkeypatch):
+        """Positive case for AR5: a CLI session that already ended must NOT
+        show up as an untorn-down failure — only a still-live one does."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Opened then closed via CLI", tags=["codex"])
+        session_store.record_cli_session_event(
+            engine="codex", event="session_start", session_id="ended1",
+            host="some-host", task_id=task.id,
+        )
+        session_store.record_cli_session_event(
+            engine="codex", event="session_end", session_id="ended1",
+            host="some-host", task_id=task.id,
+        )
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        assert r.json()["failures"] == []
+
+    def test_cancel_on_already_cancelled_me_card_is_409_not_idempotent_200(self, client, stores):
+        """(#881 RC2) Ownership must be checked before the idempotence
+        short-circuit — a `me` card that somehow already carries
+        status="cancelled" (not a state Cancel itself ever produces, since
+        it refuses `me` cards) must still 409 for the real reason, not
+        silently look like a successful no-op cancel."""
+        task_manager, *_ = stores
+        task = task_manager.create("A plain me card, already cancelled", tags=["me"], status="cancelled")
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        assert r.json()["detail"] == "cancel is only available for agent-assigned cards"
+
+    def test_cancel_on_already_cancelled_review_card_is_409_not_idempotent_200(self, client, stores):
+        """(#881 RC2) Same as above for a pending-review card."""
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "A review card, cancelled some other way", tags=["codex", "agent-completed"], status="cancelled",
+        )
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        assert r.json()["detail"] == "accept or reject the review"
+
+    def test_cancel_on_already_done_agent_card_is_409(self, client, stores):
+        """(#881 RC2) evaluate_card_action now refuses Cancel on any
+        terminal-status agent-owned card, not just an already-cancelled
+        one — an accepted/finished card has nothing left to cancel."""
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Already accepted and done", tags=["codex", "agent-completed", "accepted"], status="done",
+        )
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        updated = task_manager.get(task.id)
+        assert updated.status == "done"  # nothing written
+
+    def test_cancel_policy_is_refused_once_the_card_is_already_cancelled(self, client, stores, monkeypatch):
+        """(#881 RC2) `policy.cancel.allowed` must go False once a card is
+        already cancelled — the drawer's Cancel button must disappear
+        instead of staying offered for a pointless second click."""
+        task_manager, *_ = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Handed to the agent", tags=["codex"])
+        r1 = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r1.status_code == 200
+
+        board = client.get("/api/agents/board").json()
+        card = next(c for c in board["lanes"]["done"] if c["id"] == task.id)
+        assert card["policy"]["cancel"]["allowed"] is False
+
+    def test_cancel_skips_teardown_for_already_terminal_session(self, client, stores, monkeypatch):
+        """(#881 RC4) A claimed card whose linked session already reached a
+        terminal status (e.g. it finished between the board loading and the
+        operator clicking Cancel) must not attempt teardown."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Already finished", tags=["codex", "agent-running"])
+        session = session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="claude")
+
+        called = []
+        orig = agents_route._kill_session_subtree
+
+        async def _spy(*a, **kw):
+            called.append(True)
+            return await orig(*a, **kw)
+
+        monkeypatch.setattr(agents_route, "_kill_session_subtree", _spy)
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        assert r.json()["killed"] == []
+        assert called == []
+        assert session_store.get_by_session_id(session.session_id).status == STATUS_COMPLETED
+
+    def test_cancel_invalidates_the_board_cache(self, client, stores, monkeypatch):
+        """(#881 RC4) Cancel must invalidate the shared stream-tick board
+        cache like the lane/accept endpoints do, so the very next tick
+        reflects the cancellation instead of serving a pre-write board for
+        up to `_BOARD_CACHE_TTL` more seconds."""
+        task_manager, *_ = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Handed to the agent", tags=["codex"])
+        monkeypatch.setattr(agents_route, "_board_cache", (time.monotonic(), {"lanes": {}, "generated_at": 0}))
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        assert agents_route._board_cache is None
 
 
 # ---------------------------------------------------------------------------

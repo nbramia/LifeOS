@@ -29,6 +29,15 @@ const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local'];
 // tasks" — so the composer must not let one through.
 const AGENT_ASSIGNEES = ASSIGNEES.filter(a => a !== 'me');
 
+// (#881 AR3) Tags the worker itself writes as it drives a task through its
+// lifecycle (agent_board.py's RUNNING_TAG/BLOCKED_TAG/COMPLETED_TAG, plus
+// the accept endpoint's ACCEPTED_TAG) — the drawer's free-text Tags field
+// must never show these as editable tokens, never let them be typed in
+// (mirrors the ASSIGNEES rejection immediately below), and always
+// preserve whatever the card already has on every save, the same way the
+// field never lets a human type an assignee name into it.
+const LIFECYCLE_TAG = /^(agent(-[\w-]+)?|accepted)$/i;
+
 // Card fields the drawer renders as editable inputs — used to decide
 // whether an SSE tick needs to rebuild the drawer at all (#850 finding 2).
 const DRAWER_EDITABLE_FIELDS = [
@@ -451,6 +460,19 @@ export function initBoard() {
   function onCardDropped(cardId, targetLane) {
     const card = findCard(cardId);
     if (!card || card.kind !== 'task') return;
+    // (#881 AR6) Review and Scheduled are never a direct drag target —
+    // plan_lane_move 400s both with "cannot be set directly" for EVERY
+    // card, regardless of state. Scheduled in particular never appears in
+    // `card.policy.lanes` at all (it's not a task lane — TASK_LANES
+    // excludes it), so the policy-based fast path below can't catch it;
+    // refuse it here, matching the existing DIRECT_LANE_IDS gating on the
+    // composer/lane-add button, so dropping on Scheduled doesn't always
+    // round-trip to the server just to 400.
+    if (!DIRECT_LANE_IDS.has(targetLane)) {
+      showToast(`Can't move card to ${laneLabel(targetLane)}.`, true);
+      render();
+      return;
+    }
     // (#881) The server is still the authority — this is a fast path that
     // skips the round trip when the board already knows the move is
     // refused, matching `card.policy` exactly (see _card_policy in
@@ -804,7 +826,13 @@ export function initBoard() {
   function renderDrawer(card) {
     if (!drawerEl) return;
     const isTask = card.kind === 'task';
-    const nonAssigneeTags = (card.tags || []).filter(t => !ASSIGNEES.includes(t.toLowerCase()));
+    // (#881 AR3) The Tags field never shows an assignee tag OR a worker
+    // lifecycle tag as an editable token — both are managed elsewhere
+    // (the Assignee select above, and the worker/accept endpoint
+    // respectively) and must survive a Tags-field save untouched.
+    const editableTags = (card.tags || []).filter(
+      t => !ASSIGNEES.includes(t.toLowerCase()) && !LIFECYCLE_TAG.test(t.toLowerCase()),
+    );
     const titleValue = isTask ? (card.title || '') : (card.name || '');
     // (#881) `card.policy` is the server's own decision — the drawer never
     // re-derives these rules, it just disables-and-explains. A schedule
@@ -836,7 +864,8 @@ export function initBoard() {
         </div>
       </div>
       <label class="drawer-label">Tags</label>
-      <input class="drawer-tags" data-field="tags" value="${escapeHtml(nonAssigneeTags.join(' '))}" placeholder="space-separated tags" />
+      <input class="drawer-tags" data-field="tags" value="${escapeHtml(editableTags.join(' '))}" placeholder="space-separated tags" ${assigneeDisabled ? 'disabled' : ''} />
+      ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="tags-reason">${escapeHtml(assigneePolicy.reason || "This card's tags can't be changed right now.")}</div>` : ''}
       <div class="drawer-assignment" data-field="assignment"></div>
       <div class="drawer-actions" data-field="actions"></div>
       <div class="drawer-session" data-field="session-panel"></div>
@@ -927,14 +956,17 @@ export function initBoard() {
       const tokens = tagsEl.value.split(/\s+/).map(t => t.replace(/^#/, '')).filter(Boolean);
       // Free text here writes straight to the task store — reject anything
       // that isn't a plain word/hyphen token (blocks a vault-comment
-      // injection like `<!--id:...-->` stealing another task's id) and drop
+      // injection like `<!--id:...-->` stealing another task's id), drop
       // any assignee-name token (the assignee comes from the select above,
       // not this field) rather than letting it silently double up as a tag
-      // (#850 finding 8).
+      // (#850 finding 8), and (#881 AR3) reject a worker lifecycle tag the
+      // same way — typing `agent-running` into a `me` card's Tags field
+      // must not be able to grant it a claim tag the worker never gave it.
       const parsed = [];
       const rejected = [];
       for (const t of tokens) {
-        if (VALID_TAG.test(t) && !ASSIGNEES.includes(t.toLowerCase())) parsed.push(t);
+        const lower = t.toLowerCase();
+        if (VALID_TAG.test(t) && !ASSIGNEES.includes(lower) && !LIFECYCLE_TAG.test(lower)) parsed.push(t);
         else rejected.push(t);
       }
       if (rejected.length) {
@@ -942,8 +974,15 @@ export function initBoard() {
       }
       tagsEl.value = parsed.join(' ');
       const assigneeTag = card.assignee ? [card.assignee] : [];
-      try { await putTask(card.id, { tags: [...assigneeTag, ...parsed] }); await fetchBoard(); }
-      catch (err) { showToast(`Couldn't save tags: ${err.message}`, true); tagsEl.value = nonAssigneeTags.join(' '); }
+      // (#881 AR3) Always re-append the card's own lifecycle tags from
+      // `card.tags` — never from what's in the box, which never shows them
+      // in the first place — so a save through this field can't silently
+      // drop `agent-running`/`agent-blocked`/`agent-completed`/`accepted`
+      // even on a card where the field is still enabled (e.g. Review,
+      // which isn't claimed).
+      const lifecycleTags = (card.tags || []).filter(t => LIFECYCLE_TAG.test(t.toLowerCase()));
+      try { await putTask(card.id, { tags: [...assigneeTag, ...lifecycleTags, ...parsed] }); await fetchBoard(); }
+      catch (err) { showToast(`Couldn't save tags: ${err.message}`, true); tagsEl.value = editableTags.join(' '); }
     });
 
     // The drawer's own Assignee select above is the one assignee writer —
@@ -1026,8 +1065,12 @@ export function initBoard() {
     // card can still land in Human queue without being resolvable by a
     // human). Absent policy (schedule cards never reach here; a pre-#881
     // fixture/response might) defaults to allowed, matching every other
-    // policy read in this file.
-    const doneAllowed = !card.policy || !card.policy.lanes || card.policy.lanes.done.allowed !== false;
+    // policy read in this file. (#881 RC7/RC5) `policy.lanes` now lists
+    // ONLY refused lanes — an absent `.done` entry means allowed, so this
+    // must guard the leaf the same way `onCardDropped`'s own lane read
+    // already does, not assume it's always present.
+    const doneEntry = card.policy && card.policy.lanes && card.policy.lanes.done;
+    const doneAllowed = !doneEntry || doneEntry.allowed !== false;
     if (card.lane === 'human_queue' && !card.pending_question && doneAllowed) {
       // A manually-filed #human card with no agent question behind it —
       // "Resolve" is the operator saying they've handled it by hand.
@@ -1043,8 +1086,27 @@ export function initBoard() {
             try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
             throw new Error(msg || `HTTP ${r.status}`);
           }
-          showToast('Cancelled.', false);
-          fetchBoard();
+          const data = await r.json();
+          // (#881 AR5) A live cc:/cx: CLI session can't be torn down by
+          // Cancel yet — the endpoint still marks the card cancelled, but
+          // reports it under `failures` instead of silently claiming a
+          // teardown it didn't perform. Surface that as a warning toast
+          // rather than a plain success.
+          const untorn = (data && data.failures) || [];
+          if (untorn.length) {
+            showToast(`Cancelled, but couldn't stop: ${untorn.map(f => f.reason || f.session_id).join('; ')}`, true);
+          } else {
+            showToast('Cancelled.', false);
+          }
+          await fetchBoard();
+          // (#881 AR7) fetchBoard()'s own updateOpenDrawer skips the
+          // rebuild while this button (inside the drawer) still holds
+          // focus after the click — the same staleness the assignee
+          // handler above already works around. Without this, the drawer
+          // keeps showing a stale Open button for a card that just moved
+          // to Done, and clicking it 409s.
+          const fresh = findCard(card.id);
+          if (fresh) { renderDrawer(fresh); openCardSnapshot = fresh; }
         } catch (err) { showToast(`Cancel failed: ${err.message}`, true); }
       }]);
     }

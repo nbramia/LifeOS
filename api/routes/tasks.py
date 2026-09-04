@@ -542,9 +542,28 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
                 raise HTTPException(status_code=error[0], detail=error[1])
 
         if "tags" in updates:
-            old_assignee = agent_board.derive_assignee(current.tags)
-            new_assignee = agent_board.derive_assignee(updates["tags"])
-            if new_assignee != old_assignee:
+            # (#881 AR2/AR3) Compare the normalized assignee-tag *and*
+            # claim-tag SETS, not just `derive_assignee`'s single
+            # first-match-wins value — that value is blind to two holes a
+            # free-text tags patch can slip through on a claimed card:
+            #   - AR2: adding a SECOND assignee tag alongside the existing
+            #     one (`["claude","agent-running"]` -> `["claude",
+            #     "agent-running","codex"]`) still derives "claude" (first
+            #     match in ASSIGNEE_TAGS order), so the old single-value
+            #     comparison saw no change and never ran the guard.
+            #   - AR3: dropping `agent-running`/`agent-blocked` from the
+            #     tags box (the drawer's Tags field used to show them as
+            #     ordinary editable tokens) also leaves the derived
+            #     assignee unchanged, so the same blind spot let a claimed
+            #     card's claim tag be silently stripped through this path.
+            old_tags = agent_board.normalize_tags(current.tags)
+            new_tags = agent_board.normalize_tags(updates["tags"])
+            assignee_tag_set = set(agent_board.ASSIGNEE_TAGS)
+            claim_tag_set = {agent_board.RUNNING_TAG, agent_board.BLOCKED_TAG}
+            if (
+                (old_tags & assignee_tag_set) != (new_tags & assignee_tag_set)
+                or (old_tags & claim_tag_set) != (new_tags & claim_tag_set)
+            ):
                 error = agent_board.evaluate_card_action(current.status, current.tags, "assignee_change")
                 if error is not None:
                     raise HTTPException(status_code=error[0], detail=error[1])

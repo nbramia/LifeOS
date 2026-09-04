@@ -1113,9 +1113,12 @@
   .drawer-notes-autosize { overflow-y: auto; resize: none; max-height: 66.667vh; }
   .drawer-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
   /* (#881) Visible reason text next to a picker the board's own policy
-     has disabled — disable-and-explain, never hide, matching the
-     assignment pickers' .assignment-error styling below. */
-  .drawer-field-reason { color: var(--failed); font-size: 0.75rem; margin-top: 0.3rem; }
+     has disabled — disable-and-explain, never hide. Neutral color: this
+     is a normal explanation, not a failed-save error (that's
+     .assignment-error below, RC6 round-1 finding — the two used to share
+     one element/style, which painted an ordinary "can't change this right
+     now" reason the same alarming red as a real save failure). */
+  .drawer-field-reason { color: var(--text-dim); font-size: 0.75rem; margin-top: 0.3rem; }
   .drawer-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.75rem; }
   .drawer-action {
     background: var(--bg-card);
