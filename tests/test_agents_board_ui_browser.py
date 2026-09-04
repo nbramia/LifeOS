@@ -1619,13 +1619,20 @@ class TestLaneAddButton:
         stored = page.evaluate("localStorage.getItem('lifeos.agents.board.lanes')")
         assert stored is None, stored
 
-    def test_failed_move_with_an_assignee_does_not_reveal_a_hidden_assigned_lane(self, page: Page, agents_base_url):
-        """Round-2 finding 2, a variant where the pre-move guess (assignee
-        present -> Assigned) happens to coincide with where the card
-        actually settles even after the PUT fails — proving the guard is
-        gated on the move's own success/failure, not just on `landedLane`
-        already defaulting somewhere safe. Hide Assigned, create into Human
-        queue with an agent assignee, and let the lane PUT 500."""
+    def test_failed_move_with_an_assignee_reveals_the_hidden_assigned_lane_not_the_requested_one(
+        self, page: Page, agents_base_url
+    ):
+        """Round-3 finding 1: `landedLane` is always the lane the card
+        actually reached — on a failed move that's the tag-derived resting
+        lane (assignee present -> Assigned), never the lane requested. A
+        card created with an assignee into Human queue, whose move PUT then
+        500s, really lands in Assigned — so Assigned must be revealed and
+        show the card, exactly as a successful create into a hidden lane
+        would (round-1 finding 5). Human queue, the *requested* lane the
+        move never reached, must stay hidden and unchecked, and the filter
+        must not persist to localStorage — that's what round 2 wanted
+        proved. Hide both Assigned and Human queue, create into Human queue
+        with an agent assignee, and let the lane PUT 500."""
         task_posts = []
         lane_calls = []
         _open_board(
@@ -1633,22 +1640,29 @@ class TestLaneAddButton:
         )
         page.locator("#board-lane-filter-btn").click()
         page.locator("#board-lane-filter-options input[value='assigned']").uncheck()
+        page.locator("#board-lane-filter-options input[value='human_queue']").uncheck()
         expect(page.locator('.board-lane[data-lane="assigned"]')).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="human_queue"]')).to_have_count(0)
         stored_before = page.evaluate("localStorage.getItem('lifeos.agents.board.lanes')")
 
-        page.locator('.board-lane[data-lane="human_queue"] .board-lane-add').click()
-        page.locator("#new-card-desc").fill("Should not reveal Assigned")
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Should reveal Assigned, not Human queue")
         page.locator("#new-card-assignee").select_option("codex")
+        page.locator("#new-card-lane").select_option("human_queue")
         page.locator("#new-card-create").click()
 
         expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
         _wait_for(lambda: len(task_posts) == 1, page=page)
         expect(page.locator("#new-card-title")).to_have_count(0)
-        expect(page.locator('.board-lane[data-lane="assigned"]')).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_contain_text(
+            "Should reveal Assigned, not Human queue"
+        )
+        expect(page.locator('.board-lane[data-lane="human_queue"]')).to_have_count(0)
         stored_after = page.evaluate("localStorage.getItem('lifeos.agents.board.lanes')")
-        assert stored_after == stored_before, (stored_before, stored_after)
+        assert stored_after != stored_before, (stored_before, stored_after)
         page.locator("#board-lane-filter-btn").click()
-        expect(page.locator("#board-lane-filter-options input[value='assigned']")).not_to_be_checked()
+        expect(page.locator("#board-lane-filter-options input[value='assigned']")).to_be_checked()
+        expect(page.locator("#board-lane-filter-options input[value='human_queue']")).not_to_be_checked()
 
 
 class TestDrawerClickOutsideClose:

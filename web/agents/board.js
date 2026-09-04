@@ -660,13 +660,15 @@ export function initBoard() {
         }
         // A card that landed in a lane the filter is currently hiding would
         // otherwise have zero on-screen feedback — reveal that lane so it's
-        // actually visible (round-1 finding 5). Use the lane the card
-        // actually reached, not the one requested: a failed move never got
-        // there (round-2 finding 1b/2), and a card whose id we never learned
-        // only ever reached the tag-derived lane above (round-2 finding 4).
-        // A failed move must never persist a filter change for a column the
-        // card isn't actually in (round-2 finding 2).
-        if (!moveFailed) ensureLaneVisible(landedLane);
+        // actually visible (round-1 finding 5). landedLane is always the
+        // lane the card actually reached, never the one requested: a failed
+        // move leaves it at the tag-derived resting lane set above (round-2
+        // finding 1b/2), and a card whose id we never learned only ever
+        // reached that same tag-derived lane (round-2 finding 4). So
+        // revealing landedLane can never surface a lane the card isn't
+        // actually in — no separate moveFailed gate is needed (round-3
+        // finding 1).
+        ensureLaneVisible(landedLane);
         cleanup();
       } catch (err) {
         showToast(`Couldn't create card: ${err.message}`, true);
