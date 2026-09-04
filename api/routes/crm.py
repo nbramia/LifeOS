@@ -441,8 +441,10 @@ def _person_to_detail_response(
     include_related: bool = True,
 ) -> PersonDetailResponse:
     """Convert PersonEntity to detailed API response."""
-    # Fetch source entities first for category computation
-    source_entities = []
+    # Fetch source entities first for category computation. When include_related
+    # is False, pass None (not []) so compute_person_category() falls back to its
+    # own internal source-entity fetch instead of skipping that work entirely.
+    source_entities = None
     if include_related:
         source_store = get_source_entity_store()
         source_entities = source_store.get_for_person(person.id, limit=100)

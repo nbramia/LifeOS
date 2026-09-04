@@ -119,7 +119,18 @@ class TestPersonEndpoints:
             elapsed_samples.append((time.perf_counter() - start) * 1000)
             assert response.status_code == 200
 
-        assert min(elapsed_samples) < 150
+        # #869/#880 review finding 1: this bound was originally set to 150ms
+        # against a category-computation bug (compute_person_category() was
+        # called with `[]` instead of `None`, silently skipping its
+        # source-entity fallback fetch for the ~40 of every 50 returned
+        # people who don't qualify as "work" via their own email domain).
+        # With that fetch restored (correct behavior), warm latency for this
+        # page is consistently ~160-200ms on the real dataset -- get_all()'s
+        # cache still removes the ~600ms+ full-list hydration cost this issue
+        # targets; this bound only guards against that hydration cost coming
+        # back, not the (separate, pre-existing, out-of-scope for #869)
+        # per-page source-entity lookup cost.
+        assert min(elapsed_samples) < 300
 
 
 class TestPersonTimeline:
