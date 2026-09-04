@@ -154,6 +154,46 @@ class TestRequestQueryStringRedactionFilter:
         assert "GET /api/crm/people?<redacted> HTTP/1.1" in message
         assert "200" in message
 
+    def test_redacted_record_survives_uvicorns_actual_access_formatter(self):
+        """#907 review round 2 (BLOCKER): uvicorn.logging.AccessFormatter
+        does not call record.getMessage() at all -- it unconditionally
+        unpacks record.args as a 5-tuple and rebuilds the request line from
+        those fields. An earlier version of this filter rewrote record.msg
+        and cleared record.args to (), which made getMessage() look correct
+        (the test above) while silently breaking that unpack: formatting
+        the record for real raised `ValueError: not enough values to
+        unpack`, which is what production's uvicorn.access logger actually
+        emitted -- a 79-line traceback per request with a query string,
+        not an access line. This test would have caught it; the one above
+        could not, because it never involves the real formatter."""
+        from uvicorn.logging import AccessFormatter
+        from api.services.log_redaction import (
+            RequestQueryStringRedactionFilter,
+            REDACTED_QUERY_STRING,
+        )
+
+        marker = "ZZQMARKER7788"
+        record = self._uvicorn_access_record(
+            f"/api/crm/people?q={marker}&sort=strength&limit=5"
+        )
+        RequestQueryStringRedactionFilter().filter(record)
+
+        # The 5-tuple shape AccessFormatter.formatMessage() unpacks must
+        # survive -- this is the regression guard for the fix itself.
+        assert isinstance(record.args, tuple) and len(record.args) == 5
+
+        # uvicorn's actual default access-log format string (config.py's
+        # LOGGING_CONFIG["formatters"]["access"]["fmt"]).
+        fmt = '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+        formatter = AccessFormatter(fmt, use_colors=False)
+
+        formatted = formatter.format(record)  # must not raise
+
+        assert marker not in formatted
+        assert REDACTED_QUERY_STRING in formatted
+        assert "GET /api/crm/people?<redacted> HTTP/1.1" in formatted
+        assert "200" in formatted
+
     def test_leaves_query_string_free_requests_untouched(self):
         from api.services.log_redaction import RequestQueryStringRedactionFilter
 

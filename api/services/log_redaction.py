@@ -127,9 +127,36 @@ class RequestQueryStringRedactionFilter(logging.Filter):
     the CRM people list's search box (personal data: names, partial emails)
     reaches `logs/server.log` even after the handler's own log line (#904)
     stops naming it. Never drops a record, only redacts in place.
+
+    #907 review round 2: ``uvicorn.logging.AccessFormatter.formatMessage``
+    does not call ``record.getMessage()`` at all -- it unconditionally
+    unpacks ``record.args`` as a 5-tuple
+    (``client_addr, method, full_path, http_version, status_code``) and
+    rebuilds the request line from those fields. An earlier version of this
+    filter rewrote ``record.msg`` to the redacted line and cleared
+    ``record.args`` to make ``getMessage()`` return the safe string -- which
+    is exactly right for a *generic* ``logging.Formatter``, but broke
+    uvicorn's formatter: unpacking ``()`` into five names raises
+    ``ValueError: not enough values to unpack``, and that exception, not an
+    access line, is what actually reached ``logs/server.log`` (as a 79-line
+    "Logging error" traceback per request). The fix has to redact
+    ``args[2]`` (the piece the formatter actually reads) in place and leave
+    the 5-tuple shape intact. The ``record.msg``-based rewrite is kept only
+    as a fallback for a record that isn't shaped like uvicorn's own
+    access-log call.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str) and "?" in args[2]:
+            path, _, _query = args[2].partition("?")
+            record.args = (args[0], args[1], path + REDACTED_QUERY_STRING, args[3], args[4])
+            return True
+
+        # Fallback: a record not shaped like uvicorn's access-log call (that
+        # call always hits the branch above). Kept belt-and-braces for any
+        # other caller of this filter, formatted the ordinary way via
+        # record.getMessage()/record.msg.
         try:
             message = record.getMessage()
         except Exception:

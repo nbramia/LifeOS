@@ -37,6 +37,38 @@ def sample_person_id(client):
     pytest.skip("No people in database to test")
 
 
+class TestCRMConfig:
+    """Tests for GET /api/crm/config."""
+
+    def test_photos_enabled_reflects_settings_when_false(self, client):
+        """#907 review round 2, finding 2: the server side of #875's
+        photos_enabled field (web/crm.html's loadCRMConfig() reads it to
+        decide whether to ever request an avatar) had no test -- deleting
+        `photos_enabled=settings.photos_enabled` from get_crm_config()
+        left every other test in this repo green, because
+        CRMConfigResponse.photos_enabled defaults to False and this host
+        has no Photos library configured (settings.photos_enabled is also
+        False here) -- the mutation and the real answer coincided. This
+        pins the False case against the actual settings value; the next
+        test below forces the True case so the field can't be silently
+        hardcoded to False and still pass both."""
+        from config.settings import settings
+
+        response = client.get("/api/crm/config")
+        assert response.status_code == 200
+        assert response.json()["photos_enabled"] == settings.photos_enabled is False
+
+    def test_photos_enabled_reflects_settings_when_true(self, client):
+        from unittest.mock import patch, PropertyMock
+        from config.settings import Settings
+
+        with patch.object(Settings, "photos_enabled", new_callable=PropertyMock, return_value=True):
+            response = client.get("/api/crm/config")
+
+        assert response.status_code == 200
+        assert response.json()["photos_enabled"] is True
+
+
 class TestPersonEndpoints:
     """Tests for /api/crm/people endpoints."""
 
