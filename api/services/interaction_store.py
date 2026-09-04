@@ -4,6 +4,7 @@ Interaction Store for LifeOS People System v2.
 Stores lightweight interaction records with links to sources.
 Each interaction represents a single touchpoint (email, meeting, note mention).
 """
+import bisect
 import sqlite3
 import threading
 import uuid
@@ -11,7 +12,7 @@ import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 from urllib.parse import quote
 
 from config.settings import settings
@@ -1074,6 +1075,431 @@ class InteractionStore:
         finally:
             conn.close()
 
+    # ---- Aggregate queries for the Me/Family dashboards (#871) ----
+    #
+    # These return plain tuples/dicts instead of hydrated Interaction objects,
+    # so a 10-year dashboard window doesn't require constructing (and
+    # datetime-parsing) hundreds of thousands of Python objects just to sum or
+    # bucket them. All of them share `_range_predicate` for their WHERE
+    # clause, which mirrors get_all_in_range's existing index-friendly
+    # convention: bounds are compared as calendar-day strings against the raw
+    # `timestamp` column (no timezone conversion — `timestamp >= 'YYYY-MM-DD'`
+    # is a safe, sargable lower bound regardless of a row's own UTC offset,
+    # since it can only ever be more inclusive than an exact-instant bound,
+    # never less).
+    #
+    # Day-string bounds are exactly what get_all_in_range's callers already
+    # relied on for their day-granular outputs (the heatmap, by_source,
+    # by_month, by_circle, total_count). A few widgets (the 30-day top
+    # contacts list, and the trend/health-period comparisons) apply a
+    # sub-day-precision cutoff in the original code — `exact=True` adds an
+    # additional `julianday(timestamp)` comparison (which SQLite evaluates
+    # offset-aware, matching Python's aware-datetime comparisons) on top of a
+    # one-day-wider version of the same string bound, so the
+    # (person_id, timestamp) index can still narrow rows before the
+    # unindexed julianday() expression runs on what's left.
+
+    def _range_predicate(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+        source_types: Optional[Iterable[str]] = None,
+        gmail_sent_only: bool = False,
+        exact: bool = False,
+        end_inclusive: bool = True,
+        pool_start_date: Optional[datetime] = None,
+        pool_end_date: Optional[datetime] = None,
+    ) -> tuple[str, list]:
+        """
+        Build a WHERE fragment (no leading WHERE) and its params, shared by
+        the aggregate queries below. See the module note above this method
+        for the day-string-vs-exact-instant tradeoff `exact` controls.
+
+        `pool_start_date`/`pool_end_date` AND in an *additional*, always
+        day-string (never `exact`) bound, independent of `start_date`/
+        `end_date`/`exact` above. Use this when a caller needs a sub-day-
+        precision window (`exact=True`) that must still be clipped to a
+        wider day-granular "pool" — e.g. a trend-period comparison whose
+        window can be longer than half of the dashboard's own `days_back`.
+        The original Python implementation combined exactly these two
+        things: an outer `all_interactions` fetch bounded to `days_back`
+        (day-string, matching `get_all_in_range`), then a precise per-item
+        comparison within it — so a trend window that reached further back
+        than `days_back` was silently clipped by the outer fetch. Passing
+        only `start_date`/`end_date` with `exact=True` does NOT reproduce
+        that clipping (its own bound is a same-or-wider index-narrowing
+        margin around the exact window, not the outer pool), which is what
+        made `warming`/`cooling` diverge from the original whenever
+        `2 * trend_days > days_back` (#897 review finding 1).
+
+        Note on the end-date convention (day-string bounds, `pool_end_date`
+        included): comparing an ISO timestamp string (`...T23:59:59+00:00`)
+        against `'<end> 23:59:59'` (a space, not `T`, before the time)
+        lexically excludes every row dated exactly on `end_date`'s calendar
+        day — `'T' > ' '` in ASCII, so any same-day row sorts as "greater
+        than" the bound. This is `get_all_in_range`'s existing convention
+        (unchanged by this method), not something introduced here; the
+        practical effect is that a window's own end day never contributes
+        to the non-`exact` aggregates. Fixing it is out of scope for this
+        change (#897 review finding 8) — noted so the next reader doesn't
+        trust the boundary as exact.
+        """
+        clauses: list[str] = []
+        params: list = []
+
+        if start_date is not None:
+            floor_dt = (start_date - timedelta(days=1)) if exact else start_date
+            clauses.append("timestamp >= ?")
+            params.append(floor_dt.strftime('%Y-%m-%d'))
+            if exact:
+                clauses.append("julianday(timestamp) >= julianday(?)")
+                params.append(start_date.isoformat())
+
+        if end_date is not None:
+            ceil_dt = (end_date + timedelta(days=1)) if exact else end_date
+            clauses.append("timestamp <= ?")
+            params.append(ceil_dt.strftime('%Y-%m-%d 23:59:59'))
+            if exact:
+                op = "<=" if end_inclusive else "<"
+                clauses.append(f"julianday(timestamp) {op} julianday(?)")
+                params.append(end_date.isoformat())
+
+        if pool_start_date is not None:
+            clauses.append("timestamp >= ?")
+            params.append(pool_start_date.strftime('%Y-%m-%d'))
+
+        if pool_end_date is not None:
+            clauses.append("timestamp <= ?")
+            params.append(pool_end_date.strftime('%Y-%m-%d 23:59:59'))
+
+        if person_ids is not None:
+            ids = list(person_ids)
+            if not ids:
+                # An explicit empty id set matches nothing (avoids `IN ()`).
+                clauses.append("1=0")
+            else:
+                clauses.append(f"person_id IN ({','.join('?' * len(ids))})")
+                params.extend(ids)
+
+        if exclude_person_ids:
+            ids = list(exclude_person_ids)
+            clauses.append(f"person_id NOT IN ({','.join('?' * len(ids))})")
+            params.extend(ids)
+
+        if source_types:
+            types = list(source_types)
+            clauses.append(f"source_type IN ({','.join('?' * len(types))})")
+            params.extend(types)
+
+        if gmail_sent_only:
+            # Matches the "Me" dashboard's historical rule of only counting
+            # sent email (title prefix "→ "), never received/cc'd email.
+            clauses.append("(source_type != 'gmail' OR title LIKE '→%')")
+
+        return (" AND ".join(clauses) if clauses else "1=1"), params
+
+    def get_span(
+        self,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """
+        Earliest and latest interaction timestamps (as stored, ISO strings),
+        optionally restricted to (or excluding) a set of person ids. Excludes
+        UNDATED_SENTINEL rows (undated vault notes deliberately stored at
+        1970-01-01, exempted from the normal minimum-timestamp validation) —
+        without that floor, one such note would make the span (and so the Me
+        dashboard's heatmap window) span back to 1970 regardless of when
+        real interactions actually started.
+
+        Used to size the Me dashboard's default heatmap window from the
+        actual span of data instead of requesting a fixed 10 years and
+        shrinking the display afterward.
+
+        Implemented as two `ORDER BY ... LIMIT 1` queries rather than
+        `SELECT MIN(timestamp), MAX(timestamp)`: SQLite can answer each via a
+        single index seek that stops at the first row satisfying the
+        (typically large, e.g. thousands of hidden/peripheral ids)
+        `exclude_person_ids` filter, whereas combining MIN and MAX into one
+        aggregate query forces a full-table scan on this schema (measured
+        ~300ms+ vs ~5ms on the production dataset with a large exclude list).
+        """
+        floor = _MIN_TIMESTAMP
+        where, params = self._range_predicate(
+            start_date=floor, person_ids=person_ids, exclude_person_ids=exclude_person_ids,
+        )
+        conn = self._get_connection()
+        try:
+            earliest_row = conn.execute(
+                f"SELECT timestamp FROM interactions WHERE {where} ORDER BY timestamp ASC LIMIT 1",
+                params,
+            ).fetchone()
+            latest_row = conn.execute(
+                f"SELECT timestamp FROM interactions WHERE {where} ORDER BY timestamp DESC LIMIT 1",
+                params,
+            ).fetchone()
+            earliest = earliest_row[0] if earliest_row else None
+            latest = latest_row[0] if latest_row else None
+            return (earliest, latest)
+        finally:
+            conn.close()
+
+    def get_daily_source_counts(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+        source_types: Optional[Iterable[str]] = None,
+        gmail_sent_only: bool = False,
+    ) -> list[tuple[str, str, int]]:
+        """
+        Grouped (day, source_type) -> count within [start_date, end_date].
+
+        `day` is the literal "YYYY-MM-DD" prefix of the stored timestamp
+        string (via `substr`, not SQLite's `date()`, which would convert to
+        UTC first) — this matches the historical behavior of parsing the ISO
+        string into an aware datetime and formatting its own date fields
+        as-is, which never shifts across the stored offset.
+        """
+        where, params = self._range_predicate(
+            start_date, end_date, person_ids, exclude_person_ids, source_types, gmail_sent_only,
+        )
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"""
+                SELECT substr(timestamp, 1, 10) as day, source_type, COUNT(*) as cnt
+                FROM interactions
+                WHERE {where}
+                GROUP BY day, source_type
+                """,
+                params,
+            )
+            return [(row[0], row[1], row[2]) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_daily_person_source_counts(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+        source_types: Optional[Iterable[str]] = None,
+        gmail_sent_only: bool = False,
+    ) -> list[tuple[str, str, str, int]]:
+        """
+        Grouped (day, person_id, source_type) -> count within [start_date,
+        end_date] — a single pass covering what would otherwise be separate
+        full-window scans for day-level, person-level, and per-month
+        breakdowns.
+
+        Worth it whenever a caller needs day-level, person-level, AND
+        per-source breakdowns from the SAME window: on a real dataset where a
+        large fraction of people are excluded (e.g. many peripheral
+        contacts), passing that exclusion here as `exclude_person_ids` still
+        costs a per-row `NOT IN` membership check across the whole scanned
+        range (measured ~250-400ms for a 10-year window on production,
+        regardless of which columns are grouped — the exclusion check
+        dominates, not the grouping). A caller that's going to iterate the
+        (already much smaller, grouped) result in Python anyway should
+        usually skip exclude_person_ids/person_ids here and filter with a
+        Python `set` instead, which is a hash lookup per grouped row rather
+        than a per-raw-row SQL scan.
+        """
+        where, params = self._range_predicate(
+            start_date, end_date, person_ids, exclude_person_ids, source_types, gmail_sent_only,
+        )
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"""
+                SELECT substr(timestamp, 1, 10) as day, person_id, source_type, COUNT(*) as cnt
+                FROM interactions
+                WHERE {where}
+                GROUP BY day, person_id, source_type
+                """,
+                params,
+            )
+            return [(row[0], row[1], row[2], row[3]) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_person_counts(
+        self,
+        start_date: Optional[datetime],
+        end_date: Optional[datetime],
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+        source_types: Optional[Iterable[str]] = None,
+        gmail_sent_only: bool = False,
+        exact: bool = False,
+        end_inclusive: bool = True,
+        pool_start_date: Optional[datetime] = None,
+        pool_end_date: Optional[datetime] = None,
+    ) -> dict[str, int]:
+        """
+        Grouped person_id -> count within [start_date, end_date].
+
+        Pass exact=True for sub-day-precision windows (e.g. the "last 30
+        days" top-contacts cutoff, or a trend comparison anchored to the
+        exact request time) — see `_range_predicate`. `end_inclusive=False`
+        excludes the end instant itself, for a "previous period" bucket that
+        must not double-count the instant where the "recent period" begins.
+        `end_date=None` omits the exact upper bound entirely (e.g. "last 30
+        days" has no upper cutoff of its own beyond the outer window) —
+        pass `pool_start_date`/`pool_end_date` for that outer window, which
+        AND in as day-string bounds regardless of `exact`.
+        """
+        where, params = self._range_predicate(
+            start_date, end_date, person_ids, exclude_person_ids, source_types,
+            gmail_sent_only, exact=exact, end_inclusive=end_inclusive,
+            pool_start_date=pool_start_date, pool_end_date=pool_end_date,
+        )
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT person_id, COUNT(*) FROM interactions WHERE {where} GROUP BY person_id",
+                params,
+            )
+            return {row[0]: row[1] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
+    def get_bucketed_counts(
+        self,
+        time_points: list[datetime],
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+        source_types: Optional[Iterable[str]] = None,
+        gmail_sent_only: bool = False,
+        pool_start_date: Optional[datetime] = None,
+        pool_end_date: Optional[datetime] = None,
+    ) -> list[int]:
+        """
+        Counts interactions into the periods bounded by consecutive
+        `time_points`: bucket i is `(prev, time_points[i]]`, where `prev` is
+        `time_points[i-1]` or, for bucket 0, one inter-point interval before
+        `time_points[0]` — the same rule `_bucket_counts_by_period`
+        (api/routes/crm.py) implements for a list of already-hydrated items.
+
+        Fetches only `julianday(timestamp)` for the matching rows (no
+        person_id, no other columns) and buckets them with `bisect` in
+        Python, rather than one `SUM(CASE ...)` expression per bucket in
+        SQL: measured on the production dataset, a single combined
+        multi-bucket CASE query still has to evaluate every bucket's
+        `julianday()` comparison against every matching row (13 buckets x
+        ~150,000 rows for the health-score widget's "top 25 by relationship
+        strength" population), whereas computing `julianday()` once per row
+        and then binary-searching a handful of boundaries is measurably
+        faster (~320ms vs ~490ms) despite transferring the (still small
+        relative to a full hydration) row set instead of none.
+
+        Returns `[]` for an empty `time_points`; otherwise one int per
+        bucket, in `time_points` order.
+        """
+        if not time_points:
+            return []
+
+        bounds: list[tuple[datetime, datetime]] = []
+        for i, point in enumerate(time_points):
+            if i == 0:
+                interval = (
+                    (time_points[1] - time_points[0])
+                    if len(time_points) > 1 else timedelta(days=14)
+                )
+                prev = point - interval
+            else:
+                prev = time_points[i - 1]
+            bounds.append((prev, point))
+
+        where, where_params = self._range_predicate(
+            None, None, person_ids, exclude_person_ids, source_types, gmail_sent_only,
+            pool_start_date=pool_start_date, pool_end_date=pool_end_date,
+        )
+
+        # One query to resolve every distinct boundary datetime to SQLite's
+        # own julianday() value (so bucket comparisons below use the exact
+        # same conversion as the row fetch, not a Python reimplementation
+        # of it), instead of one query per boundary.
+        boundary_dts: list[datetime] = []
+        seen: set[str] = set()
+        for prev, point in bounds:
+            for dt in (prev, point):
+                key = dt.isoformat()
+                if key not in seen:
+                    seen.add(key)
+                    boundary_dts.append(dt)
+
+        conn = self._get_connection()
+        try:
+            boundary_exprs = ", ".join("julianday(?)" for _ in boundary_dts)
+            boundary_row = conn.execute(
+                f"SELECT {boundary_exprs}",
+                [dt.isoformat() for dt in boundary_dts],
+            ).fetchone()
+            jd_for = {dt.isoformat(): boundary_row[i] for i, dt in enumerate(boundary_dts)}
+
+            rows = conn.execute(
+                f"SELECT julianday(timestamp) FROM interactions WHERE {where}",
+                where_params,
+            ).fetchall()
+        finally:
+            conn.close()
+
+        jds = sorted(row[0] for row in rows)
+        counts = []
+        for prev, point in bounds:
+            lo = bisect.bisect_right(jds, jd_for[prev.isoformat()])
+            hi = bisect.bisect_right(jds, jd_for[point.isoformat()])
+            counts.append(hi - lo)
+        return counts
+
+    def get_person_julianday_timestamps(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+    ) -> list[tuple[str, float]]:
+        """
+        (person_id, julianday(timestamp)) tuples within [start_date,
+        end_date] — a covering-index query (person_id + timestamp only, no
+        source_type) for widgets that need exact per-interaction timestamps
+        for a specific set of people but don't care what kind of
+        interaction it was (e.g. neglected-contacts' median-gap
+        calculation). Returns julian-day floats rather than parsed
+        datetimes so gap arithmetic is plain float subtraction (1.0 == one
+        day) instead of building a datetime per row; use get_julianday(dt)
+        to get a directly-comparable value for "now" or any other cutoff.
+        """
+        where, params = self._range_predicate(start_date, end_date, person_ids, exclude_person_ids)
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT person_id, julianday(timestamp) FROM interactions WHERE {where}",
+                params,
+            )
+            return [(row[0], row[1]) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_julianday(self, dt: datetime) -> float:
+        """
+        Julian day number for a given datetime, computed the same way
+        SQLite's julianday() computes it for a UTC or UTC-offset ISO8601
+        string (days since the Julian epoch, with 1970-01-01T00:00:00Z =
+        2440587.5) — avoids opening a connection to evaluate one scalar
+        (#897 review nit 3). A naive dt is treated as UTC, matching
+        SQLite's own treatment of an offset-less timestamp string.
+        """
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (dt - datetime(1970, 1, 1, tzinfo=timezone.utc)).total_seconds() / 86400.0 + 2440587.5
+
     def get_conversation_context(
         self,
         interaction_id: str,
@@ -1362,6 +1788,7 @@ class InteractionStore:
         self,
         start_date: datetime,
         end_date: datetime,
+        person_ids: Optional[list[str]] = None,
         exclude_person_ids: list[str] = None,
         source_type: Optional[str] = None,
         limit: Optional[int] = None,
@@ -1375,6 +1802,10 @@ class InteractionStore:
         Args:
             start_date: Start of date range (inclusive)
             end_date: End of date range (inclusive)
+            person_ids: If given, restrict to interactions with these person
+                        ids (SQL `person_id IN (...)`) instead of everyone —
+                        used by the Family dashboard so it never loads
+                        interactions for people outside the selection.
             exclude_person_ids: Person IDs to exclude (e.g., self)
             source_type: Filter by source type. Supports comma-separated values
                          (e.g., "imessage,whatsapp" for messages).
@@ -1383,6 +1814,15 @@ class InteractionStore:
 
         Returns:
             List of interactions in the date range
+
+        Note: `end_date`'s own calendar day is silently excluded — the
+        `timestamp <= '<end> 23:59:59'` bound compares against a string with
+        a space before the time, and every stored timestamp has a `T`
+        there instead, which sorts as "greater than" for any row on that
+        day. Pre-existing, not something to rely on as exact — see
+        `_range_predicate`'s docstring for the full explanation (that
+        helper reproduces this same convention for the newer aggregate
+        queries below).
         """
         conn = self._get_connection()
         try:
@@ -1417,6 +1857,15 @@ class InteractionStore:
                     WHERE timestamp >= ? AND timestamp <= ?
                 """
             params = [start_str, end_str]
+
+            # Restrict to specific person IDs if provided
+            if person_ids is not None:
+                if not person_ids:
+                    query += " AND 1=0"
+                else:
+                    placeholders = ','.join('?' * len(person_ids))
+                    query += f" AND person_id IN ({placeholders})"
+                    params.extend(person_ids)
 
             # Exclude specific person IDs if provided
             if exclude_person_ids:

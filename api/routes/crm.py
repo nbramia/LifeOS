@@ -5,10 +5,11 @@ Provides comprehensive endpoints for managing people, relationships,
 and entity linking workflows.
 """
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 import asyncio
+import bisect
 import json
 import logging
 import sqlite3
@@ -80,6 +81,77 @@ def _get_strength_override(person_id: str) -> float | None:
     if not person_id:
         return None
     return STRENGTH_OVERRIDES_BY_ID.get(person_id)
+
+
+def _me_exclude_ids(person_store, all_people: Optional[list] = None) -> list[str]:
+    """
+    Self + hidden + peripheral + merged-secondary person ids — the
+    population both /me/interactions and /me/interactions/span exclude.
+
+    Pass `all_people` (from a get_all() the caller already has, e.g.
+    /me/interactions) to derive peripheral ids from it directly instead of
+    an extra query. Without it, peripheral ids come from a targeted
+    `is_peripheral_contact = 1` query — the lightweight path
+    /me/interactions/span uses to stay well under its own latency budget.
+    Merged-secondary ids are normally already hidden (merge_people.py sets
+    hidden=1 on the secondary), so including them here is mostly a
+    defensive belt-and-suspenders exclusion (#897 review finding 6).
+    """
+    hidden_ids = person_store.get_hidden_ids()
+    if all_people is not None:
+        peripheral_ids = {p.id for p in all_people if p.is_peripheral_contact}
+    else:
+        peripheral_ids = person_store.get_ids_where("is_peripheral_contact", 1)
+    merged_ids = person_store.get_merged_secondary_ids()
+    return [MY_PERSON_ID] + list(hidden_ids | peripheral_ids | merged_ids)
+
+
+def _bucket_counts_by_period(
+    items: list, time_points: list[datetime], get_ts=lambda item: item.timestamp,
+) -> list[int]:
+    """
+    Count `items` into the periods bounded by consecutive `time_points`:
+    each bucket i is `(time_points[i-1], time_points[i]]` (bucket 0 uses a
+    synthetic lower bound one inter-point interval before `time_points[0]`),
+    matching the health-score/tracked-relationship widgets' bucketing rule
+    exactly. `get_ts` extracts each item's raw timestamp — the default reads
+    `.timestamp` (for a list of Interaction objects); pass
+    `get_ts=lambda ts: ts` for a list of already-resolved datetimes.
+
+    O(N log N) — every timestamp is resolved and sorted once, then each
+    bucket's count comes from two `bisect` lookups — instead of the
+    equivalent O(len(time_points) * N) of comparing every interaction
+    against every bucket boundary directly. On the production dataset, the
+    "top 25 by relationship strength" or "circles 0-3" restrictions this
+    feeds from turn out to still mean hundreds of thousands of interactions
+    (close family and friends are, unsurprisingly, the highest-volume
+    contacts), so the nested-loop version was the dominant cost in the
+    /me/interactions request, not the SQL fetching it replaced.
+    """
+    resolved: list[datetime] = []
+    for item in items:
+        ts = get_ts(item)
+        if not ts:
+            continue
+        if hasattr(ts, 'tzinfo'):
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        else:
+            ts = datetime.fromisoformat(str(ts)[:10]).replace(tzinfo=timezone.utc)
+        resolved.append(ts)
+    resolved.sort()
+
+    counts = []
+    for i, point_date in enumerate(time_points):
+        if i == 0:
+            interval = (time_points[1] - time_points[0]).days if len(time_points) > 1 else 14
+            prev_date = point_date - timedelta(days=interval)
+        else:
+            prev_date = time_points[i - 1]
+        lo = bisect.bisect_right(resolved, prev_date)
+        hi = bisect.bisect_right(resolved, point_date)
+        counts.append(hi - lo)
+    return counts
 
 
 def _tokenize(text: str) -> list[str]:
@@ -2984,6 +3056,13 @@ class MeInteractionsResponse(BaseModel):
     tracked_relationships: list[TrackedRelationship] = []  # Parent/Coparent tracking
 
 
+class MeInteractionsSpanResponse(BaseModel):
+    """Earliest/latest interaction dates, for sizing the Me heatmap window."""
+    earliest: Optional[str] = None  # ISO timestamp, or null if there's no data
+    latest: Optional[str] = None
+    years: int  # Suggested heatmap window, clamped to [1, 10]
+
+
 class FamilyMember(BaseModel):
     """Family member for multi-select dropdown and visualizations."""
     id: str
@@ -3040,25 +3119,18 @@ def get_me_stats():
     """
     Get aggregate statistics for the owner's personal dashboard.
 
-    Returns total counts across all people in the CRM.
+    Returns total counts across all non-hidden, non-merged people in the CRM,
+    computed with a single SQL SUM instead of loading every PersonEntity.
     """
     person_store = get_person_entity_store()
-    _interaction_store = get_interaction_store()  # noqa: F841
 
-    # Get all people
-    all_people = person_store.get_all()
-    total_people = len(all_people)
-
-    # Aggregate stats from all people
-    total_emails = sum(p.email_count for p in all_people)
-    total_meetings = sum(p.meeting_count for p in all_people)
-    total_messages = sum(p.message_count for p in all_people)
+    totals = person_store.get_totals()
 
     return MeStatsResponse(
-        total_people=total_people,
-        total_emails=total_emails,
-        total_meetings=total_meetings,
-        total_messages=total_messages,
+        total_people=totals["total_people"],
+        total_emails=totals["total_emails"],
+        total_meetings=totals["total_meetings"],
+        total_messages=totals["total_messages"],
     )
 
 
@@ -3098,10 +3170,9 @@ def get_me_timeline(
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
-    # Get hidden person IDs to exclude from results
-    hidden_person_ids = {
-        p.id for p in person_store.get_all(include_hidden=True) if p.hidden
-    }
+    # Get hidden person IDs to exclude from results (targeted query, not a
+    # full people load)
+    hidden_person_ids = person_store.get_hidden_ids()
 
     # Get all interactions, excluding self and hidden people
     # Note: We fetch extra for pagination (offset + limit + 1 to check has_more)
@@ -3114,8 +3185,9 @@ def get_me_timeline(
         specific_date=date,
     )
 
-    # Build person lookup for adding person names to timeline items
-    person_lookup = {p.id: p for p in person_store.get_all()}
+    # Batch-lookup names only for the (small, already-paginated) people
+    # referenced by this page's interactions, instead of loading everyone.
+    person_lookup = person_store.get_by_ids({i.person_id for i in interactions}, exclude_hidden=True)
 
     # Filter to only include interactions with known (non-orphaned) person IDs
     interactions = [i for i in interactions if i.person_id in person_lookup]
@@ -3166,14 +3238,19 @@ def get_me_interactions(
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
-    # Build person lookup for names (excludes hidden people by default)
+    # Single full-person-list load. Cheap (#880 caches this), and genuinely
+    # needed here (unlike the other Me/Family handlers): the health-score
+    # widget's "top 25 family/personal contacts" is chosen by
+    # relationship_strength across ALL people regardless of whether they have
+    # interactions in this window, so it can't be derived from a
+    # window-scoped aggregate the way daily/top_contacts/trends can.
     all_people = person_store.get_all()
     person_lookup = {p.id: p for p in all_people}
 
-    # Get hidden person IDs to exclude from metrics
-    hidden_person_ids = {
-        p.id for p in person_store.get_all(include_hidden=True) if p.hidden
-    }
+    # Get hidden person IDs (targeted query) — used on its own below by the
+    # network-growth widget, which checks self/hidden/peripheral/orphaned
+    # separately rather than via one combined exclude set.
+    hidden_person_ids = person_store.get_hidden_ids()
 
     # Get peripheral contact IDs to exclude from counts
     # These are people with is_peripheral_contact=True (relationship_strength < 3.0)
@@ -3181,18 +3258,16 @@ def get_me_interactions(
         p.id for p in all_people if p.is_peripheral_contact
     }
 
-    # Get all interactions in date range, excluding self, hidden, and peripheral contacts
-    all_interactions_raw = interaction_store.get_all_in_range(
-        start_date=start_date,
-        end_date=end_date,
-        exclude_person_ids=[MY_PERSON_ID] + list(hidden_person_ids) + list(peripheral_person_ids),
-    )
-
-    # Filter to only include interactions with known (non-orphaned) person IDs
-    all_interactions = [
-        i for i in all_interactions_raw
-        if i.person_id in person_lookup
-    ]
+    # Self + hidden + peripheral + merged-secondary — shared with
+    # /me/interactions/span so both exclude the same population (#897
+    # review finding 6).
+    exclude_ids = _me_exclude_ids(person_store, all_people)
+    # A separate set for Python-side `in` checks (e.g. filtering window_rows
+    # below): `exclude_ids` itself stays a list because SQL query building
+    # needs an ordered sequence of params, but a list `in` check is O(n) per
+    # lookup — against ~9,500 excluded ids here, that turned a ~50,000-row
+    # Python loop into thousands of times more comparisons than necessary.
+    exclude_id_set = set(exclude_ids)
 
     # Use pre-computed Dunbar circles from person entities
     circle_map = {
@@ -3201,16 +3276,6 @@ def get_me_interactions(
     }
     circle_map[MY_PERSON_ID] = -1  # Self
 
-    # Aggregation structures
-    daily_data = defaultdict(lambda: {"total": 0, "sources": defaultdict(int)})
-    by_source = defaultdict(int)
-    by_month = defaultdict(int)
-    by_circle = defaultdict(int)
-    person_counts_30d = defaultdict(int)
-    person_counts_recent = defaultdict(int)
-    person_counts_previous = defaultdict(int)
-
-    # Date boundaries for trends based on period
     now = datetime.now(timezone.utc)
     period_days = {
         "week": 7,
@@ -3223,67 +3288,81 @@ def get_me_interactions(
     trend_previous_start = now - timedelta(days=trend_days * 2)
     thirty_days_ago = now - timedelta(days=30)
 
-    total_count = 0
+    # ---- Daily heatmap + by_source/by_month/total_count/by_circle/messaging ----
+    # A single (day, person_id, source_type) scan of the window instead of
+    # separate day+source, person, and person+month scans. On the production
+    # dataset, most of the window's ~9,500 hidden/peripheral/self people make
+    # a SQL `person_id NOT IN (...)` exclusion filter expensive (measured
+    # ~250-400ms per full-window scan REGARDLESS of which columns are
+    # grouped — the per-row membership check against ~9,500 ids dominates,
+    # not the grouping itself), so exclusion happens here in Python as a
+    # `set` lookup against the already-small GROUPED rows instead — free
+    # since every widget below iterates them anyway. This also folds in the
+    # same "known (non-orphaned) person id" check the old code applied via
+    # `if i.person_id in person_lookup`, and what used to be three separate
+    # full-window queries (one each for day-level, person-level, and
+    # per-month breakdowns) into one.
+    # "Only count SENT emails" is the /me dashboard's one global rule
+    # (gmail_sent_only=True), matching the single upstream
+    # `if source == 'gmail' ... continue` the old code applied once to a
+    # shared all_interactions list.
+    window_rows = interaction_store.get_daily_person_source_counts(
+        start_date, end_date, gmail_sent_only=True,
+    )
 
-    for interaction in all_interactions:
-        # Get date string
-        if interaction.timestamp:
-            if hasattr(interaction.timestamp, 'strftime'):
-                ts = interaction.timestamp
-                # Ensure timezone-aware for comparisons
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                date_str = ts.strftime('%Y-%m-%d')
-                month_str = ts.strftime('%Y-%m')
-            else:
-                date_str = str(interaction.timestamp)[:10]
-                month_str = date_str[:7]
-                ts = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
-        else:
+    daily_data = defaultdict(lambda: {"total": 0, "sources": defaultdict(int)})
+    by_source = defaultdict(int)
+    by_month = defaultdict(int)
+    by_circle = defaultdict(int)
+    total_count = 0
+    monthly_messaging = defaultdict(lambda: {
+        "total": 0,
+        "by_circle": defaultdict(int),
+        "people_by_circle": defaultdict(set),  # circle -> set of person_ids
+    })
+    MESSAGING_SOURCES = {'imessage', 'whatsapp'}
+
+    for day, person_id, source, cnt in window_rows:
+        if person_id not in person_lookup or person_id in exclude_id_set:
             continue
 
-        source = (interaction.source_type or "unknown").lower()
-        person_id = interaction.person_id
+        daily_data[day]["total"] += cnt
+        daily_data[day]["sources"][source] += cnt
+        by_source[source] += cnt
+        by_month[day[:7]] += cnt
+        total_count += cnt
+
         circle = circle_map.get(person_id, 7)
+        by_circle[str(circle)] += cnt
 
-        # For /me dashboard: only count SENT emails (title starts with →)
-        # Received emails (←) are excluded to focus on outbound activity
-        if source == 'gmail':
-            title = interaction.title or ""
-            is_sent = title.startswith("→")
-            if not is_sent:
-                continue  # Skip received emails entirely
+        if source in MESSAGING_SOURCES:
+            month_key = day[:7]
+            messaging_circle = min(circle, 5)  # circles 5+ grouped as "outer"
+            monthly_messaging[month_key]["total"] += cnt
+            monthly_messaging[month_key]["by_circle"][str(messaging_circle)] += cnt
+            monthly_messaging[month_key]["people_by_circle"][str(messaging_circle)].add(person_id)
 
-        # Daily aggregates
-        daily_data[date_str]["total"] += 1
-        daily_data[date_str]["sources"][source] += 1
-
-        # Breakdown totals
-        by_source[source] += 1
-        by_month[month_str] += 1
-        by_circle[str(circle)] += 1
-
-        # Top contacts (last 30 days)
-        if ts >= thirty_days_ago:
-            person_counts_30d[person_id] += 1
-
-        # Trend data (period-based comparison)
-        if ts >= trend_recent_start:
-            person_counts_recent[person_id] += 1
-        elif ts >= trend_previous_start:
-            person_counts_previous[person_id] += 1
-
-        total_count += 1
-
-    # Build daily aggregates list
     daily_list = [
         DailyAggregate(date=date, total=data["total"], sources=dict(data["sources"]))
         for date, data in sorted(daily_data.items())
     ]
 
-    # Build top contacts (top 10 by count in last 30 days)
+    # ---- Top contacts (last 30 days) ----
+    # `pool_start_date`/`pool_end_date` reproduce the original algorithm's
+    # outer `all_interactions` pool (bounded to `days_back`, day-string,
+    # including its end-date exclusion quirk — see _range_predicate) ANDed
+    # with the exact "last 30 days" lower-bound check the old Python code
+    # applied within it. Without the pool bound, this query would look
+    # further back than `days_back` whenever the caller asks for a shorter
+    # window than 30 days (#897 review finding 1). There is no exact upper
+    # bound here — the old `if ts >= thirty_days_ago:` check had none of its
+    # own either, relying entirely on the pool's own end_date.
+    top_counts = interaction_store.get_person_counts(
+        thirty_days_ago, None, exclude_person_ids=exclude_ids, gmail_sent_only=True, exact=True,
+        pool_start_date=start_date, pool_end_date=end_date,
+    )
     top_contacts = []
-    for person_id, count in sorted(person_counts_30d.items(), key=lambda x: -x[1])[:10]:
+    for person_id, count in sorted(top_counts.items(), key=lambda x: -x[1])[:10]:
         person = person_lookup.get(person_id)
         top_contacts.append(TopContact(
             person_id=person_id,
@@ -3291,13 +3370,31 @@ def get_me_interactions(
             count=count,
         ))
 
-    # Build trend data (warming and cooling)
+    # ---- Trend data (warming and cooling) ----
+    # Same pool-clamping as top_contacts above: a trend period longer than
+    # half of `days_back` (e.g. trend_period="year" with a short
+    # `days_back`) must not reach further back than the outer window did in
+    # the original algorithm (#897 review finding 1).
+    # The "previous" bucket also excludes its upper edge so it never
+    # double-counts the exact instant where the "recent" bucket begins
+    # (matching the old `if ts >= trend_recent_start: ... elif ts >=
+    # trend_previous_start:`) — that boundary is unrelated to the pool and
+    # stays an exact julianday comparison.
+    recent_counts = interaction_store.get_person_counts(
+        trend_recent_start, None, exclude_person_ids=exclude_ids, gmail_sent_only=True, exact=True,
+        pool_start_date=start_date, pool_end_date=end_date,
+    )
+    previous_counts = interaction_store.get_person_counts(
+        trend_previous_start, trend_recent_start, exclude_person_ids=exclude_ids,
+        gmail_sent_only=True, exact=True, end_inclusive=False,
+        pool_start_date=start_date, pool_end_date=end_date,
+    )
     warming = []
     cooling = []
-    all_person_ids = set(person_counts_recent.keys()) | set(person_counts_previous.keys())
+    all_person_ids = set(recent_counts.keys()) | set(previous_counts.keys())
     for person_id in all_person_ids:
-        recent = person_counts_recent.get(person_id, 0)
-        prev = person_counts_previous.get(person_id, 0)
+        recent = recent_counts.get(person_id, 0)
+        prev = previous_counts.get(person_id, 0)
         if recent == prev:
             continue
         person = person_lookup.get(person_id)
@@ -3324,78 +3421,25 @@ def get_me_interactions(
     # Limited to top 25 family/personal contacts by relationship strength
     HEALTH_INTERACTION_TYPES = {'imessage', 'whatsapp', 'phone', 'phone_call', 'calendar', 'gmail'}
 
-    # Get top 25 family/personal contacts by relationship strength
+    # Get top 25 family/personal contacts by relationship strength (chosen
+    # from the full person list — lifetime relationship_strength, not
+    # windowed — so this can't come from a window-scoped aggregate)
     personal_family_people = [
         p for p in person_lookup.values()
         if p.category in ('family', 'personal') and p.id != MY_PERSON_ID
     ]
     personal_family_people.sort(key=lambda p: p.relationship_strength or 0, reverse=True)
-    top_25_ids = {p.id for p in personal_family_people[:25]}
+    top_25_ids = [p.id for p in personal_family_people[:25]]
 
-    # Filter to personal interactions with top 25 family/personal contacts
-    personal_interactions = [
-        i for i in all_interactions
-        if (i.source_type or "").lower() in HEALTH_INTERACTION_TYPES
-        and i.person_id in top_25_ids
+    # 2. Neglected Contacts candidates.
+    # People in circles 0-3 who haven't been contacted in longer than their typical gap
+    neglect_candidate_ids = [
+        pid for pid, circle in circle_map.items()
+        if pid != MY_PERSON_ID and circle <= 3 and pid not in peripheral_person_ids
     ]
 
-    # Current health score will be calculated after we build the history
-    health_score = 0
-
-    # 2. Neglected Contacts
-    # People in circles 0-3 who haven't been contacted in longer than their typical gap
-    neglected = []
-    person_interaction_dates = defaultdict(list)
-    for interaction in all_interactions:
-        if interaction.timestamp:
-            ts = interaction.timestamp
-            if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            elif not hasattr(ts, 'tzinfo'):
-                ts = datetime.fromisoformat(str(ts)[:10]).replace(tzinfo=timezone.utc)
-            person_interaction_dates[interaction.person_id].append(ts)
-
-    for person_id, dates in person_interaction_dates.items():
-        person = person_lookup.get(person_id)
-        if not person:
-            continue
-        circle = circle_map.get(person_id, 7)
-        if circle > 3:  # Only alert for circles 0-3
-            continue
-        if len(dates) < 5:  # Need meaningful history to establish pattern
-            continue
-        dates_sorted = sorted(dates)
-        # Calculate typical gap (median of gaps, excluding outliers)
-        gaps = [(dates_sorted[i+1] - dates_sorted[i]).days for i in range(len(dates_sorted)-1)]
-        if not gaps:
-            continue
-        # Use median of gaps
-        gaps_sorted = sorted(gaps)
-        typical_gap = gaps_sorted[len(gaps_sorted)//2]
-        # Minimum based on circle - closer relationships have lower thresholds
-        min_gap = {0: 3, 1: 5, 2: 7, 3: 14}.get(circle, 14)
-        if typical_gap < min_gap:
-            typical_gap = min_gap
-        # Days since last contact
-        last_contact = dates_sorted[-1]
-        days_since = (now - last_contact).days
-        # Alert if 1.5x typical gap has passed (was 2x, now more sensitive)
-        if days_since > typical_gap * 1.5:
-            neglected.append(NeglectedContact(
-                person_id=person_id,
-                person_name=person.canonical_name,
-                days_since_contact=days_since,
-                typical_gap_days=typical_gap,
-                dunbar_circle=circle,
-            ))
-    # Sort by circle (closer first), then by how overdue they are
-    neglected.sort(key=lambda x: (x.dunbar_circle, -(x.days_since_contact / x.typical_gap_days)))
-
-    # 2b. Health Score History (longitudinal) - using "vs. average" approach
-    # Count personal interactions per period, score relative to average
-    health_score_history = []
-
-    # Determine time points based on health_period
+    # Determine health-score time points now (moved up from where they used
+    # to live, right before the SQL-side bucket query below).
     if health_period == "month":
         total_days = 61  # ~2 months
         num_points = 9
@@ -3409,28 +3453,92 @@ def get_me_interactions(
     time_points = [now - timedelta(days=int(i * total_days / (num_points - 1))) for i in range(num_points)]
     time_points = sorted(time_points)  # oldest first
 
-    # First pass: collect raw personal interaction counts for each period
-    health_raw_counts = []
-    for i, point_date in enumerate(time_points):
-        if i == 0:
-            interval = (time_points[1] - time_points[0]).days if len(time_points) > 1 else 14
-            prev_date = point_date - timedelta(days=interval)
-        else:
-            prev_date = time_points[i - 1]
+    # SQL-side bucket counts for the health score (#897 review finding 3):
+    # one SUM(CASE ...) per time-point bucket over the top-25 population,
+    # instead of fetching every one of their interactions and bisecting in
+    # Python. On the production dataset "top 25 by relationship strength"
+    # still means hundreds of thousands of interactions (the closest
+    # family/friends are, unsurprisingly, the highest-volume contacts), so
+    # this is the difference between returning ~13 numbers and
+    # hydrating/parsing every row. `pool_start_date`/`pool_end_date`
+    # reproduce the original algorithm's outer `all_interactions` pool
+    # bound (day-string, matching get_all_in_range), since the old
+    # `personal_interactions` this fed from was filtered from that same
+    # pool.
+    health_raw_counts = interaction_store.get_bucketed_counts(
+        time_points, person_ids=top_25_ids, exclude_person_ids=exclude_ids,
+        source_types=HEALTH_INTERACTION_TYPES,
+        pool_start_date=start_date, pool_end_date=end_date,
+    ) if top_25_ids else [0] * len(time_points)
 
-        # Count personal interactions in this period
-        period_count = 0
-        for interaction in personal_interactions:
-            if interaction.timestamp:
-                ts = interaction.timestamp
-                if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                elif not hasattr(ts, 'tzinfo'):
-                    ts = datetime.fromisoformat(str(ts)[:10]).replace(tzinfo=timezone.utc)
-                if prev_date < ts <= point_date:
-                    period_count += 1
+    # Current health score will be calculated after we build the history
+    health_score = 0
 
-        health_raw_counts.append(period_count)
+    # A covering (person_id, timestamp)-index query — no source_type, since
+    # neglected-contacts considers every interaction type, unlike health
+    # score — restricted to a small, specifically named set of people
+    # (#897 review finding 3). Returns julian-day floats directly so the
+    # gap-median calculation below is plain float subtraction (1.0 == one
+    # day) instead of building a datetime per row.
+    # No exclude_person_ids here: neglect_candidate_ids already excludes
+    # self and peripheral explicitly above, and hidden implicitly (it's
+    # built from circle_map, which is derived from all_people —
+    # get_all()'s default already excludes hidden) — measured ~120ms faster
+    # without a redundant `NOT IN (~9,500)` clause on a query already
+    # restricted to a couple dozen people (#897 review finding 3).
+    neglect_jd_rows = interaction_store.get_person_julianday_timestamps(
+        start_date, end_date, person_ids=neglect_candidate_ids,
+    ) if neglect_candidate_ids else []
+    now_jd = interaction_store.get_julianday(now)
+
+    neglected = []
+    person_interaction_jds = defaultdict(list)
+    for pid, jd in neglect_jd_rows:
+        person_interaction_jds[pid].append(jd)
+
+    for person_id, jds in person_interaction_jds.items():
+        person = person_lookup.get(person_id)
+        if not person:
+            continue
+        circle = circle_map.get(person_id, 7)
+        if circle > 3:  # Only alert for circles 0-3
+            continue
+        if len(jds) < 5:  # Need meaningful history to establish pattern
+            continue
+        jds_sorted = sorted(jds)
+        # Calculate typical gap (median of gaps, excluding outliers). Every
+        # gap here is between consecutive sorted timestamps, so it's always
+        # >= 0 — int() truncation matches timedelta.days' floor exactly.
+        gaps = [int(jds_sorted[i + 1] - jds_sorted[i]) for i in range(len(jds_sorted) - 1)]
+        if not gaps:
+            continue
+        # Use median of gaps
+        gaps_sorted = sorted(gaps)
+        typical_gap = gaps_sorted[len(gaps_sorted)//2]
+        # Minimum based on circle - closer relationships have lower thresholds
+        min_gap = {0: 3, 1: 5, 2: 7, 3: 14}.get(circle, 14)
+        if typical_gap < min_gap:
+            typical_gap = min_gap
+        # Days since last contact
+        last_contact_jd = jds_sorted[-1]
+        days_since = int(now_jd - last_contact_jd)
+        # Alert if 1.5x typical gap has passed (was 2x, now more sensitive)
+        if days_since > typical_gap * 1.5:
+            neglected.append(NeglectedContact(
+                person_id=person_id,
+                person_name=person.canonical_name,
+                days_since_contact=days_since,
+                typical_gap_days=typical_gap,
+                dunbar_circle=circle,
+            ))
+    # Sort by circle (closer first), then by how overdue they are
+    neglected.sort(key=lambda x: (x.dunbar_circle, -(x.days_since_contact / x.typical_gap_days)))
+
+    # 2b. Health Score History (longitudinal) - using "vs. average" approach
+    # Count personal interactions per period, score relative to average.
+    # `time_points` and `health_raw_counts` were already computed above,
+    # alongside top_25_ids, so the SQL bucket query could use them directly.
+    health_score_history = []
 
     # Calculate average for normalization
     if health_raw_counts:
@@ -3492,42 +3600,28 @@ def get_me_interactions(
             ))
 
     # 4. Messaging Volume by Circle (iMessage + WhatsApp only)
-    # Group by month, then by circle - track both message counts and unique people
-    monthly_messaging = defaultdict(lambda: {
-        "total": 0,
-        "by_circle": defaultdict(int),
-        "people_by_circle": defaultdict(set),  # circle -> set of person_ids
-    })
-    for interaction in all_interactions:
-        source = (interaction.source_type or "").lower()
-        if source not in ('imessage', 'whatsapp'):
-            continue
-        if interaction.timestamp:
-            ts = interaction.timestamp
-            if hasattr(ts, 'strftime'):
-                month_key = ts.strftime('%Y-%m')
-            else:
-                month_key = str(ts)[:7]
-        else:
-            continue
-        person_id = interaction.person_id
-        circle = circle_map.get(person_id, 7)
-        if circle > 4:  # Only track circles 0-4
-            circle = 5  # Group 5+ as "outer"
-        monthly_messaging[month_key]["total"] += 1
-        monthly_messaging[month_key]["by_circle"][str(circle)] += 1
-        monthly_messaging[month_key]["people_by_circle"][str(circle)].add(person_id)
+    # `monthly_messaging` was already built in the single combined window
+    # scan above (see the "Daily heatmap + ... + messaging" block) — no
+    # second full-window query needed here.
 
     # Build messaging list (based on days_back)
+    # NOTE (#871 bugfix): this loop used to reassign the *outer* `by_circle`
+    # dict (the full-window, all-sources total returned by the response's
+    # own `by_circle` field) to `dict(data["by_circle"])` on every iteration,
+    # so after the loop it silently held only the LAST processed month's
+    # iMessage/WhatsApp-only breakdown instead of the true window total —
+    # the Me page's "By Dunbar Circle" chart was rendering that stale,
+    # wrong-in-scope data. Renamed to `month_by_circle` so it can no longer
+    # shadow the response-level `by_circle` variable computed above.
     messaging_by_circle = []
     for month in sorted(monthly_messaging.keys()):
         if month >= chart_months_cutoff:
             data = monthly_messaging[month]
             total = data["total"]
-            by_circle = dict(data["by_circle"])
+            month_by_circle = dict(data["by_circle"])
             # Calculate percentages
             percentages = {}
-            for c, count in by_circle.items():
+            for c, count in month_by_circle.items():
                 percentages[c] = round(count / total * 100, 1) if total > 0 else 0
             # Calculate unique people per circle
             unique_by_circle = {c: len(people) for c, people in data["people_by_circle"].items()}
@@ -3535,7 +3629,7 @@ def get_me_interactions(
             messaging_by_circle.append(MonthlyMessagingVolume(
                 month=month,
                 total=total,
-                by_circle=by_circle,
+                by_circle=month_by_circle,
                 circle_percentages=percentages,
                 unique_by_circle=unique_by_circle,
                 unique_total=unique_total,
@@ -3557,6 +3651,19 @@ def get_me_interactions(
         return []
 
     TRACKED_RELATIONSHIPS_CONFIG = _load_tracked_relationships()
+
+    # Fetch all tracked people's interactions in this window in one query
+    # (still subject to the self/hidden/peripheral exclusions, and only for
+    # ids that resolve to a real, included person — an id typo'd into the
+    # config would otherwise silently pick up an unrelated/orphaned row).
+    tracked_all_ids = sorted({
+        pid for config in TRACKED_RELATIONSHIPS_CONFIG for pid in config["person_ids"]
+        if pid in person_lookup
+    })
+    tracked_all_interactions = interaction_store.get_all_in_range(
+        start_date=start_date, end_date=end_date,
+        person_ids=tracked_all_ids, exclude_person_ids=exclude_ids,
+    ) if tracked_all_ids else []
 
     tracked_relationships = []
     for config in TRACKED_RELATIONSHIPS_CONFIG:
@@ -3589,33 +3696,12 @@ def get_me_interactions(
 
         # Group interactions by tracked people
         tracked_interactions = [
-            i for i in all_interactions
+            i for i in tracked_all_interactions
             if i.person_id in person_ids
         ]
 
-        # First pass: collect raw counts for each period
-        raw_counts = []
-        for i, point_date in enumerate(tracked_time_points):
-            if i == 0:
-                # For first point, use same interval as between points
-                interval = (tracked_time_points[1] - tracked_time_points[0]).days if len(tracked_time_points) > 1 else 14
-                prev_date = point_date - timedelta(days=interval)
-            else:
-                prev_date = tracked_time_points[i - 1]
-
-            # Count interactions in this period
-            period_count = 0
-            for interaction in tracked_interactions:
-                if interaction.timestamp:
-                    ts = interaction.timestamp
-                    if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=timezone.utc)
-                    elif not hasattr(ts, 'tzinfo'):
-                        ts = datetime.fromisoformat(str(ts)[:10]).replace(tzinfo=timezone.utc)
-                    if prev_date < ts <= point_date:
-                        period_count += 1
-
-            raw_counts.append(period_count)
+        # Raw counts for each period (see _bucket_counts_by_period)
+        raw_counts = _bucket_counts_by_period(tracked_interactions, tracked_time_points)
 
         # Calculate baseline stats for normalization
         # Use historical average as the baseline for scoring
@@ -3698,6 +3784,37 @@ def get_me_interactions(
         messaging_by_circle=messaging_by_circle,
         tracked_relationships=tracked_relationships,
     )
+
+
+@router.get("/me/interactions/span", response_model=MeInteractionsSpanResponse)
+def get_me_interactions_span():
+    """
+    Get the earliest and latest interaction dates, excluding self, hidden,
+    peripheral, and merged-secondary people — the same population
+    /me/interactions aggregates (both use the shared `_me_exclude_ids`
+    helper, #897 review finding 6).
+
+    The Me dashboard calls this first to size its heatmap window from the
+    actual span of data, instead of requesting a fixed 10 years and shrinking
+    the display afterward once the (much larger) response arrives.
+    """
+    person_store = get_person_entity_store()
+    interaction_store = get_interaction_store()
+
+    exclude_ids = _me_exclude_ids(person_store)
+
+    earliest, latest = interaction_store.get_span(exclude_person_ids=exclude_ids)
+
+    years = 1
+    if earliest:
+        earliest_dt = datetime.fromisoformat(earliest)
+        if earliest_dt.tzinfo is None:
+            earliest_dt = earliest_dt.replace(tzinfo=timezone.utc)
+        days_since = (datetime.now(timezone.utc) - earliest_dt).days
+        if days_since > 0:
+            years = max(1, min(10, (days_since + 364) // 365))
+
+    return MeInteractionsSpanResponse(earliest=earliest, latest=latest, years=years)
 
 
 # Family Dashboard Routes
@@ -3879,26 +3996,24 @@ def get_family_timeline(
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
-    # Get interactions - don't apply limit yet since we need to filter by person IDs
-    # Note: This is less efficient than a direct DB filter, but works for family view
-    selected_ids_set = set(selected_ids)
-    all_interactions = interaction_store.get_all_in_range(
+    # Filter by person_id IN (...) directly in SQL, and paginate there too
+    # (same pattern as /me/timeline), instead of loading every interaction
+    # in the window across all people and filtering/paginating in Python.
+    interactions = interaction_store.get_all_in_range(
         start_date=start_date,
         end_date=end_date,
+        person_ids=selected_ids,
         exclude_person_ids=[MY_PERSON_ID],
         source_type=source_type,
+        limit=offset + limit + 1,
         specific_date=date,
     )
 
-    # Filter to only interactions with selected people
-    interactions = [i for i in all_interactions if i.person_id in selected_ids_set]
-
-    # Apply pagination after filtering
     has_more = len(interactions) > offset + limit
     interactions = interactions[offset:offset + limit]
 
-    # Build person lookup for names
-    person_lookup = {p.id: p for p in person_store.get_all()}
+    # Batch-lookup names only for this page's people
+    person_lookup = person_store.get_by_ids({i.person_id for i in interactions}, exclude_hidden=True)
 
     elapsed = (time.time() - start_time) * 1000
     logger.info(f"family_timeline took {elapsed:.1f}ms ({len(interactions)} interactions)")
@@ -3951,8 +4066,8 @@ def get_family_interactions(
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
-    # Build person lookup
-    person_lookup = {p.id: p for p in person_store.get_all()}
+    # Batch-lookup names for just the selected people
+    person_lookup = person_store.get_by_ids(selected_ids, exclude_hidden=True)
 
     # Get selected person names
     selected_names = []
@@ -3962,27 +4077,6 @@ def get_family_interactions(
             selected_names.append(person.canonical_name)
         else:
             selected_names.append("Unknown")
-
-    # Get interactions only with selected people
-    all_interactions_raw = interaction_store.get_all_in_range(
-        start_date=start_date,
-        end_date=end_date,
-        exclude_person_ids=[MY_PERSON_ID],  # Don't exclude selected people
-    )
-
-    # Filter to only interactions with selected people
-    all_interactions = [
-        i for i in all_interactions_raw
-        if i.person_id in selected_ids
-    ]
-
-    # Aggregation structures
-    daily_data = defaultdict(lambda: {"total": 0, "sources": defaultdict(int)})
-    by_source = defaultdict(int)
-    by_month = defaultdict(int)
-    person_counts_30d = defaultdict(int)
-    person_counts_recent = defaultdict(int)
-    person_counts_previous = defaultdict(int)
 
     now = datetime.now(timezone.utc)
     period_days = {
@@ -3996,55 +4090,40 @@ def get_family_interactions(
     trend_previous_start = now - timedelta(days=trend_days * 2)
     thirty_days_ago = now - timedelta(days=30)
 
+    # ---- Daily heatmap + by_source/by_month/total_count ----
+    # Filtered by person_id IN (selected_ids) in SQL — unlike /me/interactions,
+    # this dashboard has no "sent email only" or peripheral/hidden exclusion
+    # rule; it counts every interaction with the selected people.
+    daily_rows = interaction_store.get_daily_source_counts(
+        start_date, end_date, person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID],
+    )
+    daily_data = defaultdict(lambda: {"total": 0, "sources": defaultdict(int)})
+    by_source = defaultdict(int)
+    by_month = defaultdict(int)
     total_count = 0
+    for day, source, cnt in daily_rows:
+        daily_data[day]["total"] += cnt
+        daily_data[day]["sources"][source] += cnt
+        by_source[source] += cnt
+        by_month[day[:7]] += cnt
+        total_count += cnt
 
-    for interaction in all_interactions:
-        if interaction.timestamp:
-            if hasattr(interaction.timestamp, 'strftime'):
-                ts = interaction.timestamp
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                date_str = ts.strftime('%Y-%m-%d')
-                month_str = ts.strftime('%Y-%m')
-            else:
-                date_str = str(interaction.timestamp)[:10]
-                month_str = date_str[:7]
-                ts = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
-        else:
-            continue
-
-        source = (interaction.source_type or "unknown").lower()
-        person_id = interaction.person_id
-
-        # Daily aggregates
-        daily_data[date_str]["total"] += 1
-        daily_data[date_str]["sources"][source] += 1
-
-        # Breakdown totals
-        by_source[source] += 1
-        by_month[month_str] += 1
-
-        # Top contacts (last 30 days)
-        if ts >= thirty_days_ago:
-            person_counts_30d[person_id] += 1
-
-        # Trend data
-        if ts >= trend_recent_start:
-            person_counts_recent[person_id] += 1
-        elif ts >= trend_previous_start:
-            person_counts_previous[person_id] += 1
-
-        total_count += 1
-
-    # Build daily aggregates list
     daily_list = [
         DailyAggregate(date=date, total=data["total"], sources=dict(data["sources"]))
         for date, data in sorted(daily_data.items())
     ]
 
-    # Build top contacts
+    # ---- Top contacts (last 30 days) ----
+    # `pool_start_date`/`pool_end_date` clip this to the outer `days_back`
+    # window, matching the original algorithm's `all_interactions` pool
+    # (#897 review finding 1 — same fix as /me/interactions). No exact upper
+    # bound: the old `if ts >= thirty_days_ago:` check had none of its own.
+    top_counts = interaction_store.get_person_counts(
+        thirty_days_ago, None, person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID],
+        exact=True, pool_start_date=start_date, pool_end_date=end_date,
+    )
     top_contacts = []
-    for person_id, count in sorted(person_counts_30d.items(), key=lambda x: -x[1])[:10]:
+    for person_id, count in sorted(top_counts.items(), key=lambda x: -x[1])[:10]:
         person = person_lookup.get(person_id)
         top_contacts.append(TopContact(
             person_id=person_id,
@@ -4052,12 +4131,22 @@ def get_family_interactions(
             count=count,
         ))
 
-    # Build trends
+    # ---- Trends (warming and cooling) ----
+    # Same pool-clamping as top_contacts above (#897 review finding 1).
+    recent_counts = interaction_store.get_person_counts(
+        trend_recent_start, None, person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID],
+        exact=True, pool_start_date=start_date, pool_end_date=end_date,
+    )
+    previous_counts = interaction_store.get_person_counts(
+        trend_previous_start, trend_recent_start, person_ids=selected_ids,
+        exclude_person_ids=[MY_PERSON_ID], exact=True, end_inclusive=False,
+        pool_start_date=start_date, pool_end_date=end_date,
+    )
     warming = []
     cooling = []
     for person_id in selected_ids:
-        recent = person_counts_recent.get(person_id, 0)
-        prev = person_counts_previous.get(person_id, 0)
+        recent = recent_counts.get(person_id, 0)
+        prev = previous_counts.get(person_id, 0)
         if recent == prev:
             continue
         person = person_lookup.get(person_id)
@@ -4091,27 +4180,18 @@ def get_family_interactions(
     time_points = [now - timedelta(days=int(i * total_days_history / (num_points - 1))) for i in range(num_points)]
     time_points = sorted(time_points)
 
-    # Collect raw counts for each period
-    health_raw_counts = []
-    for i, point_date in enumerate(time_points):
-        if i == 0:
-            interval = (time_points[1] - time_points[0]).days if len(time_points) > 1 else 14
-            prev_date = point_date - timedelta(days=interval)
-        else:
-            prev_date = time_points[i - 1]
+    # The health-score buckets need exact per-interaction timestamps (their
+    # boundaries aren't day-aligned), but only for the selected people — a
+    # small, explicit id list — so fetching those interactions directly
+    # (rather than deriving bucket counts in SQL) keeps this exact without
+    # needing julianday()-based bucket queries.
+    selected_interactions = interaction_store.get_all_in_range(
+        start_date=start_date, end_date=end_date,
+        person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID],
+    )
 
-        period_count = 0
-        for interaction in all_interactions:
-            if interaction.timestamp:
-                ts = interaction.timestamp
-                if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                elif not hasattr(ts, 'tzinfo'):
-                    ts = datetime.fromisoformat(str(ts)[:10]).replace(tzinfo=timezone.utc)
-                if prev_date < ts <= point_date:
-                    period_count += 1
-
-        health_raw_counts.append(period_count)
+    # Raw counts for each period (see _bucket_counts_by_period)
+    health_raw_counts = _bucket_counts_by_period(selected_interactions, time_points)
 
     # Calculate average
     health_avg = sum(health_raw_counts) / len(health_raw_counts) if health_raw_counts else 0

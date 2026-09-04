@@ -16,34 +16,23 @@ from api.routes.crm import MY_PERSON_ID
 
 @pytest.mark.unit
 class TestMeStatsEndpoint:
-    """Tests for GET /api/crm/me/stats endpoint."""
+    """Tests for GET /api/crm/me/stats endpoint.
+
+    #871 replaced the "load every PersonEntity and sum in Python" approach
+    with a single SQL SUM (PersonEntityStore.get_totals()), so these mock the
+    new method's return value instead of get_all().
+    """
 
     @pytest.fixture
     def mock_person_store(self):
         """Create a mock person store with test data."""
         store = MagicMock()
-        # Create mock people with different stats
-        people = [
-            MagicMock(
-                id="person-1",
-                email_count=100,
-                meeting_count=20,
-                message_count=500,
-            ),
-            MagicMock(
-                id="person-2",
-                email_count=50,
-                meeting_count=10,
-                message_count=200,
-            ),
-            MagicMock(
-                id="person-3",
-                email_count=25,
-                meeting_count=5,
-                message_count=100,
-            ),
-        ]
-        store.get_all.return_value = people
+        store.get_totals.return_value = {
+            "total_people": 3,
+            "total_emails": 175,  # 100 + 50 + 25
+            "total_meetings": 35,  # 20 + 10 + 5
+            "total_messages": 800,  # 500 + 200 + 100
+        }
         return store
 
     def test_returns_aggregate_stats(self, mock_person_store):
@@ -51,24 +40,28 @@ class TestMeStatsEndpoint:
         from api.routes.crm import get_me_stats
 
         with patch('api.routes.crm.get_person_entity_store', return_value=mock_person_store):
-            with patch('api.routes.crm.get_interaction_store'):
-                result = get_me_stats()
+            result = get_me_stats()
 
         assert result.total_people == 3
-        assert result.total_emails == 175  # 100 + 50 + 25
-        assert result.total_meetings == 35  # 20 + 10 + 5
-        assert result.total_messages == 800  # 500 + 200 + 100
+        assert result.total_emails == 175
+        assert result.total_meetings == 35
+        assert result.total_messages == 800
+        mock_person_store.get_totals.assert_called_once()
 
     def test_handles_empty_database(self):
         """Stats endpoint should handle empty database gracefully."""
         from api.routes.crm import get_me_stats
 
         mock_store = MagicMock()
-        mock_store.get_all.return_value = []
+        mock_store.get_totals.return_value = {
+            "total_people": 0,
+            "total_emails": 0,
+            "total_meetings": 0,
+            "total_messages": 0,
+        }
 
         with patch('api.routes.crm.get_person_entity_store', return_value=mock_store):
-            with patch('api.routes.crm.get_interaction_store'):
-                result = get_me_stats()
+            result = get_me_stats()
 
         assert result.total_people == 0
         assert result.total_emails == 0
@@ -78,7 +71,22 @@ class TestMeStatsEndpoint:
 
 @pytest.mark.unit
 class TestMeInteractionsEndpoint:
-    """Tests for GET /api/crm/me/interactions endpoint (aggregated data)."""
+    """Tests for GET /api/crm/me/interactions endpoint (aggregated data).
+
+    #871 moved the heatmap/breakdown/by_circle/messaging aggregation from a
+    Python loop over every hydrated Interaction in the window to a single SQL
+    GROUP BY query (get_daily_person_source_counts, grouped by day + person +
+    source and filtered in Python instead of via a SQL exclude list — see
+    that method's docstring for why). #897's review follow-up moved the
+    health-score and neglected-contacts widgets to SQL too:
+    get_bucketed_counts (a CASE-per-bucket SUM, replacing a fetch +
+    _bucket_counts_by_period) and get_person_julianday_timestamps (a
+    covering person_id+timestamp query, replacing get_person_timestamps).
+    These tests mock those new methods directly; full correctness of the
+    aggregation math itself (identical output to the pre-#871
+    implementation) is covered by the oracle tests in
+    tests/test_me_family_aggregates_oracle.py against a real synthetic DB.
+    """
 
     @pytest.fixture
     def mock_stores(self):
@@ -96,6 +104,7 @@ class TestMeInteractionsEndpoint:
                 first_seen=now - timedelta(days=365),
                 dunbar_circle=2,
                 category="personal",
+                is_peripheral_contact=False,
             ),
             MagicMock(
                 id="person-2",
@@ -105,6 +114,7 @@ class TestMeInteractionsEndpoint:
                 first_seen=now - timedelta(days=180),
                 dunbar_circle=3,
                 category="personal",
+                is_peripheral_contact=False,
             ),
             MagicMock(
                 id=MY_PERSON_ID,
@@ -114,28 +124,26 @@ class TestMeInteractionsEndpoint:
                 first_seen=now - timedelta(days=730),
                 dunbar_circle=0,
                 category="personal",
+                is_peripheral_contact=False,
             ),
         ]
         person_store.get_all.return_value = people
+        person_store.get_hidden_ids.return_value = set()
+        person_store.get_merged_secondary_ids.return_value = set()
 
-        # Mock interaction store
+        # Mock interaction store: two imessage interactions with person-1/-2,
+        # already reflected as SQL-grouped output rather than raw rows.
         interaction_store = MagicMock()
-        interactions = [
-            MagicMock(
-                id="int-1",
-                person_id="person-1",
-                source_type="imessage",
-                timestamp=now - timedelta(days=1),
-            ),
-            MagicMock(
-                id="int-2",
-                person_id="person-2",
-                source_type="imessage",
-                timestamp=now - timedelta(days=2),
-            ),
+        interaction_store.get_daily_person_source_counts.return_value = [
+            (now.strftime('%Y-%m-%d'), "person-1", "imessage", 1),
+            ((now - timedelta(days=2)).strftime('%Y-%m-%d'), "person-2", "imessage", 1),
         ]
-        # Mock get_all_in_range to return filtered interactions (excludes self)
-        interaction_store.get_all_in_range.return_value = interactions
+        interaction_store.get_person_counts.return_value = {"person-1": 1, "person-2": 1}
+        interaction_store.get_bucketed_counts.side_effect = lambda time_points, **kwargs: [0] * len(time_points)
+        interaction_store.get_person_julianday_timestamps.return_value = []
+        interaction_store.get_julianday.return_value = 0.0
+        interaction_store.get_all_in_range.return_value = []
+        interaction_store.get_first_interaction_dates.return_value = {}
 
         return person_store, interaction_store
 
@@ -149,7 +157,7 @@ class TestMeInteractionsEndpoint:
             with patch('api.routes.crm.get_interaction_store', return_value=interaction_store):
                 result = get_me_interactions(days_back=30)
 
-        # Should have total count
+        # Should have total count (sum of get_daily_person_source_counts rows)
         assert result.total_count == 2
 
         # Should have aggregated data structures
@@ -162,10 +170,43 @@ class TestMeInteractionsEndpoint:
         assert isinstance(result.cooling, list)
 
         # Check source breakdown
-        assert 'imessage' in result.by_source
+        assert result.by_source.get('imessage') == 2
+
+        # by_circle should reflect the window rows mapped through circle_map
+        # (person-1 -> circle 2, person-2 -> circle 3)
+        assert result.by_circle.get('2') == 1
+        assert result.by_circle.get('3') == 1
 
     def test_excludes_self_interactions(self, mock_stores):
-        """Interactions should not include self-interactions (via get_all_in_range exclude)."""
+        """Self's interactions must never contribute to totals, and the
+        small trend/top-contacts SQL queries still carry exclude_person_ids
+        directly (their windows are cheap to filter that way; only the big
+        window scan moved exclusion into Python — see
+        get_daily_person_source_counts's docstring)."""
+        from api.routes.crm import get_me_interactions
+
+        person_store, interaction_store = mock_stores
+        now = datetime.now(timezone.utc)
+        # Inject a self-attributed row into the window scan: it must be
+        # dropped by the handler's Python-side exclusion filter, not counted.
+        interaction_store.get_daily_person_source_counts.return_value = [
+            (now.strftime('%Y-%m-%d'), "person-1", "imessage", 1),
+            (now.strftime('%Y-%m-%d'), MY_PERSON_ID, "imessage", 5),
+        ]
+
+        with patch('api.routes.crm.get_person_entity_store', return_value=person_store):
+            with patch('api.routes.crm.get_interaction_store', return_value=interaction_store):
+                result = get_me_interactions(days_back=365)
+
+        assert result.total_count == 1  # only person-1's row, not self's 5
+
+        interaction_store.get_person_counts.assert_called()
+        for call in interaction_store.get_person_counts.call_args_list:
+            assert MY_PERSON_ID in call.kwargs.get('exclude_person_ids', [])
+
+    def test_get_all_not_called_more_than_once(self, mock_stores):
+        """None of the Me handlers may call the load-all-people store method
+        more than once per request (#871 acceptance criterion)."""
         from api.routes.crm import get_me_interactions
 
         person_store, interaction_store = mock_stores
@@ -174,13 +215,10 @@ class TestMeInteractionsEndpoint:
             with patch('api.routes.crm.get_interaction_store', return_value=interaction_store):
                 get_me_interactions(days_back=365)
 
-        # Verify get_all_in_range was called with exclude_person_ids
-        interaction_store.get_all_in_range.assert_called_once()
-        call_args = interaction_store.get_all_in_range.call_args
-        assert MY_PERSON_ID in call_args.kwargs.get('exclude_person_ids', [])
+        assert person_store.get_all.call_count <= 1
 
     def test_filters_by_date_range(self):
-        """Date filtering is done by get_all_in_range method."""
+        """Date filtering is passed through to the SQL aggregate queries."""
         from api.routes.crm import get_me_interactions
 
         now = datetime.now(timezone.utc)
@@ -195,20 +233,22 @@ class TestMeInteractionsEndpoint:
                 first_seen=now - timedelta(days=100),
                 dunbar_circle=2,
                 category="personal",
+                is_peripheral_contact=False,
             )
         ]
+        person_store.get_hidden_ids.return_value = set()
+        person_store.get_merged_secondary_ids.return_value = set()
 
         interaction_store = MagicMock()
-        # Only return recent interaction (simulating date filter in get_all_in_range)
-        interactions = [
-            MagicMock(
-                id="recent",
-                person_id="person-1",
-                source_type="imessage",
-                timestamp=now - timedelta(days=5),
-            ),
+        interaction_store.get_daily_person_source_counts.return_value = [
+            ((now - timedelta(days=5)).strftime('%Y-%m-%d'), "person-1", "imessage", 1),
         ]
-        interaction_store.get_all_in_range.return_value = interactions
+        interaction_store.get_person_counts.return_value = {"person-1": 1}
+        interaction_store.get_bucketed_counts.side_effect = lambda time_points, **kwargs: [0] * len(time_points)
+        interaction_store.get_person_julianday_timestamps.return_value = []
+        interaction_store.get_julianday.return_value = 0.0
+        interaction_store.get_all_in_range.return_value = []
+        interaction_store.get_first_interaction_dates.return_value = {}
 
         with patch('api.routes.crm.get_person_entity_store', return_value=person_store):
             with patch('api.routes.crm.get_interaction_store', return_value=interaction_store):
@@ -216,8 +256,12 @@ class TestMeInteractionsEndpoint:
 
         assert result.total_count == 1
         assert len(result.daily) == 1  # Should have one day with data
-        # Verify date range was passed to get_all_in_range
-        interaction_store.get_all_in_range.assert_called_once()
+
+        # Verify the requested days_back translated into a start_date roughly
+        # `days_back` days before now, passed to the SQL aggregate query.
+        call_args = interaction_store.get_daily_person_source_counts.call_args
+        start_date = call_args.args[0] if call_args.args else call_args.kwargs['start_date']
+        assert (now - start_date).days in (29, 30, 31)
 
 
 class TestMyPersonIdConstant:

@@ -737,6 +737,136 @@ class TestPersonEntityStore:
         assert temp_store.count() == 2
 
 
+class TestMeFamilyAggregates:
+    """Tests for the person-store helpers #871 adds for the Me/Family
+    dashboards: get_by_ids, get_hidden_ids, get_ids_where, get_totals."""
+
+    @pytest.fixture
+    def temp_store(self, tmp_path):
+        db_path = str(tmp_path / "test_person_entity_aggregates.db")
+        store = PersonEntityStore(db_path)
+        store._blocklist.clear()
+        yield store
+
+    # ---- get_by_ids ----
+
+    def test_get_by_ids_returns_only_matching(self, temp_store):
+        temp_store.add(PersonEntity(id="p1", canonical_name="One", emails=["one@test.com"]))
+        temp_store.add(PersonEntity(id="p2", canonical_name="Two", emails=["two@test.com"]))
+
+        result = temp_store.get_by_ids(["p1", "nonexistent"])
+        assert set(result.keys()) == {"p1"}
+        assert result["p1"].canonical_name == "One"
+
+    def test_get_by_ids_empty_input(self, temp_store):
+        assert temp_store.get_by_ids([]) == {}
+
+    def test_get_by_ids_follows_merge_chain_keyed_by_original_id(self, temp_store):
+        """A merged-away secondary id should resolve to the surviving primary
+        entity, but the result dict is still keyed by the id the caller
+        asked for (e.g. an interaction's still-unrepointed person_id)."""
+        temp_store.add(PersonEntity(id="primary", canonical_name="Primary", emails=["p@test.com"]))
+        temp_store.MERGED_IDS_PATH = temp_store.db_path.parent / "merged_ids.json"
+        temp_store.MERGED_IDS_PATH.write_text(json.dumps({"secondary": "primary"}))
+        temp_store.reload_merged_ids()
+
+        result = temp_store.get_by_ids(["secondary"])
+        assert set(result.keys()) == {"secondary"}
+        assert result["secondary"].id == "primary"
+
+    def test_get_by_ids_include_hidden_default(self, temp_store):
+        """Like get_by_id(), hidden entities are included by default."""
+        temp_store.add(PersonEntity(
+            id="hidden-person", canonical_name="Hidden", emails=["h@test.com"],
+            hidden=True,
+        ))
+        result = temp_store.get_by_ids(["hidden-person"])
+        assert "hidden-person" in result
+
+    def test_get_by_ids_exclude_hidden(self, temp_store):
+        """exclude_hidden=True matches get_all()'s default view — used by
+        callers whose name lookup should show "Unknown" for a hidden person
+        instead of leaking their real name."""
+        temp_store.add(PersonEntity(
+            id="hidden-person", canonical_name="Hidden", emails=["h@test.com"],
+            hidden=True,
+        ))
+        temp_store.add(PersonEntity(id="visible", canonical_name="Visible", emails=["v@test.com"]))
+
+        result = temp_store.get_by_ids(["hidden-person", "visible"], exclude_hidden=True)
+        assert set(result.keys()) == {"visible"}
+
+    # ---- get_hidden_ids / get_ids_where ----
+
+    def test_get_hidden_ids(self, temp_store):
+        temp_store.add(PersonEntity(id="p1", canonical_name="One", emails=["one@test.com"]))
+        temp_store.add(PersonEntity(
+            id="p2", canonical_name="Two", emails=["two@test.com"], hidden=True,
+        ))
+        assert temp_store.get_hidden_ids() == {"p2"}
+
+    def test_get_ids_where_peripheral(self, temp_store):
+        temp_store.add(PersonEntity(
+            id="p1", canonical_name="One", emails=["one@test.com"],
+            is_peripheral_contact=True,
+        ))
+        temp_store.add(PersonEntity(id="p2", canonical_name="Two", emails=["two@test.com"]))
+        assert temp_store.get_ids_where("is_peripheral_contact", 1) == {"p1"}
+
+    def test_get_ids_where_rejects_unknown_column(self, temp_store):
+        with pytest.raises(ValueError):
+            temp_store.get_ids_where("canonical_name", "x")
+
+    # ---- get_totals ----
+
+    def test_get_totals_sums_only_non_hidden(self, temp_store):
+        p1 = PersonEntity(id="p1", canonical_name="One", emails=["one@test.com"])
+        p1.email_count, p1.meeting_count, p1.message_count = 10, 2, 5
+        p2 = PersonEntity(
+            id="p2", canonical_name="Two", emails=["two@test.com"], hidden=True,
+        )
+        p2.email_count, p2.meeting_count, p2.message_count = 100, 100, 100
+        temp_store.add(p1)
+        temp_store.add(p2)
+
+        totals = temp_store.get_totals()
+        assert totals == {
+            "total_people": 1,
+            "total_emails": 10,
+            "total_meetings": 2,
+            "total_messages": 5,
+        }
+
+    def test_get_totals_excludes_merged(self, temp_store):
+        """A merged-away secondary that's somehow not yet flagged hidden
+        (the historical edge case get_all()'s Python filter also guards
+        against) must still be excluded from the SQL sums."""
+        primary = PersonEntity(id="primary", canonical_name="Primary", emails=["p@test.com"])
+        primary.email_count = 10
+        secondary = PersonEntity(
+            id="secondary", canonical_name="Secondary", emails=["s@test.com"],
+        )
+        secondary.email_count = 1000  # would blow up the total if not excluded
+        temp_store.add(primary)
+        temp_store.add(secondary)
+
+        temp_store.MERGED_IDS_PATH = temp_store.db_path.parent / "merged_ids.json"
+        temp_store.MERGED_IDS_PATH.write_text(json.dumps({"secondary": "primary"}))
+        temp_store.reload_merged_ids()
+
+        totals = temp_store.get_totals()
+        assert totals["total_people"] == 1
+        assert totals["total_emails"] == 10
+
+    def test_get_totals_empty_store(self, temp_store):
+        assert temp_store.get_totals() == {
+            "total_people": 0,
+            "total_emails": 0,
+            "total_meetings": 0,
+            "total_messages": 0,
+        }
+
+
 class TestTimezoneHandling:
     """Tests for timezone-aware datetime handling."""
 

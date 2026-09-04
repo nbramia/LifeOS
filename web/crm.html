@@ -8660,6 +8660,9 @@
         let dunbarCircleMap = new Map();  // Map person ID to Dunbar circle
         let meInteractionsCache = null;  // Cache for "Me" page interactions
         let meInteractionsCacheYears = null; // Track which years setting the cache was loaded for
+        let meInteractionsSpanPromise = null; // Resolved once per page load; sizes the Me heatmap window
+        let meInteractionsPromise = null; // In-flight /me/interactions request, shared across callers
+        let meInteractionsPromiseKey = null; // days_back:trend_period the in-flight request is for
         // Config loaded from API
         let PARTNER_NAME = '';
         let FAMILY_DEFAULT_SELECTED_IDS = [];
@@ -10678,22 +10681,69 @@
         }
 
         // Load all interactions for "Me" page (for client-side processing)
+        // Size the Me page's heatmap window from the actual span of interaction
+        // data (earliest/latest interaction) instead of requesting a fixed 10
+        // years and shrinking the display afterward. Resolves once per page
+        // load; both loadMeHeatMap() and renderMeDashboard() route through
+        // loadMeInteractions(), so awaiting this here (rather than at either
+        // call site) guarantees whichever fires the first real request already
+        // has the corrected heatmapYears, regardless of call order.
+        async function ensureMeHeatmapYears() {
+            if (!meInteractionsSpanPromise) {
+                meInteractionsSpanPromise = api('/me/interactions/span')
+                    .then(span => {
+                        if (span && span.years) {
+                            heatmapYears = span.years;
+                            const yearsSelect = document.getElementById('heatmapYearsSelect');
+                            if (yearsSelect) yearsSelect.value = span.years.toString();
+                        }
+                        return span;
+                    })
+                    .catch(error => {
+                        console.error('Failed to load Me interaction span:', error);
+                        return null;
+                    });
+            }
+            return meInteractionsSpanPromise;
+        }
+
         async function loadMeInteractions(forceRefresh = false) {
+            await ensureMeHeatmapYears();
             // Use cache only if it matches current heatmapYears setting
             if (meInteractionsCache && meInteractionsCacheYears === heatmapYears && !forceRefresh) {
                 return meInteractionsCache;
             }
-            try {
-                // Fetch data for the selected number of years
-                const daysBack = (heatmapYears * 365) + 7;
-                const data = await api(`/me/interactions?days_back=${daysBack}&trend_period=${currentTrendPeriod}`);
-                meInteractionsCache = data; // Store the whole aggregated response
-                meInteractionsCacheYears = heatmapYears; // Remember which setting this was for
-                return meInteractionsCache;
-            } catch (error) {
-                console.error('Failed to load Me interactions:', error);
-                return null;
+
+            const daysBack = (heatmapYears * 365) + 7;
+            const requestKey = `${daysBack}:${currentTrendPeriod}`;
+
+            // Share one in-flight request across callers that resume on the
+            // same tick: renderMeDashboard() and loadMeHeatMap() both call
+            // loadMeInteractions() right after ensureMeHeatmapYears()
+            // resolves, and at that point meInteractionsCache is still
+            // empty for both of them — without this, both would miss the
+            // cache and fire their own /me/interactions request for the
+            // same data.
+            if (!forceRefresh && meInteractionsPromise && meInteractionsPromiseKey === requestKey) {
+                return meInteractionsPromise;
             }
+
+            meInteractionsPromiseKey = requestKey;
+            meInteractionsPromise = (async () => {
+                try {
+                    const data = await api(`/me/interactions?days_back=${daysBack}&trend_period=${currentTrendPeriod}`);
+                    meInteractionsCache = data; // Store the whole aggregated response
+                    meInteractionsCacheYears = heatmapYears; // Remember which setting this was for
+                    return meInteractionsCache;
+                } catch (error) {
+                    console.error('Failed to load Me interactions:', error);
+                    return null;
+                } finally {
+                    meInteractionsPromise = null;
+                    meInteractionsPromiseKey = null;
+                }
+            })();
+            return meInteractionsPromise;
         }
 
         // Update hero stats from aggregated source totals (called after heatmap loads)
@@ -11271,13 +11321,12 @@
                     heatmapData[day.date] = { total: day.total, sources: day.sources };
                 });
 
-                // For /me page, calculate years from actual interaction data
-                const yearsFromData = calculateYearsFromHeatmapData();
-                heatmapYears = yearsFromData;
-                const yearsSelect = document.getElementById('heatmapYearsSelect');
-                if (yearsSelect) yearsSelect.value = yearsFromData.toString();
+                // heatmapYears was already sized from /me/interactions/span
+                // (via ensureMeHeatmapYears() inside loadMeInteractions()), so
+                // there's no need to re-derive it from the fetched data and
+                // re-fetch a differently-sized window.
 
-                // Update title based on calculated years
+                // Update title based on the current years setting
                 const titleEl = document.getElementById('heatmapTitle');
                 if (titleEl) {
                     titleEl.textContent = heatmapYears === 1

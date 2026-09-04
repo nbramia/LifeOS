@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-08-12
+**Last Updated:** 2026-09-04
 
 The aggregated views that sit alongside the people list: Family Dashboard (`/crm#family`), Me Dashboard (`/me`, the CRM landing page), Birthdays Page (`/birthdays`), and Relationship Dashboard (`/relationship`). Each surfaces interaction patterns and insights derived from the CRM data model.
 
@@ -177,6 +177,10 @@ Owner's network health at a glance. Replaces the generic people list as the entr
 - **Messaging by circle** — interaction volume broken down by Dunbar circle (see [crm-people.md § Dunbar Circles](crm-people.md#dunbar-circles)).
 - **Trends** — configurable trend period for interaction patterns.
 
+### Heatmap window sizing
+
+Unlike the Family dashboard's fixed year dropdown (defaulting to 10 years), the Me page's heatmap sizes itself from the actual span of interaction data: it calls `GET /api/crm/me/interactions/span` first, which returns the earliest and latest interaction dates (excluding self, hidden, and peripheral people — the same population `/me/interactions` aggregates) and a suggested `years` value clamped to 1–10. The page requests exactly that window from `/me/interactions` instead of always requesting 10 years and shrinking the display afterward once the (much larger) response arrives.
+
 ### API endpoints
 
 | Endpoint | Purpose |
@@ -184,6 +188,7 @@ Owner's network health at a glance. Replaces the generic people list as the entr
 | `GET /api/crm/me/stats` | Aggregated owner stats (interaction counts, health score) |
 | `GET /api/crm/me/timeline` | Owner's interaction timeline, paginated |
 | `GET /api/crm/me/interactions` | Interaction data with trend and health-period support (heatmap, volume chart, trend visualizations) |
+| `GET /api/crm/me/interactions/span` | Earliest/latest interaction dates and a suggested heatmap year count; used to size the heatmap window before the first `/me/interactions` request |
 
 ---
 

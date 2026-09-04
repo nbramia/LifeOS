@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-06-21
+**Last Updated:** 2026-09-04
 
 Every `/api/crm/*` HTTP endpoint. Split out of the main [api-reference.md](api-reference.md) because the CRM endpoint catalog is large enough to deserve its own file. For the consumer view of the CRM features these endpoints back, see the [CRM specs](crm-ui.md).
 
@@ -426,6 +426,20 @@ Aggregated interaction data for the "Me" dashboard. Returns pre-aggregated data 
 - `trend_period` (string): Trend comparison period (week, month, quarter, year)
 - `health_period` (string): Health score history period (month, quarter, year)
 
+### GET /api/crm/me/interactions/span
+
+Earliest and latest interaction dates (excluding self, hidden, and peripheral people — the same population `/me/interactions` aggregates) plus a suggested heatmap year count clamped to 1–10. The Me page calls this first to size its heatmap window instead of requesting a fixed 10 years and shrinking the display afterward.
+
+```json
+{
+  "earliest": "2016-03-01T00:00:00+00:00",
+  "latest": "2026-09-04T12:00:00+00:00",
+  "years": 10
+}
+```
+
+`earliest`/`latest` are `null` when there is no data.
+
 ---
 
 ## Family
@@ -443,20 +457,20 @@ Aggregate family statistics.
 
 ### GET /api/crm/family/timeline
 
-Family interaction timeline across selected members.
+Family interaction timeline across selected members. Filters by `person_id IN (...)` in SQL rather than loading every interaction in the window and filtering in Python.
 
 **Query parameters:**
-- `member_ids` (string): Comma-separated person IDs
+- `person_ids` (string): Comma-separated person IDs
 - `source_type` (string): Filter by source type
 - `days_back` (int): Lookback period
 - `limit` (int): Max results
 
 ### GET /api/crm/family/interactions
 
-Aggregated family interaction data for charts and heatmaps.
+Aggregated family interaction data for charts and heatmaps. Filters by `person_id IN (...)` in SQL. Unlike `/me/interactions`, this does not apply a "sent email only" rule — all email (sent and received) counts.
 
 **Query parameters:**
-- `member_ids` (string): Comma-separated person IDs
+- `person_ids` (string): Comma-separated person IDs
 - `days_back` (int): Days of history
 
 ### GET /api/crm/family/channel-mix
