@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-08-28
+**Last Updated:** 2026-09-03
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -159,6 +159,7 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 |---|---|---|---|
 | `LIFEOS_AGENT_WORKER_AUTOSTART` | bool | `false` | When `true`, the worker starts on boot. Default off to require explicit opt-in. |
 | `LIFEOS_AGENT_WORKER_POLL_SECONDS` | float | `60` | Poll interval for new `#agent`-tagged tasks. |
+| `LIFEOS_HUMAN_QUEUE_POLL_SECONDS` | float | `300` | Poll interval for Human-queue `done_when` checks. See [human-queue.md](human-queue.md). |
 | `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | float | `5.00` | Per-task $-cap when the task title doesn't specify one. |
 | `LIFEOS_AGENT_DEFAULT_WALL_SECONDS` | int | `14400` (4 h) | Per-task wall-time cap when title doesn't specify. |
 | `LIFEOS_AGENT_DEFAULT_MAX_TOKENS` | int | `500000` | Per-task token cap when title doesn't specify. |
@@ -203,7 +204,7 @@ Read-only ingest of Claude Code's per-session JSONL transcripts. Decision: [ADR-
 
 ## Claude Code Resume (`/agents` operator-controlled re-launch)
 
-Operator-side controls for re-opening a Claude Code session from the `/agents` UI. Used in [agent-viz product spec § Operator controls — resume](../specs/product/agent-viz.md#operator-controls--resume).
+Operator-side controls for re-opening a Claude Code session from the `/agents` UI. Used in [agent-viz product spec § Operator controls — resume and Go To](../specs/product/agent-viz.md#graph-tab--operator-controls--resume-and-go-to).
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
@@ -231,6 +232,32 @@ Mirror of the Claude Code resume controls for Codex sessions. Drives `POST /api/
 | `LIFEOS_CODEX_RESUME_ENABLED` | bool | `false` | Gates the resume UI and route for `cx:` sessions. |
 | `LIFEOS_CODEX_RESUME_CMD` | str | `wezterm cli spawn --cwd {cwd} -- {inner_command}` | Outer launcher template. Same substitution surface as `LIFEOS_CC_RESUME_CMD`. |
 | `LIFEOS_CODEX_RESUME_INNER_CMD` | str | `codex resume {session_id}` | Inner command run inside the spawned terminal. |
+
+## Cross-Machine CLI Session Registration (`/agents` from any host)
+
+Lets a Claude Code or Codex session running on any machine — not just the one hosting the API — register itself with `/agents`. See [agent-viz technical spec § Cross-machine CLI session registration](../specs/technical/agent-viz.md#cross-machine-cli-session-registration) and [guides/agents-go-to.md § 4](agents-go-to.md#4-cross-machine-session-registration) for setup.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_AGENT_HOOK_TOKEN` | str | *(empty)* | Bearer token required from `scripts/lifeos-agent-hook.sh` on `POST /api/agents/cli-sessions/events`. Empty disables the endpoint (503). |
+
+The token above is set on the machine hosting the API. Each machine *posting* session events (the API host included, if you want its own sessions to carry a `host`) additionally needs a local env file the hook script reads — not a LifeOS setting, since it's per-machine and lives outside `.env`:
+
+| File | Purpose |
+|---|---|
+| `~/.config/lifeos/agent-hook.env` (override path via `$LIFEOS_AGENT_HOOK_ENV`) | Contains `LIFEOS_API_URL` and `LIFEOS_AGENT_HOOK_TOKEN` (the same token as above). Values already set in the environment take precedence over this file. Absent → the hook exits silently without posting. |
+
+## Card Assignment (`#851`, host / model / effort routing)
+
+See [guides/agent-worker-setup.md § Card assignment](agent-worker-setup.md#card-assignment-running-a-card-on-another-machine-851) for the ssh-prerequisites walkthrough and [specs/technical/agent-worker.md § Card assignment](../specs/technical/agent-worker.md#card-assignment-851) for the mechanism.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_AGENT_HOSTS` | JSON object | `{}` | `{name: ssh_target}` — maps a board-facing host name to the ssh target the worker/API connects to for it. Empty disables every remote host: a task naming a host not in this map lands at `#agent-failed`. Invalid JSON logs a warning and is treated as `{}`. Operator configuration — never committed with real values. |
+| `LIFEOS_AGENT_SSH_CONNECT_TIMEOUT` | int (seconds) | `10` | How long ssh may spend establishing a connection to a remote host before giving up. Applies to remote spawn, remote kill, and remote resume/focus alike. |
+| `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` | int (seconds) | `86400` | How long `GET /api/agents/models` caches each engine's model list before re-querying providers. |
+| `LIFEOS_CODEX_MODELS_CACHE_PATH` | str | `~/.codex/models_cache.json` | Path to the Codex CLI's own model-catalog cache, read by the model catalog endpoint for the codex engine's picker list. |
+| `LIFEOS_OPENAI_API_KEY` | str | *(empty)* | Optional OpenAI API key, used ONLY as the model-catalog fallback when `LIFEOS_CODEX_MODELS_CACHE_PATH` is missing/unreadable. Never used to run turns — Codex sessions are subscription-billed through the CLI itself, never the API. |
 
 ## Claude Code Orchestration (`/claude` Telegram command)
 

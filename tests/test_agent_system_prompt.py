@@ -279,3 +279,12 @@ def test_search_finances_prompt_advertises_investments(tm):
     text = "\n".join(_text_blocks(build_system_prompt()))
     assert "accounts/transactions/cashflow/budgets/investments" in text
     assert "'investments'" in text
+
+
+def test_prompt_describes_human_queue_tool(tm):
+    """#852: the orchestrator must know to file via manage_human_queue, use
+    'list' for "what's waiting on me", and never file work it can do itself."""
+    text = "\n".join(_text_blocks(build_system_prompt()))
+    assert "manage_human_queue" in text
+    assert "add/list/resolve" in text
+    assert "never file work" in text.lower()

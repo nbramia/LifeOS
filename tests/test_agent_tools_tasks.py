@@ -87,11 +87,60 @@ class TestManageTasksCreate:
         assert len(tasks) == 1
         assert tasks[0].context == "Inbox"
 
+    def test_create_forwards_status_notes_fields(self, tm):
+        """#853: status/notes/fields are threaded through the chat tool too."""
+        _tool_manage_tasks({
+            "action": "create",
+            "description": "Waiting on legal",
+            "status": "blocked",
+            "notes": "chased on Monday",
+            "fields": {"host": "laptop"},
+        })
+        tasks = tm.list_tasks()
+        assert len(tasks) == 1
+        assert tasks[0].status == "blocked"
+        assert tasks[0].notes == "chased on Monday"
+        assert tasks[0].fields == {"host": "laptop"}
+
+
+class TestManageTasksUpdateNotesAndFields:
+    def test_update_notes(self, tm):
+        task = tm.create("Plan launch")
+        _tool_manage_tasks({"action": "update", "task_id": task.id, "notes": "draft outline"})
+        assert tm.get(task.id).notes == "draft outline"
+
+    def test_update_fields_merges_and_removes(self, tm):
+        task = tm.create("Plan launch", fields={"host": "laptop"})
+        _tool_manage_tasks({
+            "action": "update", "task_id": task.id,
+            "fields": {"host": None, "effort": "high"},
+        })
+        assert tm.get(task.id).fields == {"effort": "high"}
+
 
 class TestUnknownAction:
     def test_unknown_action(self, tm):
         out = _tool_manage_tasks({"action": "nope"})
         assert out.startswith("Error:")
+
+
+class TestManageTasksCreateBadStatus:
+    """#853 round 1 finding #11: `TaskManager.create` now raises `ValueError`
+    for an unrecognized `status`. Through the chat tool boundary
+    (`execute_tool`, which wraps every handler in try/except and formats an
+    exception as an "Error: ..." string) that must come back as an error
+    string, not an unhandled exception, and nothing should be written."""
+
+    async def test_bad_status_returns_error_string_nothing_written(self, tm):
+        from api.services.agent_tools import execute_tool
+
+        out = await execute_tool("manage_tasks", {
+            "action": "create",
+            "description": "Bad status task",
+            "status": "Done",
+        })
+        assert out.startswith("Error:")
+        assert tm.list_tasks() == []
 
 
 class TestManageTasksFilterDocs:

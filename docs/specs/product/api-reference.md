@@ -2,12 +2,13 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-08-28
+**Last Updated:** 2026-09-03
 
-Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two adjacent catalogs split out for size:
+Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Three adjacent catalogs split out for size:
 
 - **CRM endpoints** (`/api/crm/*`) → [api-crm.md](api-crm.md)
 - **MCP tool catalog** (Claude Code / Managed Agents tools) → [mcp-tools.md](mcp-tools.md)
+- **Agent activity endpoints** (`/api/agents/*` — snapshot, kill, resume, cross-machine CLI session registration) → [Agent Viz — Technical](../technical/agent-viz.md#endpoints)
 
 ---
 
@@ -18,18 +19,21 @@ Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two
 3. [Google Integration](#google-integration)
 4. [Messaging Endpoints](#messaging-endpoints)
 5. [CRM Endpoints — see api-crm.md](api-crm.md)
-6. [Memories Endpoints](#memories-endpoints)
-7. [Conversations Endpoints](#conversations-endpoints)
-8. [Briefing Endpoints](#briefing-endpoints)
-9. [People Endpoints](#people-endpoints)
-10. [Photos Endpoints](#photos-endpoints)
-11. [Task Endpoints](#task-endpoints)
-12. [Scheduler & Telegram Endpoints](#scheduler--telegram-endpoints)
-13. [Monarch Money Endpoints](#monarch-money-endpoints)
-14. [Job Queue Endpoints](#job-queue-endpoints)
-15. [Performance Trace Endpoints](#performance-trace-endpoints)
-16. [Admin Endpoints](#admin-endpoints)
-17. [MCP Tools — see mcp-tools.md](mcp-tools.md)
+6. [Agent Activity Endpoints — see agent-viz.md](../technical/agent-viz.md#endpoints)
+7. [Memories Endpoints](#memories-endpoints)
+8. [Conversations Endpoints](#conversations-endpoints)
+9. [Briefing Endpoints](#briefing-endpoints)
+10. [People Endpoints](#people-endpoints)
+11. [Photos Endpoints](#photos-endpoints)
+12. [Task Endpoints](#task-endpoints)
+13. [Agent Board Endpoints](#agent-board-endpoints)
+14. [Scheduler & Telegram Endpoints](#scheduler--telegram-endpoints)
+15. [Monarch Money Endpoints](#monarch-money-endpoints)
+16. [Job Queue Endpoints](#job-queue-endpoints)
+17. [Performance Trace Endpoints](#performance-trace-endpoints)
+18. [Admin Endpoints](#admin-endpoints)
+19. [Card Assignment Endpoints](#card-assignment-endpoints-851)
+20. [MCP Tools — see mcp-tools.md](mcp-tools.md)
 
 ---
 
@@ -91,9 +95,9 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 **Pipeline routing (in order of priority):**
 1. **Ambiguous task/reminder** — asks user for clarification (task vs reminder vs both).
 2. **Claude intent** — terminal, filesystem, browser tasks. Yields `claude_intent` event for Telegram to spawn Claude Code.
-3. **Agentic loop** — everything else (including compose, tasks, reminders). Claude gets 21 tools and up to 5 rounds to fetch data and synthesize an answer. See `api/services/agent_tools.py::TOOL_DEFINITIONS` for the canonical list — count `len(TOOL_DEFINITIONS)` to re-derive this number.
+3. **Agentic loop** — everything else (including compose, tasks, reminders). Claude gets 22 tools and up to 5 rounds to fetch data and synthesize an answer. See `api/services/agent_tools.py::TOOL_DEFINITIONS` for the canonical list — count `len(TOOL_DEFINITIONS)` to re-derive this number.
 
-**Agentic loop tools (21):**
+**Agentic loop tools (22):**
 
 | Tool | Description |
 |------|-------------|
@@ -108,6 +112,7 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `person_info` | Lookup or briefing (action: lookup/briefing) |
 | `search_finances` | Monarch Money live data (action: accounts/transactions/cashflow/budgets) |
 | `manage_tasks` | Create, list, or complete tasks (action: create/list/complete) |
+| `manage_human_queue` | File, list, or resolve Human-queue cards — things only the operator can do (action: add/list/resolve) |
 | `manage_schedules` | Create or list schedules (action: create/list; schedule_action: notify/prompt/endpoint/agent). `manage_reminders` kept as a deprecated alias |
 | `create_email_draft` | Gmail draft (returns a draft_id; never sends) |
 | `send_email_draft` | Send an existing Gmail draft by draft_id (gated: only after the user confirms in a later turn — a draft created this turn cannot be sent) |
@@ -738,12 +743,16 @@ Create a task. Stored as an Obsidian Tasks-compatible markdown checkbox in the v
 {
   "description": "Call dentist",
   "context": "Personal",
+  "status": "todo",
   "priority": "high",
   "due_date": "2025-02-10",
   "tags": ["health"],
-  "reminder_id": "optional-linked-reminder-uuid"
+  "reminder_id": "optional-linked-reminder-uuid",
+  "notes": "Ask about the Tuesday afternoon slot",
+  "fields": {"host": "laptop"}
 }
 ```
+`context`, `status`, `notes`, `fields`, and `reminder_id` are all optional.
 
 ### GET /api/tasks
 
@@ -756,13 +765,21 @@ List/filter tasks.
 - `due_before` (string): YYYY-MM-DD, tasks due before this date
 - `query` (string): Fuzzy text search across task descriptions
 
+### GET /api/tasks/conflicts
+
+List Syncthing conflict copies / in-progress temp files sitting in the tasks
+folder (`name`, `mtime` each) — never indexed as tasks, surfaced so a client
+can prompt the operator to resolve them by hand.
+
 ### GET /api/tasks/{id}
 
 Get a specific task.
 
 ### PUT /api/tasks/{id}
 
-Update a task (description, status, context, priority, due_date, tags).
+Update a task (description, status, context, priority, due_date, tags,
+notes, fields). `fields` merges into the task's operator/unknown fields — a
+string value sets a field, a `null` value removes it.
 
 ### PUT /api/tasks/{id}/complete
 
@@ -771,6 +788,120 @@ Mark a task as done (adds done date automatically).
 ### DELETE /api/tasks/{id}
 
 Delete a task.
+
+### POST /api/tasks/human-queue
+
+File a Human-queue card — a task with status `blocked` and tag `human` —
+for something only the operator can do. See the
+[Human Queue guide](../../guides/human-queue.md).
+
+**Request:**
+```json
+{
+  "title": "Re-authenticate the example-service session",
+  "notes": "Login expired; re-run the interactive login script.",
+  "key": "example-service-reauth",
+  "done_when": {"type": "endpoint", "path": "/api/example-service/status", "pointer": "/status", "equals": "ok"},
+  "source_host": "example-host",
+  "source_cwd": "/home/example/project"
+}
+```
+`notes`, `key`, `done_when`, `source_host`, `source_cwd`, and `source_session`
+are all optional. Filing again with an already-open `key` updates that
+card's notes instead of creating a duplicate. The request returns `422` for
+a malformed `key` or `done_when` — see the
+[Human Queue guide](../../guides/human-queue.md#done_when--auto-resolve-checks)
+for the exact rules.
+
+### GET /api/tasks/human-queue
+
+List open Human-queue cards. Returns `{"cards": [...], "total": N}`; each
+card carries `id`, `title`, `key`, `age_hours`,
+`source_host`/`source_cwd`/`source_session`, `notes`, `done_when`.
+
+### PUT /api/tasks/human-queue/{id_or_key}/resolve
+
+Mark a card done, by task id or dedupe key. `note` (optional) is appended to
+the card's notes. Returns `404` for an id or key with no open card.
+
+All task-mutating endpoints can return `409` if a concurrent external edit
+keeps winning a compare-and-swap race on the underlying file — retry the
+request.
+
+---
+
+## Agent Board Endpoints
+
+The `/agents` Kanban board (see [Agent Viz](agent-viz.md)). Lanes are derived
+from task status/tags on every read — there is no stored lane field. See
+[Agent Viz — Technical](../technical/agent-viz.md) for the derivation rules
+and the SSE update cadence.
+
+### GET /api/agents/board
+
+Full board view model, always built fresh (never cached): `{lanes:
+{unassigned, assigned, in_progress, human_queue, scheduled, review, done},
+generated_at}`. `kind` (`"task"` | `"schedule"`) is the first field of every
+card and the only discriminator between the two shapes below — both kinds
+can land in the `done` lane. Each task card carries `kind: "task"`, `id,
+title, notes, status, tags, assignee, fields, context, updated_at, session
+(nullable), pending_question (nullable)`. Each scheduled card carries `kind:
+"schedule"`, `id, name, message_content, enabled, next_fire_at, recurring,
+last_run {at, outcome, snippet} (nullable)`.
+
+### GET /api/agents/board/stream
+
+SSE stream of the board view model — emits a full `board` event whenever
+the lanes change. Reads through a short-lived shared cache (see
+[Agent Viz — Technical](../technical/agent-viz.md#board-cache)); `GET
+/api/agents/board` above never does.
+
+### PUT /api/agents/board/cards/{id}/lane
+
+Move a task card to a lane, writing the corresponding status/tag at once —
+or writing nothing and returning an error. Body: `{lane, assignee?}`.
+`lane: "done"` marks the task done; `lane: "unassigned"` clears the
+assignee tag; `lane: "assigned"` requires `assignee` (one of
+`me`/`claude`/`codex`/`hermes`/`local`) and replaces any existing assignee
+tag. `review` and `scheduled` can't be set directly (derived from a tag
+and the scheduler store, respectively) and return **400**.
+
+Three **409** cases, no write in any of them:
+- The card is worker-owned (`agent-running` or `agent-blocked` tag
+  present) and `lane` is `in_progress` or `done` — the worker owns this
+  card while it's running or waiting on an answer; answer the question or
+  kill the session first.
+- The card's assignee is an agent engine that hasn't been claimed by the
+  worker yet and `lane` is `in_progress` — only the agent worker claims
+  agent-assigned tasks.
+- The card is a pending review (`agent-completed` tag without `accepted`)
+  and `lane` is `in_progress` or `human_queue` — accept or reject the
+  review first. `lane: "done"` on a pending review still succeeds and acts
+  as accept (adds `accepted`), same as `POST .../accept`.
+
+On success, the response's `lane` is the card's actual landed lane, which
+for `lane: "assigned"`/`"unassigned"` (tags-only writes) can differ from
+the requested lane if a higher-priority signal still applies — e.g. a
+Human-queue card assigned to someone stays in Human queue. The web board
+toasts when this happens.
+
+### POST /api/agents/board/cards/{id}/accept
+
+Move a Review card to Done by adding the `accepted` tag. Idempotent.
+Returns **409** if the card isn't in the Review lane and isn't already
+accepted.
+
+### GET /api/agents/pending-questions
+
+List unanswered agent questions: `{questions: [{id, task_id, session_id,
+question, asked_at, bot}]}`.
+
+### POST /api/agents/pending-questions/{id}/answer
+
+Answer a pending question. Body: `{answer}`, 1-4096 characters — an empty,
+whitespace-only, or over-length answer returns **400**. Writes the same
+columns a Telegram reply would — the agent worker resumes the session on
+its next tick unchanged.
 
 ---
 
@@ -972,13 +1103,31 @@ Get usage summary with stats for 24h, 7d, 30d, and all-time. Includes daily cost
 
 ---
 
+## Card Assignment Endpoints (#851)
+
+Card kill/resume/focus/registration endpoints are documented in [agent-viz.md § Endpoints](../technical/agent-viz.md#endpoints) alongside the rest of the `/agents` operator-control surface, per item 6 of this file's Table of Contents. These two are new to this issue and don't fit that page's visualization framing, so they're listed here instead — full mechanism in [agent-worker.md § Card assignment](../technical/agent-worker.md#card-assignment-851).
+
+### GET /api/agents/models
+
+Per-engine model catalog for the board's assignment pickers: `{engines: {claude: [...], codex: [...], local: [...], hermes: [...]}, refreshed_at, stale}`, each entry `{id, label, pricing}`. Cached for `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` (default 24h); `stale: true` means the last successful refresh, not this one, is being served.
+
+### POST /api/agents/board/cards/{id}/open
+
+Open an Assigned card (`status == "todo"`, a recognized assignee tag, no session already running against it) — `409` otherwise. `claude`/`codex` spawn the interactive CLI in a terminal (local, or over ssh for a registered `host` field), seeded with the card's title/notes and `LIFEOS_TASK_ID` in the environment; `hermes` returns `{open_url: "/chat?conversation=<id>"}` once the card has a Hermes conversation, else `409`.
+
+`409` also covers: a second open on the same card within a 30-second grace window after the first open claimed it but before its session has registered (`card open is already in progress` — guards a double-click racing the spawn, not a permanent lock); and a `host` field naming a value absent from `LIFEOS_AGENT_HOSTS` (`host '<name>' is not configured in LIFEOS_AGENT_HOSTS`).
+
+---
 
 ## Related Documents
 
 - [api-crm.md](api-crm.md) — `/api/crm/*` HTTP endpoints (split out from this file)
 - [mcp-tools.md](mcp-tools.md) — MCP tool catalog (the canonical home — was previously duplicated here)
+- [Agent Viz — Technical](../technical/agent-viz.md) — `/api/agents/*` endpoints in detail, including cross-machine CLI session registration
+- [Agent Worker — Technical](../technical/agent-worker.md) — Card assignment mechanism behind the Card Assignment Endpoints above
 - [Data & Sync](../technical/data-and-sync.md) — Data sources and sync pipeline
 - [Chat UI](chat-ui.md) — Chat interface product spec
 - [Client Surfaces](../technical/client-surfaces.md) — HTTP consumers and breaking-change policy
 - [CRM UI](crm-ui.md) — CRM index pointing at the four product sub-specs
 - [Configuration](../../guides/configuration.md) — Env vars referenced by several endpoints (LIFEOS_USER_NAME, LIFEOS_WORK_DOMAIN, etc.)
+- [Agent Viz](agent-viz.md) — The `/agents` Kanban board these endpoints back

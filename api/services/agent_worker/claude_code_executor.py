@@ -20,8 +20,19 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, NamedTuple, Optional
 
+from api.services.agent_worker.assignment import ENGINE_CLAUDE_CODE, map_effort_for_engine
 from api.services.agent_worker.delegation import delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
+from api.services.agent_worker.remote_spawn import (
+    HostResolutionError,
+    build_remote_argv,
+    env_names_matching_prefixes,
+    last_nonempty_line,
+    read_line_with_deadline,
+    read_remote_pgid_line,
+    resolve_host_target,
+)
+from api.services.agent_worker.remote_spawn import api_host_name as _api_host_name
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_COMPLETED,
@@ -416,6 +427,7 @@ class ClaudeCodeExecutor:
         session_id: str = "",
         model: str = "opus",
         is_child: bool = False,
+        effort: Optional[str] = None,
     ) -> list[str]:
         platform_desc = (
             "Linux server running Ubuntu"
@@ -451,6 +463,12 @@ class ClaudeCodeExecutor:
         ]
         if resume_session_id:
             cmd.extend(["-r", resume_session_id])
+        # (#851) Board-assigned effort, mapped to the CLI's own vocabulary.
+        # None (no assignment, or an engine that ignores effort) omits the
+        # flag entirely — the CLI keeps its own default.
+        claude_effort = map_effort_for_engine(ENGINE_CLAUDE_CODE, effort)
+        if claude_effort:
+            cmd.extend(["--effort", claude_effort])
         return cmd
 
     @staticmethod
@@ -475,6 +493,14 @@ class ClaudeCodeExecutor:
             k: v for k, v in os.environ.items()
             if not k.startswith(_ALTERNATE_AUTH_ENV_PREFIXES)
         }
+
+    @staticmethod
+    def _remote_unset_env_names() -> list[str]:
+        """(#851) Env var names to `env -u` on a remote-spawned subprocess —
+        mirrors `_clean_env`'s own prefix strip, applied to the remote
+        command instead of the local one (the local ssh client's own env is
+        already cleaned via `_clean_env` at the Popen call site)."""
+        return env_names_matching_prefixes(_ALTERNATE_AUTH_ENV_PREFIXES)
 
     @staticmethod
     def _effective_final_text(state: _RunState) -> str:
@@ -506,14 +532,40 @@ class ClaudeCodeExecutor:
         sid = session.session_id
         cmd = self._build_command(
             prompt, resume_session_id, session_id=sid,
-            model=session.claude_code_model or "opus",
+            # (round 1, finding #1) `session.model` is the board-assignment
+            # field (`SessionStore.set_assignment`, written by
+            # `worker._dispatch`) — it must win over `claude_code_model`,
+            # which only exists for the child-spawn escalation tier
+            # (#349/#578) and was never populated by a board assignment.
+            model=getattr(session, "model", None) or session.claude_code_model or "opus",
             is_child=bool(session.parent_session_id),
+            effort=getattr(session, "effort", None),
         )
+
+        # (#851) Board-assigned host: resolve BEFORE any spawn call. An
+        # unknown host name fails the task closed with no ssh invocation —
+        # never a fallback to local.
+        host = getattr(session, "host", None)
+        is_remote = False
+        try:
+            target = resolve_host_target(host, _api_host_name())
+        except HostResolutionError as exc:
+            self.transcript_store.append(sid, "claude_code_unknown_host", {"host": host})
+            return ExecutorOutcome(status=STATUS_FAILED, reason=str(exc))
+        if target is not None:
+            is_remote = True
+            cmd = build_remote_argv(
+                cmd,
+                target=target,
+                unset_env_names=self._remote_unset_env_names(),
+            )
 
         self.transcript_store.append(sid, "claude_code_spawn", {
             "resume": bool(resume_session_id),
             "plan_mode": plan_mode,
             "working_dir": working_dir,
+            "host": host,
+            "remote": is_remote,
         })
 
         try:
@@ -527,6 +579,9 @@ class ClaudeCodeExecutor:
                 # #379: own session/process-group leader so the operator kill can
                 # `os.killpg(pgid, ...)` the CLI + every child it spawns WITHOUT
                 # touching this worker process (which shares the worker's group).
+                # For a remote spawn this is the local `ssh` client's own group —
+                # harmless (nothing kills it via killpg) since the remote kill
+                # path (#851) reaches the actual CLI process over ssh instead.
                 start_new_session=True,
             )
         except FileNotFoundError as exc:
@@ -541,16 +596,64 @@ class ClaudeCodeExecutor:
         # observer sees the correct status.
         self.session_store.update_status(session.task_id, STATUS_RUNNING)
 
-        # #379: record the subprocess PID + process-group id so the operator
-        # kill endpoint (a separate process) can signal it. `start_new_session`
-        # makes pid==pgid, but resolve the pgid explicitly so the teardown can
-        # `killpg` the whole group. Separate from the `claude_code_spawn` marker
-        # above, which is the #400 crash-guard written *before* the Popen.
-        try:
-            pgid = os.getpgid(proc.pid)
-        except Exception:  # pragma: no cover — defensive; fall back to the pid
-            pgid = proc.pid
-        self.transcript_store.append(sid, "claude_code_pid", {"pid": proc.pid, "pgid": pgid})
+        if is_remote:
+            # (#851) The remote wrapper echoes `PGID:<n>` as its very first
+            # stdout line before the CLI's own output begins — strip it here
+            # rather than in `_consume_stream` (which would just silently
+            # discard it as unparseable JSON) so the pgid is actually
+            # captured for the remote kill path.
+            #
+            # (round 1, finding #3) Bounded wait: this read runs BEFORE the
+            # wall-clock watchdog below even exists, and `ssh -o
+            # ConnectTimeout` bounds only the TCP handshake — a stall during
+            # auth, or a host that accepts the connection but never
+            # answers, would otherwise hang this thread (and the worker's
+            # `_cli_pool`) forever with no watchdog to rescue it.
+            #
+            # (round 2, finding #2) Record the pid event immediately after
+            # Popen — BEFORE this deadline-bounded read, not after — so the
+            # operator-kill fallback (`inter_agent._kill_local_subprocess`)
+            # can reach a stalled local ssh client during the read's own
+            # deadline window instead of finding no pid event and silently
+            # no-op'ing until the wall-clock watchdog eventually fires. A
+            # second event follows with the real pgid once (if) the line
+            # arrives; `_kill_local_subprocess` scans for the LATEST
+            # `claude_code_pid` event, so it picks up the real pgid once
+            # it's recorded and falls back to this one until then.
+            self.transcript_store.append(sid, "claude_code_pid", {
+                "pid": proc.pid, "pgid": None, "remote": True, "host": host,
+            })
+            pgid = None
+            if proc.stdout is not None:
+                deadline = settings.agent_ssh_connect_timeout + 5
+                first_line, timed_out_reading_pgid = read_line_with_deadline(proc.stdout, deadline)
+                if timed_out_reading_pgid:
+                    self._terminate_unresponsive(proc)
+                    self.transcript_store.append(sid, "claude_code_remote_unresponsive", {
+                        "host": host, "deadline_seconds": deadline,
+                    })
+                    self.session_store.update_status(session.task_id, STATUS_FAILED)
+                    return ExecutorOutcome(
+                        status=STATUS_FAILED,
+                        reason=f"host {host} did not answer within {deadline}s",
+                    )
+                pgid = read_remote_pgid_line(first_line)
+            if pgid is not None:
+                self.session_store.set_remote_pgid(session.task_id, pgid)
+                self.transcript_store.append(sid, "claude_code_pid", {
+                    "pid": proc.pid, "pgid": pgid, "remote": True, "host": host,
+                })
+        else:
+            # #379: record the subprocess PID + process-group id so the operator
+            # kill endpoint (a separate process) can signal it. `start_new_session`
+            # makes pid==pgid, but resolve the pgid explicitly so the teardown can
+            # `killpg` the whole group. Separate from the `claude_code_spawn` marker
+            # above, which is the #400 crash-guard written *before* the Popen.
+            try:
+                pgid = os.getpgid(proc.pid)
+            except Exception:  # pragma: no cover — defensive; fall back to the pid
+                pgid = proc.pid
+            self.transcript_store.append(sid, "claude_code_pid", {"pid": proc.pid, "pgid": pgid})
 
         state = _RunState(plan_mode=plan_mode, is_child=bool(session.parent_session_id))
         timed_out = threading.Event()
@@ -678,9 +781,20 @@ class ClaudeCodeExecutor:
             "returncode": proc.returncode,
             "stderr_tail": stderr_tail[-500:],
         })
+        # (round 1, finding #4) On the remote path, fold the ssh failure's
+        # stderr into the reason itself — `worker.py` uses `outcome.reason`
+        # verbatim for the #agent-failed card/notice, so without this an
+        # unreachable-host failure (`Connection refused`, `Permission
+        # denied (publickey)`) only ever surfaced in the transcript's
+        # `stderr_tail`, never where the operator actually looks.
+        reason = f"claude exited with code {proc.returncode}"
+        if is_remote:
+            last_line = last_nonempty_line(stderr_tail)
+            if last_line:
+                reason = f"ssh to {host} failed (exit {proc.returncode}): {last_line}"
         return ExecutorOutcome(
             status=STATUS_FAILED,
-            reason=f"claude exited with code {proc.returncode}",
+            reason=reason,
         )
 
     # ------------------------------------------------------------------
@@ -911,6 +1025,23 @@ class ClaudeCodeExecutor:
         if rc is not None and rc < 0:
             meta["signal"] = -rc
         return meta
+
+    @staticmethod
+    def _terminate_unresponsive(proc) -> None:
+        """Best-effort terminate an ssh client that never answered the
+        `PGID:` read within its deadline (round 1, finding #3). Mirrors
+        `_on_timeout`'s terminate/wait/kill sequence minus the timed_out
+        flag (there is no watchdog running yet at this point — this read
+        happens BEFORE it starts)."""
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning("remote pgid-wait terminate failed: %s", exc)
 
     @staticmethod
     def _on_timeout(proc, timed_out: threading.Event) -> None:

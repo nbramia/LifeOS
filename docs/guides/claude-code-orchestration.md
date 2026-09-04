@@ -10,7 +10,7 @@ Run Claude Code tasks remotely from Telegram. Send `/claude <task>` (alias: `/cl
 
 > **For what `/claude` does and how the operator interaction works**, see [Claude Code Orchestration — product spec](../specs/product/claude-code-orchestration.md). For the worker internals see [`api/services/agent_worker/AGENTS.md`](../../api/services/agent_worker/AGENTS.md). This file is the operator how-to.
 
-> **`/codex` is the sibling surface for the Codex CLI.** Same setup pattern: install the binary (`npm i -g @openai/codex`), authenticate (`codex login`), set `LIFEOS_CODEX_RESUME_ENABLED=true` to enable Resume + Go To from `/agents`. Telegram commands are `/codex`, `/codex_status`, `/codex_cancel`. The agent-worker route is `routing='codex'`; the `#codex` task tag flips a `#agent` task to that surface. See the [Codex section in agent-viz](../specs/product/agent-viz.md#operator-controls--resume-and-go-to) and the [`LIFEOS_CODEX_*` env vars](configuration.md#codex-viz-agents-ingest-of-codex-sessions).
+> **`/codex` is the sibling surface for the Codex CLI.** Same setup pattern: install the binary (`npm i -g @openai/codex`), authenticate (`codex login`), set `LIFEOS_CODEX_RESUME_ENABLED=true` to enable Resume + Go To from `/agents`. Telegram commands are `/codex`, `/codex_status`, `/codex_cancel`. The agent-worker route is `routing='codex'`; the `#codex` task tag flips a `#agent` task to that surface. See the [Codex section in agent-viz](../specs/product/agent-viz.md#graph-tab--operator-controls--resume-and-go-to) and the [`LIFEOS_CODEX_*` env vars](configuration.md#codex-viz-agents-ingest-of-codex-sessions).
 
 ## Prerequisites
 

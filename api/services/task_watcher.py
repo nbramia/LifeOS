@@ -16,6 +16,8 @@ from typing import Callable, Optional
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
+from api.services.task_manager import is_conflict_file
+
 logger = logging.getLogger(__name__)
 
 _DEBOUNCE_SECONDS = 2.0
@@ -32,6 +34,8 @@ class _TaskFileHandler(FileSystemEventHandler):
     def _schedule(self, path: str):
         if path.endswith("Dashboard.md"):
             return  # Dashboard is auto-generated; never reindex it as a source
+        if is_conflict_file(Path(path)):
+            return  # Syncthing conflict copy / temp file — never a reindex source
         with self._lock:
             existing = self._pending.pop(path, None)
             if existing:

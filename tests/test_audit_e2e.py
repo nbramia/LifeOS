@@ -1188,6 +1188,13 @@ class TestFuzzySuppressionBatch5:
         from scripts.seed_proactive_reminders import MORNING_BRIEFING_PROMPT
         assert "NOTHING_TO_REPORT" in MORNING_BRIEFING_PROMPT
 
+    def test_morning_briefing_surfaces_human_queue(self):
+        """#852: the morning briefing must surface open Human-queue cards
+        by naming the list tool the orchestrator calls to check them."""
+        from scripts.seed_proactive_reminders import MORNING_BRIEFING_PROMPT
+        assert "Waiting on You" in MORNING_BRIEFING_PROMPT
+        assert "manage_human_queue" in MORNING_BRIEFING_PROMPT
+
 
 # ---------------------------------------------------------------------------
 # Q) chat_via_api HTTP Status Check (Batch 6 — Gap #8 note)

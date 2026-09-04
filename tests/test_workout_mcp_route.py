@@ -182,10 +182,11 @@ class TestSharedStore:
 
 class TestNoUnrelatedChange:
     def test_curated_endpoint_count(self):
-        """Pins the new total (56 = the pre-existing 55 + this one) so a
-        future change to this count is a deliberate, reviewed edit."""
+        """Pins the new total (59 = the pre-existing 56 [55 + this one] plus
+        the 3 Human-queue tools added by #852) so a future change to this
+        count is a deliberate, reviewed edit."""
         module = _load_mcp_module()
-        assert len(module.CURATED_ENDPOINTS) == 56
+        assert len(module.CURATED_ENDPOINTS) == 59
 
     def test_other_tools_unaffected(self):
         module = _load_mcp_module()
@@ -198,9 +199,13 @@ class TestNoUnrelatedChange:
     def test_agentic_loop_tool_count_unchanged(self):
         """manage_workouts already existed in the native agentic-loop tool
         set (#320) — this PR only adds an MCP-side route to it, so the
-        agentic-loop tool count must not move."""
+        agentic-loop tool count must not move.
+
+        Pinned total: 22 = the pre-existing 21 + `manage_human_queue`,
+        added by #852. A future change to this count should be deliberate
+        and reviewed, same as the CURATED_ENDPOINTS count above."""
         from api.services.agent_tools import TOOL_DEFINITIONS
-        assert len(TOOL_DEFINITIONS) == 21
+        assert len(TOOL_DEFINITIONS) == 22
 
 
 # ---------------------------------------------------------------------------

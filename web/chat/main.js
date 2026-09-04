@@ -72,10 +72,35 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
   // can look identical before and after (e.g. the lifeos default matches
   // index.html's initial markup).
   window.lifeChat.backendReady = initBackend(personasReady);
+  // (#851) A deep link naming a conversation — e.g. the board's "open" on
+  // a Hermes card, `/chat?conversation=<id>` — opens that thread once the
+  // backend restore above has settled, so it wins over whatever
+  // per-backend conversation initBackend() itself restored from
+  // sessionStorage. loadConversation() only needs `endpoints.conversations`
+  // (already set by the Object.assign calls above), not the resolved
+  // backend, but waiting on backendReady keeps this deterministic instead
+  // of racing initBackend()'s own restore. Purely additive: no `conversation`
+  // param leaves every existing boot path (including the plain `?mode=`/
+  // `?record=` deep links voice.js reads) byte-identical, and this never
+  // touches the SSE contract those params gate.
+  window.lifeChat.backendReady.then(() => { maybeOpenDeepLinkedConversation(); });
   initModel();  // restore the per-turn model picker (Auto/Sonnet/Opus/Gemma)
   initVoice();  // restore Voice|Text mode + wire the hold-to-talk dock (#361)
   setStatus('', 'Ready');
   inputField.focus();
+}
+
+// (#851) `?conversation=<id>` deep link — see initChat()'s call site above
+// for why this runs after backendReady rather than synchronously.
+function maybeOpenDeepLinkedConversation() {
+  let id = null;
+  try {
+    id = new URLSearchParams(window.location.search).get('conversation');
+  } catch (e) {
+    return;  // no URLSearchParams / blocked — same guard voice.js uses
+  }
+  if (!id) return;
+  loadConversation(id);
 }
 
 // --- Bridge for the classic shell script + inline handlers ---

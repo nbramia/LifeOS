@@ -2,32 +2,79 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-05-29
+> **Last Updated:** 2026-09-03
 
-LifeOS exposes a single live page at `/agents` that shows every agent session running on the box — LifeOS agent worker tasks (`#agent`-tagged), plus local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`). The graph updates every 2 seconds, clicking a node opens that session's transcript in a resizable side panel, and the operator can kill any in-flight LifeOS agent or relaunch any CLI session straight from the page.
+`/agents` is a Kanban board of the operator's work queue — vault tasks, agent questions, and scheduled work in one place, organized into lanes by status and tag. A **Graph** tab keeps the earlier force-directed session graph as a secondary, read-mostly view for watching what's actively running: every LifeOS agent worker task (`#agent`-tagged), local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`), and Claude Code / Codex sessions registered from **any other machine** on the tailnet via a lightweight hook script.
 
-The point is one place to see what your machine is doing on your behalf: whether the agent worker is making progress on the task you left in your vault, whether a Claude Code session you forgot about is still burning tokens, whether two parallel agents have collided on the same project.
+The point is one place to see what needs attention: what's waiting on an assignment, what an agent is stuck asking about, what's scheduled to run next, and — when you want to watch the machinery — what's actually executing right now.
 
 ---
 
 ## Table of Contents
 
-1. [What you see](#what-you-see)
-2. [Two sources, one graph](#two-sources-one-graph)
-3. [Status semantics](#status-semantics)
-4. [Filters and chips](#filters-and-chips)
-5. [Side panel](#side-panel)
-6. [Operator controls — kill](#operator-controls--kill)
-7. [Operator controls — resume](#operator-controls--resume)
-8. [Privacy and exposure](#privacy-and-exposure)
-9. [Configuration knobs](#configuration-knobs)
-10. [Related Documents](#related-documents)
+1. [Kanban board](#kanban-board)
+2. [Graph tab — what you see](#graph-tab--what-you-see)
+3. [Two sources, one graph](#two-sources-one-graph)
+4. [Graph tab — Status semantics](#graph-tab--status-semantics)
+5. [Graph tab — Filters and chips](#graph-tab--filters-and-chips)
+6. [Graph tab — Side panel](#graph-tab--side-panel)
+7. [Graph tab — Operator controls — kill](#graph-tab--operator-controls--kill)
+8. [Graph tab — Operator controls — resume and Go To](#graph-tab--operator-controls--resume-and-go-to)
+9. [Privacy and exposure](#privacy-and-exposure)
+10. [Configuration knobs](#configuration-knobs)
+11. [Related Documents](#related-documents)
 
 ---
 
-## What you see
+## Kanban board
 
-The page is a force-directed graph of sessions, laid out left-to-right by recency. Each node is one session:
+The board is backed by the vault task store (`LifeOS/Tasks/`) — every card is a task, plus one card per upcoming scheduler entry. There is no separate "board" data file: a card's lane is always derived fresh from the task's status and tags, so editing a task from Obsidian, `/chat`, or a Telegram reply moves its card exactly as if it had been dragged.
+
+### Lanes
+
+| Lane | What lands here |
+|---|---|
+| **Unassigned** | An open task with no assignee tag. |
+| **Assigned** | An assignee tag is set (including `#me`) but work hasn't started. |
+| **In progress** | Status `in_progress`, or the agent worker's own `#agent-running` tag. |
+| **Human queue** | An agent is blocked on a question, or a `#human` card was filed for the operator, or the task's status is `blocked`. |
+| **Scheduled** | A scheduler entry (`docs/guides/scheduler.md`) with at least one future fire. |
+| **Review** | The agent worker's `#agent-completed` tag is set and the card hasn't been accepted yet. |
+| **Done** | Status `done` or `cancelled` (cancelled cards are hidden behind the "include cancelled" filter by default — the Done lane itself is always shown), plus scheduler entries that have fired (one-off) or been disabled (recurring). |
+
+### Assignee
+
+Assignee is a single tag, one of `#me`, `#claude`, `#codex`, `#hermes`, `#local`. Dropping a card into Assigned sets that tag and clears any other assignee tag; dropping into Unassigned clears it. Setting an assignee here is a labeling action only — it does not dispatch the task to that engine. The drawer's **Open** action starts a CLI session on an Assigned `#claude`/`#codex` card explicitly, and the worker reads the card's model/effort/host fields when it claims an `#agent` task (see [Card assignment](../technical/agent-worker.md#card-assignment-851)); today the agent worker still only claims tasks carrying its own `#agent` tag, same as before this board existed.
+
+### Cards and the drawer
+
+A card shows its title, assignee chip, model/effort chips when the task carries those fields, a host chip when a linked session is running on a known machine, its other tags, and a pulsing dot when a linked session is actively running.
+
+Clicking a card opens a drawer: an editable title and notes (notes save on blur, stored as indented `> ` lines beneath the task — see [task-management.md](task-management.md)), pickers for assignee, tags, and context, and — below those — model, effort, and host pickers for engines that accept them (`#claude`/`#codex` show all three, `#local` shows effort only, `#me`/`#hermes`/unassigned show none; model options come from the model catalog per engine, and host is free text checked against the registered hosts when the card is opened) that write the fields the executors actually read. When the card has a linked session, the drawer also shows that session's live transcript feed, the same panel the Graph tab uses. Drawer actions: **Open** (an Assigned card tagged `#claude` or `#codex` spawns the CLI on the card), **Focus** (jump to the session's terminal pane), **Kill** (stop a running session), **Answer** (reply to the agent's pending question), **Accept** (move a Review card to Done), and **Resolve** (mark a manually-filed Human queue card handled).
+
+A **New card** button opens a composer — title, optional notes, and an assignee picker — that creates a task through `POST /api/tasks`.
+
+### Pending questions
+
+When an agent asks a clarifying question, the card carrying that session shows the question text and an **Answer** button in the drawer. Answering writes the reply through the same path a Telegram reply takes — the worker resumes the session on its next tick exactly as if you'd answered by text.
+
+### Scheduled column
+
+Each card shows the entry's next fire time, a recurring badge for cron entries, and — once it has fired at least once — the most recent run's outcome and a short result snippet. The drawer's title, message, and an enabled checkbox are editable and save on blur/change through the same `PUT /api/scheduler/{id}` the `/api/scheduler` UI uses — there's no separate write path for the board. Schedule type, timing, and executor are not editable from the board; use the existing scheduler UI for those.
+
+### Filters
+
+Filters AND-compose: free-text search (title and notes), lane, assignee (including "me" and "unassigned"), host, tag, context, recency, and whether to include cancelled cards. The board updates live — an edit made directly in the vault (or by the agent worker, or by the scheduler) shows up within a few seconds without a page reload.
+
+### Out of scope (for now)
+
+Card reordering within a lane — file order is lane order. See the Kanban overhaul issue set for what's next.
+
+---
+
+## Graph tab — what you see
+
+The Graph tab is a force-directed graph of sessions, laid out left-to-right by recency. Each node is one session:
 
 | Encoding | Meaning |
 |---|---|
@@ -62,7 +109,7 @@ Between filter operations the simulation **freezes after settling** (~6s). Snaps
 
 ## Two sources, one graph
 
-The page unions three ingest paths into one rendered surface:
+The Graph tab unions three ingest paths into one rendered surface:
 
 1. **LifeOS agent worker** — every `#agent` task the worker has claimed, plus its sleeps, yields, terminal outcomes, and any spawned children. This is the same data covered by [product/agent-worker.md](agent-worker.md); the viz is the read-side view of it.
 
@@ -72,9 +119,20 @@ The page unions three ingest paths into one rendered surface:
 
 All three sources are normalized to the same shape before rendering, so filters, chips, and the side panel work identically on each kind of session. Disable an ingest path with `LIFEOS_CLAUDE_CODE_VIZ_ENABLED=false` or `LIFEOS_CODEX_VIZ_ENABLED=false` if you only want a subset.
 
+Every session, from every source, now carries a `host` field — the machine it's running on. LifeOS agent worker sessions and locally-scanned CLI transcripts always report the machine hosting the API; a session registered from elsewhere (see below) reports its own hostname.
+
+### Cross-machine CLI session registration
+
+A Claude Code or Codex session doesn't have to run on the machine hosting the API to show up here. `scripts/lifeos-agent-hook.sh`, installed for both CLIs by `scripts/install-agent-hooks.sh`, posts a lifecycle event on session start, prompt submit, stop, and session end to `POST /api/agents/cli-sessions/events` — from any machine on the tailnet, bearer-token authenticated. The API keeps a small `cli_sessions` record per session (host, cwd, branch, model, status, last prompt preview, and an optional task id read from `$LIFEOS_TASK_ID`) and merges it into the snapshot:
+
+- A session with both a registration and a local transcript (the common case on the API host itself) collapses into **one row** — status comes from the registration events (accurate: `running` right after a prompt, `idle` after Stop, `ended` after SessionEnd), while token counts and dollar cost still come from the transcript.
+- A session registered from a machine with no local transcript (every other machine) appears as its own row with `host` set to that machine's name, no token/cost detail (the hook doesn't read usage data), and status directly from the event stream — never inferred from file age.
+
+This is opt-in: the endpoint is disabled (503) until an operator sets `LIFEOS_AGENT_HOOK_TOKEN`, and each machine needs the installer run once plus a small local env file with the API URL and that same token. See [guides/agents-go-to.md](../../guides/agents-go-to.md) for setup.
+
 ---
 
-## Status semantics
+## Graph tab — Status semantics
 
 A node's color is its status. The set is slightly different per source — same broad categories, different precise meaning:
 
@@ -83,19 +141,21 @@ A node's color is its status. The set is slightly different per source — same 
 | **running** | Currently executing tool calls or LLM turns. | A live `claude` / `codex` process is running with this jsonl's cwd, **or** the file was modified in the last 10 minutes. The first is authoritative; the second is inferred. |
 | **claimed** | Worker has picked up the task but hasn't fired the executor yet (preflight is in flight). | n/a |
 | **yielded** | Paused waiting for spawned children to finish. | n/a |
+| **idle** | n/a | Registered via the session hook (#849): open and waiting for input, after a `session_start` or `stop` event. Live, not finished. |
 | **inactive** | n/a | Modified within 24h but no live process — typically you closed the terminal mid-session. Resumable. |
 | **blocked** | Waiting on a Telegram clarification from you. | n/a |
 | **completed** | Task ran to completion successfully. | jsonl is >24h old, no error in the last event. |
 | **failed** | Executor crashed, preflight rejected, or runtime error. | Last event in the jsonl was an error/tool failure (and >24h old). |
+| **ended** | n/a | Registered via the session hook (#849): a `session_end` event was received — finished. Hidden by default like completed/failed; Resume available. |
 | **budget_exceeded** | Token / wall / dollar cap breached and the session was killed externally. | n/a |
 
 A small `(inferred)` hint appears next to the status on CLI sessions whenever the status came from mtime rather than from a confirmed live process — useful to know when reading "running" on a session you don't remember starting.
 
 ---
 
-## Filters and chips
+## Graph tab — Filters and chips
 
-The top toolbar has five filter controls and four count chips. **Filters are AND-composed**; the chips reflect *what's currently visible* after the filter, not the full snapshot.
+The top toolbar has six filter controls and five count chips. **Filters are AND-composed**; the chips reflect *what's currently visible* after the filter, not the full snapshot.
 
 ### Filters
 
@@ -104,6 +164,7 @@ The top toolbar has five filter controls and four count chips. **Filters are AND
 | `include finished` checkbox | off | Off → completed / failed / budget_exceeded are hidden. On → everything shows, and the default recency window widens from 30 min to 7 days. |
 | `recency` dropdown | last 30 min (60 min, 6h, 24h, 7d, all) | Filters by `last_activity_at`. Re-defaults to a wider window when `include finished` is enabled, unless the operator has set it manually. |
 | `cwd` dropdown | all | Only Claude Code sessions are scoped to a cwd. Dropdown lists every unique cwd present in the current snapshot; auto-hides when empty (no Claude Code sessions visible). |
+| `host` dropdown | all | Limit to sessions running on a specific machine. Dropdown lists every unique `host` present in the current snapshot; auto-hides on a single-host deployment (nothing to distinguish). |
 | `route` dropdown | all (local / claude / claude_code / codex) | Filters by where the session ran — operator's local LLM, Managed Agents cloud, Claude Code CLI, or Codex CLI. |
 | `status` dropdown | all | Hard-filter by the status column from the table above. |
 
@@ -121,18 +182,21 @@ Chips re-compute after every snapshot tick, so toggling `include finished` immed
 
 ---
 
-## Side panel
+## Graph tab — Side panel
 
 Clicking any node opens a panel on the right with that session's metadata header and a live-tailing event feed. The panel header carries:
 
 - **Label** — derived from the task description (LifeOS), or the first non-empty user message (Claude Code), or the session id as a fallback. **Click it to rename:** the title becomes a text box prepopulated with the current name; Enter (or clicking away) saves, Escape cancels. A manual name is pinned durably and overrides the auto-derived label and the AI summary label everywhere the node is named (graph node, panel, search). Saving an empty value clears the override and reverts to auto-naming.
 - **cwd** — Claude Code only; the project directory the session was opened in.
+- **Branch** — the git branch of that cwd, when a registration event supplied one. Blank for sessions with no cross-machine registration (e.g. a local Claude Code transcript with no hook installed).
 - **Status badge** — same status the node is colored by, with `(inferred)` if applicable.
 - **Source** — `LifeOS agent` or `Claude Code`.
-- **Routing** — `Local`, `Claude`, or `Claude Code`.
+- **Host badge** — the machine the session is running on.
+- **Routing** — `Local`, `Claude Code`, `Codex`, `Remote`, `Hermes`, or `Claude`.
 - **Cost** — `total_dollars` to 4 decimals. For Claude Code, this is cache-aware accounting (separately tracking input, output, cache_creation @ 1.25× and cache_read @ 0.10×).
 - **Tokens** — `input↓ / output↑`.
 - **Depth badge** — if the session is a child, shows spawn depth.
+- **Last prompt preview** — the most recent prompt submitted, truncated to 200 characters, when a registration event supplied one.
 
 The event feed is newest-on-top. Backfill arrives first (the last 50 events by default), then live updates stream in via SSE. Each event has:
 
@@ -146,7 +210,7 @@ Clicking the same node again, the `×` button, or empty background area closes t
 
 ---
 
-## Operator controls — kill
+## Graph tab — Operator controls — kill
 
 LifeOS agent sessions in non-terminal states get a red **Kill** button in the panel header. Clicking it opens a confirmation modal asking for an optional reason (logged to the transcript) before firing the request.
 
@@ -161,7 +225,7 @@ CLI sessions (Claude Code and Codex) do not get a Kill button — the page has n
 
 ---
 
-## Operator controls — resume and Go To
+## Graph tab — Operator controls — resume and Go To
 
 CLI sessions (Claude Code AND Codex) get up to two buttons:
 
@@ -177,13 +241,16 @@ If a cached pane has gone stale (typical: user closed the tab), the activate-pan
 
 Resume + Go To are **off by default** because spawning GUI terminals from a systemd service depends on the operator's desktop environment. Enable with `LIFEOS_CC_RESUME_ENABLED=true` for Claude Code sessions and `LIFEOS_CODEX_RESUME_ENABLED=true` for Codex; each flag also gates Go To for its respective source. Customize launchers via `LIFEOS_CC_RESUME_CMD` / `LIFEOS_CODEX_RESUME_CMD` if you don't use WezTerm — substitutions `{cwd}`, `{cwd_url}`, `{session_id}`, `{session_id_url}`, and `{inner_command}` are available. The probe-based Go To is WezTerm-specific (it reads `wezterm cli list`'s `tty_name`); non-WezTerm launchers can still use Resume but Go To will respond 404.
 
+A session registered from another host (see "Cross-machine CLI session registration" above) resumes and focuses over ssh when that host is one of the operator's registered hosts (see [Card assignment](../technical/agent-worker.md#card-assignment-851)) — the same launcher runs remotely, so Resume and Go To work wherever the session actually lives. Only a host the operator hasn't registered still 409s: the error names that host, so the operator knows to go there instead of getting a silent no-op or a misleading 404.
+
 ---
 
 ## Privacy and exposure
 
-- The page only displays sessions running on **this** machine. No cross-host federation.
-- Transcript payloads are truncated to 240 chars in the feed previews — click an event to see the full payload only on demand.
-- The kill and resume endpoints are **local-network only**. They must not be exposed via Tailscale Funnel or the public MCP HTTP transport (the gates live in [api/routes/agents.py](../../../api/routes/agents.py); see the technical spec for the threat model).
+- The transcript scan and Resume/Go To/kill primitives only ever touch **this** machine. Cross-machine visibility is opt-in and one-directional: another machine's hook posts a small lifecycle event (host, cwd, branch, status, a truncated prompt preview) to this API — this API never reaches out to, or reads files from, another machine.
+- The registration endpoint (`POST /api/agents/cli-sessions/events`) is bearer-token gated and disabled by default (503 until `LIFEOS_AGENT_HOOK_TOKEN` is set) — unlike the kill/resume endpoints below, it's meant to be reachable over Tailscale, since that's the whole point.
+- Transcript payloads are truncated to 240 chars in the feed previews — click an event to see the full payload only on demand. A registered session's prompt preview is truncated to 200 characters at the source.
+- The kill, resume, and pane-bind (`/cc-pane-bind`, `/cx-pane-bind`) endpoints are **local-network only**. They must not be exposed via Tailscale Funnel or the public MCP HTTP transport (the gates live in [api/routes/agents.py](../../../api/routes/agents.py); see the technical spec for the threat model). Resume and Go To act on sessions recorded as running on this API's own host directly, and on a registered host over ssh; a session on an unregistered host returns an error naming that host instead.
 - Claude Code ingest is strictly read-only — LifeOS opens jsonl files for reading and never writes back.
 
 ---
@@ -197,24 +264,29 @@ All in `.env`. None are required — the defaults work for the standard LifeOS i
 | `LIFEOS_CLAUDE_CODE_VIZ_ENABLED` | Surface Claude Code CLI sessions alongside agent worker sessions. Set false to scope the viz to LifeOS sessions only. | `true` |
 | `LIFEOS_CLAUDE_CODE_PROJECTS_DIR` | Where to find Claude Code transcripts. | `~/.claude/projects` |
 | `LIFEOS_CLAUDE_CODE_LOOKBACK_DAYS` | Discovery window — older jsonl files are excluded from the snapshot (they can still be loaded by direct session id). | `7` |
-| `LIFEOS_CC_RESUME_ENABLED` | Enable the Resume and Focus buttons. | `false` |
+| `LIFEOS_CC_RESUME_ENABLED` | Enable the Resume and Focus buttons, and the board drawer's **Open** action for `#claude` cards. | `false` |
 | `LIFEOS_CC_RESUME_CMD` | Launcher command. Substitutions: `{session_id}`, `{cwd}`, `{session_id_url}`, `{cwd_url}`, `{inner_command}`. The default uses WezTerm's CLI to open a tab AND run the resume in one shot. | `wezterm cli spawn --cwd {cwd} -- {inner_command}` |
 | `LIFEOS_CC_RESUME_INNER_CMD` | The command run *inside* the spawned terminal — the actual `claude --resume` invocation. Substituted into `{inner_command}` of the launcher template. | `claude --dangerously-skip-permissions --resume {session_id}` |
 | `LIFEOS_CC_RESUME_ENV_FILE` | Optional `key=value` file pinning `DISPLAY` / `XAUTHORITY` / `WAYLAND_DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` for the spawned terminal. | `` (inherit systemd env) |
 | `LIFEOS_CODEX_VIZ_ENABLED` | Surface Codex CLI sessions alongside the other sources. | `true` |
 | `LIFEOS_CODEX_SESSIONS_DIR` | Where to find Codex rollout JSONLs. | `~/.codex/sessions` |
 | `LIFEOS_CODEX_LOOKBACK_DAYS` | Discovery window for Codex rollouts. | `7` |
-| `LIFEOS_CODEX_RESUME_ENABLED` | Enable Resume + Go To for `cx:` sessions. | `false` |
+| `LIFEOS_CODEX_RESUME_ENABLED` | Enable Resume + Go To for `cx:` sessions, and the board drawer's **Open** action for `#codex` cards. | `false` |
 | `LIFEOS_CODEX_RESUME_CMD` | Codex launcher template. Same substitution surface as `LIFEOS_CC_RESUME_CMD`. | `wezterm cli spawn --cwd {cwd} -- {inner_command}` |
 | `LIFEOS_CODEX_RESUME_INNER_CMD` | Inner command inside the spawned terminal — the actual `codex resume` invocation. | `codex resume {session_id}` |
+| `LIFEOS_AGENT_HOOK_TOKEN` | Bearer token required from `scripts/lifeos-agent-hook.sh` on `POST /api/agents/cli-sessions/events`. Empty (default) disables the endpoint (503) — a fresh clone accepts no cross-machine session data until this is set. | `` |
 
 ---
 
 ## Related Documents
 
 - [ADR-011: External Agent Ingest](../../adr/011-external-agent-ingest.md) — Why Claude Code sessions surface read-only via a foreign-schema adapter
-- [Agent Viz — Technical](../technical/agent-viz.md) — Endpoint shapes, D3 force config, status inference rules, security boundaries
+- [Agent Viz — Technical](../technical/agent-viz.md) — Endpoint shapes, D3 force config, status inference rules, security boundaries, and the board's lane-derivation rules
 - [Agent Worker](agent-worker.md) — The other half of the picture: how `#agent` tasks get claimed and run
 - [Claude Code Orchestration (product)](claude-code-orchestration.md) — The orchestrator that spawns the Claude Code sessions surfaced here
 - [Agent Worker — Technical](../technical/agent-worker.md) — Sessions, transcripts, kill primitives
 - [Architecture](../technical/architecture.md) — Where the viz fits in the broader code structure
+- [Task Management](task-management.md) — The vault task store the board's cards are backed by
+- [Human Queue](../../guides/human-queue.md) — How `#human` cards are filed and auto-resolved by agents and the nightly sync
+- [Scheduler Guide](../../guides/scheduler.md) — How the Scheduled column's entries are created and edited
+- [API Reference](api-reference.md) — Board, pending-question, and lane-move endpoint shapes

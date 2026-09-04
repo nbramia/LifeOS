@@ -7,11 +7,12 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Annotated
 
 import frontmatter
 from dotenv import dotenv_values
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic import Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +281,16 @@ class Settings(BaseSettings):
                     "the Hermes text backend (optional there — Hermes may not require one), "
                     "and required from Hermes on inbound calls to "
                     "POST /api/hermes/resolve-persona (#644) — empty disables that endpoint."
+    )
+
+    agent_hook_token: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_HOOK_TOKEN",
+        description="Bearer token required from scripts/lifeos-agent-hook.sh on inbound calls "
+                    "to POST /api/agents/cli-sessions/events (#849) — the endpoint that lets a "
+                    "Claude Code or Codex session on any machine register itself with /agents. "
+                    "Empty disables the endpoint (503): a fresh clone doesn't accept "
+                    "unauthenticated session writes over the tailnet until an operator sets one."
     )
 
     # Bounded lifetime for a chat turn that has detached from its client (#611):
@@ -624,6 +635,12 @@ class Settings(BaseSettings):
         alias="LIFEOS_AGENT_WORKER_POLL_SECONDS",
         description="How often the agent worker polls for new #agent tasks."
     )
+    human_queue_poll_seconds: float = Field(
+        default=300.0,
+        alias="LIFEOS_HUMAN_QUEUE_POLL_SECONDS",
+        description="How often the agent worker checks Human-queue cards' "
+                    "done_when conditions (#852)."
+    )
     agent_worker_autostart: bool = Field(
         default=False,
         alias="LIFEOS_AGENT_WORKER_AUTOSTART",
@@ -816,6 +833,25 @@ class Settings(BaseSettings):
                     "days. Older transcripts can still be opened on demand by "
                     "direct id via the events endpoint."
     )
+    codex_models_cache_path: str = Field(
+        default="~/.codex/models_cache.json",
+        alias="LIFEOS_CODEX_MODELS_CACHE_PATH",
+        description="Path to the Codex CLI's own model-catalog cache "
+                    "(`{\"fetched_at\", \"models\": [...]}`), read by "
+                    "GET /api/agents/models for the codex engine's picker "
+                    "list. Missing/unreadable/empty falls back to a live "
+                    "OpenAI models list call when LIFEOS_OPENAI_API_KEY is "
+                    "set, else an empty list (not an error)."
+    )
+    openai_api_key: str = Field(
+        default="",
+        alias="LIFEOS_OPENAI_API_KEY",
+        description="Optional OpenAI API key, used ONLY as the model-catalog "
+                    "fallback (GET /api/agents/models) when the Codex CLI's "
+                    "own models_cache.json is missing or unreadable. Never "
+                    "used to run turns — Codex sessions are subscription-"
+                    "billed through the CLI itself, never the API."
+    )
     codex_resume_enabled: bool = Field(
         default=False,
         alias="LIFEOS_CODEX_RESUME_ENABLED",
@@ -839,6 +875,65 @@ class Settings(BaseSettings):
         description="Command run *inside* the spawned terminal — the actual "
                     "`codex resume` invocation. Substitutions: `{session_id}`, "
                     "`{cwd}`. Set to empty to skip the inner command."
+    )
+    # #851: card assignment to a host other than the API host, over ssh.
+    #
+    # `NoDecode` (round-1 review, finding #8): pydantic-settings' own
+    # complex-field JSON pre-decode runs BEFORE `mode="before"` validators —
+    # for a plain `dict[str, str]` field that pre-decode raises straight out
+    # of `Settings()` on an empty string or malformed JSON, so
+    # `_parse_agent_hosts` below never even ran for those cases despite the
+    # docstring's promise. `NoDecode` opts this field out of that pre-decode
+    # so the validator receives the raw env string and its empty/invalid
+    # branches actually execute.
+    agent_hosts: Annotated[dict[str, str], NoDecode] = Field(
+        default_factory=dict,
+        alias="LIFEOS_AGENT_HOSTS",
+        description="JSON object mapping a board-facing host name (e.g. "
+                    "\"studio\") to the ssh target the worker/API should "
+                    "connect to for it (e.g. \"user@studio.example\", or a "
+                    "name from ~/.ssh/config). Operator configuration — never "
+                    "committed with real values. Default {} disables every "
+                    "remote host: a task naming a host not in this map lands "
+                    "at #agent-failed rather than running anywhere. Invalid "
+                    "JSON logs a warning and is treated as {}."
+    )
+
+    @field_validator("agent_hosts", mode="before")
+    @classmethod
+    def _parse_agent_hosts(cls, value):
+        if isinstance(value, dict):
+            return value
+        if value in (None, ""):
+            return {}
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                logger.warning("LIFEOS_AGENT_HOSTS is not valid JSON — ignoring, no remote hosts configured")
+                return {}
+            if not isinstance(parsed, dict):
+                logger.warning("LIFEOS_AGENT_HOSTS must be a JSON object — ignoring, no remote hosts configured")
+                return {}
+            return parsed
+        return {}
+
+    agent_ssh_connect_timeout: int = Field(
+        default=10,
+        alias="LIFEOS_AGENT_SSH_CONNECT_TIMEOUT",
+        description="Seconds ssh may spend establishing a connection to a "
+                    "board-assigned remote host before giving up (`ssh -o "
+                    "ConnectTimeout=<this>`). Applies to remote spawn, remote "
+                    "kill, and remote resume/focus alike."
+    )
+    agent_model_catalog_ttl_seconds: int = Field(
+        default=86400,
+        alias="LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS",
+        description="How long GET /api/agents/models caches each engine's "
+                    "model list before re-querying providers. Default 24h — "
+                    "model catalogs change rarely and every provider call "
+                    "costs a round trip (Anthropic) or a filesystem read "
+                    "(Codex's models_cache.json)."
     )
     cc_resume_enabled: bool = Field(
         default=False,

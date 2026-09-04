@@ -111,7 +111,7 @@ LifeOS includes an external **agent worker** that picks up tasks you've tagged `
 - **Spawns its own teammates.** Agents can spawn child sessions, message them, and yield until they finish — good for fan-out research and parallel pipelines.
 - **Fully audited and restart-safe.** Every tool call, model turn, and cost delta is captured; a crash mid-task rolls back to `#agent` for retry (or resumes a still-running cloud session).
 
-You can also run terminal, filesystem, and code tasks through **Claude Code** or **Codex** — via `/claude` / `/codex` on Telegram, "use claude code" in chat, or the `/chat` model picker (see [Claude Code / Codex orchestration](docs/specs/product/claude-code-orchestration.md)). Watch every running session — local, cloud, and CLI — on the live [`/agents`](docs/specs/product/agent-viz.md) page.
+You can also run terminal, filesystem, and code tasks through **Claude Code** or **Codex** — via `/claude` / `/codex` on Telegram, "use claude code" in chat, or the `/chat` model picker (see [Claude Code / Codex orchestration](docs/specs/product/claude-code-orchestration.md)). Watch every running session — local, cloud, and CLI — on the live [`/agents`](docs/specs/product/agent-viz.md) page, whose primary view is a Kanban board of the work queue with the session graph as a secondary tab.
 
 Set up: [Agent Worker Setup](docs/guides/agent-worker-setup.md). Full reference: [Product](docs/specs/product/agent-worker.md) · [Technical](docs/specs/technical/agent-worker.md).
 
