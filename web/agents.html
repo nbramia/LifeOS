@@ -843,8 +843,12 @@
     flex: 1 1 260px;
     /* Low enough that the six default lanes actually fit an 1280px board
        without horizontal scroll, so hiding one genuinely widens the rest
-       instead of sitting pinned at this floor (round-1 finding 2). */
-    min-width: 200px;
+       instead of sitting pinned at this floor (round-1 finding 2). 200px
+       left a 20px overflow (the container's 1.25rem padding-right) that
+       still forced a scrollbar at exactly 1280px — 196px is the largest
+       floor that actually fits: (1280 - 40px padding - 60px of five 12px
+       gaps) / 6 lanes = 196.67px (round-2 finding 3). */
+    min-width: 196px;
     display: flex;
     flex-direction: column;
     background: var(--bg-secondary);
@@ -1045,7 +1049,11 @@
      cap is ALSO expressed here in CSS (not just computed from
      window.innerHeight in JS on input/render) so it re-applies automatically
      when the viewport shrinks, without a resize listener (round-1 finding 8). */
-  .drawer-notes-autosize { overflow-y: auto; resize: none; max-height: 66vh; }
+  /* Two thirds of the viewport height, matching autosizeNotesTextarea's own
+     `innerHeight * 2/3` cap (web/agents/board.js) — CSS wins when the two
+     disagree, so a mismatch here silently makes the JS branch dead
+     (round-2 finding 5). */
+  .drawer-notes-autosize { overflow-y: auto; resize: none; max-height: 66.667vh; }
   .drawer-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
   .drawer-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.75rem; }
   .drawer-action {

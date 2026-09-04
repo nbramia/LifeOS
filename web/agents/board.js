@@ -495,7 +495,12 @@ export function initBoard() {
         if (data && data.lane && data.lane !== targetLane) {
           showToast(`Card landed in ${laneLabel(data.lane)}, not ${laneLabel(targetLane)}.`, false);
         }
-        return fetchBoard();
+        // Callers that need to know where the card actually ended up (e.g.
+        // the composer revealing the right lane — round-2 finding 1b) read
+        // it off the resolved value; fetchBoard()'s own resolution (undefined)
+        // is irrelevant to them, so hand back `data` once the board refresh
+        // settles.
+        return fetchBoard().then(() => data);
       })
       .catch(err => {
         showToast(`Couldn't move card: ${err.message}`, true);
@@ -558,6 +563,13 @@ export function initBoard() {
     assigneeSelectEl.addEventListener('change', () => {
       if (assigneeSelectEl.value && laneSelectEl.value === 'unassigned') {
         laneSelectEl.value = 'assigned';
+      } else if (!assigneeSelectEl.value && laneSelectEl.value === 'assigned') {
+        // The reverse of the flip above — clearing the assignee back to
+        // blank must not leave Lane stuck on Assigned, or Create then fails
+        // on "Pick an assignee for the Assigned lane." against a select the
+        // operator never touched (round-2 finding 1, one-directional dead
+        // end).
+        laneSelectEl.value = 'unassigned';
       }
     });
 
@@ -567,7 +579,15 @@ export function initBoard() {
       const notes = backdrop.querySelector('#new-card-notes').value.trim();
       const lane = laneSelectEl.value;
       const assignee = assigneeSelectEl.value;
-      if (lane === 'assigned' && !assignee) {
+      // The assignee-select's own `change` listener (above) only flips Lane
+      // when the operator picks an assignee — it never re-fires if they then
+      // edit Lane back to Unassigned by hand, leaving it lying about where
+      // the card will actually go: derive_lane (api/services/agent_board.py)
+      // files any task carrying an assignee tag under Assigned regardless of
+      // what Lane says. Recompute here so both the guard checks below and
+      // the lane PUT match reality (round-2 finding 1a).
+      const effectiveLane = (lane === 'unassigned' && assignee) ? 'assigned' : lane;
+      if (effectiveLane === 'assigned' && !assignee) {
         showToast('Pick an assignee for the Assigned lane.', true);
         return;
       }
@@ -575,7 +595,7 @@ export function initBoard() {
       // the worker claims agent-assigned tasks") — reject client-side
       // before creating anything, mirroring the Assigned guard above
       // (round-1 finding 4b).
-      if (lane === 'in_progress' && assignee && AGENT_ASSIGNEES.includes(assignee)) {
+      if (effectiveLane === 'in_progress' && assignee && AGENT_ASSIGNEES.includes(assignee)) {
         showToast('Only "me" can be assigned directly to In progress — the worker claims agent-assigned tasks itself.', true);
         return;
       }
@@ -602,25 +622,51 @@ export function initBoard() {
         // duplicate (round-1 finding 6). The `created && created.id` guard
         // below already handles a null result cleanly.
         const created = await r.json().catch(() => null);
-        if (lane !== 'unassigned' && created && created.id) {
+        // Where the card is actually filed before any lane PUT runs:
+        // derive_lane keys off the assignee tag the create call sent, never
+        // off the composer's own Lane select — a fresh card with no
+        // assignee tag lands Unassigned, one with an assignee tag lands
+        // Assigned. Updated below with whatever a successful moveCard PUT
+        // reports it actually landed in (round-2 finding 1b/4).
+        let landedLane = assignee ? 'assigned' : 'unassigned';
+        let moveFailed = false;
+        if (effectiveLane !== 'unassigned' && created && created.id) {
           try {
-            await moveCard(created.id, lane, assignee || undefined);
+            const moved = await moveCard(created.id, effectiveLane, assignee || undefined);
             // moveCard's own success path already re-fetches the board —
             // avoid a second GET /api/agents/board round-trip here
             // (round-1 finding 9).
+            if (moved && moved.lane) landedLane = moved.lane;
           } catch (_) {
             // moveCard already toasted the failure and never re-fetches on
             // its own failure path — do it here so the board reflects the
-            // card that DID get created (just not moved).
+            // card that DID get created (just not moved). Nothing beyond the
+            // create call landed, so landedLane keeps the pre-move value
+            // above rather than the lane the PUT failed to reach (round-2
+            // finding 2).
             await fetchBoard();
+            moveFailed = true;
           }
         } else {
+          // A non-Unassigned lane was requested but there's no id to move
+          // with — a 200 whose body didn't parse to an object with one.
+          // Before this fix the operator saw nothing at all: the task WAS
+          // created, just not where they asked, with zero toasts to say so
+          // (round-2 finding 4).
+          if (effectiveLane !== 'unassigned' && !(created && created.id)) {
+            showToast(`Card created, but couldn't confirm its id to move it to ${laneLabel(effectiveLane)} — check ${laneLabel(landedLane)}.`, true);
+          }
           await fetchBoard();
         }
-        // A card created straight into a lane the filter is currently
-        // hiding would otherwise land with zero on-screen feedback — reveal
-        // that lane so the new card is actually visible (round-1 finding 5).
-        ensureLaneVisible(lane);
+        // A card that landed in a lane the filter is currently hiding would
+        // otherwise have zero on-screen feedback — reveal that lane so it's
+        // actually visible (round-1 finding 5). Use the lane the card
+        // actually reached, not the one requested: a failed move never got
+        // there (round-2 finding 1b/2), and a card whose id we never learned
+        // only ever reached the tag-derived lane above (round-2 finding 4).
+        // A failed move must never persist a filter change for a column the
+        // card isn't actually in (round-2 finding 2).
+        if (!moveFailed) ensureLaneVisible(landedLane);
         cleanup();
       } catch (err) {
         showToast(`Couldn't create card: ${err.message}`, true);

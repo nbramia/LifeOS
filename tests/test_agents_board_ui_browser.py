@@ -1184,10 +1184,18 @@ class TestLaneFilterMultiSelect:
         240px `min-width` floor pinned every column there and hiding one
         changed nothing (240 -> 240) — the prior test only proved the
         widening behavior at a much wider 2400px viewport. Lowered to
-        ~200px so the six lanes actually fit 1280px without horizontal
-        scroll and hiding one measurably widens the rest."""
+        196px (round-2 finding 3: 200px still left a 20px overflow, exactly
+        the container's padding, forcing a scrollbar even at six lanes) so
+        the six lanes actually fit 1280px without horizontal scroll and
+        hiding one measurably widens the rest."""
         page.set_viewport_size({"width": 1280, "height": 800})
         _open_board(page, agents_base_url)
+        # Pin the "fits without a scrollbar" half of the claim above, not
+        # just the widening-on-hide half (round-2 finding 3).
+        scroll_width, client_width = page.locator("#board-lanes").evaluate(
+            "el => [el.scrollWidth, el.clientWidth]"
+        )
+        assert scroll_width <= client_width, (scroll_width, client_width)
         width_before = page.locator('.board-lane[data-lane="unassigned"]').bounding_box()["width"]
 
         self._open_lane_dropdown(page)
@@ -1403,6 +1411,72 @@ class TestLaneAddButton:
         # No lane PUT contradicts the assignee that was actually chosen.
         assert all(c.get("assignee") == "codex" for c in lane_calls), lane_calls
 
+    def test_assignee_then_manual_unassigned_override_still_lands_in_assigned(self, page: Page, agents_base_url):
+        """Round-2 finding 1a: the 4a flip above only fires on the assignee
+        select's own `change` event — if the operator picks an assignee
+        (Lane auto-flips to Assigned) and then edits Lane back to Unassigned
+        by hand, the raw Lane value lies about where the card will land:
+        derive_lane (api/services/agent_board.py) files any assignee-tagged
+        task under Assigned regardless of what Lane says. Recomputing
+        `effectiveLane` at submit makes the actual lane PUT — and the card's
+        resting lane — match the tag, not the overridden select."""
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-assignee").select_option("me")
+        expect(page.locator("#new-card-lane")).to_have_value("assigned")
+        page.locator("#new-card-lane").select_option("unassigned")
+        page.locator("#new-card-desc").fill("Manually reset to Unassigned")
+        page.locator("#new-card-create").click()
+
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0]["tags"] == ["me"], task_posts
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        assert lane_calls[0]["lane"] == "assigned", lane_calls
+
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_contain_text("Manually reset to Unassigned")
+        expect(page.locator('.board-lane[data-lane="unassigned"]')).not_to_contain_text("Manually reset to Unassigned")
+
+    def test_assignee_then_manual_unassigned_override_reveals_hidden_assigned_lane(self, page: Page, agents_base_url):
+        """Same scenario as above with Assigned hidden by the filter first —
+        the reveal-on-create (round-1 finding 5) must use the lane the card
+        actually reached (Assigned), not the lane the composer's Lane select
+        was left reading (Unassigned) after the manual override (round-2
+        finding 1b)."""
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='assigned']").uncheck()
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_have_count(0)
+
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-assignee").select_option("me")
+        page.locator("#new-card-lane").select_option("unassigned")
+        page.locator("#new-card-desc").fill("Hidden Assigned reveal")
+        page.locator("#new-card-create").click()
+
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_contain_text("Hidden Assigned reveal")
+        page.locator("#board-lane-filter-btn").click()
+        expect(page.locator("#board-lane-filter-options input[value='assigned']")).to_be_checked()
+
+    def test_clearing_assignee_restores_lane_select_to_unassigned(self, page: Page, agents_base_url):
+        """Round-2 finding 1: the reverse of the 4a flip. Picking an
+        assignee flips Lane to Assigned; clearing the assignee back to blank
+        must flip it back — otherwise Create fails on "Pick an assignee for
+        the Assigned lane." against a select the operator never touched
+        (the one-directional dead end)."""
+        _open_board(page, agents_base_url)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-assignee").select_option("me")
+        expect(page.locator("#new-card-lane")).to_have_value("assigned")
+        page.locator("#new-card-assignee").select_option("")
+        expect(page.locator("#new-card-lane")).to_have_value("unassigned")
+
     def test_in_progress_lane_with_agent_assignee_is_rejected_before_creating(self, page: Page, agents_base_url):
         """Round-1 finding 4b: plan_lane_move 409s a lane=in_progress move
         for any AGENT_ASSIGNEES tag ("only the worker claims agent-assigned
@@ -1468,6 +1542,34 @@ class TestLaneAddButton:
         _wait_for(lambda: len(task_posts) == 1, page=page)
         assert len(task_posts) == 1, task_posts
 
+    def test_non_json_create_response_into_non_unassigned_lane_shows_toast(self, page: Page, agents_base_url):
+        """Round-2 finding 4: round-1 finding 6's fix (above) turned a
+        loud-but-wrong failure into a silent wrong outcome whenever a
+        non-Unassigned lane was requested — the test above only exercises
+        the Unassigned target, where staying put is correct and silence is
+        fine. A non-JSON 200 into e.g. Human queue must surface a toast: the
+        card WAS created, just not confirmed to have moved where asked, with
+        no id available to move it there."""
+        task_posts = []
+        lane_calls = []
+
+        def bad_json_handler(route):
+            body = json.loads(route.request.post_data or "{}")
+            task_posts.append(body)
+            route.fulfill(status=200, content_type="text/plain", body="not json")
+
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.route(re.compile(r"/api/tasks$"), bad_json_handler)
+
+        page.locator('.board-lane[data-lane="human_queue"] .board-lane-add').click()
+        page.locator("#new-card-desc").fill("Should toast, not vanish silently")
+        page.locator("#new-card-create").click()
+
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        assert lane_calls == [], lane_calls  # no id to move with — no PUT was attempted
+
     def test_create_with_failing_lane_put_toasts_closes_and_leaves_card_unassigned(self, page: Page, agents_base_url):
         """Round-1 finding 14d: POST /api/tasks succeeding but the follow-up
         lane PUT 500ing must not be silently swallowed — an error toast
@@ -1490,6 +1592,63 @@ class TestLaneAddButton:
         _wait_for(lambda: len(task_posts) == 1, page=page)
         expect(page.locator("#new-card-title")).to_have_count(0)
         expect(page.locator('.board-lane[data-lane="unassigned"]')).to_contain_text("Half-created card")
+
+    def test_failed_move_into_hidden_lane_does_not_reveal_or_persist_it(self, page: Page, agents_base_url):
+        """Round-2 finding 2: `ensureLaneVisible` used to run on the
+        lane-PUT-failure path too, revealing (and persisting to
+        localStorage) a lane the card never actually reached. A failed
+        create-into-a-hidden-lane must leave the operator's saved filter
+        selection exactly as they left it — Done stays hidden and unchecked,
+        and the card is visible where it actually landed (Unassigned)."""
+        task_posts = []
+        lane_calls = []
+        _open_board(
+            page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls, lane_status_code=[500],
+        )
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-lane").select_option("done")
+        page.locator("#new-card-desc").fill("Should stay hidden")
+        page.locator("#new-card-create").click()
+
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="unassigned"]')).to_contain_text("Should stay hidden")
+        stored = page.evaluate("localStorage.getItem('lifeos.agents.board.lanes')")
+        assert stored is None, stored
+
+    def test_failed_move_with_an_assignee_does_not_reveal_a_hidden_assigned_lane(self, page: Page, agents_base_url):
+        """Round-2 finding 2, a variant where the pre-move guess (assignee
+        present -> Assigned) happens to coincide with where the card
+        actually settles even after the PUT fails — proving the guard is
+        gated on the move's own success/failure, not just on `landedLane`
+        already defaulting somewhere safe. Hide Assigned, create into Human
+        queue with an agent assignee, and let the lane PUT 500."""
+        task_posts = []
+        lane_calls = []
+        _open_board(
+            page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls, lane_status_code=[500],
+        )
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='assigned']").uncheck()
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_have_count(0)
+        stored_before = page.evaluate("localStorage.getItem('lifeos.agents.board.lanes')")
+
+        page.locator('.board-lane[data-lane="human_queue"] .board-lane-add').click()
+        page.locator("#new-card-desc").fill("Should not reveal Assigned")
+        page.locator("#new-card-assignee").select_option("codex")
+        page.locator("#new-card-create").click()
+
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="assigned"]')).to_have_count(0)
+        stored_after = page.evaluate("localStorage.getItem('lifeos.agents.board.lanes')")
+        assert stored_after == stored_before, (stored_before, stored_after)
+        page.locator("#board-lane-filter-btn").click()
+        expect(page.locator("#board-lane-filter-options input[value='assigned']")).not_to_be_checked()
 
 
 class TestDrawerClickOutsideClose:
@@ -1610,6 +1769,12 @@ class TestNotesAutosize:
         scroll_height = notes.evaluate("el => el.scrollHeight")
         assert offset_height > offset_height_empty, (offset_height_empty, offset_height)
         assert offset_height <= max_height + 1, (offset_height, max_height)  # +1 for rounding
+        # Tight enough on the lower bound to actually pin "two thirds" rather
+        # than just "some cap well below the tolerance" — a CSS/JS mismatch
+        # (round-2 finding 5: CSS said 66vh, JS said 2/3 = 66.667vh, and CSS
+        # always wins) would land here at 396px, a full 4px under this floor
+        # at a 600px viewport.
+        assert offset_height > max_height - 1, (offset_height, max_height)
         assert scroll_height > offset_height, (scroll_height, offset_height)  # capped — scrolls internally
 
     def test_not_prematurely_scrollable_below_the_cap(self, page: Page, agents_base_url):
