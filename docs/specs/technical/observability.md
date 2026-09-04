@@ -101,6 +101,18 @@ curl http://localhost:8000/api/perf/routes | jq
 
 ---
 
+## Log Redaction
+
+`api/services/log_redaction.py` installs two logging filters at process startup (`configure_telegram_log_redaction()`): a Telegram bot token redaction filter, and `RequestQueryStringRedactionFilter` / `install_query_string_redaction_filter()`, which strips everything from the first `?` onward in uvicorn's own access-log line (`uvicorn.access`) for every route. This exists because that access logger writes the full request line — path *and* query string — at INFO regardless of what a route handler itself logs, so raw text typed into a search box (e.g. `GET /api/crm/people?q=<text>`) would otherwise still reach `logs/server.log` even after a handler-level fix. `RouteTimingMiddleware` above already keys its own log lines and in-memory summary by route template rather than raw path for the same reason, but that guarantee is specific to route timing — this filter is what covers the access logger itself, for every route.
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `api/services/log_redaction.py` | `RequestQueryStringRedactionFilter`, `TelegramTokenRedactionFilter`, `configure_telegram_log_redaction()` |
+
+---
+
 ## Alerting
 
 ### Severity Levels
