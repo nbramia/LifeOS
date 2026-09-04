@@ -385,6 +385,32 @@ def test_console_output_names_log_path(stub_python, tmp_path):
     # land on the directory this hook owns and normally uses.
     assert log_dir.stat().st_mode & 0o777 == 0o700, (
         "the owned log directory must be tightened to 0700")
+    # Round 4 (#908 finding 1): the happy (owned-directory) path must keep
+    # naming logs from the branch slug alone — `LOG_FILE_PREFIX` is only for
+    # the not-owned last-resort case (test_last_resort_dir_is_never_chmod_or_pruned
+    # covers that direction). A mutant that applies the prefix unconditionally,
+    # or to only one of the two logs, would otherwise slip through undetected.
+    assert not unit_logs[0].name.startswith("lifeos-prepush-"), (
+        "the happy-path unit log must not carry the not-owned-dir prefix")
+    assert not browser_logs[0].name.startswith("lifeos-prepush-"), (
+        "the happy-path browser log must not carry the not-owned-dir prefix")
+    assert unit_logs[0].name.startswith("feat_ac2-check-"), (
+        "the happy-path unit log should be named from the branch slug")
+    assert browser_logs[0].name.startswith("feat_ac2-check-"), (
+        "the happy-path browser log should be named from the branch slug")
+    # Round 4 (#908 finding 2): the happy path must never print a
+    # degraded-directory line, and the console output must be exactly these
+    # four lines — no more, no fewer — so an extra line anywhere (e.g. a
+    # spuriously injected degraded-path message) is caught.
+    for phrase in ("is unusable", "is a symlink", "every fallback failed"):
+        assert phrase not in result.stdout, (
+            f"happy path must not print a degraded-path message: {phrase!r}")
+    assert result.stdout.splitlines() == [
+        f"Log: {unit_logs[0]}",
+        "Running unit tests... passed (1 passed in 0.01s)",
+        f"Log: {browser_logs[0]}",
+        "Running server-free browser tests... passed (1 passed in 0.01s)",
+    ]
 
 
 @pytest.mark.unit
@@ -787,6 +813,15 @@ def test_last_resort_dir_is_never_chmod_or_pruned(tmp_path):
     assert not calls_file.exists(), (
         f"chmod/find must never run against the un-owned last resort: "
         f"{calls_file.read_text() if calls_file.exists() else ''}")
+    # Round 4 (#908 finding 1): the not-owned last resort is exactly where
+    # `LOG_FILE_PREFIX` must apply, so a log dropped in a shared, unswept
+    # directory is still attributable as this hook's. The other half of this
+    # assertion (the prefix must NOT appear on the owned/happy path) lives in
+    # test_console_output_names_log_path.
+    assert Path(log).name.startswith("lifeos-prepush-"), (
+        "the not-owned last-resort unit log must carry the attribution prefix")
+    assert Path(browser_log).name.startswith("lifeos-prepush-"), (
+        "the not-owned last-resort browser log must carry the attribution prefix")
 
 
 @pytest.mark.unit
@@ -833,12 +868,23 @@ def test_distinct_fixed_fallback_failure_reaches_mktemp_rung(tmp_path):
     hook must fall all the way through to the throwaway
     `mktemp -d ".../lifeos-prepush.XXXXXX"` rung, and assert its distinctive
     naming shape and that the message names the fixed fallback's own reason.
+
+    Round 4 (#908 finding 3): the configured directory and the fixed
+    fallback must fail for DIFFERENT reasons, so the "the fixed fallback's
+    own reason" assertion below is actually exercising the fallback's
+    message rather than being satisfied by the configured directory's
+    identical-looking one. The configured directory is a plain file ("not a
+    directory"); the fixed fallback is a directory that exists but can't be
+    written to ("not writable") — dropping the fallback's reason entirely
+    would previously leave this test green because both messages read
+    "(not a directory)".
     """
     hostile_tmpdir = tmp_path / "hostile_tmpdir"
     hostile_tmpdir.mkdir()
     (hostile_tmpdir / "lifeos-prepush").write_text("occupied")
     fallback_path = tmp_path / "also_occupied_fallback"
-    fallback_path.write_text("occupied")
+    fallback_path.mkdir()
+    fallback_path.chmod(0o500)
 
     env = {
         **os.environ,
@@ -854,7 +900,8 @@ def test_distinct_fixed_fallback_failure_reaches_mktemp_rung(tmp_path):
     assert result.returncode == 0
     assert "the fixed fallback" in result.stdout
     assert f"({fallback_path})" in result.stdout
-    assert "(not a directory)" in result.stdout  # the fixed fallback's own reason
+    assert "(not a directory)" in result.stdout  # the configured dir's own reason
+    assert "(not writable)" in result.stdout  # the fixed fallback's own, distinct reason
     log, browser_log = _log_paths(result.stdout)
     resolved_dir = Path(log).parent
     assert resolved_dir == Path(browser_log).parent
