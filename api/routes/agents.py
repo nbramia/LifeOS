@@ -213,11 +213,15 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "label": _label_for_session(s, events),
         "model_label": _model_label_for_routing(s.routing),
         # (#863) board-assignment + identity fields, passed through so the
-        # panel and filters can surface them without re-deriving.
-        "model": getattr(s, "model", None),
-        "effort": getattr(s, "effort", None),
-        "conversation_id": getattr(s, "conversation_id", None),
-        "bot": getattr(s, "bot", None),
+        # panel and filters can surface them without re-deriving. Direct
+        # attribute access, matching `host` above — all five (#851)
+        # fields exist on `Session` with defaults, so `getattr(..., None)`
+        # was inconsistent defensiveness rather than a real guard (#863
+        # review round 2, finding P).
+        "model": s.model,
+        "effort": s.effort,
+        "conversation_id": s.conversation_id,
+        "bot": s.bot,
         "origin": getattr(s, "origin", None),
         "last_event_kind": summary["last_event_kind"],
         "tool_call_count": summary["tool_call_count"],
@@ -487,26 +491,16 @@ def _model_label_for_routing(routing: str | None) -> str:
         # (#850) Hermes sessions used to fall through to the Claude-model-name
         # guess below and get mislabeled "Claude" — Hermes runs its own
         # DeepSeek-backed engine, not an Anthropic model.
-        # (#863 review) An earlier version of this suffix read `Session.model`
-        # — that column is written only by the board's operator-chosen model
-        # *picker* (`SessionStore.set_assignment`); `HermesExecutor` never
-        # reads or writes it, and a conversation-rooted Hermes session (the
-        # dominant path) passes no `model` at all, so the branch was
-        # unreachable there and, when it did fire, asserted a model Hermes
-        # was never actually told to use. `model_readout.py`'s
-        # `_last_observed_hermes_chat_model` is the one thing that DOES
-        # record what Hermes reported running — parsed from a real Hermes
-        # chat turn's `usage` event by `hermes_proxy.py`'s
-        # `_HermesTurnPersister`. It's a process-wide "last observed" value,
-        # not a per-session attribution — read defensively so a lookup
-        # failure just degrades to the plain "Hermes" label.
-        try:
-            from api.services.model_readout import _last_observed_hermes_chat_model
-            observed_model, _observed_at = _last_observed_hermes_chat_model()
-        except Exception:  # noqa: BLE001
-            observed_model = None
-        if observed_model:
-            return f"Hermes · {observed_model}"
+        # (#863 review round 2, finding O) A prior version of this branch
+        # appended "· <model>" from `model_readout._last_observed_hermes_chat_model()`
+        # — that's a single process-wide "last observed" value written by
+        # ANY Hermes turn (an agent-worker session and `/chat`'s Hermes
+        # proxy alike), not a per-session attribution. A finished session's
+        # badge would retroactively change to whatever model a *different*,
+        # unrelated Hermes turn most recently reported — `model_readout.py`'s
+        # own docstring rejects exactly this kind of cross-surface borrowing
+        # as dishonest. No honest per-session source exists today, so the
+        # badge stays plain.
         return "Hermes"
     if routing in ("claude_code", "code"):
         return "Claude Code"

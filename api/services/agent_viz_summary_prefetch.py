@@ -74,7 +74,15 @@ def _candidate_sessions() -> list[dict[str, Any]]:
 
     pending: list[dict[str, Any]] = []
     for s in snap.get("sessions", []):
-        if s.get("short_label"):
+        # `short_label` is `None` when nothing is cached yet and `""` (or a
+        # real string) once something is — including a terminal CLI
+        # session's fallback that `_fallback_label` deliberately returns as
+        # "" so the node falls through to `model_label` instead of echoing
+        # a raw id (#863 review round 2, finding M). A truthy check would
+        # treat that "" the same as "not yet cached" and re-pick the row
+        # forever, so check for cache presence (`is not None`), not
+        # truthiness, of the value (#863 review finding M/E interaction).
+        if s.get("short_label") is not None:
             continue
         # is_subagent CC nodes synthesize from a parent transcript — skip.
         if s.get("is_subagent"):

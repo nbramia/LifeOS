@@ -299,29 +299,34 @@ export function initGraph() {
   }
 
   function nodeLabel(d) {
-    // (#863) Precedence, first non-empty wins. `label` is skipped when it's
-    // not a human label but the raw identifier the row fell back to — the
-    // session id itself, that id with a known CLI prefix ("cc:"/"cx:")
-    // stripped, or the row's task_id — since both ingests and
-    // `_label_for_session` fall back to exactly those values when there's
-    // no real title. Compared by equality (after trimming), not by
-    // `startsWith`: a `startsWith` check never matches a prefixed session id
-    // ("cc:<uuid>".startsWith("<uuid>") is false), which let raw ids through
-    // as labels. Never emits '?'.
+    // (#863) Precedence, first non-empty wins. `label` and `short_label` are
+    // each skipped when they're not a human label but the raw identifier
+    // the row fell back to — the session id itself, that id with a known
+    // CLI prefix ("cc:"/"cx:") stripped, or the row's task_id — since both
+    // ingests and `_label_for_session` fall back to exactly those values
+    // when there's no real title, and `_fallback_label`
+    // (agent_viz_summary.py) can cache that same raw id as `short_label`
+    // (#863 review finding M — `short_label` sits ABOVE `label` in this
+    // precedence list, so it needs the identical guard or the raw id leaks
+    // through one slot higher). Compared by equality (after trimming), not
+    // by `startsWith`: a `startsWith` check never matches a prefixed
+    // session id ("cc:<uuid>".startsWith("<uuid>") is false), which let raw
+    // ids through as labels. Never emits '?'.
     const norm = (v) => (v || '').toString().trim();
-    const label = norm(d.label);
     const sessionId = norm(d.session_id);
     const bareSessionId = sessionId.replace(/^(cc|cx):/, '');
     const taskId = norm(d.task_id);
-    const labelIsRawId = !!label && (
-      label === sessionId ||
-      label === bareSessionId ||
-      (!!taskId && label === taskId)
+    const isRawId = (v) => !!v && (
+      v === sessionId ||
+      v === bareSessionId ||
+      (!!taskId && v === taskId)
     );
+    const label = norm(d.label);
+    const shortLabel = norm(d.short_label);
     const candidates = [
       d.custom_label,
-      d.short_label,
-      labelIsRawId ? '' : d.label,
+      isRawId(shortLabel) ? '' : d.short_label,
+      isRawId(label) ? '' : d.label,
       d.prompt_preview,
       d.model_label,
       routingLabel(d.routing),

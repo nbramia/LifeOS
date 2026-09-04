@@ -389,56 +389,18 @@ def test_model_label_hermes_routing_says_plain_hermes_without_an_observed_turn(c
 def test_model_label_hermes_routing_ignores_the_board_model_picker(client, stores):
     """(#863 review) `Session.model` is the board's operator-chosen model
     *picker* value (`SessionStore.set_assignment`) — `HermesExecutor` never
-    reads or writes it, so it must not drive the `Hermes · <model>` badge.
-    A session with a picker `model` set but no observed Hermes chat turn
-    still reads plain "Hermes"."""
+    reads or writes it, so it must not affect the Hermes badge. A session
+    with a picker `model` set still reads plain "Hermes" (#863 review round
+    2, finding O — the badge is plain "Hermes" unconditionally; a prior
+    `Hermes · <model>` suffix sourced from a process-wide "last observed"
+    reading was removed as a cross-session misattribution, not just
+    decoupled from the picker)."""
     session_store, _ = stores
     session_store.create(
         task_id="t-herm-picker", status=STATUS_RUNNING, routing="hermes",
         model="deepseek-v4-flash",
     )
     sess = client.get("/api/agents/snapshot").json()["sessions"][0]
-    assert sess["model_label"] == "Hermes"
-
-
-@pytest.mark.unit
-def test_model_label_hermes_routing_surfaces_the_last_observed_chat_model(
-    client, stores, monkeypatch,
-):
-    """The suffix comes from `model_readout._last_observed_hermes_chat_model`
-    — the model actually reported on the most recent real Hermes chat turn
-    in this process, written by `hermes_proxy.py`'s `_HermesTurnPersister`
-    (#658) — not from the board's model picker."""
-    from api.services import model_readout
-
-    monkeypatch.setattr(model_readout, "_hermes_chat_last_model", "deepseek-v4-flash")
-    monkeypatch.setattr(model_readout, "_hermes_chat_last_observed_at", "2026-08-01T00:00:00Z")
-
-    session_store, _ = stores
-    session_store.create(task_id="t-herm-observed", status=STATUS_RUNNING, routing="hermes")
-    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
-    assert sess["model_label"] == "Hermes · deepseek-v4-flash"
-
-
-@pytest.mark.unit
-def test_model_label_hermes_routing_degrades_gracefully_on_readout_failure(
-    client, stores, monkeypatch,
-):
-    """A `model_readout` import/read failure must degrade to plain "Hermes",
-    never raise into the snapshot response."""
-    def _raise():
-        raise RuntimeError("synthetic readout failure")
-
-    import api.services.model_readout as model_readout_module
-    monkeypatch.setattr(
-        model_readout_module, "_last_observed_hermes_chat_model", _raise,
-    )
-
-    session_store, _ = stores
-    session_store.create(task_id="t-herm-broken-readout", status=STATUS_RUNNING, routing="hermes")
-    r = client.get("/api/agents/snapshot")
-    assert r.status_code == 200
-    sess = r.json()["sessions"][0]
     assert sess["model_label"] == "Hermes"
 
 
@@ -590,6 +552,44 @@ def test_search_endpoint_requires_query(client, summary_db):
 
 
 # ---------------------------------------------------------------------------
+# (#863 review round 2, finding M) `_fallback_label` must not hand back the
+# row's own raw identifier — a uuid, a `t-...` task id, or a "cc:"/"cx:"
+# -prefixed session id — even re-spaced (`_fallback_label` used to turn
+# "cx:remote-cx-1" into "cx remote-cx-1", which is not caught by
+# `web/agents/graph.js`'s equality guard because it no longer equals the
+# session id, the bare session id, or the task id character-for-character).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("identifier", [
+    "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",  # bare uuid
+    "t-orphan-deleted",  # bare task id
+    "cx:remote-cx-1",  # cli-prefixed session id (would re-space to "cx remote-cx-1")
+    "cc:0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",  # cli-prefixed uuid
+])
+def test_fallback_label_refuses_to_echo_a_raw_identifier(identifier):
+    from api.services.agent_viz_summary import _fallback_label
+
+    assert _fallback_label(identifier) == ""
+
+
+@pytest.mark.unit
+def test_fallback_label_still_renders_a_real_multi_word_title():
+    from api.services.agent_viz_summary import _fallback_label
+
+    assert _fallback_label("Clean Up The Indexer") == "Clean Up The Indexer"
+
+
+@pytest.mark.unit
+def test_fallback_label_empty_input_is_untitled():
+    from api.services.agent_viz_summary import _fallback_label
+
+    assert _fallback_label("") == "Untitled"
+    assert _fallback_label("   ") == "Untitled"
+
+
+# ---------------------------------------------------------------------------
 # No-content fallback caching. A session whose transcript carries no
 # user/assistant text (only a seed + tool calls — the real agent-worker case)
 # hits the deterministic fallback in summarize_session. A *terminal* such
@@ -679,6 +679,183 @@ def test_raising_summarizer_caches_fallback_for_terminal_statuses(summary_db, mo
     assert calls["n"] == 1
     cached = avs.get_cached_summary(sid, 1000.0, status=status)
     assert cached is not None
+
+
+# ---------------------------------------------------------------------------
+# (#863 review round 2, finding N) An error fallback (the summarizer
+# *raised*) must never be persisted to disk, unlike the deterministic
+# no-content fallback above. `prune_disk_cache` has no scheduled caller, so
+# anything written to disk there effectively never expires — a transient
+# Gemma timeout during one summarize attempt must not permanently pin
+# "(Summary unavailable: ...)" as a terminal session's label/summary.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_raising_summarizer_error_fallback_is_not_persisted_to_disk(summary_db, monkeypatch):
+    import asyncio
+    import sqlite3
+    from api.services import agent_viz_summary as avs
+
+    async def _raise(*args, **kwargs):
+        raise RuntimeError("synthetic LLM failure")
+
+    monkeypatch.setattr(avs, "generate_text", _raise)
+
+    sid = "sess_error_fallback_disk_check"
+    events = [
+        {"kind": "user_message", "payload": {"text": "do the thing"}},
+        {"kind": "assistant_message", "payload": {"text": "done"}},
+    ]
+    result = asyncio.run(avs.summarize_session(
+        sid, label="Some Task", last_activity_at=1000.0, events=events, status=STATUS_COMPLETED,
+    ))
+    assert "Summary unavailable" in result.summary
+    # In-process cache does hold it (AC 7 — no immediate re-call)...
+    assert avs.get_cached_summary(sid, 1000.0, status=STATUS_COMPLETED) is not None
+    # ...but the disk row must not exist at all. Read straight from the
+    # sqlite table so this can't be fooled by `_disk_get`'s own freshness
+    # filtering.
+    with sqlite3.connect(avs._resolve_db_path()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM agent_viz_summary WHERE session_id = ?", (sid,)
+        ).fetchone()
+    assert row is None, "error fallback must never reach the disk cache (#863 finding N)"
+
+
+@pytest.mark.unit
+def test_raising_summarizer_recovers_after_ttl_expires_not_pinned_by_cached_error(
+    summary_db, monkeypatch
+):
+    """A terminal session whose summarizer raised, then recovered, gets the
+    real summary once the bounded error-fallback TTL elapses — not the
+    cached error forever. Also proves AC 7 still holds up to that point:
+    an immediate re-query at the same activity is still a cache hit."""
+    import asyncio
+    import sqlite3
+    import time as time_mod
+    from api.services import agent_viz_summary as avs
+
+    calls = {"n": 0}
+    should_raise = {"value": True}
+
+    async def _flaky(*args, **kwargs):
+        calls["n"] += 1
+        if should_raise["value"]:
+            raise RuntimeError("synthetic LLM failure")
+        return json.dumps({"short_label": "Fixed The Bug", "summary": "Fixed it."})
+
+    monkeypatch.setattr(avs, "generate_text", _flaky)
+
+    sid = "sess_raise_then_recover"
+    events = [
+        {"kind": "user_message", "payload": {"text": "do the thing"}},
+        {"kind": "assistant_message", "payload": {"text": "done"}},
+    ]
+    first = asyncio.run(avs.summarize_session(
+        sid, label="Some Task", last_activity_at=1000.0, events=events, status=STATUS_COMPLETED,
+    ))
+    assert "Summary unavailable" in first.summary
+    assert calls["n"] == 1
+
+    # Immediately re-querying at the same activity is still within the TTL
+    # — AC 7 holds, no re-call yet.
+    still_cached = asyncio.run(avs.summarize_session(
+        sid, label="Some Task", last_activity_at=1000.0, events=events, status=STATUS_COMPLETED,
+    ))
+    assert "Summary unavailable" in still_cached.summary
+    assert calls["n"] == 1
+
+    # The recovery: the summarizer would now succeed, and wall-clock time
+    # has advanced past the error-fallback TTL.
+    should_raise["value"] = False
+    real_time = time_mod.time
+    monkeypatch.setattr(
+        time_mod, "time", lambda: real_time() + avs._FAILURE_FALLBACK_TTL_SECONDS + 1
+    )
+    recovered = asyncio.run(avs.summarize_session(
+        sid, label="Some Task", last_activity_at=1000.0, events=events, status=STATUS_COMPLETED,
+    ))
+    assert calls["n"] == 2
+    assert recovered.short_label == "Fixed The Bug"
+    assert recovered.summary == "Fixed it."
+    # Real summaries do reach disk, unlike the error fallback.
+    with sqlite3.connect(avs._resolve_db_path()) as conn:
+        row = conn.execute(
+            "SELECT summary FROM agent_viz_summary WHERE session_id = ?", (sid,)
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "Fixed it."
+
+
+# ---------------------------------------------------------------------------
+# (#863 review round 2, REC-1) "Frozen ⇒ trust the cache regardless of new
+# activity" must be restricted to a REAL cached summary. A no-content
+# fallback costs nothing to re-derive (no LLM call on that path), so it
+# gets no such leniency — re-summarizing when activity advances is free and
+# strictly more correct.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_real_summary_still_served_from_cache_when_activity_advances_for_terminal_session(
+    summary_db, monkeypatch
+):
+    import asyncio
+    from api.services import agent_viz_summary as avs
+
+    calls = {"n": 0}
+
+    async def _succeed(*args, **kwargs):
+        calls["n"] += 1
+        return json.dumps({"short_label": "Ship The Feature", "summary": "Shipped it."})
+
+    monkeypatch.setattr(avs, "generate_text", _succeed)
+
+    sid = "sess_real_summary_frozen"
+    events = [
+        {"kind": "user_message", "payload": {"text": "ship the feature"}},
+        {"kind": "assistant_message", "payload": {"text": "shipped"}},
+    ]
+    first = asyncio.run(avs.summarize_session(
+        sid, label="Some Task", last_activity_at=1000.0, events=events, status=STATUS_COMPLETED,
+    ))
+    assert first.summary == "Shipped it."
+    assert calls["n"] == 1
+
+    # `completed` is frozen — a real cached summary is trusted even though
+    # this query reports a later activity than what was cached (e.g. an
+    # operator re-picked a model on the completed card, which bumps
+    # `last_activity_at` without changing `status`).
+    cached = avs.get_cached_summary(sid, 2000.0, status=STATUS_COMPLETED)
+    assert cached is not None
+    assert cached.summary == "Shipped it."
+    assert calls["n"] == 1
+
+
+@pytest.mark.unit
+def test_no_content_fallback_not_trusted_forever_when_activity_advances_for_terminal_session(
+    summary_db,
+):
+    """Unlike a real summary, the no-content fallback does NOT get the
+    "frozen ⇒ trust regardless of activity" leniency (REC-1) — re-deriving
+    it costs no LLM call, so there's no reason to risk serving a stale
+    fallback once a completed session's transcript could plausibly differ."""
+    import asyncio
+    from api.services import agent_viz_summary as avs
+
+    sid = "sess_no_content_frozen_resummarize"
+    events = [{"kind": "seed", "payload": {"task_id": "t1"}}]
+    first = asyncio.run(avs.summarize_session(
+        sid, label="Some Task", last_activity_at=1000.0, events=events, status=STATUS_COMPLETED,
+    ))
+    assert first.summary == avs._NO_CONTENT_SUMMARY
+    # Cached at the original activity...
+    assert avs.get_cached_summary(sid, 1000.0, status=STATUS_COMPLETED) is not None
+    # ...but NOT trusted once activity has moved on, even though `completed`
+    # is frozen — a real summary would be trusted here (see the sibling test
+    # above); a no-content fallback is not.
+    assert avs.get_cached_summary(sid, 2000.0, status=STATUS_COMPLETED) is None
 
 
 @pytest.mark.unit

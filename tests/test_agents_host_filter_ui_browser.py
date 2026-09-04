@@ -267,6 +267,12 @@ SNAPSHOT2 = {
             # that over the raw-id `label` (leak shape 1 below), and with
             # neither present it must still never fall through to a literal
             # '?' (the pre-#863 CLI-model-label special case).
+            #
+            # (#863 review finding M) `short_label` also carries the raw id
+            # here — exactly what `_fallback_label` caches when a terminal
+            # CLI session has no real content — to prove `short_label` gets
+            # the same raw-id guard as `label` rather than leaking through
+            # one precedence slot higher.
             "session_id": "cc:0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
             "task_id": None,
             "status": "ended",
@@ -281,6 +287,7 @@ SNAPSHOT2 = {
             "total_dollars": 0.01,
             "spawn_depth": 0,
             "label": "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "short_label": "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
             "prompt_preview": "fix the synthetic widget parser",
             "model_label": "Claude Code",
             "decoded_cwd": "/home/synthetic/proj-a",
@@ -291,6 +298,10 @@ SNAPSHOT2 = {
             # the vault task file was deleted while the `sessions` row
             # survived), so `label` equals `task_id` verbatim. That raw id
             # must not render as the node label (leak shape 2 below).
+            #
+            # (#863 review finding M) `short_label` also equals `task_id`
+            # here, proving the guard catches `short_label` == task_id, not
+            # just `short_label` == session_id.
             "session_id": "sess_label_orphan",
             "task_id": "t-orphan-deleted",
             "status": "running",
@@ -305,6 +316,7 @@ SNAPSHOT2 = {
             "total_dollars": 0.0,
             "spawn_depth": 0,
             "label": "t-orphan-deleted",
+            "short_label": "t-orphan-deleted",
             "model_label": "Local",
             "decoded_cwd": "/home/synthetic/proj-a",
         },
