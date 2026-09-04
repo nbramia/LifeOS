@@ -80,6 +80,25 @@ class _FakeClient:
         pass
 
 
+class _DropAfterUsageResponse(_FakeResponse):
+    """Yields its body, then raises mid-stream — simulates the connection
+    dropping right after Hermes's own `usage` event already arrived,
+    exactly like a genuine connection error."""
+
+    def iter_bytes(self):
+        yield self._body
+        raise httpx.ReadError("connection dropped mid-stream")
+
+
+class _DropAfterUsageClient(_FakeClient):
+    def stream(self, method, url, content=None, headers=None):
+        self.captured["method"] = method
+        self.captured["url"] = url
+        self.captured["content"] = content
+        self.captured["headers"] = headers
+        return _FakeStreamCM(_DropAfterUsageResponse(self._body))
+
+
 def _build(tmp_path, monkeypatch, *, body: bytes, status_code: int = 200,
            backend_url: str = "http://hermes-backend.example"):
     from config.settings import settings
@@ -218,45 +237,20 @@ def test_no_usage_event_leaves_hermes_model_null(tmp_path, monkeypatch):
 
 def test_failed_turn_after_usage_event_still_records_the_reported_model(tmp_path, monkeypatch):
     """The upstream connection can drop AFTER Hermes's own `usage`
-    event already arrived (simulated here as an `iter_bytes()` that yields
-    the usage frame, then raises mid-stream, exactly like a genuine
-    connection error). The turn still ran on that model, so it must still
-    be recorded even though the executor's outcome is FAILED — dropping it
-    would be less honest, not more (see `design.md`)."""
+    event already arrived (simulated here via `_DropAfterUsageClient`'s
+    `iter_bytes()`, which yields the usage frame, then raises mid-stream,
+    exactly like a genuine connection error). The turn still ran on that
+    model, so it must still be recorded even though the executor's outcome
+    is FAILED — dropping it would be less honest, not more (see
+    `design.md`)."""
     usage_frame = _sse([
         {"type": "conversation_id", "conversation_id": "conv-model-3"},
         {"type": "usage", "model": "drop-after-usage-model", "input_tokens": 3, "output_tokens": 2, "cost_usd": 0.001},
     ])
-
-    class _DropAfterUsageResponse(_FakeResponse):
-        def iter_bytes(self):
-            yield self._body
-            raise httpx.ReadError("connection dropped mid-stream")
-
-    class _DropAfterUsageClient(_FakeClient):
-        def stream(self, method, url, content=None, headers=None):
-            self.captured["method"] = method
-            self.captured["url"] = url
-            self.captured["content"] = content
-            self.captured["headers"] = headers
-            return _FakeStreamCM(_DropAfterUsageResponse(self._body))
-
-    from config.settings import settings
-    monkeypatch.setattr(settings, "hermes_backend_url", "http://hermes-backend.example", raising=False)
-    monkeypatch.setattr(settings, "hermes_backend_token", "test-token", raising=False)
-
-    conv_store = ConversationStore(db_path=str(tmp_path / "conversations.db"))
-    usage_store = UsageStore(db_path=str(tmp_path / "usage.db"))
-    monkeypatch.setattr(hp, "get_store", lambda: conv_store)
-    monkeypatch.setattr(hp, "get_usage_store", lambda: usage_store)
-    monkeypatch.setattr(hp, "schedule_retitle", lambda conv_id: None)
-
-    store = SessionStore(db_path=tmp_path / "sessions.db")
-    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
-    captured: dict = {}
-    factory = lambda: _DropAfterUsageClient(usage_frame, 200, captured)  # noqa: E731
+    store, transcripts = _hermes_env(tmp_path, monkeypatch)
     executor = HermesExecutor(
-        session_store=store, transcript_store=transcripts, http_client_factory=factory,
+        session_store=store, transcript_store=transcripts,
+        http_client_factory=lambda: _DropAfterUsageClient(usage_frame, 200),
     )
     session = store.create(task_id="t1", routing="hermes")
 
@@ -473,3 +467,89 @@ def test_completed_sessions_model_is_frozen_against_a_real_later_turn(tmp_path, 
     rows = _real_snapshot_rows(monkeypatch, store.db_path, tmp_path)
     assert rows["t-alpha"]["model_label"] == "Hermes · model-ALPHA", "AC4 violated by a real later turn"
     assert rows["t-beta"]["model_label"] == "Hermes · model-BETA"
+
+
+# ---------------------------------------------------------------------------
+# The tests above give every session in play a real turn of its own. Two gaps
+# that leaves open: a session that never runs a turn at all (completed OR
+# running) must keep its plain `Hermes` label when an UNRELATED session's
+# turn completes, and the failure exit path (only single-session-tested
+# above) must write only to its own session, same as the completion path.
+# ---------------------------------------------------------------------------
+
+
+def test_turnless_hermes_sessions_and_the_chat_anchor_stay_plain_hermes(tmp_path, monkeypatch):
+    """A real turn on session alpha must leave every OTHER session's
+    `hermes_model` alone — including a turn-less completed session, a
+    turn-less running session, and the `/chat` conversation-anchor row
+    `resolve_hermes_caller_session_id` creates (never dispatched, so it
+    never runs a turn of its own). Fails under mutation M3b/M3c (backfill
+    any turn-less hermes row with this turn's model). The anchor is given
+    the SAME conversation id alpha's own turn reports, so a write keyed by
+    conversation_id instead of task_id would also land on it — this also
+    fails under mutation M6."""
+    from api.services.agent_worker.hermes_session import resolve_hermes_caller_session_id
+
+    store, ts = _hermes_env(tmp_path, monkeypatch)
+    sa = store.create(task_id="t-alpha", status=STATUS_RUNNING, routing="hermes")
+    store.create(task_id="t-quiet", status=STATUS_COMPLETED, routing="hermes")
+    store.create(task_id="t-quiet-running", status=STATUS_RUNNING, routing="hermes")
+    anchor_sid = resolve_hermes_caller_session_id(store, "conv-a")
+    anchor_task = "hermes_" + anchor_sid.removeprefix("sess_")
+    store.set_conversation_id(anchor_task, "conv-a")
+
+    ea = HermesExecutor(
+        session_store=store, transcript_store=ts,
+        http_client_factory=lambda: _FakeClient(_sse([
+            {"type": "conversation_id", "conversation_id": "conv-a"},
+            {"type": "content", "content": "hi"},
+            {"type": "usage", "model": "model-ALPHA", "input_tokens": 7, "output_tokens": 3, "cost_usd": 0.001},
+            {"type": "done"},
+        ])),
+    )
+    assert ea.execute(sa, {"description": "qa"}).status == STATUS_COMPLETED
+
+    rows = _real_snapshot_rows(monkeypatch, store.db_path, tmp_path)
+    assert rows["t-alpha"]["model_label"] == "Hermes · model-ALPHA"
+    assert rows["t-quiet"]["model_label"] == "Hermes"
+    assert rows["t-quiet-running"]["model_label"] == "Hermes"
+    assert rows[anchor_task]["model_label"] == "Hermes"
+
+
+def test_failure_exit_path_writes_only_its_own_session(tmp_path, monkeypatch):
+    """AC2 on the FAILURE exit path with TWO real sessions: beta completes
+    a normal turn, then alpha's own turn reports `usage` and drops mid-
+    stream (FAILED). Alpha's own model must still be recorded (the
+    failure path DID record its own model) and beta's must be unchanged.
+    `_record_reported_model` runs on both exit paths, but the
+    completion-path tests above are the only ones with two sessions in
+    play, so a broadcast confined to the failure path alone (mutation M4)
+    is invisible to the rest of the suite."""
+    store, ts = _hermes_env(tmp_path, monkeypatch)
+    sa = store.create(task_id="t-alpha", status=STATUS_RUNNING, routing="hermes")
+    sb = store.create(task_id="t-beta", status=STATUS_RUNNING, routing="hermes")
+
+    eb = HermesExecutor(
+        session_store=store, transcript_store=ts,
+        http_client_factory=lambda: _FakeClient(_sse([
+            {"type": "conversation_id", "conversation_id": "conv-b"},
+            {"type": "content", "content": "hi"},
+            {"type": "usage", "model": "model-BETA", "input_tokens": 7, "output_tokens": 3, "cost_usd": 0.001},
+            {"type": "done"},
+        ])),
+    )
+    assert eb.execute(sb, {"description": "qb"}).status == STATUS_COMPLETED
+
+    dropped = _sse([
+        {"type": "conversation_id", "conversation_id": "conv-a"},
+        {"type": "usage", "model": "model-ALPHA", "input_tokens": 3, "output_tokens": 2, "cost_usd": 0.001},
+    ])
+    ea = HermesExecutor(
+        session_store=store, transcript_store=ts,
+        http_client_factory=lambda: _DropAfterUsageClient(dropped, 200),
+    )
+    assert ea.execute(sa, {"description": "qa"}).status == STATUS_FAILED
+
+    rows = _real_snapshot_rows(monkeypatch, store.db_path, tmp_path)
+    assert rows["t-alpha"]["model_label"] == "Hermes · model-ALPHA"
+    assert rows["t-beta"]["model_label"] == "Hermes · model-BETA", "a failed turn must not rewrite another session"
