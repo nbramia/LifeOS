@@ -62,6 +62,9 @@ STORE_MODULES = [
     "api/services/relationship_insights.py",
     "api/services/apple_photos.py",
     "api/services/tone_analysis_store.py",
+    # #876: AggregateCache's two data_version connections follow the same
+    # marked exception as PersonEntityStore's.
+    "api/services/aggregate_cache.py",
 ]
 
 

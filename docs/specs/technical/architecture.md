@@ -93,6 +93,7 @@ Per-backend capabilities (personas, handoff, history ownership, usage capture) a
 - `person_facts.py` - Fact extraction and storage
 - `person_indexer.py` - Person search indexing
 - `person_stats.py` - Statistics computation
+- `aggregate_cache.py` - Response cache for the heaviest CRM aggregate endpoints (see below)
 
 `PersonEntityStore.get_all()` keeps a process-local cache of hydrated
 `PersonEntity` objects for the people list and CRM aggregate views. Cache
@@ -104,6 +105,23 @@ invalidates the cached people list on the next read. Callers receive a new
 list object on each call, but entity objects are shared, so write paths that
 mutate a person fetched from the full list must refetch that person by ID
 before persisting changes.
+
+`aggregate_cache.py`'s `AggregateCache` memoizes the return value of the
+CRM's heaviest read endpoints — `/me/interactions`, `/me/timeline`,
+`/family/interactions`, `/family/timeline`, `/birthdays/all`, `/statistics`,
+and `/people` — applied via a `@cached_aggregate()` decorator directly under
+each route's `@router.get(...)`. The cache key is the route's resolved
+keyword arguments (every query parameter FastAPI resolved) plus both
+`crm.db` and `interactions.db`'s `PRAGMA data_version`, read from two
+long-lived, pragma-only connections following the same pattern as
+`PersonEntityStore`'s own data_version connection above. A commit to either
+database — from this process or another — makes the next request for an
+affected cache key recompute; a 300-second TTL is a backstop bound on entry
+lifetime, not the primary invalidation path. Entries are bounded by count
+(200) and total serialized bytes (20 MB), evicted least-recently-used; a
+raised exception (including an `HTTPException` for a non-200 response)
+propagates before the cache-store step, so error responses are never
+cached.
 
 **Relationships:**
 - `relationship.py` - Relationship store
@@ -463,5 +481,7 @@ Tests are in `tests/` with naming convention `test_*.py`.
 - [Client Surfaces](client-surfaces.md) -- HTTP consumers and breaking-change policy
 - [Frontend](frontend.md) -- UI components and patterns
 - [API Reference](../product/api-reference.md) -- API endpoint contracts
+- [CRM Dashboards & Insights](../product/crm-analytics.md) -- The dashboards `AggregateCache` serves
+- [CRM API Reference](../product/api-crm.md) -- The specific endpoints `AggregateCache` covers
 - [ADR-001: Python/FastAPI](../../adr/001-python-fastapi.md) -- Why Python/FastAPI was chosen
 - [Python Conventions](../standards/python-conventions.md) -- Coding style and module patterns

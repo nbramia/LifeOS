@@ -6,6 +6,8 @@
 
 Every `/api/crm/*` HTTP endpoint. Split out of the main [api-reference.md](api-reference.md) because the CRM endpoint catalog is large enough to deserve its own file. For the consumer view of the CRM features these endpoints back, see the [CRM specs](crm-ui.md).
 
+`GET /api/crm/people`, `/statistics`, `/me/interactions`, `/me/timeline`, `/family/interactions`, `/family/timeline`, and `/birthdays/all` are backed by a short-lived, data-version-keyed response cache — see [architecture.md](../technical/architecture.md) for how it's keyed and invalidated. This is transparent to callers: response shape, status codes, and freshness (any write anywhere in the CRM data invalidates the relevant cached responses immediately) are unchanged.
+
 ---
 
 ## Table of Contents
@@ -658,3 +660,4 @@ Sync Apple Contacts to the CRM. Creates SourceEntity records for all contacts. O
 - [crm-graph.md](crm-graph.md) — Consumer view of the graph and relationship model
 - [crm-analytics.md](crm-analytics.md) — Consumer view of the family/me/birthday/relationship dashboards
 - [data-model.md](data-model.md) — Two-tier data model semantics behind every endpoint here
+- [architecture.md](../technical/architecture.md) — `AggregateCache`, the response cache behind the endpoints noted above

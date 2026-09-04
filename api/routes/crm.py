@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from api.services.person_entity import PersonEntity, get_person_entity_store, compute_person_category
 from api.services.interaction_store import get_interaction_store
+from api.services.aggregate_cache import cached_aggregate
 from config.people_config import InteractionConfig
 from config.settings import settings
 from api.services.source_entity import (
@@ -719,6 +720,7 @@ def get_todays_birthdays():
 
 
 @router.get("/birthdays/all")
+@cached_aggregate()
 def get_all_birthdays():
     """Get all people with birthdays, grouped by date."""
     person_store = get_person_entity_store()
@@ -747,6 +749,7 @@ def get_all_birthdays():
 
 
 @router.get("/people", response_model=PersonListResponse)
+@cached_aggregate()
 def list_people(
     q: Optional[str] = Query(default=None, description="Search query"),
     category: Optional[str] = Query(default=None, description="Filter by category"),
@@ -2494,6 +2497,7 @@ def update_relationship_strengths():
 
 
 @router.get("/statistics", response_model=StatisticsResponse)
+@cached_aggregate()
 def get_crm_statistics():
     """
     Get comprehensive CRM statistics.
@@ -3431,6 +3435,7 @@ def get_me_stats():
 
 
 @router.get("/me/timeline", response_model=TimelineResponse)
+@cached_aggregate()
 def get_me_timeline(
     source_type: Optional[str] = Query(
         default=None,
@@ -3514,6 +3519,7 @@ def get_me_timeline(
 
 
 @router.get("/me/interactions", response_model=MeInteractionsResponse)
+@cached_aggregate()
 def get_me_interactions(
     days_back: int = Query(default=365, ge=1, le=3660, description="Days of history (up to 10 years)"),
     trend_period: str = Query(default="quarter", description="Trend comparison period: week, month, quarter, year"),
@@ -4253,6 +4259,7 @@ def get_family_stats(
 
 
 @router.get("/family/timeline", response_model=TimelineResponse)
+@cached_aggregate()
 def get_family_timeline(
     person_ids: str = Query(
         ...,
@@ -4333,6 +4340,7 @@ def get_family_timeline(
 
 
 @router.get("/family/interactions", response_model=FamilyInteractionsResponse)
+@cached_aggregate()
 def get_family_interactions(
     person_ids: str = Query(
         ...,
