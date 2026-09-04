@@ -456,12 +456,60 @@ class TestTasksAPI:
         assert response.status_code == 200
         mock_task_manager.update.assert_called_once()
 
-    def test_board_marker_tags_unchanged_assignee_skips_assignee_check(self, client, mock_task_manager):
-        """The same assignee tag re-sent (no actual assignee change) must
+    def test_board_marker_tags_and_claim_state_unchanged_skips_assignee_check(self, client, mock_task_manager):
+        """The same assignee tag AND the same claim tag re-sent (no actual
+        assignee or claim-state change, just an unrelated extra label) must
         not trip the assignee_change guard even on a claimed card."""
         self._set_current(mock_task_manager, tags=["codex", "agent-running"])
         response = client.put("/api/tasks/abc12345", json={
+            "tags": ["codex", "agent-running", "extra-label"],
+            "fields": {"assigned_by": "board"},
+        })
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_board_marker_tags_patch_dropping_claim_tag_on_claimed_card_is_409(self, client, mock_task_manager):
+        """(#881 AR3) A tags patch that leaves the derived assignee
+        unchanged but silently drops `agent-running` must be refused just
+        like an explicit assignee change — this is exactly how the
+        drawer's Tags field used to defeat the claimed-card guard: the
+        derived assignee ("codex") doesn't change, only the claim tag
+        disappears. This test previously asserted the opposite (200) and
+        sanctioned the hole; AR2/AR3's set-based comparison catches it
+        because the claim-tag set (`{agent-running}` -> `{}`) changed even
+        though the assignee-tag set didn't."""
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
             "tags": ["codex", "extra-label"],
+            "fields": {"assigned_by": "board"},
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        mock_task_manager.update.assert_not_called()
+
+    def test_board_marker_second_assignee_tag_on_claimed_card_is_409(self, client, mock_task_manager):
+        """(#881 AR2) Adding a second assignee tag alongside the existing
+        one must be refused on a claimed card even though `derive_assignee`
+        (first-match-wins) still resolves to the same tag — comparing the
+        normalized assignee-tag *set*, not the derived value, is what
+        catches this."""
+        self._set_current(mock_task_manager, tags=["claude", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
+            "tags": ["claude", "agent-running", "codex"],
+            "fields": {"assigned_by": "board"},
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        mock_task_manager.update.assert_not_called()
+
+    def test_board_marker_second_assignee_tag_on_unclaimed_card_succeeds(self, client, mock_task_manager):
+        """Positive case for AR2's fix: the same second-assignee-tag patch
+        on an UNCLAIMED agent card is still allowed — the set comparison
+        only feeds into the existing claimed-only refusal, it doesn't add
+        a new refusal of its own."""
+        self._set_current(mock_task_manager, tags=["claude"])
+        response = client.put("/api/tasks/abc12345", json={
+            "tags": ["claude", "codex"],
             "fields": {"assigned_by": "board"},
         })
         assert response.status_code == 200

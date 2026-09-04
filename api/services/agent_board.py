@@ -58,6 +58,17 @@ def _norm_tags(tags: Iterable[str]) -> set[str]:
     return {str(t).lstrip("#").lower() for t in (tags or [])}
 
 
+def normalize_tags(tags: Iterable[str]) -> set[str]:
+    """Public wrapper around the internal tag normalization above — `#`
+    stripped, lowercased. Exposed for write paths outside this module (e.g.
+    `api/routes/tasks.py`'s board-marker guard, #881 AR2/AR3) that need to
+    compare raw tag *sets* themselves rather than only a single derived
+    value like `derive_assignee`'s first-match-wins result, which a second
+    assignee tag or a dropped claim tag can slip past unnoticed.
+    """
+    return _norm_tags(tags)
+
+
 def derive_assignee(tags: Iterable[str]) -> Optional[str]:
     """Return the single assignee tag on `tags`, or None.
 
@@ -127,16 +138,41 @@ CANCEL_NOT_AGENT_OWNED_ERROR: tuple[int, str] = (
     409,
     "cancel is only available for agent-assigned cards",
 )
+CANCEL_ALREADY_FINISHED_ERROR: tuple[int, str] = (
+    409,
+    "this card is already finished — nothing to cancel",
+)
 
 # The actions every server write path that can touch an agent-owned card's
 # lane, assignee, or status funnels through `evaluate_card_action` for (#881).
 CARD_ACTIONS: tuple[str, ...] = ("lane_move", "assignee_change", "field_edit", "cancel")
 
 
-def is_claimed(tags: Iterable[str]) -> bool:
+def is_claimed(status: str, tags: Iterable[str]) -> bool:
     """True once the worker owns the card — actively running it, or waiting
-    on an answer from the operator (`agent-running` / `agent-blocked`)."""
-    return bool(_norm_tags(tags) & {RUNNING_TAG, BLOCKED_TAG})
+    on an answer from the operator (`agent-running` / `agent-blocked`), OR
+    (#881 AR4) a CLI session has been opened on an agent-owned card
+    (`cli_session_event` sets `status == "in_progress"` the first time a
+    `#claude`/`#codex` card's Open button spawns a session, but never adds
+    `agent-running` — the worker only does that for its own #agent-tagged
+    claim flow) — that's still a live agent session the board must protect
+    the same way, or a human could reassign/unassign/edit right out from
+    under it.
+
+    Excludes a pending Review card (`agent-completed` without `accepted`):
+    the same status can linger at `in_progress` after the worker completes
+    a card that was earlier opened via a CLI session (nothing resets it),
+    and Review must stay reachable through the accept-by-drag Done
+    carve-out rather than being swallowed by this status-derived claim.
+    """
+    tset = _norm_tags(tags)
+    if tset & {RUNNING_TAG, BLOCKED_TAG}:
+        return True
+    if (status or "").lower() != "in_progress":
+        return False
+    if COMPLETED_TAG in tset and ACCEPTED_TAG not in tset:
+        return False  # Review — see docstring
+    return derive_assignee(tset) in AGENT_ASSIGNEES
 
 
 def is_agent_owned(tags: Iterable[str]) -> bool:
@@ -171,7 +207,15 @@ def evaluate_card_action(
     assigned to `me`, or with no assignee, is entirely unaffected — every
     rule below for those is byte-identical to the pre-#881 behavior.
     """
-    claimed = is_claimed(current_tags)
+    if action not in CARD_ACTIONS:
+        # RC1 (#881 round-1 review): this used to fall through the whole
+        # if-chain below to `return None` — i.e. an unrecognized action was
+        # silently ALLOWED. Every caller passes a literal from CARD_ACTIONS,
+        # so reaching here at all means a caller bug; fail closed instead of
+        # open.
+        raise ValueError(f"unknown card action: {action!r}")
+
+    claimed = is_claimed(current_status, current_tags)
     agent_owned = is_agent_owned(current_tags)
     is_review = is_review_pending(current_tags)
 
@@ -217,9 +261,19 @@ def evaluate_card_action(
             return REVIEW_UNRESOLVED_ERROR
         if not agent_owned:
             return CANCEL_NOT_AGENT_OWNED_ERROR
+        # (#881 RC2) A card that's already finished — accepted-and-done, or
+        # cancelled some other way than through this endpoint's own
+        # idempotent short-circuit — has nothing left to cancel. The route
+        # (`cancel_board_card`) still special-cases "already cancelled" as
+        # a 200 no-op, but only AFTER checking ownership/review above, so a
+        # `me` or Review card that happens to already carry
+        # status="cancelled" gets its real refusal reason instead of a
+        # misleading success (round-1 finding RC2).
+        if (current_status or "").lower() in ("done", "cancelled"):
+            return CANCEL_ALREADY_FINISHED_ERROR
         return None
 
-    return None
+    raise AssertionError(f"unhandled action {action!r} despite CARD_ACTIONS validation above")
 
 
 @dataclass

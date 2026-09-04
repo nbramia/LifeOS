@@ -36,6 +36,17 @@ class TestDeriveAssignee:
         assert agent_board.derive_assignee(["codex", "me"]) == "me"
 
 
+class TestNormalizeTags:
+    def test_strips_hash_and_lowercases(self):
+        # (#881 AR2/AR3) The public wrapper `api/routes/tasks.py` uses to
+        # compare tag SETS, not just the single derive_assignee() value.
+        assert agent_board.normalize_tags(["#Codex", "Agent-Running"]) == {"codex", "agent-running"}
+
+    def test_empty(self):
+        assert agent_board.normalize_tags([]) == set()
+        assert agent_board.normalize_tags(None) == set()
+
+
 # ---------------------------------------------------------------------------
 # derive_lane — one test per row of the issue's lane table
 # ---------------------------------------------------------------------------
@@ -384,7 +395,11 @@ class TestIsScheduleActive:
 # States are every combination of:
 #   assignee   -- none, `me`, or one of the four agent engines
 #   condition  -- unclaimed, agent-running, agent-blocked, a pending review
-#                 (agent-completed, not accepted), accepted, done, cancelled
+#                 (agent-completed, not accepted), accepted, done, cancelled,
+#                 cli_opened (status="in_progress", no agent-running tag —
+#                 the state cli_session_event leaves behind after the board's
+#                 Open button spawns a session but before the worker ever
+#                 claims the card itself, #881 AR4/RC9)
 # crossed against every action:
 #   lane_move  -- to each of the seven lanes
 #   assignee_change, field_edit, cancel
@@ -403,6 +418,7 @@ ALL_LANES = (
 ALL_ASSIGNEES = (None, "me", "claude", "codex", "hermes", "local")
 ALL_CONDITIONS = (
     "unclaimed", "agent_running", "agent_blocked", "review", "accepted", "done", "cancelled",
+    "cli_opened",
 )
 ALL_ACTIONS = ("lane_move", "assignee_change", "field_edit", "cancel")
 
@@ -420,6 +436,7 @@ _AGENT_MANAGED = (
 )
 _ACCEPT_OR_REJECT = (409, "accept or reject the review")
 _CANCEL_NOT_AGENT_OWNED = (409, "cancel is only available for agent-assigned cards")
+_CANCEL_ALREADY_FINISHED = (409, "this card is already finished — nothing to cancel")
 
 
 def _state_to_status_tags(assignee, condition):
@@ -440,6 +457,12 @@ def _state_to_status_tags(assignee, condition):
         status = "done"
     elif condition == "cancelled":
         status = "cancelled"
+    elif condition == "cli_opened":
+        # (#881 AR4/RC9) cli_session_event sets status="in_progress" the
+        # first time a card's Open button spawns a session, but never adds
+        # agent-running (only the worker's own #agent claim flow does) —
+        # no extra tag beyond the plain assignee.
+        status = "in_progress"
     return status, tags
 
 
@@ -448,7 +471,14 @@ def _expected_outcome(assignee, condition, action, target_lane=None):
     target_lane) combination, per the issue's rule text — `None` for
     allowed, `(status_code, detail)` for refused."""
     agent_owned = assignee in ("claude", "codex", "hermes", "local")
-    claimed = condition in ("agent_running", "agent_blocked")
+    # (#881 AR4) A CLI-opened, agent-owned card (status="in_progress", no
+    # agent-running tag) is claimed the same way agent-running/agent-blocked
+    # are — a live session exists either way. `condition == "cli_opened"`
+    # for a `me`/unassigned card is deliberately NOT claimed (only an
+    # agent-owned assignee triggers the status-derived claim).
+    claimed = condition in ("agent_running", "agent_blocked") or (
+        condition == "cli_opened" and agent_owned
+    )
     is_review = condition == "review"
 
     if action == "lane_move":
@@ -486,6 +516,17 @@ def _expected_outcome(assignee, condition, action, target_lane=None):
             return _ACCEPT_OR_REJECT
         if not agent_owned:
             return _CANCEL_NOT_AGENT_OWNED
+        # (#881 RC2) A card that's already finished (accepted-and-done, or
+        # cancelled some other way than through the endpoint's own
+        # idempotent 200) has nothing left to cancel — narrows the
+        # operator's literal "any agent-assigned card not in Review"
+        # wording to exclude already-finished cards. Checked against the
+        # actual STATUS the condition produces (both "accepted" and "done"
+        # conditions carry status="done"), matching what the real function
+        # checks — not the condition label itself.
+        status, _tags = _state_to_status_tags(assignee, condition)
+        if status.lower() in ("done", "cancelled"):
+            return _CANCEL_ALREADY_FINISHED
         return None
 
     raise AssertionError(f"unhandled action {action!r} in test oracle")
@@ -544,3 +585,64 @@ class TestEvaluateCardActionDecisionTable:
             # Cancel is the one action still allowed on a claimed card —
             # it's how a human gets rid of it without dragging it anywhere.
             assert agent_board.evaluate_card_action(status, tags, "cancel") is None
+
+    # ---- #881 AR4: a CLI-opened card (status="in_progress", no
+    # agent-running tag) is claimed the same way a tag-based claim is.
+
+    @pytest.mark.parametrize("assignee", ["claude", "codex", "hermes", "local"])
+    def test_cli_opened_agent_card_is_claimed_same_as_agent_running(self, assignee):
+        status, tags = _state_to_status_tags(assignee, "cli_opened")
+        for lane in ("unassigned", "assigned", "in_progress", "human_queue", "done"):
+            assert agent_board.evaluate_card_action(status, tags, "lane_move", lane) == _WORKER_OWNED, lane
+        assert agent_board.evaluate_card_action(status, tags, "assignee_change") == _WORKER_OWNED
+        assert agent_board.evaluate_card_action(status, tags, "field_edit") == _WORKER_OWNED
+        # Cancel still works on a CLI-opened card, same as a tag-claimed one.
+        assert agent_board.evaluate_card_action(status, tags, "cancel") is None
+
+    def test_cli_opened_review_card_still_treated_as_review_not_claimed(self):
+        """(#881 AR4 ordering) A card opened via a CLI session before the
+        worker later completed it can retain `status == "in_progress"`
+        (cli_session_event's guard only flips todo -> in_progress once)
+        while also carrying `agent-completed` without `accepted` — this
+        must still resolve as Review, not as claimed, or the accept-by-drag
+        Done carve-out regresses."""
+        status, tags = "in_progress", ["codex", "agent-completed"]
+        assert agent_board.evaluate_card_action(status, tags, "lane_move", "done") is None
+        assert agent_board.evaluate_card_action(status, tags, "lane_move", "in_progress") == _REVIEW_FIRST
+        assert agent_board.evaluate_card_action(status, tags, "lane_move", "human_queue") == _REVIEW_FIRST
+        assert agent_board.evaluate_card_action(status, tags, "assignee_change") is None
+        assert agent_board.evaluate_card_action(status, tags, "field_edit") is None
+        assert agent_board.evaluate_card_action(status, tags, "cancel") == _ACCEPT_OR_REJECT
+
+    @pytest.mark.parametrize("assignee", [None, "me"])
+    def test_cli_opened_status_on_me_or_unassigned_card_is_unaffected(self, assignee):
+        """(#881 AR4) status == "in_progress" alone must never make a `me`
+        or unassigned card look claimed — only an agent-owned assignee
+        triggers the CLI-opened claim."""
+        status, tags = _state_to_status_tags(assignee, "cli_opened")
+        for lane in ("unassigned", "assigned", "in_progress", "human_queue", "done"):
+            assert agent_board.evaluate_card_action(status, tags, "lane_move", lane) is None, lane
+        assert agent_board.evaluate_card_action(status, tags, "assignee_change") is None
+        assert agent_board.evaluate_card_action(status, tags, "field_edit") is None
+
+    # ---- #881 RC1: evaluate_card_action must fail closed on an action it
+    # doesn't recognize, not silently allow it.
+
+    def test_unrecognized_action_raises_instead_of_silently_allowing(self):
+        with pytest.raises(ValueError):
+            agent_board.evaluate_card_action("todo", ["codex"], "delete_card")
+
+    # ---- #881 RC2: cancel refuses an already-finished (done/cancelled)
+    # agent-owned, non-review card, not just a review or non-agent-owned one.
+
+    def test_cancel_refused_on_terminal_status_agent_owned_non_review_card(self):
+        for status in ("done", "cancelled"):
+            assert (
+                agent_board.evaluate_card_action(status, ["codex"], "cancel")
+                == agent_board.CANCEL_ALREADY_FINISHED_ERROR
+            )
+        # Positive case: a not-yet-terminal status on the same card is
+        # still allowed — the new check is status-specific, not a blanket
+        # "cancel is now half-broken" regression.
+        assert agent_board.evaluate_card_action("todo", ["codex"], "cancel") is None
+        assert agent_board.evaluate_card_action("in_progress", ["codex"], "cancel") is None

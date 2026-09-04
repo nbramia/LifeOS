@@ -194,7 +194,7 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   container.innerHTML = `
     <div class="assignment-row" data-row="engine">
       <label class="assignment-label">Engine</label>
-      <select class="assignment-engine" data-field="assignee">
+      <select class="assignment-engine" data-field="assignee" ${fieldsDisabled ? 'disabled' : ''}>
         <option value="">unassigned</option>
         ${ENGINES.map(e => `<option value="${e}" ${currentEngine === e ? 'selected' : ''}>${e}</option>`).join('')}
       </select>
@@ -217,7 +217,8 @@ export function renderAssignmentPickers(container, card, opts = {}) {
       <select class="assignment-host" data-field="host" ${fieldsDisabled ? 'disabled' : ''}></select>
     </div>
     <div class="assignment-ran" data-field="ran"></div>
-    <div class="assignment-error" data-field="error" ${fieldsDisabled ? '' : 'hidden'}>${fieldsDisabled ? escapeHtml(fieldsPolicy.reason || "This card's fields can't be changed right now.") : ''}</div>
+    <div class="drawer-field-reason" data-field="fields-reason" ${fieldsDisabled ? '' : 'hidden'}>${fieldsDisabled ? escapeHtml(fieldsPolicy.reason || "This card's fields can't be changed right now.") : ''}</div>
+    <div class="assignment-error" data-field="error" hidden></div>
   `;
 
   const engineEl = container.querySelector('[data-field="assignee"]');

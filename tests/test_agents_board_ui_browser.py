@@ -1930,8 +1930,11 @@ def _unclaimed_agent_owned_card(card_id="t8", lane="assigned", title="Deploy the
             "cancel": _allowed(True),
             "assignee": _allowed(True),
             "fields": _allowed(True),
+            # (#881 RC5) `lanes` lists ONLY refused lanes now — Unassigned
+            # and Assigned are allowed here, so they're simply absent, not
+            # present-and-true. The client already treats an absent entry
+            # as allowed (onCardDropped/renderDrawerActions).
             "lanes": {
-                "unassigned": _allowed(True), "assigned": _allowed(True),
                 "in_progress": _allowed(False, _ONLY_WORKER_CLAIMS_REASON),
                 "human_queue": _allowed(False, _AGENT_OWNED_MANAGED_REASON),
                 "review": _allowed(False, "lane 'review' cannot be set directly"),
@@ -1991,12 +1994,157 @@ class TestAgentCardMoveRulesAndCancel:
         expect(effort).to_be_disabled()
         host = page.locator(".assignment-host")
         expect(host).to_be_disabled()
-        expect(page.locator('[data-field="error"]')).to_contain_text(_WORKER_OWNED_REASON)
+        # (#881 RC6) The disabled-fields explanation renders in its own
+        # neutral `.drawer-field-reason` element, not `.assignment-error` —
+        # that one is reserved for a genuinely failed save, so a normal
+        # explanation doesn't paint red.
+        expect(page.locator('[data-field="fields-reason"]')).to_contain_text(_WORKER_OWNED_REASON)
+        expect(page.locator('[data-field="error"]')).to_be_hidden()
+
+        # (#881 AR3) The Tags field is disabled-with-reason exactly like
+        # the Assignee select, and its lifecycle tag (agent-running) never
+        # shows as an editable token.
+        tags = page.locator(".drawer-tags")
+        expect(tags).to_be_disabled()
+        expect(tags).to_have_value("")
+        expect(page.locator('[data-field="tags-reason"]')).to_contain_text(_WORKER_OWNED_REASON)
 
         # Kill is offered (there's no linked session in this fixture, so it
         # isn't here) but no Resolve/Accept — Cancel is the only mutation
         # left available on a claimed card.
         expect(page.get_by_role("button", name="Cancel", exact=True)).to_be_visible()
+
+    def test_typing_a_lifecycle_tag_into_tags_field_is_rejected(self, page: Page, agents_base_url):
+        """(#881 AR3) A human must not be able to grant/strip a worker
+        lifecycle tag by typing it into the free-text Tags field — rejected
+        the same way an assignee name already is, on an otherwise-editable
+        (unclaimed, `me`-assigned) card."""
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()  # t2: tags=["me"], unclaimed
+        tags = page.locator(".drawer-tags")
+        tags.fill("agent-running foo")
+        page.locator(".drawer-title").click()  # blur the tags field
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        expect(tags).to_have_value("foo")
+        assert any(sorted(p.get("tags") or []) == ["foo", "me"] for p in task_puts), task_puts
+        assert not any("agent-running" in (p.get("tags") or []) for p in task_puts)
+
+    def test_review_card_tags_edit_preserves_agent_completed_tag(self, page: Page, agents_base_url):
+        """(#881 AR3) A Review card (agent-completed, not yet accepted) is
+        not claimed, so its Tags field stays editable — but the field
+        never shows `agent-completed` as an editable token, and saving it
+        must always re-append that tag from the card instead of silently
+        dropping it."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["review"].append({
+            "kind": "task", "id": "t10", "title": "Pending review",
+            "notes": "", "status": "done", "tags": ["codex", "agent-completed"], "assignee": "codex",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+            "policy": {
+                "claimed": False, "agent_owned": True,
+                "cancel": _allowed(False, "accept or reject the review"),
+                "assignee": _allowed(True), "fields": _allowed(True),
+                "lanes": {
+                    "in_progress": _allowed(False, "accept the review first"),
+                    "human_queue": _allowed(False, "accept the review first"),
+                    "review": _allowed(False, "lane 'review' cannot be set directly"),
+                },
+            },
+        })
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+
+        page.locator('[data-card-id="t10"]').click()
+        tags = page.locator(".drawer-tags")
+        expect(tags).to_be_enabled()
+        expect(tags).to_have_value("")  # agent-completed never shows as an editable token
+        tags.fill("urgent")
+        page.locator(".drawer-title").click()  # blur
+        assert any(
+            sorted(p.get("tags") or []) == ["agent-completed", "codex", "urgent"] for p in task_puts
+        ), task_puts
+
+    def test_dropping_on_scheduled_is_refused_locally_with_zero_requests(self, page: Page, agents_base_url):
+        """(#881 AR6) Scheduled is never a direct drag target. It isn't
+        even a key `card.policy.lanes` can carry (TASK_LANES excludes it),
+        so the policy-based fast path alone can't catch it — refuse it
+        client-side via DIRECT_LANE_IDS instead, with zero network
+        round-trip, matching every other structurally-unreachable lane."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append(_unclaimed_agent_owned_card())
+        lane_calls = []
+        _open_board(page, agents_base_url, board_state=board_state, lane_calls=lane_calls)
+
+        _drag_card(page, "t8", "scheduled")
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        assert lane_calls == []
+        expect(page.locator('.board-lane[data-lane="assigned"] [data-card-id="t8"]')).to_be_visible()
+
+    def test_cancel_refreshes_the_open_drawer_so_a_stale_open_button_cant_409(self, page: Page, agents_base_url):
+        """(#881 AR7) Cancel must re-render the open drawer explicitly,
+        like the assignee handler already does — fetchBoard()'s own
+        updateOpenDrawer skips the rebuild while the just-clicked Cancel
+        button (inside the drawer) still holds focus, so without an
+        explicit re-render the drawer keeps showing a stale Open button
+        for a card that just moved to Done, and clicking it would 409."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append(_unclaimed_agent_owned_card())
+        cancel_calls = []
+        _open_board(page, agents_base_url, board_state=board_state, cancel_calls=cancel_calls)
+
+        page.locator('[data-card-id="t8"]').click()
+        expect(page.get_by_role("button", name="Open", exact=True)).to_be_visible()
+
+        page.get_by_role("button", name="Cancel", exact=True).click()
+        expect(page.locator(".toast")).to_contain_text("Cancelled.", timeout=5000)
+        assert cancel_calls == ["t8"]
+        expect(page.get_by_role("button", name="Open", exact=True)).to_have_count(0)
+
+    def test_resolve_button_offered_when_done_lane_absent_from_policy_meaning_allowed(self, page: Page, agents_base_url):
+        """(#881 RC7) Once RC5 made `policy.lanes` list only refused lanes,
+        a human_queue card whose Done move IS allowed has no "done" key in
+        `policy.lanes` at all (absent = allowed) — the Resolve gate must
+        treat that as allowed, not read `.allowed` off `undefined`."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["human_queue"].append({
+            "kind": "task", "id": "t12", "title": "Handled by hand",
+            "notes": "", "status": "blocked", "tags": ["human", "me"], "assignee": "me",
+            "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+            "policy": {
+                "claimed": False, "agent_owned": False,
+                "cancel": _allowed(False, "cancel is only available for agent-assigned cards"),
+                "assignee": _allowed(True), "fields": _allowed(True),
+                "lanes": {"review": _allowed(False, "lane 'review' cannot be set directly")},
+            },
+        })
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t12"]').click()
+        expect(page.get_by_role("button", name="Resolve", exact=True)).to_be_visible()
+
+    def test_cancel_button_absent_for_a_me_card_with_cancel_refused_in_its_policy(self, page: Page, agents_base_url):
+        """(#881 RC3) The production-shaped case: a `me`-assigned card
+        carries a real `policy.cancel = {allowed: false, reason: ...}`
+        block (every task card does, post-#881), not no policy at all —
+        Cancel must not appear."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append({
+            "kind": "task", "id": "t11", "title": "My own task",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+            "policy": {
+                "claimed": False, "agent_owned": False,
+                "cancel": _allowed(False, "cancel is only available for agent-assigned cards"),
+                "assignee": _allowed(True), "fields": _allowed(True),
+                "lanes": {},
+            },
+        })
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t11"]').click()
+        expect(page.get_by_role("button", name="Cancel", exact=True)).to_have_count(0)
 
     def test_cancel_on_unclaimed_agent_card_posts_and_lands_in_done(self, page: Page, agents_base_url):
         board_state = copy.deepcopy(_board_fixture())
