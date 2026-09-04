@@ -124,7 +124,7 @@ settings-derived one, deduped by `os.path.realpath` (the two are the same
 file by default, but can diverge under a non-default `LIFEOS_CHROMA_PATH`)
 — plus `interactions.db`, each read from a long-lived, pragma-only
 connection following the same pattern as `PersonEntityStore`'s own
-data_version connection above, opened with a `mode=rw` URI so a missing
+data_version connection above, opened read-only with a `mode=ro` URI so a missing
 file is never silently created. A `PRAGMA data_version` read failure (a
 missing file, a file mid-replacement) never fails the request: it logs
 once and falls through to computing uncached, reopening the connection on

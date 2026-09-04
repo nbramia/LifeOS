@@ -29,7 +29,7 @@ with.
    `api.utils.db_paths.get_crm_db_path()` (deduped by `os.path.realpath`),
    since the stores backing `/statistics` and `/people` use the latter and
    the two can diverge under a non-default `LIFEOS_CHROMA_PATH`. Connections
-   open with a `mode=rw` URI so a missing file is never silently created.
+   open read-only with a `mode=ro` URI so a missing file is never silently created.
 4. The byte bound tracks serialized JSON size, which understates real
    retained heap by roughly 7x (measured) -- `MAX_TOTAL_BYTES` is scaled down
    by that ratio so it targets a real ~50 MB heap ceiling, not a 20 MB one.
@@ -45,6 +45,12 @@ with.
    `threading.Event`: the first caller computes, the rest wait for it and
    reuse its result (falling back to computing themselves only if the
    leader's call raised).
+11. A store re-checks that the generation it read before computing is still
+    current: finding 8's generation-stamp redesign otherwise let a commit
+    that lands while a handler is running get that handler's pre-write
+    result cached under the post-write generation, served stale for the
+    full TTL. A mismatch at store time skips caching -- the next request
+    for that key simply misses and recomputes against the new generation.
 """
 import copy
 import functools
@@ -68,6 +74,15 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TTL_SECONDS = 300
 MAX_ENTRIES = 200
+
+# How long a follower waits for the leader computing its key before giving
+# up and computing itself. Deliberately far shorter than DEFAULT_TTL_SECONDS
+# (which used to also gate this wait): a real handler realistically takes at
+# most a few seconds even on the largest aggregate, so waiting a full 300s
+# would just hold a threadpool worker thread hostage to whatever went wrong
+# with the leader (an unexpected hang, not merely a slow query) far longer
+# than any request should ever legitimately take (#917 review nit).
+FOLLOWER_WAIT_TIMEOUT_SECONDS = 30
 
 # A ~7 MB serialized-JSON entry was measured to retain ~51 MB of actual
 # Python-object heap once decoded/cached -- nested dicts/lists/model
@@ -106,15 +121,19 @@ def _default_crm_db_paths() -> list:
 
 
 def _open_existing_db(path: str) -> sqlite3.Connection:
-    """Open `path` for read-write without ever creating it.
+    """Open `path` read-only, without ever creating it.
 
     Plain `sqlite3.connect(path)` silently creates a 0-byte (and therefore
     permanently `data_version`-static) file if `path` doesn't exist yet --
     exactly the wrong failure mode for a path this cache merely *watches*
-    and never writes to (#917 review finding 2). The `mode=rw` URI param
-    makes SQLite raise instead.
+    and never writes to (#917 review finding 2). The `mode=ro` URI param
+    makes SQLite raise instead of creating it, and -- verified against a
+    WAL-mode database, which every store here uses -- a read-only
+    connection still sees `PRAGMA data_version` change correctly after an
+    external write, so there is no need for `mode=rw` (which would also
+    have worked, but claims write access this connection never uses).
     """
-    uri = Path(path).absolute().as_uri() + "?mode=rw"
+    uri = Path(path).absolute().as_uri() + "?mode=ro"
     return sqlite3.connect(
         uri,
         uri=True,
@@ -325,7 +344,7 @@ class AggregateCache:
                     # A concurrent call is already computing this exact key;
                     # wait for it and reuse its result instead of also
                     # computing (#917 review finding 9).
-                    event.wait(timeout=ttl_seconds)
+                    event.wait(timeout=FOLLOWER_WAIT_TIMEOUT_SECONDS)
                     with self._lock:
                         cached = self._cache.get(key)
                         if cached is not None:
@@ -357,15 +376,36 @@ class AggregateCache:
                     # Deep-copy what's stored (and returned): the caller of
                     # this very call could still mutate `result` in place,
                     # but that must never reach the cached entry another
-                    # caller receives later (#917 review finding 5).
-                    # jsonable_encoder is used only to measure a byte size
-                    # for the cache's bounds; it never replaces what's
-                    # actually stored/returned.
+                    # caller receives later (#917 review finding 5). This
+                    # roughly doubles a warm hit's CPU cost relative to a
+                    # shallow return (measured: a 235 KB /me/timeline page
+                    # went from ~2.5ms to ~4.6ms of *added* work over real
+                    # HTTP -- still far under the 20ms target, but worth
+                    # knowing if a response size this decorates grows a lot
+                    # further). jsonable_encoder is used only to measure a
+                    # byte size for the cache's bounds; it never replaces
+                    # what's actually stored/returned.
                     stored = copy.deepcopy(result)
                     size = len(json.dumps(jsonable_encoder(stored)).encode("utf-8"))
 
                     with self._lock:
-                        if size > self.max_total_bytes:
+                        # Re-check the generation against what THIS call
+                        # read before computing, not whatever it is now: a
+                        # commit that lands while `func()` above is running
+                        # advances `self._generation` (via a later request's
+                        # own version read) before this store runs, so
+                        # storing unconditionally would cache a pre-write
+                        # result under the post-write generation and serve
+                        # it for the full TTL -- exactly the staleness this
+                        # cache exists to prevent (#917 review finding 11,
+                        # introduced by finding 8's generation-stamp
+                        # redesign: the old version-in-key design was
+                        # immune, since a V1-computed entry stored under a
+                        # V1 key was simply never looked up again once the
+                        # generation moved to V2).
+                        if self._generation != versions:
+                            pass
+                        elif size > self.max_total_bytes:
                             # Too big to ever fit -- skip caching it rather
                             # than evicting everything else to make room
                             # (#917 review finding 8).
@@ -380,9 +420,19 @@ class AggregateCache:
 
                     return result
                 finally:
+                    # Wake followers before dropping the in-flight marker:
+                    # a brand-new request arriving in between would
+                    # otherwise see neither a cache entry (if the store
+                    # above was skipped) nor an in-flight event, and start
+                    # a second, fully redundant computation rather than
+                    # falling into the (already-set, so non-blocking)
+                    # follower path and getting the same "compute it
+                    # myself" fallback that path already has (#917 review
+                    # nit: single-flight is best-effort, not exact, but this
+                    # ordering narrows the gap).
+                    event.set()
                     with self._lock:
                         self._in_flight.pop(key, None)
-                    event.set()
 
             return wrapper
 

@@ -515,6 +515,89 @@ class TestSingleFlight:
         assert all(r == {"call_number": 1} for r in results)
 
 
+class TestGenerationRaceDuringCompute:
+    """A commit that lands while the leader is still computing must never
+    get that leader's pre-write result cached under the post-write
+    generation (#917 review finding 11, introduced by finding 8's
+    generation-stamp redesign: the old version-in-key design was immune,
+    since a pre-write result stored under the pre-write key was simply
+    never looked up again once the generation moved on).
+
+    Reproduction shape, matching the review: request 1 starts computing
+    (reads the pre-write generation), an external commit lands, request 2
+    arrives (reads the post-write generation, becomes a single-flight
+    follower of request 1 since nothing is cached yet), request 1 finishes
+    and attempts its store. Without the fix, that store succeeds --
+    unconditionally -- so request 2 (waking as a follower) and any later
+    request both get the stale pre-write value from the cache. With the
+    fix, the store is skipped (the generation moved since request 1 read
+    it), so request 2 falls back to computing its own fresh result, and a
+    later request 3 gets a fresh (correct) cache entry from its own
+    computation."""
+
+    def test_write_during_leader_compute_is_not_served_stale(self, cache):
+        state = {"value": "BEFORE"}
+        handler_calls = []
+        leader_started = threading.Event()
+
+        @cache.cached()
+        def endpoint():
+            handler_calls.append(1)
+            # Read first, same as a real aggregate query snapshotting its
+            # data at the start -- then (only the leader, first call) take
+            # a while to actually finish, long enough for the external
+            # write and request 2 below to both land before it returns.
+            value = state["value"]
+            if len(handler_calls) == 1:
+                leader_started.set()
+                time.sleep(0.3)
+            return {"value": value}
+
+        results = {}
+
+        def req1():
+            results["req1"] = endpoint()
+
+        t1 = threading.Thread(target=req1)
+        t1.start()
+        leader_started.wait(timeout=5)
+
+        # External write lands while request 1 (the leader) is still
+        # "computing" (sleeping) -- this is what advances the generation
+        # before request 1's store runs.
+        state["value"] = "AFTER"
+        _commit_external_write(cache.crm_db_paths[0])
+
+        def req2():
+            results["req2"] = endpoint()
+
+        t2 = threading.Thread(target=req2)
+        t2.start()
+        # Give request 2 time to read the (now advanced) generation and
+        # register as a single-flight follower of request 1 before request
+        # 1 finishes and attempts its store.
+        time.sleep(0.1)
+
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        # Request 1 correctly reflects the (pre-write) data it actually read.
+        assert results["req1"] == {"value": "BEFORE"}
+        # Request 2, woken as a follower, must never receive request 1's
+        # stale result -- it must fall back to computing its own, fresh one.
+        assert results["req2"] == {"value": "AFTER"}, (
+            f"follower must not be served the leader's pre-write result: {results['req2']}"
+        )
+
+        # Request 3, well after everything has settled and no more writes
+        # have happened, must also see the post-write value -- proving
+        # nothing stale was left cached under the new generation either.
+        req3 = endpoint()
+        assert req3 == {"value": "AFTER"}, (
+            f"a later request must never see a stale cached entry: {req3}"
+        )
+
+
 class TestFastAPIIntegration:
     """The decorator works through FastAPI's own request handling, not just
     as a plain Python function call: Query() parameters are still resolved
