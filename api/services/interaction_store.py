@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 from urllib.parse import quote
 
 from config.settings import settings
@@ -1074,6 +1074,370 @@ class InteractionStore:
         finally:
             conn.close()
 
+    # ---- Aggregate queries for the Me/Family dashboards (#871) ----
+    #
+    # These return plain tuples/dicts instead of hydrated Interaction objects,
+    # so a 10-year dashboard window doesn't require constructing (and
+    # datetime-parsing) hundreds of thousands of Python objects just to sum or
+    # bucket them. All of them share `_range_predicate` for their WHERE
+    # clause, which mirrors get_all_in_range's existing index-friendly
+    # convention: bounds are compared as calendar-day strings against the raw
+    # `timestamp` column (no timezone conversion — `timestamp >= 'YYYY-MM-DD'`
+    # is a safe, sargable lower bound regardless of a row's own UTC offset,
+    # since it can only ever be more inclusive than an exact-instant bound,
+    # never less).
+    #
+    # Day-string bounds are exactly what get_all_in_range's callers already
+    # relied on for their day-granular outputs (the heatmap, by_source,
+    # by_month, by_circle, total_count). A few widgets (the 30-day top
+    # contacts list, and the trend/health-period comparisons) apply a
+    # sub-day-precision cutoff in the original code — `exact=True` adds an
+    # additional `julianday(timestamp)` comparison (which SQLite evaluates
+    # offset-aware, matching Python's aware-datetime comparisons) on top of a
+    # one-day-wider version of the same string bound, so the
+    # (person_id, timestamp) index can still narrow rows before the
+    # unindexed julianday() expression runs on what's left.
+
+    def _range_predicate(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+        source_types: Optional[Iterable[str]] = None,
+        gmail_sent_only: bool = False,
+        exact: bool = False,
+        end_inclusive: bool = True,
+    ) -> tuple[str, list]:
+        """Build a WHERE fragment (no leading WHERE) and its params, shared by
+        the aggregate queries below. See the module note above this method for
+        the day-string-vs-exact-instant tradeoff `exact` controls."""
+        clauses: list[str] = []
+        params: list = []
+
+        if start_date is not None:
+            floor_dt = (start_date - timedelta(days=1)) if exact else start_date
+            clauses.append("timestamp >= ?")
+            params.append(floor_dt.strftime('%Y-%m-%d'))
+            if exact:
+                clauses.append("julianday(timestamp) >= julianday(?)")
+                params.append(start_date.isoformat())
+
+        if end_date is not None:
+            ceil_dt = (end_date + timedelta(days=1)) if exact else end_date
+            clauses.append("timestamp <= ?")
+            params.append(ceil_dt.strftime('%Y-%m-%d 23:59:59'))
+            if exact:
+                op = "<=" if end_inclusive else "<"
+                clauses.append(f"julianday(timestamp) {op} julianday(?)")
+                params.append(end_date.isoformat())
+
+        if person_ids is not None:
+            ids = list(person_ids)
+            if not ids:
+                # An explicit empty id set matches nothing (avoids `IN ()`).
+                clauses.append("1=0")
+            else:
+                clauses.append(f"person_id IN ({','.join('?' * len(ids))})")
+                params.extend(ids)
+
+        if exclude_person_ids:
+            ids = list(exclude_person_ids)
+            clauses.append(f"person_id NOT IN ({','.join('?' * len(ids))})")
+            params.extend(ids)
+
+        if source_types:
+            types = list(source_types)
+            clauses.append(f"source_type IN ({','.join('?' * len(types))})")
+            params.extend(types)
+
+        if gmail_sent_only:
+            # Matches the "Me" dashboard's historical rule of only counting
+            # sent email (title prefix "→ "), never received/cc'd email.
+            clauses.append("(source_type != 'gmail' OR title LIKE '→%')")
+
+        return (" AND ".join(clauses) if clauses else "1=1"), params
+
+    def get_span(
+        self,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """
+        Earliest and latest interaction timestamps (as stored, ISO strings),
+        optionally restricted to (or excluding) a set of person ids. Excludes
+        UNDATED_SENTINEL rows (undated vault notes deliberately stored at
+        1970-01-01, exempted from the normal minimum-timestamp validation) —
+        without that floor, one such note would make the span (and so the Me
+        dashboard's heatmap window) span back to 1970 regardless of when
+        real interactions actually started.
+
+        Used to size the Me dashboard's default heatmap window from the
+        actual span of data instead of requesting a fixed 10 years and
+        shrinking the display afterward.
+
+        Implemented as two `ORDER BY ... LIMIT 1` queries rather than
+        `SELECT MIN(timestamp), MAX(timestamp)`: SQLite can answer each via a
+        single index seek that stops at the first row satisfying the
+        (typically large, e.g. thousands of hidden/peripheral ids)
+        `exclude_person_ids` filter, whereas combining MIN and MAX into one
+        aggregate query forces a full-table scan on this schema (measured
+        ~300ms+ vs ~5ms on the production dataset with a large exclude list).
+        """
+        floor = _MIN_TIMESTAMP
+        where, params = self._range_predicate(
+            start_date=floor, person_ids=person_ids, exclude_person_ids=exclude_person_ids,
+        )
+        conn = self._get_connection()
+        try:
+            earliest_row = conn.execute(
+                f"SELECT timestamp FROM interactions WHERE {where} ORDER BY timestamp ASC LIMIT 1",
+                params,
+            ).fetchone()
+            latest_row = conn.execute(
+                f"SELECT timestamp FROM interactions WHERE {where} ORDER BY timestamp DESC LIMIT 1",
+                params,
+            ).fetchone()
+            earliest = earliest_row[0] if earliest_row else None
+            latest = latest_row[0] if latest_row else None
+            return (earliest, latest)
+        finally:
+            conn.close()
+
+    def get_daily_source_counts(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+        source_types: Optional[Iterable[str]] = None,
+        gmail_sent_only: bool = False,
+    ) -> list[tuple[str, str, int]]:
+        """
+        Grouped (day, source_type) -> count within [start_date, end_date].
+
+        `day` is the literal "YYYY-MM-DD" prefix of the stored timestamp
+        string (via `substr`, not SQLite's `date()`, which would convert to
+        UTC first) — this matches the historical behavior of parsing the ISO
+        string into an aware datetime and formatting its own date fields
+        as-is, which never shifts across the stored offset.
+        """
+        where, params = self._range_predicate(
+            start_date, end_date, person_ids, exclude_person_ids, source_types, gmail_sent_only,
+        )
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"""
+                SELECT substr(timestamp, 1, 10) as day, source_type, COUNT(*) as cnt
+                FROM interactions
+                WHERE {where}
+                GROUP BY day, source_type
+                """,
+                params,
+            )
+            return [(row[0], row[1], row[2]) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_daily_person_source_counts(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+        source_types: Optional[Iterable[str]] = None,
+        gmail_sent_only: bool = False,
+    ) -> list[tuple[str, str, str, int]]:
+        """
+        Grouped (day, person_id, source_type) -> count within [start_date,
+        end_date] — a single pass covering what would otherwise be three
+        separate full-window scans (get_daily_source_counts, get_person_counts,
+        get_person_month_counts).
+
+        Worth it whenever a caller needs day-level, person-level, AND
+        per-source breakdowns from the SAME window: on a real dataset where a
+        large fraction of people are excluded (e.g. many peripheral
+        contacts), passing that exclusion here as `exclude_person_ids` still
+        costs a per-row `NOT IN` membership check across the whole scanned
+        range (measured ~250-400ms for a 10-year window on production,
+        regardless of which columns are grouped — the exclusion check
+        dominates, not the grouping). A caller that's going to iterate the
+        (already much smaller, grouped) result in Python anyway should
+        usually skip exclude_person_ids/person_ids here and filter with a
+        Python `set` instead, which is a hash lookup per grouped row rather
+        than a per-raw-row SQL scan.
+        """
+        where, params = self._range_predicate(
+            start_date, end_date, person_ids, exclude_person_ids, source_types, gmail_sent_only,
+        )
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"""
+                SELECT substr(timestamp, 1, 10) as day, person_id, source_type, COUNT(*) as cnt
+                FROM interactions
+                WHERE {where}
+                GROUP BY day, person_id, source_type
+                """,
+                params,
+            )
+            return [(row[0], row[1], row[2], row[3]) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_person_counts(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+        source_types: Optional[Iterable[str]] = None,
+        gmail_sent_only: bool = False,
+        exact: bool = False,
+        end_inclusive: bool = True,
+    ) -> dict[str, int]:
+        """
+        Grouped person_id -> count within [start_date, end_date].
+
+        Pass exact=True for sub-day-precision windows (e.g. the "last 30
+        days" top-contacts cutoff, or a trend comparison anchored to the
+        exact request time) — see `_range_predicate`. `end_inclusive=False`
+        excludes the end instant itself, for a "previous period" bucket that
+        must not double-count the instant where the "recent period" begins.
+        """
+        where, params = self._range_predicate(
+            start_date, end_date, person_ids, exclude_person_ids, source_types,
+            gmail_sent_only, exact=exact, end_inclusive=end_inclusive,
+        )
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT person_id, COUNT(*) FROM interactions WHERE {where} GROUP BY person_id",
+                params,
+            )
+            return {row[0]: row[1] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
+    def get_person_month_counts(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+        source_types: Optional[Iterable[str]] = None,
+    ) -> list[tuple[str, str, int]]:
+        """
+        Grouped (month, person_id) -> count within [start_date, end_date].
+
+        Used for per-month unique-contact tracking (e.g. messaging volume by
+        Dunbar circle), where each (month, person) pair only needs to be
+        known once, not fetched as N individual interaction rows.
+        """
+        where, params = self._range_predicate(
+            start_date, end_date, person_ids, exclude_person_ids, source_types,
+        )
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"""
+                SELECT substr(timestamp, 1, 7) as month, person_id, COUNT(*) as cnt
+                FROM interactions
+                WHERE {where}
+                GROUP BY month, person_id
+                """,
+                params,
+            )
+            return [(row[0], row[1], row[2]) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_person_source_counts(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+    ) -> dict[str, dict[str, int]]:
+        """Grouped person_id -> {source_type: count}."""
+        where, params = self._range_predicate(start_date, end_date, person_ids, exclude_person_ids)
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT person_id, source_type, COUNT(*) FROM interactions "
+                f"WHERE {where} GROUP BY person_id, source_type",
+                params,
+            )
+            result: dict[str, dict[str, int]] = {}
+            for pid, source, cnt in cursor.fetchall():
+                result.setdefault(pid, {})[source] = cnt
+            return result
+        finally:
+            conn.close()
+
+    def get_last_interaction_per_person(
+        self,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+    ) -> dict[str, str]:
+        """Grouped person_id -> most recent timestamp (as stored, ISO string)."""
+        where, params = self._range_predicate(start_date, end_date, person_ids, exclude_person_ids)
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT person_id, MAX(timestamp) FROM interactions WHERE {where} GROUP BY person_id",
+                params,
+            )
+            return {row[0]: row[1] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
+    def get_person_timestamps(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        person_ids: Optional[Iterable[str]] = None,
+        exclude_person_ids: Optional[Iterable[str]] = None,
+        source_types: Optional[Iterable[str]] = None,
+    ) -> list[tuple[str, datetime, str]]:
+        """
+        (person_id, timestamp, source_type) tuples within [start_date,
+        end_date] — timestamps parsed into aware datetimes, but NOT
+        hydrated into full Interaction objects (skips title, snippet, links,
+        id, source_id, and the Interaction dataclass's own
+        `datetime.now()`-default `created_at`).
+
+        For a caller that only needs exact per-interaction timestamps for a
+        specific (often small) set of people — health score, neglected
+        contacts, tracked relationships — this is meaningfully cheaper than
+        get_all_in_range() on a real dataset: "the top 25 by relationship
+        strength" or "circle 0-3" contacts can mean hundreds of thousands of
+        interactions for the closest family/friends, and building an
+        Interaction object per row (not just parsing its timestamp) is what
+        dominates at that scale.
+        """
+        where, params = self._range_predicate(
+            start_date, end_date, person_ids, exclude_person_ids, source_types,
+        )
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"SELECT person_id, timestamp, source_type FROM interactions WHERE {where}",
+                params,
+            )
+            result = []
+            for person_id, ts_str, source_type in cursor.fetchall():
+                ts = datetime.fromisoformat(ts_str)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                result.append((person_id, ts, source_type))
+            return result
+        finally:
+            conn.close()
+
     def get_conversation_context(
         self,
         interaction_id: str,
@@ -1362,6 +1726,7 @@ class InteractionStore:
         self,
         start_date: datetime,
         end_date: datetime,
+        person_ids: Optional[list[str]] = None,
         exclude_person_ids: list[str] = None,
         source_type: Optional[str] = None,
         limit: Optional[int] = None,
@@ -1375,6 +1740,10 @@ class InteractionStore:
         Args:
             start_date: Start of date range (inclusive)
             end_date: End of date range (inclusive)
+            person_ids: If given, restrict to interactions with these person
+                        ids (SQL `person_id IN (...)`) instead of everyone —
+                        used by the Family dashboard so it never loads
+                        interactions for people outside the selection.
             exclude_person_ids: Person IDs to exclude (e.g., self)
             source_type: Filter by source type. Supports comma-separated values
                          (e.g., "imessage,whatsapp" for messages).
@@ -1417,6 +1786,15 @@ class InteractionStore:
                     WHERE timestamp >= ? AND timestamp <= ?
                 """
             params = [start_str, end_str]
+
+            # Restrict to specific person IDs if provided
+            if person_ids is not None:
+                if not person_ids:
+                    query += " AND 1=0"
+                else:
+                    placeholders = ','.join('?' * len(person_ids))
+                    query += f" AND person_id IN ({placeholders})"
+                    params.extend(person_ids)
 
             # Exclude specific person IDs if provided
             if exclude_person_ids:

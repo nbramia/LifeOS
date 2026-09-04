@@ -17,7 +17,7 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING
+from typing import Iterable, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from api.services.people_aggregator import PersonRecord
@@ -1032,6 +1032,100 @@ class PersonEntityStore:
             if row:
                 return self._row_to_entity(row)
             return None
+        finally:
+            conn.close()
+
+    def get_by_ids(self, ids: Iterable[str], exclude_hidden: bool = False) -> dict[str, PersonEntity]:
+        """
+        Batch version of get_by_id(): one query for many ids instead of N.
+
+        Follows the merge chain per id like get_by_id() does, and returns a
+        dict keyed by the ORIGINAL id passed in (not the canonical id), so
+        callers can look up entities by whatever id they started from (e.g.
+        an interaction's person_id) even if it was later merged into another
+        person. Ids with no surviving entity are simply absent from the
+        result.
+
+        Like get_by_id(), hidden entities are included by default. Pass
+        exclude_hidden=True for callers that want get_all()'s default view
+        instead (e.g. a name lookup that should show "Unknown" for a hidden
+        person rather than their real name).
+        """
+        wanted = [i for i in dict.fromkeys(ids) if i]
+        if not wanted:
+            return {}
+
+        canonical_of = {i: self.get_canonical_id(i) for i in wanted}
+        canonical_ids = set(canonical_of.values())
+
+        conn = self._get_connection()
+        try:
+            placeholders = ','.join('?' * len(canonical_ids))
+            query = f"SELECT * FROM person_entities WHERE id IN ({placeholders})"
+            params: list = list(canonical_ids)
+            if exclude_hidden:
+                query += " AND hidden = 0"
+            rows = conn.execute(query, params).fetchall()
+            by_canonical = {row['id']: self._row_to_entity(row) for row in rows}
+        finally:
+            conn.close()
+
+        result: dict[str, PersonEntity] = {}
+        for original_id, canonical_id in canonical_of.items():
+            entity = by_canonical.get(canonical_id)
+            if entity is not None:
+                result[original_id] = entity
+        return result
+
+    def get_ids_where(self, column: str, value) -> set[str]:
+        """
+        Return the set of ids where `column` equals `value`.
+
+        `column` is always a fixed string chosen by the caller in code (never
+        derived from a request), so this is safe from injection; still
+        restricted to a small allow-list of known boolean flag columns.
+        """
+        if column not in {"hidden", "is_peripheral_contact"}:
+            raise ValueError(f"Unsupported column for get_ids_where: {column!r}")
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                f"SELECT id FROM person_entities WHERE {column} = ?", (value,)
+            ).fetchall()
+            return {row[0] for row in rows}
+        finally:
+            conn.close()
+
+    def get_hidden_ids(self) -> set[str]:
+        """All ids currently marked hidden (`WHERE hidden = 1`)."""
+        return self.get_ids_where("hidden", 1)
+
+    def get_totals(self) -> dict[str, int]:
+        """
+        Lifetime interaction totals across non-hidden, non-merged people,
+        summed in SQL — used by /me/stats instead of loading every
+        PersonEntity into Python just to add up three columns.
+        """
+        merged_ids = set(self._merged_ids.keys())
+        conn = self._get_connection()
+        try:
+            query = (
+                "SELECT COUNT(*), COALESCE(SUM(email_count), 0), "
+                "COALESCE(SUM(meeting_count), 0), COALESCE(SUM(message_count), 0) "
+                "FROM person_entities WHERE hidden = 0"
+            )
+            params: list = []
+            if merged_ids:
+                ids = list(merged_ids)
+                query += f" AND id NOT IN ({','.join('?' * len(ids))})"
+                params.extend(ids)
+            row = conn.execute(query, params).fetchone()
+            return {
+                "total_people": row[0] or 0,
+                "total_emails": row[1] or 0,
+                "total_meetings": row[2] or 0,
+                "total_messages": row[3] or 0,
+            }
         finally:
             conn.close()
 
