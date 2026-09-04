@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-04
 
 Engineering view of the `/agents` page — endpoint shapes, ingest paths, status inference, layout, and security boundaries. For the consumer view see [product/agent-viz.md](../product/agent-viz.md).
 
@@ -133,6 +133,8 @@ The issue's target is "reflects an external vault edit within ~3 seconds," and t
 **Drag and drop is pointer-based, not the native HTML5 Drag and Drop API.** `draggable="true"` + `dragstart`/`dragover`/`drop` only fires through the browser's OS-level drag gesture — synthetic mouse events (Playwright's included) can't reliably trigger it, which would have made the server-free browser test (`tests/test_agents_board_ui_browser.py`) unable to drive a drag at all. `board.js` instead tracks `mousedown` → `mousemove` (past a 4px threshold, to distinguish a drag from a click) → `mouseup`, rendering a floating ghost card and using `document.elementFromPoint` to resolve the lane under the cursor. The trailing `click` event that a `mouseup` also fires is suppressed via a `suppressNextClick` flag set only when a real drag happened, so the same gesture never both moves a card and opens its drawer.
 
 A successful drop always re-fetches the board (`fetchBoard()`) rather than mutating the DOM optimistically — the server is the single source of truth for a card's lane, and a rejected move (400/409/500) leaves the card exactly where the last successful fetch put it, with a toast surfacing the server's error text.
+
+`board.js` also owns three pieces of client-side state added by the lane-filter/composer work (#882). The lane-selection filter persists to `localStorage` under the key `lifeos.agents.board.lanes`, defaulting to every lane except Done; a missing or malformed (non-JSON, non-array) stored value falls back to that default, and an unknown lane id inside an otherwise-valid array is dropped individually, only falling back to the default when nothing valid survives, while a deliberately-emptied selection (`[]`) round-trips as empty rather than being treated as malformed. The drawer's click-outside-close guard requires the `mousedown`, `mouseup`, **and** `click` to all target the backdrop element itself — the same event-target plumbing the drag/drop paragraph above relies on — because a single `click` listener alone would also close the drawer on a text selection or scrollbar drag that starts inside the drawer and ends on the backdrop. And the New-card composer's create is two calls, not one: `POST /api/tasks` creates the task, then, for any lane other than Unassigned, `PUT /api/agents/board/cards/{id}/lane` moves it there; if that second call fails, the card still exists at its tag-derived resting lane, an error toast reports the failure, and the board re-fetches to reflect what's actually true server-side.
 
 ---
 

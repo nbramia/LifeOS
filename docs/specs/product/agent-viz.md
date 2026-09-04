@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-04
 
 `/agents` is a Kanban board of the operator's work queue — vault tasks, agent questions, and scheduled work in one place, organized into lanes by status and tag. A **Graph** tab keeps the earlier force-directed session graph as a secondary, read-mostly view for watching what's actively running: every LifeOS agent worker task (`#agent`-tagged), local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`), and Claude Code / Codex sessions registered from **any other machine** on the tailnet via a lightweight hook script.
 
@@ -40,7 +40,7 @@ The board is backed by the vault task store (`LifeOS/Tasks/`) — every card is 
 | **Human queue** | An agent is blocked on a question, or a `#human` card was filed for the operator, or the task's status is `blocked`. |
 | **Scheduled** | A scheduler entry (`docs/guides/scheduler.md`) with at least one future fire. |
 | **Review** | The agent worker's `#agent-completed` tag is set and the card hasn't been accepted yet. |
-| **Done** | Status `done` or `cancelled` (cancelled cards are hidden behind the "include cancelled" filter by default — the Done lane itself is always shown), plus scheduler entries that have fired (one-off) or been disabled (recurring). |
+| **Done** | Status `done` or `cancelled` (cancelled cards are hidden behind the "include cancelled" filter by default whenever the Done column is shown), plus scheduler entries that have fired (one-off) or been disabled (recurring). Hidden by default in the lane filter below — the least useful lane day to day. |
 
 ### Assignee
 
@@ -50,9 +50,16 @@ Assignee is a single tag, one of `#me`, `#claude`, `#codex`, `#hermes`, `#local`
 
 A card shows its title, assignee chip, model/effort chips when the task carries those fields, a host chip when a linked session is running on a known machine, its other tags, and a pulsing dot when a linked session is actively running.
 
-Clicking a card opens a drawer: an editable title and notes (notes save on blur, stored as indented `> ` lines beneath the task — see [task-management.md](task-management.md)), pickers for assignee, tags, and context, and — below those — model, effort, and host pickers for engines that accept them (`#claude`/`#codex` show all three, `#local` shows effort only, `#me`/`#hermes`/unassigned show none; model options come from the model catalog per engine, and host is free text checked against the registered hosts when the card is opened) that write the fields the executors actually read. When the card has a linked session, the drawer also shows that session's live transcript feed, the same panel the Graph tab uses. Drawer actions: **Open** (an Assigned card tagged `#claude` or `#codex` spawns the CLI on the card), **Focus** (jump to the session's terminal pane), **Kill** (stop a running session), **Answer** (reply to the agent's pending question), **Accept** (move a Review card to Done), and **Resolve** (mark a manually-filed Human queue card handled).
+Clicking a card opens a drawer: an editable title and notes (notes save on blur, stored as indented `> ` lines beneath the task — see [task-management.md](task-management.md)), pickers for assignee, tags, and context, and — below those — model, effort, and host pickers for engines that accept them (`#claude`/`#codex` show all three, `#local` shows effort only, `#me`/`#hermes`/unassigned show none; model options come from the model catalog per engine, and host is free text checked against the registered hosts when the card is opened) that write the fields the executors actually read. On a task card, the notes field grows with its content as you type (and when the drawer opens on a card with existing notes), up to two-thirds of the viewport height, after which it scrolls internally rather than growing further; a Scheduled card's message field (see [Scheduled column](#scheduled-column)) keeps a fixed box. When the card has a linked session, the drawer also shows that session's live transcript feed, the same panel the Graph tab uses. Drawer actions: **Open** (an Assigned card tagged `#claude` or `#codex` spawns the CLI on the card), **Focus** (jump to the session's terminal pane), **Kill** (stop a running session), **Answer** (reply to the agent's pending question), **Accept** (move a Review card to Done), and **Resolve** (mark a manually-filed Human queue card handled). Clicking anywhere outside the drawer — the board background, a lane, or another card — closes it exactly like its close button; a click inside the drawer never does. Escape closes the drawer, but does nothing while the New card composer or the Answer prompt is open on top of it.
 
-A **New card** button opens a composer — title, optional notes, and an assignee picker — that creates a task through `POST /api/tasks`.
+A **New card** button in the filter bar opens a composer — title, optional notes, a lane picker, and an assignee picker — that creates a task. Each visible lane also carries its own full-width **+** button above its cards, opening the same composer with that lane preselected. A few rules govern how Lane and assignee interact:
+
+- Picking an assignee while Lane still reads Unassigned flips Lane to Assigned, since a task carrying an assignee tag always files there regardless of what Lane says; manually overriding Lane back to Unassigned afterward doesn't change where the card lands.
+- Clearing the assignee back to blank while Lane reads Assigned flips Lane back to Unassigned.
+- Picking Assigned (from the top-bar button or a lane's own **+**) requires an assignee; the created card carries it as a tag.
+- Picking In progress with an agent assignee (`#claude`/`#codex`/`#hermes`/`#local`) is rejected before anything is created — only `#me` can be assigned directly to In progress, since the worker claims agent-assigned tasks itself.
+- Review and Scheduled don't get a **+** — neither lane can be set directly; a card reaches Review or Scheduled the same way it always has (the worker's own tags, or the scheduler).
+- Creating a card straight into a lane the filter is currently hiding reveals that lane — and persists the change to the saved filter selection — so the new card is actually visible.
 
 ### Pending questions
 
@@ -64,7 +71,9 @@ Each card shows the entry's next fire time, a recurring badge for cron entries, 
 
 ### Filters
 
-Filters AND-compose: free-text search (title and notes), lane, assignee (including "me" and "unassigned"), host, tag, context, recency, and whether to include cancelled cards. The board updates live — an edit made directly in the vault (or by the agent worker, or by the scheduler) shows up within a few seconds without a page reload.
+Which lanes show at all is a multi-select: a checkbox per lane in a dropdown, plus **All** and **Clear** controls (Clear resets to the default: every lane except Done). An unchecked lane's column is removed from the board entirely, not just emptied of cards, so the remaining lanes widen to fill the space; re-checking it puts it back in canonical lane order. The selection is remembered via `localStorage` (per browser/device, not synced) and restored on your next visit; if nothing at all is checked, the board shows a one-line hint instead of going blank.
+
+The rest of the filters AND-compose on top of whichever lanes are showing: free-text search (title and notes), assignee (including "me" and "unassigned"), host, tag, context, recency, and whether to include cancelled cards. The board updates live — an edit made directly in the vault (or by the agent worker, or by the scheduler) shows up within a few seconds without a page reload.
 
 ### Out of scope (for now)
 

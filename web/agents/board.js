@@ -24,6 +24,10 @@ const LANES = [
 ];
 
 const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local'];
+// plan_lane_move (api/services/agent_board.py) 409s a lane=in_progress move
+// whose assignee is one of these — "only the worker claims agent-assigned
+// tasks" — so the composer must not let one through (round-1 finding 4b).
+const AGENT_ASSIGNEES = ASSIGNEES.filter(a => a !== 'me');
 
 // Card fields the drawer renders as editable inputs — used to decide
 // whether an SSE tick needs to rebuild the drawer at all (#850 finding 2).
@@ -33,10 +37,58 @@ const DRAWER_EDITABLE_FIELDS = [
   'name', 'message_content', 'enabled',
 ];
 
+// Lane filter — multi-select checkbox dropdown (#882). Hidden lanes are
+// removed from the grid entirely (not just emptied), so the remaining
+// .board-lane columns (flex: 1 1 260px, see web/agents.html CSS) widen to
+// fill the space.
+const LANE_FILTER_STORAGE_KEY = 'lifeos.agents.board.lanes';
+const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done').map(l => l.id);
+// plan_lane_move (api/services/agent_board.py) rejects `review` and
+// `scheduled` with "cannot be set directly" — no per-lane "+" button for
+// either, and both are excluded from the new-card composer's lane select.
+const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled').map(l => l.id));
+
+function loadLaneSelection() {
+  try {
+    const raw = localStorage.getItem(LANE_FILTER_STORAGE_KEY);
+    if (!raw) return new Set(DEFAULT_VISIBLE_LANE_IDS);
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set(DEFAULT_VISIBLE_LANE_IDS);
+    // A deliberately emptied selection ([]) is a valid, intentional state —
+    // AC 2 says the selection is restored from storage, and the empty-state
+    // hint already covers the UI for it — so it must round-trip as empty,
+    // not be treated as malformed (round-1 finding 7).
+    if (parsed.length === 0) return new Set();
+    const validIds = new Set(LANES.map(l => l.id));
+    // Tolerate an id naming a lane that no longer exists — drop it, but
+    // keep whatever's still valid. Only fall back to the default when
+    // nothing valid survives (a malformed store, or a stored selection that
+    // was every lane the operator once had but none exist anymore) — never
+    // render zero lanes from a bad stored value that wasn't actually an
+    // intentional empty selection.
+    const filtered = parsed.filter(id => validIds.has(id));
+    if (filtered.length === 0) return new Set(DEFAULT_VISIBLE_LANE_IDS);
+    return new Set(filtered);
+  } catch (_) {
+    return new Set(DEFAULT_VISIBLE_LANE_IDS);
+  }
+}
+
+function saveLaneSelection(ids) {
+  try {
+    localStorage.setItem(LANE_FILTER_STORAGE_KEY, JSON.stringify([...ids]));
+  } catch (_) {}
+}
+
 export function initBoard() {
   const lanesEl = document.getElementById('board-lanes');
   const searchEl = document.getElementById('board-search');
-  const laneFilterEl = document.getElementById('board-filter-lane');
+  const laneFilterDropdown = document.getElementById('board-lane-filter-dropdown');
+  const laneFilterBtn = document.getElementById('board-lane-filter-btn');
+  const laneFilterOptions = document.getElementById('board-lane-filter-options');
+  const laneFilterLabel = document.getElementById('board-lane-filter-label');
+  const laneFilterAllBtn = document.getElementById('board-lane-filter-all');
+  const laneFilterClearBtn = document.getElementById('board-lane-filter-clear');
   const assigneeFilterEl = document.getElementById('board-filter-assignee');
   const hostFilterEl = document.getElementById('board-filter-host');
   const tagFilterEl = document.getElementById('board-filter-tag');
@@ -49,6 +101,7 @@ export function initBoard() {
   const drawerEl = document.getElementById('board-drawer');
 
   let board = { lanes: Object.fromEntries(LANES.map(l => [l.id, []])) };
+  let visibleLanes = loadLaneSelection();
   let openCardId = null;
   let openCardLane = null;
   let openCardSnapshot = null;  // last card object the drawer was fully rendered from
@@ -183,9 +236,6 @@ export function initBoard() {
       if (!haystack.toLowerCase().includes(search)) return false;
     }
 
-    const laneSel = laneFilterEl?.value || 'all';
-    if (laneSel !== 'all' && card.lane !== laneSel) return false;
-
     const assigneeSel = assigneeFilterEl?.value || 'all';
     if (assigneeSel !== 'all') {
       if (card.kind !== 'task') return false;
@@ -299,7 +349,15 @@ export function initBoard() {
     // that same card id (#850 verify-1 finding 3).
     suppressNextClick = null;
     lanesEl.innerHTML = '';
+    if (visibleLanes.size === 0) {
+      const hint = document.createElement('div');
+      hint.className = 'board-lanes-empty-hint';
+      hint.textContent = 'No lanes selected — use the Lanes filter above to show columns.';
+      lanesEl.appendChild(hint);
+      return;
+    }
     for (const lane of LANES) {
+      if (!visibleLanes.has(lane.id)) continue;
       const column = document.createElement('div');
       column.className = 'board-lane';
       column.dataset.lane = lane.id;
@@ -308,7 +366,12 @@ export function initBoard() {
         .map(c => ({ ...c, lane: lane.id }))
         .filter(cardMatchesFilters);
 
-      column.innerHTML = `<div class="board-lane-header">${escapeHtml(lane.label)} <span class="board-lane-count">${cards.length}</span></div>`;
+      column.innerHTML = `
+        <div class="board-lane-header">${escapeHtml(lane.label)} <span class="board-lane-count">${cards.length}</span></div>
+        ${DIRECT_LANE_IDS.has(lane.id) ? `<button type="button" class="board-lane-add" data-lane="${lane.id}" title="New card in ${escapeHtml(lane.label)}">+</button>` : ''}
+      `;
+      const addBtn = column.querySelector('.board-lane-add');
+      if (addBtn) addBtn.addEventListener('click', () => openNewCardForm(lane.id));
       const cardsEl = document.createElement('div');
       cardsEl.className = 'board-lane-cards';
       for (const card of cards) {
@@ -432,7 +495,12 @@ export function initBoard() {
         if (data && data.lane && data.lane !== targetLane) {
           showToast(`Card landed in ${laneLabel(data.lane)}, not ${laneLabel(targetLane)}.`, false);
         }
-        return fetchBoard();
+        // Callers that need to know where the card actually ended up (e.g.
+        // the composer revealing the right lane — round-2 finding 1b) read
+        // it off the resolved value; fetchBoard()'s own resolution (undefined)
+        // is irrelevant to them, so hand back `data` once the board refresh
+        // settles.
+        return fetchBoard().then(() => data);
       })
       .catch(err => {
         showToast(`Couldn't move card: ${err.message}`, true);
@@ -451,7 +519,11 @@ export function initBoard() {
   // New-card composer
   // ------------------------------------------------------------------
 
-  function openNewCardForm() {
+  // `targetLane` preselects the composer's own Lane select (still
+  // changeable by the operator) — omitted (defaults to unassigned) for the
+  // top-bar "+ New card" button, which never moves the card after creation.
+  function openNewCardForm(targetLane) {
+    const initialLane = DIRECT_LANE_IDS.has(targetLane) ? targetLane : 'unassigned';
     const backdrop = document.createElement('div');
     backdrop.className = 'modal-backdrop';
     backdrop.innerHTML = `
@@ -461,6 +533,10 @@ export function initBoard() {
         <input id="new-card-desc" type="text" style="width:100%;box-sizing:border-box;margin:0.35rem 0;padding:0.4rem;background:var(--bg-elev);color:var(--text-primary);border:1px solid var(--border);border-radius:6px" />
         <label style="font-size:0.75rem;color:var(--text-secondary)">Notes (optional)</label>
         <textarea id="new-card-notes" placeholder="Notes…"></textarea>
+        <label style="font-size:0.75rem;color:var(--text-secondary)">Lane</label>
+        <select id="new-card-lane" style="width:100%;margin:0.35rem 0;padding:0.4rem;background:var(--bg-elev);color:var(--text-primary);border:1px solid var(--border);border-radius:6px">
+          ${LANES.filter(l => DIRECT_LANE_IDS.has(l.id)).map(l => `<option value="${l.id}" ${l.id === initialLane ? 'selected' : ''}>${escapeHtml(l.label)}</option>`).join('')}
+        </select>
         <label style="font-size:0.75rem;color:var(--text-secondary)">Assignee</label>
         <select id="new-card-assignee" style="width:100%;margin:0.35rem 0;padding:0.4rem;background:var(--bg-elev);color:var(--text-primary);border:1px solid var(--border);border-radius:6px">
           <option value="">unassigned</option>
@@ -476,11 +552,53 @@ export function initBoard() {
     const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
     backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
     backdrop.querySelector('#new-card-cancel').onclick = cleanup;
+
+    const laneSelectEl = backdrop.querySelector('#new-card-lane');
+    const assigneeSelectEl = backdrop.querySelector('#new-card-assignee');
+    // Picking an assignee while Lane still reads Unassigned would otherwise
+    // silently file the card in Assigned anyway (derive_lane files any task
+    // carrying an assignee tag there) with the Lane control still
+    // contradicting that outcome — flip it to what will actually happen
+    // instead of leaving it to lie (round-1 finding 4a).
+    assigneeSelectEl.addEventListener('change', () => {
+      if (assigneeSelectEl.value && laneSelectEl.value === 'unassigned') {
+        laneSelectEl.value = 'assigned';
+      } else if (!assigneeSelectEl.value && laneSelectEl.value === 'assigned') {
+        // The reverse of the flip above — clearing the assignee back to
+        // blank must not leave Lane stuck on Assigned, or Create then fails
+        // on "Pick an assignee for the Assigned lane." against a select the
+        // operator never touched (round-2 finding 1, one-directional dead
+        // end).
+        laneSelectEl.value = 'unassigned';
+      }
+    });
+
     backdrop.querySelector('#new-card-create').onclick = async () => {
       const desc = backdrop.querySelector('#new-card-desc').value.trim();
       if (!desc) return;
       const notes = backdrop.querySelector('#new-card-notes').value.trim();
-      const assignee = backdrop.querySelector('#new-card-assignee').value;
+      const lane = laneSelectEl.value;
+      const assignee = assigneeSelectEl.value;
+      // The assignee-select's own `change` listener (above) only flips Lane
+      // when the operator picks an assignee — it never re-fires if they then
+      // edit Lane back to Unassigned by hand, leaving it lying about where
+      // the card will actually go: derive_lane (api/services/agent_board.py)
+      // files any task carrying an assignee tag under Assigned regardless of
+      // what Lane says. Recompute here so both the guard checks below and
+      // the lane PUT match reality (round-2 finding 1a).
+      const effectiveLane = (lane === 'unassigned' && assignee) ? 'assigned' : lane;
+      if (effectiveLane === 'assigned' && !assignee) {
+        showToast('Pick an assignee for the Assigned lane.', true);
+        return;
+      }
+      // plan_lane_move 409s In progress for any AGENT_ASSIGNEES tag ("only
+      // the worker claims agent-assigned tasks") — reject client-side
+      // before creating anything, mirroring the Assigned guard above
+      // (round-1 finding 4b).
+      if (effectiveLane === 'in_progress' && assignee && AGENT_ASSIGNEES.includes(assignee)) {
+        showToast('Only "me" can be assigned directly to In progress — the worker claims agent-assigned tasks itself.', true);
+        return;
+      }
       const btn = backdrop.querySelector('#new-card-create');
       btn.disabled = true;
       btn.textContent = 'Creating…';
@@ -498,8 +616,58 @@ export function initBoard() {
           const text = await r.text();
           throw new Error(text);
         }
+        // A 200 with a non-JSON body must not throw here — the task was
+        // already created; falling into the outer catch left the composer
+        // open with Create re-enabled, and a second click created a
+        // duplicate (round-1 finding 6). The `created && created.id` guard
+        // below already handles a null result cleanly.
+        const created = await r.json().catch(() => null);
+        // Where the card is actually filed before any lane PUT runs:
+        // derive_lane keys off the assignee tag the create call sent, never
+        // off the composer's own Lane select — a fresh card with no
+        // assignee tag lands Unassigned, one with an assignee tag lands
+        // Assigned. Updated below with whatever a successful moveCard PUT
+        // reports it actually landed in (round-2 finding 1b/4).
+        let landedLane = assignee ? 'assigned' : 'unassigned';
+        if (effectiveLane !== 'unassigned' && created && created.id) {
+          try {
+            const moved = await moveCard(created.id, effectiveLane, assignee || undefined);
+            // moveCard's own success path already re-fetches the board —
+            // avoid a second GET /api/agents/board round-trip here
+            // (round-1 finding 9).
+            if (moved && moved.lane) landedLane = moved.lane;
+          } catch (_) {
+            // moveCard already toasted the failure and never re-fetches on
+            // its own failure path — do it here so the board reflects the
+            // card that DID get created (just not moved). Nothing beyond the
+            // create call landed, so landedLane keeps the pre-move value
+            // above rather than the lane the PUT failed to reach (round-2
+            // finding 2).
+            await fetchBoard();
+          }
+        } else {
+          // A non-Unassigned lane was requested but there's no id to move
+          // with — a 200 whose body didn't parse to an object with one.
+          // Before this fix the operator saw nothing at all: the task WAS
+          // created, just not where they asked, with zero toasts to say so
+          // (round-2 finding 4).
+          if (effectiveLane !== 'unassigned' && !(created && created.id)) {
+            showToast(`Card created, but couldn't confirm its id to move it to ${laneLabel(effectiveLane)} — check ${laneLabel(landedLane)}.`, true);
+          }
+          await fetchBoard();
+        }
+        // A card that landed in a lane the filter is currently hiding would
+        // otherwise have zero on-screen feedback — reveal that lane so it's
+        // actually visible (round-1 finding 5). landedLane is always the
+        // lane the card actually reached, never the one requested: a failed
+        // move leaves it at the tag-derived resting lane set above (round-2
+        // finding 1b/2), and a card whose id we never learned only ever
+        // reached that same tag-derived lane (round-2 finding 4). So
+        // revealing landedLane can never surface a lane the card isn't
+        // actually in — no separate failure gate is needed (round-3
+        // finding 1).
+        ensureLaneVisible(landedLane);
         cleanup();
-        fetchBoard();
       } catch (err) {
         showToast(`Couldn't create card: ${err.message}`, true);
         btn.disabled = false;
@@ -508,7 +676,7 @@ export function initBoard() {
     };
   }
 
-  if (newCardBtn) newCardBtn.addEventListener('click', openNewCardForm);
+  if (newCardBtn) newCardBtn.addEventListener('click', () => openNewCardForm());
 
   // ------------------------------------------------------------------
   // Drawer
@@ -532,6 +700,47 @@ export function initBoard() {
     if (drawerBackdrop) drawerBackdrop.hidden = false;
     renderDrawer(card);
   }
+
+  // Click-outside-close (#882). The drawer sits INSIDE the full-screen
+  // fixed backdrop (`justify-content: flex-end` puts it at the right
+  // edge), so a click anywhere on the board background/lane/card actually
+  // lands on the backdrop element itself — closing when the click's target
+  // IS the backdrop covers all of those in one listener, and a click
+  // inside .board-drawer (whose target is never the backdrop) never
+  // matches. Guarded against a mousedown/mouseup pair that starts on one
+  // side of the backdrop boundary and ends on the other — a scrollbar-drag
+  // (mousedown inside the drawer, mouseup on the backdrop) or a text
+  // selection dragged inward (mousedown on the backdrop, mouseup inside the
+  // drawer) both still fire a `click` on the backdrop (the nearest common
+  // ancestor of the two targets) — so only close when the mousedown, the
+  // mouseup, AND the click all targeted the backdrop itself (round-1
+  // finding 1).
+  let drawerBackdropMouseDownOnSelf = false;
+  let drawerBackdropMouseUpOnSelf = false;
+  if (drawerBackdrop) {
+    drawerBackdrop.addEventListener('mousedown', (e) => {
+      drawerBackdropMouseDownOnSelf = (e.target === drawerBackdrop);
+    });
+    drawerBackdrop.addEventListener('mouseup', (e) => {
+      drawerBackdropMouseUpOnSelf = (e.target === drawerBackdrop);
+    });
+    drawerBackdrop.addEventListener('click', (e) => {
+      if (e.target === drawerBackdrop && drawerBackdropMouseDownOnSelf && drawerBackdropMouseUpOnSelf) closeDrawer();
+      drawerBackdropMouseDownOnSelf = false;
+      drawerBackdropMouseUpOnSelf = false;
+    });
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (!openCardId) return;
+    if (drawerBackdrop && drawerBackdrop.hidden) return;
+    // A modal (new-card composer, answer prompt) renders on top of the
+    // drawer (.modal-backdrop z-index 100 > .board-drawer-backdrop's 90) —
+    // let it own Escape instead of closing the drawer underneath it.
+    if (document.querySelector('.modal-backdrop')) return;
+    closeDrawer();
+  });
 
   async function putTask(taskId, patch) {
     const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
@@ -563,6 +772,28 @@ export function initBoard() {
     return r.json();
   }
 
+  // Notes autosize (#882) — height tracks content up to 2/3 of the
+  // viewport height, after which `.drawer-notes-autosize`'s
+  // `overflow-y: auto` (web/agents.html) takes over scrolling. Scoped to
+  // the task notes textarea only — the schedule drawer's message-content
+  // textarea keeps its plain fixed/manual-resize box.
+  function autosizeNotesTextarea(el) {
+    if (!el) return;
+    el.style.height = 'auto';
+    // `* { box-sizing: border-box }` (web/agents.html) means the assigned
+    // `height` is a border-box total, but `scrollHeight` never counts the
+    // border — only content + padding. Without adding the border widths
+    // back, the box is assigned exactly `scrollHeight`, so its actual
+    // content+padding area ends up `scrollHeight` minus the border, 2px
+    // (1px top + 1px bottom) short of the content at every length past the
+    // minimum — clipping and forcing an early internal scroll (round-1
+    // finding 3).
+    const cs = getComputedStyle(el);
+    const borderY = parseFloat(cs.borderTopWidth || '0') + parseFloat(cs.borderBottomWidth || '0');
+    const maxHeight = window.innerHeight * (2 / 3);
+    el.style.height = Math.min(el.scrollHeight + borderY, maxHeight) + 'px';
+  }
+
   function renderDrawer(card) {
     if (!drawerEl) return;
     const isTask = card.kind === 'task';
@@ -575,7 +806,7 @@ export function initBoard() {
       </div>
       ${isTask ? `
       <label class="drawer-label">Notes</label>
-      <textarea class="drawer-notes" data-field="notes" placeholder="Notes…">${escapeHtml(card.notes || '')}</textarea>
+      <textarea class="drawer-notes drawer-notes-autosize" data-field="notes" placeholder="Notes…">${escapeHtml(card.notes || '')}</textarea>
       <div class="drawer-row">
         <div>
           <label class="drawer-label">Assignee</label>
@@ -640,6 +871,8 @@ export function initBoard() {
       try { await putTask(card.id, { notes: value }); await fetchBoard(); }
       catch (err) { showToast(`Couldn't save notes: ${err.message}`, true); notesEl.value = card.notes || ''; }
     });
+    notesEl.addEventListener('input', () => autosizeNotesTextarea(notesEl));
+    autosizeNotesTextarea(notesEl);  // size to existing content on open/re-render
 
     const assigneeEl = drawerEl.querySelector('[data-field="assignee"]');
     assigneeEl.addEventListener('change', async () => {
@@ -864,10 +1097,83 @@ export function initBoard() {
   }
 
   // ------------------------------------------------------------------
+  // Lane filter dropdown — checkboxes + All/Clear toggles + outside-click
+  // close (#882, mirrors web/crm.html's people-filter-* dropdown pattern).
+  // ------------------------------------------------------------------
+
+  function laneFilterCheckboxes() {
+    return laneFilterOptions ? [...laneFilterOptions.querySelectorAll('input[type="checkbox"]')] : [];
+  }
+
+  function updateLaneFilterLabel() {
+    if (!laneFilterLabel) return;
+    if (visibleLanes.size === LANES.length) laneFilterLabel.textContent = 'All lanes';
+    else if (visibleLanes.size === 0) laneFilterLabel.textContent = 'No lanes';
+    else laneFilterLabel.textContent = `${visibleLanes.size} lane${visibleLanes.size === 1 ? '' : 's'}`;
+  }
+
+  function applyLaneSelection(ids) {
+    visibleLanes = new Set(ids);
+    saveLaneSelection(visibleLanes);
+    updateLaneFilterLabel();
+    render();
+  }
+
+  // Reveals `laneId` in the filter (and persists it) if it's currently
+  // hidden — used after creating a card straight into a lane the filter
+  // was hiding, so the new card doesn't vanish with no feedback (round-1
+  // finding 5). A no-op when the lane is already visible.
+  function ensureLaneVisible(laneId) {
+    if (visibleLanes.has(laneId)) return;
+    const checkbox = laneFilterOptions && laneFilterOptions.querySelector(`input[value="${laneId}"]`);
+    if (checkbox) checkbox.checked = true;
+    applyLaneSelection([...visibleLanes, laneId]);
+  }
+
+  function renderLaneFilterCheckboxes() {
+    if (!laneFilterOptions) return;
+    for (const lane of LANES) {
+      const label = document.createElement('label');
+      label.className = 'board-lane-filter-option';
+      label.innerHTML = `<input type="checkbox" value="${lane.id}" ${visibleLanes.has(lane.id) ? 'checked' : ''} /> ${escapeHtml(lane.label)}`;
+      label.querySelector('input').addEventListener('change', () => {
+        applyLaneSelection(laneFilterCheckboxes().filter(cb => cb.checked).map(cb => cb.value));
+      });
+      laneFilterOptions.appendChild(label);
+    }
+  }
+
+  if (laneFilterBtn) {
+    laneFilterBtn.addEventListener('click', () => {
+      if (laneFilterOptions) laneFilterOptions.classList.toggle('show');
+    });
+  }
+  if (laneFilterAllBtn) {
+    laneFilterAllBtn.addEventListener('click', () => {
+      laneFilterCheckboxes().forEach(cb => { cb.checked = true; });
+      applyLaneSelection(LANES.map(l => l.id));
+    });
+  }
+  if (laneFilterClearBtn) {
+    laneFilterClearBtn.addEventListener('click', () => {
+      laneFilterCheckboxes().forEach(cb => { cb.checked = DEFAULT_VISIBLE_LANE_IDS.includes(cb.value); });
+      applyLaneSelection(DEFAULT_VISIBLE_LANE_IDS);
+    });
+  }
+  document.addEventListener('click', (e) => {
+    if (laneFilterDropdown && !laneFilterDropdown.contains(e.target) && laneFilterOptions) {
+      laneFilterOptions.classList.remove('show');
+    }
+  });
+
+  renderLaneFilterCheckboxes();
+  updateLaneFilterLabel();
+
+  // ------------------------------------------------------------------
   // Wire filters + boot
   // ------------------------------------------------------------------
 
-  [searchEl, laneFilterEl, assigneeFilterEl, hostFilterEl, tagFilterEl,
+  [searchEl, assigneeFilterEl, hostFilterEl, tagFilterEl,
    contextFilterEl, recencyFilterEl, includeDoneEl].filter(Boolean).forEach(el => {
     const evt = (el.tagName === 'SELECT' || el.type === 'checkbox') ? 'change' : 'input';
     el.addEventListener(evt, () => render());
