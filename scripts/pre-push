@@ -58,12 +58,43 @@ CHANGED_FILES=$(echo "$CHANGED_FILES" | sort -u | grep -v '^$' || true)
 # result could be misattributed to the wrong branch. Derive a per-branch,
 # per-process path instead: reproducible from the branch (no guessing to
 # find a failure's log) and unique per concurrent run (no collision).
+#
+# An unwritable/occupied configured directory must never block a push (a
+# regression an earlier version of this hook had: a silenced `mkdir`
+# failure left `$LOG` pointing nowhere, `> "$LOG"` then failed under `set -e`,
+# and the push died reporting a fake test failure). So: try the configured
+# directory, then a fixed fallback, then a throwaway one — and say so.
+_prepush_dir_usable() {
+    [ -d "$1" ] && [ -w "$1" ]
+}
+
 LOG_DIR="${TMPDIR:-/tmp}/lifeos-prepush"
-mkdir -p -m 700 "$LOG_DIR" 2>/dev/null || true
-# Prune logs older than 3 days so this directory doesn't grow unbounded.
-# Never touch anything younger than that — a live run's log, passing or
-# failing, must survive until someone reads it.
-find "$LOG_DIR" -maxdepth 1 -type f -mtime +3 -delete 2>/dev/null || true
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+if ! _prepush_dir_usable "$LOG_DIR"; then
+    UNUSABLE_LOG_DIR="$LOG_DIR"
+    # LIFEOS_PREPUSH_TEST_FALLBACK_DIR lets tests exercise this fallback
+    # without ever touching the real, shared /tmp/lifeos-prepush. Unset in
+    # production, where the fallback is always the well-known fixed path.
+    LOG_DIR="${LIFEOS_PREPUSH_TEST_FALLBACK_DIR:-/tmp/lifeos-prepush}"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    if [ "$LOG_DIR" = "$UNUSABLE_LOG_DIR" ] || ! _prepush_dir_usable "$LOG_DIR"; then
+        LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lifeos-prepush.XXXXXX" 2>/dev/null \
+            || mktemp -d 2>/dev/null || echo "/tmp")
+    fi
+    echo "Pre-push: log directory $UNUSABLE_LOG_DIR is unusable; using $LOG_DIR instead"
+fi
+# mkdir -m only sets the mode on creation, so a directory left behind
+# world-writable by something else would never get tightened. Do it
+# unconditionally instead.
+chmod 700 "$LOG_DIR" 2>/dev/null || true
+
+# Prune this hook's own old logs so the directory doesn't grow unbounded.
+# GNU find's `-mtime +3` matches files whose age exceeds 3 whole days, i.e.
+# it starts deleting at the 4-day mark, not the 3-day mark. Scoped to this
+# hook's own `*.log` files so it never removes anything else that happens to
+# be in the directory. Never touches anything younger than that — a live
+# run's log, passing or failing, must survive until someone reads it.
+find "$LOG_DIR" -maxdepth 1 -type f -name '*.log' -mtime +3 -delete 2>/dev/null || true
 
 sanitize_branch_slug() {
     # Replace everything outside [A-Za-z0-9._-] (slashes included) with "_",
@@ -145,8 +176,17 @@ if [ -f "$HOME/.venvs/lifeos/bin/activate" ]; then
 fi
 
 fail() {
-    echo "FAILED ($(tail -1 "$LOG"))"
-    echo "  Full output: $LOG"
+    # $LOG may not exist (or be empty) if the failure happened before pytest
+    # produced any output — e.g. the log directory turned out unusable mid-run.
+    # Report that honestly instead of a blank "FAILED ()".
+    if [ -s "$LOG" ] 2>/dev/null; then
+        echo "FAILED ($(tail -1 "$LOG"))"
+    elif [ -e "$LOG" ]; then
+        echo "FAILED (empty log — command likely failed before producing output)"
+    else
+        echo "FAILED (no log was written to $LOG)"
+    fi
+    [ -e "$LOG" ] && echo "  Full output: $LOG"
     exit 1
 }
 

@@ -1,7 +1,7 @@
 # Testing Standards
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-19
+> **Last Updated:** 2026-09-04
 > **Audience:** All developers and AI agents
 
 Testing patterns and conventions for the LifeOS codebase.
@@ -88,7 +88,7 @@ That distinction is load-bearing: `browser and not requires_server` is the set t
 
 Prefer the self-contained pattern for new frontend tests — it also means the test exercises the checkout under test rather than whatever a running server has deployed.
 
-The pre-push hook writes each suite's output to a per-branch, per-process log under `${TMPDIR:-/tmp}/lifeos-prepush/` and prints the resolved path before each run, so concurrent pushes from different worktrees never overwrite each other's log.
+The pre-push hook writes each suite's output to a per-branch, per-process log under `${TMPDIR:-/tmp}/lifeos-prepush/` and prints the resolved path before each run, so concurrent pushes from different worktrees never overwrite each other's log; logs older than 3 days are pruned automatically. A branch name with non-ASCII characters or longer than 80 characters collapses to a less distinguishable slug in the filename, but the log path still stays unique (it's the process id, not the slug, that guarantees that).
 
 ## Fixture Patterns
 
