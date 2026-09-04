@@ -33,11 +33,14 @@ ZERO_SHA="0000000000000000000000000000000000000000"
 # this separately is what lets a pure deletion exit early instead of running
 # the whole suite just to delete a branch.
 HAVE_CONTENT=0
+# First local_ref seen on stdin — used below to derive a per-branch log path.
+PUSH_LOCAL_REF=""
 while read local_ref local_sha remote_ref remote_sha; do
     [ -z "$local_sha" ] && continue
     # Deletion push (local_sha is zeros) — nothing to diff.
     [ "$local_sha" = "$ZERO_SHA" ] && continue
     HAVE_CONTENT=1
+    [ -z "$PUSH_LOCAL_REF" ] && PUSH_LOCAL_REF="$local_ref"
     if [ "$remote_sha" = "$ZERO_SHA" ]; then
         # New branch: diff against origin/main if available, else last 10 commits.
         MERGE_BASE=$(git merge-base "$local_sha" origin/main 2>/dev/null || echo "${local_sha}~10")
@@ -48,6 +51,44 @@ while read local_ref local_sha remote_ref remote_sha; do
     CHANGED_FILES="$CHANGED_FILES"$'\n'"$DIFF"
 done
 CHANGED_FILES=$(echo "$CHANGED_FILES" | sort -u | grep -v '^$' || true)
+
+# --- Per-run log paths (#908) --------------------------------------------
+# Fixed /tmp paths used to be shared across every worktree/branch/agent on
+# this machine, so concurrent pushes clobbered each other's output and a
+# result could be misattributed to the wrong branch. Derive a per-branch,
+# per-process path instead: reproducible from the branch (no guessing to
+# find a failure's log) and unique per concurrent run (no collision).
+LOG_DIR="${TMPDIR:-/tmp}/lifeos-prepush"
+mkdir -p -m 700 "$LOG_DIR" 2>/dev/null || true
+# Prune logs older than 3 days so this directory doesn't grow unbounded.
+# Never touch anything younger than that — a live run's log, passing or
+# failing, must survive until someone reads it.
+find "$LOG_DIR" -maxdepth 1 -type f -mtime +3 -delete 2>/dev/null || true
+
+sanitize_branch_slug() {
+    # Replace everything outside [A-Za-z0-9._-] (slashes included) with "_",
+    # so a branch like "feat/x" or a hostile "../../etc/passwd" collapses to
+    # a single safe filename component that can't escape LOG_DIR. Cap the
+    # length so a very long branch name can't produce an unwieldy path.
+    local slug
+    slug=$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')
+    slug="${slug:0:80}"
+    [ -z "$slug" ] && slug="unknown"
+    printf '%s' "$slug"
+}
+
+if [ -n "$PUSH_LOCAL_REF" ] && [[ "$PUSH_LOCAL_REF" == refs/heads/* ]]; then
+    BRANCH_RAW="${PUSH_LOCAL_REF#refs/heads/}"
+else
+    # No branch ref on stdin (e.g. a tag push, or nothing read at all) —
+    # fall back to the checked-out branch, then a literal placeholder.
+    BRANCH_RAW=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    [ "$BRANCH_RAW" = "HEAD" ] && BRANCH_RAW="detached"
+fi
+BRANCH_SLUG=$(sanitize_branch_slug "$BRANCH_RAW")
+
+LOG="$LOG_DIR/${BRANCH_SLUG}-$$-unit.log"
+BROWSER_LOG="$LOG_DIR/${BRANCH_SLUG}-$$-browser.log"
 
 # Test overrides: stand in for the stdin ref lines so the decision below can be
 # exercised without a real push (mirrors test.sh's LIFEOS_TEST_CHANGED_FILES).
@@ -60,6 +101,8 @@ fi
 plan_only_exit() {
     if [ -n "${LIFEOS_PREPUSH_PLAN_ONLY:-}" ]; then
         echo "prepush-plan: $1"
+        echo "prepush-log: $LOG"
+        echo "prepush-browser-log: $BROWSER_LOG"
         exit 0
     fi
 }
@@ -96,9 +139,6 @@ fi
 
 plan_only_exit "run"
 
-LOG="/tmp/lifeos-prepush-tests.log"
-BROWSER_LOG="/tmp/lifeos-prepush-browser.log"
-
 # Activate virtual environment
 if [ -f "$HOME/.venvs/lifeos/bin/activate" ]; then
     source "$HOME/.venvs/lifeos/bin/activate"
@@ -110,6 +150,7 @@ fail() {
     exit 1
 }
 
+echo "Log: $LOG"
 echo -n "Running unit tests... "
 
 # #682: this scope (`-m "unit and not slow"`) and scripts/test.sh's unit
@@ -148,10 +189,11 @@ echo "passed ($(tail -1 "$LOG"))"
 # -p no:cacheprovider keeps this run out of .pytest_cache so it can't disturb
 # the unit run's --ff ordering data.
 if python -c "import playwright" 2>/dev/null; then
-    echo -n "Running server-free browser tests... "
     # Its own log, so a browser failure doesn't clobber the unit-run output
     # someone may still need to read.
     LOG="$BROWSER_LOG"
+    echo "Log: $LOG"
+    echo -n "Running server-free browser tests... "
     python -m pytest -m "browser and not requires_server" tests/ -q --tb=line \
         --no-header -p no:cacheprovider > "$LOG" 2>&1 || fail
     echo "passed ($(tail -1 "$LOG"))"

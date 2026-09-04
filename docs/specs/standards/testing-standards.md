@@ -88,6 +88,8 @@ That distinction is load-bearing: `browser and not requires_server` is the set t
 
 Prefer the self-contained pattern for new frontend tests — it also means the test exercises the checkout under test rather than whatever a running server has deployed.
 
+The pre-push hook writes each suite's output to a per-branch, per-process log under `${TMPDIR:-/tmp}/lifeos-prepush/` and prints the resolved path before each run, so concurrent pushes from different worktrees never overwrite each other's log.
+
 ## Fixture Patterns
 
 Shared fixtures are in `tests/conftest.py`. Key fixtures:
