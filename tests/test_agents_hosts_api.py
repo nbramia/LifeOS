@@ -257,6 +257,20 @@ async def test_probe_degrades_on_value_error_from_runner(registry, api_host):
     assert by_name["desktop-box"]["online"] is True
 
 
+def test_probe_peers_itself_catches_value_error(registry, api_host):
+    """(#901 round 2, finding A2) Calls `_probe_peers()` DIRECTLY rather
+    than going through `get()` — round 2's A4 fix also added a blanket
+    `except Exception` around `_build()` in `get()`, which would degrade
+    to the same `online: null` content regardless of whether
+    `_probe_peers`'s OWN except tuple catches `ValueError` — a test that
+    only asserts through `get()` can't tell the two guards apart. This
+    pins the guard at the level the finding actually names."""
+    def _raise():
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    catalog = HostCatalog(status_runner=_raise, clock=_FrozenClock())
+    assert catalog._probe_peers() == []
+
+
 @pytest.mark.asyncio
 async def test_online_null_for_registry_host_absent_from_peer_list(registry, api_host):
     # tailscale runs fine, but only reports one of the two registry hosts.
