@@ -1,7 +1,7 @@
 # Installation Guide
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-28
+> **Last Updated:** 2026-09-04
 > **Audience:** New users
 
 > **Quick start**: If you have Claude Code, run it in the project root and point it at
@@ -109,7 +109,10 @@ runs — it's the unattended-operations layer, and it's Linux-only today.
 ```bash
 git clone https://github.com/yourusername/LifeOS.git
 cd LifeOS
+./scripts/setup-hooks.sh
 ```
+
+`setup-hooks.sh` wires up the tracked git hooks and repoints `origin`'s *push* URL at HTTPS (fetches stay SSH), because GitHub closes an idle SSH session after ~6 minutes and the pre-push test gate runs for ~9, which otherwise fails a passing push. It also checks that `gh`'s credential helper is configured for HTTPS pushes and tells you to run `gh auth setup-git` if not, without failing setup.
 
 ---
 
