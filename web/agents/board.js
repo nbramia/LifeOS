@@ -629,7 +629,6 @@ export function initBoard() {
         // Assigned. Updated below with whatever a successful moveCard PUT
         // reports it actually landed in (round-2 finding 1b/4).
         let landedLane = assignee ? 'assigned' : 'unassigned';
-        let moveFailed = false;
         if (effectiveLane !== 'unassigned' && created && created.id) {
           try {
             const moved = await moveCard(created.id, effectiveLane, assignee || undefined);
@@ -645,7 +644,6 @@ export function initBoard() {
             // above rather than the lane the PUT failed to reach (round-2
             // finding 2).
             await fetchBoard();
-            moveFailed = true;
           }
         } else {
           // A non-Unassigned lane was requested but there's no id to move
@@ -666,7 +664,7 @@ export function initBoard() {
         // finding 1b/2), and a card whose id we never learned only ever
         // reached that same tag-derived lane (round-2 finding 4). So
         // revealing landedLane can never surface a lane the card isn't
-        // actually in — no separate moveFailed gate is needed (round-3
+        // actually in — no separate failure gate is needed (round-3
         // finding 1).
         ensureLaneVisible(landedLane);
         cleanup();

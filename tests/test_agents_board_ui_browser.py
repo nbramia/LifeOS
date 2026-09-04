@@ -1629,10 +1629,10 @@ class TestLaneAddButton:
         500s, really lands in Assigned — so Assigned must be revealed and
         show the card, exactly as a successful create into a hidden lane
         would (round-1 finding 5). Human queue, the *requested* lane the
-        move never reached, must stay hidden and unchecked, and the filter
-        must not persist to localStorage — that's what round 2 wanted
-        proved. Hide both Assigned and Human queue, create into Human queue
-        with an agent assignee, and let the lane PUT 500."""
+        move never reached, must stay hidden and unchecked, and must never
+        appear in the persisted selection. Hide both Assigned and Human
+        queue, create into Human queue with an agent assignee, and let the
+        lane PUT 500."""
         task_posts = []
         lane_calls = []
         _open_board(
