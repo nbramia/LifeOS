@@ -223,9 +223,11 @@ class RouteTimingMiddleware:
     saw.
 
     A pure-ASGI implementation (rather than `BaseHTTPMiddleware`, which
-    buffers the whole response to hand back a `Response` object) so a
-    streaming response (SSE chat) is timed to completion via its final body
-    chunk, and passes every chunk through untouched and unbuffered.
+    buffers the whole response to hand back a `Response` object): every
+    chunk is passed straight through and the middleware waits for the
+    stream's final chunk before recording. A non-SSE streaming response is
+    timed to that final chunk; an SSE response is recorded by count and
+    bytes only (see `record_stream()` above), never a duration.
 
     Registered outermost among this app's own middleware (added *last*, in
     `api/main.py`, after `CORSMiddleware` and the scoped gzip middleware --
