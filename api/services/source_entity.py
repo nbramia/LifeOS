@@ -668,6 +668,84 @@ class SourceEntityStore:
         finally:
             conn.close()
 
+    # Bound each compound statement's size (SQL text + bound parameters).
+    # 300 people per statement covers the CRM UI's page size (web/crm.html
+    # requests limit=300) in a single round trip, while still keeping the
+    # statement (600 bound parameters) well under any SQLite build's
+    # variable limit for larger, less common page sizes that need chunking.
+    _BATCH_CHUNK_SIZE = 300
+
+    def get_for_people_batch(
+        self,
+        canonical_person_ids: list[str],
+        limit_per_person: int = 500,
+    ) -> dict[str, list[SourceEntity]]:
+        """
+        Get source entities for many canonical people in a handful of round
+        trips instead of one call to get_for_person() per person.
+
+        Ordering and per-person limiting are IDENTICAL to
+        get_for_person(canonical_person_id, limit=limit_per_person): most
+        recent (observed_at DESC) first, capped at limit_per_person rows per
+        person -- because each person's rows literally come from that exact
+        per-person query. The trick is combining many of those queries into
+        one compound statement (UNION ALL of subqueries, each independently
+        planned) rather than one round trip per person, or a single
+        WHERE canonical_person_id IN (...) query.
+
+        A naive single query (IN (...) plus either a Python-side group/sort
+        or a ROW_NUMBER() OVER (PARTITION BY ...) window function) was tried
+        and measured slower here, not faster: SQLite does not have a
+        per-group "top-K" optimization for window functions, so it must
+        fully rank every matching row before filtering, while a handful of
+        this dataset's people have 10,000-65,000+ source entities each
+        (heavy iMessage/calendar/Slack history) -- ranking all of those
+        dwarfs the cost of the bounded per-person queries this replaces.
+        A single-person `ORDER BY observed_at DESC LIMIT N` query, by
+        contrast, gets SQLite's efficient top-N-via-heap plan even without a
+        composite index, so preserving that per-person query shape (just
+        combined into fewer round trips) is what actually pays off.
+
+        Args:
+            canonical_person_ids: Canonical person IDs to fetch for
+            limit_per_person: Max source entities to keep per person, same
+                meaning as get_for_person()'s limit
+
+        Returns:
+            Dict mapping canonical_person_id -> list of SourceEntity, most
+            recent first. IDs with no source entities are simply absent
+            (equivalent to get_for_person() returning an empty list for them).
+        """
+        if not canonical_person_ids:
+            return {}
+
+        unique_ids = list(dict.fromkeys(canonical_person_ids))
+        results: dict[str, list[SourceEntity]] = {}
+
+        conn = self._get_connection()
+        try:
+            for start in range(0, len(unique_ids), self._BATCH_CHUNK_SIZE):
+                chunk = unique_ids[start:start + self._BATCH_CHUNK_SIZE]
+                subquery = (
+                    "SELECT * FROM ("
+                    "SELECT * FROM source_entities "
+                    "WHERE canonical_person_id = ? "
+                    "ORDER BY observed_at DESC LIMIT ?"
+                    ")"
+                )
+                compound_query = " UNION ALL ".join([subquery] * len(chunk))
+                params: list = []
+                for person_id in chunk:
+                    params.extend([person_id, limit_per_person])
+
+                cursor = conn.execute(compound_query, params)
+                for row in cursor.fetchall():
+                    person_id = row[7]  # canonical_person_id column (see SourceEntity.from_row)
+                    results.setdefault(person_id, []).append(SourceEntity.from_row(row))
+            return results
+        finally:
+            conn.close()
+
     def get_unlinked(
         self,
         source_type: Optional[str] = None,

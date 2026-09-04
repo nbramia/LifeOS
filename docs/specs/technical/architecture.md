@@ -112,6 +112,22 @@ before persisting changes.
 - `relationship_summary.py` - Summary generation
 - `relationship_insights.py` - Therapy note insights
 
+The CRM people-list endpoints (`GET /api/crm/people`, `GET /birthdays/today`)
+compute each returned person's category dynamically, which needs that
+person's source entities when they don't already qualify as "work" via their
+own email domain or a `slack` source tag. Rather than calling
+`SourceEntityStore.get_for_person()` once per returned person,
+`SourceEntityStore.get_for_people_batch()` fetches the whole page in one
+round trip (a compound `UNION ALL` of per-person, `LIMIT`-bounded
+subqueries — chosen over a single `WHERE ... IN (...)` query because SQLite
+has no per-group "top-K" optimization for that shape, so it would have to
+fully rank every matching row for the highest-interaction people before
+applying any per-person cap). The category fetch also caps at 50 source
+entities per person rather than the single-person path's 500, verified
+against the full production dataset to produce identical categories either
+way — compute_person_category() only needs to find one qualifying entity,
+not all of them.
+
 **Source Integration:**
 - `source_entity.py` - Raw observation records
 - `interaction_store.py` - Interaction storage
