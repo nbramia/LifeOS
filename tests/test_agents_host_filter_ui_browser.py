@@ -374,6 +374,34 @@ SNAPSHOT2 = {
             "model_label": "Remote",
             "decoded_cwd": "/home/synthetic/proj-a",
         },
+        {
+            # (#863 review round 3 finding Q) A CLI row whose real title is
+            # non-Latin (CJK here). Post-fix, `_fallback_label` returns ""
+            # for a genuinely non-empty title that tokenizes to zero ASCII
+            # words (round 2's fix wrongly returned "Untitled", which sits
+            # ABOVE `label` in `nodeLabel`'s precedence and clobbered the
+            # real title on screen for every non-Latin session). This row
+            # models that fixed shape — empty `short_label`, the real title
+            # in `label` — end to end through the browser: the node must
+            # render the title, never "Untitled" and never blank.
+            "session_id": "cc:nonlatin-title-session",
+            "task_id": None,
+            "status": "running",
+            "status_inferred": False,
+            "routing": "claude_code",
+            "source": "claude_code",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 3,
+            "total_output_tokens": 6,
+            "total_dollars": 0.001,
+            "spawn_depth": 0,
+            "label": "検索インデックスをリファクタリングする",
+            "short_label": "",
+            "model_label": "Claude Code",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
     ],
     "edges": [],
     "generated_at": 1234567890,
@@ -442,16 +470,40 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
         page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
 
         _open_agents2(page, agents_base_url)
-        expect(page.locator(".node")).to_have_count(6)
+        expect(page.locator(".node")).to_have_count(7)
         # Let the force-layout / label-render tick settle before reading text.
         page.wait_for_timeout(300)
         labels = page.eval_on_selector_all(
             "text.node-label", "els => els.map(e => e.textContent)"
         )
-        assert len(labels) == 6
+        assert len(labels) == 7
         assert all((label or "").strip() != "?" for label in labels)
         assert all((label or "").strip() != "" for label in labels)
+        # (#863 review round 3 finding Q) never a bare "Untitled" clobbering
+        # a real (non-Latin) title.
+        assert all((label or "").strip() != "Untitled" for label in labels)
         assert errors == []
+
+    def test_node_label_renders_a_non_latin_title_not_untitled(self, page: Page, agents_base_url):
+        """(#863 review round 3 finding Q) `_fallback_label` used to return
+        "Untitled" for any title that tokenized to zero ASCII words —
+        firing for every non-Latin (CJK/Cyrillic/Greek/Arabic) or
+        emoji-only title, not just a genuinely empty one. Since "Untitled"
+        sits ABOVE `label` in `nodeLabel`'s precedence, it clobbered the
+        real title on screen. Fixed to return "" instead, so the node falls
+        through to `label` exactly as it already does for a raw-id
+        `short_label`."""
+        _open_agents2(page, agents_base_url)
+        page.wait_for_timeout(300)
+        rows = page.evaluate(
+            "() => Array.from(document.querySelectorAll('.node')).map(el => ({"
+            "session_id: el.__data__.session_id,"
+            "label: el.querySelector('text.node-label').textContent,"
+            "}))"
+        )
+        by_id = {r["session_id"]: r["label"] for r in rows}
+        rendered = (by_id["cc:nonlatin-title-session"] or "").replace(" ", "")
+        assert rendered == "検索インデックスをリファクタリングする".replace(" ", "")
 
     def test_node_label_prefers_prompt_preview_over_a_raw_id_label(self, page: Page, agents_base_url):
         """(#863) `nodeLabel`'s precedence guard used to compare with

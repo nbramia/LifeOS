@@ -581,6 +581,31 @@ def test_fallback_label_still_renders_a_real_multi_word_title():
     assert _fallback_label("Clean Up The Indexer") == "Clean Up The Indexer"
 
 
+# ---------------------------------------------------------------------------
+# (#863 review round 3, finding Q) A genuinely non-empty, non-Latin title
+# tokenizes to zero ASCII words — the same shape `_fallback_label` sees for
+# a truly empty input — but it is NOT the same case: there is a real title
+# in `label` for the caller to fall through to, so this must return "" (like
+# the raw-identifier guard above), never "Untitled". Round 2's fix returned
+# "Untitled" here, which clobbered the real title since "Untitled" is
+# truthy and outranks `label` in `web/agents/graph.js`'s `nodeLabel`
+# precedence.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("title", [
+    "検索インデックスをリファクタリングする",  # Japanese (CJK)
+    "Исправить парсер виджетов",  # Russian (Cyrillic)
+    "重构搜索索引",  # Chinese (CJK)
+    "🚀 🐛",  # emoji-only
+])
+def test_fallback_label_non_latin_title_falls_through_not_untitled(title):
+    from api.services.agent_viz_summary import _fallback_label
+
+    assert _fallback_label(title) == ""
+
+
 @pytest.mark.unit
 def test_fallback_label_empty_input_is_untitled():
     from api.services.agent_viz_summary import _fallback_label
@@ -1111,6 +1136,10 @@ def test_prefetch_with_engine_disabled_still_caches_fallback_and_drops_out(
 
     monkeypatch.setattr(settings_obj, "codex_viz_enabled", False)
     monkeypatch.setattr(settings_obj, "codex_sessions_dir", str(tmp_path / "no-such-codex-dir"))
+    # (#863 review round 3 finding X) Also isolate the Claude Code side, or
+    # `_build_snapshot()` scans the operator's real `~/.claude/projects` —
+    # not hermetic, and its runtime scales with the operator's own history.
+    monkeypatch.setattr(settings_obj, "claude_code_projects_dir", str(tmp_path / "no-such-cc-dir"))
 
     snap = agents_route._build_snapshot()
     rows = [s for s in snap["sessions"] if s["session_id"].startswith("cx:")]

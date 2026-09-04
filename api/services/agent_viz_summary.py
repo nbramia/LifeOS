@@ -438,13 +438,31 @@ def _fallback_label(label: str) -> str:
     had no whitespace, treat *any* tokenized result as suspect and return
     ""  instead, so the caller (`web/agents/graph.js`'s `nodeLabel`) falls
     through to a real candidate like `model_label` rather than rendering
-    the id back at the operator (#863 finding M).
+    the id back at the operator (#863 finding M). Accepted cost: a
+    legitimate one-word Latin title (`'Refactor'`, `'Q4-roadmap'`) now also
+    returns "" — the graph node is unaffected (it falls through to the
+    identical `label`), but the panel's short-label row renders blank and
+    `search_cached_summaries` loses coverage for those rows. Deliberate,
+    not a bug (#863 review round 3 finding U).
+
+    The tokenizer is ASCII-only ([A-Za-z0-9] word starts), so a genuinely
+    non-empty, non-Latin title (CJK, Cyrillic, Greek, Arabic, emoji-only)
+    also produces zero tokens — the same shape as "no title at all". Those
+    two cases must not share an exit: a non-empty input that merely
+    tokenized to nothing still has a real title sitting in `label` for the
+    caller to fall through to, so it returns "" like the no-whitespace
+    case above. "Untitled" is reserved for a genuinely empty/whitespace-
+    only `label`, where there is no real title to fall through to (#863
+    review round 3 finding Q — round 2's fix returned "Untitled" for any
+    zero-token result, which fired first for non-Latin titles and clobbered
+    them since "Untitled" outranks `label` in `nodeLabel`'s precedence).
     """
-    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]*", label or "")
+    stripped = (label or "").strip()
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]*", stripped)
     result = " ".join(words[:5]).strip()
     if not result:
-        return "Untitled"
-    if not re.search(r"\s", (label or "").strip()):
+        return "Untitled" if not stripped else ""
+    if not re.search(r"\s", stripped):
         return ""
     return result
 
