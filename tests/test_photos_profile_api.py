@@ -1,9 +1,9 @@
 """
 Tests for the profile photo endpoint (GET/HEAD /api/photos/profile/{person_id}).
 
-#875: the CRM people list needs to know, and then fetch, which people have a
+The CRM people list needs to know, and then fetch, which people have a
 usable avatar without probing every row with a request method the route
-didn't accept. These tests pin the route-level contract that makes that
+doesn't accept. These tests pin the route-level contract that makes that
 possible: HEAD behaves like GET (status, no body), and both 200 and 404
 responses carry a cache header the client can rely on to avoid repeat
 requests.
@@ -78,17 +78,13 @@ class TestProfilePhotoAvailable:
     def test_head_returns_200_with_no_body_and_full_header_parity_with_get(
         self, client, photos_enabled, tmp_path
     ):
-        """#875: HEAD used to 405 on this route (GET-only), which is why the
-        list's avatar loader was permanently marking everyone as no-photo.
-
-        #907 review finding 3: a hand-rolled `if request.method == "HEAD"`
-        branch returning a bare `Response` matched status and `cache-control`
-        but dropped `etag`, `last-modified`, `accept-ranges`, and the real
-        `content-length` -- a client using HEAD to revalidate a cached avatar
-        couldn't. The route now stacks `@router.get`/`@router.head` on the
-        same function so Starlette's `FileResponse` handles HEAD natively
-        (RFC 9110 SS9.3.2: HEAD's header fields must match what GET would
-        send), so this asserts full header equality, not just cache-control."""
+        """HEAD must return status and headers matching what GET would send
+        for the same resource (RFC 9110 SS9.3.2), including `etag`,
+        `last-modified`, `accept-ranges`, and the real `content-length` --
+        not just status and `cache-control` -- so a client can use HEAD to
+        revalidate a cached avatar. The route stacks `@router.get`/
+        `@router.head` on the same function so Starlette's `FileResponse`
+        handles HEAD natively, giving that header parity for free."""
         thumb = tmp_path / "thumb.jpeg"
         thumb.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg-bytes")
 

@@ -262,6 +262,25 @@ function showError(message) {
 }
 ```
 
+### Comments
+
+Same rule as the Python conventions: `//` and `/* */` comments in `web/*.html`
+describe current behavior only — what the code does and, where non-obvious, why. No
+"used to"/"previously"/"now"/"no longer", no review rounds, findings, or issue/PR
+numbers cited as history. Git history holds that narrative.
+
+```javascript
+// BAD — narrates history instead of describing current behavior
+// This used to make its own round trip to /api/photos/stats; now the
+// caller passes the count in so there's no separate request (review finding 2).
+function renderPhotoBadge(count) { ... }
+
+// GOOD — states what the function expects and why
+// count comes from the caller's already-fetched stats response, not a
+// fresh request, so this never triggers its own network call.
+function renderPhotoBadge(count) { ... }
+```
+
 ### Mobile Responsiveness
 
 ```css

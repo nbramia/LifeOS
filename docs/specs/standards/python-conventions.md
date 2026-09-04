@@ -209,6 +209,31 @@ logger.info(f"Indexed person {person_id}, {len(sources)} source entities")
 logger.info(f"Indexed {person.display_name}: {person.email}, {person.phone}")
 ```
 
+## Comments and Docstrings
+
+Comments and docstrings describe current behavior only: what the code does and, where
+it's non-obvious, why — never how it got there. No "used to"/"previously"/"now"/"no
+longer", no "this change"/"this fix", no review rounds, findings, reviewers, or
+issue/PR numbers cited as history. Git history is where that narrative belongs. A
+comment earns its place only by stating an invariant or a non-obvious present-tense
+reason.
+
+```python
+# BAD — narrates history instead of describing current behavior
+# This used to fetch every relationship row per call; now caches results
+# per person (review finding 6) because that was measured at ~40ms per row
+# on the full table.
+def get_all_for_person(self, person_id: str) -> list[Relationship]:
+    ...
+
+# GOOD — states the invariant a maintainer needs
+# Caches per person_id: relationship rows are read far more often than
+# written, and a full-table scan per call doesn't stay flat under production
+# row counts.
+def get_all_for_person(self, person_id: str) -> list[Relationship]:
+    ...
+```
+
 ## Data Classes
 
 Domain objects use `@dataclass` with `to_dict()` / `from_dict()` classmethods for serialization. Pydantic is reserved for API request/response shapes.

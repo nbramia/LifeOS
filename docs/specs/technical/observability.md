@@ -70,17 +70,17 @@ Test queries and expected results are defined in `BENCHMARK_QUERIES` within the 
 
 ## Route Timing
 
-Every HTTP request is timed, independently of the chat-turn tracing above (#877). Where perf tracing follows one chat turn through its LLM/tool stages, route timing answers a different question -- "what's slow right now, across the whole API" -- and catches regressions perf tracing can't see, like a CRM endpoint whose response quietly grows to ten seconds with no chat turn involved at all.
+Every HTTP request is timed, independently of the chat-turn tracing above. Where perf tracing follows one chat turn through its LLM/tool stages, route timing answers a different question -- "what's slow right now, across the whole API" -- and catches slowdowns perf tracing can't see, like a CRM endpoint whose response quietly grows to ten seconds with no chat turn involved at all.
 
 ### How It Works
 
 - `RouteTimingMiddleware` (`api/services/route_timing.py`) is a pure-ASGI middleware, registered last in `api/main.py` so it wraps outermost around this app's own middleware (CORS, the scoped gzip middleware) -- its duration and byte count cover the full response, including compression.
 - Being pure ASGI rather than `BaseHTTPMiddleware` means it never buffers a response: every chunk is passed straight through and the middleware waits for the stream's final chunk before recording. A non-SSE streaming response is timed to that final chunk; an SSE response is recorded by count and bytes only (below), never a duration.
 - Routes are keyed by **route template**, not the raw request path -- `request.scope["route"].path` (e.g. `/api/crm/people/{person_id}`), read after routing resolves it, falling back to `"<unmatched>"` for a 404. A raw path or query string never reaches a log line or the in-memory summary, so a person id in a URL is never exposed.
-- `/health*` and `/static/*` are excluded entirely (too frequent/trivial to matter), matched as a full path segment (like `_in_gzip_scope` in `api/main.py`, #895) so a future `/healthz-admin` or `/staticmaps` route isn't swept in by accident. Everything else -- every `/api/*` call and every page route (`/crm`, `/me`, `/family`, `/relationship`, `/birthdays`, ...) -- is timed and recorded.
+- `/health*` and `/static/*` are excluded entirely (too frequent/trivial to matter), matched as a full path segment (like `_in_gzip_scope` in `api/main.py`) so a future `/healthz-admin` or `/staticmaps` route isn't swept in by accident. Everything else -- every `/api/*` call and every page route (`/crm`, `/me`, `/family`, `/relationship`, `/birthdays`, ...) -- is timed and recorded.
 - A request slower than `LIFEOS_SLOW_REQUEST_MS` (default 500ms) logs one WARNING with method, route template, status, duration, and response bytes. A request that raises before any response was sent is recorded and logged (if slow) with status 500; one that raises *after* its response already started (a stream that dies mid-flight) logs the status actually sent to the client instead, plus `aborted=true` -- never a synthetic 500 the client never saw.
 - A `text/event-stream` response (SSE) is tracked separately and never subject to any of the above: an SSE connection's duration is however long the client kept its tab or transcript viewer open, not a latency measurement, so timing it like a normal request would let a page-open artifact dominate the summary and fire a false slow-request warning on every disconnect. `RouteTimingStore.record_stream()` keeps only count and total bytes per route, no duration/percentiles/slow_count.
-- Per-route stats live in `RouteTimingStore`, a thread-safe, bounded rolling window (last 200 samples) per `(method, route template)`. Process-local and reset on restart -- this is a live signal, not persisted history (#733 covers persisted rollups this can feed).
+- Per-route stats live in `RouteTimingStore`, a thread-safe, bounded rolling window (last 200 samples) per `(method, route template)`. Process-local and reset on restart -- this is a live signal, not persisted history.
 
 ### API Endpoint
 

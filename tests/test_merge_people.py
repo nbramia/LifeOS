@@ -452,10 +452,9 @@ class TestMergePeopleToneAnalysisResults:
         assert len(tone_store.get_for_person("secondary-person")) == 2  # untouched by dry run
 
     def test_merge_still_clears_facts_for_both_ids(self, merge_env):
-        """Regression guard: the pre-existing facts-cleared-for-both-ids
-        behavior (person_facts, above the new tone_analysis_results step
-        in scripts/merge_people.py) must be unaffected by #910's addition
-        right after it."""
+        """The facts-cleared-for-both-ids behavior (person_facts, above the
+        tone_analysis_results step in scripts/merge_people.py) must be
+        unaffected by that step."""
         from scripts.merge_people import merge_people
 
         stats = merge_people("primary-person", "secondary-person", dry_run=False)
@@ -469,11 +468,9 @@ class TestMergePeopleToneAnalysisResults:
     def merge_env_without_tone_table(self, tmp_path, monkeypatch):
         """Same as merge_env, but the tone_analysis_results table is never
         created -- reproducing a crm.db from an install where tone
-        analysis has never run (the table is created lazily). Regression
-        coverage for a real bug this addition introduced and fixed in the
-        same round: tests/test_merge_crash_safety.py's fixture builds its
-        own crm.db without this table, and the first version of this
-        change 500'd on it with `no such table: tone_analysis_results`."""
+        analysis has never run (the table is created lazily). Covers
+        tests/test_merge_crash_safety.py's fixture, whose crm.db is built
+        without this table."""
         from api.services.person_entity import PersonEntity, PersonEntityStore
         from api.services.relationship import RelationshipStore
         from api.services.source_entity import SourceEntityStore

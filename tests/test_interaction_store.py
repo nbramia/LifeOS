@@ -234,8 +234,8 @@ class TestInteractionStore:
     def test_get_for_person_in_range(self, temp_store):
         """get_for_person_in_range returns every interaction in the window,
         with no row cap -- unlike get_for_person, which always applies
-        InteractionConfig's limit (#899 review finding 5: CRM tone analysis
-        needs the true per-month count, not a capped sample)."""
+        InteractionConfig's limit. CRM tone analysis needs the true
+        per-month count, not a capped sample."""
         person_id = "person-range"
 
         # More rows than get_for_person's default cap would ever return
@@ -306,8 +306,7 @@ class TestInteractionStore:
     def test_get_monthly_interaction_counts_in_range(self, temp_store):
         """get_monthly_interaction_counts_in_range groups by calendar month
         without ever returning row data -- the lightweight freshness check
-        CRM tone analysis uses to avoid loading full rows on a cache hit
-        (#899 review finding N1)."""
+        CRM tone analysis uses to avoid loading full rows on a cache hit."""
         person_id = "person-monthly-counts"
         now = datetime.now(timezone.utc)
 
@@ -381,9 +380,9 @@ class TestInteractionStore:
         assert counts == {}
 
     def test_month_grouping_is_utc_normalized_even_for_a_non_utc_offset_row(self, temp_store):
-        """#899 review, second pass, nit 1: get_monthly_interaction_counts_in_range's
-        SQL grouping (`strftime('%Y-%m', timestamp)`, which SQLite always
-        evaluates in UTC regardless of the stored offset) must agree with
+        """get_monthly_interaction_counts_in_range's SQL grouping
+        (`strftime('%Y-%m', timestamp)`, which SQLite always evaluates in
+        UTC regardless of the stored offset) must agree with
         `api/routes/crm.py`'s Python-side bucketing for the same row --
         even when that row is stored with a non-UTC offset, not just when
         (as every writer in this codebase does today) it's already
@@ -1339,9 +1338,9 @@ class TestMassMeetingExclusion:
 
 class TestMeFamilyAggregates:
     """
-    Store-level tests for the Me/Family dashboard aggregate queries (#871):
-    plain tuples/dicts computed in SQL instead of hydrating every interaction
-    in a window into an Interaction object.
+    Store-level tests for the Me/Family dashboard aggregate queries: plain
+    tuples/dicts computed in SQL instead of hydrating every interaction in
+    a window into an Interaction object.
     """
 
     @pytest.fixture
@@ -1639,15 +1638,13 @@ class TestMeFamilyAggregates:
     def test_get_bucketed_counts_empty_time_points(self, temp_store):
         assert temp_store.get_bucketed_counts([]) == []
 
-    # ---- _range_predicate pool_start_date/pool_end_date (#897 review finding 1) ----
+    # ---- _range_predicate pool_start_date/pool_end_date ----
 
     def test_pool_bounds_clip_an_exact_window_that_extends_before_the_pool(self, temp_store):
         """
-        Reproduces #897 review finding 1: an exact-mode window (e.g. a trend
-        period) that reaches further back than the outer "pool" window
-        (e.g. days_back) must be clipped to the pool, matching the original
-        Python implementation's `all_interactions` (bounded by days_back)
-        plus a precise per-item comparison within it.
+        An exact-mode window (e.g. a trend period) that reaches further
+        back than the outer "pool" window (e.g. days_back) must be clipped
+        to the pool.
         """
         now = datetime.now(timezone.utc)
         pool_start = now - timedelta(days=10)  # e.g. "days_back=10"

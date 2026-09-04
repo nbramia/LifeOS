@@ -1,13 +1,10 @@
 """
 Static guard: no store reachable from the CRM/people/photos routers caches
-a SQLite connection across calls, or opens one with `check_same_thread=False`
-(#868 review finding 9).
+a SQLite connection across calls, or opens one with `check_same_thread=False`.
 
-Acceptance criterion 6 for #868 is that these routers' stores keep opening a
-fresh `sqlite3.connect()` per call rather than sharing one across threads —
-that is what makes dispatching their handlers to worker threads safe at all.
-This was verified by inspection at review time rather than tested; this
-guard locks the invariant in going forward.
+These routers' stores must keep opening a fresh `sqlite3.connect()` per
+call rather than sharing one across threads — that is what makes
+dispatching their handlers to worker threads safe at all.
 
 A cached connection would show up as an instance attribute assigned the
 result of `sqlite3.connect(...)` (e.g. `self._conn = sqlite3.connect(...)`
@@ -17,8 +14,8 @@ in `__init__` or anywhere else) — the opposite of the established pattern
 method. `check_same_thread=False` is SQLite's own opt-out of the safety
 check that would otherwise raise if a connection built on one thread were
 used from another; needing it at all would mean a connection is being
-shared across threads, which these stores must never do now that their
-callers run on the worker threadpool.
+shared across threads, which these stores must never do, since these
+routers' handlers run on the worker threadpool.
 
 One narrow, explicitly-marked exception exists: `PersonEntityStore`'s
 persistent connection (`api/services/person_entity.py`,
@@ -51,8 +48,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 _MARKER = "# threadpool-safe: pragma-only, guarded by lock"
 
 # Every store module reachable from api/routes/crm.py, api/routes/people.py,
-# and api/routes/photos.py (verified by grepping their imports at review
-# time -- see the PR's review response for the exact call graph).
+# and api/routes/photos.py.
 STORE_MODULES = [
     "api/services/person_entity.py",
     "api/services/interaction_store.py",

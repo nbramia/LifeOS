@@ -290,16 +290,14 @@ def trigger_photo_sync(
         except Exception as e:
             # A plain JSONResponse, not a SyncResponse, so a top-level "error"
             # key can ride alongside the existing fields instead of being
-            # filtered out by response_model validation. #609 made this legible
-            # (top-level "error" key); #614 decided a total failure must also
-            # be non-2xx, since a consumer that only checks HTTP status
-            # (`raise_for_status()`) should get correct behavior without
-            # knowing about the body convention. 500 because this is an
-            # unhandled exception, not a classified upstream/dependency
-            # failure. The "error" key stays as additive defense —
-            # `mcp_server.py: dispatch()` and the agent worker's ToolRegistry
-            # already flag any tool result as an error generically whenever the
-            # body carries a top-level "error" key.
+            # filtered out by response_model validation. A total failure is
+            # non-2xx so a consumer that only checks HTTP status
+            # (`raise_for_status()`) gets correct behavior without knowing
+            # about the body convention. 500 because this is an unhandled
+            # exception, not a classified upstream/dependency failure. The
+            # top-level "error" key also lets `mcp_server.py: dispatch()` and
+            # the agent worker's ToolRegistry flag this result as an error
+            # generically, without knowing about this endpoint specifically.
             return JSONResponse(status_code=500, content={
                 "success": False,
                 "stats": {"error": str(e)},
@@ -420,11 +418,10 @@ def get_profile_photo(person_id: str):
     branching on the request method ourselves) lets Starlette's `FileResponse`
     handle it natively, which gives a `HEAD` response the exact same headers
     (`etag`, `last-modified`, `content-length`, `accept-ranges`) a `GET` would
-    carry, just without the body -- a hand-rolled `HEAD` branch returning a
-    bare `Response` could not match that (#907 review finding 3). It also
-    avoids FastAPI's "duplicate operation ID" warning that a single
-    `@router.api_route(methods=["GET", "HEAD"])` registration triggers
-    (finding 5), since GET and HEAD are now separate routes.
+    carry, just without the body. It also avoids FastAPI's "duplicate
+    operation ID" warning that a single `@router.api_route(methods=["GET",
+    "HEAD"])` registration would trigger, since GET and HEAD are separate
+    routes.
     """
     _check_photos_enabled()
 

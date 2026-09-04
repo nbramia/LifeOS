@@ -1,7 +1,7 @@
 # Documentation Strategy
 
 **Status:** Complete
-**Last Updated:** 2026-06-19
+**Last Updated:** 2026-09-04
 
 > **Backlog lives in GitHub issues.** Future work, deferred features, bugs, and enhancements are tracked as GitHub issues — never as `backlog.md` files in this directory. Plan files are reserved for time-bounded execution notes (migration plans, gap analyses, point-in-time issue-drafting context).
 
@@ -26,6 +26,7 @@ Both readers benefit from the same things: short, focused documents; explicit de
 5. **Consistent over creative** — Follow established patterns and structures. Consistency makes documentation predictable and navigable.
 6. **AI-readable** — Be succinct, specific, and clear. Prefer shorter, well-named documents over longer ones. Don't overexplain, but make requirements and decisions explicit.
 7. **Single source of truth** — Default to keeping each piece of information in exactly one authoritative location; other documents link to it rather than repeating it. When in doubt about where something belongs, consult the [Content Classification table](#content-classification). When you find duplication, prefer consolidating to the authoritative location and replacing duplicates with cross-references.
+8. **Current behavior only** — Specs, guides, code comments, docstrings, and test docstrings describe the system as it is today, with no history of how it got there: no comparisons to an older state, no review-process play-by-play, no findings, no issue/PR numbers cited as a timeline — git history is where that lives. A comment earns its place only by stating an invariant or a non-obvious present-tense reason.
 
 ## Document Taxonomy
 
@@ -260,7 +261,7 @@ Use only the buckets that apply — omit empty buckets rather than including the
 **Specs are living:**
 - Update when the design changes, not when tasks complete.
 - If a spec describes a target that's not yet built, the `Status: Partial` value is appropriate.
-- Specs are not changelogs. Don't add "Added X in PR #N" notes; that's what `git log` and `git blame` are for.
+- Specs are not changelogs, and neither are comments, docstrings, or tests. Don't add "Added X in PR #N" notes, "this used to do X" narration, or review-round/finding citations anywhere in the repo; that's what `git log` and `git blame` are for.
 
 **Plans are ephemeral:**
 - A plan ends as either "completed" (move to `archive/` with `Completed: YYYY-MM-DD`) or "superseded" (note the successor and move to `archive/`).

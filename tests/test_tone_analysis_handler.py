@@ -1,8 +1,7 @@
 """
 Unit tests for `POST /api/crm/relationship/tone-analysis-detailed` persistence,
-freshness, batching, and failure handling (#873, tightened by the #899
-adversarial review: cross-month contamination, batching, freshness drift,
-concurrent dedup, and trend-derivation coverage).
+freshness, batching, and failure handling, covering cross-month contamination,
+batching, freshness drift, concurrent dedup, and trend-derivation.
 
 Builds a router-only FastAPI app (see tests/test_route_handlers_concurrency.py
 for why: no lifespan side effects) and patches the LLM client, the
@@ -111,10 +110,9 @@ def _interactions_for_months(months: list) -> list:
 def _find_straddling_month_boundary():
     """Find a month boundary where the last day of one month and the first
     day of the next share the same %Y-W%W key -- i.e. a real week that
-    straddles two calendar months, reproducing the #899 review's finding 1
-    repro without hardcoding a specific calendar year (some, not all, month
-    boundaries have this property; this recurs multiple times a year, so a
-    12-month backward search always finds one).
+    straddles two calendar months, without hardcoding a specific calendar
+    year (some, not all, month boundaries have this property; this recurs
+    multiple times a year, so a 12-month backward search always finds one).
 
     Returns (last_day_of_month_M, first_day_of_month_M_plus_1).
     """
@@ -161,8 +159,8 @@ def _distinct_months_back(n: int) -> list:
 @pytest.fixture
 def patch_interactions(monkeypatch):
     """Patch both interaction_store.get_monthly_interaction_counts_in_range
-    (the lightweight, no-rows freshness-check query -- #899 review finding
-    N1) and get_for_person_in_range (the full row fetch, made only when at
+    (the lightweight, no-rows freshness-check query) and
+    get_for_person_in_range (the full row fetch, made only when at
     least one month is stale), deriving both from the same synthetic
     interaction list. Returns a setter the test calls (any number of times)
     with the desired list, so a test can simulate new messages arriving
@@ -248,10 +246,9 @@ class TestCacheAndFreshness:
 
         # `client.calls == []` is the load-bearing assertion for the "cache
         # hit avoids the LLM call" acceptance criterion. The wall-clock
-        # bound below is the issue's literal 200ms figure and passes
-        # comfortably in practice, but it is secondary -- a loaded xdist
-        # worker is a more plausible source of flake than the call-count
-        # check (#899 review finding 11).
+        # bound below passes comfortably in practice, but it is secondary --
+        # a loaded xdist worker is a more plausible source of flake than the
+        # call-count check.
         assert response.status_code == 200
         assert client.calls == []
         assert elapsed < 0.2
@@ -271,8 +268,8 @@ class TestCacheAndFreshness:
 
         first = app_client.post("/api/crm/relationship/tone-analysis-detailed")
         assert first.status_code == 200
-        # Both missing months are batched into a single LLM call (#899
-        # review finding 4), not one call per month.
+        # Both missing months are batched into a single LLM call, not one
+        # call per month.
         assert len(client.calls) == 1
 
         data = first.json()
@@ -371,9 +368,8 @@ class TestCacheAndFreshness:
         )
 
         assert response.status_code == 200
-        # Both months are forced stale, but still batched into one call
-        # (#899 review finding 4) -- a full refresh costs one call, not one
-        # per month.
+        # Both months are forced stale, but still batched into one call --
+        # a full refresh costs one call, not one per month.
         assert len(client.calls) == 1
         for t in response.json()["monthly_tones"]:
             assert t["user_score"] == 15.0
@@ -395,11 +391,10 @@ class TestCacheAndFreshness:
     def test_straddling_week_does_not_cross_contaminate_or_double_count(
         self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
     ):
-        """#899 review finding 1 (BLOCKER): a %W week spanning a month
-        boundary used to be looked up in a single week-keyed dict shared by
-        both months, so both months' prompts got the *other* month's
-        messages too and both months' sample counts roughly doubled. Fixed
-        by bucketing month-first, then week-within-month."""
+        """A %W week spanning a month boundary must not leak messages
+        between the two months: bucketing is month-first, then
+        week-within-month, so each month's prompt and sample count reflect
+        only that month's messages."""
         last_day_of_m, first_day_of_m_plus_1 = _find_straddling_month_boundary()
         month_m_key = last_day_of_m.strftime("%Y-%m")
         month_m_plus_1_key = first_day_of_m_plus_1.strftime("%Y-%m")
@@ -451,11 +446,7 @@ class TestCacheAndFreshness:
     def test_no_drift_for_a_fully_elapsed_month_when_new_messages_arrive_elsewhere(
         self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
     ):
-        """#899 review finding 5 (MAJOR): with the old `now - months*30
-        days` rolling cutoff and a 10,000-row cap, an old (non-current)
-        month's *reported* count could drift purely from wall-clock time or
-        new messages elsewhere, forcing a needless recompute on every load.
-        With the window snapped to a calendar-month boundary and fetched
+        """With the window snapped to a calendar-month boundary and fetched
         without a row cap, a fully-elapsed month's count must be stable
         across calls even as new messages arrive in the current month."""
         now = datetime.now(timezone.utc)
@@ -516,15 +507,10 @@ class TestCacheAndFreshness:
 
 
 class TestWindowStart:
-    """Direct guard for the calendar-month snap (#899 review finding N4).
-
-    The drift-regression test above (test_no_drift_for_a_fully_elapsed_...)
-    protects the *removal of the row cap*, but its synthetic old month
-    sits comfortably inside the window either way, so it stayed green even
-    under the reviewer's mutation reverting the window start back to
-    `now - timedelta(days=months * 30)`. These tests exercise the window
-    boundary calculation itself, which the end-to-end fixture could not
-    pin down."""
+    """The tone-analysis window start snaps to a calendar-month boundary,
+    never a rolling day count -- exercised directly here since the drift
+    test above (test_no_drift_for_a_fully_elapsed_...) protects the
+    row-cap removal but can't pin down the boundary calculation itself."""
 
     def test_twelve_months_back_lands_on_the_first_of_the_month(self):
         now = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
@@ -559,11 +545,9 @@ class TestWindowStart:
 
 
 class TestCacheHitPerformance:
-    """#899 review finding N1: a cache hit was measured at ~0.3s on real
-    data because it always loaded and bucketed every row in the window just
-    to compare counts. The freshness check must use a lightweight,
-    no-rows-loaded query instead, falling through to the full row fetch
-    only when at least one month is actually stale."""
+    """The freshness check uses a lightweight, no-rows-loaded query instead
+    of loading and bucketing every row in the window, falling through to
+    the full row fetch only when at least one month is actually stale."""
 
     def test_cache_hit_never_calls_the_row_loading_fetch(
         self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
@@ -611,12 +595,9 @@ class TestCacheHitPerformance:
 
 
 class TestStaleVsError:
-    """#899 review finding N2: a stale month whose recompute fails must be
-    served with its last stored score and status="stale" -- never
-    discarded. status="error" is reserved for a month with no stored data
-    at all. Before this fix, any LLM failure during a stale recompute
-    turned every affected month to status="error" and withheld its score,
-    even when a perfectly good result was sitting in storage."""
+    """A stale month whose recompute fails is served with its last stored
+    score and status="stale" -- never discarded. status="error" is reserved
+    for a month with no stored data at all."""
 
     def test_all_stale_months_with_dead_llm_return_stored_scores_marked_stale(
         self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
@@ -686,12 +667,10 @@ class TestStaleVsError:
 
 
 class TestChunking:
-    """#899 review finding N2: batching every stale month into one call
-    (finding 4) made a single slow/timed-out call all-or-nothing for the
-    whole window -- the implementer's own manual run against a 12-month
-    real window timed out and blanked everything. Chunking at
-    TONE_MAX_MONTHS_PER_LLM_CALL bounds the blast radius of one bad call
-    and lets earlier chunks' results survive a later chunk's failure."""
+    """Chunking at TONE_MAX_MONTHS_PER_LLM_CALL bounds the blast radius of
+    one bad call and lets earlier chunks' results survive a later chunk's
+    failure, instead of batching every stale month into a single
+    all-or-nothing call."""
 
     def test_more_than_the_chunk_size_is_split_into_multiple_calls(
         self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
@@ -767,12 +746,12 @@ class TestLockTimeout:
     def test_lock_timeout_falls_through_to_storage_only_stale_marked_response(
         self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
     ):
-        """#899 review finding N3: if the per-person lock can't be acquired
-        within TONE_LOCK_TIMEOUT_SECONDS (another request for the same
-        person is already computing), the request must not block on it --
-        it falls through to a storage-only response, marking any month
-        that's actually stale as "stale" (it has a real stored score) or
-        "error" (it doesn't), rather than hanging."""
+        """If the per-person lock can't be acquired within
+        TONE_LOCK_TIMEOUT_SECONDS (another request for the same person is
+        already computing), the request must not block on it -- it falls
+        through to a storage-only response, marking any month that's
+        actually stale as "stale" (it has a real stored score) or "error"
+        (it doesn't), rather than hanging."""
         month_a = _two_distinct_months()[0]
         patch_interactions(_interactions_for_months([month_a]))
 
@@ -808,12 +787,11 @@ class TestLockTimeout:
     def test_lock_timeout_fallthrough_rereads_storage_for_freshly_upserted_months(
         self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
     ):
-        """#899 review, second pass, nit 2: the fall-through must re-read
-        storage before assembling its response. Without that re-read, a
-        month the lock holder finishes and upserts *while this request is
-        still waiting* on the lock (but before releasing it) would be
-        reported based on the stale pre-wait snapshot, even though a fresh
-        score already landed while this request waited.
+        """The fall-through must re-read storage before assembling its
+        response: a month the lock holder finishes and upserts *while this
+        request is still waiting* on the lock (but before releasing it)
+        must be reported with that fresh score, not the stale
+        pre-wait snapshot.
 
         Reproduces the actual race, not just its end state: month_a is
         genuinely unstored (and so genuinely stale) at the moment this
@@ -888,12 +866,12 @@ class TestFailureHandling:
     def test_llm_client_unreachable_yields_error_status_not_500(
         self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
     ):
-        """#899 review finding 7: get_anthropic_llm() itself never raises in
-        real code (per its own docstring) -- the real 'LLM unavailable'
-        path is the *returned client's* .create() call failing (e.g. the
-        local llama-server being unreachable), not client acquisition. The
-        handler's broad `except Exception` around both must still turn that
-        into a status="error" month rather than a 500."""
+        """get_anthropic_llm() itself never raises (per its own docstring)
+        -- the real 'LLM unavailable' path is the *returned client's*
+        .create() call failing (e.g. the local llama-server being
+        unreachable). The handler's broad `except Exception` around both
+        must still turn that into a status="error" month rather than a
+        500."""
         month_a = _two_distinct_months()[0]
         patch_interactions(_interactions_for_months([month_a]))
 
@@ -910,10 +888,10 @@ class TestFailureHandling:
     def test_llm_response_omitting_a_requested_month_marks_only_that_month_error(
         self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
     ):
-        """#899 review finding 4: when the batched call succeeds but its
-        parsed response simply omits one of the requested months, only that
-        month is marked status="error" -- the other stale month(s) the
-        response did cover are stored and returned normally."""
+        """When the batched call succeeds but its parsed response simply
+        omits one of the requested months, only that month is marked
+        status="error" -- the other stale month(s) the response did cover
+        are stored and returned normally."""
         month_a, month_b = _two_distinct_months()
         patch_interactions(_interactions_for_months([month_a, month_b]))
 
@@ -967,7 +945,7 @@ class TestConcurrency:
     ):
         """The LLM call itself (not just the interaction fetch) must run off
         the event loop: a slow, patched LLM client in progress must not
-        push GET /api/crm/config past the 100ms bound (#873)."""
+        push GET /api/crm/config past the 100ms bound."""
         month_a = _two_distinct_months()[0]
         patch_interactions(_interactions_for_months([month_a]))
 
@@ -990,12 +968,10 @@ class TestConcurrency:
     def test_concurrent_requests_for_same_person_call_llm_once(
         self, tone_store, patch_partner, patch_interactions, monkeypatch,
     ):
-        """#899 review finding 9: 4 concurrent requests for the same person
-        with stale months must call the LLM once, not once per request --
-        the reviewer measured 12 calls (4 requests x 3 stale months each,
-        pre-batching) with no in-flight dedup. A per-person lock plus
-        batching (finding 4) means only the request that wins the race
-        computes anything; the rest see fresh storage once they acquire the
+        """4 concurrent requests for the same person with stale months must
+        call the LLM once, not once per request: a per-person lock plus
+        batching means only the request that wins the race computes
+        anything, and the rest see fresh storage once they acquire the
         lock in turn."""
         month_a, month_b = _two_distinct_months()
         patch_interactions(_interactions_for_months([month_a, month_b]))
@@ -1025,9 +1001,8 @@ class TestConcurrency:
 
 
 class TestDeriveTrend:
-    """Direct branch/threshold coverage for _derive_trend (#899 review
-    finding 6) -- the only prior trend assertion exercised the pre-existing
-    early return for zero interactions, never the heuristic itself."""
+    """Direct branch/threshold coverage for _derive_trend's classification
+    heuristic."""
 
     def test_fewer_than_two_scores_is_insufficient_data(self):
         assert _derive_trend([]) == "insufficient-data"

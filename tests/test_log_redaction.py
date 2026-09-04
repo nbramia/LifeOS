@@ -155,17 +155,16 @@ class TestRequestQueryStringRedactionFilter:
         assert "200" in message
 
     def test_redacted_record_survives_uvicorns_actual_access_formatter(self):
-        """#907 review round 2 (BLOCKER): uvicorn.logging.AccessFormatter
-        does not call record.getMessage() at all -- it unconditionally
-        unpacks record.args as a 5-tuple and rebuilds the request line from
-        those fields. An earlier version of this filter rewrote record.msg
-        and cleared record.args to (), which made getMessage() look correct
-        (the test above) while silently breaking that unpack: formatting
-        the record for real raised `ValueError: not enough values to
-        unpack`, which is what production's uvicorn.access logger actually
-        emitted -- a 79-line traceback per request with a query string,
-        not an access line. This test would have caught it; the one above
-        could not, because it never involves the real formatter."""
+        """uvicorn.logging.AccessFormatter does not call record.getMessage()
+        at all -- it unconditionally unpacks record.args as a 5-tuple and
+        rebuilds the request line from those fields. Redacting the query
+        string must keep record.args a 5-tuple: rewriting record.msg and
+        clearing record.args to () would make getMessage() look correct
+        (the test above) while breaking that unpack, since
+        AccessFormatter.formatMessage() would raise `ValueError: not
+        enough values to unpack` instead of producing an access line. The
+        test above cannot catch that, because it never involves the real
+        formatter."""
         from uvicorn.logging import AccessFormatter
         from api.services.log_redaction import (
             RequestQueryStringRedactionFilter,
@@ -179,7 +178,7 @@ class TestRequestQueryStringRedactionFilter:
         RequestQueryStringRedactionFilter().filter(record)
 
         # The 5-tuple shape AccessFormatter.formatMessage() unpacks must
-        # survive -- this is the regression guard for the fix itself.
+        # survive redaction.
         assert isinstance(record.args, tuple) and len(record.args) == 5
 
         # uvicorn's actual default access-log format string (config.py's

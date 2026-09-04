@@ -9055,13 +9055,10 @@
                     FAMILY_DEFAULT_SELECTED_IDS = config.family_default_selected_ids;
                     console.log('[Config] Loaded family_default_selected_ids:', FAMILY_DEFAULT_SELECTED_IDS.length, 'IDs');
                 }
-                // #907 review finding 2: this used to be its own round trip
-                // to GET /api/photos/stats, which -- when Photos *is*
-                // configured -- runs several full-library aggregate queries
-                // and blocked every page's first render on it. `config`'s
-                // `photos_enabled` is just a Path.exists() check server-side
-                // and this request is already awaited before the list ever
-                // renders, so no extra request is needed.
+                // `photos_enabled` comes from `config` (a cheap Path.exists()
+                // check server-side) rather than a separate call to
+                // GET /api/photos/stats, which runs full-library aggregate
+                // queries when Photos is configured.
                 photosEnabled = !!config.photos_enabled;
             } catch (error) {
                 console.warn('[Config] Failed to load CRM config:', error);
@@ -9290,9 +9287,9 @@
             const method = replace ? 'replaceState' : 'pushState';
             history[method]({ personId, tab }, '', path);
             // Selecting a person clears whichever dashboard link was
-            // highlighted (or sets "me" for the owner's own profile) --
-            // without this the previous dashboard's link stayed lit while a
-            // person page rendered underneath it (#909 review finding 4).
+            // highlighted (or sets "me" for the owner's own profile), so a
+            // stale dashboard link doesn't stay lit while a person page
+            // renders underneath it.
             updateActiveNavLink();
         }
 
@@ -9301,10 +9298,7 @@
         // render, since that page doesn't need either. If the user then
         // navigates to a dashboard that does need them -- a nav-link click
         // or back/forward -- dispatchRoute() below ensures they've been
-        // kicked off at least once per session, via this memoized promise
-        // (#909 review finding 3: previously nothing compensated, leaving
-        // the sidebar and header stats stuck on their loading state
-        // forever).
+        // kicked off at least once per session, via this memoized promise.
         let corePeopleAndStatsPromise = null;
         function ensurePeopleAndStatsLoaded() {
             if (!corePeopleAndStatsPromise) {
@@ -9315,25 +9309,21 @@
 
         // Render whatever the current URL (window.location.pathname) points
         // at, without a document load. Shared by the popstate handler and
-        // navigateTo() (#876) so a click and a back/forward step dispatch
+        // navigateTo() so a click and a back/forward step dispatch
         // identically. Per-dashboard state (meInteractionsCache, familyData,
         // communicationGapsData, relationshipToneCache, the person detail
         // cache) lives in module-scope variables that this function never
         // clears, so returning to a dashboard with the same parameters
         // reuses what was already fetched instead of re-requesting it.
         async function dispatchRoute() {
-            // A running graph force simulation (#896) has its own tick timer
-            // and was never stopped on navigating away from the Graph tab --
-            // harmless under a full document reload (the timer died with the
-            // page), but with dashboard navigation no longer reloading the
-            // document, leaving a person's graph tab for another dashboard
-            // left it ticking indefinitely against DOM it no longer owns,
-            // eventually throwing NaN-attribute console errors once its
-            // physics interacted with whatever the destination view was
-            // doing. Stop it unconditionally here, the single choke point
-            // every dashboard/person navigation passes through; re-entering
-            // the Graph tab starts a fresh one via renderGraph()'s own
-            // (pre-existing) stop-then-restart.
+            // A running graph force simulation has its own tick timer and
+            // must be stopped unconditionally here, the single choke point
+            // every dashboard/person navigation passes through -- otherwise
+            // it keeps ticking against DOM it no longer owns and eventually
+            // throws NaN-attribute console errors once its physics interact
+            // with whatever the destination view is doing. Re-entering the
+            // Graph tab starts a fresh one via renderGraph()'s own
+            // stop-then-restart.
             if (graphSimulation) {
                 graphSimulation.stop();
                 graphSimulation = null;
@@ -9371,8 +9361,7 @@
                 await loadPersonDetail(personId, false);
                 // Restore the requested tab, or fall back to Overview -- a
                 // click/back-step that lands on a URL with no tab segment
-                // must not leave whatever tab was previously showing (#909
-                // review finding 7).
+                // must not leave whatever tab was previously showing.
                 await switchTab(tab || 'overview', true); // true = don't update URL
             } else {
                 // Hide birthdays page and show main container
@@ -9438,11 +9427,10 @@
 
             // Compare against pathname + search, not pathname alone: none of
             // the nav links carry a query string, so this only short-circuits
-            // a genuine no-op click. Comparing pathname alone treated e.g.
-            // clicking Birthdays from /birthdays?day=03-15 as "already
-            // there" and left the day filter and Timeline tab in place,
-            // instead of resetting to the plain unfiltered view a document
-            // reload would have shown (#909 review finding 6).
+            // a genuine no-op click. Comparing pathname alone would treat
+            // e.g. clicking Birthdays from /birthdays?day=03-15 as "already
+            // there" and leave the day filter and Timeline tab in place
+            // instead of resetting to the plain unfiltered view.
             if (window.location.pathname + window.location.search === targetPath) {
                 return false;
             }
@@ -9453,7 +9441,7 @@
             // Fire-and-forget (matches the popstate handler's own call
             // below), but a rejection inside any dashboard initializer
             // should never vanish as a silent, contextless unhandled
-            // promise rejection (#909 review finding 9).
+            // promise rejection.
             dispatchRoute().catch(err => console.error('Navigation failed:', err));
             return false;
         }
@@ -10598,10 +10586,9 @@
                 familyDashboard.classList.remove('visible');
             }
 
-            // Hide relationship dashboard (and its no-partner empty state,
-            // #899 review finding 2 -- it was left visible here, rendering
-            // inside an unrelated person's page) when viewing any person
-            // (including /me)
+            // Hide relationship dashboard, and its no-partner empty state,
+            // when viewing any person (including /me) -- otherwise the
+            // empty state renders inside an unrelated person's page
             const relationshipDashboard = document.getElementById('relationshipDashboard');
             if (relationshipDashboard) {
                 relationshipDashboard.style.display = 'none';
@@ -10767,11 +10754,9 @@
             // an array, possibly empty) — the "loading" fallback below is
             // only reachable if some other caller renders a person object
             // that omits the key entirely. Checking presence of the key
-            // (not its length) matters: with the old length-based check, an
-            // empty-but-present array fell through to the "loading" branch
-            // and stayed there forever (nothing re-renders it — the
-            // follow-up fetch that used to settle it, loadRelatedData(),
-            // was removed when the two-fetch flow was consolidated).
+            // (not its length) matters: an empty-but-present array must not
+            // fall through to the "loading" branch, since nothing else
+            // re-renders it.
             const sourceEntityCount = person.source_entity_count || 0;
             document.getElementById('sourceEntitiesCount').textContent = sourceEntityCount.toLocaleString();
             const listEl = document.getElementById('sourceEntitiesList');
@@ -10954,21 +10939,17 @@
         // fires the first real request already has the corrected
         // heatmapYears, regardless of call order.
         //
-        // `respectExplicitYears` (#909 review finding 1): the years dropdown's
-        // own change handler already set `heatmapYears` to what the user
-        // picked before calling down into loadMeHeatMap() -> here; a caller
-        // passes true to mean "don't overwrite that." Without this,
-        // re-asserting from meSpanYears unconditionally (added by #876 to
-        // fix a *different* bug -- heatmapYears drifting from a Family/person
-        // visit in between -- see below) clobbered the user's own selection
-        // on every call, making the dropdown inert. The span promise itself
-        // is still awaited either way so meSpanYears ends up populated for
-        // the next dashboard-entry call.
+        // `respectExplicitYears`: the years dropdown's own change handler
+        // already set `heatmapYears` to what the user picked before calling
+        // down into loadMeHeatMap() -> here; a caller passes true to mean
+        // "don't overwrite that." The span promise itself is still awaited
+        // either way so meSpanYears ends up populated for the next
+        // dashboard-entry call.
         //
         // When NOT respecting an explicit selection, heatmapYears is
         // re-asserted from meSpanYears on every call: it's a single global
-        // the Family and person heatmap views also write to, and with
-        // dashboard navigation no longer reloading the document, a Family or
+        // that the Family and person heatmap views also write to, and since
+        // dashboard navigation doesn't reload the document, a Family or
         // person visit in between can leave it pointing at the wrong window
         // by the time a returning Me visit compares it against
         // meInteractionsCacheYears in loadMeInteractions() below.
@@ -11551,7 +11532,7 @@
                     // dropdown's change handler) already set heatmapYears to
                     // what the user picked -- respect it rather than letting
                     // ensureMeHeatmapYears() re-derive it from the interaction
-                    // span (#909 review finding 1).
+                    // span.
                     await loadMeHeatMap(years !== null);
                     return;
                 }
@@ -11741,10 +11722,9 @@
             document.getElementById('meDashboard').classList.remove('visible');
             document.getElementById('personContentGrid').style.display = 'none';
 
-            // Hide relationship dashboard and its no-partner empty state when
-            // navigating here directly from /relationship (#899 review
-            // finding 2 -- neither was hidden here, so either could keep
-            // rendering underneath the family dashboard).
+            // Hide relationship dashboard and its no-partner empty state --
+            // otherwise either can keep rendering underneath the family
+            // dashboard when navigating here directly from /relationship.
             const relationshipDashboardOnFamily = document.getElementById('relationshipDashboard');
             if (relationshipDashboardOnFamily) {
                 relationshipDashboardOnFamily.style.display = 'none';
@@ -11894,10 +11874,9 @@
 
             // A filter switches to the Timeline tab; no filter resets to the
             // default Calendar tab -- matching what a fresh document load of
-            // /birthdays would show. Without the explicit reset, navigating
-            // here client-side (#909 review finding 6) after an earlier
-            // filtered visit left the Timeline tab showing even though the
-            // URL and filter had both cleared.
+            // /birthdays would show, so a client-side navigation after an
+            // earlier filtered visit can't leave the Timeline tab showing
+            // once the URL and filter have both cleared.
             switchBirthdaysTab(filterDay ? 'timeline' : 'heatmap');
         }
 
@@ -12171,12 +12150,10 @@
             if (personHeroStats) personHeroStats.style.display = 'none';
 
             // Hide family hero stats and selector -- must happen regardless
-            // of whether a partner is configured (#909 review follow-up:
-            // this used to sit after the no-partner early return below, so
-            // Family -> Relationship left Family's hero stats and member
+            // of whether a partner is configured, otherwise navigating from
+            // Family to Relationship leaves Family's hero stats and member
             // selector visible on top of the "no partner configured" empty
-            // state; unreachable under a full document reload, live once
-            // dashboard navigation stopped reloading the document).
+            // state.
             const familyHeroStats = document.getElementById('familyHeroStats');
             if (familyHeroStats) familyHeroStats.style.display = 'none';
             const familySelectorContainer = document.getElementById('familySelectorContainer');
@@ -12243,7 +12220,7 @@
 
             // Load insights and the timeline first; tone analysis can be slow
             // (a persisted-but-stale month still needs an LLM call) so it must
-            // not gate the rest of the page from rendering (#873). It renders
+            // not gate the rest of the page from rendering. It renders
             // itself into the tone card whenever it resolves.
             await Promise.all([
                 loadRelationshipInsights(),
@@ -12674,12 +12651,11 @@
             // couldn't compute them and nothing was ever stored) are skipped
             // entirely here rather than plotted at a fabricated score -- see
             // errorMarkers below, which renders a distinct "not analysed"
-            // marker at their x position instead (#899 review finding 3).
-            // A "stale" month (a real, previously-computed score the server
-            // couldn't refresh this load) is NOT skipped -- it still has
-            // real data and #873's own acceptance criteria require serving
-            // it rather than discarding it -- but is rendered dimmed and
-            // distinct from a normal point (#899 review finding N2).
+            // marker at their x position instead. A "stale" month (a real,
+            // previously-computed score the server couldn't refresh this
+            // load) is NOT skipped -- it still has real data and must be
+            // served rather than discarded -- but is rendered dimmed and
+            // distinct from a normal point.
             // `i` (the original, unfiltered index) is kept on each point so
             // buildLinePath can detect a skipped month and break the line.
             const buildPoints = (scoreFn) => {
@@ -12767,12 +12743,12 @@
             // label implying real data exists) -- errorMarkers above gives
             // them their own distinct marker instead.
             //
-            // `new Date(t.month + '-01')` used to parse "YYYY-MM-01" as UTC
+            // `new Date(t.month + '-01')` would parse "YYYY-MM-01" as UTC
             // midnight, which toLocaleDateString then renders in the
             // browser's local timezone -- west of UTC that rolls back to the
-            // last day of the *previous* month, so e.g. "2026-04" rendered
-            // as "Mar". Parsing the year/month directly and constructing the
-            // Date in local time avoids the UTC/local mismatch entirely.
+            // last day of the *previous* month, so e.g. "2026-04" would
+            // render as "Mar". Parsing the year/month directly and
+            // constructing the Date in local time avoids that mismatch.
             const showEvery = tones.length > 8 ? 2 : 1;
             const monthLabels = tones.map((t, i) => {
                 if (t.status === 'error') return '';
@@ -13705,13 +13681,11 @@
         // (settings.photos_enabled, cheap: a Path.exists() check). Set from
         // GET /api/crm/config's `photos_enabled` field in loadCRMConfig(),
         // which init() already awaits before the people list first renders --
-        // no separate request (see #907 review finding 2: this used to be
-        // its own round trip to GET /api/photos/stats, which runs several
-        // full-library aggregate queries when Photos *is* configured and
-        // blocked every page's first render on it). Defaults to false (no
-        // requests) until loadCRMConfig() resolves, so an install without
-        // Photos configured issues zero photo requests instead of letting
-        // every flagged person's <img> fail with a 503.
+        // no separate request to GET /api/photos/stats, which runs several
+        // full-library aggregate queries when Photos *is* configured.
+        // Defaults to false (no requests) until loadCRMConfig() resolves, so
+        // an install without Photos configured issues zero photo requests
+        // instead of letting every flagged person's <img> fail with a 503.
         let photosEnabled = false;
 
         // Returns the <img> markup for a person-list avatar, or '' when no photo
@@ -13755,10 +13729,9 @@
             // Reset classes
             avatar.classList.remove('has-photo', 'no-photo');
 
-            // #907 review finding 7: without this, an install with Photos
-            // not configured issued a photo request (and got a 503, logged
-            // to the console) every time a person was selected -- the list
-            // half of #875 already avoids this, this loader didn't.
+            // Skip the photo request entirely when Photos isn't configured,
+            // to avoid a 503 (logged to the console) every time a person is
+            // selected.
             if (!photosEnabled) {
                 avatar.style.backgroundImage = '';
                 avatar.classList.add('no-photo');
@@ -13799,10 +13772,9 @@
             const avatar = document.getElementById('detailAvatar');
             if (!avatar || !personId) return;
 
-            // #907 review finding 7: see loadDetailProfilePhoto -- without
-            // this, a Photos-less install issued a photo request (503) every
-            // time the relationship dashboard loaded. Leave the default
-            // emoji in place, same as the "no photo" outcome below.
+            // Skip the photo request when Photos isn't configured (same as
+            // loadDetailProfilePhoto), leaving the default emoji in place,
+            // same as the "no photo" outcome below.
             if (!photosEnabled) return;
 
             // Check cache first
@@ -17180,12 +17152,10 @@
 
             // Weight range comes from ALL links (matching getGraphWeightStats(),
             // which is what applyGraphFilters() actually turns a percent back
-            // into a threshold with), not just the first-degree ones. Picking a
-            // percent against a narrower first-degree-only range and then
-            // applying it against the full range is how a real response (e.g.
-            // first-degree weights 9-35 but other edges up to 99) could still
-            // pick a percent that excludes every first-degree edge once
-            // applied (#896 review round 4, MINOR finding 3).
+            // into a threshold with), not just the first-degree ones -- a
+            // narrower first-degree-only range would let a picked percent
+            // exclude every first-degree edge once applied against the full
+            // range (e.g. first-degree weights 9-35 but other edges up to 99).
             const weights = links.map(l => l.weight);
             const maxWeight = weights.reduce((a, b) => Math.max(a, b), 1);
             const minWeight = weights.reduce((a, b) => Math.min(a, b), Infinity);
@@ -17193,8 +17163,7 @@
             // Every edge shares one weight - there's no discriminating
             // threshold to pick, and forcing a minimum weightRange of 1 below
             // would make even a 5% step exclude every edge (weight >=
-            // minWeight + 0.05), blanking the whole tab (#896 review round 3
-            // finding 1).
+            // minWeight + 0.05), blanking the whole tab.
             if (maxWeight === minWeight) return 0;
 
             const weightRange = Math.max(1, maxWeight - minWeight);
@@ -17230,7 +17199,7 @@
 
                 // Never pick a threshold that hides every first-degree
                 // node - being closer to the target count is worthless if
-                // the tab ends up blank (#896 review round 3 finding 1).
+                // the tab ends up blank.
                 if (nodeCount === 0) break;
 
                 const diff = Math.abs(nodeCount - targetNodeCount);
@@ -17265,7 +17234,7 @@
                 // Use the network endpoint with depth=2 for second-degree connections.
                 // Only depth/center_on are sent - max_nodes/max_second_degree_per_node/
                 // max_edges are left to the server's own defaults so a future default
-                // change reaches the tab without a frontend edit (#896 review finding 12).
+                // change reaches the tab without a frontend edit.
                 const data = await api(`/network?center_on=${personId}&depth=2`);
 
                 if (!data.nodes || data.nodes.length === 0) {
@@ -18052,11 +18021,11 @@
             // Wait for simulation to stabilize a bit before fitting
             setTimeout(() => {
                 // The graph may no longer be the active view by the time this
-                // fires: a full document reload used to kill this timer
-                // outright, but dashboard/person navigation (#876) doesn't,
-                // so navigating away within this 800ms window left graphSvg
-                // (or its container) present but hidden or gone. Re-check
-                // freshness here rather than only when scheduling above.
+                // fires: dashboard/person navigation doesn't reload the
+                // document, so navigating away within this 800ms window can
+                // leave graphSvg (or its container) present but hidden or
+                // gone. Re-check freshness here rather than only when
+                // scheduling above.
                 if (!graphSvg || !graphZoom) return;
 
                 // Get first-degree nodes (degree 0 or 1)
@@ -18087,10 +18056,7 @@
                 // torn down) -- graphSvg.node() itself, or its
                 // parentElement, can be null at this point, so both must be
                 // checked before reading clientWidth/clientHeight off of
-                // whatever `container` turns out to be (#909 review
-                // follow-up: the freshness guard above this stopped the
-                // NaN-transform case but not this one -- same root cause,
-                // a stale reference outliving the view it belonged to).
+                // whatever `container` turns out to be.
                 const svgNode = graphSvg.node();
                 const container = svgNode && svgNode.parentElement;
                 if (!container) return;
@@ -18558,7 +18524,7 @@
                 // was dragged manually, or the first-degree and full weight
                 // ranges still diverge for some case not accounted for), fall
                 // back to showing everything rather than rendering a blank
-                // tab (#896 review round 4, MINOR finding 3).
+                // tab.
                 const firstDegreeEdgesAll = graphLinksAll.filter(l => {
                     if (!l) return false;
                     const isFirstDegree = l.source === graphCenterId || l.target === graphCenterId;

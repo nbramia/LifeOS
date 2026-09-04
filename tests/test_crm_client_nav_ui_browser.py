@@ -1,17 +1,13 @@
-"""Browser tests for client-side CRM dashboard navigation (#876).
+"""Browser tests for client-side CRM dashboard navigation.
 
-Before this, the Me/Family/Birthdays/Relationship/CRM nav links were plain
-anchors: every click was a full document load that re-downloaded the ~750 KB
-page, refetched the d3 CDN script, and discarded whatever the previous
-dashboard had already fetched. This pins that clicking those links now goes
-through `navigateTo()` -> `dispatchRoute()` (a `pushState` plus the same
-dispatch the popstate handler already used for person/tab navigation)
-instead of letting the browser load the anchor's `href`, that back/forward
-still works, that the active nav-link style follows the current view, and
-that a dashboard's in-memory caches (in particular `meInteractionsCache`,
-via `loadMeInteractions()`) survive a round trip through another dashboard
-instead of being silently invalidated by shared UI state (`heatmapYears`)
-another dashboard also writes to.
+Clicking a Me/Family/Birthdays/Relationship/CRM nav link goes through
+`navigateTo()` -> `dispatchRoute()` (a `pushState` plus the same dispatch the
+popstate handler uses for person/tab navigation) instead of the browser
+loading the anchor's `href`, so back/forward still works, the active
+nav-link style follows the current view, and a dashboard's in-memory caches
+(in particular `meInteractionsCache`, via `loadMeInteractions()`) survive a
+round trip through another dashboard instead of being invalidated by shared
+UI state (`heatmapYears`) another dashboard also writes to.
 
 Unlike most of the browser suite this serves `web/crm.html` itself from an
 ephemeral port rather than pointing at a running API — every `/api/crm/**`
@@ -71,7 +67,7 @@ SYNTHETIC_ME_PERSON = {
 
 # A second, non-owner person -- used by the /birthdays-entry test to prove
 # the sidebar/stats actually populate rather than being stuck on their
-# loading state (#909 review finding 3).
+# loading state.
 SYNTHETIC_OTHER_PERSON = {
     "id": "person-synthetic-other",
     "canonical_name": "Synthetic Friend",
@@ -88,8 +84,7 @@ EMPTY_ME_INTERACTIONS = {
 }
 
 # The four dashboard containers that must never be visible at the same time
-# -- a leak here is the class of bug #909 review finding 2 caught
-# (Relationship left rendered underneath Family).
+# (e.g. Relationship left rendered underneath Family).
 _DASHBOARD_IDS = ["#meDashboard", "#familyDashboard", "#relationshipDashboard", "#birthdaysPage"]
 
 
@@ -132,8 +127,7 @@ def _route_api(page: Page, requests_seen: list, partner_configured: bool = True)
     `partner_person_id` set) -- the default is `True` so most tests exercise
     the real Relationship dashboard rather than its no-partner empty state;
     `TestRelationshipNoPartnerChrome` below explicitly wants the empty-state
-    path (#909 review follow-up finding 1: a fresh install is not a corner
-    case)."""
+    path."""
 
     def handler(route):
         parsed = urlparse(route.request.url)
@@ -143,7 +137,7 @@ def _route_api(page: Page, requests_seen: list, partner_configured: bool = True)
         if path == "/api/crm/config":
             # partner_person_id set (by default) so showRelationshipDashboard()
             # renders the real dashboard rather than the no-partner empty
-            # state (#899) -- keeps the Relationship hops representative of
+            # state -- keeps the Relationship hops representative of
             # a configured install, not the degenerate case.
             body = {"my_person_id": MY_PERSON_ID}
             if partner_configured:
@@ -213,12 +207,10 @@ def _active_pages(page: Page):
 def _visible_dashboards(page: Page):
     """Which of the four dashboard containers are currently visible.
 
-    #909 review finding 2/5: a leaked dashboard (e.g. Relationship still
-    rendered underneath Family) is invisible to a test that only checks the
-    *target* container is shown -- this checks all four every time so a
-    stacked leak fails immediately, and finding 5's mutation test (deleting
-    `showFamilyDashboard()`'s `#meDashboard`-hiding lines) actually fails
-    the suite instead of passing it.
+    Checks all four every time rather than just the target container, so a
+    leaked dashboard (e.g. Relationship still rendered underneath Family)
+    fails immediately instead of passing a test that only checks the target
+    is shown.
     """
     return [sel for sel in _DASHBOARD_IDS if page.locator(sel).is_visible()]
 
@@ -257,10 +249,9 @@ class TestNoDocumentReload:
         assert _active_pages(page) == ["relationship"]
         _assert_only_visible(page, "#relationshipDashboard")
 
-        # Relationship -> Family and Family -> Relationship (#909 review
-        # finding 2/5): showFamilyDashboard() used to leave the Relationship
-        # dashboard rendered underneath it, invisible to a test that only
-        # ever entered Family from Me/Birthdays.
+        # Relationship -> Family and Family -> Relationship: each dashboard
+        # switch must hide every other dashboard container, not just the
+        # one it's replacing.
         page.locator('[data-page="family"]').click()
         expect(page.locator("#familyDashboard")).to_be_visible()
         assert page.evaluate("window.location.pathname") == "/family"
@@ -316,8 +307,7 @@ class TestNoDocumentReload:
         where the page already is -- pathname alone isn't enough: from
         /birthdays?day=03-15 (Timeline tab, filtered), clicking Birthdays
         again must land on plain /birthdays, Calendar tab, matching what a
-        full document reload to the bare URL would have shown (#909 review
-        finding 6)."""
+        full document reload to the bare URL shows."""
         _, load_events, console_errors = _prepare(page)
         page.goto(f"{crm_base_url}/birthdays?day=03-15")
         expect(page.locator("#birthdaysPage")).to_be_visible()
@@ -392,9 +382,9 @@ class TestDashboardStatePersists:
     with Me's) is 10 years while Me's is derived from
     /me/interactions/span.
 
-    Also covers the CRM performance follow-up review finding 18: the owner's
-    person detail fetch, /api/crm/me/stats, and /api/crm/family/members must
-    each fire at most once per session too, not just /me/interactions."""
+    The owner's person detail fetch, /api/crm/me/stats, and
+    /api/crm/family/members must each fire at most once per session too, not
+    just /me/interactions."""
 
     def test_second_me_visit_does_not_refetch_interactions(self, page: Page, crm_base_url):
         requests_seen, load_events, console_errors = _goto_me(page, crm_base_url)
@@ -480,10 +470,9 @@ class TestDirectLoadsUnchanged:
 
 class TestYearsSelectorRespectsUserOverride:
     """The Me dashboard's heatmap years dropdown must not be clobbered by
-    ensureMeHeatmapYears()'s span re-assertion (#909 review finding 1):
-    picking a year count fetches that window and keeps showing it, rather
-    than silently reverting to the span-derived default on the very call the
-    selection triggered."""
+    ensureMeHeatmapYears()'s span re-assertion: picking a year count fetches
+    that window and keeps showing it, rather than silently reverting to the
+    span-derived default on the very call the selection triggered."""
 
     def test_selecting_years_fetches_that_window_and_keeps_the_selection(
         self, page: Page, crm_base_url,
@@ -526,10 +515,10 @@ class TestYearsSelectorRespectsUserOverride:
 class TestBirthdaysEntryPoint:
     """Entering the app at /birthdays (a realistic bookmark/share target)
     and then navigating to another dashboard must not leave the sidebar and
-    header stats stuck on their loading state forever (#909 review
-    finding 3): /birthdays intentionally skips loadPeople()/loadStatistics()
-    in init() for a faster initial render, and nothing previously
-    compensated once the user moved on to a dashboard that does need them."""
+    header stats stuck on their loading state forever: /birthdays
+    intentionally skips loadPeople()/loadStatistics() in init() for a faster
+    initial render, so a dashboard that does need them must fetch on its own
+    once the user moves on to it."""
 
     def test_family_and_me_load_people_and_stats_after_entering_at_birthdays(
         self, page: Page, crm_base_url,
@@ -555,11 +544,11 @@ class TestBirthdaysEntryPoint:
 
 class TestRelationshipNoPartnerChrome:
     """Family -> Relationship must not leak Family's hero stats or member
-    selector onto the no-partner empty state (#909 review follow-up
-    finding 1). A fresh install has no partner configured by default, so
-    this is not a corner case -- every other test in this file configures a
-    partner (see `_route_api`'s default) specifically so the Relationship
-    hops exercise the real dashboard; this one deliberately doesn't."""
+    selector onto the no-partner empty state. A fresh install has no
+    partner configured by default, so this is not a corner case -- every
+    other test in this file configures a partner (see `_route_api`'s
+    default) specifically so the Relationship hops exercise the real
+    dashboard; this one deliberately doesn't."""
 
     def test_family_chrome_hidden_after_navigating_to_relationship(self, page: Page, crm_base_url):
         _prepare(page, partner_configured=False)
@@ -571,19 +560,17 @@ class TestRelationshipNoPartnerChrome:
         expect(page.locator("#relationshipEmptyState")).to_be_visible()
         expect(page.locator("#relationshipDashboard")).to_be_hidden()
 
-        # The bug: these two, plus the detail header, used to still show
-        # Family's content underneath/around the empty state.
+        # These two, plus the detail header, must not show Family's content
+        # underneath/around the empty state.
         expect(page.locator("#familyHeroStats")).to_be_hidden()
         expect(page.locator("#familySelectorContainer")).to_be_hidden()
         expect(page.locator("#detailName")).to_have_text("Relationship Dashboard")
 
 
 class TestActiveLinkAndTabRegressions:
-    """Regression tests for two one-line fixes from the #909 review that
-    shipped without their own test the first time (review finding 3):
-    selecting a person must clear whichever dashboard link was highlighted,
-    and landing on a person's URL with no tab segment must show Overview
-    even if a different tab was showing a moment ago."""
+    """Selecting a person must clear whichever dashboard link was
+    highlighted, and landing on a person's URL with no tab segment must show
+    Overview even if a different tab was showing a moment ago."""
 
     def test_selecting_a_person_from_me_clears_the_active_dashboard_link(
         self, page: Page, crm_base_url,
@@ -633,8 +620,7 @@ class TestActiveLinkAndTabRegressions:
 
 
 class TestToneRefreshFailureNotice:
-    """Regression test for the CRM performance follow-up review finding 19:
-    when every month in a refresh=true response comes back `status:
+    """When every month in a refresh=true response comes back `status:
     "stale"` (the server couldn't recompute a single one and fell back to
     stored scores for all of them), the Tone Evolution card must show one
     small notice -- the per-point dimmed `(stale)` markers alone are easy
@@ -685,11 +671,9 @@ class TestToneRefreshFailureNotice:
 
 
 class TestBirthdaysNavigateToPersonIsClientSide:
-    """Regression test for the CRM performance follow-up review finding 16:
-    `navigateToPerson()` (used by the Birthdays timeline's person rows) set
-    `window.location.href` directly, forcing a full document reload instead
-    of going through the same client-side `navigateTo()`/`dispatchRoute()`
-    path every other CRM link uses (#876)."""
+    """`navigateToPerson()` (used by the Birthdays timeline's person rows)
+    must go through the same client-side `navigateTo()`/`dispatchRoute()`
+    path every other CRM link uses, not a full document reload."""
 
     def test_clicking_a_birthday_person_does_not_reload_the_document(
         self, page: Page, crm_base_url,
@@ -732,13 +716,13 @@ class TestBirthdaysNavigateToPersonIsClientSide:
 
 
 class TestDirectLoadTabHighlight:
-    """Regression test for the CRM performance follow-up review finding 15:
-    `switchTab()` used to select `[data-tab="${tabName}"]` unscoped, and the
-    Birthdays page's `.birthdays-tab[data-tab="timeline"]` button sits
-    earlier in the DOM than the person-detail tab bar's own
-    `.tab[data-tab="timeline"]` div -- so `document.querySelector` picked
-    the Birthdays button first and the actual detail Timeline tab never got
-    its `active` class on a direct load of `/crm/{id}/timeline`."""
+    """`switchTab()` must select `[data-tab="${tabName}"]` scoped to the
+    active tab bar: the Birthdays page's `.birthdays-tab[data-tab="timeline"]`
+    button sits earlier in the DOM than the person-detail tab bar's own
+    `.tab[data-tab="timeline"]` div, so an unscoped `document.querySelector`
+    would pick the Birthdays button first and leave the actual detail
+    Timeline tab without its `active` class on a direct load of
+    `/crm/{id}/timeline`."""
 
     def test_direct_load_of_person_timeline_highlights_the_detail_tab(
         self, page: Page, crm_base_url,
@@ -759,10 +743,9 @@ class TestDirectLoadTabHighlight:
 
 
 class TestNotesEditInvalidatesPersonCache:
-    """Regression test for the CRM performance follow-up review's round-2
-    nit 6: saveNotes() must invalidate the cached person after a
-    successful save, or navigating away and back within the same session
-    renders the pre-edit cached copy instead of what was just saved.
+    """saveNotes() must invalidate the cached person after a successful
+    save, or navigating away and back within the same session renders the
+    pre-edit cached copy instead of what was just saved.
 
     Proven without any timing race by making the post-edit GET hang
     forever: a correctly-invalidated cache takes the no-cache path on the
