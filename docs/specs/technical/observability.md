@@ -77,14 +77,16 @@ Every HTTP request is timed, independently of the chat-turn tracing above (#877)
 - `RouteTimingMiddleware` (`api/services/route_timing.py`) is a pure-ASGI middleware, registered last in `api/main.py` so it wraps outermost around this app's own middleware (CORS, the scoped gzip middleware) -- its duration and byte count cover the full response, including compression.
 - Being pure ASGI rather than `BaseHTTPMiddleware` means it never buffers a response: a streaming reply (SSE chat) is timed to completion via its final body chunk, with every chunk passed straight through.
 - Routes are keyed by **route template**, not the raw request path -- `request.scope["route"].path` (e.g. `/api/crm/people/{person_id}`), read after routing resolves it, falling back to `"<unmatched>"` for a 404. A raw path or query string never reaches a log line or the in-memory summary, so a person id in a URL is never exposed.
-- `/health*` and `/static/*` are excluded entirely (too frequent/trivial to matter). Everything else -- every `/api/*` call and every page route (`/crm`, `/me`, `/family`, `/relationship`, `/birthdays`, ...) -- is timed and recorded.
-- A request slower than `LIFEOS_SLOW_REQUEST_MS` (default 500ms) logs one WARNING with method, route template, status, duration, and response bytes. A request that raises is recorded and logged (if slow) with status 500, then re-raised.
+- `/health*` and `/static/*` are excluded entirely (too frequent/trivial to matter), matched as a full path segment (like `_in_gzip_scope` in `api/main.py`, #895) so a future `/healthz-admin` or `/staticmaps` route isn't swept in by accident. Everything else -- every `/api/*` call and every page route (`/crm`, `/me`, `/family`, `/relationship`, `/birthdays`, ...) -- is timed and recorded.
+- A request slower than `LIFEOS_SLOW_REQUEST_MS` (default 500ms) logs one WARNING with method, route template, status, duration, and response bytes. A request that raises before any response was sent is recorded and logged (if slow) with status 500; one that raises *after* its response already started (a stream that dies mid-flight) logs the status actually sent to the client instead, plus `aborted=true` -- never a synthetic 500 the client never saw.
+- A `text/event-stream` response (SSE) is tracked separately and never subject to any of the above: an SSE connection's duration is however long the client kept its tab or transcript viewer open, not a latency measurement, so timing it like a normal request would let a page-open artifact dominate the summary and fire a false slow-request warning on every disconnect. `RouteTimingStore.record_stream()` keeps only count and total bytes per route, no duration/percentiles/slow_count.
 - Per-route stats live in `RouteTimingStore`, a thread-safe, bounded rolling window (last 200 samples) per `(method, route template)`. Process-local and reset on restart -- this is a live signal, not persisted history (#733 covers persisted rollups this can feed).
 
 ### API Endpoint
 
 ```bash
-# Per-route rolling summary: count, p50/p95/max duration, slow_count, last_slow_at
+# Per-route rolling summary: count, p50/p95/max duration, slow_count, last_slow_at,
+# plus a separate "streams" list (SSE routes: count and total bytes only)
 curl http://localhost:8000/api/perf/routes | jq
 ```
 

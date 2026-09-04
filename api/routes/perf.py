@@ -58,7 +58,20 @@ def get_route_stats():
     records every HTTP request's duration/status/size in-process. A plain
     `def` handler -- the store's own lock, not the event loop, is what
     makes this safe under concurrent requests.
+
+    `routes` never includes streaming (`text/event-stream`) responses --
+    those show up in `streams` instead, with count and total bytes only.
+    An SSE connection's duration is however long the client kept it open,
+    not a latency signal, so timing it like a normal request would let a
+    page-open artifact dominate this table and fire a false slow-request
+    warning on every disconnect (#877 review).
     """
     store = get_route_timing_store()
     routes = store.summary()
-    return {"routes": routes, "count": len(routes)}
+    streams = store.stream_summary()
+    return {
+        "routes": routes,
+        "count": len(routes),
+        "streams": streams,
+        "stream_count": len(streams),
+    }
