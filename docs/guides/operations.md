@@ -90,7 +90,9 @@ Every HTTP request (not just chat turns) is timed by `RouteTimingMiddleware`. So
 curl http://localhost:8000/api/perf/routes | jq
 ```
 
-A request slower than `LIFEOS_SLOW_REQUEST_MS` (default 500ms) also logs one WARNING with its route template, status, duration, and response size — `grep "slow request" logs/lifeos-api-error.log`. Full design in [Observability](../specs/technical/observability.md).
+A request slower than `LIFEOS_SLOW_REQUEST_MS` (default 500ms) also logs one WARNING with its route template, status, duration, and response size — `grep "slow request" logs/server.log` (Linux systemd, which appends stdout+stderr there; on macOS launchd it's `logs/lifeos-api-error.log`). Full design in [Observability](../specs/technical/observability.md).
+
+The uvicorn access log itself has its query string stripped before it ever reaches disk (`api/services/log_redaction.py`), so grepping `logs/server.log` for a raw path never turns up whatever a user typed into a search box — see [Observability § Log Redaction](../specs/technical/observability.md#log-redaction).
 
 ## GPU Watchdog
 

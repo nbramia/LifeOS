@@ -151,9 +151,10 @@ cheaper per-person category check with no batched fetch. Every node's
 same computation for that node (either the batched one during selection, or
 the cheap one otherwise) — an id is never selected under one category
 decision and then dropped, or kept, under a different one. `min_strength` is
-applied to already-selected nodes exactly as it always was — note it's
-currently a no-op in practice regardless of value, since it's validated to
-0.0–1.0 while `relationship_strength` is on a 0–100 scale.
+applied to already-selected nodes exactly as it always was, against
+`relationship_strength` on its 0–100 scale — since the parameter itself is
+only accepted up to 1.0, the only nodes it can drop are those with a
+`relationship_strength` below 1.0 (in practice, strength-0 nodes).
 
 A well-connected center often has few or no genuine friends-of-friends left
 to fill the deeper-hop tier once its own direct connections are excluded
@@ -164,7 +165,7 @@ relabeling note above), so a dense center's response still reaches
 `max_nodes` rather than coming back short.
 
 The Graph tab's own auto-selected strength-slider threshold
-(`calculateOptimalEdgeThreshold`) never picks a threshold that would hide
+never picks a threshold that would hide
 every first-degree node, and returns 0 outright when every first-degree
 edge shares one weight (there's no discriminating threshold to pick in that
 case) — without this, bounding the edge set could put a real person's
@@ -184,9 +185,8 @@ their server defaults so a future default change reaches the tab without a
 frontend edit.
 
 `allow_full_graph=true` combined with `category` now filters every person by
-the same dynamically-computed category the response displays for them
-(`compute_person_category(person, [])`), rather than their raw stored
-`category` field — more self-consistent than before (a person's displayed
+the same dynamically-computed category the response displays for them,
+rather than their raw stored `category` field — more self-consistent than before (a person's displayed
 category and whether a category filter kept them can no longer disagree),
 and the only externally-visible change to the full-graph path from this
 issue's otherwise-untouched behavior.
@@ -327,9 +327,10 @@ Per-source weights are configurable. The graph respects the source-filter select
 
 ## Related Documents
 
+- [api-crm.md](api-crm.md) — API endpoint reference for the graph/relationship data described here
 - [crm-ui.md](crm-ui.md) — CRM index
 - [crm-people.md](crm-people.md) — Person list/detail, Dunbar circles (drives graph filtering and coloring)
 - [crm-interactions.md](crm-interactions.md) — The per-source observations the discovery job aggregates over
 - [crm-analytics.md](crm-analytics.md) — Dashboards that share the underlying relationship model
-- [Frontend](../technical/frontend.md) — D3 / vanilla-JS implementation details
+- [Frontend](../technical/frontend.md#network-graph) — D3 / vanilla-JS implementation details, including the bounded-neighborhood loading pointer back here
 - [Agent Viz](agent-viz.md) — The other D3 force-graph in LifeOS; the two share visual conventions and code patterns

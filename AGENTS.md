@@ -352,7 +352,7 @@ curl -X POST http://localhost:8000/api/admin/reindex
 
 ```bash
 ~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --status
-tail -50 logs/lifeos-api-error.log
+tail -50 logs/server.log    # Linux systemd (macOS launchd: logs/lifeos-api-error.log)
 ```
 
 ### Manage Tasks

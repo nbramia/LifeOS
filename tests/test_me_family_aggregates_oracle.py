@@ -768,6 +768,46 @@ class TestMeInteractionsOracle:
         assert "p-peripheral" not in neglected_ids
         assert "p-hidden" not in neglected_ids
 
+    def test_neglected_contacts_tie_broken_by_person_id(self, monkeypatch, stores):
+        """Two contacts with the identical circle and the identical
+        overdue-ness ratio (same sort key otherwise) must come back in a
+        stable, deterministic order — person id ascending — rather than
+        whatever order the underlying dict/query iteration happened to
+        produce."""
+        istore, pstore = stores
+        _add_person(pstore, MY_PERSON_ID, "Self", category="self", circle=-1, strength=100)
+
+        # Both circle 2 (min_gap=7), both with 5 interactions 10 days apart
+        # (typical_gap=10) and both last contacted 20 days ago (ratio=2.0,
+        # alerted since 20 > 10 * 1.5) — an identical sort key except for
+        # person_id.
+        for pid, name in (("p-tie-z", "Tie Z"), ("p-tie-a", "Tie A")):
+            _add_person(pstore, pid, name, category="personal", circle=2, strength=50)
+            for days_ago in (20, 30, 40, 50, 60):
+                _add_interaction(istore, pid, days_ago=days_ago, source_type="imessage")
+
+        # get_person_julianday_timestamps' covering index is on person_id,
+        # so the real store already returns rows person_id-ascending -- that
+        # alone would make this assertion pass even with the x.person_id
+        # tie-break key removed (dict insertion order would coincidentally
+        # already be "a" before "z"). Wrap the store method to return the
+        # opposite order, so the assertion actually exercises the explicit
+        # tie-break rather than a coincidence of index order.
+        real_get_jds = istore.get_person_julianday_timestamps
+
+        def reversed_get_jds(*args, **kwargs):
+            return list(reversed(real_get_jds(*args, **kwargs)))
+
+        monkeypatch.setattr(istore, 'get_person_julianday_timestamps', reversed_get_jds)
+
+        monkeypatch.setattr('api.routes.crm.get_interaction_store', lambda: istore)
+        monkeypatch.setattr('api.routes.crm.get_person_entity_store', lambda: pstore)
+        monkeypatch.setattr('api.routes.crm.MY_PERSON_ID', MY_PERSON_ID)
+
+        result = get_me_interactions(days_back=365)
+        tied = [n for n in result.neglected_contacts if n.person_id in ("p-tie-z", "p-tie-a")]
+        assert [n.person_id for n in tied] == ["p-tie-a", "p-tie-z"]
+
     def test_gmail_received_excluded_from_totals(self, monkeypatch, stores):
         istore, pstore = stores
         _seed_synthetic_dataset(istore, pstore)

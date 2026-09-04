@@ -309,7 +309,7 @@ app.add_middleware(
 # is ~750 KB uncompressed — all of which matter on Tailscale from a phone.
 #
 # This is a deliberate scoping choice, not a workaround for a streaming
-# hazard: Starlette 0.52.1's GZipMiddleware already refuses to compress
+# hazard: the installed Starlette (0.52.x) GZipMiddleware already refuses to compress
 # `text/event-stream` responses on its own (`DEFAULT_EXCLUDED_CONTENT_TYPES`
 # in `starlette.middleware.gzip`), so applying it app-wide would not in fact
 # risk buffering the chat/agents/conversations SSE endpoints. Scoping by an
