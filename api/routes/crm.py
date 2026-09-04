@@ -269,6 +269,9 @@ class PersonDetailResponse(BaseModel):
     slack_message_count: int = 0  # Actual Slack messages (not daily summaries)
     # Pre-computed Dunbar circle (0-6 for meaningful, 7 for peripheral)
     dunbar_circle: Optional[int] = None
+    # True when photo_count > 0, so the client knows to request an avatar
+    # instead of rendering initials -- no per-person probe needed.
+    has_profile_photo: bool = False
     # Related data
     source_entities: list[SourceEntityResponse] = []
     relationships: list[RelationshipResponse] = []
@@ -605,6 +608,7 @@ def _person_to_detail_response(
         message_count=person.message_count,
         slack_message_count=person.slack_message_count,
         dunbar_circle=person.dunbar_circle,
+        has_profile_photo=person.photo_count > 0,
     )
 
     if include_related:
@@ -851,8 +855,11 @@ def list_people(
         has_more=has_more,
     )
 
+    # #904: never log the raw search text or other filter values here -- the
+    # CRM search box's contents (names, partial emails) are personal data.
+    # Counts and timing only.
     elapsed = (time.time() - start_time) * 1000
-    logger.info(f"list_people(q={q}, category={category}, limit={limit}) took {elapsed:.1f}ms ({total} total, {len(people)} returned)")
+    logger.info(f"list_people took {elapsed:.1f}ms (limit={limit}, {total} total, {len(people)} returned)")
 
     return result
 

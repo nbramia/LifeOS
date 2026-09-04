@@ -742,7 +742,7 @@ Get a thumbnail image for a photo by UUID. Returns the image file from the Photo
 
 ### GET /api/photos/profile/{person_id}
 
-Get a profile photo thumbnail for a person. Returns the most recent available photo thumbnail for use as an avatar.
+Get a profile photo thumbnail for a person. Returns the most recent available photo thumbnail for use as an avatar. Also accepts `HEAD` (same status as `GET`, no body), so a client can check availability without downloading the image. Both the `200` and `404` responses carry `Cache-Control: public, max-age=3600`, so a client that already knows a person has no reachable photo doesn't need to ask again within the hour.
 
 ### GET /api/photos/open/{uuid}
 

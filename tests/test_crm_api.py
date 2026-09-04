@@ -8,6 +8,7 @@ Tests are organized by endpoint group:
 - Sync health and status
 - Statistics
 """
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -48,6 +49,43 @@ class TestPersonEndpoints:
         assert "total" in data
         assert "offset" in data
         assert "count" in data
+
+    def test_get_people_list_has_profile_photo_field(self, client):
+        """#875: every row must carry `has_profile_photo` as a plain bool, so
+        the client can decide whether to request an avatar without probing
+        each person first."""
+        response = client.get("/api/crm/people?limit=50")
+        assert response.status_code == 200
+        people = response.json()["people"]
+        if not people:
+            pytest.skip("No people in database to test")
+        for person in people:
+            assert "has_profile_photo" in person
+            assert isinstance(person["has_profile_photo"], bool)
+
+    def test_person_detail_has_profile_photo_matches_list(self, client):
+        """#875: the detail endpoint must agree with the list endpoint for
+        the same person -- both derive `has_profile_photo` from
+        `person.photo_count` via the same `_person_to_detail_response`
+        helper, so a divergence here would mean one path stopped setting it."""
+        response = client.get("/api/crm/people?limit=20")
+        people = response.json()["people"]
+        if not people:
+            pytest.skip("No people in database to test")
+        for person in people[:10]:
+            detail = client.get(f"/api/crm/people/{person['id']}")
+            assert detail.status_code == 200
+            assert detail.json()["has_profile_photo"] == person["has_profile_photo"]
+
+    def test_list_people_never_logs_the_search_query(self, client, caplog):
+        """#904: the search box's contents are personal data (names, partial
+        emails) -- the list handler's own log line must carry counts and
+        timing only, never the raw `q` (or other filter values)."""
+        distinctive_query = "zzz-synthetic-search-marker-not-a-real-name-9f3c"
+        with caplog.at_level(logging.INFO, logger="api.routes.crm"):
+            response = client.get(f"/api/crm/people?q={distinctive_query}&limit=5")
+        assert response.status_code == 200
+        assert distinctive_query not in caplog.text
 
     def test_get_people_with_search(self, client):
         """GET /people with search query works."""

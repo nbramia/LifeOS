@@ -7,8 +7,8 @@ and syncing to LifeOS CRM.
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from api.routes.crm import _mutation_lock
@@ -408,13 +408,15 @@ def get_photo_thumbnail(uuid: str):
     )
 
 
-@router.get("/profile/{person_id}")
-def get_profile_photo(person_id: str):
+@router.api_route("/profile/{person_id}", methods=["GET", "HEAD"])
+def get_profile_photo(person_id: str, request: Request):
     """
     Get a profile photo thumbnail for a person.
 
     Returns the most recent photo of the person that has a thumbnail available.
-    Use this for avatars/profile pictures in the UI.
+    Use this for avatars/profile pictures in the UI. Also accepts HEAD, returning
+    the same status and headers with no body, so clients can check availability
+    without downloading the image.
     """
     _check_photos_enabled()
 
@@ -438,16 +440,24 @@ def get_profile_photo(person_id: str):
                 if suffix == ".png":
                     media_type = "image/png"
 
+                if request.method == "HEAD":
+                    return Response(
+                        media_type=media_type,
+                        headers={"Cache-Control": "public, max-age=3600"}  # Cache for 1 hour
+                    )
+
                 return FileResponse(
                     thumb_path,
                     media_type=media_type,
                     headers={"Cache-Control": "public, max-age=3600"}  # Cache for 1 hour
                 )
 
-    # No photo available
+    # No photo available. Cache the miss too, so repeated list renders for
+    # people without a photo don't re-request it every time.
     raise HTTPException(
         status_code=404,
-        detail=f"No profile photo available for person {person_id}"
+        detail=f"No profile photo available for person {person_id}",
+        headers={"Cache-Control": "public, max-age=3600"},
     )
 
 
