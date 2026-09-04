@@ -12346,6 +12346,11 @@
             // entirely here rather than plotted at a fabricated score -- see
             // errorMarkers below, which renders a distinct "not analysed"
             // marker at their x position instead (#899 review finding 3).
+            // A "stale" month (a real, previously-computed score the server
+            // couldn't refresh this load) is NOT skipped -- it still has
+            // real data and #873's own acceptance criteria require serving
+            // it rather than discarding it -- but is rendered dimmed and
+            // distinct from a normal point (#899 review finding N2).
             // `i` (the original, unfiltered index) is kept on each point so
             // buildLinePath can detect a skipped month and break the line.
             const buildPoints = (scoreFn) => {
@@ -12356,7 +12361,7 @@
                         const score = scoreFn(t);
                         const x = leftMargin + (i / Math.max(1, tones.length - 1)) * chartWidth;
                         const y = topMargin + chartHeight - (score / 100) * chartHeight;
-                        return { x, y, score, month: t.month, i };
+                        return { x, y, score, month: t.month, status: t.status, i };
                     });
             };
 
@@ -12449,14 +12454,21 @@
                 return `<text x="${x}" y="${height - 8}" text-anchor="middle" style="font-size: 0.55rem; fill: var(--text-muted);">${monthName}</text>`;
             }).join('');
 
-            // Build SVG paths and points
+            // Build SVG paths and points. A "stale" point (real data the
+            // server couldn't refresh this load) is dimmed and its tooltip
+            // says so, distinct from both a normal point and an error gap
+            // (#899 review finding N2).
             let pathsSvg = '';
             let pointsSvg = '';
             lines.forEach(line => {
                 const path = buildLinePath(line.points);
                 pathsSvg += `<path d="${path}" fill="none" stroke="${line.color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.9" />`;
                 line.points.forEach((p) => {
-                    pointsSvg += `<circle cx="${p.x}" cy="${p.y}" r="4" fill="${line.color}" class="tone-data-point"><title>${p.month} (${line.label}): ${Math.round(p.score)}</title></circle>`;
+                    const isStale = p.status === 'stale';
+                    const opacity = isStale ? '0.4' : '1';
+                    const staleClass = isStale ? ' tone-data-point-stale' : '';
+                    const staleSuffix = isStale ? ' (stale)' : '';
+                    pointsSvg += `<circle cx="${p.x}" cy="${p.y}" r="4" fill="${line.color}" opacity="${opacity}" class="tone-data-point${staleClass}"><title>${p.month} (${line.label}): ${Math.round(p.score)}${staleSuffix}</title></circle>`;
                 });
             });
 

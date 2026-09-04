@@ -139,22 +139,59 @@ def patch_partner(monkeypatch):
     monkeypatch.setattr(crm_module, "PARTNER_PERSON_ID", PARTNER_ID)
 
 
+def _distinct_months_back(n: int) -> list:
+    """n distinct calendar-month keys, stepping back one full calendar
+    month at a time from the current month -- guaranteed distinct, unlike
+    day-offset arithmetic (`_months_ago(30 * i)`), which can collide near
+    month boundaries (a 31-day month plus a 30-day one can put two offsets
+    30 days apart in the same calendar month)."""
+    now = datetime.now(timezone.utc)
+    year, month = now.year, now.month
+    months = []
+    for _ in range(n):
+        months.append(f"{year:04d}-{month:02d}")
+        month -= 1
+        if month == 0:
+            month = 12
+            year -= 1
+    return sorted(months)
+
+
 @pytest.fixture
 def patch_interactions(monkeypatch):
-    """Patch interaction_store.get_for_person_in_range; returns a setter the
-    test calls (any number of times) with the desired synthetic interaction
-    list, so a test can simulate new messages arriving between two calls."""
+    """Patch both interaction_store.get_monthly_interaction_counts_in_range
+    (the lightweight, no-rows freshness-check query -- #899 review finding
+    N1) and get_for_person_in_range (the full row fetch, made only when at
+    least one month is stale), deriving both from the same synthetic
+    interaction list. Returns a setter the test calls (any number of times)
+    with the desired list, so a test can simulate new messages arriving
+    between two calls. The setter also exposes `.range_fetch_calls` (a list
+    that grows by one on each get_for_person_in_range call) so a test can
+    assert the row-loading fetch was, or wasn't, made."""
     store = get_interaction_store()
     box = {"interactions": []}
+    range_fetch_calls: list = []
+
+    def _get_monthly_interaction_counts_in_range(*args, **kwargs):
+        counts: dict = {}
+        for interaction in box["interactions"]:
+            key = interaction.timestamp.strftime("%Y-%m")
+            counts[key] = counts.get(key, 0) + 1
+        return counts
 
     def _get_for_person_in_range(*args, **kwargs):
+        range_fetch_calls.append(1)
         return box["interactions"]
 
+    monkeypatch.setattr(
+        store, "get_monthly_interaction_counts_in_range", _get_monthly_interaction_counts_in_range,
+    )
     monkeypatch.setattr(store, "get_for_person_in_range", _get_for_person_in_range)
 
     def _set(interactions):
         box["interactions"] = interactions
 
+    _set.range_fetch_calls = range_fetch_calls
     return _set
 
 
@@ -475,6 +512,297 @@ class TestCacheAndFreshness:
         old_month_point = by_month[old_month_key]
         assert old_month_point["user_sample_count"] + old_month_point["partner_sample_count"] == 5
         assert old_month_point.get("status") is None
+
+
+class TestWindowStart:
+    """Direct guard for the calendar-month snap (#899 review finding N4).
+
+    The drift-regression test above (test_no_drift_for_a_fully_elapsed_...)
+    protects the *removal of the row cap*, but its synthetic old month
+    sits comfortably inside the window either way, so it stayed green even
+    under the reviewer's mutation reverting the window start back to
+    `now - timedelta(days=months * 30)`. These tests exercise the window
+    boundary calculation itself, which the end-to-end fixture could not
+    pin down."""
+
+    def test_twelve_months_back_lands_on_the_first_of_the_month(self):
+        now = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+        start = crm_module._tone_analysis_window_start(now, 12)
+        assert start == datetime(2025, 10, 1, tzinfo=timezone.utc)
+
+    def test_start_is_never_a_rolling_day_count(self):
+        now = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+        start = crm_module._tone_analysis_window_start(now, 12)
+        rolling_equivalent = now - timedelta(days=12 * 30)
+        assert start != rolling_equivalent
+        assert start.day == 1
+        assert start.hour == 0 and start.minute == 0 and start.second == 0
+
+    def test_crosses_a_year_boundary_correctly(self):
+        now = datetime(2026, 2, 15, 12, 0, tzinfo=timezone.utc)
+        start = crm_module._tone_analysis_window_start(now, 3)
+        # 3 months back from Feb 2026, inclusive of Feb itself: Dec, Jan, Feb.
+        assert start == datetime(2025, 12, 1, tzinfo=timezone.utc)
+
+    def test_stable_across_the_same_calendar_month(self):
+        # Two "now"s on different days of the same month must produce the
+        # identical start_date -- the whole point of a calendar-aligned
+        # boundary instead of one that drifts daily.
+        start_a = crm_module._tone_analysis_window_start(
+            datetime(2026, 9, 1, 0, 0, tzinfo=timezone.utc), 12,
+        )
+        start_b = crm_module._tone_analysis_window_start(
+            datetime(2026, 9, 30, 23, 59, tzinfo=timezone.utc), 12,
+        )
+        assert start_a == start_b
+
+
+class TestCacheHitPerformance:
+    """#899 review finding N1: a cache hit was measured at ~0.3s on real
+    data because it always loaded and bucketed every row in the window just
+    to compare counts. The freshness check must use a lightweight,
+    no-rows-loaded query instead, falling through to the full row fetch
+    only when at least one month is actually stale."""
+
+    def test_cache_hit_never_calls_the_row_loading_fetch(
+        self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
+    ):
+        # A fixture large enough that loading rows would be visible even
+        # without timing: 12 months, ~50 messages each.
+        months = _distinct_months_back(12)
+        interactions = []
+        for m in months:
+            year, mon = (int(p) for p in m.split("-"))
+            for j in range(50):
+                interactions.append(Interaction(
+                    id=f"pad-{m}-{j}", person_id=PARTNER_ID,
+                    timestamp=datetime(year, mon, 10, 0, 0, tzinfo=timezone.utc) + timedelta(minutes=j),
+                    source_type="imessage",
+                    title=("→" if j % 2 == 0 else "←") + f" padding message {j}",
+                ))
+        patch_interactions(interactions)
+
+        counts: dict = {}
+        for interaction in interactions:
+            key = interaction.timestamp.strftime("%Y-%m")
+            counts[key] = counts.get(key, 0) + 1
+        for month, count in counts.items():
+            tone_store.upsert(PARTNER_ID, month, count, {
+                "user_score": 70.0, "partner_score": 70.0, "combined_score": 70.0,
+                "user_sample_count": count // 2, "partner_sample_count": count // 2,
+            })
+
+        client = _patch_llm(monkeypatch, _RecordingLLMClient())
+
+        start = time.time()
+        response = app_client.post("/api/crm/relationship/tone-analysis-detailed?months=12")
+        elapsed = time.time() - start
+
+        assert response.status_code == 200
+        assert client.calls == []
+        # The load-bearing assertion: the row-loading fetch must never be
+        # called on a full cache hit, regardless of how large the window's
+        # true row count is.
+        assert patch_interactions.range_fetch_calls == []
+        assert elapsed < 0.2
+
+        assert len(response.json()["monthly_tones"]) == len(counts)
+
+
+class TestStaleVsError:
+    """#899 review finding N2: a stale month whose recompute fails must be
+    served with its last stored score and status="stale" -- never
+    discarded. status="error" is reserved for a month with no stored data
+    at all. Before this fix, any LLM failure during a stale recompute
+    turned every affected month to status="error" and withheld its score,
+    even when a perfectly good result was sitting in storage."""
+
+    def test_all_stale_months_with_dead_llm_return_stored_scores_marked_stale(
+        self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
+    ):
+        months = _distinct_months_back(4)
+        interactions = []
+        for m in months:
+            interactions.extend(_interactions_for_months([m]))
+        patch_interactions(interactions)
+
+        stored_scores = {}
+        for i, m in enumerate(months):
+            score = 70.0 + i
+            stored_scores[m] = score
+            tone_store.upsert(PARTNER_ID, m, 2, {
+                "user_score": score, "partner_score": score, "combined_score": score,
+                "user_sample_count": 1, "partner_sample_count": 1,
+            })
+            _age_month(tone_store, PARTNER_ID, m, days_old=crm_module.TONE_FRESHNESS_DAYS + 5)
+
+        _patch_llm(monkeypatch, _RecordingLLMClient(
+            raises=TimeoutError("synthetic: local model timed out"),
+        ))
+
+        response = app_client.post("/api/crm/relationship/tone-analysis-detailed")
+        assert response.status_code == 200
+        data = response.json()
+        by_month = {t["month"]: t for t in data["monthly_tones"]}
+
+        for m in months:
+            assert by_month[m]["status"] == "stale"
+            assert by_month[m]["user_score"] == stored_scores[m]
+
+        # Stale months' real scores still feed the trend -- not excluded
+        # from it the way a true error month (no data at all) is.
+        assert data["user_trend"] != "insufficient-data"
+
+        # Still genuinely stored -- not silently "refreshed" behind the
+        # scenes -- so a later successful call would still see them as stale.
+        for m in months:
+            row = tone_store.get_month(PARTNER_ID, m)
+            assert row.result["user_score"] == stored_scores[m]
+
+    def test_error_reserved_for_months_with_no_stored_data(
+        self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
+    ):
+        month_a, month_b = _two_distinct_months()
+        patch_interactions(_interactions_for_months([month_a, month_b]))
+
+        # month_a has a stored value that's since aged out; month_b was
+        # never stored at all.
+        tone_store.upsert(PARTNER_ID, month_a, 2, {
+            "user_score": 65.0, "partner_score": 65.0, "combined_score": 65.0,
+            "user_sample_count": 1, "partner_sample_count": 1,
+        })
+        _age_month(tone_store, PARTNER_ID, month_a, days_old=crm_module.TONE_FRESHNESS_DAYS + 5)
+
+        _patch_llm(monkeypatch, _RecordingLLMClient(raises=RuntimeError("synthetic outage")))
+        response = app_client.post("/api/crm/relationship/tone-analysis-detailed")
+
+        assert response.status_code == 200
+        data = response.json()
+        by_month = {t["month"]: t for t in data["monthly_tones"]}
+        assert by_month[month_a]["status"] == "stale"
+        assert by_month[month_a]["user_score"] == 65.0
+        assert by_month[month_b]["status"] == "error"
+
+
+class TestChunking:
+    """#899 review finding N2: batching every stale month into one call
+    (finding 4) made a single slow/timed-out call all-or-nothing for the
+    whole window -- the implementer's own manual run against a 12-month
+    real window timed out and blanked everything. Chunking at
+    TONE_MAX_MONTHS_PER_LLM_CALL bounds the blast radius of one bad call
+    and lets earlier chunks' results survive a later chunk's failure."""
+
+    def test_more_than_the_chunk_size_is_split_into_multiple_calls(
+        self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
+    ):
+        months = _distinct_months_back(7)
+        assert len(months) > crm_module.TONE_MAX_MONTHS_PER_LLM_CALL
+        interactions = []
+        for m in months:
+            interactions.extend(_interactions_for_months([m]))
+        patch_interactions(interactions)
+
+        client = _patch_llm(monkeypatch, _RecordingLLMClient(user_score=80.0, partner_score=80.0))
+        response = app_client.post("/api/crm/relationship/tone-analysis-detailed?months=200")
+
+        assert response.status_code == 200
+        expected_chunks = -(-len(months) // crm_module.TONE_MAX_MONTHS_PER_LLM_CALL)  # ceil
+        assert len(client.calls) == expected_chunks
+
+        marker = "Months to score: "
+        for call_prompt in client.calls:
+            idx = call_prompt.find(marker)
+            months_line = call_prompt[idx + len(marker):].split("\n", 1)[0]
+            requested = [x.strip() for x in months_line.split(",") if x.strip()]
+            assert len(requested) <= crm_module.TONE_MAX_MONTHS_PER_LLM_CALL
+
+        for t in response.json()["monthly_tones"]:
+            assert t["user_score"] == 80.0
+            assert t.get("status") is None
+
+    def test_a_later_chunk_failing_does_not_undo_an_earlier_chunks_success(
+        self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
+    ):
+        months = _distinct_months_back(5)  # 5 months -> chunks of [4, 1]
+        interactions = []
+        for m in months:
+            interactions.extend(_interactions_for_months([m]))
+        patch_interactions(interactions)
+
+        class _FailSecondChunkClient(_RecordingLLMClient):
+            def __init__(self):
+                super().__init__(user_score=88.0, partner_score=88.0)
+                self._n = 0
+
+            def create(self, messages, max_tokens=4096):
+                self._n += 1
+                if self._n == 2:
+                    raise TimeoutError("synthetic: second chunk timed out")
+                return super().create(messages, max_tokens=max_tokens)
+
+        client = _FailSecondChunkClient()
+        _patch_llm(monkeypatch, client)
+
+        response = app_client.post("/api/crm/relationship/tone-analysis-detailed?months=200")
+        assert response.status_code == 200
+        assert client.calls  # at least the first (successful) chunk ran
+
+        data = response.json()
+        by_month = {t["month"]: t for t in data["monthly_tones"]}
+        succeeded = [m for m in months if by_month[m].get("status") is None]
+        # None of these months were ever stored before, so the chunk that
+        # failed leaves its months as "error", not "stale".
+        failed = [m for m in months if by_month[m].get("status") == "error"]
+
+        assert len(succeeded) == crm_module.TONE_MAX_MONTHS_PER_LLM_CALL
+        assert len(failed) == len(months) - crm_module.TONE_MAX_MONTHS_PER_LLM_CALL
+        for m in succeeded:
+            assert by_month[m]["user_score"] == 88.0
+            # And genuinely persisted, not just present in this response.
+            assert tone_store.get_month(PARTNER_ID, m) is not None
+
+
+class TestLockTimeout:
+    def test_lock_timeout_falls_through_to_storage_only_stale_marked_response(
+        self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
+    ):
+        """#899 review finding N3: if the per-person lock can't be acquired
+        within TONE_LOCK_TIMEOUT_SECONDS (another request for the same
+        person is already computing), the request must not block on it --
+        it falls through to a storage-only response, marking any month
+        that's actually stale as "stale" (it has a real stored score) or
+        "error" (it doesn't), rather than hanging."""
+        month_a = _two_distinct_months()[0]
+        patch_interactions(_interactions_for_months([month_a]))
+
+        tone_store.upsert(PARTNER_ID, month_a, 2, {
+            "user_score": 55.0, "partner_score": 55.0, "combined_score": 55.0,
+            "user_sample_count": 1, "partner_sample_count": 1,
+        })
+        _age_month(tone_store, PARTNER_ID, month_a, days_old=crm_module.TONE_FRESHNESS_DAYS + 5)
+
+        # Simulate the lock already being held by another in-flight request
+        # for this same person.
+        lock = crm_module._get_tone_analysis_lock(PARTNER_ID)
+        lock.acquire()
+        try:
+            client = _patch_llm(monkeypatch, _RecordingLLMClient(user_score=99.0, partner_score=99.0))
+            start = time.time()
+            response = app_client.post("/api/crm/relationship/tone-analysis-detailed")
+            elapsed = time.time() - start
+        finally:
+            lock.release()
+
+        assert response.status_code == 200
+        # Waits up to TONE_LOCK_TIMEOUT_SECONDS before giving up -- assert
+        # it doesn't hang past that (plus a safety margin), not that it
+        # returns instantly.
+        assert elapsed < crm_module.TONE_LOCK_TIMEOUT_SECONDS + 2
+        assert client.calls == []  # never attempted the LLM while the lock was held
+
+        data = response.json()
+        assert data["monthly_tones"][0]["status"] == "stale"
+        assert data["monthly_tones"][0]["user_score"] == 55.0
 
 
 class TestFailureHandling:

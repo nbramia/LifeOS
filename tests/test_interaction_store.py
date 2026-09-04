@@ -303,6 +303,83 @@ class TestInteractionStore:
         assert len(results) == 1
         assert results[0].person_id == "person-a"
 
+    def test_get_monthly_interaction_counts_in_range(self, temp_store):
+        """get_monthly_interaction_counts_in_range groups by calendar month
+        without ever returning row data -- the lightweight freshness check
+        CRM tone analysis uses to avoid loading full rows on a cache hit
+        (#899 review finding N1)."""
+        person_id = "person-monthly-counts"
+        now = datetime.now(timezone.utc)
+
+        # 3 messages in the current month, 2 in the previous month, 1
+        # clearly outside the query range.
+        for i in range(3):
+            temp_store.add(Interaction(
+                id=str(uuid.uuid4()), person_id=person_id,
+                timestamp=now.replace(day=1) + timedelta(hours=i),
+                source_type="imessage", title=f"current month {i}",
+            ))
+        prev_month = (now.replace(day=1) - timedelta(days=1)).replace(day=1)
+        for i in range(2):
+            temp_store.add(Interaction(
+                id=str(uuid.uuid4()), person_id=person_id,
+                timestamp=prev_month + timedelta(hours=i),
+                source_type="imessage", title=f"prev month {i}",
+            ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id=person_id,
+            timestamp=now - timedelta(days=400),
+            source_type="imessage", title="way outside range",
+        ))
+
+        counts = temp_store.get_monthly_interaction_counts_in_range(
+            person_id=person_id,
+            start_date=prev_month,
+            end_date=now.replace(day=1) + timedelta(days=1),
+        )
+
+        current_month_key = now.strftime("%Y-%m")
+        prev_month_key = prev_month.strftime("%Y-%m")
+        assert counts[current_month_key] == 3
+        assert counts[prev_month_key] == 2
+        assert sum(counts.values()) == 5  # excludes the one 400 days back
+
+    def test_get_monthly_interaction_counts_in_range_filters_by_source_and_person(self, temp_store):
+        now = datetime.now(timezone.utc)
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-a", timestamp=now,
+            source_type="imessage", title="A imessage",
+        ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-a", timestamp=now,
+            source_type="gmail", title="A email",
+        ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-b", timestamp=now,
+            source_type="imessage", title="B imessage",
+        ))
+
+        counts = temp_store.get_monthly_interaction_counts_in_range(
+            person_id="person-a",
+            start_date=now - timedelta(days=1),
+            end_date=now + timedelta(days=1),
+            source_type="imessage",
+        )
+        assert sum(counts.values()) == 1
+
+    def test_get_monthly_interaction_counts_in_range_empty_when_nothing_in_range(self, temp_store):
+        now = datetime.now(timezone.utc)
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-empty", timestamp=now,
+            source_type="imessage", title="msg",
+        ))
+        counts = temp_store.get_monthly_interaction_counts_in_range(
+            person_id="person-empty",
+            start_date=now + timedelta(days=10),
+            end_date=now + timedelta(days=20),
+        )
+        assert counts == {}
+
     def test_get_for_person_by_source_type(self, temp_store):
         """Test filtering interactions by source type."""
         person_id = "person-filter"

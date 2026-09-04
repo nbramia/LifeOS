@@ -203,6 +203,63 @@ class TestToneChartErrorMonth:
         assert any("2026-07" in t for t in titles)
 
 
+# A tone-analysis-detailed response with one stale month (a real, previously
+# -stored score the server couldn't refresh this load) between two fresh
+# ones -- #899 review finding N2.
+_TONE_RESPONSE_WITH_STALE_MONTH = {
+    "monthly_tones": [
+        {"month": "2026-05", "user_score": 80.0, "partner_score": 80.0,
+         "combined_score": 80.0, "user_sample_count": 5, "partner_sample_count": 5,
+         "status": None},
+        {"month": "2026-06", "user_score": 62.0, "partner_score": 58.0,
+         "combined_score": 60.0, "user_sample_count": 4, "partner_sample_count": 4,
+         "status": "stale"},
+        {"month": "2026-07", "user_score": 20.0, "partner_score": 20.0,
+         "combined_score": 20.0, "user_sample_count": 5, "partner_sample_count": 5,
+         "status": None},
+    ],
+    "user_trend": "declining", "partner_trend": "declining", "combined_trend": "declining",
+    "user_average": 54.0, "partner_average": 52.7, "generated_at": "2026-07-15T00:00:00+00:00",
+}
+
+
+class TestToneChartStaleMonth:
+    """#899 review finding N2 (MAJOR): a stale month whose recompute failed
+    must still be plotted with its real, previously-stored score (never
+    discarded), but rendered distinctly from a fresh month -- dimmed,
+    rather than indistinguishable from current data."""
+
+    def test_stale_month_is_plotted_with_its_real_score_dimmed(self, page: Page, crm_base_url):
+        _open_relationship_page(
+            page, crm_base_url, partner_person_id=SYNTHETIC_PARTNER_ID,
+            tone_response=_TONE_RESPONSE_WITH_STALE_MONTH,
+        )
+        page.wait_for_timeout(300)
+
+        # Unlike an error month, a stale month IS a real data point -- no
+        # "not analysed" gap marker for it.
+        expect(page.locator(".tone-data-point-error")).to_have_count(0)
+
+        stale_points = page.locator(".tone-data-point-stale")
+        expect(stale_points).to_have_count(1)
+
+        stale_title = stale_points.first.locator("title").text_content()
+        assert "2026-06" in stale_title
+        assert "(stale)" in stale_title.lower()
+
+        # Dimmed relative to a normal point.
+        stale_opacity = stale_points.first.get_attribute("opacity")
+        assert stale_opacity is not None
+        assert float(stale_opacity) < 1.0
+
+        # The two fresh months on either side render as normal, full-opacity
+        # points with no "(stale)" suffix.
+        normal_points = page.locator(".tone-data-point:not(.tone-data-point-stale)")
+        expect(normal_points).to_have_count(2)
+        normal_titles = normal_points.all_text_contents()
+        assert not any("stale" in t.lower() for t in normal_titles)
+
+
 class TestToneChartMonthLabel:
     """Pre-existing bug, fixed while in this code per the #899 review:
     `new Date(t.month + '-01')` parses "YYYY-MM-01" as UTC midnight, and
