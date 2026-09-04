@@ -473,7 +473,9 @@ def _cache_put(session_id: str, last_activity_at: float, result: SummaryResult,
     enforced uniformly — a stray direct assignment (e.g. a disk-hit promotion
     in `summarize_session` / `get_cached_summary`) must not sidestep the cap
     and grow the cache unbounded. When at capacity, evicts the oldest-inserted
-    entry (dict insertion order) and then writes the new one.
+    entry (dict insertion order) and then writes the new one. Eviction applies
+    only to a genuinely new key at capacity; re-putting a key already present
+    updates its entry in place and keeps its FIFO position.
 
     `created_at` is stamped wall-clock at write time; it feeds the live-session
     grace window (`_LIVE_REFRESH_GRACE_SECONDS`) and the error-fallback TTL

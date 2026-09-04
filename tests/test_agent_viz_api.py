@@ -1309,11 +1309,14 @@ def test_cache_put_repeat_key_at_capacity_evicts_nothing(summary_db, monkeypatch
     try:
         for key in ("a", "b", "c"):
             avs._cache_put(key, 0.0, avs.SummaryResult(short_label=key, summary=key))
+        avs._cache_put("c", 1.0, avs.SummaryResult(short_label="c2", summary="c2"))
         avs._cache_put("a", 1.0, avs.SummaryResult(short_label="a2", summary="a2"))
         avs._cache_put("b", 1.0, avs.SummaryResult(short_label="b2", summary="b2"))
         assert len(avs._cache) == 3
         assert set(avs._cache) == {"a", "b", "c"}
         assert list(avs._cache) == ["a", "b", "c"]
+        assert avs._cache["a"][2].short_label == "a2"
+        assert avs._cache["a"][0] == 1.0
     finally:
         avs._cache.clear()
 
@@ -1385,7 +1388,10 @@ def test_real_summary_write_site_respects_cache_max(summary_db, monkeypatch):
 
     from api.services import agent_viz_summary as avs
 
+    calls: list = []
+
     async def _succeed(*args, **kwargs):
+        calls.append(1)
         return json.dumps({"short_label": "Ship The Feature", "summary": "Shipped it."})
 
     monkeypatch.setattr(avs, "generate_text", _succeed)
@@ -1404,6 +1410,7 @@ def test_real_summary_write_site_respects_cache_max(summary_db, monkeypatch):
             ))
             assert len(avs._cache) <= small_max
 
+        assert len(calls) == len(sids)
         assert len(avs._cache) == small_max
         assert list(avs._cache) == sids[3:]
     finally:
