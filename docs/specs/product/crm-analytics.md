@@ -8,6 +8,8 @@ The aggregated views that sit alongside the people list: Family Dashboard (`/fam
 
 See [crm-ui.md](crm-ui.md) for the CRM index and the sibling specs that cover people, interactions, and the graph.
 
+Each dashboard's heaviest endpoint (its interactions/timeline aggregate, plus `/statistics`, `/birthdays/all`, and the default people list) is served from a short-lived server cache, bounded by a five-minute TTL: a repeat request with the same parameters, from any client, returns instantly and a change anywhere in the CRM data invalidates it well within that window — see [architecture.md](../technical/architecture.md) for how the cache is keyed and invalidated.
+
 ---
 
 ## Table of Contents
@@ -264,5 +266,6 @@ Each panel has a refresh button to re-extract insights on demand.
 - [crm-interactions.md](crm-interactions.md) — Interaction source ingestion (the dashboards aggregate over these)
 - [crm-graph.md](crm-graph.md) — Relationship graph (some dashboards link out to the graph view)
 - [api-reference.md](api-reference.md) — Full HTTP endpoint catalog
+- [architecture.md](../technical/architecture.md) — `AggregateCache`, the response cache these dashboards' heaviest endpoints share
 - [journal-analytics.md](journal-analytics.md) — Sibling analytics view (daily-journal emotion wheel) using the same pre-aggregated-response, graceful-window-fallback pattern
 - [configuration.md](../../guides/configuration.md) — `LIFEOS_PARTNER_NAME`, `LIFEOS_THERAPIST_PATTERNS`, `LIFEOS_PERSONAL_RELATIONSHIP_PATTERNS`
