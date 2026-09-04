@@ -45,11 +45,14 @@ class SummaryResult:
         return {"short_label": self.short_label, "summary": self.summary}
 
 
-# In-process cache: session_id → (last_activity_at, created_at, SummaryResult).
-# Disk cache (below) is the durable layer; this just keeps hot reads
-# fingertip-fast. `created_at` is wall-clock seconds at write time and feeds
-# the live-session grace window below.
-_cache: dict[str, tuple[float, float, SummaryResult]] = {}
+# In-process cache: session_id → (last_activity_at, created_at, SummaryResult,
+# is_error_fallback). Disk cache (below) is the durable layer for real
+# summaries and the deterministic no-content fallback; this just keeps hot
+# reads fingertip-fast. `created_at` is wall-clock seconds at write time and
+# feeds the live-session grace window below. `is_error_fallback` marks an
+# entry cached from a *raising* summarizer (#863 finding N) — those never
+# reach disk and are only trusted for a bounded TTL, never "forever".
+_cache: dict[str, tuple[float, float, SummaryResult, bool]] = {}
 _CACHE_MAX = 500
 
 # Non-terminal sessions move `last_activity_at` on every tool call. Without
@@ -60,10 +63,42 @@ _CACHE_MAX = 500
 # next access. Terminal sessions ignore this grace and use cache forever.
 _LIVE_REFRESH_GRACE_SECONDS = 60 * 60  # 60 min
 
+# How long an *error* fallback (the summarizer raised — a timeout, a Gemma
+# queue backup, a JSON-parse failure) stays trusted, even for a terminal
+# session. Deliberately NOT "forever": unlike the no-content fallback, an
+# exception fallback isn't a genuine dead end — the same session's real
+# transcript is sitting right there and a retry could well succeed. Matches
+# `agent_viz_summary_prefetch._FAILURE_BACKOFF_TICKS` (30 * 20s = 10 min) so
+# the prefetcher's own retry-after-cooldown isn't silently absorbed by a
+# cache hit here (#863 review finding N).
+_FAILURE_FALLBACK_TTL_SECONDS = 10 * 60
+
+# Sentinel content for the deterministic "nothing to summarize" fallback
+# (as opposed to an *error* fallback, or a real LLM-produced summary).
+# `_is_fresh_enough` uses it to withhold the "frozen ⇒ trust regardless of
+# new activity" leniency from a fallback — that leniency is only warranted
+# for a genuine summary (#863 review REC-1); re-deriving a no-content
+# fallback is free (no LLM call), so there's no cost to re-checking it.
+_NO_CONTENT_SUMMARY = "(No transcript content yet.)"
+
 # Statuses that mean the session is done and `last_activity_at` is frozen.
 # Imported lazily inside _is_terminal so this module stays importable
 # without the agent_worker package on tests/standalone scripts.
 _TERMINAL_STATUSES_CACHE: frozenset[str] | None = None
+
+
+# CLI session statuses ("ended"/"inactive") don't exist in the worker's
+# TERMINAL_STATUSES set at all — they're event-driven statuses from
+# `cli_sessions` / the transcript scan's file-age guess, not worker session
+# statuses. Without this a CLI session's fallback label was never cached and
+# the prefetcher retried it on every tick forever (#863).
+#
+# `inactive` is deliberately included here even though it's NOT truly frozen
+# (see `_is_frozen` below) — this set answers "should a fallback/no-content
+# summary be cached for this session so the prefetcher stops retrying it?"
+# (acceptance criterion 7), which is a different question from "is it safe
+# to keep serving that cache once activity moves?" (`_is_fresh_enough`).
+_CLI_TERMINAL_STATUSES = frozenset({"ended", "inactive"})
 
 
 def _is_terminal(status: str) -> bool:
@@ -71,26 +106,64 @@ def _is_terminal(status: str) -> bool:
     if _TERMINAL_STATUSES_CACHE is None:
         try:
             from api.services.agent_worker.session_store import TERMINAL_STATUSES
-            _TERMINAL_STATUSES_CACHE = frozenset(TERMINAL_STATUSES)
+            _TERMINAL_STATUSES_CACHE = frozenset(TERMINAL_STATUSES) | _CLI_TERMINAL_STATUSES
         except Exception:  # noqa: BLE001
             _TERMINAL_STATUSES_CACHE = frozenset({
                 "completed", "failed", "budget_exceeded", "killed", "cascade_killed",
-            })
+            }) | _CLI_TERMINAL_STATUSES
     return (status or "") in _TERMINAL_STATUSES_CACHE
 
 
+# Strict subset of `_is_terminal` whose `last_activity_at` is genuinely
+# frozen — the session cannot produce more transcript content, so a cache
+# for it is valid forever no matter what a later read reports. `inactive`
+# is deliberately excluded (#863 review): it's the transcript scan's
+# file-age guess for a Claude Code session idle >30 min, not a real
+# terminal event, and `web/agents/panel.js`'s `TERMINAL` set explicitly
+# agrees — "'idle' is a live cli session waiting for input — it must NOT be
+# treated as terminal. Only 'ended' … is." A session reported `inactive`
+# can resume (new activity), and its cache — possibly only a failure
+# fallback cached to satisfy acceptance criterion 7 above — must not be
+# trusted "regardless of new activity" the way a truly frozen session's
+# can.
+def _is_frozen(status: str) -> bool:
+    return _is_terminal(status) and status != "inactive"
+
+
 def _is_fresh_enough(cached_activity: float, cached_created_at: float,
-                     new_activity: float, status: str) -> bool:
+                     new_activity: float, status: str,
+                     cached_summary: str = "") -> bool:
     """True iff the cached summary can be served even though the session
-    may have advanced. Terminal: always (activity is frozen). Live: only
-    if the cache is within the grace window AND we haven't already
-    invalidated it via the activity timestamp."""
+    may have advanced. Frozen (`_is_frozen`): always, regardless of new
+    activity — the status guarantees nothing more will happen — UNLESS the
+    cached entry is only the no-content fallback (`cached_summary ==
+    _NO_CONTENT_SUMMARY`), not a real summary: re-summarizing costs no LLM
+    call (that path never invokes one) and a frozen status guaranteeing "no
+    more content" is exactly what a later real summary would need to have
+    been wrong about (#863 review REC-1). Everything else (a genuinely live
+    session, or `inactive` whose activity really did move — i.e. it
+    resumed) only gets served within the live grace window, same as any
+    other unsettled session.
+
+    Callers reading an *error* fallback (a raising summarizer) never reach
+    this function at all — that path is bounded by
+    `_FAILURE_FALLBACK_TTL_SECONDS` instead, checked directly by
+    `summarize_session`/`get_cached_summary` from the in-process `_cache`,
+    since an error fallback is never written to disk (#863 finding N)."""
     # Exact match on activity → never stale regardless of status.
     if cached_activity >= new_activity:
         return True
-    # Activity moved forward. Terminal sessions shouldn't reach here
-    # (activity is frozen), but if status is somehow misreported treat
-    # them as not-fresh and re-summarize.
+    # Activity moved forward despite a frozen status — that shouldn't
+    # happen, but if it does, trust the cache rather than treat a stray
+    # timestamp nudge as meaningful new content: frozen statuses are valid
+    # "regardless of new activity" by definition. Restricted to a REAL
+    # cached summary — a no-content fallback gets no such leniency.
+    if _is_frozen(status) and cached_summary != _NO_CONTENT_SUMMARY:
+        return True
+    # Everything not frozen falls to the grace window below, EXCEPT the
+    # extended-but-not-frozen bucket (currently just `inactive`): that
+    # status moving is the resumption signal itself, so don't extend it the
+    # same leniency a genuinely live session gets — re-summarize now.
     if _is_terminal(status):
         return False
     # Live session: cached entry stays valid for the grace window.
@@ -153,7 +226,8 @@ def _disk_get(session_id: str, last_activity_at: float, status: str = "") -> Sum
     if not row:
         return None
     cached_activity, short_label, summary, created_at = row
-    if not _is_fresh_enough(cached_activity, float(created_at), last_activity_at, status):
+    if not _is_fresh_enough(cached_activity, float(created_at), last_activity_at, status,
+                             cached_summary=summary):
         return None
     return SummaryResult(short_label=short_label, summary=summary)
 
@@ -348,9 +422,73 @@ def _build_prompt(label: str, ctx: dict[str, Any]) -> str:
 
 
 def _fallback_label(label: str) -> str:
-    """Heuristic short label when LLM is unavailable or returns garbage."""
-    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]*", label or "")
-    return " ".join(words[:5]).strip() or "Untitled"
+    """Heuristic short label when LLM is unavailable or returns garbage.
+
+    `label` is routinely the row's own raw identifier (a session id, a
+    "cc:"/"cx:"-prefixed id, or a bare task id) when there's no real title —
+    every ingest and `_label_for_session` fall back to exactly that. The
+    tokenizer below treats '-'/'_' as continuation characters, so a whole
+    uuid or `t-...` task id matches as a single "word" and comes back
+    byte-for-byte; a colon-prefixed id like "cx:remote-cx-1" comes back as
+    a trivial re-spacing ("cx remote-cx-1") instead. Neither is a real
+    label — it's the identifier itself, cosmetically reformatted.
+
+    An identifier has no word boundaries of its own; a genuine human title
+    already carries real whitespace in `label`. So: if the original label
+    had no whitespace, treat *any* tokenized result as suspect and return
+    ""  instead, so the caller (`web/agents/graph.js`'s `nodeLabel`) falls
+    through to a real candidate like `model_label` rather than rendering
+    the id back at the operator (#863 finding M). Accepted cost: a
+    legitimate one-word Latin title (`'Refactor'`, `'Q4-roadmap'`) now also
+    returns "" — the graph node is unaffected (it falls through to the
+    identical `label`), but the panel's short-label row renders blank and
+    `search_cached_summaries` loses coverage for those rows. Deliberate,
+    not a bug (#863 review round 3 finding U).
+
+    The tokenizer is ASCII-only ([A-Za-z0-9] word starts), so a genuinely
+    non-empty, non-Latin title (CJK, Cyrillic, Greek, Arabic, emoji-only)
+    also produces zero tokens — the same shape as "no title at all". Those
+    two cases must not share an exit: a non-empty input that merely
+    tokenized to nothing still has a real title sitting in `label` for the
+    caller to fall through to, so it returns "" like the no-whitespace
+    case above. "Untitled" is reserved for a genuinely empty/whitespace-
+    only `label`, where there is no real title to fall through to (#863
+    review round 3 finding Q — round 2's fix returned "Untitled" for any
+    zero-token result, which fired first for non-Latin titles and clobbered
+    them since "Untitled" outranks `label` in `nodeLabel`'s precedence).
+    """
+    stripped = (label or "").strip()
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]*", stripped)
+    result = " ".join(words[:5]).strip()
+    if not result:
+        return "Untitled" if not stripped else ""
+    if not re.search(r"\s", stripped):
+        return ""
+    return result
+
+
+def _cache_if_terminal(session_id: str, last_activity_at: float, status: str,
+                        result: SummaryResult, *, is_error_fallback: bool = False) -> None:
+    """Cache `result` for a session whose status is terminal, so it drops out
+    of the prefetch candidate list for good. A live session's activity keeps
+    moving and might yet produce real content, so callers must not cache for
+    it — the next access retries instead (#863).
+
+    `is_error_fallback=True` (the summarizer raised) keeps the entry
+    in-process only, bounded by `_FAILURE_FALLBACK_TTL_SECONDS` — it is
+    deliberately NEVER written to disk. A transient LLM failure (a Gemma
+    queue backup, a timeout) must not permanently poison a terminal
+    session's summary for the life of the install; `prune_disk_cache` has
+    no scheduled caller, so anything written to disk here effectively never
+    expires (#863 review finding N)."""
+    if not _is_terminal(status):
+        return
+    now = time.time()
+    if len(_cache) >= _CACHE_MAX:
+        _cache.pop(next(iter(_cache)))
+    _cache[session_id] = (last_activity_at, now, result, is_error_fallback)
+    if not is_error_fallback:
+        _disk_put(session_id, last_activity_at, result)
 
 
 async def summarize_session(
@@ -374,15 +512,28 @@ async def summarize_session(
     """
     cached = _cache.get(session_id)
     if cached:
-        cached_activity, cached_created_at, cached_result = cached
-        if _is_fresh_enough(cached_activity, cached_created_at, last_activity_at, status):
+        cached_activity, cached_created_at, cached_result, is_error_fallback = cached
+        if is_error_fallback:
+            # (#863 finding N) Bounded TTL only, regardless of status — an
+            # error fallback is never trusted "forever" even for a frozen
+            # session, because the failure was transient (Gemma timeout /
+            # queue backup), not a genuine dead end. Also require an exact
+            # activity match: if the session's activity has moved on, don't
+            # serve a stale error against newer content.
+            if (cached_activity >= last_activity_at
+                    and (time.time() - cached_created_at) < _FAILURE_FALLBACK_TTL_SECONDS):
+                return cached_result
+        elif _is_fresh_enough(cached_activity, cached_created_at, last_activity_at, status,
+                               cached_summary=cached_result.summary):
             return cached_result
 
     # Disk cache check — populated by a previous call (possibly across a
-    # restart). Promotes into the in-process cache on hit.
+    # restart). Promotes into the in-process cache on hit. Only real
+    # summaries and the no-content fallback ever reach disk (#863 finding N
+    # — an error fallback never does), so this is never an error fallback.
     disk_hit = _disk_get(session_id, last_activity_at, status)
     if disk_hit is not None:
-        _cache[session_id] = (last_activity_at, time.time(), disk_hit)
+        _cache[session_id] = (last_activity_at, time.time(), disk_hit, False)
         return disk_hit
 
     ctx = _extract_context(events)
@@ -394,14 +545,9 @@ async def summarize_session(
     if not ctx["first_user"] and not ctx["final_assistant"] and not ctx["prs"]:
         result = SummaryResult(
             short_label=_fallback_label(label),
-            summary="(No transcript content yet.)",
+            summary=_NO_CONTENT_SUMMARY,
         )
-        if _is_terminal(status):
-            now = time.time()
-            if len(_cache) >= _CACHE_MAX:
-                _cache.pop(next(iter(_cache)))
-            _cache[session_id] = (last_activity_at, now, result)
-            _disk_put(session_id, last_activity_at, result)
+        _cache_if_terminal(session_id, last_activity_at, status, result)
         return result
 
     prompt = _build_prompt(label, ctx)
@@ -435,16 +581,30 @@ async def summarize_session(
             short_label = " ".join(words[:7])
     except Exception as exc:  # noqa: BLE001 — never break the panel on summary failure
         logger.warning("session summary failed for %s: %s", session_id, exc)
-        return SummaryResult(
+        fallback = SummaryResult(
             short_label=_fallback_label(label),
             summary=f"(Summary unavailable: {type(exc).__name__})",
         )
+        # (#863) A terminal session whose summary call keeps raising was
+        # never cached, so the prefetcher retried it on every tick forever.
+        # A live session might succeed later, so it stays uncached.
+        #
+        # (#863 review finding N) `is_error_fallback=True` keeps this
+        # in-process only, bounded by `_FAILURE_FALLBACK_TTL_SECONDS` — NOT
+        # written to disk. Caching it forever on disk (as a prior version of
+        # this fix did) meant an ordinary transient failure — Gemma mid-
+        # restart, a queue backup past the 240s timeout — permanently pinned
+        # `(Summary unavailable: ...)` as a terminal session's label/summary
+        # for the life of the install, since `prune_disk_cache` is never
+        # scheduled anywhere.
+        _cache_if_terminal(session_id, last_activity_at, status, fallback, is_error_fallback=True)
+        return fallback
 
     result = SummaryResult(short_label=short_label, summary=summary)
     if len(_cache) >= _CACHE_MAX:
         _cache.pop(next(iter(_cache)))
     now = time.time()
-    _cache[session_id] = (last_activity_at, now, result)
+    _cache[session_id] = (last_activity_at, now, result, False)
     _disk_put(session_id, last_activity_at, result)
     return result
 
@@ -458,12 +618,18 @@ def get_cached_summary(session_id: str, last_activity_at: float, status: str = "
     """
     cached = _cache.get(session_id)
     if cached:
-        cached_activity, cached_created_at, cached_result = cached
-        if _is_fresh_enough(cached_activity, cached_created_at, last_activity_at, status):
+        cached_activity, cached_created_at, cached_result, is_error_fallback = cached
+        if is_error_fallback:
+            # See summarize_session — bounded TTL, never "forever" (#863 finding N).
+            if (cached_activity >= last_activity_at
+                    and (time.time() - cached_created_at) < _FAILURE_FALLBACK_TTL_SECONDS):
+                return cached_result
+        elif _is_fresh_enough(cached_activity, cached_created_at, last_activity_at, status,
+                               cached_summary=cached_result.summary):
             return cached_result
     disk = _disk_get(session_id, last_activity_at, status)
     if disk is not None:
-        _cache[session_id] = (last_activity_at, time.time(), disk)
+        _cache[session_id] = (last_activity_at, time.time(), disk, False)
         return disk
     return None
 

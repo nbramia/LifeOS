@@ -191,9 +191,10 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "session_id": s.session_id,
         "task_id": s.task_id,
         "status": s.status,
-        # Worker sessions only ever run on the machine hosting the API
-        # (#849) — no cross-host worker dispatch exists.
-        "host": api_host_name(),
+        # (#851) `Session.host` is the board-assignment field a worker was
+        # dispatched to run on; unset (legacy rows, or a session created
+        # before #851) falls back to the machine hosting this API process.
+        "host": s.host or api_host_name(),
         "routing": s.routing,
         "parent_session_id": s.parent_session_id,
         "root_session_id": s.root_session_id,
@@ -211,6 +212,17 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "expected_output": s.expected_output,
         "label": _label_for_session(s, events),
         "model_label": _model_label_for_routing(s.routing),
+        # (#863) board-assignment + identity fields, passed through so the
+        # panel and filters can surface them without re-deriving. Direct
+        # attribute access, matching `host` above — all five (#851)
+        # fields exist on `Session` with defaults, so `getattr(..., None)`
+        # was inconsistent defensiveness rather than a real guard (#863
+        # review round 2, finding P).
+        "model": s.model,
+        "effort": s.effort,
+        "conversation_id": s.conversation_id,
+        "bot": s.bot,
+        "origin": getattr(s, "origin", None),
         "last_event_kind": summary["last_event_kind"],
         "tool_call_count": summary["tool_call_count"],
         "error_count": summary["error_count"],
@@ -310,7 +322,9 @@ def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
         from api.services.codex import session_ingest as cx
         model_lbl = cx.model_label(cli.model or "")
     else:
-        model_lbl = "Claude"
+        # (#863) An unrecognized engine used to hardcode a Claude tier
+        # guess ("Claude") — surface the engine's own name instead.
+        model_lbl = cli.engine.replace("_", " ").title() if cli.engine else "Claude"
     return {
         "session_id": cli.session_id,
         "task_id": cli.task_id,
@@ -330,7 +344,9 @@ def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
         "total_dollars": 0.0,
         "total_active_seconds": 0.0,
         "expected_output": None,
-        "label": cli.session_id,
+        # (#863) Prefer the hook-posted prompt preview — the session id is
+        # not a human label.
+        "label": cli.prompt_preview or cli.session_id,
         "model_label": model_lbl,
         "last_event_kind": "",
         "tool_call_count": 0,
@@ -457,17 +473,39 @@ def _build_snapshot() -> dict[str, Any]:
 def _model_label_for_routing(routing: str | None) -> str:
     if (routing or "local") == "local":
         return "Local"
+    if routing == "ask":
+        # (#863) A worker session parked waiting on the operator has no
+        # model running at all — it must never render a Claude tier guess.
+        return "Waiting on you"
     if routing == "remote":
         # (#809) `#cloud` — the configured remote OpenAI-compatible provider,
         # not an Anthropic model, so it must not fall into the Claude-model-
         # name guessing below.
-        return "Remote"
+        try:
+            from config.settings import settings
+            return settings.remote_llm_label or "Remote"
+        except Exception:  # noqa: BLE001
+            return "Remote"
     from api.services.agent_worker.hermes_session import HERMES_ROUTING
     if routing == HERMES_ROUTING:
         # (#850) Hermes sessions used to fall through to the Claude-model-name
         # guess below and get mislabeled "Claude" — Hermes runs its own
         # DeepSeek-backed engine, not an Anthropic model.
+        # (#863 review round 2, finding O) A prior version of this branch
+        # appended "· <model>" from `model_readout._last_observed_hermes_chat_model()`
+        # — that's a single process-wide "last observed" value written by
+        # ANY Hermes turn (an agent-worker session and `/chat`'s Hermes
+        # proxy alike), not a per-session attribution. A finished session's
+        # badge would retroactively change to whatever model a *different*,
+        # unrelated Hermes turn most recently reported — `model_readout.py`'s
+        # own docstring rejects exactly this kind of cross-surface borrowing
+        # as dishonest. No honest per-session source exists today, so the
+        # badge stays plain.
         return "Hermes"
+    if routing in ("claude_code", "code"):
+        return "Claude Code"
+    if routing == "codex":
+        return "Codex"
     try:
         from config.settings import settings
         m = (settings.agent_managed_model or "").lower()

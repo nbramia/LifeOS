@@ -549,6 +549,39 @@ def test_to_session_dict_includes_required_fields(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_to_session_dict_task_id_is_none_for_locally_scanned_session(tmp_path: Path):
+    """A locally scanned session's `raw_session_id` (the Claude Code UUID)
+    used to leak into `task_id`, poisoning the board's `sessions_by_task`
+    join — every locally scanned session looked like it had a real LifeOS
+    task link (#863). A hook-registered session still gets a real task_id
+    overlaid afterwards by `_apply_cli_session_to_dict` in the agents route."""
+    proj = tmp_path / "-home-syn-Code-A"
+    _write_jsonl(proj / "notask.jsonl", [_assistant_event("hi")])
+    metas = cc.discover_sessions(projects_dir=tmp_path)
+    meta, _ = cc.parse_session(metas[0])
+    d = cc.to_session_dict(meta)
+    assert d["task_id"] is None
+    assert meta.raw_session_id  # sanity: the UUID exists, it's just not leaked
+
+
+@pytest.mark.unit
+def test_subagent_session_dict_task_id_is_none(tmp_path: Path):
+    """`subagent_session_dict`'s task_id used to be the tool_use_id — the
+    same `sessions_by_task` poisoning bug as `to_session_dict` (#863)."""
+    proj = tmp_path / "-home-syn-Code-A"
+    _write_jsonl(proj / "sub2.jsonl", [
+        _assistant_event(tool_uses=[
+            {"id": "tu_9", "name": "Agent", "input": {"prompt": "child task"}},
+        ]),
+    ])
+    metas = cc.discover_sessions(projects_dir=tmp_path)
+    meta, _ = cc.parse_session(metas[0])
+    assert len(meta.subagents) == 1
+    d = cc.subagent_session_dict(meta, meta.subagents[0])
+    assert d["task_id"] is None
+
+
+@pytest.mark.unit
 def test_model_label_normalizes_known_models():
     assert cc.model_label("claude-haiku-4-5") == "Haiku"
     assert cc.model_label("claude-sonnet-4-6") == "Sonnet"
@@ -688,13 +721,19 @@ def test_live_process_detection_per_cwd_topN_promotes_recent_to_running(
     cc.invalidate_process_cache()
 
     sessions, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=0)
-    by_task = {s["task_id"]: s for s in sessions if s.get("source") == "claude_code"}
-    assert by_task["active"]["status"] == "running"
-    assert by_task["active"]["status_inferred"] is False
+    # Keyed by the raw filename stem embedded in `session_id` (`cc:<stem>`)
+    # rather than `task_id` — a locally scanned session's `task_id` is now
+    # always None (#863), it's not a stand-in for the jsonl filename.
+    by_stem = {
+        s["session_id"].removeprefix("cc:"): s
+        for s in sessions if s.get("source") == "claude_code"
+    }
+    assert by_stem["active"]["status"] == "running"
+    assert by_stem["active"]["status_inferred"] is False
     # Critical: the sibling sessions in the same cwd are NOT promoted.
-    assert by_task["old-1"]["status"] == "completed"
-    assert by_task["old-1"]["status_inferred"] is True
-    assert by_task["old-2"]["status"] == "completed"
+    assert by_stem["old-1"]["status"] == "completed"
+    assert by_stem["old-1"]["status_inferred"] is True
+    assert by_stem["old-2"]["status"] == "completed"
 
 
 @pytest.mark.unit
@@ -717,14 +756,19 @@ def test_live_process_detection_multi_process_cwd(tmp_path: Path, monkeypatch):
     cc.invalidate_process_cache()
 
     sessions, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=0)
-    by_task = {s["task_id"]: s for s in sessions if s.get("source") == "claude_code"}
+    # See test_live_process_detection_per_cwd_topN_promotes_recent_to_running
+    # for why this keys by session_id's raw stem instead of task_id (#863).
+    by_stem = {
+        s["session_id"].removeprefix("cc:"): s
+        for s in sessions if s.get("source") == "claude_code"
+    }
     # Top-2 most-recent are running (authoritative).
-    assert by_task["s1"]["status"] == "running"
-    assert by_task["s1"]["status_inferred"] is False
-    assert by_task["s2"]["status"] == "running"
-    assert by_task["s2"]["status_inferred"] is False
+    assert by_stem["s1"]["status"] == "running"
+    assert by_stem["s1"]["status_inferred"] is False
+    assert by_stem["s2"]["status"] == "running"
+    assert by_stem["s2"]["status_inferred"] is False
     # 3rd jsonl stays on heuristic.
-    assert by_task["s3"]["status"] == "completed"
+    assert by_stem["s3"]["status"] == "completed"
 
 
 @pytest.mark.unit
@@ -739,7 +783,9 @@ def test_live_process_detection_no_match_falls_back_to_heuristic(tmp_path: Path,
     cc.invalidate_process_cache()
 
     sessions, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=0)
-    target = next(s for s in sessions if s["task_id"] == "idle")
+    # session_id's raw stem, not task_id — a locally scanned session's
+    # task_id is now always None (#863).
+    target = next(s for s in sessions if s["session_id"] == "cc:idle")
     assert target["status"] == "inactive"
     assert target["status_inferred"] is True
 

@@ -751,7 +751,11 @@ def to_session_dict(meta: SessionMeta) -> dict[str, Any]:
     """Render `meta` into a snapshot row matching the agent-worker shape."""
     return {
         "session_id": meta.session_id,
-        "task_id": meta.raw_session_id,
+        # (#863) `raw_session_id` is the Claude Code UUID, not a LifeOS task
+        # id — it poisoned `_build_board`'s task join. `SessionMeta` carries
+        # no LifeOS task link of its own; a hook-registered session gets one
+        # overlaid afterwards by `_apply_cli_session_to_dict`.
+        "task_id": None,
         "status": meta.status,
         "routing": "claude_code",
         "parent_session_id": meta.parent_session_id,
@@ -794,7 +798,9 @@ def subagent_session_dict(parent: SessionMeta, subagent: dict[str, Any]) -> dict
     synthetic_id = f"{parent.session_id}:agent:{tu_id}"
     return {
         "session_id": synthetic_id,
-        "task_id": tu_id,
+        # (#863) `tu_id` is a tool_use_id, not a LifeOS task id — same
+        # `sessions_by_task` poisoning bug as `to_session_dict` above.
+        "task_id": None,
         "status": subagent.get("status", "running"),
         "routing": "claude_code",
         "parent_session_id": parent.session_id,

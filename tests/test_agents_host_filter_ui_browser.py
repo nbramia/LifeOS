@@ -17,6 +17,11 @@ page family.
 scenario here clicks into the Graph tab before touching graph-specific
 elements like `#filter-host` or `.node`, which now live in initially-hidden
 markup and aren't wired up until `initGraph()` runs.
+
+`TestRecentChipAndRouteFilterAndNodeLabels` (#863) covers the "recent" chip
+(completed + ended), the route filter's `hermes`/`ask` options, and that no
+rendered node label is a literal '?' — using a second synthetic snapshot
+(`SNAPSHOT2`) on a single host so the host filter doesn't interfere.
 """
 import http.server
 import json
@@ -220,3 +225,339 @@ class TestPanelFields:
         expect(panel.locator('[data-field="host"]')).to_have_text("api-host")
         expect(panel.locator('[data-field="branch-hint"]')).to_have_count(0)
         expect(panel.locator('[data-field="prompt-preview-hint"]')).to_have_count(0)
+
+
+# ---------------------------------------------------------------------------
+# #863 — recent chip (completed + ended), the route filter's hermes/ask
+# options, and the graph's node label precedence (never a literal '?').
+# Same server-free pattern as above: everything on one host so the host
+# filter doesn't interfere with these assertions, a mix of routing/status
+# values, and a CLI row with no label/short_label/prompt_preview at all —
+# the shape that used to render a literal '?'.
+# ---------------------------------------------------------------------------
+
+SNAPSHOT2 = {
+    "sessions": [
+        {
+            "session_id": "sess_label_completed",
+            "task_id": "t-completed",
+            "status": "completed",
+            "status_inferred": False,
+            "routing": "local",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 5,
+            "total_output_tokens": 5,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "labeltest-alpha-completed",
+            "model_label": "Local",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            # (#863) Shape a locally-scanned CC session actually ingests as:
+            # no custom title / AI title / user text / cwd basename, so
+            # `claude_code/session_ingest.py` falls `meta.label` back to the
+            # bare raw session id, while `session_id` carries the "cc:"
+            # prefix (`CC_PREFIX + raw_id`). A prior fixture here omitted
+            # `label` entirely, a shape the ingest never produces. This row
+            # also has a real `prompt_preview` — the node label must prefer
+            # that over the raw-id `label` (leak shape 1 below), and with
+            # neither present it must still never fall through to a literal
+            # '?' (the pre-#863 CLI-model-label special case).
+            #
+            # (#863 review finding M) `short_label` also carries the raw id
+            # here — exactly what `_fallback_label` caches when a terminal
+            # CLI session has no real content — to prove `short_label` gets
+            # the same raw-id guard as `label` rather than leaking through
+            # one precedence slot higher.
+            "session_id": "cc:0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "task_id": None,
+            "status": "ended",
+            "status_inferred": False,
+            "routing": "claude_code",
+            "source": "claude_code",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 10,
+            "total_output_tokens": 20,
+            "total_dollars": 0.01,
+            "spawn_depth": 0,
+            "label": "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "short_label": "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "prompt_preview": "fix the synthetic widget parser",
+            "model_label": "Claude Code",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            # (#863) An orphaned worker row: `_label_for_session` falls back
+            # to `s.task_id` when the task lookup finds no description (e.g.
+            # the vault task file was deleted while the `sessions` row
+            # survived), so `label` equals `task_id` verbatim. That raw id
+            # must not render as the node label (leak shape 2 below).
+            #
+            # (#863 review finding M) `short_label` also equals `task_id`
+            # here, proving the guard catches `short_label` == task_id, not
+            # just `short_label` == session_id.
+            "session_id": "sess_label_orphan",
+            "task_id": "t-orphan-deleted",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "local",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "t-orphan-deleted",
+            "short_label": "t-orphan-deleted",
+            "model_label": "Local",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_label_ask",
+            "task_id": "t-ask",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "ask",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "labeltest-ask",
+            "model_label": "Waiting on you",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_label_hermes",
+            "task_id": "t-hermes",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "hermes",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 1,
+            "total_output_tokens": 1,
+            "total_dollars": 0.001,
+            "spawn_depth": 0,
+            "label": "labeltest-hermes",
+            "model_label": "Hermes",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_label_remote",
+            "task_id": "t-remote",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "remote",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 1,
+            "total_output_tokens": 1,
+            "total_dollars": 0.002,
+            "spawn_depth": 0,
+            "label": "labeltest-remote",
+            "model_label": "Remote",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            # (#863 review round 3 finding Q) A CLI row whose real title is
+            # non-Latin (CJK here). Post-fix, `_fallback_label` returns ""
+            # for a genuinely non-empty title that tokenizes to zero ASCII
+            # words (round 2's fix wrongly returned "Untitled", which sits
+            # ABOVE `label` in `nodeLabel`'s precedence and clobbered the
+            # real title on screen for every non-Latin session). This row
+            # models that fixed shape — empty `short_label`, the real title
+            # in `label` — end to end through the browser: the node must
+            # render the title, never "Untitled" and never blank.
+            "session_id": "cc:nonlatin-title-session",
+            "task_id": None,
+            "status": "running",
+            "status_inferred": False,
+            "routing": "claude_code",
+            "source": "claude_code",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 3,
+            "total_output_tokens": 6,
+            "total_dollars": 0.001,
+            "spawn_depth": 0,
+            "label": "検索インデックスをリファクタリングする",
+            "short_label": "",
+            "model_label": "Claude Code",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+    ],
+    "edges": [],
+    "generated_at": 1234567890,
+}
+
+
+def _open_agents2(page: Page, base_url):
+    def handler(route):
+        if "/stream" in route.request.url:
+            # graph.js opens an EventSource against /api/agents/stream — a
+            # plain JSON stub response makes the browser log a real MIME-type
+            # console error unrelated to anything under test here.
+            route.fulfill(status=200, content_type="text/event-stream", body="")
+            return
+        if "/api/agents/snapshot" in route.request.url:
+            body = SNAPSHOT2
+        elif "/api/agents/board" in route.request.url:
+            body = {"lanes": {}, "generated_at": 0}
+        else:
+            body = {}
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(body))
+
+    page.route("**/api/**", handler)
+    page.goto(f"{base_url}/agents")
+    page.click('[data-tab="graph"]')
+    page.wait_for_selector("#filter-route")
+    page.select_option("#filter-recency", "all")
+    page.locator("#filter-terminal").check()
+    page.wait_for_timeout(400)
+
+
+class TestRecentChipAndRouteFilterAndNodeLabels:
+    def test_recent_chip_counts_completed_and_ended(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        expect(page.locator("#chip-recent")).to_have_text("2")
+
+    def test_route_filter_lists_hermes_remote_and_ask(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        options = page.locator("#filter-route option").all_inner_texts()
+        assert "hermes" in options
+        assert "remote" in options
+        assert "ask" in options
+
+    def test_route_filter_selecting_hermes_shows_only_hermes_node(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        page.select_option("#filter-route", "hermes")
+        page.wait_for_timeout(400)
+        expect(page.locator(".node")).to_have_count(1)
+
+    def test_route_filter_selecting_ask_shows_only_ask_node(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        page.select_option("#filter-route", "ask")
+        page.wait_for_timeout(400)
+        expect(page.locator(".node")).to_have_count(1)
+
+    def test_no_node_label_is_a_literal_question_mark(self, page: Page, agents_base_url):
+        """The node label is an SVG `<text class="node-label">` whose text
+        lives in appended `<tspan>` children (graph.js's `renderNodeLabel`).
+        SVG `<text>` has no `innerText`, so Playwright's `all_inner_texts()`
+        (which reads `innerText`) returns `None` for every element here and
+        this assertion was vacuously true even against the pre-#863
+        `nodeLabel` that really does render a literal '?' (#863 review).
+        Read `textContent` instead, which SVG supports."""
+        errors = []
+        page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
+
+        _open_agents2(page, agents_base_url)
+        expect(page.locator(".node")).to_have_count(7)
+        # Let the force-layout / label-render tick settle before reading text.
+        page.wait_for_timeout(300)
+        labels = page.eval_on_selector_all(
+            "text.node-label", "els => els.map(e => e.textContent)"
+        )
+        assert len(labels) == 7
+        assert all((label or "").strip() != "?" for label in labels)
+        assert all((label or "").strip() != "" for label in labels)
+        # (#863 review round 3 finding Q) never a bare "Untitled" clobbering
+        # a real (non-Latin) title.
+        assert all((label or "").strip() != "Untitled" for label in labels)
+        assert errors == []
+
+    def test_node_label_renders_a_non_latin_title_not_untitled(self, page: Page, agents_base_url):
+        """(#863 review round 3 finding Q) `_fallback_label` used to return
+        "Untitled" for any title that tokenized to zero ASCII words —
+        firing for every non-Latin (CJK/Cyrillic/Greek/Arabic) or
+        emoji-only title, not just a genuinely empty one. Since "Untitled"
+        sits ABOVE `label` in `nodeLabel`'s precedence, it clobbered the
+        real title on screen. Fixed to return "" instead, so the node falls
+        through to `label` exactly as it already does for a raw-id
+        `short_label`."""
+        _open_agents2(page, agents_base_url)
+        page.wait_for_timeout(300)
+        rows = page.evaluate(
+            "() => Array.from(document.querySelectorAll('.node')).map(el => ({"
+            "session_id: el.__data__.session_id,"
+            "label: el.querySelector('text.node-label').textContent,"
+            "}))"
+        )
+        by_id = {r["session_id"]: r["label"] for r in rows}
+        rendered = (by_id["cc:nonlatin-title-session"] or "").replace(" ", "")
+        assert rendered == "検索インデックスをリファクタリングする".replace(" ", "")
+
+    def test_node_label_prefers_prompt_preview_over_a_raw_id_label(self, page: Page, agents_base_url):
+        """(#863) `nodeLabel`'s precedence guard used to compare with
+        `session_id.startsWith(label)`, which never matches a prefixed CLI
+        session id ("cc:<uuid>".startsWith("<uuid>") is false) — so the raw
+        id `label` the ingest falls back to shadowed the far more useful
+        `prompt_preview`. Fixed by comparing equality against the session id
+        with its "cc:"/"cx:" prefix stripped."""
+        _open_agents2(page, agents_base_url)
+        page.wait_for_timeout(300)
+        rows = page.evaluate(
+            "() => Array.from(document.querySelectorAll('.node')).map(el => ({"
+            "session_id: el.__data__.session_id,"
+            "label: el.querySelector('text.node-label').textContent,"
+            "}))"
+        )
+        by_id = {r["session_id"]: r["label"] for r in rows}
+        # Long labels wrap across multiple <tspan> children (renderNodeLabel
+        # in graph.js) without preserving the inter-word space, so compare
+        # with whitespace collapsed rather than the raw textContent.
+        rendered = (by_id["cc:0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42"] or "").replace(" ", "")
+        assert rendered == "fix the synthetic widget parser".replace(" ", "")
+
+    def test_node_label_suppresses_a_worker_label_that_equals_its_task_id(self, page: Page, agents_base_url):
+        """(#863) An orphaned worker row's `label` falls back to its bare
+        `task_id` in `_label_for_session`; the node label must not render
+        that raw id and must fall through to the next real candidate
+        (`model_label` here, since there's no `prompt_preview`)."""
+        _open_agents2(page, agents_base_url)
+        page.wait_for_timeout(300)
+        rows = page.evaluate(
+            "() => Array.from(document.querySelectorAll('.node')).map(el => ({"
+            "session_id: el.__data__.session_id,"
+            "label: el.querySelector('text.node-label').textContent,"
+            "}))"
+        )
+        by_id = {r["session_id"]: r["label"] for r in rows}
+        assert by_id["sess_label_orphan"] == "Local"
+
+    def test_panel_routing_badge_says_ask_not_a_model_name(self, page: Page, agents_base_url):
+        """panel.js's routingLabel() gains an `ask` arm (#863) — the side
+        panel's Routing badge must say "Ask", never fall through to the
+        default "Claude"."""
+        _open_agents2(page, agents_base_url)
+        page.locator("#search-input").fill("labeltest-ask")
+        result = page.locator(".search-result", has_text="labeltest-ask")
+        expect(result).to_be_visible()
+        result.click()
+        expect(page.locator("#panel [data-field=\"routing\"]")).to_have_text("Ask")
+
+    def test_panel_routing_badge_says_hermes(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        page.locator("#search-input").fill("labeltest-hermes")
+        result = page.locator(".search-result", has_text="labeltest-hermes")
+        expect(result).to_be_visible()
+        result.click()
+        expect(page.locator("#panel [data-field=\"routing\"]")).to_have_text("Hermes")

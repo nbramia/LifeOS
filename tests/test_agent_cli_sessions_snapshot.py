@@ -46,7 +46,12 @@ def client():
 def _fake_cc_transcript_row(session_id="cc:merge-target", **overrides):
     row = {
         "session_id": session_id,
-        "task_id": session_id.split(":", 1)[1],
+        # (#863 review) `to_session_dict` always sets `task_id: None` for a
+        # locally scanned session now — a real LifeOS task link only ever
+        # arrives via `_apply_cli_session_to_dict`'s overlay below. This
+        # fixture used to build the pre-#863 shape (the raw session id
+        # leaking into `task_id`), which no production code emits any more.
+        "task_id": None,
         "status": "inactive",
         "routing": "claude_code",
         "parent_session_id": None,
@@ -126,6 +131,55 @@ def test_remote_row_with_no_local_transcript(client, stores):
     assert row["status_inferred"] is False
     assert row["status"] == "idle"
     assert row["branch"] == "feat/x"
+
+
+@pytest.mark.unit
+def test_remote_row_label_prefers_prompt_preview(client, stores):
+    """#863: a remote CLI row's `label` used to always be the session id —
+    with no local transcript there was no human label at all, even though
+    `prompt_preview` was right there on the same row."""
+    session_store, _ = stores
+    session_store.record_cli_session_event(
+        engine="codex", event="user_prompt_submit",
+        session_id="labelled-remote", host="a-different-laptop",
+        cwd="/home/laptop/proj", prompt="refactor the synthetic widget",
+    )
+
+    r = client.get("/api/agents/snapshot")
+    sessions = r.json()["sessions"]
+    row = next(s for s in sessions if s["session_id"] == "cx:labelled-remote")
+    assert row["label"] == "refactor the synthetic widget"
+
+
+@pytest.mark.unit
+def test_remote_row_label_falls_back_to_session_id_without_prompt_preview(client, stores):
+    session_store, _ = stores
+    session_store.record_cli_session_event(
+        engine="codex", event="session_start",
+        session_id="unlabelled-remote", host="a-different-laptop",
+        cwd="/home/laptop/proj",
+    )
+
+    r = client.get("/api/agents/snapshot")
+    sessions = r.json()["sessions"]
+    row = next(s for s in sessions if s["session_id"] == "cx:unlabelled-remote")
+    assert row["label"] == "cx:unlabelled-remote"
+
+
+@pytest.mark.unit
+def test_cli_session_to_dict_unknown_engine_uses_engine_name_not_claude_tier():
+    """#863: an unrecognized `engine` on a `cli_sessions` row (defensive
+    only — the route only ever writes claude_code/codex) used to hardcode
+    `model_label = "Claude"`, a misleading Claude-tier guess."""
+    from api.services.agent_worker.session_store import CliSession
+    from api.routes.agents import _cli_session_to_dict
+
+    cli = CliSession(
+        session_id="xy:synthetic", engine="some_new_engine", host="a-laptop",
+        status="idle", started_at=1000, last_event_at=1000,
+    )
+    d = _cli_session_to_dict(cli)
+    assert d["model_label"] == "Some New Engine"
 
 
 @pytest.mark.unit
