@@ -177,7 +177,8 @@ def _move_card_in_state(board_state: dict, card_id: str, target_lane: str) -> No
 def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: list, lane_status_code: list,
                   schedule_puts: list, board_stream_frames: list, stream_gate: "threading.Event | None" = None,
                   lane_response: "list | None" = None, open_calls: "list | None" = None,
-                  open_response: "dict | None" = None, task_posts: "list | None" = None):
+                  open_response: "dict | None" = None, task_posts: "list | None" = None,
+                  cancel_calls: "list | None" = None):
     """Stub d3 (offline CDN) + every /api/ call the page makes.
 
     `open_calls`: appended with each opened card id (POST
@@ -237,6 +238,22 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             frame = board_stream_frames[frame_idx] if 0 <= frame_idx < len(board_stream_frames) else ""
             stream_attempt[0] += 1
             route.fulfill(status=200, content_type="text/event-stream", body=f"retry: 20\n: ok\n\n{frame}")
+            return
+
+        cancel_match = re.search(r"/api/agents/board/cards/([^/]+)/cancel$", url)
+        if cancel_match and method == "POST":
+            card_id = cancel_match.group(1)
+            if cancel_calls is not None:
+                cancel_calls.append(card_id)
+            _move_card_in_state(board_state, card_id, "done")
+            for cards in board_state["lanes"].values():
+                for card in cards:
+                    if card["id"] == card_id:
+                        card["status"] = "cancelled"
+            route.fulfill(
+                status=200, content_type="application/json",
+                body=json.dumps({"id": card_id, "lane": "done", "status": "cancelled", "tags": [], "killed": [], "failures": []}),
+            )
             return
 
         open_match = re.search(r"/api/agents/board/cards/([^/]+)/open$", url)
@@ -376,7 +393,7 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
 
 def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_puts=None, lane_status_code=None,
                  schedule_puts=None, board_stream_frames=None, stream_gate=None, lane_response=None,
-                 open_calls=None, open_response=None, task_posts=None):
+                 open_calls=None, open_response=None, task_posts=None, cancel_calls=None):
     _stub_routes(
         page,
         board_state if board_state is not None else _board_fixture(),
@@ -390,6 +407,7 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
         open_calls,
         open_response,
         task_posts,
+        cancel_calls,
     )
     page.goto(f"{base_url}/agents")
     page.wait_for_selector('[data-card-id="t1"]')
@@ -1875,3 +1893,136 @@ class TestNoConsoleErrorsMainFlow:
         expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
 
         assert errors == [], errors
+
+
+# ---------------------------------------------------------------------------
+# #881: human-move restrictions on agent-owned cards, and Cancel. `policy`
+# blocks below mirror exactly what `_card_policy` (api/routes/agents.py)
+# computes from `agent_board.evaluate_card_action` — the board/drawer never
+# re-derive these rules, they just read `card.policy`.
+# ---------------------------------------------------------------------------
+
+_WORKER_OWNED_REASON = (
+    "the worker owns this task while it is running or waiting on an "
+    "answer — answer or kill the session first"
+)
+_AGENT_OWNED_MANAGED_REASON = (
+    "agent-owned cards are managed by the agent — reassign, unassign, or "
+    "cancel this card instead"
+)
+_ONLY_WORKER_CLAIMS_REASON = "only the worker claims agent-assigned tasks"
+
+
+def _allowed(v=True, reason=None):
+    return {"allowed": v, "reason": reason}
+
+
+def _unclaimed_agent_owned_card(card_id="t8", lane="assigned", title="Deploy the staging build"):
+    """An unclaimed `#codex`-assigned card: reassign/unassign/cancel are
+    allowed, In progress/Human queue/Done are refused."""
+    return {
+        "kind": "task", "id": card_id, "title": title,
+        "notes": "", "status": "todo", "tags": ["codex"], "assignee": "codex",
+        "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+        "session": None, "pending_question": None,
+        "policy": {
+            "claimed": False, "agent_owned": True,
+            "cancel": _allowed(True),
+            "assignee": _allowed(True),
+            "fields": _allowed(True),
+            "lanes": {
+                "unassigned": _allowed(True), "assigned": _allowed(True),
+                "in_progress": _allowed(False, _ONLY_WORKER_CLAIMS_REASON),
+                "human_queue": _allowed(False, _AGENT_OWNED_MANAGED_REASON),
+                "review": _allowed(False, "lane 'review' cannot be set directly"),
+                "done": _allowed(False, _AGENT_OWNED_MANAGED_REASON),
+            },
+        },
+    }
+
+
+def _claimed_agent_owned_card(card_id="t9", lane="in_progress", title="Migrate the database"):
+    """A claimed (`agent-running`) `#codex` card: every lane, the assignee
+    picker, and the field pickers are refused; only Cancel is left."""
+    return {
+        "kind": "task", "id": card_id, "title": title,
+        "notes": "", "status": "in_progress", "tags": ["codex", "agent-running"], "assignee": "codex",
+        "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+        "session": None, "pending_question": None,
+        "policy": {
+            "claimed": True, "agent_owned": True,
+            "cancel": _allowed(True),
+            "assignee": _allowed(False, _WORKER_OWNED_REASON),
+            "fields": _allowed(False, _WORKER_OWNED_REASON),
+            "lanes": {lane_id: _allowed(False, _WORKER_OWNED_REASON if lane_id not in ("review",) else "lane 'review' cannot be set directly")
+                      for lane_id in ("unassigned", "assigned", "in_progress", "human_queue", "review", "done")},
+        },
+    }
+
+
+class TestAgentCardMoveRulesAndCancel:
+    def test_refused_drag_shows_toast_and_issues_no_lane_put(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append(_unclaimed_agent_owned_card())
+        lane_calls = []
+        _open_board(page, agents_base_url, board_state=board_state, lane_calls=lane_calls)
+
+        _drag_card(page, "t8", "human_queue")
+        expect(page.locator(".toast.error")).to_contain_text(_AGENT_OWNED_MANAGED_REASON, timeout=5000)
+        # The client-side policy check refused the move before any PUT —
+        # the server is still the authority for a stale board, but a fresh
+        # one never even makes the round trip.
+        assert lane_calls == []
+        expect(page.locator('.board-lane[data-lane="assigned"] [data-card-id="t8"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="human_queue"] [data-card-id="t8"]')).to_have_count(0)
+
+    def test_claimed_card_drawer_disables_assignee_and_field_pickers_with_visible_reason(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["in_progress"].append(_claimed_agent_owned_card())
+        _open_board(page, agents_base_url, board_state=board_state)
+
+        page.locator('[data-card-id="t9"]').click()
+        assignee = page.locator(".drawer-assignee")
+        expect(assignee).to_be_disabled()
+        expect(page.locator('[data-field="assignee-reason"]')).to_contain_text(_WORKER_OWNED_REASON)
+
+        effort = page.locator(".assignment-effort")
+        expect(effort).to_be_visible()
+        expect(effort).to_be_disabled()
+        host = page.locator(".assignment-host")
+        expect(host).to_be_disabled()
+        expect(page.locator('[data-field="error"]')).to_contain_text(_WORKER_OWNED_REASON)
+
+        # Kill is offered (there's no linked session in this fixture, so it
+        # isn't here) but no Resolve/Accept — Cancel is the only mutation
+        # left available on a claimed card.
+        expect(page.get_by_role("button", name="Cancel", exact=True)).to_be_visible()
+
+    def test_cancel_on_unclaimed_agent_card_posts_and_lands_in_done(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append(_unclaimed_agent_owned_card())
+        cancel_calls = []
+        _open_board(page, agents_base_url, board_state=board_state, cancel_calls=cancel_calls)
+
+        page.locator('[data-card-id="t8"]').click()
+        page.get_by_role("button", name="Cancel", exact=True).click()
+        expect(page.locator(".toast")).to_contain_text("Cancelled.", timeout=5000)
+        assert cancel_calls == ["t8"]
+        expect(page.locator('.board-lane[data-lane="assigned"] [data-card-id="t8"]')).to_have_count(0)
+        page.locator('[data-action="drawer-close"]').click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+        # Done is hidden by the default lane filter, and a cancelled card
+        # within it is further hidden behind "include cancelled" — reveal
+        # both to check (the card's `status` went to "cancelled", matching
+        # the real cancel endpoint's write).
+        _check_only_lanes(page, LANE_IDS)
+        page.locator("#board-filter-done").check()
+        expect(page.locator('.board-lane[data-lane="done"] [data-card-id="t8"]')).to_be_visible(timeout=5000)
+
+    def test_cancel_button_absent_when_policy_forbids_it(self, page: Page, agents_base_url):
+        """A plain `me`-assigned card (t2 in the fixture) has no `policy`
+        block at all — Cancel must not appear (defaults to not-offered,
+        never shown speculatively)."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.get_by_role("button", name="Cancel", exact=True)).to_have_count(0)

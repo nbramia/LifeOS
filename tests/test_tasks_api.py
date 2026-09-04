@@ -381,6 +381,108 @@ class TestTasksAPI:
         assert response.status_code == 422
         assert "must not contain" in response.json()["detail"]
 
+    # --- #881: board-marker guard on the field/assignee pickers' writes ---
+
+    def _set_current(self, mock_task_manager, *, status="todo", tags=None):
+        from api.services.task_manager import Task
+        current = Task(
+            id="abc12345", description="Pull 1099 from Schwab", status=status,
+            tags=list(tags or []), source_file="LifeOS/Tasks/Finance.md", line_number=7,
+        )
+        mock_task_manager.get.return_value = current
+        return current
+
+    def test_board_marker_field_edit_on_claimed_card_is_409_and_nothing_written(self, client, mock_task_manager):
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
+            "fields": {"effort": "high", "host": None, "assigned_by": "board"},
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        mock_task_manager.update.assert_not_called()
+
+    def test_board_marker_assignee_change_on_claimed_card_is_409_and_nothing_written(self, client, mock_task_manager):
+        self._set_current(mock_task_manager, tags=["codex", "agent-blocked"])
+        response = client.put("/api/tasks/abc12345", json={
+            "tags": ["hermes"],
+            "fields": {"effort": None, "host": None, "assigned_by": "board"},
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        mock_task_manager.update.assert_not_called()
+
+    def test_board_marker_case_insensitive_and_stripped(self, client, mock_task_manager):
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
+            "fields": {"model": "claude-opus-5", "assigned_by": "  Board  "},
+        })
+        assert response.status_code == 409
+        mock_task_manager.update.assert_not_called()
+
+    def test_same_patch_without_board_marker_succeeds_on_claimed_card(self, client, mock_task_manager):
+        """No `assigned_by: board` marker -> the guard never runs, matching
+        today's behavior exactly (agent-side/vault-side writes)."""
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
+            "fields": {"effort": "high", "host": None},
+        })
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_board_marker_field_edit_on_unclaimed_agent_card_succeeds(self, client, mock_task_manager):
+        self._set_current(mock_task_manager, tags=["codex"])
+        response = client.put("/api/tasks/abc12345", json={
+            "fields": {"effort": "high", "host": None, "assigned_by": "board"},
+        })
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_board_marker_assignee_change_on_unclaimed_agent_card_succeeds(self, client, mock_task_manager):
+        self._set_current(mock_task_manager, tags=["codex"])
+        response = client.put("/api/tasks/abc12345", json={
+            "tags": ["hermes"],
+            "fields": {"effort": None, "host": None, "assigned_by": "board"},
+        })
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_board_marker_without_model_effort_host_or_assignee_change_skips_guard(self, client, mock_task_manager):
+        """The marker alone doesn't trigger a refusal — only an actual
+        model/effort/host change or an assignee-changing tag patch does."""
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
+            "fields": {"assigned_by": "board"},
+        })
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_board_marker_tags_unchanged_assignee_skips_assignee_check(self, client, mock_task_manager):
+        """The same assignee tag re-sent (no actual assignee change) must
+        not trip the assignee_change guard even on a claimed card."""
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
+            "tags": ["codex", "extra-label"],
+            "fields": {"assigned_by": "board"},
+        })
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_board_marker_missing_task_is_404(self, client, mock_task_manager):
+        mock_task_manager.get.return_value = None
+        response = client.put("/api/tasks/abc12345", json={
+            "fields": {"effort": "high", "assigned_by": "board"},
+        })
+        assert response.status_code == 404
+        mock_task_manager.update.assert_not_called()
+
+    def test_no_fields_patch_never_reads_current_task(self, client, mock_task_manager):
+        """No `fields` in the request at all -> the guard short-circuits
+        before ever calling `manager.get` (no extra read on the hot path)."""
+        response = client.put("/api/tasks/abc12345", json={"priority": "high"})
+        assert response.status_code == 200
+        mock_task_manager.get.assert_not_called()
+        mock_task_manager.update.assert_called_once()
+
     # --- COMPLETE ---
 
     def test_complete_task(self, client, mock_task_manager):

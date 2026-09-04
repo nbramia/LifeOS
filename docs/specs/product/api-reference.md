@@ -387,6 +387,14 @@ Update a task (description, status, context, priority, due_date, tags,
 notes, fields). `fields` merges into the task's operator/unknown fields — a
 string value sets a field, a `null` value removes it.
 
+When `fields.assigned_by` is `"board"` (the marker the `/agents` board's
+own pickers stamp on every write) and the patch changes `model`, `effort`,
+`host`, or the derived assignee, this endpoint enforces the same
+claimed-card rule the board's lane endpoint does — **409** on a card the
+worker has claimed, with no write. Requests without that marker (agent-
+side or vault-side writes) are unaffected. See [Agent Viz —
+Product](agent-viz.md#human-moves-on-agent-owned-cards).
+
 ### PUT /api/tasks/{id}/complete
 
 Mark a task as done (adds done date automatically).
@@ -472,14 +480,18 @@ assignee tag; `lane: "assigned"` requires `assignee` (one of
 tag. `review` and `scheduled` can't be set directly (derived from a tag
 and the scheduler store, respectively) and return **400**.
 
-Three **409** cases, no write in any of them:
+Four **409** cases, no write in any of them:
 - The card is worker-owned (`agent-running` or `agent-blocked` tag
-  present) and `lane` is `in_progress` or `done` — the worker owns this
-  card while it's running or waiting on an answer; answer the question or
-  kill the session first.
+  present) — **every** `lane` is refused, not just `in_progress`/`done`
+  — the worker owns this card while it's running or waiting on an answer;
+  answer the question or kill the session first.
 - The card's assignee is an agent engine that hasn't been claimed by the
   worker yet and `lane` is `in_progress` — only the agent worker claims
   agent-assigned tasks.
+- The card's assignee is an agent engine that hasn't been claimed by the
+  worker yet (and isn't a pending review) and `lane` is `human_queue` or
+  `done` — agent-owned cards are managed by the agent; reassign, unassign,
+  or cancel (see below) instead of dragging it there.
 - The card is a pending review (`agent-completed` tag without `accepted`)
   and `lane` is `in_progress` or `human_queue` — accept or reject the
   review first. `lane: "done"` on a pending review still succeeds and acts
@@ -491,11 +503,33 @@ the requested lane if a higher-priority signal still applies — e.g. a
 Human-queue card assigned to someone stays in Human queue. The web board
 toasts when this happens.
 
+Every task card in `GET /api/agents/board`'s response also carries a
+server-computed `policy` block (`{claimed, agent_owned, cancel, assignee,
+fields, lanes}`, each of `cancel`/`assignee`/`fields`/`lanes.<lane>` an
+`{allowed, reason}` pair) derived from the exact same rules this endpoint
+enforces — see [Agent Viz — Technical](../technical/agent-viz.md) for the
+shape. The board and drawer read this instead of re-implementing the
+rules, so they can't disagree with what a write actually does.
+
 ### POST /api/agents/board/cards/{id}/accept
 
 Move a Review card to Done by adding the `accepted` tag. Idempotent.
 Returns **409** if the card isn't in the Review lane and isn't already
 accepted.
+
+### POST /api/agents/board/cards/{id}/cancel
+
+Cancel an agent-assigned card — available whether or not the worker has
+claimed it, unlike a lane drag. If a live session is linked, kills it and
+every descendant in its subtree (the same teardown `POST
+/sessions/{id}/kill` performs), then marks the task `cancelled`, which
+derives to the Done lane (behind "include cancelled"). Idempotent: calling
+this on an already-cancelled card returns the current state and touches no
+session. Returns **409** `"accept or reject the review"` for a pending
+review, or **409** `"cancel is only available for agent-assigned cards"`
+for a card whose assignee isn't an agent engine (`#me` or unassigned).
+Response: `{id, lane, status, tags, killed: [session_id, ...], failures:
+[{session_id, reason}, ...]}`.
 
 ### GET /api/agents/pending-questions
 

@@ -151,18 +151,19 @@ rule as every other agent.
 
 The **Morning Briefing** proactive reminder's prompt
 (`scripts/seed_proactive_reminders.py`'s `MORNING_BRIEFING_PROMPT`) has a
-**Waiting on You** section instructing the orchestrator to call
+**Human queue** section instructing the orchestrator to call
 `manage_human_queue` (action `list`) and report cards shown as 24h old or
 older, skipping the section when there are none.
 
 If your Morning Briefing scheduler entry was seeded before this section
-existed, it won't pick up the change on its own. Re-running
+existed (or before it was renamed from "Waiting on You" — #881), it won't
+pick up the change on its own. Re-running
 `scripts/seed_proactive_reminders.py --force` does **not** update it —
 `--force` only skips the by-name existence check, and `SchedulerStore.create`
 always inserts a new entry, so it would leave you with two Morning Briefing
 schedules. Instead, either edit the existing entry's prompt by hand to add
-a **Waiting on You** paragraph like the one above, or delete that entry
-first and then re-run the seed script to recreate it from the current
+(or rename) a **Human queue** paragraph like the one above, or delete that
+entry first and then re-run the seed script to recreate it from the current
 prompt.
 
 ## Related Documents
