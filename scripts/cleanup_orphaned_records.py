@@ -83,6 +83,34 @@ def cleanup_orphaned_records(dry_run: bool = True) -> dict:
         print(f"  Deleted: {cursor.rowcount}")
         stats['deleted_facts'] = cursor.rowcount
 
+    # 2b. Count orphaned tone_analysis_results (#910). Unlike the other
+    # tables here, this one is created lazily by ToneAnalysisStore on its
+    # first use (api/services/tone_analysis_store.py), so it may not exist
+    # yet on an install where tone analysis has never run -- guarded,
+    # unlike the always-present tables above.
+    tone_table_exists = cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='tone_analysis_results'"
+    ).fetchone()
+    if tone_table_exists:
+        cursor.execute("""
+            SELECT COUNT(*) FROM tone_analysis_results t
+            WHERE NOT EXISTS (SELECT 1 FROM valid_person_ids v WHERE v.id = t.person_id)
+        """)
+        orphan_tone_rows = cursor.fetchone()[0]
+        print(f"Orphaned tone_analysis_results: {orphan_tone_rows}")
+        stats['orphan_tone_rows'] = orphan_tone_rows
+
+        if not dry_run and orphan_tone_rows > 0:
+            cursor.execute("""
+                DELETE FROM tone_analysis_results
+                WHERE NOT EXISTS (SELECT 1 FROM valid_person_ids v WHERE v.id = tone_analysis_results.person_id)
+            """)
+            print(f"  Deleted: {cursor.rowcount}")
+            stats['deleted_tone_rows'] = cursor.rowcount
+    else:
+        print("Orphaned tone_analysis_results: table not present, skipping")
+        stats['orphan_tone_rows'] = 0
+
     # 3. Count orphaned link_overrides
     cursor.execute("""
         SELECT COUNT(*) FROM link_overrides o

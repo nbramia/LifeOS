@@ -1,7 +1,7 @@
 # Troubleshooting
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-28
+> **Last Updated:** 2026-09-04
 > **Audience:** Operators
 
 Common issues and solutions organized by category.
@@ -57,8 +57,8 @@ kill -9 <PID>
 # Check status
 ./scripts/server.sh status
 
-# Check error logs
-tail -50 logs/lifeos-api-error.log
+# Check error logs (Linux systemd: logs/server.log; macOS launchd: logs/lifeos-api-error.log)
+tail -50 logs/server.log
 
 # Run in the foreground to watch startup errors live (Ctrl+C to stop)
 ./scripts/server.sh foreground
@@ -355,7 +355,10 @@ curl http://localhost:8000/health/full | jq
 ### View Logs
 
 ```bash
-# API server
+# API server (Linux systemd — combined stdout+stderr)
+tail -f logs/server.log
+
+# API server (macOS launchd — separate stdout/stderr)
 tail -f logs/lifeos-api.log
 tail -f logs/lifeos-api-error.log
 

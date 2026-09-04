@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-05-27
+**Last Updated:** 2026-09-04
 
 The D3 force-directed graph at `/crm` plus the multi-source `Relationship` model that backs it. Covers connection discovery, edge-weight calculation, source-filter UI, and the graph rendering itself.
 
@@ -83,7 +83,113 @@ D3-based force-directed graph that renders the selected person's network.
 - Clicking a node navigates to that person; hovering shows a tooltip with name and company.
 - Toggle the labels and reset-zoom controls in the toolbar.
 - Re-renders when the person selection changes.
-- Renders < 2s for ~30 nodes.
+- Renders in roughly half a second on the real dataset regardless of how
+  large the underlying contact graph is, because the server returns a
+  bounded neighborhood rather than the full relationship set (see Bounded
+  Neighborhood below); the client-side strength slider then further narrows
+  that bounded set to the ~25 first-degree nodes the graph is designed to
+  display at once.
+
+### Bounded Neighborhood
+
+`GET /api/crm/network?center_on=<id>` (used by the Graph tab) never loads
+every relationship. Node selection:
+
+1. The center person (degree 0), resolved to its canonical id first — a
+   merged/legacy `center_on` id still resolves to the surviving person.
+   The center is always present in the response *unless it is hidden*, in
+   which case it (and anything reachable only through it) is dropped the
+   same way a hidden person is dropped anywhere else in the CRM — the
+   response can end up with zero nodes if the hidden person also has no
+   real relationships, but that isn't guaranteed for every hidden person.
+   If the center is filtered out this way, edges naming it are omitted too
+   (see Edge selection below).
+2. The center's strongest first-degree connections (degree 1) — up to
+   `max_nodes - 1` when `depth=1`, or up to 75% of `max_nodes` when
+   `depth >= 2` (see the next point for why). Ranked by the same value the
+   response renders as edge weight: for an edge to the CRM owner, the other
+   person's `relationship_strength`; otherwise the pair's own
+   `pair_strength`. This ranking uses one indexed query for the center's own
+   relationships, not the full relationship table.
+3. For `depth=2` (the Graph tab's default), the *remaining* node budget goes
+   to deeper hops: each first-degree node, processed strongest first,
+   contributes up to `max_second_degree_per_node` (default `10`) of its own
+   strongest connections, ranked by a cheaper sum-of-shared-interaction-counts
+   proxy, until `max_nodes` is reached. First-degree selection reserving
+   ~25% of the budget for this tier (rather than consuming the whole budget
+   itself) is what makes second-degree nodes actually appear for a
+   well-connected center. A node that has a genuine direct relationship to
+   the center but missed the first-degree cut, and is then re-discovered
+   through a friend, is relabeled `degree: 1` (and given its own center
+   edge) rather than being shown as second-degree — `degree` always means
+   "has a direct edge to the center," not "was found in the first pass."
+
+A relationship row referencing a legacy (merged-away) person id is resolved
+to its canonical id before any of this ranking or de-duplication, so a
+stale id in the underlying data can't produce a duplicate node or a
+first-degree node with no edge back to the center.
+
+Edge selection: every edge connecting the center to a first-degree node is
+always included, regardless of `max_edges` — this is what guarantees every
+first-degree node has an edge to the center — except when the center itself
+was dropped by the `category`/`min_strength` filters below, in which case no
+center edges are emitted (there is no center node left for them to connect
+to). The remaining edge budget (`max_edges` minus those center edges) is
+filled with the strongest remaining edges among the selected nodes, by the
+same rendered edge weight. Without this cap, the induced subgraph among a
+well-connected center's neighbors is close to complete (up to `max_nodes`
+choose 2 edges) — capping it means the strength slider's bottom end may
+show fewer inter-node edges than an uncapped response would have.
+
+`category`, if set, is applied during first-degree selection over a window
+of the 3×`max_nodes` strongest candidates (categories computed via the same
+batched source-entity lookup `GET /people` uses), then the top slots are
+taken from the survivors — best-effort: a category concentrated outside
+that window is under-represented in the result. Deeper-hop candidates use a
+cheaper per-person category check with no batched fetch. Every node's
+`category` field, and whether it survives this filter, both come from the
+same computation for that node (either the batched one during selection, or
+the cheap one otherwise) — an id is never selected under one category
+decision and then dropped, or kept, under a different one. `min_strength` is
+applied to already-selected nodes exactly as it always was, against
+`relationship_strength` on its 0–100 scale — since the parameter itself is
+only accepted up to 1.0, the only nodes it can drop are those with a
+`relationship_strength` below 1.0 (in practice, strength-0 nodes).
+
+A well-connected center often has few or no genuine friends-of-friends left
+to fill the deeper-hop tier once its own direct connections are excluded
+from that tier (point 3 above) — so any of that tier's budget that goes
+unspent is backfilled from the center's next-strongest direct candidates
+that missed the first-degree cut. They're real first-degree people (see the
+relabeling note above), so a dense center's response still reaches
+`max_nodes` rather than coming back short.
+
+The Graph tab's own auto-selected strength-slider threshold
+never picks a threshold that would hide
+every first-degree node, and returns 0 outright when every first-degree
+edge shares one weight (there's no discriminating threshold to pick in that
+case) — without this, bounding the edge set could put a real person's
+graph in a state where it rendered nothing at all on first load.
+
+Query parameters:
+
+| Parameter | Range | Default | Meaning |
+|---|---|---|---|
+| `max_nodes` | 1–500 | 150 | Total nodes in the response, including the center |
+| `max_second_degree_per_node` | 0–50 | 10 | Second-(and deeper-)degree neighbors added per node at the previous depth |
+| `max_edges` | 1–20000 | 2000 | Target maximum edges; every edge touching the center is always included even if that alone exceeds this |
+| `allow_full_graph` | bool | false | Opt-in to load every person and relationship (no `center_on`); ignores the three caps above |
+
+The Graph tab sends only `center_on` and `depth`, leaving the caps above at
+their server defaults so a future default change reaches the tab without a
+frontend edit.
+
+`allow_full_graph=true` combined with `category` now filters every person by
+the same dynamically-computed category the response displays for them,
+rather than their raw stored `category` field — more self-consistent than before (a person's displayed
+category and whether a category filter kept them can no longer disagree),
+and the only externally-visible change to the full-graph path from this
+issue's otherwise-untouched behavior.
 
 **Graph enhancements:**
 
@@ -170,7 +276,7 @@ class RelationshipDetailResponse(BaseModel):
     weight: int = 0
 ```
 
-The network endpoint (`/api/crm/people/{id}/network`) includes the same breakdown per edge so the graph can filter and re-weight client-side.
+The network endpoint (`GET /api/crm/network?center_on={id}`) includes the same breakdown per edge so the graph can filter and re-weight client-side.
 
 ---
 
@@ -221,9 +327,10 @@ Per-source weights are configurable. The graph respects the source-filter select
 
 ## Related Documents
 
+- [api-crm.md](api-crm.md) — API endpoint reference for the graph/relationship data described here
 - [crm-ui.md](crm-ui.md) — CRM index
 - [crm-people.md](crm-people.md) — Person list/detail, Dunbar circles (drives graph filtering and coloring)
 - [crm-interactions.md](crm-interactions.md) — The per-source observations the discovery job aggregates over
 - [crm-analytics.md](crm-analytics.md) — Dashboards that share the underlying relationship model
-- [Frontend](../technical/frontend.md) — D3 / vanilla-JS implementation details
+- [Frontend](../technical/frontend.md#network-graph) — D3 / vanilla-JS implementation details, including the bounded-neighborhood loading pointer back here
 - [Agent Viz](agent-viz.md) — The other D3 force-graph in LifeOS; the two share visual conventions and code patterns

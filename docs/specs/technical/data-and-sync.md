@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Data Pipeline
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-04
 
 How LifeOS ingests and stores data from multiple sources.
 
@@ -191,8 +191,20 @@ auto-resolved by the next successful run of that source.
 | SourceEntity | `data/crm.db` | Raw observations | All sync scripts |
 | Interactions | `data/interactions.db` | Interactions per person | People v2 sync, Slack sync |
 | Relationships | `data/crm.db` | Person-to-person edges | Relationship discovery |
+| Tone Analysis | `data/crm.db` (`tone_analysis_results` table) | Cached per-person/month relationship tone scores | Relationship Dashboard tone refresh (see [crm-analytics.md § Tone Analysis APIs](../product/crm-analytics.md#tone-analysis-apis)) |
 | iMessage | `data/imessage.db` | Message export cache | iMessage sync |
 | Gmail Skip Cache | `data/gmail_skip_cache.db` | Message IDs already judged marketing, per account | Gmail sync |
+
+`tone_analysis_results` schema (`api/services/tone_analysis_store.py`):
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `person_id` | TEXT | Part of the composite primary key |
+| `period_key` | TEXT | `YYYY-MM`; part of the composite primary key |
+| `interaction_count` | INTEGER | Stored count used for the freshness check (a month is stale once its live count diverges) |
+| `result` | TEXT | JSON-encoded scores for the period |
+| `model` | TEXT | LLM model that produced `result` |
+| `created_at` / `updated_at` | TEXT | Timestamps |
 
 ### Backups
 

@@ -23,6 +23,30 @@ cd "$PROJECT_ROOT"
 # git call below (and inside pytest) resolves via cwd.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
 
+# git invokes pre-push as `pre-push <remote name> <remote url>`. An SSH push
+# URL holds a connection open for this whole gate (~9 min), and GitHub closes
+# an idle SSH session after ~6 min -- so a push over SSH can fail with
+# "Connection closed by remote host" even after every test passed (#886).
+# Warn once with the HTTPS equivalent and keep going; never fail the push
+# over this. `./scripts/setup-hooks.sh` configures the HTTPS push URL so this
+# should not normally fire.
+REMOTE_PUSH_URL="${2:-}"
+case "$REMOTE_PUSH_URL" in
+    git@*:*)
+        _rest="${REMOTE_PUSH_URL#git@}"
+        _host="${_rest%%:*}"
+        _path="${_rest#*:}"
+        echo "Warning: pushing over SSH ($REMOTE_PUSH_URL) can outlive GitHub's ~6-minute idle limit during this gate. Prefer: https://${_host}/${_path}"
+        unset _rest _host _path
+        ;;
+    ssh://*)
+        _rest="${REMOTE_PUSH_URL#ssh://}"
+        _rest="${_rest#*@}"
+        echo "Warning: pushing over SSH ($REMOTE_PUSH_URL) can outlive GitHub's ~6-minute idle limit during this gate. Prefer: https://${_rest}"
+        unset _rest
+        ;;
+esac
+
 # Detect what's being pushed so we can skip tests on docs-only pushes.
 # git feeds pre-push hooks lines of "local_ref local_sha remote_ref remote_sha" on stdin.
 CHANGED_FILES=""

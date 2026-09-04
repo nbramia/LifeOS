@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Frontend
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-09-04
 
 UI components, patterns, and implementation details for LifeOS web interfaces.
 
@@ -137,6 +137,10 @@ function createObsidianLink(filePath) {
 └────────────────────────┴────────────────────────────────────┘
 ```
 
+### Client-Side Navigation
+
+Moving between the CRM's dashboards (Me, Family, Birthdays, Relationship, the person list at `/crm`), and between a person's tabs (Overview/Timeline/Network), is entirely client-side: `navigateTo()`/`selectPerson()`/`switchTab()` update the URL with `history.pushState` and dispatch straight to the target view's existing initializer, with no document reload. Browser back/forward restores the previous view the same way, and a dashboard's in-memory state (its own cached aggregates) persists for the life of the tab. A full page reload or a direct link/bookmark still renders every URL exactly as a fresh visit. Product-level behavior: [crm-ui.md § Navigation](../product/crm-ui.md#navigation).
+
 ### Network Graph
 
 D3.js force-directed graph visualization:
@@ -181,6 +185,10 @@ function calculateOptimalEdgeThreshold(nodes, links, centerId, targetNodeCount =
 ```
 
 The threshold is recalculated each time a different person is selected as the center node.
+
+**Bounded Neighborhood Loading:**
+
+`GET /api/crm/network?center_on={id}` never loads the full relationship table — it returns a bounded neighborhood (the center, its strongest first-degree connections, then a limited number of deeper-hop nodes per node) capped by `max_nodes`, `max_second_degree_per_node`, and `max_edges`. The Graph tab sends only `center_on` and `depth`, leaving the caps at their server defaults. Full node/edge selection algorithm: [crm-graph.md § Bounded Neighborhood](../product/crm-graph.md#bounded-neighborhood).
 
 ### Relationship Strength Visualization
 

@@ -47,6 +47,7 @@ class SearchResponse(BaseModel):
     people: list[PersonResponse]
     count: int
     query: str
+    total: Optional[int] = None
 
 
 class StatisticsResponse(BaseModel):
@@ -92,7 +93,11 @@ class InteractionsResponse(BaseModel):
     formatted_history: str = ""
 
 
-def _entity_to_response(entity, include_channels: bool = True) -> PersonResponse:
+def _entity_to_response(
+    entity,
+    include_channels: bool = True,
+    precomputed_recency: Optional[dict[str, datetime]] = None,
+) -> PersonResponse:
     """
     Convert PersonEntity to API response.
 
@@ -100,6 +105,11 @@ def _entity_to_response(entity, include_channels: bool = True) -> PersonResponse
         entity: PersonEntity to convert
         include_channels: If True, fetch active_channels from InteractionStore.
                          Set to False for bulk operations to improve performance.
+        precomputed_recency: If given, use this source_type -> last-interaction
+                         datetime map instead of querying InteractionStore for
+                         this entity. Lets callers batch the recency lookup for
+                         a whole page of results with one query instead of one
+                         per person. Ignored when include_channels is False.
     """
     # Basic fields from entity
     response = PersonResponse(
@@ -135,8 +145,11 @@ def _entity_to_response(entity, include_channels: bool = True) -> PersonResponse
     # Fetch active channels if requested (uses new get_last_interaction_by_source)
     if include_channels and entity.id:
         try:
-            interaction_store = get_interaction_store()
-            recency_by_source = interaction_store.get_last_interaction_by_source(entity.id)
+            if precomputed_recency is not None:
+                recency_by_source = precomputed_recency
+            else:
+                interaction_store = get_interaction_store()
+                recency_by_source = interaction_store.get_last_interaction_by_source(entity.id)
 
             now = datetime.now(timezone.utc)
             active = []
@@ -155,43 +168,87 @@ def _entity_to_response(entity, include_channels: bool = True) -> PersonResponse
 
 
 @router.get("/search", response_model=SearchResponse)
-async def search_people(
+def search_people(
     q: str = Query(..., description="Search query for name or email"),
+    limit: int = Query(default=20, ge=1, le=200, description="Max results to return"),
 ):
-    """Search for people by name or email."""
+    """
+    Search for people by name, email, alias, or display name.
+
+    Matching runs in SQL (PersonEntityStore.search, an indexed LIKE scan)
+    instead of loading every person into Python and substring-scanning them.
+    A generous internal candidate cap (`limit * 5`, minimum 200) is fetched
+    from the store so the existing relevance ordering -- exact canonical-name
+    match first, then most recent `last_seen` -- is preserved within the
+    returned page. For a query with more than `candidate_cap` total matches,
+    the *canonical-name* exact match could otherwise fall outside that
+    window (it's ranked by recency like everything else while the store
+    fetches candidates), so it's looked up separately via the store's
+    indexed `person_names` table (`get_by_name`, an O(1) lookup) and spliced
+    into the candidate set when it isn't already present -- restoring "your
+    own exact name always finds you" for single-token names with thousands
+    of substring matches, at the cost of one extra indexed lookup per
+    request.
+    """
     store = get_person_entity_store()
-    all_entities = store.get_all()
-
-    # Search by name, email, or aliases
     query_lower = q.lower()
-    results = []
-    for entity in all_entities:
-        if query_lower in entity.canonical_name.lower():
-            results.append(entity)
-        elif any(query_lower in email.lower() for email in entity.emails):
-            results.append(entity)
-        elif any(query_lower in alias.lower() for alias in entity.aliases):
-            results.append(entity)
-        elif entity.display_name and query_lower in entity.display_name.lower():
-            results.append(entity)
 
-    # Sort by relevance (exact matches first, then by last_seen)
-    results.sort(
+    candidate_cap = max(limit * 5, 200)
+    candidates = store.search(q, limit=candidate_cap)
+
+    # Guarantee the exact canonical-name match is always a candidate, even
+    # when it doesn't fall within the store's recency-ordered candidate
+    # window (see docstring). `get_by_name` is an indexed exact lookup on
+    # person_names, not a substring scan, so this is cheap regardless of how
+    # many people match `q` as a substring.
+    candidate_ids = {e.id for e in candidates if e.id}
+    exact_owner = store.get_by_name(q)
+    if (
+        exact_owner is not None
+        and exact_owner.id not in candidate_ids
+        and not exact_owner.hidden
+        and exact_owner.canonical_name.lower() == query_lower
+    ):
+        candidates.append(exact_owner)
+
+    # Sort by relevance (exact matches first, then by last_seen) -- same
+    # ordering the old full-scan implementation used.
+    candidates.sort(
         key=lambda e: (
             e.canonical_name.lower() != query_lower,  # Exact match first
             -(e.last_seen.timestamp() if e.last_seen else 0)  # Recent first
         )
     )
+    results = candidates[:limit]
+
+    # Batch the recency-by-source lookup for the whole page in one query
+    # instead of one per person (the old N+1 cost). A person absent from the
+    # batch result genuinely has no interactions -- get_last_interaction_by_
+    # source_batch() documents that IDs with none are simply absent, so this
+    # must be `{}` (a real "no recency data" answer), not `None`, or
+    # _entity_to_response falls back to its own per-person query for every
+    # such person and the N+1 cost this batching exists to remove comes right
+    # back.
+    interaction_store = get_interaction_store()
+    recency_map = interaction_store.get_last_interaction_by_source_batch(
+        [e.id for e in results if e.id]
+    )
+
+    total = store.count_search(q)
 
     return SearchResponse(
-        people=[_entity_to_response(e) for e in results],
+        people=[
+            _entity_to_response(e, precomputed_recency=recency_map.get(e.id, {}))
+            for e in results
+        ],
         count=len(results),
         query=q,
+        total=total,
     )
 
 
 @router.get("/person/{name}", response_model=PersonResponse)
-async def get_person(name: str):
+def get_person(name: str):
     """Get a specific person by name."""
     resolver = get_entity_resolver()
     result = resolver.resolve(name=name)
@@ -203,7 +260,7 @@ async def get_person(name: str):
 
 
 @router.get("/statistics", response_model=StatisticsResponse)
-async def get_statistics():
+def get_statistics():
     """Get statistics about aggregated people."""
     store = get_person_entity_store()
     stats = store.get_statistics()
@@ -216,36 +273,34 @@ async def get_statistics():
 
 
 @router.get("/list", response_model=SearchResponse)
-async def list_people(
+def list_people(
     limit: int = Query(default=50, ge=1, le=500, description="Max results"),
     category: Optional[str] = Query(default=None, description="Filter by category"),
 ):
     """List all people, optionally filtered by category."""
     store = get_person_entity_store()
-    all_entities = store.get_all()
+    entities = store.list_recent(limit=limit, category=category)
 
-    # Filter by category if specified
-    if category:
-        all_entities = [e for e in all_entities if e.category == category]
-
-    # Sort by last_seen (most recent first)
-    all_entities.sort(
-        key=lambda e: e.last_seen or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True
+    # Same batched recency lookup as search_people() -- without it this
+    # became the endpoint with the N+1 (one interaction-store query per
+    # returned person, up to `limit`=500).
+    interaction_store = get_interaction_store()
+    recency_map = interaction_store.get_last_interaction_by_source_batch(
+        [e.id for e in entities if e.id]
     )
 
-    # Limit results
-    all_entities = all_entities[:limit]
-
     return SearchResponse(
-        people=[_entity_to_response(e) for e in all_entities],
-        count=len(all_entities),
+        people=[
+            _entity_to_response(e, precomputed_recency=recency_map.get(e.id, {}))
+            for e in entities
+        ],
+        count=len(entities),
         query="*",
     )
 
 
 @router.post("/resolve", response_model=EntityResolveResponse)
-async def resolve_entity(request: EntityResolveRequest) -> EntityResolveResponse:
+def resolve_entity(request: EntityResolveRequest) -> EntityResolveResponse:
     """
     **PRIMARY TOOL for finding someone's email, full name, and contact info from a nickname or partial name.**
 
@@ -283,7 +338,7 @@ async def resolve_entity(request: EntityResolveRequest) -> EntityResolveResponse
 
 
 @router.get("/entity/{entity_id}", response_model=PersonResponse)
-async def get_entity(entity_id: str):
+def get_entity(entity_id: str):
     """Get a specific entity by ID."""
     store = get_person_entity_store()
     entity = store.get_by_id(entity_id)
@@ -295,7 +350,7 @@ async def get_entity(entity_id: str):
 
 
 @router.get("/entity/{entity_id}/interactions", response_model=InteractionsResponse)
-async def get_entity_interactions(
+def get_entity_interactions(
     entity_id: str,
     days_back: int = Query(default=90, ge=1, le=365, description="Days to look back"),
     limit: int = Query(default=50, ge=1, le=200, description="Max interactions"),
@@ -338,38 +393,38 @@ async def get_entity_interactions(
 
 # Legacy v2 endpoints (redirect to main endpoints for backward compatibility)
 @router.post("/v2/resolve", response_model=EntityResolveResponse, include_in_schema=False)
-async def resolve_entity_v2(request: EntityResolveRequest) -> EntityResolveResponse:
+def resolve_entity_v2(request: EntityResolveRequest) -> EntityResolveResponse:
     """Legacy v2 endpoint - redirects to main resolve endpoint."""
-    return await resolve_entity(request)
+    return resolve_entity(request)
 
 
 @router.get("/v2/entities", response_model=SearchResponse, include_in_schema=False)
-async def list_entities_v2(
+def list_entities_v2(
     limit: int = Query(default=50, ge=1, le=500),
     category: Optional[str] = Query(default=None),
 ):
     """Legacy v2 endpoint - redirects to main list endpoint."""
-    return await list_people(limit=limit, category=category)
+    return list_people(limit=limit, category=category)
 
 
 @router.get("/v2/entity/{entity_id}", response_model=PersonResponse, include_in_schema=False)
-async def get_entity_v2(entity_id: str):
+def get_entity_v2(entity_id: str):
     """Legacy v2 endpoint - redirects to main entity endpoint."""
-    return await get_entity(entity_id)
+    return get_entity(entity_id)
 
 
 @router.get("/v2/entity/{entity_id}/interactions", response_model=InteractionsResponse, include_in_schema=False)
-async def get_entity_interactions_v2(
+def get_entity_interactions_v2(
     entity_id: str,
     days_back: int = Query(default=90, ge=1, le=365),
     limit: int = Query(default=50, ge=1, le=200),
 ):
     """Legacy v2 endpoint - redirects to main interactions endpoint."""
-    return await get_entity_interactions(entity_id, days_back=days_back, limit=limit)
+    return get_entity_interactions(entity_id, days_back=days_back, limit=limit)
 
 
 @router.get("/v2/statistics", include_in_schema=False)
-async def get_v2_statistics():
+def get_v2_statistics():
     """Legacy v2 endpoint - redirects to main statistics."""
     store = get_person_entity_store()
     interaction_store = get_interaction_store()

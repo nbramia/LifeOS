@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from api.services.person_entity import PersonEntity, PersonEntityStore
 from api.services.entity_resolver import (
     EntityResolver,
+    ResolutionResult,
 )
 
 # #682: marked per-class/per-function rather than module-level, because
@@ -338,6 +339,64 @@ class TestResolveFromLinkedIn:
         assert result.is_new is True
         # Company is stored on the entity (vault_contexts comes from domain mapping config)
         assert result.entity.company == "Example Corp"
+
+    def test_linkedin_name_match_does_not_mutate_cache_shared_entity(self, temp_store):
+        """The name-matching fallback (no email, no company/domain match) must
+        not mutate a PersonEntityStore.get_all()-cache-shared object in place.
+        resolve_by_name()'s fuzzy path (_score_candidates) returns entities
+        straight out of get_all(), so a write here has to refetch a private
+        copy by ID before mutating -- otherwise every other reader of the
+        cache observes an unpersisted, in-place-mutated entity."""
+        resolver = EntityResolver(temp_store)
+        person = PersonEntity(
+            canonical_name="Alex Johnson",
+            emails=["alex@example.com"],
+            sources=["gmail"],
+        )
+        temp_store.add(person)
+
+        # Warm the get_all() cache and hold a reference to the shared object.
+        cached_before = temp_store.get_all()
+        cached_entity = next(p for p in cached_before if p.id == person.id)
+        original_sources = list(cached_entity.sources)
+        assert "linkedin" not in original_sources
+        assert cached_entity.linkedin_url is None
+
+        # Stub resolve_by_name to return the exact cache-shared object, as
+        # _score_candidates() does for real (it iterates store.get_all()).
+        # email=None and company=None force resolve_from_linkedin past the
+        # email-exact and domain-match branches into this one.
+        fake_result = ResolutionResult(
+            entity=cached_entity,
+            is_new=False,
+            confidence=0.9,
+            match_type="fuzzy_full_name",
+        )
+        resolver.resolve_by_name = lambda name, context_path=None, create_if_missing=False: fake_result
+
+        result = resolver.resolve_from_linkedin(
+            first_name="Alex",
+            last_name="Johnson",
+            email=None,
+            company=None,
+            position="Engineer",
+            linkedin_url="https://linkedin.com/in/alexjohnson",
+        )
+
+        # The object the test still holds a reference to (as any other
+        # concurrent get_all() caller would) must be untouched.
+        assert cached_entity.sources == original_sources
+        assert cached_entity.linkedin_url is None
+
+        # The write did happen -- through a private copy that got persisted.
+        assert result.entity.linkedin_url == "https://linkedin.com/in/alexjohnson"
+        assert "linkedin" in result.entity.sources
+
+        # And the cache, once invalidated by the store.update() call inside
+        # resolve_from_linkedin, reflects the write on the next get_all().
+        refreshed_entity = next(p for p in temp_store.get_all() if p.id == person.id)
+        assert refreshed_entity.linkedin_url == "https://linkedin.com/in/alexjohnson"
+        assert "linkedin" in refreshed_entity.sources
 
 
 @pytest.mark.unit

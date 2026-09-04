@@ -315,3 +315,220 @@ class TestRelationshipStore:
         assert stats["by_type"][TYPE_COWORKER] == 1
         assert stats["by_type"][TYPE_FRIEND] == 1
         assert stats["avg_shared_interactions"] > 0
+
+
+class TestGetTopNeighbors:
+    """Tests for RelationshipStore.get_top_neighbors() (#870)."""
+
+    def test_orders_by_summed_shared_counts_desc(self, store):
+        """Strongest neighbor (highest summed shared counts) comes first."""
+        store.add(Relationship(person_a_id="center", person_b_id="weak", shared_events_count=1))
+        store.add(Relationship(person_a_id="center", person_b_id="strong", shared_events_count=20))
+        store.add(Relationship(person_a_id="center", person_b_id="medium", shared_messages_count=5))
+
+        neighbors = store.get_top_neighbors("center", limit=10)
+
+        assert [r.other_person("center") for r in neighbors] == ["strong", "medium", "weak"]
+
+    def test_works_regardless_of_person_a_or_b_position(self, store):
+        """A neighbor stored as person_a_id or person_b_id is found either way."""
+        # "center" ends up as person_a_id or person_b_id depending on
+        # lexicographic order - both must be found.
+        store.add(Relationship(person_a_id="aaa_center", person_b_id="zzz_other", shared_events_count=3))
+        store.add(Relationship(person_a_id="000_other", person_b_id="aaa_center", shared_events_count=7))
+
+        neighbors = store.get_top_neighbors("aaa_center", limit=10)
+
+        others = {r.other_person("aaa_center") for r in neighbors}
+        assert others == {"zzz_other", "000_other"}
+
+    def test_respects_limit(self, store):
+        """Only the top `limit` neighbors are returned."""
+        for i in range(5):
+            store.add(Relationship(
+                person_a_id="center", person_b_id=f"p{i}", shared_events_count=i + 1,
+            ))
+
+        neighbors = store.get_top_neighbors("center", limit=2)
+
+        assert len(neighbors) == 2
+        # Highest shared_events_count values are p4 (5) then p3 (4).
+        assert {r.other_person("center") for r in neighbors} == {"p4", "p3"}
+
+    def test_limit_zero_returns_empty(self, store):
+        """limit=0 (or negative) returns no rows without querying."""
+        store.add(Relationship(person_a_id="center", person_b_id="other", shared_events_count=1))
+
+        assert store.get_top_neighbors("center", limit=0) == []
+        assert store.get_top_neighbors("center", limit=-1) == []
+
+    def test_no_relationships_returns_empty(self, store):
+        """A person with no relationships returns an empty list."""
+        assert store.get_top_neighbors("lonely", limit=10) == []
+
+    def test_tied_scores_break_deterministically_by_id(self, store):
+        """Two relationships tied on the count-sum proxy resolve to a stable
+        order (by relationship id), not whatever order SQLite happens to
+        return (#896 review finding 9)."""
+        r1 = store.add(Relationship(person_a_id="center", person_b_id="tied1", shared_events_count=5))
+        r2 = store.add(Relationship(person_a_id="center", person_b_id="tied2", shared_events_count=5))
+        expected_order = sorted([r1.id, r2.id])
+
+        # Repeat a few times - a non-deterministic tiebreak would be free to
+        # vary across calls even against the same data.
+        for _ in range(3):
+            neighbors = store.get_top_neighbors("center", limit=10)
+            assert [r.id for r in neighbors] == expected_order
+
+    def test_shares_a_passed_in_connection(self, store):
+        """A caller-supplied `conn` is used (and left open) instead of the
+        store opening and closing its own (#896 review finding 11)."""
+        store.add(Relationship(person_a_id="center", person_b_id="other", shared_events_count=1))
+
+        conn = store.open_connection()
+        try:
+            neighbors = store.get_top_neighbors("center", limit=10, conn=conn)
+            assert len(neighbors) == 1
+            # Connection must still be usable - the store did not close it.
+            conn.execute("SELECT 1")
+        finally:
+            conn.close()
+
+    def test_only_hydrates_up_to_limit_relationships(self, store, monkeypatch):
+        """The ranking and LIMIT happen in SQL, so from_row() is called at
+        most `limit` times -- not once per relationship touching the
+        person. An earlier version of this method fetched every
+        relationship for the person via get_all_for_person() and ranked in
+        Python, which fixed the tiebreak but turned a bounded fetch into an
+        unbounded one on the network-graph endpoint's hottest path (#896
+        review round 3, BLOCKER 2: measured at ~39,600 Relationship
+        constructions for one real request, ~0.356s of a 0.549s response)."""
+        for i in range(50):
+            store.add(Relationship(person_a_id="center", person_b_id=f"p{i}", shared_events_count=i))
+
+        original_from_row = Relationship.from_row.__func__
+        calls = []
+
+        def _counting_from_row(cls, row):
+            calls.append(1)
+            return original_from_row(cls, row)
+
+        monkeypatch.setattr(Relationship, "from_row", classmethod(_counting_from_row))
+
+        neighbors = store.get_top_neighbors("center", limit=5)
+
+        assert len(neighbors) == 5
+        assert len(calls) == 5, f"expected exactly 5 Relationship.from_row() calls, got {len(calls)}"
+
+
+class TestGetAllForPerson:
+    """Tests for RelationshipStore.get_all_for_person() (#896 review finding 5/10)."""
+
+    def test_returns_every_relationship_for_person_unordered(self, store):
+        """All relationships touching person_id come back, regardless of
+        which side of the row they're stored on."""
+        store.add(Relationship(person_a_id="center", person_b_id="a", shared_events_count=1))
+        store.add(Relationship(person_a_id="b", person_b_id="center", shared_events_count=2))
+        store.add(Relationship(person_a_id="x", person_b_id="y", shared_events_count=99))  # unrelated
+
+        rels = store.get_all_for_person("center")
+
+        others = {r.other_person("center") for r in rels}
+        assert others == {"a", "b"}
+
+    def test_no_relationships_returns_empty(self, store):
+        assert store.get_all_for_person("lonely") == []
+
+    def test_shares_a_passed_in_connection(self, store):
+        store.add(Relationship(person_a_id="center", person_b_id="other"))
+        conn = store.open_connection()
+        try:
+            rels = store.get_all_for_person("center", conn=conn)
+            assert len(rels) == 1
+            conn.execute("SELECT 1")  # still usable
+        finally:
+            conn.close()
+
+
+class TestGetEdgesAmong:
+    """Tests for RelationshipStore.get_edges_among() (#870)."""
+
+    def test_returns_only_edges_with_both_endpoints_in_set(self, store):
+        """An edge is included only when both its endpoints are in the set."""
+        store.add(Relationship(person_a_id="a", person_b_id="b"))  # both in set
+        store.add(Relationship(person_a_id="a", person_b_id="outside"))  # one in set
+        store.add(Relationship(person_a_id="outside1", person_b_id="outside2"))  # none in set
+
+        edges = store.get_edges_among({"a", "b"})
+
+        pairs = {(r.person_a_id, r.person_b_id) for r in edges}
+        assert pairs == {("a", "b")}
+
+    def test_empty_input_returns_empty(self, store):
+        """An empty id set returns no edges without querying."""
+        store.add(Relationship(person_a_id="a", person_b_id="b"))
+        assert store.get_edges_among(set()) == []
+
+    def test_dedupes_by_unordered_pair(self, store):
+        """Each unordered pair appears at most once even though the method
+        queries both person_a_id and person_b_id."""
+        store.add(Relationship(person_a_id="a", person_b_id="b"))
+
+        edges = store.get_edges_among({"a", "b"})
+
+        assert len(edges) == 1
+
+    def test_correct_with_more_ids_than_sqlite_variable_limit(self, store):
+        """Correct results when the id set is larger than SQLite's default
+        999-variable limit. The temp-table join this method uses (#896
+        review finding 4) has no `IN (...)` list at all, so there's no
+        chunking to reason about -- this just pins that a large id set
+        still works."""
+        num_people = 1200
+        ids = [f"person{i}" for i in range(num_people)]
+
+        # Chain them: person0-person1, person1-person2, ... so there are
+        # num_people - 1 edges, every one of which has both endpoints in `ids`.
+        for i in range(num_people - 1):
+            store.add(Relationship(person_a_id=ids[i], person_b_id=ids[i + 1]))
+
+        # Also add an edge to someone outside the set - must be excluded.
+        store.add(Relationship(person_a_id=ids[0], person_b_id="outsider"))
+
+        edges = store.get_edges_among(ids)
+
+        assert len(edges) == num_people - 1
+        pairs = {(r.person_a_id, r.person_b_id) for r in edges}
+        for i in range(num_people - 1):
+            a, b = sorted([ids[i], ids[i + 1]])
+            assert (a, b) in pairs
+        assert not any("outsider" in pair for pair in pairs)
+
+    def test_shares_a_passed_in_connection(self, store):
+        """A caller-supplied `conn` is used (and left open) instead of the
+        store opening and closing its own (#896 review finding 11)."""
+        store.add(Relationship(person_a_id="a", person_b_id="b"))
+
+        conn = store.open_connection()
+        try:
+            edges = store.get_edges_among({"a", "b"}, conn=conn)
+            assert len(edges) == 1
+            conn.execute("SELECT 1")  # still usable
+        finally:
+            conn.close()
+
+    def test_two_calls_on_same_connection_do_not_collide(self, store):
+        """The temp table used internally is cleared/dropped between calls,
+        so reusing one connection for consecutive calls (as the network
+        endpoint does across its selection pass) doesn't leak stale rows."""
+        store.add(Relationship(person_a_id="a", person_b_id="b"))
+        store.add(Relationship(person_a_id="c", person_b_id="d"))
+
+        conn = store.open_connection()
+        try:
+            first = store.get_edges_among({"a", "b"}, conn=conn)
+            second = store.get_edges_among({"c", "d"}, conn=conn)
+            assert {(r.person_a_id, r.person_b_id) for r in first} == {("a", "b")}
+            assert {(r.person_a_id, r.person_b_id) for r in second} == {("c", "d")}
+        finally:
+            conn.close()

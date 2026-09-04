@@ -2,9 +2,11 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-06-21
+**Last Updated:** 2026-09-04
 
 Every `/api/crm/*` HTTP endpoint. Split out of the main [api-reference.md](api-reference.md) because the CRM endpoint catalog is large enough to deserve its own file. For the consumer view of the CRM features these endpoints back, see the [CRM specs](crm-ui.md).
+
+`GET /api/crm/people` (only for the default page shape — no search text, `limit` ≤ 300), `/statistics`, `/me/interactions`, `/me/timeline`, `/family/interactions`, `/family/timeline`, and `/birthdays/all` are backed by a short-lived, data-version-keyed response cache — see [architecture.md](../technical/architecture.md) for how it's keyed and invalidated. Response shape and status codes are unchanged. Freshness is bounded by a five-minute TTL rather than guaranteed immediate: a write to the CRM data invalidates a cached response well within that window, but a response can otherwise be up to five minutes old, and a time-windowed aggregate (computed from the request time) freezes "now" for the life of the cached entry that served it.
 
 ---
 
@@ -39,11 +41,15 @@ List/search people with filters.
 - `q` (string): Search query (name, email, company)
 - `category` (string): work, personal, family
 - `source` (string): gmail, calendar, slack, etc.
-- `has_pending` (bool): Has pending links
-- `sort` (string): name, last_seen, interaction_count, strength
-- `order` (string): asc, desc
-- `limit` (int): Results per page (default: 50)
-- `offset` (int): Pagination offset
+- `dunbar_circles` (string): Comma-separated Dunbar circles, e.g. `5,6+`
+- `tags` (string): Comma-separated tags; person must have at least one
+- `has_interactions` (bool): Filter by interaction count > 0
+- `min_interactions` (int, default 0): Minimum total interactions (emails + meetings + mentions + messages)
+- `sort` (string, default `strength`): `interactions`, `last_seen`, `name`, `strength`
+- `offset` (int, default 0): Pagination offset
+- `limit` (int, 1–10000, default 50): Results per page
+
+Each returned person carries `has_profile_photo` (bool, from `photo_count > 0`) alongside the usual fields, so a client can request `GET /api/photos/profile/{id}` only for people flagged true instead of probing everyone (#875). `GET /api/crm/people/{id}` carries the same field for consistency.
 
 ### GET /api/crm/people/{id}
 
@@ -232,13 +238,21 @@ Merge two person records. Combines all interactions, relationships, and source e
 
 ### GET /api/crm/network
 
-Network graph data (nodes + edges).
+Network graph data (nodes + edges). With `center_on`, this is a bounded
+neighborhood — the strongest connections within `depth` hops, capped by
+`max_nodes`, `max_second_degree_per_node`, and `max_edges` — not the full
+relationship table (see
+[crm-graph.md § Bounded Neighborhood](crm-graph.md#bounded-neighborhood)).
 
 **Query parameters:**
-- `center_on` (string): Person ID to center on
-- `depth` (int): Graph depth
-- `min_strength` (float): Minimum edge strength
-- `category` (string): Filter by category
+- `center_on` (string): Person ID to center on. Required unless `allow_full_graph=true`.
+- `depth` (int, 1–4, default 2): Graph depth
+- `min_strength` (float, 0.0–1.0, default 0.0): Minimum node relationship strength, applied against `relationship_strength` on its 0–100 scale. Since the parameter itself is only accepted up to 1.0, the only nodes it can drop are those with a `relationship_strength` below 1.0 (in practice, strength-0 nodes).
+- `category` (string): Filter by category. Best-effort for a centered request — see the docs linked above.
+- `max_nodes` (int, 1–500, default 150): Total nodes in the response, including the center
+- `max_second_degree_per_node` (int, 0–50, default 10): Second-(and deeper-)degree neighbors added per node at the previous depth
+- `max_edges` (int, 1–20000, default 2000): Target maximum edges; every edge touching the center is always included even if that alone exceeds this
+- `allow_full_graph` (bool, default false): Opt-in to load every person and relationship (no `center_on`); ignores the three caps above
 
 **Response includes edge source breakdown:**
 - `shared_events_count`
@@ -396,7 +410,10 @@ Summary for UI display.
 
 ### GET /api/crm/config
 
-Get CRM configuration values for the frontend (owner person ID, work email domain, partner ID, family default selected IDs). Reads from `LIFEOS_*` env vars — see [configuration.md](../../guides/configuration.md).
+Get CRM configuration values for the frontend (owner person ID, work email domain, partner ID, family default selected IDs, `photos_enabled`). Reads from `LIFEOS_*` env vars — see [configuration.md](../../guides/configuration.md).
+
+**Response fields:**
+- `photos_enabled` (bool): Whether Apple Photos is configured on this install. The frontend uses this to decide whether to request avatar/profile photos at all, gated the same as `has_profile_photo` on person list cards — see [crm-people.md](crm-people.md).
 
 ---
 
@@ -426,6 +443,20 @@ Aggregated interaction data for the "Me" dashboard. Returns pre-aggregated data 
 - `trend_period` (string): Trend comparison period (week, month, quarter, year)
 - `health_period` (string): Health score history period (month, quarter, year)
 
+### GET /api/crm/me/interactions/span
+
+Earliest and latest interaction dates (excluding self, hidden, and peripheral people — the same population `/me/interactions` aggregates) plus a suggested heatmap year count clamped to 1–10. The Me page calls this first to size its heatmap window instead of requesting a fixed 10 years and shrinking the display afterward.
+
+```json
+{
+  "earliest": "2016-03-01T00:00:00+00:00",
+  "latest": "2026-09-04T12:00:00+00:00",
+  "years": 10
+}
+```
+
+`earliest`/`latest` are `null` when there is no data.
+
 ---
 
 ## Family
@@ -443,20 +474,20 @@ Aggregate family statistics.
 
 ### GET /api/crm/family/timeline
 
-Family interaction timeline across selected members.
+Family interaction timeline across selected members, filtered to the selected member IDs.
 
 **Query parameters:**
-- `member_ids` (string): Comma-separated person IDs
+- `person_ids` (string): Comma-separated person IDs
 - `source_type` (string): Filter by source type
 - `days_back` (int): Lookback period
 - `limit` (int): Max results
 
 ### GET /api/crm/family/interactions
 
-Aggregated family interaction data for charts and heatmaps.
+Aggregated family interaction data for charts and heatmaps, filtered to the selected member IDs. Unlike `/me/interactions`, this does not apply a "sent email only" rule — all email (sent and received) counts.
 
 **Query parameters:**
-- `member_ids` (string): Comma-separated person IDs
+- `person_ids` (string): Comma-separated person IDs
 - `days_back` (int): Days of history
 
 ### GET /api/crm/family/channel-mix
@@ -569,11 +600,16 @@ Analyze tone/sentiment in iMessage conversations over time. Samples messages mon
 
 ### POST /api/crm/relationship/tone-analysis-detailed
 
-Detailed tone analysis with separate scores for the user and their partner. Groups messages by week, analyzes each person separately, then aggregates to monthly averages.
+Detailed tone analysis with separate scores for the user and their partner. Messages are bucketed by calendar month first, then by week within that month (so a week straddling a month boundary is never double-counted), and each stale month gets one overall score per person.
+
+Results are persisted per person and month (see [crm-analytics.md](crm-analytics.md#tone-analysis-apis)). Freshness is checked with a lightweight per-month count query that loads no interaction rows, so a fully-cached response touches storage only and returns in well under 200ms regardless of how many interactions exist in the window; only when at least one month is stale does the handler load and bucket the actual messages. Stale months are recomputed in one or more LLM calls, chunked at a handful of months per call so a single slow or timed-out call can't affect the whole window, and every chunk's result is saved as soon as it completes. Concurrent requests for the same person are serialized (with a short timeout) so two open tabs don't both pay for the same call.
 
 **Query parameters:**
 - `person_id` (string, optional): Target person (defaults to partner)
 - `months` (int): Months to analyze (default: 12)
+- `refresh` (bool, optional): Force recomputation of every month in the window, bypassing the freshness cache (default: false)
+
+**Response:** a stale month that couldn't be recomputed this request (the LLM failed, was unavailable, or its response omitted that month) is never discarded -- it comes back with its last stored score and `"status": "stale"` if one exists, or `"status": "error"` (a neutral placeholder score, not a real one) only when nothing was ever stored for it. `null`/omitted status means the score is current. The Relationship page's Tone Evolution chart plots a stale month as a dimmed point and an error month as a gap with a "not analysed" marker.
 
 ---
 
@@ -629,3 +665,4 @@ Sync Apple Contacts to the CRM. Creates SourceEntity records for all contacts. O
 - [crm-graph.md](crm-graph.md) — Consumer view of the graph and relationship model
 - [crm-analytics.md](crm-analytics.md) — Consumer view of the family/me/birthday/relationship dashboards
 - [data-model.md](data-model.md) — Two-tier data model semantics behind every endpoint here
+- [architecture.md](../technical/architecture.md) — `AggregateCache`, the response cache behind the endpoints noted above

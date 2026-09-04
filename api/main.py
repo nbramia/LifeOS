@@ -37,20 +37,25 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
+import hashlib
 import logging
+import os
 import socket
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from email.utils import formatdate
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
+from starlette.middleware.gzip import GZipMiddleware
 
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, agent_assignment, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends, journal_ingest
-from api.services.log_redaction import configure_telegram_log_redaction
+from api.services.log_redaction import configure_telegram_log_redaction, install_query_string_redaction_filter
+from api.services.route_timing import RouteTimingMiddleware
 from config.settings import settings
 
 # Configure root logging here, explicitly, rather than leaving it to whatever
@@ -62,6 +67,12 @@ from config.settings import settings
 # API embeds the bot token in the URL) from ever logging at INFO here (#519).
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 configure_telegram_log_redaction()
+# #904: uvicorn's own access logger writes every request's raw query string
+# to logs/server.log regardless of what a route handler logs -- this is the
+# only process that runs an HTTP server, so it's the only place this needs
+# installing (see install_query_string_redaction_filter()'s docstring for
+# why this must run at import time, not inside a route or startup event).
+install_query_string_redaction_filter()
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +301,65 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Gzip: scoped to the CRM/people JSON endpoints plus the CRM page itself
+# (#874), rather than applied app-wide. A 300-person list is ~216 KB, a
+# person's full timeline ~620 KB, and the CRM page (`web/crm.html`) itself
+# is ~750 KB uncompressed — all of which matter on Tailscale from a phone.
+#
+# This is a deliberate scoping choice, not a workaround for a streaming
+# hazard: the installed Starlette (0.52.x) GZipMiddleware already refuses to compress
+# `text/event-stream` responses on its own (`DEFAULT_EXCLUDED_CONTENT_TYPES`
+# in `starlette.middleware.gzip`), so applying it app-wide would not in fact
+# risk buffering the chat/agents/conversations SSE endpoints. Scoping by an
+# *allow*-list of paths instead keeps the gzip CPU cost (and the `Vary:
+# Accept-Encoding` header) confined to the handful of routes this issue
+# targets, and keeps that guarantee independent of Starlette's own default
+# exclusion list, which is this dependency's choice to change.
+_GZIP_API_PREFIXES = ("/api/crm", "/api/people")
+# The page routes that serve `web/crm.html` (api/main.py's crm_page() and
+# friends, further down this file) and their client-side-routed sub-paths
+# (e.g. /crm/{person_id}/timeline). Matched as a full path segment, not a
+# bare prefix, so a hypothetical future "/crmfoo" route wouldn't match.
+_GZIP_PAGE_ROUTES = ("/crm", "/me", "/family", "/relationship", "/birthdays")
+
+
+def _in_gzip_scope(path: str) -> bool:
+    if path.startswith(_GZIP_API_PREFIXES):
+        return True
+    return any(path == route or path.startswith(route + "/") for route in _GZIP_PAGE_ROUTES)
+
+
+class _ScopedGZipMiddleware:
+    """Apply `GZipMiddleware` only to requests `_in_gzip_scope()` accepts."""
+
+    def __init__(self, app, minimum_size: int = 1024, compresslevel: int = 6) -> None:
+        self.app = app
+        self._gzip_app = GZipMiddleware(app, minimum_size=minimum_size, compresslevel=compresslevel)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and _in_gzip_scope(scope["path"]):
+            await self._gzip_app(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
+
+
+# compresslevel=6 (Starlette's default is 9): the gzip step itself runs
+# synchronously in this middleware, on the event loop, for every matching
+# response. Measured on the real 300-person list response (215,625 raw
+# bytes): level 9 took ~4.5ms for 33,171 compressed bytes; level 6 took
+# ~2.5ms for 34,311 bytes — nearly half the blocking time on the loop for
+# ~3% more bytes on the wire, a better trade here.
+app.add_middleware(_ScopedGZipMiddleware, minimum_size=1024, compresslevel=6)
+
+# Route timing (#877): added last, which Starlette's middleware stack makes
+# the OUTERMOST of this app's own middleware (each `add_middleware` call
+# wraps *around* everything added before it) -- so its timing and byte
+# count cover the full response, including gzip compression performed by
+# `_ScopedGZipMiddleware` above and any header work CORS does. See
+# api/services/route_timing.py for what is recorded.
+app.add_middleware(RouteTimingMiddleware)
 
 # Include routers
 app.include_router(search.router)
@@ -910,13 +980,60 @@ async def chat_page():
     return {"message": "Chat page not found"}
 
 
-@app.get("/crm")
-async def crm_page():
-    """Serve the CRM UI."""
+_CRM_CACHE_CONTROL = "max-age=60, must-revalidate"
+
+
+def _if_none_match_hits(if_none_match: str, etag: str) -> bool:
+    """Does this request's `If-None-Match` cover `etag` (RFC 9110 §13.1.2)?
+
+    `*` matches any current representation. Otherwise this is a
+    comma-separated list of entity-tags, each optionally weak (`W/"..."`
+    rather than `"..."`) — a weak validator from an intermediary still means
+    "you already have an equivalent representation" for a static file that
+    only ever changes by full replacement, so it's stripped before
+    comparing rather than treated as a non-match.
+    """
+    candidates = [tag.strip() for tag in if_none_match.split(",")]
+    if "*" in candidates:
+        return True
+    normalized = [tag[2:] if tag.startswith("W/") else tag for tag in candidates]
+    return etag in normalized
+
+
+def _crm_file_response(request: Request) -> Response:
+    """Serve `web/crm.html` with a short revalidation cache lifetime.
+
+    `FileResponse` on its own computes an ETag from the file's mtime/size but
+    never checks it against the request's `If-None-Match`, so every
+    navigation between Me/Family/Birthdays/a person page re-sent the full
+    ~750 KB page. This replicates Starlette's own ETag algorithm so the
+    header matches what `FileResponse` would have sent, and answers with a
+    bodyless 304 when the client's cached copy is still current.
+    """
     crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    if not crm_path.exists():
+        return JSONResponse({"message": "CRM page not found"}, status_code=404)
+
+    stat_result = os.stat(crm_path)
+    etag_base = f"{stat_result.st_mtime}-{stat_result.st_size}"
+    etag = f'"{hashlib.md5(etag_base.encode(), usedforsecurity=False).hexdigest()}"'
+    headers = {
+        "Cache-Control": _CRM_CACHE_CONTROL,
+        "ETag": etag,
+        "Last-Modified": formatdate(stat_result.st_mtime, usegmt=True),
+    }
+
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match and _if_none_match_hits(if_none_match, etag):
+        return Response(status_code=304, headers=headers)
+
+    return FileResponse(str(crm_path), stat_result=stat_result, headers=headers)
+
+
+@app.get("/crm")
+async def crm_page(request: Request):
+    """Serve the CRM UI."""
+    return _crm_file_response(request)
 
 
 @app.get("/agents")
@@ -948,81 +1065,54 @@ async def journal_trends_page():
 
 
 @app.get("/crm/{path:path}")
-async def crm_page_with_path(path: str):
+async def crm_page_with_path(request: Request, path: str):
     """Serve the CRM UI for any sub-path (client-side routing)."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/me")
-async def me_page():
+async def me_page(request: Request):
     """Serve the CRM UI for the 'Me' dashboard (owner's profile)."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/me/{path:path}")
-async def me_page_with_path(path: str):
+async def me_page_with_path(request: Request, path: str):
     """Serve the CRM UI for 'Me' sub-paths (client-side routing)."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/family")
-async def family_page():
+async def family_page(request: Request):
     """Serve the CRM UI for the Family dashboard."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/family/{path:path}")
-async def family_page_with_path(path: str):
+async def family_page_with_path(request: Request, path: str):
     """Serve the CRM UI for Family sub-paths (client-side routing)."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/relationship")
-async def relationship_page():
+async def relationship_page(request: Request):
     """Serve the CRM UI for the Relationship dashboard."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/relationship/{path:path}")
-async def relationship_page_with_path(path: str):
+async def relationship_page_with_path(request: Request, path: str):
     """Serve the CRM UI for Relationship sub-paths (client-side routing)."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/birthdays")
-async def birthdays_page():
+async def birthdays_page(request: Request):
     """Serve the CRM UI for the Birthdays page."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/birthdays/{path:path}")
-async def birthdays_page_with_path(path: str):
+async def birthdays_page_with_path(request: Request, path: str):
     """Serve the CRM UI for Birthdays sub-paths (client-side routing)."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)

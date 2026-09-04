@@ -28,6 +28,7 @@ def reset_lightweight_singletons() -> None:
     - ConversationStore
     - HybridSearch
     - BM25Index
+    - AggregateCache (cache entries only -- see reset_aggregate_cache())
 
     Does NOT reset embedding service (causes slow model reload).
     """
@@ -37,12 +38,14 @@ def reset_lightweight_singletons() -> None:
     from api.services.bm25_index import reset_bm25_index
     from api.services.perf_trace import reset_perf_trace_store
     from api.services.llm_client import reset_local_llm
+    from api.services.aggregate_cache import reset_aggregate_cache
 
     reset_service_health()
     reset_conversation_store()
     reset_hybrid_search()
     reset_bm25_index()
     reset_perf_trace_store()
+    reset_aggregate_cache()
     reset_local_llm()
 
 
