@@ -747,6 +747,34 @@ def _reset_turn_registry():
     chat_turns.reset_turn_registry()
 
 
+@pytest.fixture(autouse=True)
+def _reset_hermes_model_readout():
+    """Snapshot and restore `model_readout.py`'s process-wide Hermes-chat
+    globals (`_hermes_chat_last_model`, `_hermes_chat_last_observed_at`)
+    around every test (#892).
+
+    Any test that drives a real Hermes turn's `usage` event through
+    `_HermesTurnPersister._handle_usage` (directly, or via `HermesExecutor`/
+    the `/chat` Hermes proxy route) calls `record_hermes_chat_turn_model`
+    as a side effect and, before this fixture, never restored it —
+    `tests/test_hermes_proxy.py`, `tests/test_agent_worker_hermes_executor.py`,
+    and `tests/test_usage_store.py` all do this, and already caused an
+    order-dependent failure during #863's review (a later test's `/api/health`
+    Hermes readout assertion inherited an earlier test's model instead of
+    seeing "unknown"). Kept here as ONE definition rather than three copies
+    so every current and future test gets the reset for free — it's a
+    plain module-global read/write, so the cost of running it for every
+    test (even ones that never touch Hermes) is negligible.
+    """
+    from api.services import model_readout
+
+    saved_model = model_readout._hermes_chat_last_model
+    saved_observed_at = model_readout._hermes_chat_last_observed_at
+    yield
+    model_readout._hermes_chat_last_model = saved_model
+    model_readout._hermes_chat_last_observed_at = saved_observed_at
+
+
 @pytest.fixture(scope="session")
 def embedding_service():
     """

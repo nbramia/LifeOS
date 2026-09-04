@@ -211,7 +211,7 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "total_active_seconds": round(s.total_active_seconds, 3),
         "expected_output": s.expected_output,
         "label": _label_for_session(s, events),
-        "model_label": _model_label_for_routing(s.routing),
+        "model_label": _model_label_for_routing(s.routing, s.hermes_model),
         # Board-assignment + identity fields, passed through so the
         # panel and filters can surface them without re-deriving. Direct
         # attribute access, matching `host` above — all five fields exist
@@ -590,7 +590,7 @@ def _build_snapshot() -> dict[str, Any]:
     }
 
 
-def _model_label_for_routing(routing: str | None) -> str:
+def _model_label_for_routing(routing: str | None, hermes_model: str | None = None) -> str:
     if (routing or "local") == "local":
         return "Local"
     if routing == "ask":
@@ -611,17 +611,24 @@ def _model_label_for_routing(routing: str | None) -> str:
         # (#850) Hermes sessions used to fall through to the Claude-model-name
         # guess below and get mislabeled "Claude" — Hermes runs its own
         # DeepSeek-backed engine, not an Anthropic model.
-        # The badge stays plain rather than appending "· <model>" from
-        # `model_readout._last_observed_hermes_chat_model()`: that's a
-        # single process-wide "last observed" value written by ANY Hermes
-        # turn (an agent-worker session and `/chat`'s Hermes proxy alike),
-        # not a per-session attribution, so a badge built from it could
-        # retroactively show a finished session whatever model a
-        # *different*, unrelated Hermes turn most recently reported —
-        # `model_readout.py`'s own docstring rejects exactly this kind of
-        # cross-surface borrowing as dishonest. No honest per-session
-        # source exists, so the badge stays plain.
-        return "Hermes"
+        # The per-turn model comes from `Session.hermes_model`, written
+        # only by `HermesExecutor.execute` for the session it is running
+        # (via `set_hermes_model`, after the turn's own
+        # `_HermesTurnPersister.reported_model` is known). No other writer
+        # touches it, so it can never be overwritten by an unrelated
+        # session's or surface's turn, and a completed session's value
+        # stays fixed once no more of its own turns run. The badge stays
+        # plain when no model is set rather than appending "· <model>"
+        # from `model_readout._last_observed_hermes_chat_model()`: that's
+        # a single process-wide "last observed" value written by ANY
+        # Hermes turn (an agent-worker session and `/chat`'s Hermes proxy
+        # alike), not a per-session attribution, so a badge built from it
+        # could show a finished session whatever model a *different*,
+        # unrelated Hermes turn most recently reported. The identical
+        # string already flows verbatim into `usage_store.record_usage(
+        # model=...)` and the `/api/health` readout, so it is not
+        # truncated or reformatted here either.
+        return f"Hermes · {hermes_model}" if hermes_model else "Hermes"
     if routing in ("claude_code", "code"):
         return "Claude Code"
     if routing == "codex":
@@ -1173,6 +1180,9 @@ def _thread_dict(s: Session) -> dict[str, Any]:
         "total_dollars": round(s.total_dollars, 6),
         "expected_output": s.expected_output,
         "label": _label_for_session(s, []),
+        # (#892) Deliberately called with one argument: the /chat threads
+        # panel's badge stays plain "Hermes" here, out of #892's scope
+        # (the `/agents` snapshot row via `_session_to_dict` above).
         "model_label": _model_label_for_routing(s.routing),
         "origin": getattr(s, "origin", None),
         "resumable": s.status in TERMINAL_STATUSES,
