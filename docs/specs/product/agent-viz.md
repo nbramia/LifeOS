@@ -59,7 +59,7 @@ A **New card** button in the filter bar opens a composer — title, optional not
 - Picking Assigned (from the top-bar button or a lane's own **+**) requires an assignee; the created card carries it as a tag.
 - Picking In progress with an agent assignee (`#claude`/`#codex`/`#hermes`/`#local`) is rejected before anything is created — only `#me` can be assigned directly to In progress, since the worker claims agent-assigned tasks itself.
 - Review and Scheduled don't get a **+** — neither lane can be set directly; a card reaches Review or Scheduled the same way it always has (the worker's own tags, or the scheduler).
-- Creating a card straight into a lane the filter is currently hiding reveals that lane — and persists the change to the saved filter selection — so the new card is actually visible.
+- Creating a card straight into a lane the filter is currently hiding reveals that lane, updating the saved filter selection, so the new card is actually visible.
 
 ### Pending questions
 
@@ -101,7 +101,7 @@ Shape encodes *where the agent runs*, not whether it is a subagent — a Task/Ag
 
 The simulation converges in ~8 seconds and then stops, so the graph stops jittering once it settles. New snapshots arrive every 2 seconds and only nudge nodes whose positions are now misleading.
 
-**Node label** — the text under each node, first non-empty of: an operator-pinned custom label, the AI-generated short summary, the derived label (task description for LifeOS, first non-empty user message for Claude Code), the most recent prompt preview (cross-machine CLI sessions), the routing/model badge, then the session id as a last resort. The AI-generated short summary and the derived label are each skipped when they're not a real label but the raw id the row fell back to (the session id, that id with its `cc:`/`cx:` CLI prefix stripped, or the row's task id) — including a short summary the summarizer itself derived from that same raw id, which it also declines to reformat and hand back (#863 review round 2, finding M). A node never renders a bare `?`; in practice the routing/model badge always resolves to something, so the session-id fallback is a safety net rather than something you'll see on screen.
+**Node label** — the text under each node, first non-empty of: an operator-pinned custom label, the AI-generated short summary, the derived label (task description for LifeOS, first non-empty user message for Claude Code), the most recent prompt preview (cross-machine CLI sessions), the routing/model badge, then the session id as a last resort. The AI-generated short summary and the derived label are each skipped when they're not a real label but the raw id the row fell back to (the session id, that id with its `cc:`/`cx:` CLI prefix stripped, or the row's task id) — including a short summary the summarizer itself derived from that same raw id, which it also declines to reformat and hand back. A node never renders a bare `?`; in practice the routing/model badge always resolves to something, so the session-id fallback is a safety net rather than something you'll see on screen.
 
 ### Canvas controls
 
@@ -203,7 +203,7 @@ Clicking any node opens a panel on the right with that session's metadata header
 - **Status badge** — same status the node is colored by, with `(inferred)` if applicable.
 - **Source** — `LifeOS agent` or `Claude Code`.
 - **Host badge** — the machine the session is running on.
-- **Routing** — a plain badge, one of `Local`, `Claude Code`, `Codex`, `Remote`, `Hermes`, `Ask` (parked waiting on the operator, no model running), or `Claude` — never a model name. (#863 review) The graph node's `model_label` badge is the richer one for most routings — `Remote` becomes the configured remote provider's own label — but `Hermes` stays plain everywhere. (#863 review round 2, finding O) An earlier revision of this doc described `Hermes` gaining a `Hermes · <model>` suffix from the model Hermes last reported; that value turned out to be a single process-wide "last observed" reading, not scoped to the session on screen, so a finished session's badge could show a model an unrelated Hermes turn reported. The suffix was dropped rather than shipped with that caveat. See **Node label** in [Graph tab — what you see](#graph-tab--what-you-see).
+- **Routing** — a plain badge, one of `Local`, `Claude Code`, `Codex`, `Remote`, `Hermes`, `Ask` (parked waiting on the operator, no model running), or `Claude` — never a model name. The graph node's `model_label` badge is the richer one for most routings — `Remote` becomes the configured remote provider's own label — but `Hermes` stays plain everywhere: the last-observed Hermes model is a single process-wide reading, not scoped to the session on screen, so attaching it to this badge could show a finished session a model that an unrelated Hermes turn reported. See **Node label** in [Graph tab — what you see](#graph-tab--what-you-see).
 - **Cost** — `total_dollars` to 4 decimals. For Claude Code, this is cache-aware accounting (separately tracking input, output, cache_creation @ 1.25× and cache_read @ 0.10×).
 - **Tokens** — `input↓ / output↑`.
 - **Depth badge** — if the session is a child, shows spawn depth.

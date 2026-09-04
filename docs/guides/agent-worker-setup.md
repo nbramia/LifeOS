@@ -497,7 +497,7 @@ this map fails the task closed (`#agent-failed`, reason naming the host)
 without ever attempting a connection; leaving `LIFEOS_AGENT_HOSTS` unset
 (the default, `{}`) disables every remote host.
 
-**The board's host picker (#883)** shows this same registry as a
+**The board's host picker** shows this same registry as a
 dropdown — the API host plus every name in `LIFEOS_AGENT_HOSTS` — rather
 than a free-text field, each marked `(offline)` or `(unknown)` when it
 isn't reachable. Reachability comes from `tailscale status --json` when
