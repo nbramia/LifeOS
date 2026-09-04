@@ -24,6 +24,10 @@ const LANES = [
 ];
 
 const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local'];
+// plan_lane_move (api/services/agent_board.py) 409s a lane=in_progress move
+// whose assignee is one of these — "only the worker claims agent-assigned
+// tasks" — so the composer must not let one through (round-1 finding 4b).
+const AGENT_ASSIGNEES = ASSIGNEES.filter(a => a !== 'me');
 
 // Card fields the drawer renders as editable inputs — used to decide
 // whether an SSE tick needs to rebuild the drawer at all (#850 finding 2).
@@ -50,12 +54,18 @@ function loadLaneSelection() {
     if (!raw) return new Set(DEFAULT_VISIBLE_LANE_IDS);
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return new Set(DEFAULT_VISIBLE_LANE_IDS);
+    // A deliberately emptied selection ([]) is a valid, intentional state —
+    // AC 2 says the selection is restored from storage, and the empty-state
+    // hint already covers the UI for it — so it must round-trip as empty,
+    // not be treated as malformed (round-1 finding 7).
+    if (parsed.length === 0) return new Set();
     const validIds = new Set(LANES.map(l => l.id));
     // Tolerate an id naming a lane that no longer exists — drop it, but
     // keep whatever's still valid. Only fall back to the default when
-    // nothing valid survives (an empty/malformed store, or a stored
-    // selection that was every lane the operator once had but none exist
-    // anymore) — never render zero lanes from a bad stored value.
+    // nothing valid survives (a malformed store, or a stored selection that
+    // was every lane the operator once had but none exist anymore) — never
+    // render zero lanes from a bad stored value that wasn't actually an
+    // intentional empty selection.
     const filtered = parsed.filter(id => validIds.has(id));
     if (filtered.length === 0) return new Set(DEFAULT_VISIBLE_LANE_IDS);
     return new Set(filtered);
@@ -537,14 +547,36 @@ export function initBoard() {
     const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
     backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
     backdrop.querySelector('#new-card-cancel').onclick = cleanup;
+
+    const laneSelectEl = backdrop.querySelector('#new-card-lane');
+    const assigneeSelectEl = backdrop.querySelector('#new-card-assignee');
+    // Picking an assignee while Lane still reads Unassigned would otherwise
+    // silently file the card in Assigned anyway (derive_lane files any task
+    // carrying an assignee tag there) with the Lane control still
+    // contradicting that outcome — flip it to what will actually happen
+    // instead of leaving it to lie (round-1 finding 4a).
+    assigneeSelectEl.addEventListener('change', () => {
+      if (assigneeSelectEl.value && laneSelectEl.value === 'unassigned') {
+        laneSelectEl.value = 'assigned';
+      }
+    });
+
     backdrop.querySelector('#new-card-create').onclick = async () => {
       const desc = backdrop.querySelector('#new-card-desc').value.trim();
       if (!desc) return;
       const notes = backdrop.querySelector('#new-card-notes').value.trim();
-      const lane = backdrop.querySelector('#new-card-lane').value;
-      const assignee = backdrop.querySelector('#new-card-assignee').value;
+      const lane = laneSelectEl.value;
+      const assignee = assigneeSelectEl.value;
       if (lane === 'assigned' && !assignee) {
         showToast('Pick an assignee for the Assigned lane.', true);
+        return;
+      }
+      // plan_lane_move 409s In progress for any AGENT_ASSIGNEES tag ("only
+      // the worker claims agent-assigned tasks") — reject client-side
+      // before creating anything, mirroring the Assigned guard above
+      // (round-1 finding 4b).
+      if (lane === 'in_progress' && assignee && AGENT_ASSIGNEES.includes(assignee)) {
+        showToast('Only "me" can be assigned directly to In progress — the worker claims agent-assigned tasks itself.', true);
         return;
       }
       const btn = backdrop.querySelector('#new-card-create');
@@ -564,15 +596,32 @@ export function initBoard() {
           const text = await r.text();
           throw new Error(text);
         }
-        const created = await r.json();
+        // A 200 with a non-JSON body must not throw here — the task was
+        // already created; falling into the outer catch left the composer
+        // open with Create re-enabled, and a second click created a
+        // duplicate (round-1 finding 6). The `created && created.id` guard
+        // below already handles a null result cleanly.
+        const created = await r.json().catch(() => null);
         if (lane !== 'unassigned' && created && created.id) {
-          // moveCard already toasts and re-throws on failure — the card
-          // still exists (just not in the requested lane), so swallow the
-          // rejection here rather than doubling the error surface.
-          await moveCard(created.id, lane, assignee || undefined).catch(() => {});
+          try {
+            await moveCard(created.id, lane, assignee || undefined);
+            // moveCard's own success path already re-fetches the board —
+            // avoid a second GET /api/agents/board round-trip here
+            // (round-1 finding 9).
+          } catch (_) {
+            // moveCard already toasted the failure and never re-fetches on
+            // its own failure path — do it here so the board reflects the
+            // card that DID get created (just not moved).
+            await fetchBoard();
+          }
+        } else {
+          await fetchBoard();
         }
+        // A card created straight into a lane the filter is currently
+        // hiding would otherwise land with zero on-screen feedback — reveal
+        // that lane so the new card is actually visible (round-1 finding 5).
+        ensureLaneVisible(lane);
         cleanup();
-        fetchBoard();
       } catch (err) {
         showToast(`Couldn't create card: ${err.message}`, true);
         btn.disabled = false;
@@ -612,18 +661,27 @@ export function initBoard() {
   // lands on the backdrop element itself — closing when the click's target
   // IS the backdrop covers all of those in one listener, and a click
   // inside .board-drawer (whose target is never the backdrop) never
-  // matches. Guarded against a scrollbar-drag inside the drawer whose
-  // mouseup lands on the backdrop (that also fires a `click` on the
-  // backdrop): only close when BOTH the mousedown and the click targeted
-  // the backdrop itself.
+  // matches. Guarded against a mousedown/mouseup pair that starts on one
+  // side of the backdrop boundary and ends on the other — a scrollbar-drag
+  // (mousedown inside the drawer, mouseup on the backdrop) or a text
+  // selection dragged inward (mousedown on the backdrop, mouseup inside the
+  // drawer) both still fire a `click` on the backdrop (the nearest common
+  // ancestor of the two targets) — so only close when the mousedown, the
+  // mouseup, AND the click all targeted the backdrop itself (round-1
+  // finding 1).
   let drawerBackdropMouseDownOnSelf = false;
+  let drawerBackdropMouseUpOnSelf = false;
   if (drawerBackdrop) {
     drawerBackdrop.addEventListener('mousedown', (e) => {
       drawerBackdropMouseDownOnSelf = (e.target === drawerBackdrop);
     });
+    drawerBackdrop.addEventListener('mouseup', (e) => {
+      drawerBackdropMouseUpOnSelf = (e.target === drawerBackdrop);
+    });
     drawerBackdrop.addEventListener('click', (e) => {
-      if (e.target === drawerBackdrop && drawerBackdropMouseDownOnSelf) closeDrawer();
+      if (e.target === drawerBackdrop && drawerBackdropMouseDownOnSelf && drawerBackdropMouseUpOnSelf) closeDrawer();
       drawerBackdropMouseDownOnSelf = false;
+      drawerBackdropMouseUpOnSelf = false;
     });
   }
 
@@ -676,8 +734,18 @@ export function initBoard() {
   function autosizeNotesTextarea(el) {
     if (!el) return;
     el.style.height = 'auto';
+    // `* { box-sizing: border-box }` (web/agents.html) means the assigned
+    // `height` is a border-box total, but `scrollHeight` never counts the
+    // border — only content + padding. Without adding the border widths
+    // back, the box is assigned exactly `scrollHeight`, so its actual
+    // content+padding area ends up `scrollHeight` minus the border, 2px
+    // (1px top + 1px bottom) short of the content at every length past the
+    // minimum — clipping and forcing an early internal scroll (round-1
+    // finding 3).
+    const cs = getComputedStyle(el);
+    const borderY = parseFloat(cs.borderTopWidth || '0') + parseFloat(cs.borderBottomWidth || '0');
     const maxHeight = window.innerHeight * (2 / 3);
-    el.style.height = Math.min(el.scrollHeight, maxHeight) + 'px';
+    el.style.height = Math.min(el.scrollHeight + borderY, maxHeight) + 'px';
   }
 
   function renderDrawer(card) {
@@ -1003,6 +1071,17 @@ export function initBoard() {
     saveLaneSelection(visibleLanes);
     updateLaneFilterLabel();
     render();
+  }
+
+  // Reveals `laneId` in the filter (and persists it) if it's currently
+  // hidden — used after creating a card straight into a lane the filter
+  // was hiding, so the new card doesn't vanish with no feedback (round-1
+  // finding 5). A no-op when the lane is already visible.
+  function ensureLaneVisible(laneId) {
+    if (visibleLanes.has(laneId)) return;
+    const checkbox = laneFilterOptions && laneFilterOptions.querySelector(`input[value="${laneId}"]`);
+    if (checkbox) checkbox.checked = true;
+    applyLaneSelection([...visibleLanes, laneId]);
   }
 
   function renderLaneFilterCheckboxes() {

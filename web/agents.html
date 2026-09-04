@@ -841,7 +841,10 @@
   }
   .board-lane {
     flex: 1 1 260px;
-    min-width: 240px;
+    /* Low enough that the six default lanes actually fit an 1280px board
+       without horizontal scroll, so hiding one genuinely widens the rest
+       instead of sitting pinned at this floor (round-1 finding 2). */
+    min-width: 200px;
     display: flex;
     flex-direction: column;
     background: var(--bg-secondary);
@@ -1038,8 +1041,11 @@
   .drawer-notes { min-height: 5rem; resize: vertical; }
   /* Task-card notes only (#882) — height tracks content via JS, capped at
      2/3 of the viewport height; the schedule drawer's message-content
-     textarea keeps the plain manual-resize behavior above, untouched. */
-  .drawer-notes-autosize { overflow-y: auto; resize: none; }
+     textarea keeps the plain manual-resize behavior above, untouched. The
+     cap is ALSO expressed here in CSS (not just computed from
+     window.innerHeight in JS on input/render) so it re-applies automatically
+     when the viewport shrinks, without a resize listener (round-1 finding 8). */
+  .drawer-notes-autosize { overflow-y: auto; resize: none; max-height: 66vh; }
   .drawer-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
   .drawer-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.75rem; }
   .drawer-action {

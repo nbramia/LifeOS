@@ -858,14 +858,17 @@ class TestFilters:
         expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
         expect(page.locator('[data-card-id="t2"]')).to_have_count(0)
 
-    def test_done_lane_visible_by_default_only_cancelled_behind_filter(self, page: Page, agents_base_url):
+    def test_cancelled_cards_hidden_behind_filter_in_shown_done_lane(self, page: Page, agents_base_url):
         """Round-1 finding 3: the "include cancelled" checkbox only hides
         cancelled cards — the Done lane itself (finished tasks) stays
         visible whether it's checked or not, once its column is shown.
         (#882: Done is now UNCHECKED by default in the lane filter — that's
         covered by TestLaneFilterMultiSelect; this test is about the
         "include cancelled" filter within a shown Done column, so check
-        Done explicitly first.)"""
+        Done explicitly first. Renamed from
+        test_done_lane_visible_by_default_only_cancelled_behind_filter —
+        Done is no longer visible by default, so the old name asserted the
+        opposite of what it checks — round-1 finding 11.)"""
         _open_board(page, agents_base_url)
         _check_only_lanes(page, set(DEFAULT_VISIBLE_LANE_IDS) | {"done"})
         expect(page.locator('[data-card-id="t5"]')).to_be_visible()
@@ -1176,6 +1179,24 @@ class TestLaneFilterMultiSelect:
         width_after = page.locator('.board-lane[data-lane="unassigned"]').bounding_box()["width"]
         assert width_after > width_before, (width_before, width_after)
 
+    def test_unchecking_a_lane_widens_the_rest_at_1280_viewport(self, page: Page, agents_base_url):
+        """Round-1 finding 2: at 1280x800 with the six default lanes, the
+        240px `min-width` floor pinned every column there and hiding one
+        changed nothing (240 -> 240) — the prior test only proved the
+        widening behavior at a much wider 2400px viewport. Lowered to
+        ~200px so the six lanes actually fit 1280px without horizontal
+        scroll and hiding one measurably widens the rest."""
+        page.set_viewport_size({"width": 1280, "height": 800})
+        _open_board(page, agents_base_url)
+        width_before = page.locator('.board-lane[data-lane="unassigned"]').bounding_box()["width"]
+
+        self._open_lane_dropdown(page)
+        page.locator("#board-lane-filter-options input[value='review']").uncheck()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_have_count(0)
+
+        width_after = page.locator('.board-lane[data-lane="unassigned"]').bounding_box()["width"]
+        assert width_after > width_before, (width_before, width_after)
+
     def test_rechecking_restores_canonical_dom_order(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
         self._open_lane_dropdown(page)
@@ -1218,6 +1239,48 @@ class TestLaneFilterMultiSelect:
         for lane_id in DEFAULT_VISIBLE_LANE_IDS:
             expect(page.locator(f'.board-lane[data-lane="{lane_id}"]')).to_be_visible()
 
+    def test_stored_empty_selection_is_restored_not_reset_to_default(self, page: Page, agents_base_url):
+        """Round-1 finding 7 (and 14b, pinning the restore path): a
+        deliberately emptied selection ([]) is a valid, intentional state —
+        AC 2 says the selection is restored from storage, and the
+        empty-state hint already covers the UI for it — so a reload must
+        restore it as empty, not treat it as malformed and fall back to the
+        six default lanes. Can't use `_open_board`'s helper here since it
+        waits for a card that would never render with zero lanes shown."""
+        _seed_lane_storage(page, json.dumps([]))
+        _stub_routes(page, _board_fixture(), [], [], [200], [], [])
+        page.goto(f"{agents_base_url}/agents")
+        expect(page.locator(".board-lanes-empty-hint")).to_be_visible()
+        expect(page.locator(".board-lane")).to_have_count(0)
+
+    def test_storage_throwing_getitem_setitem_does_not_break_the_board(self, page: Page, agents_base_url):
+        """Round-1 finding 14c: a blocked/private-browsing localStorage
+        whose getItem/setItem throw must not crash the board —
+        loadLaneSelection and saveLaneSelection already catch around both,
+        this pins that already-correct behavior against a regression."""
+        page.add_init_script(
+            """
+            Object.defineProperty(Storage.prototype, 'getItem', {
+              configurable: true,
+              value: function() { throw new Error('blocked'); },
+            });
+            Object.defineProperty(Storage.prototype, 'setItem', {
+              configurable: true,
+              value: function() { throw new Error('blocked'); },
+            });
+            """
+        )
+        _open_board(page, agents_base_url)
+        for lane_id in DEFAULT_VISIBLE_LANE_IDS:
+            expect(page.locator(f'.board-lane[data-lane="{lane_id}"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+
+        # A toggle that tries to persist (and fails) must still apply
+        # in-memory rather than throwing into an unhandled listener error.
+        self._open_lane_dropdown(page)
+        page.locator("#board-lane-filter-options input[value='review']").uncheck()
+        expect(page.locator('.board-lane[data-lane="review"]')).to_have_count(0)
+
     def test_clear_control_restores_default(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
         self._open_lane_dropdown(page)
@@ -1256,6 +1319,10 @@ class TestLaneAddButton:
         _open_board(page, agents_base_url)
         for lane_id in ["unassigned", "assigned", "in_progress", "human_queue"]:
             expect(page.locator(f'.board-lane[data-lane="{lane_id}"] .board-lane-add')).to_be_visible()
+        # Guard the absence assertion the same way the Review half below
+        # does — asserting `.to_have_count(0)` alone passes vacuously if the
+        # Scheduled column itself stopped rendering (round-1 finding 10).
+        expect(page.locator('.board-lane[data-lane="scheduled"]')).to_be_visible()
         expect(page.locator('.board-lane[data-lane="scheduled"] .board-lane-add')).to_have_count(0)
 
         # Review is empty in the fixture and hidden by default — check it so
@@ -1313,6 +1380,117 @@ class TestLaneAddButton:
         assert task_posts[0] == {"description": "Plain new card"}, task_posts
         assert lane_calls == [], lane_calls  # unassigned never triggers a lane PUT
 
+    def test_choosing_an_assignee_while_lane_is_unassigned_flips_lane_to_assigned(self, page: Page, agents_base_url):
+        """Round-1 finding 4a: the common flow (top-bar New card, title,
+        assignee codex, Create) left the Lane select reading Unassigned
+        while the assignee tag on the POST body silently filed the card in
+        Assigned anyway (derive_lane files any assignee-tagged task there) —
+        the Lane control contradicted the outcome with no toast. Fix: flip
+        the select to Assigned as soon as an assignee is chosen, so what's
+        displayed matches where the card actually goes and any resulting
+        lane PUT agrees with the chosen assignee."""
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.locator("#board-new-card").click()
+        expect(page.locator("#new-card-lane")).to_have_value("unassigned")
+        page.locator("#new-card-assignee").select_option("codex")
+        expect(page.locator("#new-card-lane")).to_have_value("assigned")
+        page.locator("#new-card-desc").fill("Silent lane flip check")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0]["tags"] == ["codex"], task_posts
+        # No lane PUT contradicts the assignee that was actually chosen.
+        assert all(c.get("assignee") == "codex" for c in lane_calls), lane_calls
+
+    def test_in_progress_lane_with_agent_assignee_is_rejected_before_creating(self, page: Page, agents_base_url):
+        """Round-1 finding 4b: plan_lane_move 409s a lane=in_progress move
+        for any AGENT_ASSIGNEES tag ("only the worker claims agent-assigned
+        tasks"), reachable in three clicks from the In-progress lane's own
+        '+'. Before the fix the card was created, the move 409d, the
+        rejection was swallowed, and the composer closed anyway leaving a
+        stray card in Assigned. Mirrors test_assigned_lane_requires_an_assignee's
+        shape: reject client-side before any POST."""
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator('.board-lane[data-lane="in_progress"] .board-lane-add').click()
+        expect(page.locator("#new-card-lane")).to_have_value("in_progress")
+        page.locator("#new-card-desc").fill("Should not be created")
+        page.locator("#new-card-assignee").select_option("codex")
+        page.locator("#new-card-create").click()
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        assert task_posts == [], task_posts
+        expect(page.locator("#new-card-title")).to_be_visible()
+
+    def test_create_into_a_hidden_lane_reveals_it_with_the_new_card(self, page: Page, agents_base_url):
+        """Round-1 finding 5: the composer's Lane select offers every direct
+        lane regardless of what the filter shows — creating into Done (hidden
+        by default) landed the card nowhere visible with zero toasts.
+        Fix: reveal the target lane in the filter on a successful create."""
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-lane").select_option("done")
+        page.locator("#new-card-desc").fill("Filed straight to Done")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        expect(page.locator('.board-lane[data-lane="done"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="done"]')).to_contain_text("Filed straight to Done")
+        # The checkbox reflects the reveal too — the selection is persisted,
+        # not a one-off render fluke.
+        page.locator("#board-lane-filter-btn").click()
+        expect(page.locator("#board-lane-filter-options input[value='done']")).to_be_checked()
+
+    def test_non_json_create_response_does_not_throw_or_leave_composer_open(self, page: Page, agents_base_url):
+        """Round-1 finding 6: `await r.json()` on the create response throws
+        on a 200 with a non-JSON body — the base branch never read that
+        body at all. Before the fix, the operator saw a
+        "Failed to execute 'json'..." toast and the composer stayed open
+        with Create re-enabled even though the task WAS created, inviting a
+        duplicate on a second click."""
+        task_posts = []
+
+        def bad_json_handler(route):
+            body = json.loads(route.request.post_data or "{}")
+            task_posts.append(body)
+            route.fulfill(status=200, content_type="text/plain", body="not json")
+
+        _open_board(page, agents_base_url)
+        page.route(re.compile(r"/api/tasks$"), bad_json_handler)
+
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Should not duplicate")
+        page.locator("#new-card-create").click()
+
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert len(task_posts) == 1, task_posts
+
+    def test_create_with_failing_lane_put_toasts_closes_and_leaves_card_unassigned(self, page: Page, agents_base_url):
+        """Round-1 finding 14d: POST /api/tasks succeeding but the follow-up
+        lane PUT 500ing must not be silently swallowed — an error toast
+        shows, the composer still closes (the card WAS created), and the
+        card is visible in Unassigned (moveCard's own failure path never
+        re-fetches, so the board is refreshed here instead, per finding 9's
+        fix). Deliberately does NOT reuse TestNoConsoleErrorsMainFlow's
+        zero-console-errors pattern — Chromium logs a console.error for the
+        500 response itself."""
+        task_posts = []
+        lane_calls = []
+        _open_board(
+            page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls, lane_status_code=[500],
+        )
+        page.locator('.board-lane[data-lane="in_progress"] .board-lane-add').click()
+        page.locator("#new-card-desc").fill("Half-created card")
+        page.locator("#new-card-create").click()
+
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="unassigned"]')).to_contain_text("Half-created card")
+
 
 class TestDrawerClickOutsideClose:
     """#882 AC 4: a click on the backdrop (board background/lane/card) closes
@@ -1349,6 +1527,26 @@ class TestDrawerClickOutsideClose:
         page.mouse.move(drawer_box["x"] + drawer_box["width"] / 2, drawer_box["y"] + 50)
         page.mouse.down()
         page.mouse.move(backdrop_box["x"] + 10, backdrop_box["y"] + 10, steps=5)
+        page.mouse.up()
+
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+
+    def test_mousedown_outside_mouseup_inside_does_not_close(self, page: Page, agents_base_url):
+        """Round-1 finding 1 (and 14a, its reverse-direction case): a
+        mousedown starting on the backdrop whose mouseup lands INSIDE the
+        drawer (e.g. a text selection started just left of the notes field
+        and dragged rightward across it) still fires a `click` on the
+        backdrop — the nearest common ancestor of the two targets. Before
+        the fix, only the mousedown target was tracked, so this closed the
+        drawer mid-selection."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        drawer_box = page.locator(".board-drawer").bounding_box()
+        backdrop_box = page.locator("#board-drawer-backdrop").bounding_box()
+
+        page.mouse.move(backdrop_box["x"] + 10, backdrop_box["y"] + 10)
+        page.mouse.down()
+        page.mouse.move(drawer_box["x"] + drawer_box["width"] / 2, drawer_box["y"] + 50, steps=5)
         page.mouse.up()
 
         expect(page.locator("#board-drawer-backdrop")).to_be_visible()
@@ -1414,6 +1612,40 @@ class TestNotesAutosize:
         assert offset_height <= max_height + 1, (offset_height, max_height)  # +1 for rounding
         assert scroll_height > offset_height, (scroll_height, offset_height)  # capped — scrolls internally
 
+    def test_not_prematurely_scrollable_below_the_cap(self, page: Page, agents_base_url):
+        """Round-1 finding 3: `* { box-sizing: border-box }` (web/agents.html)
+        means the assigned height must also absorb the 1px top/bottom
+        borders, or the box is clipped 2px short at every content length
+        below the cap and scrolls internally the whole time instead of only
+        once capped (AC 5)."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        expect(notes).to_be_visible()
+        mid_lines = "\n".join(f"note line {i}" for i in range(10))
+        notes.fill(mid_lines)
+        scroll_height = notes.evaluate("el => el.scrollHeight")
+        client_height = notes.evaluate("el => el.clientHeight")
+        assert scroll_height <= client_height, (scroll_height, client_height)
+
+    def test_cap_re_applies_on_viewport_shrink_without_a_resize_listener(self, page: Page, agents_base_url):
+        """Round-1 finding 8: the cap was only recomputed from
+        window.innerHeight on `input`/drawer-render, so shrinking the window
+        left a box grown past the NEW, smaller cap. Fixed via CSS
+        `max-height: 66vh` on `.drawer-notes-autosize` (NOT a resize
+        listener), which reapplies automatically — this test resizes and
+        asserts the cap held with no further `input` event ever firing."""
+        page.set_viewport_size({"width": 1200, "height": 900})
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator(".drawer-notes")
+        many_lines = "\n".join(f"note line {i}" for i in range(200))
+        notes.fill(many_lines)
+
+        page.set_viewport_size({"width": 1200, "height": 400})
+        offset_height = notes.evaluate("el => el.offsetHeight")
+        assert offset_height <= 400 * 0.67, offset_height  # 66vh + a little rounding slack
+
 
 class TestNoConsoleErrorsMainFlow:
     """Exercises the new #882 surfaces together — lane filter, per-lane add,
@@ -1434,6 +1666,14 @@ class TestNoConsoleErrorsMainFlow:
         expect(page.locator('.board-lane[data-lane="review"]')).to_have_count(0)
         page.locator("#board-lane-filter-options input[value='review']").check()
         expect(page.locator('.board-lane[data-lane="review"]')).to_be_visible()
+        # Close the dropdown before interacting with the board underneath it
+        # — round-1 finding 2's narrower lane `min-width` shifts the Assigned
+        # lane's "+" button further left, under the still-open dropdown's
+        # footprint, so leaving it open (as this test previously did) now
+        # reliably blocks the click below instead of the near-miss it was
+        # before that fix.
+        page.locator("#board-lane-filter-btn").click()
+        expect(page.locator("#board-lane-filter-options")).not_to_have_class(re.compile(r"\bshow\b"))
 
         page.locator('.board-lane[data-lane="assigned"] .board-lane-add').click()
         page.locator("#new-card-desc").fill("Follow up with the vendor")
