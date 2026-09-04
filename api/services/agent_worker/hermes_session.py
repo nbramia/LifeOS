@@ -43,7 +43,7 @@ alone unconditionally on worker restart) — see `worker.py`. `origin="hermes"`
 the way it claims operator root-spawns. It exists purely as an
 identity/lineage anchor for `lifeos_agent_*` calls Hermes itself makes.
 
-(#892) Because this anchor row is never dispatched, `HermesExecutor.execute`
+Because this anchor row is never dispatched, `HermesExecutor.execute`
 — the only writer of `Session.hermes_model` — never runs against it, so its
 `hermes_model` stays NULL forever and `/agents` renders it as plain
 "Hermes". That is the honest label for a row that never itself ran a turn;

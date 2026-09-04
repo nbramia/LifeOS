@@ -146,7 +146,7 @@ class HermesExecutor:
 
     def _record_reported_model(self, session, persister: _HermesTurnPersister) -> None:
         """Record the model Hermes reported for THIS turn onto THIS
-        session's own row (#892) — run on both the success and failure exit
+        session's own row — run on both the success and failure exit
         paths, right after `persister.finalize()`, so a turn whose
         connection dropped after Hermes reported usage still gets credited:
         it ran on that model regardless of how the request ended. Wrapped

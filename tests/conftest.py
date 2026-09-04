@@ -751,7 +751,7 @@ def _reset_turn_registry():
 def _reset_hermes_model_readout():
     """Snapshot and restore `model_readout.py`'s process-wide Hermes-chat
     globals (`_hermes_chat_last_model`, `_hermes_chat_last_observed_at`)
-    around every test (#892).
+    around every test.
 
     Defence-in-depth, not a fix for a currently-reproducible leak: any test
     that drives a real Hermes turn's `usage` event through
@@ -760,17 +760,16 @@ def _reset_hermes_model_readout():
     a side effect and never restores it on its own —
     `tests/test_hermes_proxy.py`, `tests/test_agent_worker_hermes_executor.py`,
     and `tests/test_usage_store.py` all do this. `tests/test_model_readout.py`
-    already carries its own independent autouse reset (pre-existing, not
-    part of this PR) that protects its own assertions regardless of run
-    order, and #892's round-1 review confirmed with the fixture removed,
-    in both directions, that no test currently observes a leak (149/149
-    passed either way). Kept here as ONE definition rather than three
-    copies so every current and future test gets the reset for free — it's
-    a plain module-global read/write, so the cost of running it for every
-    test (even ones that never touch Hermes) is negligible, and it closes
-    off the *shape* of the order-dependent failure #863's review hit
-    (before `test_model_readout.py` had its own fixture) even though that
-    specific failure is no longer reproducible today.
+    carries its own independent autouse reset that protects its own
+    assertions regardless of run order — removing this fixture in both
+    directions shows no test currently observes a leak (149/149 pass
+    either way). Kept here as ONE definition rather than three copies so
+    every current and future test gets the reset for free — it's a plain
+    module-global read/write, so the cost of running it for every test
+    (even ones that never touch Hermes) is negligible, and it guards
+    against the same *shape* of order-dependent failure that relying
+    solely on `test_model_readout.py`'s own fixture would risk, even
+    though no test currently reproduces that specific failure.
     """
     from api.services import model_readout
 

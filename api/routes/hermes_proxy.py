@@ -456,14 +456,14 @@ class _HermesTurnPersister:
     def reported_model(self) -> Optional[str]:
         """The model Hermes reported for this turn in its own `usage`
         event, or None if no well-formed `usage` event arrived (see
-        `_handle_usage`). Read by `HermesExecutor` (#892) after
+        `_handle_usage`). Read by `HermesExecutor` after
         `finalize()` so a board-assigned Hermes session records the model
         ITS OWN turn ran on, onto its own `SessionStore` row — never
         onto any other session, and never onto `model_readout.py`'s
         process-wide "last observed" value, which this property is
         deliberately independent of (that global is written directly by
-        `_handle_usage` below, for `/api/health` only; see #892's design
-        notes for why a per-session value can't live there)."""
+        `_handle_usage` below, for `/api/health` only, which has no
+        per-session scope to attach a value like this to)."""
         return self._usage_model
 
     def bind_turn(self, turn) -> None:

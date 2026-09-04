@@ -1787,29 +1787,29 @@ async def test_usage_store_failure_is_logged_and_never_breaks_the_relay(
 async def test_chat_hermes_turn_never_touches_any_agent_sessions_hermes_model(
     usage_proxy_client, agent_session_store,
 ):
-    """(#892 AC3) `/chat`'s Hermes proxy path (this route, `ask_stream`)
+    """`/chat`'s Hermes proxy path (this route, `ask_stream`)
     threads no session id into `_HermesTurnPersister` — `observe()`/
     `_handle_usage()`/`finalize()` never reference a `SessionStore` at all
     (see `_HermesTurnPersister`'s class docstring) — so a real turn's own
     `usage` event, which DOES update `model_readout.py`'s process-wide
-    `/api/health` reading (unaffected by #892, asserted below as proof this
-    turn actually ran), must change NO agent session's `hermes_model`.
-    That includes the deterministic `sess_herm<hash>` conversation-anchor
-    row `resolve_hermes_caller_session_id` creates for this same
-    conversation — it is inert (never dispatched, see hermes_session.py's
-    #892 docstring paragraph), so plain `Hermes` staying its honest label
-    depends on this turn never writing to it.
+    `/api/health` reading (asserted below as proof this turn actually
+    ran), must change NO agent session's `hermes_model`. That includes the
+    deterministic `sess_herm<hash>` conversation-anchor row
+    `resolve_hermes_caller_session_id` creates for this same
+    conversation — it is inert (never dispatched, see `hermes_session.py`'s
+    docstring), so plain `Hermes` staying its honest label depends on this
+    turn never writing to it.
 
     Uses the SAME conversation id the request resolves its caller session
     against and the id the stub backend's own SSE stream reports, so the
     two match — this is what makes the mutation proof below meaningful (a
     regression that writes `hermes_model` from the turn's OWN observed
     conversation id would otherwise silently target a different, unrelated
-    session and pass vacuously). (round-1 review, R-3) Also seeds an
-    UNRELATED, pre-existing agent-worker Hermes session (a board-assigned
-    task, not this turn's own conversation anchor) and asserts it is
-    untouched too — proving this isn't just the anchor row's own inertness
-    but that a real `/chat` turn writes to no `SessionStore` row at all."""
+    session and pass vacuously). Also seeds an UNRELATED, pre-existing
+    agent-worker Hermes session (a board-assigned task, not this turn's own
+    conversation anchor) and asserts it is untouched too — proving this
+    isn't just the anchor row's own inertness but that a real `/chat` turn
+    writes to no `SessionStore` row at all."""
     from api.services import model_readout
     from api.services.agent_worker.hermes_session import _deterministic_session_id
 
@@ -1825,7 +1825,7 @@ async def test_chat_hermes_turn_never_touches_any_agent_sessions_hermes_model(
     assert resp.status_code == 200
 
     # Proof the turn actually happened and reported a model — the
-    # process-wide readout (untouched by #892) did observe it.
+    # process-wide readout did observe it.
     assert model_readout._hermes_chat_last_model == "deepseek-v3-fireworks"
 
     anchor_id = _deterministic_session_id(conversation_id)
