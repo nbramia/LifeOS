@@ -777,6 +777,132 @@ class InteractionStore:
         finally:
             conn.close()
 
+    def get_for_person_in_range(
+        self,
+        person_id: str,
+        start_date: datetime,
+        end_date: datetime,
+        source_type: Optional[str] = None,
+    ) -> list[Interaction]:
+        """
+        Get ALL of a person's interactions within a date range, with no row
+        limit -- unlike get_for_person(), which always applies
+        InteractionConfig's cap (1000 by default) regardless of how many
+        interactions actually exist in the window.
+
+        Used where every interaction in the window is actually needed --
+        e.g. CRM tone analysis (api/routes/crm.py) building LLM prompts for
+        stale months -- rather than a capped, newest-first sample that
+        silently truncates the oldest months once total volume exceeds the
+        cap (worse, that truncation point drifts with every new message, so
+        an old month's apparent count kept changing even though nothing
+        about that month did -- #899 review finding 5). For a cheap
+        freshness *count* check that must not pay the cost of loading every
+        row, see get_monthly_interaction_counts_in_range() below.
+
+        Args:
+            person_id: PersonEntity ID
+            start_date: Start of date range (inclusive)
+            end_date: End of date range (inclusive)
+            source_type: Filter by source type; comma-separated for multiple.
+
+        Returns:
+            List of interactions in the range, most recent first.
+        """
+        conn = self._get_connection()
+        try:
+            source_types = None
+            if source_type:
+                source_types = [s.strip() for s in source_type.split(",") if s.strip()]
+
+            query = """
+                SELECT * FROM interactions
+                WHERE person_id = ? AND timestamp >= ? AND timestamp <= ?
+            """
+            params = [person_id, start_date.isoformat(), end_date.isoformat()]
+
+            if source_types:
+                placeholders = ",".join("?" * len(source_types))
+                query += f" AND source_type IN ({placeholders})"
+                params.extend(source_types)
+
+            query += " ORDER BY timestamp DESC"
+
+            cursor = conn.execute(query, params)
+            return [Interaction.from_row(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_monthly_interaction_counts_in_range(
+        self,
+        person_id: str,
+        start_date: datetime,
+        end_date: datetime,
+        source_type: Optional[str] = None,
+    ) -> dict[str, int]:
+        """
+        Count a person's interactions in a date range, grouped by calendar
+        month (`YYYY-MM`), without loading any row data.
+
+        Used for a freshness check that must not pay the cost of loading
+        every interaction just to compare counts: CRM tone analysis
+        (api/routes/crm.py) calls this first on every request, and only
+        falls through to the row-loading get_for_person_in_range() when at
+        least one month is actually stale -- a fully-cached response used
+        to take ~0.3s on a heavy relationship because it loaded and
+        bucketed every row in the window just to compute a count comparison
+        (#899 review finding N1).
+
+        Month grouping relies on every `timestamp` being stored with a
+        `+00:00` offset (true for every writer in this codebase today,
+        verified across all interactions in production). `strftime('%Y-%m',
+        timestamp)` below normalizes the timestamp to UTC before extracting
+        the month, regardless of what offset the string carries -- SQLite
+        does this unconditionally, it is not something this query opts
+        into. The Python-side bucketing this count is compared against
+        (`api/routes/crm.py`'s `_bucket_interactions_by_month_and_week`)
+        mirrors that by converting to UTC itself (`dt.astimezone(timezone.utc)`)
+        rather than trusting `dt`'s own offset, so the two sides agree even
+        if a row were ever stored with a non-UTC offset (#899 review,
+        second pass, nit 1) -- see `test_month_grouping_is_utc_normalized...`
+        in tests/test_interaction_store.py, which pins this directly rather
+        than relying on production data happening to already be UTC.
+
+        Args:
+            person_id: PersonEntity ID
+            start_date: Start of date range (inclusive)
+            end_date: End of date range (inclusive)
+            source_type: Filter by source type; comma-separated for multiple.
+
+        Returns:
+            {"YYYY-MM": count} for every month with at least one interaction
+            in the range. A month with zero interactions is simply absent.
+        """
+        conn = self._get_connection()
+        try:
+            source_types = None
+            if source_type:
+                source_types = [s.strip() for s in source_type.split(",") if s.strip()]
+
+            query = """
+                SELECT strftime('%Y-%m', timestamp) AS month_key, COUNT(*)
+                FROM interactions
+                WHERE person_id = ? AND timestamp >= ? AND timestamp <= ?
+            """
+            params = [person_id, start_date.isoformat(), end_date.isoformat()]
+
+            if source_types:
+                placeholders = ",".join("?" * len(source_types))
+                query += f" AND source_type IN ({placeholders})"
+                params.extend(source_types)
+
+            query += " GROUP BY month_key"
+
+            cursor = conn.execute(query, params)
+            return {row[0]: row[1] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
     def get_interaction_counts(
         self, person_id: str, days_back: int = None
     ) -> dict[str, int]:

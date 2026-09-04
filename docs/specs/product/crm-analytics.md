@@ -220,7 +220,7 @@ When contacts have birthdays matching today's date, a dismissible toast banner a
 
 `URL: /relationship`
 
-Therapy-informed insights and communication visualizations for a primary relationship (e.g., partner). Identified by `LIFEOS_PARTNER_NAME` and adjacent settings (see [configuration.md § Relationships](../../guides/configuration.md#relationships)).
+Therapy-informed insights and communication visualizations for a primary relationship (e.g., partner). Identified by `LIFEOS_PARTNER_NAME` and adjacent settings (see [configuration.md § Relationships](../../guides/configuration.md#relationships)). If no partner is configured (`partner_person_id` empty in `GET /api/crm/config`), the page renders a short empty state explaining what to configure instead of issuing any partner-scoped request.
 
 ### Therapy insights
 
@@ -242,7 +242,7 @@ Each panel has a refresh button to re-extract insights on demand.
 | Card | What it shows |
 |------|---------------|
 | **iMessage Dynamics** | Who initiates conversations and volume balance. |
-| **Tone Evolution** | Emotional warmth over time, with view modes (combined / user-only / partner-only / both). |
+| **Tone Evolution** | Emotional warmth over time, with view modes (combined / user-only / partner-only / both). Results are persisted per person/month and only recomputed when stale (see below); a manual refresh button forces recomputation of the full window. |
 | **Interaction Intensity** | Daily connection rhythm over 12 months. |
 | **Weekly Rhythm** | Peak connection days of the week. |
 | **Beyond Texting** | Monthly activity breakdown by channel (email, calendar, etc.). |
@@ -253,7 +253,7 @@ Each panel has a refresh button to re-extract insights on demand.
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /api/crm/relationship/tone-analysis` | Aggregated tone analysis over configurable months (samples up to 20 messages per month). |
-| `POST /api/crm/relationship/tone-analysis-detailed` | Separate user/partner tone scores (samples up to 10 messages per week per person). |
+| `POST /api/crm/relationship/tone-analysis-detailed` | Separate user/partner tone scores, one overall score per person per stale month. Persisted per person/month in `crm.db`'s `tone_analysis_results` table (one row per person + `YYYY-MM` period). Freshness is checked with a lightweight per-month count query that loads no interaction rows, so a page load with nothing new to analyze touches storage only, never the LLM and never a full row scan; a month is fresh when its stored interaction count hasn't changed and it was computed within the last 30 days. Only when at least one month is stale does the handler load and bucket the actual messages. Stale months are scored in one or more LLM calls, chunked at a few months per call (not one call for the whole window, and not one call per month) so a single slow or timed-out call can't blank the whole response — each chunk's result is saved as soon as it completes. Concurrent requests for the same person are serialized (with a short timeout, after which a request falls back to storage-only results) so two open tabs don't pay for the same call twice. `refresh=true` forces every month in the window to recompute. A stale month that couldn't be recomputed this request is never discarded: it's returned with its last stored score marked `status: "stale"`, and the Tone Evolution chart renders it as a dimmed point; `status: "error"` (a gap with a "not analysed" marker) is reserved for a month with no stored score at all. Trend labels (`user_trend`, `partner_trend`, `combined_trend`) are computed locally from the stored monthly scores (comparing the first half of the window's average to the second half) rather than authored by the LLM, since a response can be assembled from a mix of stored and freshly recomputed months. |
 
 ---
 

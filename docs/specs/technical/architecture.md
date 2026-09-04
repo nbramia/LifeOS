@@ -111,6 +111,7 @@ before persisting changes.
 - `relationship_metrics.py` - Strength computation
 - `relationship_summary.py` - Summary generation
 - `relationship_insights.py` - Therapy note insights
+- `tone_analysis_store.py` - Persisted per-person/month iMessage tone scores
 
 The CRM people-list endpoints (`GET /api/crm/people`, `GET /birthdays/today`)
 compute each returned person's category dynamically, which needs that

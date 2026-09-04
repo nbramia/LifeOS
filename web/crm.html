@@ -8084,13 +8084,16 @@
                                             <div class="viz-card-title">Tone Evolution</div>
                                             <div class="viz-card-subtitle">iMessage emotional warmth over time</div>
                                         </div>
-                                        <div class="tone-view-dropdown" style="position: relative;">
-                                            <select id="toneViewSelect" onchange="setToneViewMode(this.value)" style="font-size: 0.7rem; padding: 0.25rem 0.5rem; border-radius: 4px; border: 1px solid var(--border-subtle); background: var(--bg-secondary); color: var(--text-primary); cursor: pointer;">
-                                                <option value="combined">Shared Tone</option>
-                                                <option value="user">My Tone</option>
-                                                <option value="partner">Partner's Tone</option>
-                                                <option value="both">Both</option>
-                                            </select>
+                                        <div style="display: flex; align-items: center; gap: 0.35rem;">
+                                            <div class="tone-view-dropdown" style="position: relative;">
+                                                <select id="toneViewSelect" onchange="setToneViewMode(this.value)" style="font-size: 0.7rem; padding: 0.25rem 0.5rem; border-radius: 4px; border: 1px solid var(--border-subtle); background: var(--bg-secondary); color: var(--text-primary); cursor: pointer;">
+                                                    <option value="combined">Shared Tone</option>
+                                                    <option value="user">My Tone</option>
+                                                    <option value="partner">Partner's Tone</option>
+                                                    <option value="both">Both</option>
+                                                </select>
+                                            </div>
+                                            <button id="toneRefreshBtn" onclick="refreshToneAnalysis()" title="Recompute tone analysis" style="font-size: 0.75rem; padding: 0.2rem 0.4rem; border-radius: 4px; border: 1px solid var(--border-subtle); background: var(--bg-secondary); color: var(--text-primary); cursor: pointer;">↻</button>
                                         </div>
                                     </div>
                                     <div class="viz-card-content" id="toneTimelineViz">
@@ -8149,6 +8152,13 @@
                                 </div>
                             </div>
 
+                        </div>
+
+                        <!-- Shown instead of relationshipDashboard when no partner is configured (#891) -->
+                        <div class="detail-empty" id="relationshipEmptyState" style="display: none;">
+                            <div class="detail-empty-icon">💕</div>
+                            <p>No partner configured</p>
+                            <p style="font-size: 0.85rem; color: var(--text-muted);">Set <code>partner_person_id</code> in <code>config/relationship_overrides.json</code> to enable the Relationship dashboard.</p>
                         </div>
 
                         <!-- Two-column content grid (hidden for Me page) -->
@@ -10342,11 +10352,18 @@
                 familyDashboard.classList.remove('visible');
             }
 
-            // Hide relationship dashboard when viewing any person (including /me)
+            // Hide relationship dashboard (and its no-partner empty state,
+            // #899 review finding 2 -- it was left visible here, rendering
+            // inside an unrelated person's page) when viewing any person
+            // (including /me)
             const relationshipDashboard = document.getElementById('relationshipDashboard');
             if (relationshipDashboard) {
                 relationshipDashboard.style.display = 'none';
                 relationshipDashboard.classList.remove('visible');
+            }
+            const relationshipEmptyStateOnPerson = document.getElementById('relationshipEmptyState');
+            if (relationshipEmptyStateOnPerson) {
+                relationshipEmptyStateOnPerson.style.display = 'none';
             }
 
             // Show heatmap for person views (relationship view hides it, so restore it)
@@ -11429,6 +11446,20 @@
             document.getElementById('meDashboard').classList.remove('visible');
             document.getElementById('personContentGrid').style.display = 'none';
 
+            // Hide relationship dashboard and its no-partner empty state when
+            // navigating here directly from /relationship (#899 review
+            // finding 2 -- neither was hidden here, so either could keep
+            // rendering underneath the family dashboard).
+            const relationshipDashboardOnFamily = document.getElementById('relationshipDashboard');
+            if (relationshipDashboardOnFamily) {
+                relationshipDashboardOnFamily.style.display = 'none';
+                relationshipDashboardOnFamily.classList.remove('visible');
+            }
+            const relationshipEmptyStateOnFamily = document.getElementById('relationshipEmptyState');
+            if (relationshipEmptyStateOnFamily) {
+                relationshipEmptyStateOnFamily.style.display = 'none';
+            }
+
             // Hide the person-level hero stats (they're in tabOverview which stays visible)
             const personHeroStats = document.getElementById('heroStats');
             if (personHeroStats) personHeroStats.style.display = 'none';
@@ -11834,6 +11865,17 @@
             document.getElementById('familyDashboard').classList.remove('visible');
             document.getElementById('personContentGrid').style.display = 'none';
 
+            // No partner configured (#891): render an empty state and issue no
+            // partner-scoped requests (no insights/timeline/tone/photo calls).
+            const relationshipEmptyState = document.getElementById('relationshipEmptyState');
+            if (!PARTNER_PERSON_ID) {
+                document.getElementById('relationshipDashboard').style.display = 'none';
+                document.getElementById('relationshipDashboard').classList.remove('visible');
+                if (relationshipEmptyState) relationshipEmptyState.style.display = 'flex';
+                return;
+            }
+            if (relationshipEmptyState) relationshipEmptyState.style.display = 'none';
+
             // Hide person-level hero stats
             const personHeroStats = document.getElementById('heroStats');
             if (personHeroStats) personHeroStats.style.display = 'none';
@@ -11889,12 +11931,15 @@
                 detailTabs.style.display = 'none';
             }
 
-            // Load all data
+            // Load insights and the timeline first; tone analysis can be slow
+            // (a persisted-but-stale month still needs an LLM call) so it must
+            // not gate the rest of the page from rendering (#873). It renders
+            // itself into the tone card whenever it resolves.
             await Promise.all([
                 loadRelationshipInsights(),
                 loadRelationshipTimeline(),
-                loadToneAnalysis(),
             ]);
+            loadToneAnalysis();
 
             // Render visualizations
             renderIMessageBalance();
@@ -12104,17 +12149,33 @@
         // Tone view mode: 'user', 'partner', 'combined', 'both'
         let toneViewMode = 'combined';
 
-        // Load tone analysis (detailed version with separate user/partner scores)
-        async function loadToneAnalysis() {
+        // Load tone analysis (detailed version with separate user/partner scores).
+        // Stored, fresh months are served instantly; stale/missing months are
+        // recomputed server-side (#873). Pass refresh=true to force every
+        // month in the window to recompute regardless of freshness.
+        async function loadToneAnalysis(refresh = false) {
             const container = document.getElementById('toneTimelineViz');
+            const refreshBtn = document.getElementById('toneRefreshBtn');
+            if (refreshBtn) refreshBtn.disabled = true;
             try {
-                const data = await api('/relationship/tone-analysis-detailed', { method: 'POST' });
+                const path = refresh
+                    ? '/relationship/tone-analysis-detailed?refresh=true'
+                    : '/relationship/tone-analysis-detailed';
+                const data = await api(path, { method: 'POST' });
                 relationshipToneCache = data;
                 renderToneTimeline(data);
             } catch (error) {
                 console.error('Failed to load tone analysis:', error);
                 container.innerHTML = '<div class="viz-loading">Unable to analyze tone</div>';
+            } finally {
+                if (refreshBtn) refreshBtn.disabled = false;
             }
+        }
+
+        // "Refresh" affordance on the Tone Evolution card: force recomputation
+        // of every month in the window, bypassing the freshness cache.
+        function refreshToneAnalysis() {
+            loadToneAnalysis(true);
         }
 
         // Handle tone view mode change
@@ -12280,28 +12341,60 @@
                 return t.combined_score ?? t.score ?? 50;
             };
 
-            // Build points for a given score function
+            // Build points for a given score function. Error months (the LLM
+            // couldn't compute them and nothing was ever stored) are skipped
+            // entirely here rather than plotted at a fabricated score -- see
+            // errorMarkers below, which renders a distinct "not analysed"
+            // marker at their x position instead (#899 review finding 3).
+            // A "stale" month (a real, previously-computed score the server
+            // couldn't refresh this load) is NOT skipped -- it still has
+            // real data and #873's own acceptance criteria require serving
+            // it rather than discarding it -- but is rendered dimmed and
+            // distinct from a normal point (#899 review finding N2).
+            // `i` (the original, unfiltered index) is kept on each point so
+            // buildLinePath can detect a skipped month and break the line.
             const buildPoints = (scoreFn) => {
-                return tones.map((t, i) => {
-                    const score = scoreFn(t);
-                    const x = leftMargin + (i / Math.max(1, tones.length - 1)) * chartWidth;
-                    const y = topMargin + chartHeight - (score / 100) * chartHeight;
-                    return { x, y, score, month: t.month };
-                });
+                return tones
+                    .map((t, i) => ({ t, i }))
+                    .filter(({ t }) => t.status !== 'error')
+                    .map(({ t, i }) => {
+                        const score = scoreFn(t);
+                        const x = leftMargin + (i / Math.max(1, tones.length - 1)) * chartWidth;
+                        const y = topMargin + chartHeight - (score / 100) * chartHeight;
+                        return { x, y, score, month: t.month, status: t.status, i };
+                    });
             };
 
-            // Build smooth line path
+            // Build a smooth line path, starting a new sub-path (gap) wherever
+            // consecutive points skip an original index -- i.e. an error
+            // month sits between them and must not be smoothed over.
             const buildLinePath = (points) => {
                 if (points.length === 0) return '';
                 let path = `M ${points[0].x} ${points[0].y}`;
                 for (let i = 1; i < points.length; i++) {
                     const p0 = points[i - 1];
                     const p1 = points[i];
+                    if (p1.i !== p0.i + 1) {
+                        path += ` M ${p1.x} ${p1.y}`;
+                        continue;
+                    }
                     const cpX = (p0.x + p1.x) / 2;
                     path += ` C ${cpX} ${p0.y}, ${cpX} ${p1.y}, ${p1.x} ${p1.y}`;
                 }
                 return path;
             };
+
+            // Distinct markers for months the server couldn't analyse, at the
+            // same x position they'd otherwise occupy.
+            const errorMarkers = tones
+                .map((t, i) => ({ t, i }))
+                .filter(({ t }) => t.status === 'error')
+                .map(({ i }) => {
+                    const x = leftMargin + (i / Math.max(1, tones.length - 1)) * chartWidth;
+                    const y = topMargin + chartHeight / 2;
+                    return `<circle cx="${x}" cy="${y}" r="3" fill="none" stroke="var(--text-muted)" stroke-width="1.5" stroke-dasharray="2,2" class="tone-data-point-error"><title>${tones[i].month}: not analysed</title></circle>`;
+                })
+                .join('');
 
             // Colors
             const userColor = '#3b82f6';  // Blue
@@ -12341,23 +12434,41 @@
                 <text x="${leftMargin - 8}" y="${topMargin + chartHeight + 1}" text-anchor="end" style="font-size: 0.55rem; fill: #e94560;">Dismissive</text>
             `;
 
-            // X-axis month labels
+            // X-axis month labels. Error months are skipped here too (no
+            // label implying real data exists) -- errorMarkers above gives
+            // them their own distinct marker instead.
+            //
+            // `new Date(t.month + '-01')` used to parse "YYYY-MM-01" as UTC
+            // midnight, which toLocaleDateString then renders in the
+            // browser's local timezone -- west of UTC that rolls back to the
+            // last day of the *previous* month, so e.g. "2026-04" rendered
+            // as "Mar". Parsing the year/month directly and constructing the
+            // Date in local time avoids the UTC/local mismatch entirely.
             const showEvery = tones.length > 8 ? 2 : 1;
             const monthLabels = tones.map((t, i) => {
+                if (t.status === 'error') return '';
                 if (i % showEvery !== 0 && i !== tones.length - 1) return '';
                 const x = leftMargin + (i / Math.max(1, tones.length - 1)) * chartWidth;
-                const monthName = new Date(t.month + '-01').toLocaleDateString('en-US', { month: 'short' });
+                const [y, m] = t.month.split('-').map(Number);
+                const monthName = new Date(y, m - 1, 1).toLocaleDateString('en-US', { month: 'short' });
                 return `<text x="${x}" y="${height - 8}" text-anchor="middle" style="font-size: 0.55rem; fill: var(--text-muted);">${monthName}</text>`;
             }).join('');
 
-            // Build SVG paths and points
+            // Build SVG paths and points. A "stale" point (real data the
+            // server couldn't refresh this load) is dimmed and its tooltip
+            // says so, distinct from both a normal point and an error gap
+            // (#899 review finding N2).
             let pathsSvg = '';
             let pointsSvg = '';
             lines.forEach(line => {
                 const path = buildLinePath(line.points);
                 pathsSvg += `<path d="${path}" fill="none" stroke="${line.color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.9" />`;
-                line.points.forEach((p, i) => {
-                    pointsSvg += `<circle cx="${p.x}" cy="${p.y}" r="4" fill="${line.color}" class="tone-data-point"><title>${tones[i].month} (${line.label}): ${Math.round(p.score)}</title></circle>`;
+                line.points.forEach((p) => {
+                    const isStale = p.status === 'stale';
+                    const opacity = isStale ? '0.4' : '1';
+                    const staleClass = isStale ? ' tone-data-point-stale' : '';
+                    const staleSuffix = isStale ? ' (stale)' : '';
+                    pointsSvg += `<circle cx="${p.x}" cy="${p.y}" r="4" fill="${line.color}" opacity="${opacity}" class="tone-data-point${staleClass}"><title>${p.month} (${line.label}): ${Math.round(p.score)}${staleSuffix}</title></circle>`;
                 });
             });
 
@@ -12382,6 +12493,7 @@
                         ${monthLabels}
                         ${pathsSvg}
                         ${pointsSvg}
+                        ${errorMarkers}
                     </svg>
                     ${legendHtml}
                     <div style="text-align: center; font-size: 0.65rem; color: var(--text-muted); margin-top: 0.25rem;">${summaryText}</div>

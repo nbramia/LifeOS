@@ -583,11 +583,16 @@ Analyze tone/sentiment in iMessage conversations over time. Samples messages mon
 
 ### POST /api/crm/relationship/tone-analysis-detailed
 
-Detailed tone analysis with separate scores for the user and their partner. Groups messages by week, analyzes each person separately, then aggregates to monthly averages.
+Detailed tone analysis with separate scores for the user and their partner. Messages are bucketed by calendar month first, then by week within that month (so a week straddling a month boundary is never double-counted), and each stale month gets one overall score per person.
+
+Results are persisted per person and month (see [crm-analytics.md](crm-analytics.md#tone-analysis-apis)). Freshness is checked with a lightweight per-month count query that loads no interaction rows, so a fully-cached response touches storage only and returns in well under 200ms regardless of how many interactions exist in the window; only when at least one month is stale does the handler load and bucket the actual messages. Stale months are recomputed in one or more LLM calls, chunked at a handful of months per call so a single slow or timed-out call can't affect the whole window, and every chunk's result is saved as soon as it completes. Concurrent requests for the same person are serialized (with a short timeout) so two open tabs don't both pay for the same call.
 
 **Query parameters:**
 - `person_id` (string, optional): Target person (defaults to partner)
 - `months` (int): Months to analyze (default: 12)
+- `refresh` (bool, optional): Force recomputation of every month in the window, bypassing the freshness cache (default: false)
+
+**Response:** a stale month that couldn't be recomputed this request (the LLM failed, was unavailable, or its response omitted that month) is never discarded -- it comes back with its last stored score and `"status": "stale"` if one exists, or `"status": "error"` (a neutral placeholder score, not a real one) only when nothing was ever stored for it. `null`/omitted status means the score is current. The Relationship page's Tone Evolution chart plots a stale month as a dimmed point and an error month as a gap with a "not analysed" marker.
 
 ---
 

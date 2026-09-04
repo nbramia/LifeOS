@@ -231,6 +231,187 @@ class TestInteractionStore:
         # Should be ordered by timestamp DESC (most recent first)
         assert results[0].title == "Note 0"  # 1 day ago
 
+    def test_get_for_person_in_range(self, temp_store):
+        """get_for_person_in_range returns every interaction in the window,
+        with no row cap -- unlike get_for_person, which always applies
+        InteractionConfig's limit (#899 review finding 5: CRM tone analysis
+        needs the true per-month count, not a capped sample)."""
+        person_id = "person-range"
+
+        # More rows than get_for_person's default cap would ever return
+        # unbounded, plus one clearly outside the range on each side.
+        now = datetime.now()
+        for i, days_ago in enumerate([-5, 1, 2, 3, 4, 5, 100]):
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id=person_id,
+                timestamp=now - timedelta(days=days_ago),
+                source_type="imessage",
+                title=f"Message {i}",
+            )
+            temp_store.add(interaction)
+
+        results = temp_store.get_for_person_in_range(
+            person_id=person_id,
+            start_date=now - timedelta(days=6),
+            end_date=now,
+        )
+        # Excludes the 100-days-ago message (before start_date) and the
+        # 5-days-in-the-future one (after end_date).
+        assert len(results) == 5
+        assert all(r.person_id == person_id for r in results)
+        # Most recent first.
+        assert results[0].title == "Message 1"
+
+    def test_get_for_person_in_range_filters_by_source_type(self, temp_store):
+        person_id = "person-range-source"
+        now = datetime.now()
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id=person_id, timestamp=now,
+            source_type="imessage", title="iMessage",
+        ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id=person_id, timestamp=now,
+            source_type="gmail", title="Email",
+        ))
+
+        results = temp_store.get_for_person_in_range(
+            person_id=person_id,
+            start_date=now - timedelta(days=1),
+            end_date=now + timedelta(days=1),
+            source_type="imessage",
+        )
+        assert len(results) == 1
+        assert results[0].source_type == "imessage"
+
+    def test_get_for_person_in_range_only_returns_that_person(self, temp_store):
+        now = datetime.now()
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-a", timestamp=now,
+            source_type="imessage", title="A's message",
+        ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-b", timestamp=now,
+            source_type="imessage", title="B's message",
+        ))
+
+        results = temp_store.get_for_person_in_range(
+            person_id="person-a",
+            start_date=now - timedelta(days=1),
+            end_date=now + timedelta(days=1),
+        )
+        assert len(results) == 1
+        assert results[0].person_id == "person-a"
+
+    def test_get_monthly_interaction_counts_in_range(self, temp_store):
+        """get_monthly_interaction_counts_in_range groups by calendar month
+        without ever returning row data -- the lightweight freshness check
+        CRM tone analysis uses to avoid loading full rows on a cache hit
+        (#899 review finding N1)."""
+        person_id = "person-monthly-counts"
+        now = datetime.now(timezone.utc)
+
+        # 3 messages in the current month, 2 in the previous month, 1
+        # clearly outside the query range.
+        for i in range(3):
+            temp_store.add(Interaction(
+                id=str(uuid.uuid4()), person_id=person_id,
+                timestamp=now.replace(day=1) + timedelta(hours=i),
+                source_type="imessage", title=f"current month {i}",
+            ))
+        prev_month = (now.replace(day=1) - timedelta(days=1)).replace(day=1)
+        for i in range(2):
+            temp_store.add(Interaction(
+                id=str(uuid.uuid4()), person_id=person_id,
+                timestamp=prev_month + timedelta(hours=i),
+                source_type="imessage", title=f"prev month {i}",
+            ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id=person_id,
+            timestamp=now - timedelta(days=400),
+            source_type="imessage", title="way outside range",
+        ))
+
+        counts = temp_store.get_monthly_interaction_counts_in_range(
+            person_id=person_id,
+            start_date=prev_month,
+            end_date=now.replace(day=1) + timedelta(days=1),
+        )
+
+        current_month_key = now.strftime("%Y-%m")
+        prev_month_key = prev_month.strftime("%Y-%m")
+        assert counts[current_month_key] == 3
+        assert counts[prev_month_key] == 2
+        assert sum(counts.values()) == 5  # excludes the one 400 days back
+
+    def test_get_monthly_interaction_counts_in_range_filters_by_source_and_person(self, temp_store):
+        now = datetime.now(timezone.utc)
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-a", timestamp=now,
+            source_type="imessage", title="A imessage",
+        ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-a", timestamp=now,
+            source_type="gmail", title="A email",
+        ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-b", timestamp=now,
+            source_type="imessage", title="B imessage",
+        ))
+
+        counts = temp_store.get_monthly_interaction_counts_in_range(
+            person_id="person-a",
+            start_date=now - timedelta(days=1),
+            end_date=now + timedelta(days=1),
+            source_type="imessage",
+        )
+        assert sum(counts.values()) == 1
+
+    def test_get_monthly_interaction_counts_in_range_empty_when_nothing_in_range(self, temp_store):
+        now = datetime.now(timezone.utc)
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-empty", timestamp=now,
+            source_type="imessage", title="msg",
+        ))
+        counts = temp_store.get_monthly_interaction_counts_in_range(
+            person_id="person-empty",
+            start_date=now + timedelta(days=10),
+            end_date=now + timedelta(days=20),
+        )
+        assert counts == {}
+
+    def test_month_grouping_is_utc_normalized_even_for_a_non_utc_offset_row(self, temp_store):
+        """#899 review, second pass, nit 1: get_monthly_interaction_counts_in_range's
+        SQL grouping (`strftime('%Y-%m', timestamp)`, which SQLite always
+        evaluates in UTC regardless of the stored offset) must agree with
+        `api/routes/crm.py`'s Python-side bucketing for the same row --
+        even when that row is stored with a non-UTC offset, not just when
+        (as every writer in this codebase does today) it's already
+        `+00:00`. Pins the dependency directly rather than relying on
+        production data happening to already be UTC."""
+        from api.routes.crm import _bucket_interactions_by_month_and_week
+
+        person_id = "person-non-utc-offset"
+        # 2026-06-30 22:00 at UTC-04:00 is 2026-07-01 02:00 UTC -- a genuine
+        # month-boundary crossing that only a UTC-normalizing comparison
+        # gets right on both sides.
+        ts = datetime(2026, 6, 30, 22, 0, tzinfo=timezone(timedelta(hours=-4)))
+        interaction = Interaction(
+            id=str(uuid.uuid4()), person_id=person_id, timestamp=ts,
+            source_type="imessage", title="→ boundary-crossing message",
+        )
+        temp_store.add(interaction)
+
+        counts = temp_store.get_monthly_interaction_counts_in_range(
+            person_id=person_id,
+            start_date=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            end_date=datetime(2026, 7, 31, tzinfo=timezone.utc),
+        )
+        assert counts == {"2026-07": 1}  # SQL side: normalized to UTC
+
+        user_by_month_week, _ = _bucket_interactions_by_month_and_week([interaction])
+        assert set(user_by_month_week.keys()) == {"2026-07"}  # Python side must agree
+
     def test_get_for_person_by_source_type(self, temp_store):
         """Test filtering interactions by source type."""
         person_id = "person-filter"

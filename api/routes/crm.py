@@ -5059,6 +5059,7 @@ class ToneDataPointDetailed(BaseModel):
     combined_score: float  # Average of the two
     user_sample_count: int = 0
     partner_sample_count: int = 0
+    status: Optional[str] = None  # None = ok; "error" if the LLM failed for this month
 
 
 class ToneAnalysisResponse(BaseModel):
@@ -5355,97 +5356,126 @@ MESSAGES:
         raise HTTPException(status_code=500, detail=f"Tone analysis failed: {str(e)}")
 
 
-@router.post("/relationship/tone-analysis-detailed", response_model=ToneAnalysisDetailedResponse)
-def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: int = 12):
+# Stored tone results older than this are recomputed even if the
+# interaction count for that month hasn't changed (#873).
+TONE_FRESHNESS_DAYS = 30
+
+# Cap on how many stale months go into a single LLM call. The prompt is
+# still one call per chunk rather than one call per month (#899 review
+# finding 4), but capping the chunk size means a single slow/timed-out call
+# only blanks a few months' worth of recompute instead of the whole window
+# -- a 12-month first-ever load used to be all-or-nothing (#899 review
+# finding N2: a single stuck 12-month call turned every month to
+# status="error" at once, discarding whatever was already stored for them).
+TONE_MAX_MONTHS_PER_LLM_CALL = 4
+
+# How long a request waits to acquire the per-person lock below before
+# falling through to a storage-only response (#899 review finding N3): the
+# lock has no timeout otherwise, so one slow/stuck computation for a person
+# would stall every other request for that same person indefinitely, each
+# holding a threadpool worker.
+TONE_LOCK_TIMEOUT_SECONDS = 5
+
+# Per-person locks serializing concurrent tone-analysis requests for the same
+# person, so a double-clicked refresh or two open tabs don't both pay for the
+# same LLM call (#899 review finding 9). Keyed by person_id; created lazily
+# and never removed (bounded by the number of distinct people ever analyzed,
+# which is small). `_tone_analysis_locks_meta_lock` only guards the dict
+# itself, held for the instant it takes to look up or create one entry --
+# the actual tone-analysis work happens under the per-person lock it returns,
+# acquired with TONE_LOCK_TIMEOUT_SECONDS rather than blocking forever.
+_tone_analysis_locks: dict[str, threading.Lock] = {}
+_tone_analysis_locks_meta_lock = threading.Lock()
+
+
+def _get_tone_analysis_lock(person_id: str) -> threading.Lock:
+    """Get or create the per-person lock used to serialize tone analysis."""
+    with _tone_analysis_locks_meta_lock:
+        lock = _tone_analysis_locks.get(person_id)
+        if lock is None:
+            lock = threading.Lock()
+            _tone_analysis_locks[person_id] = lock
+        return lock
+
+
+def _derive_trend(scores: list) -> str:
+    """Derive a trend label from a chronological list of monthly scores.
+
+    Heuristic, computed from already-scored data -- not the LLM's own
+    trend text. Needed because a response can now be assembled from a mix
+    of stored months (scored in earlier, separate calls) and freshly
+    recomputed ones, so no single LLM call sees the whole window anymore.
+    Compares the average of the first half of the window to the second
+    half; options mirror the ones the prompt used to ask the LLM for.
     """
-    Analyze tone/sentiment separately for the user and their partner in iMessage conversations.
+    if len(scores) < 2:
+        return "insufficient-data"
+    mid = len(scores) // 2
+    first_avg = sum(scores[:mid]) / mid
+    second_avg = sum(scores[mid:]) / (len(scores) - mid)
+    diff = second_avg - first_avg
+    if diff > 8:
+        return "improving"
+    if diff < -8:
+        return "declining"
+    overall_avg = sum(scores) / len(scores)
+    variance = sum((s - overall_avg) ** 2 for s in scores) / len(scores)
+    if variance > 225:  # stddev > 15
+        return "variable"
+    return "stable-positive" if overall_avg >= 60 else "stable-neutral"
 
-    Groups messages by week, analyzes each person's tone separately, normalizes 0-100,
-    then aggregates to monthly averages. Returns separate scores for each person
-    plus a combined average.
+
+def _compute_tone_for_months(
+    client,
+    stale_months: list,
+    user_by_month_week: dict,
+    partner_by_month_week: dict,
+    user_name: str,
+    partner_name: str,
+) -> tuple:
+    """Call the LLM ONCE for the given months (`stale_months` here is
+    usually one chunk of at most TONE_MAX_MONTHS_PER_LLM_CALL months, not
+    the whole stale set -- see the caller), asking for one overall score
+    per person per month. Returns (results_by_month, model_name), where
+    `results_by_month` holds an entry only for the months the parsed
+    response actually covers -- a month present in `stale_months` but
+    absent from the result means the LLM omitted it. The original version
+    made one call per stale month (up to `months` sequential calls on a
+    first load or a refresh, each several seconds to minutes on a local
+    model); batching restores something close to a "one call per request"
+    cost while capping how much a single slow/timed-out call can affect
+    (#899 review findings 4 and N2).
+
+    Raises only if the call itself fails or the response can't be parsed at
+    all -- the caller treats every month in this chunk as missing in that
+    case and marks it `status="stale"` (if a prior stored value exists) or
+    `status="error"` (if not), never failing the request.
+
+    Messages are still presented to the LLM grouped by week within each
+    month (each (month, week) pair holds only that month's own messages --
+    see the handler's bucketing, which fixes #899 review finding 1), purely
+    for readability in the prompt; the requested output is one score per
+    month, not per week, since nothing downstream needs week-level
+    resolution (trend is now derived locally from the monthly scores, see
+    _derive_trend).
     """
-    from api.services.llm_client import get_anthropic_llm
-    import json
-    from datetime import datetime, timezone, timedelta
-    from collections import defaultdict
-
-    target_id = person_id or PARTNER_PERSON_ID
-    interaction_store = get_interaction_store()
-
-    # Get date range
-    now = datetime.now(timezone.utc)
-    start_date = now - timedelta(days=months * 30)
-
-    # Fetch iMessage interactions for this person
-    interactions = interaction_store.get_for_person(
-        person_id=target_id,
-        source_type="imessage",
-        limit=10000,  # Get more for weekly analysis
-    )
-
-    # Get names from settings
-    user_name = settings.user_name if settings.user_name else "User"
-    partner_name = settings.partner_name if settings.partner_name else "Partner"
-
-    # Separate messages by sender and group by week
-    # iMessage interactions have is_from_me attribute or we check title patterns
-    user_by_week: dict[str, list] = defaultdict(list)
-    partner_by_week: dict[str, list] = defaultdict(list)
-
-    for interaction in interactions:
-        dt = interaction.timestamp
-        if dt < start_date:
-            continue
-
-        # Week key: year-week number
-        week_key = dt.strftime("%Y-W%W")
-        title = interaction.title or ""
-
-        # Determine sender from title arrow prefix
-        # → means sent BY user, ← means received FROM partner
-        is_from_user = title.startswith("→")
-        message_text = title.lstrip("→←").strip() if title else ""
-
-        if is_from_user:
-            user_by_week[week_key].append(message_text)
-        else:
-            partner_by_week[week_key].append(message_text)
-
-    if not user_by_week and not partner_by_week:
-        return ToneAnalysisDetailedResponse(
-            monthly_tones=[],
-            user_trend="insufficient-data",
-            partner_trend="insufficient-data",
-            combined_trend="insufficient-data",
-            user_average=50.0,
-            partner_average=50.0,
-            generated_at=now.isoformat(),
-        )
-
-    # Get all weeks and sort them
-    all_weeks = sorted(set(user_by_week.keys()) | set(partner_by_week.keys()))
-
-    # Sample messages for tone analysis (max 10 per week per person)
-    def format_weekly_samples(by_week: dict, person_name: str) -> str:
+    def format_month_samples(by_month_week: dict, person_name: str) -> str:
         lines = []
-        for week in all_weeks:
-            msgs = by_week.get(week, [])
-            if msgs:
+        for month in stale_months:
+            for week in sorted(by_month_week.get(month, {}).keys()):
+                msgs = by_month_week[month][week]
                 sample = [m for m in msgs[:10] if m]
                 if sample:
-                    lines.append(f"=== {week} ({person_name}) ===\n" + "\n".join(sample))
+                    lines.append(f"=== {month} {week} ({person_name}) ===\n" + "\n".join(sample))
         return "\n\n".join(lines)
 
-    user_text = format_weekly_samples(user_by_week, user_name)
-    partner_text = format_weekly_samples(partner_by_week, partner_name)
-
-    # Use local LLM to analyze tone for each person
-    client = get_anthropic_llm()
+    user_text = format_month_samples(user_by_month_week, user_name)
+    partner_text = format_month_samples(partner_by_month_week, partner_name)
 
     prompt = f"""Analyze the emotional warmth of these iMessage conversations between {user_name} and {partner_name}.
-Messages are grouped by week and separated by sender.
+Messages are grouped by month, then by week within each month, and separated by sender.
 
-For EACH week where messages exist, rate emotional warmth on a scale from 0 to 100:
+For EACH month listed below, rate the OVERALL emotional warmth for that whole month on a scale from 0 to 100:
 - 100 = Extremely warm: Affectionate, loving, deeply connected
 - 75 = Warm: Friendly, caring, positive
 - 50 = Neutral: Everyday logistics, matter-of-fact
@@ -5460,106 +5490,360 @@ Analyze {user_name}'s messages and {partner_name}'s messages SEPARATELY.
 {partner_name.upper()}'S MESSAGES:
 {partner_text if partner_text else "(No messages)"}
 
-Return ONLY valid JSON with separate scores for each person for each week:
+Return ONLY valid JSON with one overall score per person for EACH month listed:
 {{
-  "weekly_scores": [
-    {{"week": "2025-W01", "user_score": 72, "partner_score": 68}},
-    {{"week": "2025-W02", "user_score": 65, "partner_score": 70}}
-  ],
-  "user_trend": "stable-positive",
-  "partner_trend": "stable-positive"
+  "monthly_scores": [
+    {{"month": "2025-03", "user_score": 72, "partner_score": 68}},
+    {{"month": "2025-04", "user_score": 65, "partner_score": 70}}
+  ]
 }}
 
-Trend options: stable-positive, stable-neutral, improving, declining, variable
-If a person has no messages for a week, omit their score for that week (don't put null)."""
+Months to score: {", ".join(stale_months)}
+If a person has few or no messages in a month, still include that month with your best estimate from context, or 50 if there is none."""
 
-    try:
-        response = client.create(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=4096,
-        )
+    response = client.create(
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=4096,
+    )
 
-        response_text = response.text
+    response_text = response.text
+    if "```json" in response_text:
+        json_start = response_text.find("```json") + 7
+        json_end = response_text.find("```", json_start)
+        response_text = response_text[json_start:json_end].strip()
+    elif "```" in response_text:
+        json_start = response_text.find("```") + 3
+        json_end = response_text.find("```", json_start)
+        response_text = response_text[json_start:json_end].strip()
 
-        # Parse JSON
-        if "```json" in response_text:
-            json_start = response_text.find("```json") + 7
-            json_end = response_text.find("```", json_start)
-            response_text = response_text[json_start:json_end].strip()
-        elif "```" in response_text:
-            json_start = response_text.find("```") + 3
-            json_end = response_text.find("```", json_start)
-            response_text = response_text[json_start:json_end].strip()
+    data = json.loads(response_text)
+    monthly_scores = data.get("monthly_scores", [])
 
-        data = json.loads(response_text)
-        weekly_scores = data.get("weekly_scores", [])
+    stale_month_set = set(stale_months)
+    results = {}
+    for item in monthly_scores:
+        month = item.get("month", "")
+        if month not in stale_month_set:
+            continue
+        if "user_score" not in item and "partner_score" not in item:
+            continue
+        user_score = float(item.get("user_score", 50.0))
+        partner_score = float(item.get("partner_score", 50.0))
+        combined_score = (user_score + partner_score) / 2
+        user_sample_count = sum(len(v) for v in user_by_month_week.get(month, {}).values())
+        partner_sample_count = sum(len(v) for v in partner_by_month_week.get(month, {}).values())
+        results[month] = {
+            "user_score": round(user_score, 1),
+            "partner_score": round(partner_score, 1),
+            "combined_score": round(combined_score, 1),
+            "user_sample_count": user_sample_count,
+            "partner_sample_count": partner_sample_count,
+        }
 
-        # Aggregate weekly scores to monthly
-        monthly_user: dict[str, list] = defaultdict(list)
-        monthly_partner: dict[str, list] = defaultdict(list)
+    model_name = getattr(response, "model", "") or ""
+    return results, model_name
 
-        for item in weekly_scores:
-            week = item.get("week", "")
-            if not week:
-                continue
 
-            # Convert week to month (approximate: use the Monday of that week)
-            try:
-                year = int(week[:4])
-                week_num = int(week.split("W")[1])
-                # Get first day of that week
-                from datetime import date
-                first_day = date.fromisocalendar(year, week_num, 1)
-                month_key = first_day.strftime("%Y-%m")
-            except (ValueError, IndexError):
-                continue
+def _tone_analysis_window_start(now, months: int):
+    """Calendar-month-aligned start of the tone-analysis window: the 1st of
+    the month `months` calendar months back from `now`'s month, inclusive
+    of the current month.
 
-            if "user_score" in item:
-                monthly_user[month_key].append(float(item["user_score"]))
-            if "partner_score" in item:
-                monthly_partner[month_key].append(float(item["partner_score"]))
+    Deliberately never `now - timedelta(days=months * 30)`: that rolling
+    cutoff drifts by a fraction of a day with every request, so the oldest
+    retained month's messages (and therefore its "current" interaction
+    count) shift purely from wall-clock time passing, forcing a needless
+    recompute on every load even though nothing about that month changed
+    (#899 review finding 5). Extracted as its own function so this exact
+    property is directly testable rather than only observable end-to-end
+    through a synthetic fixture that happens to sit inside either window
+    (#899 review finding N4 -- the original drift-regression test didn't
+    actually distinguish this from a reverted rolling window).
+    """
+    current_month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    year, month = current_month_start.year, current_month_start.month - (months - 1)
+    while month <= 0:
+        month += 12
+        year -= 1
+    return current_month_start.replace(year=year, month=month)
 
-        # Compute monthly averages
-        all_months = sorted(set(monthly_user.keys()) | set(monthly_partner.keys()))
 
-        monthly_tones = []
-        all_user_scores = []
-        all_partner_scores = []
+def _bucket_interactions_by_month_and_week(interactions: list) -> tuple:
+    """Bucket messages by their own calendar month first, then by week
+    within that month -- never by week alone. A week that straddles a
+    month boundary used to be looked up in one week-keyed dict shared
+    across both months, so both months' LLM prompts got the *other*
+    month's messages too and both months' sample counts roughly doubled
+    (#899 review finding 1). Keying week dicts under their month first
+    makes that impossible: each message lands under exactly one
+    (month, week) pair.
 
-        for month in all_months:
-            user_scores = monthly_user.get(month, [])
-            partner_scores = monthly_partner.get(month, [])
+    The month key is computed from the UTC-normalized instant
+    (`dt.astimezone(timezone.utc)`), not `dt`'s own stored offset, to match
+    `InteractionStore.get_monthly_interaction_counts_in_range`'s
+    `strftime('%Y-%m', timestamp)`, which SQLite always evaluates in UTC
+    regardless of what offset the timestamp string carries. Every
+    interaction in this codebase is stored with a `+00:00` offset today, so
+    this is a no-op in practice, but without it a row ever stored with a
+    non-UTC offset would land in a different month here than in that
+    count query -- and a month whose bucketed count permanently disagrees
+    with its stored `interaction_count` would recompute on every single
+    load (#899 review, second pass, nit 1).
 
-            user_avg = sum(user_scores) / len(user_scores) if user_scores else 50.0
-            partner_avg = sum(partner_scores) / len(partner_scores) if partner_scores else 50.0
-            combined_avg = (user_avg + partner_avg) / 2
+    Returns (user_by_month_week, partner_by_month_week).
+    """
+    from collections import defaultdict
 
-            all_user_scores.extend(user_scores)
-            all_partner_scores.extend(partner_scores)
+    user_by_month_week: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    partner_by_month_week: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
 
-            monthly_tones.append(ToneDataPointDetailed(
-                month=month,
-                user_score=round(user_avg, 1),
-                partner_score=round(partner_avg, 1),
-                combined_score=round(combined_avg, 1),
-                user_sample_count=len(user_by_week.get(month, [])),
-                partner_sample_count=len(partner_by_week.get(month, [])),
-            ))
+    for interaction in interactions:
+        dt = interaction.timestamp.astimezone(timezone.utc)
+        month_key = dt.strftime("%Y-%m")
+        week_key = dt.strftime("%Y-W%W")
 
-        # Overall averages
-        user_overall = sum(all_user_scores) / len(all_user_scores) if all_user_scores else 50.0
-        partner_overall = sum(all_partner_scores) / len(all_partner_scores) if all_partner_scores else 50.0
+        title = interaction.title or ""
+        # → means sent BY user, ← means received FROM partner
+        is_from_user = title.startswith("→")
+        message_text = title.lstrip("→←").strip() if title else ""
 
+        if is_from_user:
+            user_by_month_week[month_key][week_key].append(message_text)
+        else:
+            partner_by_month_week[month_key][week_key].append(message_text)
+
+    return user_by_month_week, partner_by_month_week
+
+
+def _chunked(items: list, size: int):
+    """Yield successive `size`-length slices of `items`."""
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+@router.post("/relationship/tone-analysis-detailed", response_model=ToneAnalysisDetailedResponse)
+def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: int = 12, refresh: bool = False):
+    """
+    Analyze tone/sentiment separately for the user and their partner in iMessage conversations.
+
+    Freshness is decided from a lightweight per-month COUNT query
+    (`get_monthly_interaction_counts_in_range`) that never loads a single
+    interaction row -- a fully-cached response touches storage only, no
+    row scan and no LLM call (#899 review finding N1). Only when at least
+    one month is stale does the handler fetch and bucket the actual
+    messages (by calendar month first, then by week within that month --
+    #899 review finding 1) to build LLM prompts, chunked at
+    `TONE_MAX_MONTHS_PER_LLM_CALL` months per call so one slow or timed-out
+    call can't blank the whole window (#899 review finding N2). Results
+    are persisted per person/month in `tone_analysis_results`
+    (api/services/tone_analysis_store.py): a month is served from storage
+    when its stored interaction count still matches the current count and
+    the result is within the freshness window (`TONE_FRESHNESS_DAYS`).
+    Pass `refresh=true` to force recomputation of every month in the window
+    regardless of freshness.
+
+    Never discards a good stored result and never raises for an LLM
+    failure or unavailability: a stale month that couldn't be recomputed
+    this request is returned with its last stored score and
+    `status="stale"` if one exists, or `status="error"` only if nothing
+    was ever stored for it (#899 review finding N2; ADR-025 fallback
+    preserved via get_anthropic_llm).
+    """
+    from api.services.llm_client import get_anthropic_llm
+    from api.services.tone_analysis_store import get_tone_analysis_store
+    from datetime import datetime, timezone, timedelta
+
+    target_id = person_id or PARTNER_PERSON_ID
+    interaction_store = get_interaction_store()
+    tone_store = get_tone_analysis_store()
+
+    now = datetime.now(timezone.utc)
+    start_date = _tone_analysis_window_start(now, months)
+
+    # Cheap freshness check: counts only, no rows loaded (#899 review
+    # finding N1). get_for_person_in_range (which loads every row) is only
+    # called below once stale_months is known to be non-empty.
+    month_interaction_counts = interaction_store.get_monthly_interaction_counts_in_range(
+        person_id=target_id,
+        start_date=start_date,
+        end_date=now,
+        source_type="imessage",
+    )
+
+    if not month_interaction_counts:
         return ToneAnalysisDetailedResponse(
-            monthly_tones=monthly_tones,
-            user_trend=data.get("user_trend", "variable"),
-            partner_trend=data.get("partner_trend", "variable"),
-            combined_trend="stable-positive" if abs(user_overall - partner_overall) < 10 else "variable",
-            user_average=round(user_overall, 1),
-            partner_average=round(partner_overall, 1),
+            monthly_tones=[],
+            user_trend="insufficient-data",
+            partner_trend="insufficient-data",
+            combined_trend="insufficient-data",
+            user_average=50.0,
+            partner_average=50.0,
             generated_at=now.isoformat(),
         )
 
-    except Exception as e:
-        logger.error(f"Detailed tone analysis failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Tone analysis failed: {str(e)}")
+    all_months = sorted(month_interaction_counts.keys())
+    user_name = settings.user_name if settings.user_name else "User"
+    partner_name = settings.partner_name if settings.partner_name else "Partner"
+
+    stored_by_month = {r.period_key: r for r in tone_store.get_for_person(target_id)}
+
+    def _compute_stale_months(stored_map: dict) -> list:
+        stale = []
+        for month in all_months:
+            stored = stored_map.get(month)
+            current_count = month_interaction_counts.get(month, 0)
+            if refresh or stored is None or stored.interaction_count != current_count:
+                stale.append(month)
+                continue
+            age = (now - stored.updated_at) if stored.updated_at else timedelta.max
+            if age > timedelta(days=TONE_FRESHNESS_DAYS):
+                stale.append(month)
+        return stale
+
+    stale_months = _compute_stale_months(stored_by_month)
+
+    # Serialize same-person requests: two concurrent tabs or a double-clicked
+    # refresh must not both pay for the same LLM call (#899 review finding
+    # 9). Bounded to TONE_LOCK_TIMEOUT_SECONDS (#899 review finding N3): a
+    # request that can't get the lock in time falls through to a
+    # storage-only response (marking anything stale as such) rather than
+    # blocking on someone else's in-flight computation and tying up a
+    # threadpool worker indefinitely. This only affects the *same* person --
+    # other people and unrelated endpoints (e.g. GET /api/crm/config) are
+    # unaffected, since the handler still runs off the event loop.
+    results_by_month: dict = {}
+    model_name = ""
+    if stale_months:
+        lock = _get_tone_analysis_lock(target_id)
+        lock_acquired = lock.acquire(timeout=TONE_LOCK_TIMEOUT_SECONDS)
+        try:
+            if lock_acquired:
+                # Re-check under the lock: a concurrent request may have
+                # already refreshed some or all of these months while this
+                # one waited.
+                stored_by_month = {r.period_key: r for r in tone_store.get_for_person(target_id)}
+                stale_months = _compute_stale_months(stored_by_month)
+
+                if stale_months:
+                    interactions = interaction_store.get_for_person_in_range(
+                        person_id=target_id, start_date=start_date, end_date=now,
+                        source_type="imessage",
+                    )
+                    user_by_month_week, partner_by_month_week = _bucket_interactions_by_month_and_week(
+                        interactions,
+                    )
+
+                    # One LLM call per chunk of at most TONE_MAX_MONTHS_PER_LLM_CALL
+                    # months, not one call for the whole window (#899 review
+                    # finding N2) and not one call per month (#899 review
+                    # finding 4) -- each chunk's result is upserted as soon as
+                    # it completes, so a later chunk's failure or timeout
+                    # (bounded by the LLM client's own configured timeout;
+                    # see api/services/llm_client.py) can't undo an earlier
+                    # chunk's success.
+                    for chunk in _chunked(stale_months, TONE_MAX_MONTHS_PER_LLM_CALL):
+                        try:
+                            client = get_anthropic_llm()
+                            chunk_results, model_name = _compute_tone_for_months(
+                                client, chunk, user_by_month_week, partner_by_month_week,
+                                user_name, partner_name,
+                            )
+                        except Exception as e:
+                            # Never a 500 for an LLM failure or unavailability --
+                            # catches both client acquisition (get_anthropic_llm)
+                            # and the call itself. Log without personal data (no
+                            # prompt/message content); this chunk's months are
+                            # marked stale/error below, but earlier chunks'
+                            # upserts already happened and are unaffected.
+                            logger.warning(
+                                "Tone analysis failed for a %d-month chunk: %s",
+                                len(chunk), e,
+                            )
+                            chunk_results = {}
+
+                        for month in chunk:
+                            if month in chunk_results:
+                                stored_by_month[month] = tone_store.upsert(
+                                    person_id=target_id,
+                                    period_key=month,
+                                    interaction_count=month_interaction_counts.get(month, 0),
+                                    result=chunk_results[month],
+                                    model=model_name,
+                                )
+                                results_by_month[month] = chunk_results[month]
+            else:
+                # Couldn't get the lock in time -- fall through without
+                # attempting the LLM, rather than blocking this request on
+                # someone else's in-flight computation. Re-read storage
+                # (and re-check staleness against it) before assembly: the
+                # lock holder may have just upserted some or all of these
+                # months while this request waited, and without this
+                # re-read they'd still be reported "stale" from the
+                # pre-wait snapshot for the rest of this response, even
+                # though a fresh score already landed (#899 review, second
+                # pass, nit 2).
+                stored_by_month = {r.period_key: r for r in tone_store.get_for_person(target_id)}
+                stale_months = _compute_stale_months(stored_by_month)
+        finally:
+            if lock_acquired:
+                lock.release()
+
+    # Assemble the response from storage. A month left in stale_months that
+    # wasn't freshly computed this request (chunk failed, response omitted
+    # it, or the lock couldn't be acquired) is served its last stored score
+    # marked status="stale" -- never discarded -- or status="error" only if
+    # nothing was ever stored for it (#899 review finding N2).
+    monthly_tones = []
+    all_user_scores = []
+    all_partner_scores = []
+
+    for month in all_months:
+        stored = stored_by_month.get(month)
+        if month in results_by_month:
+            status = None
+        elif month in stale_months:
+            status = "stale" if stored is not None else "error"
+        else:
+            status = None
+
+        if stored is not None:
+            r = stored.result
+            user_score = float(r.get("user_score", 50.0))
+            partner_score = float(r.get("partner_score", 50.0))
+            combined_score = float(r.get("combined_score", (user_score + partner_score) / 2))
+            monthly_tones.append(ToneDataPointDetailed(
+                month=month,
+                user_score=user_score,
+                partner_score=partner_score,
+                combined_score=combined_score,
+                user_sample_count=int(r.get("user_sample_count", 0)),
+                partner_sample_count=int(r.get("partner_sample_count", 0)),
+                status=status,
+            ))
+            all_user_scores.append(user_score)
+            all_partner_scores.append(partner_score)
+        else:
+            # No stored result exists at all for this month -- report the
+            # gap, don't fail the request or fabricate a score.
+            monthly_tones.append(ToneDataPointDetailed(
+                month=month,
+                user_score=50.0,
+                partner_score=50.0,
+                combined_score=50.0,
+                user_sample_count=0,
+                partner_sample_count=0,
+                status="error",
+            ))
+
+    user_overall = sum(all_user_scores) / len(all_user_scores) if all_user_scores else 50.0
+    partner_overall = sum(all_partner_scores) / len(all_partner_scores) if all_partner_scores else 50.0
+
+    return ToneAnalysisDetailedResponse(
+        monthly_tones=monthly_tones,
+        user_trend=_derive_trend(all_user_scores),
+        partner_trend=_derive_trend(all_partner_scores),
+        combined_trend="stable-positive" if abs(user_overall - partner_overall) < 10 else "variable",
+        user_average=round(user_overall, 1),
+        partner_average=round(partner_overall, 1),
+        generated_at=now.isoformat(),
+    )
