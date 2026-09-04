@@ -180,18 +180,36 @@ def search_people(
     A generous internal candidate cap (`limit * 5`, minimum 200) is fetched
     from the store so the existing relevance ordering -- exact canonical-name
     match first, then most recent `last_seen` -- is preserved within the
-    returned page for the common cases (a full name, a rare token, a partial
-    email). Note: for a query with more than `candidate_cap` total matches
-    (e.g. a single common letter), an exact match with an old `last_seen` that
-    falls outside the store's candidate window could be excluded even though
-    a full scan would have surfaced it first -- this only matters for
-    pathologically broad queries, not realistic search terms.
+    returned page. For a query with more than `candidate_cap` total matches,
+    the *canonical-name* exact match could otherwise fall outside that
+    window (it's ranked by recency like everything else while the store
+    fetches candidates), so it's looked up separately via the store's
+    indexed `person_names` table (`get_by_name`, an O(1) lookup) and spliced
+    into the candidate set when it isn't already present -- restoring "your
+    own exact name always finds you" for single-token names with thousands
+    of substring matches, at the cost of one extra indexed lookup per
+    request.
     """
     store = get_person_entity_store()
     query_lower = q.lower()
 
     candidate_cap = max(limit * 5, 200)
     candidates = store.search(q, limit=candidate_cap)
+
+    # Guarantee the exact canonical-name match is always a candidate, even
+    # when it doesn't fall within the store's recency-ordered candidate
+    # window (see docstring). `get_by_name` is an indexed exact lookup on
+    # person_names, not a substring scan, so this is cheap regardless of how
+    # many people match `q` as a substring.
+    candidate_ids = {e.id for e in candidates if e.id}
+    exact_owner = store.get_by_name(q)
+    if (
+        exact_owner is not None
+        and exact_owner.id not in candidate_ids
+        and not exact_owner.hidden
+        and exact_owner.canonical_name.lower() == query_lower
+    ):
+        candidates.append(exact_owner)
 
     # Sort by relevance (exact matches first, then by last_seen) -- same
     # ordering the old full-scan implementation used.
@@ -204,7 +222,13 @@ def search_people(
     results = candidates[:limit]
 
     # Batch the recency-by-source lookup for the whole page in one query
-    # instead of one per person (the old N+1 cost).
+    # instead of one per person (the old N+1 cost). A person absent from the
+    # batch result genuinely has no interactions -- get_last_interaction_by_
+    # source_batch() documents that IDs with none are simply absent, so this
+    # must be `{}` (a real "no recency data" answer), not `None`, or
+    # _entity_to_response falls back to its own per-person query for every
+    # such person and the N+1 cost this batching exists to remove comes right
+    # back.
     interaction_store = get_interaction_store()
     recency_map = interaction_store.get_last_interaction_by_source_batch(
         [e.id for e in results if e.id]
@@ -214,7 +238,7 @@ def search_people(
 
     return SearchResponse(
         people=[
-            _entity_to_response(e, precomputed_recency=recency_map.get(e.id))
+            _entity_to_response(e, precomputed_recency=recency_map.get(e.id, {}))
             for e in results
         ],
         count=len(results),
@@ -257,8 +281,19 @@ def list_people(
     store = get_person_entity_store()
     entities = store.list_recent(limit=limit, category=category)
 
+    # Same batched recency lookup as search_people() -- without it this
+    # became the endpoint with the N+1 (one interaction-store query per
+    # returned person, up to `limit`=500).
+    interaction_store = get_interaction_store()
+    recency_map = interaction_store.get_last_interaction_by_source_batch(
+        [e.id for e in entities if e.id]
+    )
+
     return SearchResponse(
-        people=[_entity_to_response(e) for e in entities],
+        people=[
+            _entity_to_response(e, precomputed_recency=recency_map.get(e.id, {}))
+            for e in entities
+        ],
         count=len(entities),
         query="*",
     )

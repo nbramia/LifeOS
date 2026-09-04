@@ -354,9 +354,33 @@ class TestSearchPeopleEndpoint:
         for entity in (exact_old, partial_recent, email_match, non_match):
             person_store.add(entity)
 
+        # One of the four has a real interaction; the other three have none
+        # at all -- exercising both branches of the batched-recency fix
+        # (#872 review finding 1): "absent from the batch map" must mean
+        # "no interactions", not "go run a per-person fallback query".
+        self._insert_raw_interaction(interaction_store, "partial-recent", "gmail", days_ago=1)
+
         monkeypatch.setattr(people_routes, "get_person_entity_store", lambda: person_store)
         monkeypatch.setattr(people_routes, "get_interaction_store", lambda: interaction_store)
         return person_store, interaction_store
+
+    @staticmethod
+    def _insert_raw_interaction(interaction_store, person_id, source_type, days_ago):
+        """Insert an interaction row directly, bypassing InteractionStore.add()
+        (which resolves person_id against the global PersonEntityStore
+        singleton, not this test's isolated one)."""
+        import uuid
+        conn = interaction_store._get_connection()
+        ts = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        try:
+            conn.execute(
+                "INSERT INTO interactions (id, person_id, timestamp, source_type, title) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), person_id, ts, source_type, "test"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     @pytest.fixture
     def client(self, stores):
@@ -411,22 +435,154 @@ class TestSearchPeopleEndpoint:
 
     def test_recency_lookup_is_batched_once(self, client, stores, monkeypatch):
         """The N+1 per-person recency query must become exactly one batched
-        call for the whole page, no matter how many results are returned."""
+        call for the whole page, no matter how many results are returned --
+        and the per-person fallback (get_last_interaction_by_source) must
+        never run, including for the three people in this fixture with zero
+        interactions (#872 review finding 1: an id absent from the batch
+        result means "no interactions", not "go run the fallback query")."""
         _, interaction_store = stores
-        calls = []
-        original = interaction_store.get_last_interaction_by_source_batch
+        batch_calls = []
+        original_batch = interaction_store.get_last_interaction_by_source_batch
 
-        def spy(person_ids):
-            calls.append(list(person_ids))
-            return original(person_ids)
+        def batch_spy(person_ids):
+            batch_calls.append(list(person_ids))
+            return original_batch(person_ids)
 
-        monkeypatch.setattr(interaction_store, "get_last_interaction_by_source_batch", spy)
+        per_person_calls = []
+
+        def per_person_spy(person_id):
+            per_person_calls.append(person_id)
+            return {}
+
+        monkeypatch.setattr(interaction_store, "get_last_interaction_by_source_batch", batch_spy)
+        monkeypatch.setattr(interaction_store, "get_last_interaction_by_source", per_person_spy)
 
         resp = client.get("/api/people/search", params={"q": "ada", "limit": 20})
         assert resp.status_code == 200
-        assert len(calls) == 1, "expected exactly one batched recency call"
-        returned_ids = {p["entity_id"] for p in resp.json()["people"]}
-        assert set(calls[0]) == returned_ids
+        data = resp.json()
+
+        assert len(batch_calls) == 1, "expected exactly one batched recency call"
+        returned_ids = {p["entity_id"] for p in data["people"]}
+        assert set(batch_calls[0]) == returned_ids
+        assert per_person_calls == [], (
+            f"the per-person fallback must never run once results are batched, "
+            f"but it ran for: {per_person_calls}"
+        )
+
+        # The fixture's zero-interaction people must still report "no active
+        # channels" correctly, not silently omit the field or error.
+        by_id = {p["entity_id"]: p for p in data["people"]}
+        assert by_id["exact-old"]["active_channels"] == []
+        assert by_id["partial-recent"]["active_channels"] == ["gmail"]
+
+
+class TestExactMatchOutsideCandidateWindow:
+    """#872 review finding 2: a query with far more matches than the
+    internal candidate cap (`limit * 5`, minimum 200) must still surface the
+    exact canonical-name match. The store's candidate window is ordered by
+    recency, so the exact match -- the single oldest of hundreds of
+    substring matches here -- would otherwise be excluded from the window
+    entirely and never returned at all, not just reordered."""
+
+    @pytest.fixture
+    def client(self, tmp_path, monkeypatch):
+        from api.services.person_entity import PersonEntityStore
+        from api.services.interaction_store import InteractionStore
+        import api.routes.people as people_routes
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        person_store = PersonEntityStore(db_path=str(tmp_path / "people.db"))
+        interaction_store = InteractionStore(
+            db_path=str(tmp_path / "interactions.db"), strict=False
+        )
+
+        now = datetime.now(timezone.utc)
+        # 205 filler people, all matching the substring "widget" and all
+        # more recently seen than the exact match below -- comfortably more
+        # than the 200-row candidate window a default query uses.
+        for i in range(205):
+            person_store.add(_make_person(
+                id=f"filler-{i}",
+                canonical_name=f"Widget Owner {i}",
+                last_seen=now - timedelta(seconds=i),
+            ))
+        # The exact canonical-name match for query "widget" -- the oldest
+        # last_seen of anyone matching, so a plain recency-ordered candidate
+        # fetch excludes it from the top 200 entirely.
+        person_store.add(_make_person(
+            id="exact-widget",
+            canonical_name="Widget",
+            last_seen=now - timedelta(days=3650),
+        ))
+
+        monkeypatch.setattr(people_routes, "get_person_entity_store", lambda: person_store)
+        monkeypatch.setattr(people_routes, "get_interaction_store", lambda: interaction_store)
+        return TestClient(app)
+
+    def test_exact_match_still_returned_first(self, client):
+        resp = client.get("/api/people/search", params={"q": "widget", "limit": 20})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["people"][0]["canonical_name"] == "Widget"
+        assert data["total"] == 206
+
+    def test_exact_match_included_at_mcp_default_limit_too(self, client):
+        """MCP's default limit=10 hits the same >=200 candidate cap (the
+        formula is `max(limit * 5, 200)`), so the splice must still apply."""
+        resp = client.get("/api/people/search", params={"q": "widget", "limit": 10})
+        assert resp.status_code == 200
+        names = [p["canonical_name"] for p in resp.json()["people"]]
+        assert names[0] == "Widget"
+
+
+class TestSearchPeopleLikeEscaping:
+    """#872 review finding 5: `%` and `_` in a search query must match
+    literally, not act as SQL LIKE wildcards, now that matching runs in SQL
+    instead of a Python substring scan."""
+
+    @pytest.fixture
+    def client(self, tmp_path, monkeypatch):
+        from api.services.person_entity import PersonEntityStore
+        from api.services.interaction_store import InteractionStore
+        import api.routes.people as people_routes
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        person_store = PersonEntityStore(db_path=str(tmp_path / "people.db"))
+        interaction_store = InteractionStore(
+            db_path=str(tmp_path / "interactions.db"), strict=False
+        )
+
+        now = datetime.now(timezone.utc)
+        # A literal "_" in the name, plus a distractor with an arbitrary
+        # character in the same position -- an unescaped "_" (SQL LIKE's
+        # single-character wildcard) would incorrectly match both.
+        person_store.add(_make_person(id="underscore-literal", canonical_name="Foo_Bar", last_seen=now))
+        person_store.add(_make_person(id="underscore-distractor", canonical_name="FooXBar", last_seen=now))
+        # A literal "%" in the name, plus a distractor with extra characters
+        # in the same position -- an unescaped "%" (SQL LIKE's multi-character
+        # wildcard) would incorrectly match both.
+        person_store.add(_make_person(id="percent-literal", canonical_name="100%Club", last_seen=now))
+        person_store.add(_make_person(id="percent-distractor", canonical_name="100XYZClub", last_seen=now))
+
+        monkeypatch.setattr(people_routes, "get_person_entity_store", lambda: person_store)
+        monkeypatch.setattr(people_routes, "get_interaction_store", lambda: interaction_store)
+        return TestClient(app)
+
+    def test_underscore_matches_literally(self, client):
+        resp = client.get("/api/people/search", params={"q": "foo_bar", "limit": 20})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert {p["entity_id"] for p in data["people"]} == {"underscore-literal"}
+        assert data["total"] == 1
+
+    def test_percent_matches_literally(self, client):
+        resp = client.get("/api/people/search", params={"q": "100%club", "limit": 20})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert {p["entity_id"] for p in data["people"]} == {"percent-literal"}
+        assert data["total"] == 1
 
 
 class TestListPeopleEndpoint:
@@ -435,9 +591,13 @@ class TestListPeopleEndpoint:
     @pytest.fixture
     def stores(self, tmp_path, monkeypatch):
         from api.services.person_entity import PersonEntityStore
+        from api.services.interaction_store import InteractionStore
         import api.routes.people as people_routes
 
         person_store = PersonEntityStore(db_path=str(tmp_path / "people.db"))
+        interaction_store = InteractionStore(
+            db_path=str(tmp_path / "interactions.db"), strict=False
+        )
 
         now = datetime.now(timezone.utc)
         oldest = _make_person(
@@ -456,7 +616,8 @@ class TestListPeopleEndpoint:
             person_store.add(entity)
 
         monkeypatch.setattr(people_routes, "get_person_entity_store", lambda: person_store)
-        return person_store
+        monkeypatch.setattr(people_routes, "get_interaction_store", lambda: interaction_store)
+        return person_store, interaction_store
 
     @pytest.fixture
     def client(self, stores):
@@ -482,6 +643,37 @@ class TestListPeopleEndpoint:
         data = resp.json()
         assert data["count"] == 1
         assert data["people"][0]["canonical_name"] == "Erin New"
+
+    def test_recency_lookup_is_batched_once(self, client, stores, monkeypatch):
+        """#872 review finding 6: /api/people/list must use the same batched
+        recency lookup as /api/people/search instead of one query per
+        returned person."""
+        _, interaction_store = stores
+        batch_calls = []
+        original_batch = interaction_store.get_last_interaction_by_source_batch
+
+        def batch_spy(person_ids):
+            batch_calls.append(list(person_ids))
+            return original_batch(person_ids)
+
+        per_person_calls = []
+
+        def per_person_spy(person_id):
+            per_person_calls.append(person_id)
+            return {}
+
+        monkeypatch.setattr(interaction_store, "get_last_interaction_by_source_batch", batch_spy)
+        monkeypatch.setattr(interaction_store, "get_last_interaction_by_source", per_person_spy)
+
+        resp = client.get("/api/people/list", params={"limit": 10})
+        assert resp.status_code == 200
+        returned_ids = {p["entity_id"] for p in resp.json()["people"]}
+
+        assert len(batch_calls) == 1, "expected exactly one batched recency call"
+        assert set(batch_calls[0]) == returned_ids
+        assert per_person_calls == [], (
+            f"the per-person fallback must never run, but it ran for: {per_person_calls}"
+        )
 
 
 class TestInteractionStoreBatchRecency:

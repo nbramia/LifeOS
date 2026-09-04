@@ -558,6 +558,64 @@ def test_people_search_tool_schema_advertises_limit_default_and_cap(openapi_spec
     assert limit_prop["maximum"] == 50
 
 
+def _synthetic_people(n):
+    return [
+        {
+            "canonical_name": f"Person {i}",
+            "entity_id": f"id{i}",
+            "relationship_strength": 10,
+            "days_since_contact": 5,
+            "active_channels": [],
+        }
+        for i in range(n)
+    ]
+
+
+@pytest.mark.unit
+def test_people_search_formatter_header_reports_total_not_page_size():
+    """#872 review finding 3: with `limit` now bounding the page, the header
+    must report the true match count (`total`), not just how many rows are
+    in this page -- otherwise a broad query silently looks exhaustive and
+    the caller loses the "there are many more, narrow your query" signal.
+    The ten person blocks themselves must stay byte-identical either way."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    server = module.LifeOSMCPServer()
+
+    people = _synthetic_people(10)
+    small_query_data = {"people": people, "count": 10, "query": "a", "total": 10}
+    broad_query_data = {"people": people, "count": 10, "query": "a", "total": 253}
+
+    small_out = server._format_response("lifeos_people_search", small_query_data)
+    broad_out = server._format_response("lifeos_people_search", broad_query_data)
+
+    assert "Found 10 people:" in small_out
+    assert "Found 253 people (showing 10):" in broad_out
+
+    small_body = small_out.split("\n\n", 1)[1]
+    broad_body = broad_out.split("\n\n", 1)[1]
+    assert small_body == broad_body, "person blocks must be identical regardless of the header"
+
+
+@pytest.mark.unit
+def test_people_search_formatter_falls_back_to_page_size_without_total():
+    """A response with no `total` field must not crash and should fall back
+    to the page size, matching the pre-#872 header exactly."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    server = module.LifeOSMCPServer()
+
+    people = _synthetic_people(1)
+    out = server._format_response(
+        "lifeos_people_search", {"people": people, "count": 1, "query": "solo"}
+    )
+    assert "Found 1 people:" in out
+
+
 # ---------------------------------------------------------------------------
 # Investments snapshot tool (#447)
 # ---------------------------------------------------------------------------

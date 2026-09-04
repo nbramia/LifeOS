@@ -1416,8 +1416,18 @@ class LifeOSMCPServer:
             people = data.get("people", data.get("results", []))
             if not people:
                 return "No people found."
-            text = f"Found {len(people)} people:\n\n"
-            for p in people[:10]:
+            shown = people[:10]
+            # Use the API's total match count when available (falling back to
+            # the page size for older/mocked responses that lack it) so a
+            # broad query still signals "there are many more matches, narrow
+            # your query" instead of silently looking like an exhaustive
+            # result set of 10.
+            total = data.get("total", len(people))
+            if total > len(shown):
+                text = f"Found {total} people (showing {len(shown)}):\n\n"
+            else:
+                text = f"Found {total} people:\n\n"
+            for p in shown:
                 name = p.get("name", p.get("canonical_name", "Unknown"))
                 text += f"- **{name}**"
                 if email := p.get("email"):

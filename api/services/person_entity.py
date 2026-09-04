@@ -27,6 +27,16 @@ from api.utils.datetime_utils import make_aware as _make_aware
 logger = logging.getLogger(__name__)
 
 
+def _escape_like_pattern(text: str) -> str:
+    """Escape SQL LIKE wildcards (`%`, `_`) and the escape character itself.
+
+    Without this, a literal `%` or `_` typed into a search box (e.g. an
+    email local part containing `_`) is interpreted as a wildcard instead of
+    a literal character. Pair with `ESCAPE '\\'` in the LIKE clause.
+    """
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @dataclass
 class PersonEntity:
     """
@@ -1063,6 +1073,16 @@ class PersonEntityStore:
         """
         Search entities by name, email, or alias.
 
+        `%` and `_` in `query` are escaped so they match literally rather
+        than as SQL LIKE wildcards.
+
+        Known limitation (pre-existing, not introduced by the LIKE-based
+        matching added in #872): `emails` and `aliases` are stored as JSON
+        text, so a non-ASCII character inside one of those lists is stored
+        as a `\\uXXXX` escape sequence and a LIKE against the raw column
+        cannot match the literal character a caller types. `canonical_name`
+        and `display_name` are plain text columns and are unaffected.
+
         Args:
             query: Search string
             limit: Maximum results to return
@@ -1074,13 +1094,13 @@ class PersonEntityStore:
         """
         query_lower = query.lower()
         merged_ids = set(self._merged_ids.keys()) if not include_merged else set()
-        pattern = f"%{query_lower}%"
+        pattern = f"%{_escape_like_pattern(query_lower)}%"
 
         conn = self._get_connection()
         try:
             conditions = [
-                "(LOWER(canonical_name) LIKE ? OR LOWER(display_name) LIKE ? "
-                "OR LOWER(emails) LIKE ? OR LOWER(aliases) LIKE ?)"
+                "(LOWER(canonical_name) LIKE ? ESCAPE '\\' OR LOWER(display_name) LIKE ? ESCAPE '\\' "
+                "OR LOWER(emails) LIKE ? ESCAPE '\\' OR LOWER(aliases) LIKE ? ESCAPE '\\')"
             ]
             params: list = [pattern, pattern, pattern, pattern]
 
@@ -1105,37 +1125,47 @@ class PersonEntityStore:
         finally:
             conn.close()
 
-    def count_search(self, query: str, include_hidden: bool = False) -> int:
+    def count_search(self, query: str, include_hidden: bool = False,
+                      include_merged: bool = False) -> int:
         """
         Count entities matching the same predicate as search().
 
         Cheap `COUNT(*)` companion to search() for callers that want a
         "how many matched in total" figure without paginating through every
-        row. Note this does not exclude already-merged duplicate rows (search()
-        filters those out in Python after fetching) -- that set is normally
-        tiny relative to total matches, and re-checking it here would cost the
-        same full-table work count_search exists to avoid.
+        row. Excludes already-merged duplicate rows the same way search()
+        does, via `id NOT IN (...)` over the (small, currently in the low
+        hundreds) set of merged ids -- comfortably under SQLite's default
+        999-bound-parameter limit, and cheap relative to the LIKE scan this
+        query already has to do.
 
         Args:
             query: Search string, same matching as search()
             include_hidden: If True, include hidden entities (default: False)
+            include_merged: If True, include entities that were merged into
+                others (default: False)
 
         Returns:
             Number of matching rows.
         """
         query_lower = query.lower()
-        pattern = f"%{query_lower}%"
+        pattern = f"%{_escape_like_pattern(query_lower)}%"
+        merged_ids = list(self._merged_ids.keys()) if not include_merged else []
 
         conn = self._get_connection()
         try:
             conditions = [
-                "(LOWER(canonical_name) LIKE ? OR LOWER(display_name) LIKE ? "
-                "OR LOWER(emails) LIKE ? OR LOWER(aliases) LIKE ?)"
+                "(LOWER(canonical_name) LIKE ? ESCAPE '\\' OR LOWER(display_name) LIKE ? ESCAPE '\\' "
+                "OR LOWER(emails) LIKE ? ESCAPE '\\' OR LOWER(aliases) LIKE ? ESCAPE '\\')"
             ]
             params: list = [pattern, pattern, pattern, pattern]
 
             if not include_hidden:
                 conditions.append("hidden = 0")
+
+            if merged_ids:
+                placeholders = ",".join("?" * len(merged_ids))
+                conditions.append(f"id NOT IN ({placeholders})")
+                params.extend(merged_ids)
 
             where = " AND ".join(conditions)
             row = conn.execute(
