@@ -70,7 +70,7 @@ Test queries and expected results are defined in `BENCHMARK_QUERIES` within the 
 
 ## Route Timing
 
-Every HTTP request is timed, independently of the chat-turn tracing above. Where perf tracing follows one chat turn through its LLM/tool stages, route timing answers a different question -- "what's slow right now, across the whole API" -- and catches slowdowns perf tracing can't see, like a CRM endpoint whose response quietly grows to ten seconds with no chat turn involved at all.
+Every HTTP request is timed, independently of the chat-turn tracing above. Where perf tracing follows one chat turn through its LLM/tool stages, route timing answers a different question -- "what's slow right now, across the whole API" -- and catches regressions perf tracing can't see, like a CRM endpoint whose response quietly grows to ten seconds with no chat turn involved at all.
 
 ### How It Works
 

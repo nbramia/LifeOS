@@ -1,5 +1,5 @@
 """
-Unit tests for ToneAnalysisStore (#873) -- the persistence layer behind
+Unit tests for ToneAnalysisStore -- the persistence layer behind
 `POST /api/crm/relationship/tone-analysis-detailed`.
 
 Uses a throwaway SQLite file per test (never `data/crm.db`), mirroring the

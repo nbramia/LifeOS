@@ -52,14 +52,14 @@ MY_PERSON_ID = "oracle-self"
 
 
 # ============================================================================
-# Oracle: pre-#871 /me/interactions algorithm
+# Oracle: independent /me/interactions algorithm
 # ============================================================================
 
 def oracle_me_interactions(
     interaction_store, person_store, my_person_id, days_back=365,
     trend_period="quarter", health_period="quarter",
 ):
-    """Verbatim copy of the pre-#871 get_me_interactions() body."""
+    """Independent per-item implementation of get_me_interactions()'s aggregation."""
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
@@ -381,14 +381,14 @@ def oracle_me_interactions(
 
 
 # ============================================================================
-# Oracle: pre-#871 /family/interactions algorithm
+# Oracle: independent /family/interactions algorithm
 # ============================================================================
 
 def oracle_family_interactions(
     interaction_store, person_store, my_person_id, selected_ids,
     days_back=365, trend_period="quarter", health_period="quarter",
 ):
-    """Verbatim copy of the pre-#871 get_family_interactions() body."""
+    """Independent per-item implementation of get_family_interactions()'s aggregation."""
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
@@ -936,10 +936,9 @@ class TestFamilyInteractionsOracle:
 
 class TestFamilyTimeline:
     """
-    #871's family/timeline acceptance criterion: filter by person_id IN (...)
-    in SQL rather than loading every interaction in the window and filtering
-    in Python. These use the same synthetic dataset as the aggregate oracle
-    tests above.
+    /family/timeline filters by person_id IN (...) in SQL rather than loading
+    every interaction in the window and filtering in Python. These use the
+    same synthetic dataset as the aggregate oracle tests above.
     """
 
     def test_restricts_to_selected_ids_via_sql(self, monkeypatch, stores):
@@ -953,7 +952,7 @@ class TestFamilyTimeline:
         # This call and test_excludes_non_selected_people()'s below share the
         # exact same parameters against the same seeded dataset shape -- they
         # only get independent results because the CRM aggregate response
-        # cache (#917) is cleared between every test (autouse
+        # cache is cleared between every test (autouse
         # reset_aggregate_cache() in tests/reset_singletons.py), not because
         # anything here makes the calls distinguishable to it.
         result = get_family_timeline(person_ids="p-close", source_type=None, days_back=365, date=None, offset=0, limit=100)

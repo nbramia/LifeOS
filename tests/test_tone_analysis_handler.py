@@ -916,9 +916,9 @@ class TestResponseShape:
     def test_response_matches_the_documented_contract(
         self, app_client, tone_store, patch_partner, patch_interactions, monkeypatch,
     ):
-        """Schema/shape oracle: every field the pre-#873 implementation
-        promised in ToneAnalysisDetailedResponse / ToneDataPointDetailed is
-        still present, plus the new optional `status` marker."""
+        """Schema/shape oracle: every field ToneAnalysisDetailedResponse /
+        ToneDataPointDetailed promises is present, including the optional
+        `status` marker."""
         month_a, month_b = _two_distinct_months()
         patch_interactions(_interactions_for_months([month_a, month_b]))
         _patch_llm(monkeypatch, _RecordingLLMClient(user_score=70.0, partner_score=65.0))

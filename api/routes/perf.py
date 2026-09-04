@@ -52,7 +52,7 @@ async def get_stats(
 
 @router.get("/routes")
 def get_route_stats():
-    """Rolling per-route request timing summary (#877).
+    """Rolling per-route request timing summary.
 
     Backed by `RouteTimingMiddleware` (api/services/route_timing.py), which
     records every HTTP request's duration/status/size in-process. A plain
@@ -64,7 +64,7 @@ def get_route_stats():
     An SSE connection's duration is however long the client kept it open,
     not a latency signal, so timing it like a normal request would let a
     page-open artifact dominate this table and fire a false slow-request
-    warning on every disconnect (#877 review).
+    warning on every disconnect.
     """
     store = get_route_timing_store()
     routes = store.summary()

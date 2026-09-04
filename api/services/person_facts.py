@@ -1733,9 +1733,9 @@ Interactions:
 # Singleton instances
 _fact_store: Optional[PersonFactStore] = None
 _fact_extractor: Optional[PersonFactExtractor] = None
-# #868 moved CRM/people/photos handlers off the event loop and onto worker
-# threads, so two first-requests after a restart can now race this
-# check-and-set. Double-checked locking: the lock is only taken while
+# CRM/people/photos handlers run on worker threads (not the event loop),
+# so two first-requests after a restart can race this check-and-set.
+# Double-checked locking: the lock is only taken while
 # _fact_store is still None, so it costs nothing once constructed.
 _fact_store_lock = threading.Lock()
 

@@ -2449,7 +2449,7 @@ def sync_source(source_type: str):
     Trigger a sync for a specific data source.
     """
     with _mutation_lock:
-        # WhatsApp has no standalone nightly sync of its own (issue #784) — its
+        # WhatsApp has no standalone nightly sync of its own -- its
         # data is imported as part of the combined apple_import step, so a
         # WhatsApp entry here belongs at the same (currently stub, see TODO
         # below) parity level as gmail/imessage/linkedin, not below it.

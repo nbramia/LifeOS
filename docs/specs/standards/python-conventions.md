@@ -93,7 +93,7 @@ Key patterns:
 - Request/response Pydantic models are defined at the top of the route file.
 - 404s use `raise HTTPException(status_code=404, detail="...")`.
 - No try/except in routes -- services handle errors internally.
-- `async def` only if the handler's own body actually `await`s something; otherwise plain `def` (#868). LifeOS runs a single uvicorn event loop shared by every client surface, so a coroutine handler with no `await` still runs inline on that loop instead of FastAPI's worker threadpool -- one slow handler then blocks everyone else's requests. A handler that keeps `async def` pushes its blocking store/LLM calls onto a thread with `await asyncio.to_thread(...)` rather than calling them inline. Applied and enforced (`tests/test_route_handlers_sync.py`) for `api/routes/crm.py`, `api/routes/people.py`, and `api/routes/photos.py` as of #868 -- the rest of `api/routes/` has not been converted yet, so `async def` with no `await` elsewhere is pre-existing, not an exception to this rule.
+- `async def` only if the handler's own body actually `await`s something; otherwise plain `def`. LifeOS runs a single uvicorn event loop shared by every client surface, so a coroutine handler with no `await` still runs inline on that loop instead of FastAPI's worker threadpool -- one slow handler then blocks everyone else's requests. A handler that keeps `async def` pushes its blocking store/LLM calls onto a thread with `await asyncio.to_thread(...)` rather than calling them inline. Applied and enforced (`tests/test_route_handlers_sync.py`) for `api/routes/crm.py`, `api/routes/people.py`, and `api/routes/photos.py`; the rest of `api/routes/` has not been converted, so `async def` with no `await` elsewhere is not an exception to this rule.
 
 ## Service / Store Pattern
 
@@ -269,3 +269,4 @@ class Task:
 - [specs/technical/architecture.md](../technical/architecture.md) -- system architecture and code structure
 - [AGENTS.md](../../../AGENTS.md) -- development workflow and agent instructions
 - [Testing Standards](testing-standards.md) -- test patterns and conventions
+- [Frontend](../technical/frontend.md) -- applies this doc's § Comments and Docstrings rule to `web/`'s JavaScript

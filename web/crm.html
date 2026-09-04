@@ -8206,7 +8206,7 @@
 
                         </div>
 
-                        <!-- Shown instead of relationshipDashboard when no partner is configured (#891) -->
+                        <!-- Shown instead of relationshipDashboard when no partner is configured -->
                         <div class="detail-empty" id="relationshipEmptyState" style="display: none;">
                             <div class="detail-empty-icon">💕</div>
                             <p>No partner configured</p>
@@ -8710,7 +8710,7 @@
         let selectedPersonId = null;
         let searchQuery = '';
         // AbortController for the in-flight people search, so a slower
-        // earlier response can't overwrite a newer query's results (#874).
+        // earlier response can't overwrite a newer query's results.
         let currentPeopleSearchController = null;
         // People list filters (multi-select)
         let peopleCategoryFilters = new Set(['self', 'family', 'personal']);  // Work excluded by default
@@ -8723,10 +8723,10 @@
         let meInteractionsCache = null;  // Cache for "Me" page interactions
         let meInteractionsCacheYears = null; // Track which years setting the cache was loaded for
         let meInteractionsSpanPromise = null; // Resolved once per page load; sizes the Me heatmap window
-        let meSpanYears = null; // The Me-specific years value derived from that span (#876: re-asserted
+        let meSpanYears = null; // The Me-specific years value derived from that span; re-asserted
         // on every ensureMeHeatmapYears() call, not just the first, because `heatmapYears` is a single
-        // shared global the Family/person heatmap views also write to; with dashboard navigation no
-        // longer reloading the document, a Family or person visit in between can leave it pointing at
+        // shared global the Family/person heatmap views also write to, and dashboard navigation doesn't
+        // reload the document, so a Family or person visit in between can leave it pointing at
         // the wrong window by the time a returning Me visit compares it against meInteractionsCacheYears.
         let meInteractionsPromise = null; // In-flight /me/interactions request, shared across callers
         let meInteractionsPromiseKey = null; // days_back:trend_period the in-flight request is for
@@ -9404,7 +9404,7 @@
         }
 
         // Client-side navigation for the CRM/Me/Family/Birthdays/Relationship
-        // nav links (#876): pushes a history entry and dispatches to the
+        // nav links: pushes a history entry and dispatches to the
         // existing dashboard initializers instead of letting the browser
         // load the anchor's href as a fresh document. Returning `false`
         // (via the caller's `onclick="return navigateTo(...)"`) suppresses
@@ -10385,7 +10385,7 @@
 
             try {
                 // Single fetch: person detail plus related data (source
-                // entities, relationships) in one round trip (#874).
+                // entities, relationships) in one round trip.
                 const person = await api(`/people/${personId}?include_related=true`);
                 setCachedPerson(personId, person);
                 renderPersonDetail(person);
@@ -12110,10 +12110,9 @@
         }
 
         function navigateToPerson(personId) {
-            // Navigate to the person's profile page client-side (#876
-            // pattern), instead of a full document load that re-downloads
-            // the page and discards whatever the Birthdays page had already
-            // fetched.
+            // Navigate to the person's profile page client-side, instead of
+            // a full document load that re-downloads the page and discards
+            // whatever the Birthdays page had already fetched.
             navigateTo(`/crm/${personId}`);
         }
 
@@ -12199,7 +12198,7 @@
                 detailTabs.style.display = 'none';
             }
 
-            // No partner configured (#891): render an empty state and issue no
+            // No partner configured: render an empty state and issue no
             // partner-scoped requests (no insights/timeline/tone/photo calls).
             const relationshipEmptyState = document.getElementById('relationshipEmptyState');
             if (!PARTNER_PERSON_ID) {
@@ -12444,7 +12443,7 @@
 
         // Load tone analysis (detailed version with separate user/partner scores).
         // Stored, fresh months are served instantly; stale/missing months are
-        // recomputed server-side (#873). Pass refresh=true to force every
+        // recomputed server-side. Pass refresh=true to force every
         // month in the window to recompute regardless of freshness.
         async function loadToneAnalysis(refresh = false) {
             const container = document.getElementById('toneTimelineViz');
@@ -12761,8 +12760,7 @@
 
             // Build SVG paths and points. A "stale" point (real data the
             // server couldn't refresh this load) is dimmed and its tooltip
-            // says so, distinct from both a normal point and an error gap
-            // (#899 review finding N2).
+            // says so, distinct from both a normal point and an error gap.
             let pathsSvg = '';
             let pointsSvg = '';
             lines.forEach(line => {

@@ -1,5 +1,5 @@
 """
-Tests for the per-route request timing middleware and summary (#877).
+Tests for the per-route request timing middleware and summary.
 
 Deliberately built against a *tiny* FastAPI app rather than `from api.main
 import app` -- importing the real app pulls in chromadb/sentence-transformers
@@ -30,7 +30,7 @@ def _reset_route_timing_store():
     regardless of which FastAPI app instance it attaches to. Resetting
     before *and* after each test keeps assertions against that singleton
     order-independent, rather than relying on file/class ordering or
-    scattered inline `store.reset()` calls (#877 review)."""
+    scattered inline `store.reset()` calls."""
     store = get_route_timing_store()
     store.reset()
     yield

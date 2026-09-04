@@ -1,4 +1,4 @@
-"""API tests for CRM request hygiene (#874):
+"""API tests for CRM request hygiene:
 
 - `GZipMiddleware` is scoped to `/api/crm/*`, `/api/people/*`, and the CRM
   page routes (`/crm`, `/me`, `/family`, `/birthdays`, `/relationship`, and
@@ -163,7 +163,7 @@ class TestGzipScoping:
 
 class TestCrmPageCacheControl:
     """Page routes serving crm.html send a short revalidation Cache-Control
-    and honor If-None-Match with a 304 (#874)."""
+    and honor If-None-Match with a 304."""
 
     pytestmark = pytest.mark.slow
 

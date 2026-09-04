@@ -282,9 +282,9 @@ class _CountingConnection:
 
 
 class TestGetForPeopleBatch:
-    """Tests for SourceEntityStore.get_for_people_batch() (#869/#880 follow-up:
-    batch the per-page source-entity fetch that compute_person_category()'s
-    include_related=False fallback needs, instead of one query per person)."""
+    """Tests for SourceEntityStore.get_for_people_batch(): batches the
+    per-page source-entity fetch that compute_person_category()'s
+    include_related=False fallback needs, instead of one query per person."""
 
     def _add_entities(self, store, canonical_person_id: str, count: int, source_type: str = "gmail"):
         now = datetime.now(timezone.utc)

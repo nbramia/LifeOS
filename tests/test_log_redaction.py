@@ -104,11 +104,11 @@ class TestTelegramTokenRedactionFilter:
 
 
 class TestRequestQueryStringRedactionFilter:
-    """#904: uvicorn's own access logger (`uvicorn.access`) logs the full
+    """uvicorn's own access logger (`uvicorn.access`) logs the full
     request line -- path and query string -- for every request at INFO,
-    independent of anything a route handler logs. That's how the CRM people
-    list's raw search text (`?q=<text>`) reached `logs/server.log` even
-    after the handler's own log line stopped naming it."""
+    independent of anything a route handler logs, so a raw search text
+    (`?q=<text>`) reaches `logs/server.log` through this path even when no
+    route handler logs it."""
 
     def setup_method(self, method):
         self._access_logger = logging.getLogger("uvicorn.access")

@@ -67,7 +67,7 @@ from config.settings import settings
 # API embeds the bot token in the URL) from ever logging at INFO here (#519).
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 configure_telegram_log_redaction()
-# #904: uvicorn's own access logger writes every request's raw query string
+# uvicorn's own access logger writes every request's raw query string
 # to logs/server.log regardless of what a route handler logs -- this is the
 # only process that runs an HTTP server, so it's the only place this needs
 # installing (see install_query_string_redaction_filter()'s docstring for
@@ -303,8 +303,8 @@ app.add_middleware(
 )
 
 
-# Gzip: scoped to the CRM/people JSON endpoints plus the CRM page itself
-# (#874), rather than applied app-wide. A 300-person list is ~216 KB, a
+# Gzip: scoped to the CRM/people JSON endpoints plus the CRM page itself,
+# rather than applied app-wide. A 300-person list is ~216 KB, a
 # person's full timeline ~620 KB, and the CRM page (`web/crm.html`) itself
 # is ~750 KB uncompressed — all of which matter on Tailscale from a phone.
 #
@@ -353,7 +353,7 @@ class _ScopedGZipMiddleware:
 # ~3% more bytes on the wire, a better trade here.
 app.add_middleware(_ScopedGZipMiddleware, minimum_size=1024, compresslevel=6)
 
-# Route timing (#877): added last, which Starlette's middleware stack makes
+# Route timing is added last, which Starlette's middleware stack makes
 # the OUTERMOST of this app's own middleware (each `add_middleware` call
 # wraps *around* everything added before it) -- so its timing and byte
 # count cover the full response, including gzip compression performed by
