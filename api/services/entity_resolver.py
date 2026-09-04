@@ -1028,13 +1028,25 @@ class EntityResolver:
         # Try name matching
         result = self.resolve_by_name(full_name, create_if_missing=False)
         if result:
-            entity = result.entity
-            entity.linkedin_url = linkedin_url or entity.linkedin_url
-            entity.company = company or entity.company
-            entity.position = position or entity.position
-            if "linkedin" not in entity.sources:
-                entity.sources.append("linkedin")
-            self._store.update(entity)
+            # result.entity may be a cache-shared PersonEntity from
+            # get_all()'s fuzzy-match path (via _score_candidates()) -- refetch
+            # by ID before mutating so we never write to an object other
+            # readers of the get_all() cache may still be holding.
+            updated_entity = self._store.get_by_id(result.entity.id)
+            if updated_entity:
+                updated_entity.linkedin_url = linkedin_url or updated_entity.linkedin_url
+                updated_entity.company = company or updated_entity.company
+                updated_entity.position = position or updated_entity.position
+                if "linkedin" not in updated_entity.sources:
+                    updated_entity.sources.append("linkedin")
+                self._store.update(updated_entity)
+                return ResolutionResult(
+                    entity=updated_entity,
+                    is_new=result.is_new,
+                    confidence=result.confidence,
+                    match_type=result.match_type,
+                    disambiguation_applied=result.disambiguation_applied,
+                )
             return result
 
         # Create new entity
