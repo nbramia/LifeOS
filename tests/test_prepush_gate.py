@@ -1,8 +1,8 @@
 """
 Tests for the `scripts/pre-push` gate's skip/run decision, its per-run log
-paths (#908), and the round-1 review fixes on top of that (#913): a graceful
-fallback when the configured log directory is unusable, real runtime
-observation of the console output (not a source grep), and pruning coverage.
+paths, a graceful fallback when the configured log directory is unusable,
+real runtime observation of the console output (not a source grep), and
+pruning coverage.
 
 The hook decides three things before running anything: skip a deletion-only
 push, skip a docs-only push, or run the suites. That decision is pure, so we
@@ -117,10 +117,10 @@ def stub_python(tmp_path):
     controllable via env vars (STUB_UNIT_EXIT/STUB_UNIT_SUMMARY,
     STUB_BROWSER_EXIT/STUB_BROWSER_SUMMARY), read by the stub at runtime.
 
-    Two more unit-stage-only modes exercise `fail()`'s other two branches
-    (round-1 review finding B), which a normal failing run can't reach
-    because bash's `> "$LOG"` redirection always creates the file before the
-    stub ever runs, even if the stub prints nothing:
+    Two more unit-stage-only modes exercise `fail()`'s other two branches,
+    which a normal failing run can't reach because bash's `> "$LOG"`
+    redirection always creates the file before the stub ever runs, even if
+    the stub prints nothing:
 
     - STUB_UNIT_NO_OUTPUT=1: exit 1 without printing anything, so `$LOG`
       exists but is empty ("empty log" branch).
@@ -267,11 +267,11 @@ def test_gate_is_not_narrowed_by_lastfailed():
     assert "--ff" in code, "pre-push should still order previously-failed tests first"
 
 
-# --- Per-run log paths (#908) ---------------------------------------------
+# --- Per-run log paths -----------------------------------------------------
 #
-# Fixed shared /tmp paths meant two pushes from different worktrees/branches
-# clobbered each other's output, and a result could be misattributed to the
-# wrong branch. The hook now derives a log path from the pushed branch (and
+# A fixed shared /tmp path would let two pushes from different worktrees or
+# branches clobber each other's output and misattribute a result to the
+# wrong branch. The hook derives a log path from the pushed branch (and
 # the process id), and prints it in plan-only mode as `prepush-log:` /
 # `prepush-browser-log:` so path resolution is testable without running pytest.
 
@@ -381,15 +381,15 @@ def test_console_output_names_log_path(stub_python, tmp_path):
     # The logs must contain the stubbed pytest's actual output, not just exist.
     assert unit_logs[0].read_text().strip() == "1 passed in 0.01s"
     assert browser_logs[0].read_text().strip() == "1 passed in 0.01s"
-    # Round 2 (#913 finding C): the unconditional `chmod 700` must actually
-    # land on the directory this hook owns and normally uses.
+    # The unconditional `chmod 700` must actually land on the directory this
+    # hook owns and normally uses.
     assert log_dir.stat().st_mode & 0o777 == 0o700, (
         "the owned log directory must be tightened to 0700")
-    # Round 4 (#908 finding 1): the happy (owned-directory) path must keep
-    # naming logs from the branch slug alone — `LOG_FILE_PREFIX` is only for
-    # the not-owned last-resort case (test_last_resort_dir_is_never_chmod_or_pruned
-    # covers that direction). A mutant that applies the prefix unconditionally,
-    # or to only one of the two logs, would otherwise slip through undetected.
+    # The happy (owned-directory) path must keep naming logs from the branch
+    # slug alone — `LOG_FILE_PREFIX` is only for the not-owned last-resort
+    # case (test_last_resort_dir_is_never_chmod_or_pruned covers that
+    # direction). A mutant that applies the prefix unconditionally, or to
+    # only one of the two logs, would otherwise slip through undetected.
     assert not unit_logs[0].name.startswith("lifeos-prepush-"), (
         "the happy-path unit log must not carry the not-owned-dir prefix")
     assert not browser_logs[0].name.startswith("lifeos-prepush-"), (
@@ -398,10 +398,10 @@ def test_console_output_names_log_path(stub_python, tmp_path):
         "the happy-path unit log should be named from the branch slug")
     assert browser_logs[0].name.startswith("feat_ac2-check-"), (
         "the happy-path browser log should be named from the branch slug")
-    # Round 4 (#908 finding 2): the happy path must never print a
-    # degraded-directory line, and the console output must be exactly these
-    # four lines — no more, no fewer — so an extra line anywhere (e.g. a
-    # spuriously injected degraded-path message) is caught.
+    # The happy path must never print a degraded-directory line, and the
+    # console output must be exactly these four lines — no more, no fewer —
+    # so an extra line anywhere (e.g. a spuriously injected degraded-path
+    # message) is caught.
     for phrase in ("is unusable", "is a symlink", "every fallback failed"):
         assert phrase not in result.stdout, (
             f"happy path must not print a degraded-path message: {phrase!r}")
@@ -497,12 +497,11 @@ def test_fallback_branch_when_no_ref_on_stdin(tmp_path):
     assert log and browser_log
 
 
-# --- Round-1 review fixes (#913) -------------------------------------------
+# --- Log-directory fallback degradation ------------------------------------
 #
-# Finding A: an unwritable/occupied configured log directory must degrade to
-# a working fallback location rather than blocking the push. Finding C: the
-# pruning behaviour (AC4) had no test at all. Finding G: the prune must be
-# scoped to this hook's own *.log files.
+# An unwritable/occupied configured log directory must degrade to a working
+# fallback location rather than blocking the push. Pruning must be scoped
+# to this hook's own *.log files.
 
 
 def _make_occupied_by_file(hostile_tmpdir: Path) -> None:
@@ -535,9 +534,8 @@ def _restore_writable(hostile_tmpdir: Path) -> None:
         log_dir.chmod(0o700)
 
 
-# Round-2 (#913 finding F): the fallback message must name WHY the
-# configured directory was unusable, not just that it was. One expected
-# reason string per hostile fixture above.
+# The fallback message must name WHY the configured directory is unusable,
+# not just that it is. One expected reason string per hostile fixture above.
 _REASON_FOR_MAKER = {
     _make_occupied_by_file: "not a directory",
     _make_unwritable_log_dir: "not writable",
@@ -552,13 +550,12 @@ _REASON_FOR_MAKER = {
     ids=["occupied_by_file", "unwritable_log_dir", "readonly_tmpdir"],
 )
 def test_unwritable_log_dir_push_still_completes(tmp_path, stub_python, make_hostile):
-    """Finding A/#1: each of the three real-world triggers reported in
-    review (LOG_DIR occupied by a file, LOG_DIR existing but unwritable, and
-    a read-only TMPDIR) must still let a real (stubbed) test run complete and
-    pass, degrading to a fallback directory instead of reporting a fake
-    `FAILED ()` for an unrelated filesystem problem. Round 2 (finding F): the
-    printed line must also say WHY the configured directory was unusable.
-    Round 2 (finding A/C): the adopted fallback directory is OWNED by this
+    """Each of the three real-world triggers (LOG_DIR occupied by a file,
+    LOG_DIR existing but unwritable, and a read-only TMPDIR) must still let
+    a real (stubbed) test run complete and pass, degrading to a fallback
+    directory instead of reporting a fake `FAILED ()` for an unrelated
+    filesystem problem. The printed line must also say WHY the configured
+    directory is unusable. The adopted fallback directory is OWNED by this
     hook, so it must be tightened to 0700 (positive half of the
     owned/not-owned pair; see test_last_resort_dir_is_never_chmod_or_pruned
     for the not-owned negative half).
@@ -658,16 +655,13 @@ def test_prune_only_touches_its_own_log_files(tmp_path):
     assert old_other.exists(), "prune deleted a non-.log file it must not touch"
 
 
-# --- Round-2 review fixes (#913 round 2) -----------------------------------
+# --- Ownership boundaries for chmod/prune -----------------------------------
 #
-# Finding A: never chmod/prune a directory the hook does not own (the bare
-# `/tmp` last resort, and any symlinked $LOG_DIR at any rung). Finding B:
-# `fail()`'s empty-log and no-log-at-all branches were untested. Finding C:
-# the unconditional `chmod 700` itself was untested, and needs a positive
-# (owned dir tightened) AND negative (not-owned dir left alone) pair.
-# Finding E: fallback rungs 3/4 and the equality guard were unreachable.
-# Finding F: the fallback message must name why, and say if the fixed
-# fallback also failed.
+# Never chmod/prune a directory the hook does not own (the bare `/tmp` last
+# resort, and any symlinked $LOG_DIR at any rung). The unconditional
+# `chmod 700` needs a positive (owned dir tightened) AND negative (not-owned
+# dir left alone) pair. The fallback message must name why, and say if the
+# fixed fallback also failed.
 
 
 @pytest.mark.unit
@@ -813,10 +807,10 @@ def test_last_resort_dir_is_never_chmod_or_pruned(tmp_path):
     assert not calls_file.exists(), (
         f"chmod/find must never run against the un-owned last resort: "
         f"{calls_file.read_text() if calls_file.exists() else ''}")
-    # Round 4 (#908 finding 1): the not-owned last resort is exactly where
-    # `LOG_FILE_PREFIX` must apply, so a log dropped in a shared, unswept
-    # directory is still attributable as this hook's. The other half of this
-    # assertion (the prefix must NOT appear on the owned/happy path) lives in
+    # The not-owned last resort is exactly where `LOG_FILE_PREFIX` must
+    # apply, so a log dropped in a shared, unswept directory is still
+    # attributable as this hook's. The other half of this assertion (the
+    # prefix must NOT appear on the owned/happy path) lives in
     # test_console_output_names_log_path.
     assert Path(log).name.startswith("lifeos-prepush-"), (
         "the not-owned last-resort unit log must carry the attribution prefix")
@@ -861,23 +855,22 @@ def test_equality_guard_skips_redundant_fallback_retry(tmp_path):
 
 @pytest.mark.unit
 def test_distinct_fixed_fallback_failure_reaches_mktemp_rung(tmp_path):
-    """Finding E/#8: rung 3 (`mktemp -d` with the templated name) was
-    previously unreachable in the suite because every fallback test pointed
-    the override at a fresh, writable directory. Make BOTH the configured
-    directory and the (distinct) fixed fallback genuinely unusable, so the
-    hook must fall all the way through to the throwaway
-    `mktemp -d ".../lifeos-prepush.XXXXXX"` rung, and assert its distinctive
-    naming shape and that the message names the fixed fallback's own reason.
+    """Rung 3 (`mktemp -d` with the templated name) is otherwise unreachable
+    in the suite because every other fallback test points the override at a
+    fresh, writable directory. Make BOTH the configured directory and the
+    (distinct) fixed fallback genuinely unusable, so the hook must fall all
+    the way through to the throwaway `mktemp -d ".../lifeos-prepush.XXXXXX"`
+    rung, and assert its distinctive naming shape and that the message names
+    the fixed fallback's own reason.
 
-    Round 4 (#908 finding 3): the configured directory and the fixed
-    fallback must fail for DIFFERENT reasons, so the "the fixed fallback's
-    own reason" assertion below is actually exercising the fallback's
-    message rather than being satisfied by the configured directory's
-    identical-looking one. The configured directory is a plain file ("not a
-    directory"); the fixed fallback is a directory that exists but can't be
-    written to ("not writable") — dropping the fallback's reason entirely
-    would previously leave this test green because both messages read
-    "(not a directory)".
+    The configured directory and the fixed fallback must fail for DIFFERENT
+    reasons, so the "the fixed fallback's own reason" assertion below
+    actually exercises the fallback's message rather than being satisfied by
+    the configured directory's identical-looking one. The configured
+    directory is a plain file ("not a directory"); the fixed fallback is a
+    directory that exists but can't be written to ("not writable") —
+    dropping the fallback's reason entirely would let this test stay green
+    even if both messages read "(not a directory)".
     """
     hostile_tmpdir = tmp_path / "hostile_tmpdir"
     hostile_tmpdir.mkdir()

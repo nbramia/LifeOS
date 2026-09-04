@@ -18,7 +18,7 @@
 //     `{engines: {claude: [...], codex: [...], local: [...], hermes: [...]},
 //     refreshed_at, stale}`, each entry `{id, label, pricing}` — the
 //     source for the model picker's options.
-//   - `GET /api/agents/hosts` (#883) returns
+//   - `GET /api/agents/hosts` returns
 //     `{hosts: [{name, ssh_target, online, is_api_host}], refreshed_at}`
 //     — the source for the host picker's options; `online` is
 //     `true`/`false`/`null` (null = unknown, never guessed).
@@ -359,24 +359,24 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   // exception: it's omitted (not nulled) until the model catalog has
   // populated the select. Before that, `modelEl.value` is always '' —
   // regardless of what the card has saved — so sending `model: null` would
-  // wipe a previously saved model on the very first effort/host change of
-  // a page load, before `GET /api/agents/models` has resolved (#861).
+  // wipe the card's already-saved model on the very first effort/host
+  // change of a page load, before `GET /api/agents/models` has resolved.
   //
-  // (#901 round 3, finding A5) Saves are serialized through a single
-  // in-flight chain (`saveChain` below) rather than fired independently:
-  // with two saves in flight, whichever finished LAST used to decide what
-  // "last known good" meant for BOTH, so an accepted change could be
-  // reverted by an unrelated later rejection, and a rejected change could
-  // be "confirmed" by an unrelated earlier acceptance — both silent, no
-  // toast. Chaining each save onto the previous one's settlement means at
+  // Saves are serialized through a single in-flight chain (`saveChain`
+  // below) rather than fired independently: without it, whichever of two
+  // in-flight saves finishes LAST would decide what "last known good"
+  // means for BOTH, so an accepted change could be reverted by an
+  // unrelated later rejection, and a rejected change could be "confirmed"
+  // by an unrelated earlier acceptance — both silent, no toast. Chaining
+  // each save onto the previous one's settlement means at
   // most one PUT is ever outstanding, so there is no "other save's
   // resolution time" left to read from: `runSave` reads the controls
   // fresh, at the moment it actually starts, and every `lastSaved*`
   // update reflects exactly what THAT save sent.
   async function runSave(extra) {
     const { tags, ...extraFields } = extra;  // `tags` is a top-level PUT key, not a field
-    // Capture what's actually being sent BEFORE the await (#901 round 3,
-    // finding M11) — `lastSaved*` must reflect the payload this save
+    // Capture what's actually being sent BEFORE the await —
+    // `lastSaved*` must reflect the payload this save
     // sent, not whatever the controls happen to hold once the PUT
     // resolves (a later change may already have moved them, even with
     // saves serialized — the operator can still edit while a PUT is in
@@ -395,7 +395,7 @@ export function renderAssignmentPickers(container, card, opts = {}) {
     if (tags) patch.tags = tags;
     try {
       await putTask(card.id, patch);
-      // (#901 round 2, finding A3) Record what actually stuck, so a LATER
+      // Record what actually stuck, so a LATER
       // failed save has something correct to revert to.
       lastSavedEffort = sentEffort;
       lastSavedHost = sentHost;
@@ -403,14 +403,13 @@ export function renderAssignmentPickers(container, card, opts = {}) {
       clearError();
       onSaved();
     } catch (err) {
-      // (#901 round 2, finding A3) The server REJECTED this change —
-      // revert the controls to their last-known-good values BEFORE
-      // surfacing the error, so the rejected choice can't ride along on
-      // the next unrelated save with no toast at all. Every other drawer
-      // control already does this on failure (board.js's title/notes/
-      // context/tags fields and the Assignee select); the assignment
-      // pickers didn't, until now. The engine select is deliberately NOT
-      // reverted here (#901 round 3, finding M12) — board.js owns the
+      // The server REJECTED the update — revert the controls to their
+      // last-known-good values BEFORE surfacing the error, so the rejected
+      // choice can't ride along on the next unrelated save with no toast
+      // at all. Every other drawer control already does this on failure
+      // (board.js's title/notes/context/tags fields and the Assignee
+      // select); the assignment pickers behave the same way. The engine
+      // select is deliberately NOT reverted here — board.js owns the
       // Assignee select and hides this module's engine row, so there's
       // no user-reachable path that leaves it stale.
       restoreSelect(effortEl, lastSavedEffort);

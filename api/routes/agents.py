@@ -191,9 +191,9 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "session_id": s.session_id,
         "task_id": s.task_id,
         "status": s.status,
-        # (#851) `Session.host` is the board-assignment field a worker was
-        # dispatched to run on; unset (legacy rows, or a session created
-        # before #851) falls back to the machine hosting this API process.
+        # `Session.host` is the board-assignment field a worker was
+        # dispatched to run on; unset (legacy rows, or no board
+        # assignment) falls back to the machine hosting this API process.
         "host": s.host or api_host_name(),
         "routing": s.routing,
         "parent_session_id": s.parent_session_id,
@@ -212,12 +212,11 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "expected_output": s.expected_output,
         "label": _label_for_session(s, events),
         "model_label": _model_label_for_routing(s.routing),
-        # (#863) board-assignment + identity fields, passed through so the
+        # Board-assignment + identity fields, passed through so the
         # panel and filters can surface them without re-deriving. Direct
-        # attribute access, matching `host` above — all five (#851)
-        # fields exist on `Session` with defaults, so `getattr(..., None)`
-        # was inconsistent defensiveness rather than a real guard (#863
-        # review round 2, finding P).
+        # attribute access, matching `host` above — all five fields exist
+        # on `Session` with defaults, so `getattr(..., None)` would be
+        # inconsistent defensiveness rather than a real guard.
         "model": s.model,
         "effort": s.effort,
         "conversation_id": s.conversation_id,
@@ -322,8 +321,9 @@ def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
         from api.services.codex import session_ingest as cx
         model_lbl = cx.model_label(cli.model or "")
     else:
-        # (#863) An unrecognized engine used to hardcode a Claude tier
-        # guess ("Claude") — surface the engine's own name instead.
+        # An unrecognized engine (the route only ever writes claude_code
+        # or codex) surfaces its own name rather than a hardcoded Claude
+        # tier guess.
         model_lbl = cli.engine.replace("_", " ").title() if cli.engine else "Claude"
     return {
         "session_id": cli.session_id,
@@ -344,7 +344,7 @@ def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
         "total_dollars": 0.0,
         "total_active_seconds": 0.0,
         "expected_output": None,
-        # (#863) Prefer the hook-posted prompt preview — the session id is
+        # Prefer the hook-posted prompt preview — the session id is
         # not a human label.
         "label": cli.prompt_preview or cli.session_id,
         "model_label": model_lbl,
@@ -474,7 +474,7 @@ def _model_label_for_routing(routing: str | None) -> str:
     if (routing or "local") == "local":
         return "Local"
     if routing == "ask":
-        # (#863) A worker session parked waiting on the operator has no
+        # A worker session parked waiting on the operator has no
         # model running at all — it must never render a Claude tier guess.
         return "Waiting on you"
     if routing == "remote":
@@ -491,16 +491,16 @@ def _model_label_for_routing(routing: str | None) -> str:
         # (#850) Hermes sessions used to fall through to the Claude-model-name
         # guess below and get mislabeled "Claude" — Hermes runs its own
         # DeepSeek-backed engine, not an Anthropic model.
-        # (#863 review round 2, finding O) A prior version of this branch
-        # appended "· <model>" from `model_readout._last_observed_hermes_chat_model()`
-        # — that's a single process-wide "last observed" value written by
-        # ANY Hermes turn (an agent-worker session and `/chat`'s Hermes
-        # proxy alike), not a per-session attribution. A finished session's
-        # badge would retroactively change to whatever model a *different*,
-        # unrelated Hermes turn most recently reported — `model_readout.py`'s
-        # own docstring rejects exactly this kind of cross-surface borrowing
-        # as dishonest. No honest per-session source exists today, so the
-        # badge stays plain.
+        # The badge stays plain rather than appending "· <model>" from
+        # `model_readout._last_observed_hermes_chat_model()`: that's a
+        # single process-wide "last observed" value written by ANY Hermes
+        # turn (an agent-worker session and `/chat`'s Hermes proxy alike),
+        # not a per-session attribution, so a badge built from it could
+        # retroactively show a finished session whatever model a
+        # *different*, unrelated Hermes turn most recently reported —
+        # `model_readout.py`'s own docstring rejects exactly this kind of
+        # cross-surface borrowing as dishonest. No honest per-session
+        # source exists, so the badge stays plain.
         return "Hermes"
     if routing in ("claude_code", "code"):
         return "Claude Code"

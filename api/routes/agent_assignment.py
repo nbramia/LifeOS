@@ -35,12 +35,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
 
-# (#901 round 2, finding R5) The endpoint's "2-second budget" was only ever
-# an inference from the tailscale probe's own 1.5s timeout, which doesn't
-# cover asyncio.Lock queueing or event-loop scheduling — measured up to
-# 2.57s under concurrent load. This makes the ceiling a real mechanism:
-# just under 2s, comfortably above the probe timeout so a healthy build
-# still completes inside it.
+# A real ceiling rather than an inference from the tailscale probe's own
+# 1.5s timeout, which doesn't cover asyncio.Lock queueing or event-loop
+# scheduling and can be exceeded under concurrent load. Just under 2s,
+# comfortably above the probe timeout so a healthy build still completes
+# inside it.
 _HOSTS_ROUTE_TIMEOUT_SECONDS = 1.8
 
 # Recognized assignee tags, in the order checked. Mirrors preflight.py's
@@ -107,21 +106,21 @@ async def get_models() -> dict[str, Any]:
 @router.get("/hosts")
 async def get_hosts() -> dict[str, Any]:
     """Registry of hosts a card's `host` field can target, with
-    reachability — the source for the board's host picker (#883).
+    reachability — the source for the board's host picker.
 
     `{hosts: [{name, ssh_target, online, is_api_host}], refreshed_at}` —
     see `host_catalog.py` for how the list is built and `online` probed
     and cached. `HostCatalog.get()` already degrades internally on a build
-    failure (registry intact, every non-API host `online: null` — #901
-    round 2, finding A4) rather than raising, but two more layers back
-    this up: a hard `_HOSTS_ROUTE_TIMEOUT_SECONDS` ceiling in case a build
-    somehow outlives it (finding R5), and a bare `except Exception` for
-    anything else that still goes wrong. Both fall back to
-    `HostCatalog.degraded()` — the same registry-at-`online: null` list,
-    not the pre-round-2 one-row degenerate — and log at `error` with a
-    traceback (dropping the operator's whole host list is not a quiet
-    `warning`-level event, finding A2). Only if `degraded()` itself somehow
-    raises does this fall back further, to a single API-host row.
+    failure (registry intact, every non-API host `online: null`) rather
+    than raising, but two more layers back this up: a hard
+    `_HOSTS_ROUTE_TIMEOUT_SECONDS` ceiling in case a build somehow outlives
+    it, and a bare `except Exception` for anything else that still goes
+    wrong. Both fall back to `HostCatalog.degraded()` — the same
+    registry-at-`online: null` list, never a bare single-row degenerate —
+    and log at `error` with a traceback: dropping the operator's whole
+    host list is not a quiet `warning`-level event. Only if `degraded()`
+    itself somehow raises does this fall back further, to a single
+    API-host row.
     """
     catalog = get_host_catalog()
     try:

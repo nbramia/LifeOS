@@ -132,18 +132,17 @@ class TestGetBoard:
     def test_locally_scanned_cc_session_does_not_bogus_link_to_a_task(
         self, client, stores, monkeypatch, tmp_path: Path,
     ):
-        """#863: `to_session_dict`'s `task_id` used to be the Claude Code
-        UUID, so `_build_board`'s `sessions_by_task` join (keyed purely on
-        truthiness) treated every locally scanned CC session as if it had a
-        real LifeOS task link. A session with no real link (`task_id: None`,
-        the corrected shape) must not surface on any task's card.
+        """`to_session_dict`'s `task_id` must never be the Claude Code UUID —
+        `_build_board`'s `sessions_by_task` join is keyed purely on
+        truthiness, so a leaked UUID would treat a locally scanned CC
+        session as if it had a real LifeOS task link. A session with no real
+        link (`task_id: None`) must not surface on any task's card.
 
-        (#863 review) A prior version of this test monkeypatched
-        `_claude_code_snapshot` to return a literal dict with `task_id: None`
-        hardcoded, so `to_session_dict` never ran and the test passed
-        identically on the pre-fix code that leaked `raw_session_id` into
-        `task_id`. Drive a real `cc.build_snapshot` over a synthetic on-disk
-        transcript instead, so production code supplies the field."""
+        Driving a real `cc.build_snapshot` over a synthetic on-disk
+        transcript (rather than monkeypatching `_claude_code_snapshot` to
+        return a literal dict with `task_id: None` hardcoded) ensures
+        `to_session_dict` actually runs and production code supplies the
+        field."""
         from api.services.claude_code import session_ingest as cc
 
         task_manager, *_ = stores

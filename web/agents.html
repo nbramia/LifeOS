@@ -863,11 +863,11 @@
     flex: 1 1 260px;
     /* Low enough that the six default lanes actually fit an 1280px board
        without horizontal scroll, so hiding one genuinely widens the rest
-       instead of sitting pinned at this floor (round-1 finding 2). 200px
-       left a 20px overflow (the container's 1.25rem padding-right) that
-       still forced a scrollbar at exactly 1280px — 196px is the largest
-       floor that actually fits: (1280 - 40px padding - 60px of five 12px
-       gaps) / 6 lanes = 196.67px (round-2 finding 3). */
+       instead of sitting pinned at this floor. 200px
+       would leave a 20px overflow (the container's 1.25rem padding-right)
+       that still forces a scrollbar at exactly 1280px — 196px is the
+       largest floor that actually fits: (1280 - 40px padding - 60px of
+       five 12px gaps) / 6 lanes = 196.67px. */
     min-width: 196px;
     display: flex;
     flex-direction: column;
@@ -894,7 +894,7 @@
     color: var(--text-dim);
     font-size: 0.85rem;
   }
-  /* Lane multi-select filter (#882) — mirrors the CRM's people-filter-*
+  /* Lane multi-select filter — mirrors the CRM's people-filter-*
      checkbox dropdown (web/crm.html:640, :7410-7460), scoped to the board
      so it can't leak into the Graph tab's own filter styles. */
   .board-lane-filter-dropdown { position: relative; }
@@ -1063,16 +1063,15 @@
     font-size: 0.8rem;
   }
   .drawer-notes { min-height: 5rem; resize: vertical; }
-  /* Task-card notes only (#882) — height tracks content via JS, capped at
+  /* Task-card notes only — height tracks content via JS, capped at
      2/3 of the viewport height; the schedule drawer's message-content
      textarea keeps the plain manual-resize behavior above, untouched. The
      cap is ALSO expressed here in CSS (not just computed from
      window.innerHeight in JS on input/render) so it re-applies automatically
-     when the viewport shrinks, without a resize listener (round-1 finding 8). */
+     when the viewport shrinks, without a resize listener. */
   /* Two thirds of the viewport height, matching autosizeNotesTextarea's own
      `innerHeight * 2/3` cap (web/agents/board.js) — CSS wins when the two
-     disagree, so a mismatch here silently makes the JS branch dead
-     (round-2 finding 5). */
+     disagree, so a mismatch here silently makes the JS branch dead. */
   .drawer-notes-autosize { overflow-y: auto; resize: none; max-height: 66.667vh; }
   .drawer-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
   .drawer-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.75rem; }

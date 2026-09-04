@@ -1,4 +1,4 @@
-"""Tests for the board's host catalog (#883): `HostCatalog`
+"""Tests for the board's host catalog: `HostCatalog`
 (`api/services/agent_worker/host_catalog.py`) and the
 `GET /api/agents/hosts` route that wraps it. Every `tailscale status`
 call is a stub — no network call and no real subprocess is ever made.
@@ -139,7 +139,7 @@ async def test_online_null_on_timeout_expired(registry, api_host):
     raising `TimeoutExpired` on a hung `tailscale status` — the catalog
     must catch it and degrade to `online: null`, not propagate.
 
-    (round 1, finding R3) This test does NOT prove the 2-second budget —
+    This test does NOT prove the 2-second budget —
     the fake runner raises `TimeoutExpired` immediately rather than
     actually blocking, so a wall-clock assertion here would be vacuous:
     it could not fail for any implementation, timeout-bounded or not. The
@@ -159,13 +159,13 @@ async def test_online_null_on_timeout_expired(registry, api_host):
 
 
 def test_default_status_runner_invokes_tailscale_with_bounded_timeout(monkeypatch):
-    """(round 1, finding R3) The two-second endpoint budget has exactly one
+    """The two-second endpoint budget has exactly one
     enforcement mechanism: `_default_status_runner` passing `timeout=` to
     `subprocess.run`. Nothing else in this suite touches
     `_default_status_runner` or the timeout constant directly — deleting
-    the `timeout=` argument left the rest of this file's 14 tests green
-    (verified as this finding's mutation proof), because every other test
-    injects its own `status_runner` stub instead of using the real one."""
+    the `timeout=` argument leaves the rest of this file's 14 tests green,
+    since every other test injects its own `status_runner` stub instead of
+    using the real one, so this test alone is what pins the mechanism."""
     calls = []
 
     def _fake_run(*args, **kwargs):
@@ -186,13 +186,13 @@ def test_default_status_runner_invokes_tailscale_with_bounded_timeout(monkeypatc
 
 
 def test_default_status_runner_does_not_request_text_decoding(monkeypatch):
-    """(#901 round 2, finding A2) `subprocess.run(text=True)` decodes
-    stdout AND stderr eagerly and raises `UnicodeDecodeError` on invalid
-    bytes *inside* subprocess.run itself, before `_probe_peers`'s except
-    tuple ever gets a chance — that's a `ValueError`, which round 1's tuple
-    didn't catch, so a `tailscale` writing non-UTF-8 (a non-UTF-8 locale,
-    an accented device name in an error message, ...) wiped the whole
-    registry from the response. The runner must request raw bytes and let
+    """`subprocess.run(text=True)` decodes stdout AND stderr eagerly and
+    raises `UnicodeDecodeError` on invalid bytes *inside* subprocess.run
+    itself, before `_probe_peers`'s except tuple ever gets a chance —
+    that's a `ValueError`, which the except tuple must also catch, or a
+    `tailscale` writing non-UTF-8 (a non-UTF-8 locale, an accented device
+    name in an error message, ...) wipes the whole registry from the
+    response. The runner must request raw bytes and let
     `_probe_peers` decode defensively instead."""
     calls = []
 
@@ -209,11 +209,9 @@ def test_default_status_runner_does_not_request_text_decoding(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_online_null_on_non_utf8_stdout_bytes(registry, api_host):
-    """(#901 round 2, finding A2) `tailscale` writing non-UTF-8 bytes on
-    stdout must degrade every registry host to `online: null` — NOT vanish
-    them from the response the way an unhandled `UnicodeDecodeError`
-    (caught only by the route's blanket backstop, which used to ignore the
-    registry entirely) did before this fix."""
+    """`tailscale` writing non-UTF-8 bytes on
+    stdout must degrade every registry host to `online: null` — not vanish
+    them from the response."""
     def _runner():
         return _FakeResult(stdout=b"\xff\xfe not valid utf-8 {", returncode=0)
     catalog = HostCatalog(status_runner=_runner, clock=_FrozenClock())
@@ -242,7 +240,7 @@ async def test_online_true_from_valid_bytes_stdout(registry, api_host):
 
 @pytest.mark.asyncio
 async def test_probe_degrades_on_value_error_from_runner(registry, api_host):
-    """Belt-and-braces half of #901 round 2's A2 fix: even if a custom
+    """Belt-and-braces guard: even if a custom
     `status_runner` raises `UnicodeDecodeError` (a `ValueError` subclass)
     directly — rather than it surfacing from stdout/stderr decoding inside
     `_default_status_runner` — `_probe_peers` must degrade to `[]` rather
@@ -258,13 +256,13 @@ async def test_probe_degrades_on_value_error_from_runner(registry, api_host):
 
 
 def test_probe_peers_itself_catches_value_error(registry, api_host):
-    """(#901 round 2, finding A2) Calls `_probe_peers()` DIRECTLY rather
-    than going through `get()` — round 2's A4 fix also added a blanket
-    `except Exception` around `_build()` in `get()`, which would degrade
+    """Calls `_probe_peers()` DIRECTLY rather
+    than going through `get()`: `get()` also has a blanket
+    `except Exception` around `_build()`, which would degrade
     to the same `online: null` content regardless of whether
     `_probe_peers`'s OWN except tuple catches `ValueError` — a test that
     only asserts through `get()` can't tell the two guards apart. This
-    pins the guard at the level the finding actually names."""
+    pins the guard at the level that actually needs to catch it."""
     def _raise():
         raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
     catalog = HostCatalog(status_runner=_raise, clock=_FrozenClock())
@@ -300,7 +298,7 @@ async def test_no_duplicate_entry_when_registry_names_the_api_host(api_host, mon
 
 @pytest.mark.asyncio
 async def test_api_host_ssh_target_found_despite_registry_key_case_difference(api_host, monkeypatch):
-    """(round 1, finding M1) The dedup guard above already matches a
+    """The dedup guard above already matches a
     registry key against `api_host_name()` case-insensitively — a
     registry entry named e.g. `DESKTOP-BOX` for an API host reported as
     `desktop-box` gets merged into the single `is_api_host: true` row, not
@@ -343,7 +341,7 @@ async def test_ttl_expiry_triggers_a_fresh_probe(registry, api_host):
 
 @pytest.mark.asyncio
 async def test_concurrent_cold_get_calls_probe_exactly_once(registry, api_host):
-    """(round 1, finding R4) N concurrent `get()` calls that all miss the
+    """N concurrent `get()` calls that all miss the
     cache at once must coalesce into ONE probe, not one per caller — the
     `asyncio.Lock` + double-checked-locking in `get()` is what makes that
     true. `_gated_runner` blocks (on a worker thread, via
@@ -377,18 +375,17 @@ async def test_concurrent_cold_get_calls_probe_exactly_once(registry, api_host):
 
 @pytest.mark.asyncio
 async def test_concurrent_cold_get_calls_with_a_raising_build_probe_exactly_once(registry, api_host):
-    """(#901 round 2, finding A4) Round 1's lock only coalesced the SUCCESS
-    path — when `_build` raises, `_cached` never gets set, so every queued
-    waiter re-runs the double-check, misses, and executes its OWN probe
-    under the lock: a concurrent-failure storm turned into a serialized
-    queue of probes (measured: 30 concurrent failures went from 1.2s/30
-    probes with no lock to 36s/30 probes with the naive lock). The fix
-    handles a raising build INSIDE the lock and caches the degraded result,
-    so N concurrent failing misses must still share ONE probe — same
-    gating technique as the success-path test above, but the runner raises
-    instead of returning. (`RuntimeError`, not any of `_probe_peers`'s own
-    caught exception types, so this exercises `_build`/`get()`'s handling,
-    not `_probe_peers`'s.)"""
+    """The lock in `get()` must coalesce a RAISING build the same way it
+    coalesces a successful one — when `_build` raises, `_cached` never gets
+    set, so every queued waiter re-runs the double-check, misses, and
+    without this handling would execute its OWN probe under the lock: a
+    concurrent-failure storm turning into a serialized queue of probes.
+    `_build`'s raise is caught INSIDE the lock and the degraded result is
+    cached there, so N concurrent failing misses must still share ONE
+    probe — same gating technique as the success-path test above, but the
+    runner raises instead of returning. (`RuntimeError`, not any of
+    `_probe_peers`'s own caught exception types, so this exercises
+    `_build`/`get()`'s handling, not `_probe_peers`'s.)"""
     gate = threading.Event()
 
     def _gated_raiser():
@@ -420,7 +417,7 @@ async def test_concurrent_cold_get_calls_with_a_raising_build_probe_exactly_once
 
 @pytest.mark.asyncio
 async def test_negative_ttl_expires_and_a_later_call_reprobes_and_succeeds(registry, api_host):
-    """(#901 round 2, finding A4) A degraded result must not be cached
+    """A degraded result must not be cached
     forever — it sits behind a much shorter negative TTL so the catalog
     retries soon. This proves all three phases: (1) a failing build
     degrades and probes once, (2) a second call still inside the negative
@@ -513,13 +510,13 @@ def test_get_hosts_endpoint_shape(client, monkeypatch):
 
 
 def test_get_hosts_endpoint_degrades_instead_of_500(client, monkeypatch):
-    """(#901 round 2, A2/A4/R5) `HostCatalog.get()` itself raising must
+    """`HostCatalog.get()` itself raising must
     still degrade the route to a 200 — this test forces that by
     monkeypatching `get` wholesale (bypassing HostCatalog's own internal
     degrade-on-build-failure) so it exercises the route's OWN backstop,
     `HostCatalog.degraded()`. `agent_hosts` is pinned to `{}` so the
     result is environment-independent — `degraded()` reads the real
-    registry, unlike the pre-round-2 backstop, which ignored it."""
+    registry rather than returning a bare API host."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
 
@@ -538,7 +535,7 @@ def test_get_hosts_endpoint_degrades_instead_of_500(client, monkeypatch):
 
 
 def test_get_hosts_endpoint_falls_back_to_bare_api_host_when_degraded_also_raises(client, monkeypatch):
-    """(#901 round 3, finding M15) `test_get_hosts_endpoint_degrades_instead_of_500`
+    """`test_get_hosts_endpoint_degrades_instead_of_500`
     above only exercises the OUTER `try` (`HostCatalog.get()` raising,
     `degraded()` succeeding) -- its assertion is satisfied by `degraded()`
     on an empty registry either way. This pins the route's INNERMOST
@@ -564,16 +561,15 @@ def test_get_hosts_endpoint_falls_back_to_bare_api_host_when_degraded_also_raise
 
 
 def test_get_hosts_route_times_out_and_degrades_with_registry_intact(client, monkeypatch):
-    """(#901 round 2, finding R5) The route's "hard 2-second ceiling" was
-    only ever an inference from the tailscale probe's own 1.5s timeout,
-    which doesn't cover asyncio.Lock queueing or event-loop scheduling —
-    measured up to 2.57s under concurrent load. This pins a REAL
-    mechanism: `HostCatalog.get()` is forced to hang for 10s (far past any
-    plausible ceiling), and the route must still respond well inside its
-    own budget, with the DEGRADED registry-at-online-null CONTENT (not
-    just "some 200") — proving the `asyncio.wait_for` wrapper is both
-    present and wired to the registry-preserving backstop from A4, not the
-    pre-round-2 one-row degenerate."""
+    """The route's "hard 2-second ceiling" cannot be inferred from the
+    tailscale probe's own 1.5s timeout alone, since that doesn't cover
+    asyncio.Lock queueing or event-loop scheduling — measured up to 2.57s
+    under concurrent load. This pins a REAL mechanism: `HostCatalog.get()`
+    is forced to hang for 10s (far past any plausible ceiling), and the
+    route must still respond well inside its own budget, with the
+    DEGRADED registry-at-online-null CONTENT (not just "some 200") —
+    proving the `asyncio.wait_for` wrapper is both present and wired to
+    the registry-preserving backstop, not a one-row degenerate."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_hosts", {"studio-box": "operator@studio-box.example"}, raising=False)
 
@@ -594,7 +590,7 @@ def test_get_hosts_route_times_out_and_degrades_with_registry_intact(client, mon
     elapsed = time.monotonic() - start
 
     assert resp.status_code == 200
-    # (#901 round 3, finding R10) No bare wall-clock ceiling here — a
+    # No bare wall-clock ceiling here — a
     # concurrent `-n 4` run measured this at 1.81s, only 0.19s under a
     # `< 2.0` assertion that would have been the only claim it made. The
     # `+ 0.5` assertion below already pins the MECHANISM (wait_for is

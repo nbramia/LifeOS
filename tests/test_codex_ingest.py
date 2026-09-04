@@ -285,12 +285,12 @@ def test_parse_session_handles_malformed_lines(tmp_path):
 
 @pytest.mark.unit
 def test_to_session_dict_task_id_is_none_for_locally_scanned_session(tmp_path):
-    """A locally scanned Codex session's `raw_session_id` (the rollout UUID)
-    used to leak into `task_id`, poisoning the board's `sessions_by_task`
-    join — every locally scanned session looked like it had a real LifeOS
-    task link (#863). Mirrors the Claude Code fix in
+    """`task_id` must never be a locally scanned Codex session's
+    `raw_session_id` (the rollout UUID) — leaking it in would poison the
+    board's `sessions_by_task` join, making every locally scanned session
+    look like it had a real LifeOS task link. Mirrors
     `test_to_session_dict_task_id_is_none_for_locally_scanned_session`
-    (tests/test_claude_code_ingest.py)."""
+    (tests/test_claude_code_ingest.py) for Claude Code."""
     root = tmp_path / "sessions"
     _write_rollout(root, "session-notask", [_session_meta()])
     metas = cx.discover_sessions(sessions_dir=root)

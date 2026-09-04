@@ -18,7 +18,7 @@ scenario here clicks into the Graph tab before touching graph-specific
 elements like `#filter-host` or `.node`, which now live in initially-hidden
 markup and aren't wired up until `initGraph()` runs.
 
-`TestRecentChipAndRouteFilterAndNodeLabels` (#863) covers the "recent" chip
+`TestRecentChipAndRouteFilterAndNodeLabels` covers the "recent" chip
 (completed + ended), the route filter's `hermes`/`ask` options, and that no
 rendered node label is a literal '?' — using a second synthetic snapshot
 (`SNAPSHOT2`) on a single host so the host filter doesn't interfere.
@@ -228,12 +228,12 @@ class TestPanelFields:
 
 
 # ---------------------------------------------------------------------------
-# #863 — recent chip (completed + ended), the route filter's hermes/ask
+# Covers: the recent chip (completed + ended), the route filter's hermes/ask
 # options, and the graph's node label precedence (never a literal '?').
 # Same server-free pattern as above: everything on one host so the host
 # filter doesn't interfere with these assertions, a mix of routing/status
 # values, and a CLI row with no label/short_label/prompt_preview at all —
-# the shape that used to render a literal '?'.
+# the shape that would otherwise render a literal '?'.
 # ---------------------------------------------------------------------------
 
 SNAPSHOT2 = {
@@ -257,22 +257,21 @@ SNAPSHOT2 = {
             "decoded_cwd": "/home/synthetic/proj-a",
         },
         {
-            # (#863) Shape a locally-scanned CC session actually ingests as:
-            # no custom title / AI title / user text / cwd basename, so
+            # Shape a locally-scanned CC session actually ingests as: no
+            # custom title / AI title / user text / cwd basename, so
             # `claude_code/session_ingest.py` falls `meta.label` back to the
             # bare raw session id, while `session_id` carries the "cc:"
-            # prefix (`CC_PREFIX + raw_id`). A prior fixture here omitted
-            # `label` entirely, a shape the ingest never produces. This row
-            # also has a real `prompt_preview` — the node label must prefer
-            # that over the raw-id `label` (leak shape 1 below), and with
-            # neither present it must still never fall through to a literal
-            # '?' (the pre-#863 CLI-model-label special case).
+            # prefix (`CC_PREFIX + raw_id`); the ingest always supplies a
+            # `label`, never omits it. This row also has a real
+            # `prompt_preview` — the node label must prefer that over the
+            # raw-id `label` (leak shape 1 below), and with neither present
+            # it must still never fall through to a literal '?'.
             #
-            # (#863 review finding M) `short_label` also carries the raw id
-            # here — exactly what `_fallback_label` caches when a terminal
-            # CLI session has no real content — to prove `short_label` gets
-            # the same raw-id guard as `label` rather than leaking through
-            # one precedence slot higher.
+            # `short_label` also carries the raw id here — exactly what
+            # `_fallback_label` caches when a terminal CLI session has no
+            # real content — to prove `short_label` gets the same raw-id
+            # guard as `label` rather than leaking through one precedence
+            # slot higher.
             "session_id": "cc:0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
             "task_id": None,
             "status": "ended",
@@ -293,15 +292,15 @@ SNAPSHOT2 = {
             "decoded_cwd": "/home/synthetic/proj-a",
         },
         {
-            # (#863) An orphaned worker row: `_label_for_session` falls back
+            # An orphaned worker row: `_label_for_session` falls back
             # to `s.task_id` when the task lookup finds no description (e.g.
             # the vault task file was deleted while the `sessions` row
             # survived), so `label` equals `task_id` verbatim. That raw id
             # must not render as the node label (leak shape 2 below).
             #
-            # (#863 review finding M) `short_label` also equals `task_id`
-            # here, proving the guard catches `short_label` == task_id, not
-            # just `short_label` == session_id.
+            # `short_label` also equals `task_id` here, proving the guard
+            # catches `short_label` == task_id, not just
+            # `short_label` == session_id.
             "session_id": "sess_label_orphan",
             "task_id": "t-orphan-deleted",
             "status": "running",
@@ -375,15 +374,15 @@ SNAPSHOT2 = {
             "decoded_cwd": "/home/synthetic/proj-a",
         },
         {
-            # (#863 review round 3 finding Q) A CLI row whose real title is
-            # non-Latin (CJK here). Post-fix, `_fallback_label` returns ""
-            # for a genuinely non-empty title that tokenizes to zero ASCII
-            # words (round 2's fix wrongly returned "Untitled", which sits
-            # ABOVE `label` in `nodeLabel`'s precedence and clobbered the
-            # real title on screen for every non-Latin session). This row
-            # models that fixed shape — empty `short_label`, the real title
-            # in `label` — end to end through the browser: the node must
-            # render the title, never "Untitled" and never blank.
+            # A CLI row whose real title is non-Latin (CJK here).
+            # `_fallback_label` returns "" for a genuinely non-empty title
+            # that tokenizes to zero ASCII words — returning "Untitled"
+            # instead would sit ABOVE `label` in `nodeLabel`'s precedence
+            # and clobber the real title on screen for every non-Latin
+            # session. This row models the correct shape — empty
+            # `short_label`, the real title in `label` — end to end through
+            # the browser: the node must render the title, never
+            # "Untitled" and never blank.
             "session_id": "cc:nonlatin-title-session",
             "task_id": None,
             "status": "running",
@@ -462,9 +461,9 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
         """The node label is an SVG `<text class="node-label">` whose text
         lives in appended `<tspan>` children (graph.js's `renderNodeLabel`).
         SVG `<text>` has no `innerText`, so Playwright's `all_inner_texts()`
-        (which reads `innerText`) returns `None` for every element here and
-        this assertion was vacuously true even against the pre-#863
-        `nodeLabel` that really does render a literal '?' (#863 review).
+        (which reads `innerText`) returns `None` for every element here,
+        which would make this assertion vacuously true even against a
+        `nodeLabel` that really does render a literal '?'.
         Read `textContent` instead, which SVG supports."""
         errors = []
         page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
@@ -479,20 +478,18 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
         assert len(labels) == 7
         assert all((label or "").strip() != "?" for label in labels)
         assert all((label or "").strip() != "" for label in labels)
-        # (#863 review round 3 finding Q) never a bare "Untitled" clobbering
-        # a real (non-Latin) title.
+        # Never a bare "Untitled" clobbering a real (non-Latin) title.
         assert all((label or "").strip() != "Untitled" for label in labels)
         assert errors == []
 
     def test_node_label_renders_a_non_latin_title_not_untitled(self, page: Page, agents_base_url):
-        """(#863 review round 3 finding Q) `_fallback_label` used to return
-        "Untitled" for any title that tokenized to zero ASCII words —
-        firing for every non-Latin (CJK/Cyrillic/Greek/Arabic) or
-        emoji-only title, not just a genuinely empty one. Since "Untitled"
-        sits ABOVE `label` in `nodeLabel`'s precedence, it clobbered the
-        real title on screen. Fixed to return "" instead, so the node falls
-        through to `label` exactly as it already does for a raw-id
-        `short_label`."""
+        """`_fallback_label` must not return "Untitled" for a title that
+        tokenizes to zero ASCII words — that fires for every non-Latin
+        (CJK/Cyrillic/Greek/Arabic) or emoji-only title, not just a
+        genuinely empty one, and since "Untitled" sits ABOVE `label` in
+        `nodeLabel`'s precedence it would clobber the real title on screen.
+        It returns "" instead, so the node falls through to `label` exactly
+        as it already does for a raw-id `short_label`."""
         _open_agents2(page, agents_base_url)
         page.wait_for_timeout(300)
         rows = page.evaluate(
@@ -506,12 +503,12 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
         assert rendered == "検索インデックスをリファクタリングする".replace(" ", "")
 
     def test_node_label_prefers_prompt_preview_over_a_raw_id_label(self, page: Page, agents_base_url):
-        """(#863) `nodeLabel`'s precedence guard used to compare with
-        `session_id.startsWith(label)`, which never matches a prefixed CLI
-        session id ("cc:<uuid>".startsWith("<uuid>") is false) — so the raw
-        id `label` the ingest falls back to shadowed the far more useful
-        `prompt_preview`. Fixed by comparing equality against the session id
-        with its "cc:"/"cx:" prefix stripped."""
+        """`nodeLabel`'s precedence guard compares equality against the
+        session id with its "cc:"/"cx:" prefix stripped, rather than
+        `session_id.startsWith(label)` — the latter never matches a
+        prefixed CLI session id ("cc:<uuid>".startsWith("<uuid>") is false),
+        which would let the raw id `label` the ingest falls back to shadow
+        the far more useful `prompt_preview`."""
         _open_agents2(page, agents_base_url)
         page.wait_for_timeout(300)
         rows = page.evaluate(
@@ -528,7 +525,7 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
         assert rendered == "fix the synthetic widget parser".replace(" ", "")
 
     def test_node_label_suppresses_a_worker_label_that_equals_its_task_id(self, page: Page, agents_base_url):
-        """(#863) An orphaned worker row's `label` falls back to its bare
+        """An orphaned worker row's `label` falls back to its bare
         `task_id` in `_label_for_session`; the node label must not render
         that raw id and must fall through to the next real candidate
         (`model_label` here, since there's no `prompt_preview`)."""
@@ -544,7 +541,7 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
         assert by_id["sess_label_orphan"] == "Local"
 
     def test_panel_routing_badge_says_ask_not_a_model_name(self, page: Page, agents_base_url):
-        """panel.js's routingLabel() gains an `ask` arm (#863) — the side
+        """panel.js's routingLabel() has an `ask` arm — the side
         panel's Routing badge must say "Ask", never fall through to the
         default "Claude"."""
         _open_agents2(page, agents_base_url)

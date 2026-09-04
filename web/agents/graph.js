@@ -298,9 +298,9 @@ export function initGraph() {
     };
   }
 
-  // (#863) Shared by `nodeLabel` and `sessionDisplayName` below (#863 review
-  // round 3 finding V) — a raw identifier (the session id itself, that id
-  // with a known CLI prefix ("cc:"/"cx:") stripped, or the row's task_id)
+  // Shared by `nodeLabel` and `sessionDisplayName` below — a raw identifier
+  // (the session id itself, that id with a known CLI prefix ("cc:"/"cx:")
+  // stripped, or the row's task_id)
   // is never a real label, wherever it might render: the graph node, or
   // the search-results dropdown. Compared by equality (after trimming),
   // not by `startsWith`: a `startsWith` check never matches a prefixed
@@ -320,15 +320,14 @@ export function initGraph() {
   }
 
   function nodeLabel(d) {
-    // (#863) Precedence, first non-empty wins. `label` and `short_label` are
+    // Precedence, first non-empty wins. `label` and `short_label` are
     // each skipped when they're not a human label but the raw identifier
     // the row fell back to (`isRawIdValue` above) — since both ingests and
     // `_label_for_session` fall back to exactly that raw id when there's no
     // real title, and `_fallback_label` (agent_viz_summary.py) can cache
-    // that same raw id as `short_label` (#863 review finding M —
-    // `short_label` sits ABOVE `label` in this precedence list, so it needs
-    // the identical guard or the raw id leaks through one slot higher).
-    // Never emits '?'.
+    // that same raw id as `short_label`, which sits ABOVE `label` in this
+    // precedence list, so it needs the identical guard or the raw id leaks
+    // through one slot higher. Never emits '?'.
     const candidates = [
       d.custom_label,
       isRawIdValue(d, d.short_label) ? '' : d.short_label,
@@ -647,20 +646,20 @@ export function initGraph() {
   const SEARCH_BADGE = { label: 'name', short_label: 'label', summary: 'summary' };
 
   function sessionDisplayName(s) {
-    // (#863 review round 3 finding V) Same raw-id guard `nodeLabel` uses —
-    // this feeds the search-results sort order and (via `renderSearchResults`
-    // below) the dropdown title whenever the matched field isn't rendered
-    // from its own raw value. Not independently browser-testable through
-    // `#search-input` today: `buildSearchResults`'s 'label' tier only
-    // matches when `custom_label || label` is truthy, and
-    // `renderSearchResults` then renders that same truthy `label` directly
+    // Same raw-id guard `nodeLabel` uses — this feeds the search-results
+    // sort order and (via `renderSearchResults` below) the dropdown title
+    // whenever the matched field isn't rendered from its own raw value.
+    // Not independently browser-testable through `#search-input` today:
+    // `buildSearchResults`'s 'label' tier only matches when
+    // `custom_label || label` is truthy, and `renderSearchResults` then
+    // renders that same truthy `label` directly
     // (`r.session.label || sessionDisplayName(r.session)`) rather than
     // through this function — so a search that matches on a raw-id
-    // `label` never reaches this guard in the first place (a pre-existing
-    // gap in `renderSearchResults` itself, out of scope for this fix; see
-    // PR #890 round-3 report). This function's guard covers the paths that
-    // DO route through it: the dropdown's sort comparator, and any title
-    // that falls through because the matched field's own value is empty.
+    // `label` never reaches this guard in the first place, a gap in
+    // `renderSearchResults` itself that this function's guard does not
+    // cover. This function's guard covers the paths that DO route through
+    // it: the dropdown's sort comparator, and any title that falls through
+    // because the matched field's own value is empty.
     const shortLabel = isRawIdValue(s, s.short_label) ? '' : s.short_label;
     const label = isRawIdValue(s, s.label) ? '' : s.label;
     return s.custom_label || shortLabel || label || s.session_id.slice(0, 8);

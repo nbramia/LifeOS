@@ -26,7 +26,7 @@ const LANES = [
 const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local'];
 // plan_lane_move (api/services/agent_board.py) 409s a lane=in_progress move
 // whose assignee is one of these — "only the worker claims agent-assigned
-// tasks" — so the composer must not let one through (round-1 finding 4b).
+// tasks" — so the composer must not let one through.
 const AGENT_ASSIGNEES = ASSIGNEES.filter(a => a !== 'me');
 
 // Card fields the drawer renders as editable inputs — used to decide
@@ -37,7 +37,7 @@ const DRAWER_EDITABLE_FIELDS = [
   'name', 'message_content', 'enabled',
 ];
 
-// Lane filter — multi-select checkbox dropdown (#882). Hidden lanes are
+// Lane filter — multi-select checkbox dropdown. Hidden lanes are
 // removed from the grid entirely (not just emptied), so the remaining
 // .board-lane columns (flex: 1 1 260px, see web/agents.html CSS) widen to
 // fill the space.
@@ -57,10 +57,10 @@ function loadLaneSelection() {
     // A deliberately emptied selection ([]) is a valid, intentional state —
     // AC 2 says the selection is restored from storage, and the empty-state
     // hint already covers the UI for it — so it must round-trip as empty,
-    // not be treated as malformed (round-1 finding 7).
+    // not be treated as malformed.
     if (parsed.length === 0) return new Set();
     const validIds = new Set(LANES.map(l => l.id));
-    // Tolerate an id naming a lane that no longer exists — drop it, but
+    // Tolerate an id naming a lane that isn't in the current LANES list — drop it, but
     // keep whatever's still valid. Only fall back to the default when
     // nothing valid survives (a malformed store, or a stored selection that
     // was every lane the operator once had but none exist anymore) — never
@@ -496,7 +496,7 @@ export function initBoard() {
           showToast(`Card landed in ${laneLabel(data.lane)}, not ${laneLabel(targetLane)}.`, false);
         }
         // Callers that need to know where the card actually ended up (e.g.
-        // the composer revealing the right lane — round-2 finding 1b) read
+        // the composer revealing the right lane) read
         // it off the resolved value; fetchBoard()'s own resolution (undefined)
         // is irrelevant to them, so hand back `data` once the board refresh
         // settles.
@@ -559,7 +559,7 @@ export function initBoard() {
     // silently file the card in Assigned anyway (derive_lane files any task
     // carrying an assignee tag there) with the Lane control still
     // contradicting that outcome — flip it to what will actually happen
-    // instead of leaving it to lie (round-1 finding 4a).
+    // instead of leaving it to lie.
     assigneeSelectEl.addEventListener('change', () => {
       if (assigneeSelectEl.value && laneSelectEl.value === 'unassigned') {
         laneSelectEl.value = 'assigned';
@@ -567,8 +567,7 @@ export function initBoard() {
         // The reverse of the flip above — clearing the assignee back to
         // blank must not leave Lane stuck on Assigned, or Create then fails
         // on "Pick an assignee for the Assigned lane." against a select the
-        // operator never touched (round-2 finding 1, one-directional dead
-        // end).
+        // operator never touched.
         laneSelectEl.value = 'unassigned';
       }
     });
@@ -585,7 +584,7 @@ export function initBoard() {
       // the card will actually go: derive_lane (api/services/agent_board.py)
       // files any task carrying an assignee tag under Assigned regardless of
       // what Lane says. Recompute here so both the guard checks below and
-      // the lane PUT match reality (round-2 finding 1a).
+      // the lane PUT match reality.
       const effectiveLane = (lane === 'unassigned' && assignee) ? 'assigned' : lane;
       if (effectiveLane === 'assigned' && !assignee) {
         showToast('Pick an assignee for the Assigned lane.', true);
@@ -593,8 +592,7 @@ export function initBoard() {
       }
       // plan_lane_move 409s In progress for any AGENT_ASSIGNEES tag ("only
       // the worker claims agent-assigned tasks") — reject client-side
-      // before creating anything, mirroring the Assigned guard above
-      // (round-1 finding 4b).
+      // before creating anything, mirroring the Assigned guard above.
       if (effectiveLane === 'in_progress' && assignee && AGENT_ASSIGNEES.includes(assignee)) {
         showToast('Only "me" can be assigned directly to In progress — the worker claims agent-assigned tasks itself.', true);
         return;
@@ -619,7 +617,7 @@ export function initBoard() {
         // A 200 with a non-JSON body must not throw here — the task was
         // already created; falling into the outer catch left the composer
         // open with Create re-enabled, and a second click created a
-        // duplicate (round-1 finding 6). The `created && created.id` guard
+        // duplicate. The `created && created.id` guard
         // below already handles a null result cleanly.
         const created = await r.json().catch(() => null);
         // Where the card is actually filed before any lane PUT runs:
@@ -627,30 +625,28 @@ export function initBoard() {
         // off the composer's own Lane select — a fresh card with no
         // assignee tag lands Unassigned, one with an assignee tag lands
         // Assigned. Updated below with whatever a successful moveCard PUT
-        // reports it actually landed in (round-2 finding 1b/4).
+        // reports it actually landed in.
         let landedLane = assignee ? 'assigned' : 'unassigned';
         if (effectiveLane !== 'unassigned' && created && created.id) {
           try {
             const moved = await moveCard(created.id, effectiveLane, assignee || undefined);
             // moveCard's own success path already re-fetches the board —
-            // avoid a second GET /api/agents/board round-trip here
-            // (round-1 finding 9).
+            // avoid a second GET /api/agents/board round-trip here.
             if (moved && moved.lane) landedLane = moved.lane;
           } catch (_) {
             // moveCard already toasted the failure and never re-fetches on
             // its own failure path — do it here so the board reflects the
             // card that DID get created (just not moved). Nothing beyond the
             // create call landed, so landedLane keeps the pre-move value
-            // above rather than the lane the PUT failed to reach (round-2
-            // finding 2).
+            // above rather than the lane the PUT failed to reach.
             await fetchBoard();
           }
         } else {
           // A non-Unassigned lane was requested but there's no id to move
           // with — a 200 whose body didn't parse to an object with one.
-          // Before this fix the operator saw nothing at all: the task WAS
-          // created, just not where they asked, with zero toasts to say so
-          // (round-2 finding 4).
+          // Without the toast below, the operator would see nothing at
+          // all: the task IS created, just not where they asked, with
+          // zero indication of that otherwise.
           if (effectiveLane !== 'unassigned' && !(created && created.id)) {
             showToast(`Card created, but couldn't confirm its id to move it to ${laneLabel(effectiveLane)} — check ${laneLabel(landedLane)}.`, true);
           }
@@ -658,14 +654,12 @@ export function initBoard() {
         }
         // A card that landed in a lane the filter is currently hiding would
         // otherwise have zero on-screen feedback — reveal that lane so it's
-        // actually visible (round-1 finding 5). landedLane is always the
-        // lane the card actually reached, never the one requested: a failed
-        // move leaves it at the tag-derived resting lane set above (round-2
-        // finding 1b/2), and a card whose id we never learned only ever
-        // reached that same tag-derived lane (round-2 finding 4). So
+        // actually visible. landedLane is always the lane the card actually
+        // reached, never the one requested: a failed move leaves it at the
+        // tag-derived resting lane set above, and a card whose id we never
+        // learned only ever reached that same tag-derived lane. So
         // revealing landedLane can never surface a lane the card isn't
-        // actually in — no separate failure gate is needed (round-3
-        // finding 1).
+        // actually in — no separate failure gate is needed.
         ensureLaneVisible(landedLane);
         cleanup();
       } catch (err) {
@@ -701,7 +695,7 @@ export function initBoard() {
     renderDrawer(card);
   }
 
-  // Click-outside-close (#882). The drawer sits INSIDE the full-screen
+  // Click-outside-close. The drawer sits INSIDE the full-screen
   // fixed backdrop (`justify-content: flex-end` puts it at the right
   // edge), so a click anywhere on the board background/lane/card actually
   // lands on the backdrop element itself — closing when the click's target
@@ -713,8 +707,7 @@ export function initBoard() {
   // selection dragged inward (mousedown on the backdrop, mouseup inside the
   // drawer) both still fire a `click` on the backdrop (the nearest common
   // ancestor of the two targets) — so only close when the mousedown, the
-  // mouseup, AND the click all targeted the backdrop itself (round-1
-  // finding 1).
+  // mouseup, AND the click all targeted the backdrop itself.
   let drawerBackdropMouseDownOnSelf = false;
   let drawerBackdropMouseUpOnSelf = false;
   if (drawerBackdrop) {
@@ -772,7 +765,7 @@ export function initBoard() {
     return r.json();
   }
 
-  // Notes autosize (#882) — height tracks content up to 2/3 of the
+  // Notes autosize — height tracks content up to 2/3 of the
   // viewport height, after which `.drawer-notes-autosize`'s
   // `overflow-y: auto` (web/agents.html) takes over scrolling. Scoped to
   // the task notes textarea only — the schedule drawer's message-content
@@ -786,8 +779,7 @@ export function initBoard() {
     // back, the box is assigned exactly `scrollHeight`, so its actual
     // content+padding area ends up `scrollHeight` minus the border, 2px
     // (1px top + 1px bottom) short of the content at every length past the
-    // minimum — clipping and forcing an early internal scroll (round-1
-    // finding 3).
+    // minimum — clipping and forcing an early internal scroll.
     const cs = getComputedStyle(el);
     const borderY = parseFloat(cs.borderTopWidth || '0') + parseFloat(cs.borderBottomWidth || '0');
     const maxHeight = window.innerHeight * (2 / 3);
@@ -1098,7 +1090,7 @@ export function initBoard() {
 
   // ------------------------------------------------------------------
   // Lane filter dropdown — checkboxes + All/Clear toggles + outside-click
-  // close (#882, mirrors web/crm.html's people-filter-* dropdown pattern).
+  // close (mirrors web/crm.html's people-filter-* dropdown pattern).
   // ------------------------------------------------------------------
 
   function laneFilterCheckboxes() {
@@ -1121,8 +1113,8 @@ export function initBoard() {
 
   // Reveals `laneId` in the filter (and persists it) if it's currently
   // hidden — used after creating a card straight into a lane the filter
-  // was hiding, so the new card doesn't vanish with no feedback (round-1
-  // finding 5). A no-op when the lane is already visible.
+  // was hiding, so the new card doesn't vanish with no feedback. A no-op
+  // when the lane is already visible.
   function ensureLaneVisible(laneId) {
     if (visibleLanes.has(laneId)) return;
     const checkbox = laneFilterOptions && laneFilterOptions.querySelector(`input[value="${laneId}"]`);

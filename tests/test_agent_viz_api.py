@@ -337,18 +337,20 @@ def test_model_label_claude_routing_derives_from_settings(client, stores, monkey
 
 
 # ---------------------------------------------------------------------------
-# #863 — model_label per routing arm, host passthrough, board-assignment
-# field passthrough. A session parked on `ask` used to render a Claude tier
-# guess; `remote` ignored the configured label; `hermes` never surfaced the
-# model it ran; `claude_code`/`codex` routing (an operator-directed
-# escalation, not just CLI ingest) fell through to the Claude-tier guess too.
+# model_label per routing arm, host passthrough, board-assignment field
+# passthrough. A session parked on `ask` must never render a Claude tier
+# guess; `remote` must honor the configured label; `hermes` must never
+# surface the model it ran, staying plain "Hermes" regardless of any
+# observed turn; `claude_code`/`codex` routing (an operator-directed
+# escalation, not just CLI ingest) must not fall through to a Claude-tier
+# guess either.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 def test_model_label_ask_routing_is_waiting_on_you(client, stores):
     """A session parked waiting on the operator must never render a Claude
-    model name (#863)."""
+    model name."""
     session_store, _ = stores
     session_store.create(task_id="t-ask", status=STATUS_RUNNING, routing="ask")
     sess = client.get("/api/agents/snapshot").json()["sessions"][0]
@@ -387,14 +389,14 @@ def test_model_label_hermes_routing_says_plain_hermes_without_an_observed_turn(c
 
 @pytest.mark.unit
 def test_model_label_hermes_routing_ignores_the_board_model_picker(client, stores):
-    """(#863 review) `Session.model` is the board's operator-chosen model
-    *picker* value (`SessionStore.set_assignment`) — `HermesExecutor` never
-    reads or writes it, so it must not affect the Hermes badge. A session
-    with a picker `model` set still reads plain "Hermes" (#863 review round
-    2, finding O — the badge is plain "Hermes" unconditionally; a prior
-    `Hermes · <model>` suffix sourced from a process-wide "last observed"
-    reading was removed as a cross-session misattribution, not just
-    decoupled from the picker)."""
+    """`Session.model` is the board's operator-chosen model *picker* value
+    (`SessionStore.set_assignment`) — `HermesExecutor` never reads or writes
+    it, so it must not affect the Hermes badge. A session with a picker
+    `model` set still reads plain "Hermes": the badge is plain "Hermes"
+    unconditionally, never a `Hermes · <model>` suffix sourced from a
+    process-wide "last observed" reading, since that reading is a
+    cross-session misattribution and not merely decoupled from the
+    picker."""
     session_store, _ = stores
     session_store.create(
         task_id="t-herm-picker", status=STATUS_RUNNING, routing="hermes",
@@ -552,12 +554,12 @@ def test_search_endpoint_requires_query(client, summary_db):
 
 
 # ---------------------------------------------------------------------------
-# (#863 review round 2, finding M) `_fallback_label` must not hand back the
-# row's own raw identifier — a uuid, a `t-...` task id, or a "cc:"/"cx:"
-# -prefixed session id — even re-spaced (`_fallback_label` used to turn
-# "cx:remote-cx-1" into "cx remote-cx-1", which is not caught by
-# `web/agents/graph.js`'s equality guard because it no longer equals the
-# session id, the bare session id, or the task id character-for-character).
+# `_fallback_label` must not hand back the row's own raw identifier — a
+# uuid, a `t-...` task id, or a "cc:"/"cx:"-prefixed session id — even
+# re-spaced: turning "cx:remote-cx-1" into "cx remote-cx-1" would not be
+# caught by `web/agents/graph.js`'s equality guard, since a re-spaced value
+# does not equal the session id, the bare session id, or the task id
+# character-for-character.
 # ---------------------------------------------------------------------------
 
 
@@ -582,14 +584,13 @@ def test_fallback_label_still_renders_a_real_multi_word_title():
 
 
 # ---------------------------------------------------------------------------
-# (#863 review round 3, finding Q) A genuinely non-empty, non-Latin title
-# tokenizes to zero ASCII words — the same shape `_fallback_label` sees for
-# a truly empty input — but it is NOT the same case: there is a real title
-# in `label` for the caller to fall through to, so this must return "" (like
-# the raw-identifier guard above), never "Untitled". Round 2's fix returned
-# "Untitled" here, which clobbered the real title since "Untitled" is
-# truthy and outranks `label` in `web/agents/graph.js`'s `nodeLabel`
-# precedence.
+# A genuinely non-empty, non-Latin title tokenizes to zero ASCII words — the
+# same shape `_fallback_label` sees for a truly empty input — but it is NOT
+# the same case: there is a real title in `label` for the caller to fall
+# through to, so this must return "" (like the raw-identifier guard above),
+# never "Untitled". Returning "Untitled" here would clobber the real title,
+# since "Untitled" is truthy and outranks `label` in
+# `web/agents/graph.js`'s `nodeLabel` precedence.
 # ---------------------------------------------------------------------------
 
 
@@ -667,7 +668,7 @@ def test_no_content_live_session_not_cached(summary_db):
 
 
 # ---------------------------------------------------------------------------
-# #863 — CLI-only terminal statuses ("ended"/"inactive") union into the
+# CLI-only terminal statuses ("ended"/"inactive") are unioned into the
 # terminal set, and a summary call that keeps *raising* gets the same
 # cache-the-fallback treatment as the no-content case above. Without this,
 # a CLI session whose summarizer errors is retried by the prefetcher on
@@ -707,12 +708,12 @@ def test_raising_summarizer_caches_fallback_for_terminal_statuses(summary_db, mo
 
 
 # ---------------------------------------------------------------------------
-# (#863 review round 2, finding N) An error fallback (the summarizer
-# *raised*) must never be persisted to disk, unlike the deterministic
-# no-content fallback above. `prune_disk_cache` has no scheduled caller, so
-# anything written to disk there effectively never expires — a transient
-# Gemma timeout during one summarize attempt must not permanently pin
-# "(Summary unavailable: ...)" as a terminal session's label/summary.
+# An error fallback (the summarizer *raised*) must never be persisted to
+# disk, unlike the deterministic no-content fallback above. `prune_disk_cache`
+# has no scheduled caller, so anything written to disk there effectively
+# never expires — a transient Gemma timeout during one summarize attempt
+# must not permanently pin "(Summary unavailable: ...)" as a terminal
+# session's label/summary.
 # ---------------------------------------------------------------------------
 
 
@@ -814,8 +815,8 @@ def test_raising_summarizer_recovers_after_ttl_expires_not_pinned_by_cached_erro
 
 
 # ---------------------------------------------------------------------------
-# (#863 review round 2, REC-1) "Frozen ⇒ trust the cache regardless of new
-# activity" must be restricted to a REAL cached summary. A no-content
+# "Frozen ⇒ trust the cache regardless of new activity" must be restricted
+# to a REAL cached summary. A no-content
 # fallback costs nothing to re-derive (no LLM call on that path), so it
 # gets no such leniency — re-summarizing when activity advances is free and
 # strictly more correct.
@@ -914,7 +915,7 @@ def test_raising_summarizer_not_cached_for_live_session(summary_db, monkeypatch)
 def test_inactive_session_fallback_caches_but_is_not_served_stale_after_resuming(
     summary_db, monkeypatch,
 ):
-    """(#863 review) `inactive` is in the extended terminal set so a
+    """`inactive` is in the extended terminal set so a
     session's fallback gets cached — otherwise the prefetcher would retry
     it every tick forever (AC 7). But `inactive` is NOT truly frozen
     (`web/agents/panel.js`'s `TERMINAL` set explicitly excludes it — a
@@ -963,7 +964,7 @@ def test_inactive_session_fallback_caches_but_is_not_served_stale_after_resuming
 
 @pytest.mark.unit
 def test_frozen_status_cache_valid_regardless_of_new_activity(summary_db):
-    """(#863 review) `_is_frozen` (worker-terminal statuses + `ended`,
+    """`_is_frozen` (worker-terminal statuses + `ended`,
     deliberately excluding `inactive`) is the strict set consulted by
     `_is_fresh_enough` for "is this cache valid no matter what a later read
     reports" — as opposed to `_is_terminal`'s broader "should a fallback be
@@ -983,9 +984,10 @@ def test_frozen_status_cache_valid_regardless_of_new_activity(summary_db):
 
 
 # ---------------------------------------------------------------------------
-# #863 — the prefetcher used to dispatch only `cc:`/other; a `cx:` id fell
-# through to the LifeOS TranscriptStore (which returns [] for a Codex id),
-# so Codex sessions never got a summary at all.
+# The prefetcher must dispatch a `cx:` id to the Codex path rather than
+# falling through to the LifeOS TranscriptStore (which returns [] for a
+# Codex id) — the `cc:`/`cx:`/other three-way split covers Codex sessions,
+# not just Claude Code and LifeOS.
 # ---------------------------------------------------------------------------
 
 
@@ -1013,7 +1015,7 @@ def test_prefetch_summarizes_codex_session_and_snapshot_carries_short_label(
     monkeypatch.setattr(agents_route, "_claude_code_snapshot", lambda: ([], []))
     agents_route._label_cache.clear()
 
-    # (#863 review) A bare `session_meta`-only rollout produces an empty
+    # A bare `session_meta`-only rollout produces an empty
     # `_extract_context` result regardless of whether events came from the
     # `cx:` dispatch branch or fell through to the LifeOS TranscriptStore
     # (which returns `[]` for a Codex id) — so every assertion below held
@@ -1095,15 +1097,13 @@ def test_prefetch_summarizes_codex_session_and_snapshot_carries_short_label(
 def test_prefetch_with_engine_disabled_still_caches_fallback_and_drops_out(
     tmp_path: Path, monkeypatch
 ):
-    """(#863 review — regression) `_build_snapshot` emits a synthetic
-    `cli_sessions` row for a hook-registered session on another host
-    *unconditionally* — it's never gated by `codex_viz_enabled` /
-    `claude_code_viz_enabled`. With the engine disabled, `_summarize_one`
-    can't read the transcript, but an earlier version of this fix returned
-    False before `summarize_session` ever ran, so the fallback was never
-    cached and the row was re-picked as a prefetch candidate forever — the
-    exact "retried every tick forever" failure mode this PR set out to
-    remove. It must instead fall through to an empty event list so the
+    """`_build_snapshot` emits a synthetic `cli_sessions` row for a
+    hook-registered session on another host *unconditionally* — it's never
+    gated by `codex_viz_enabled` / `claude_code_viz_enabled`. With the
+    engine disabled, `_summarize_one` can't read the transcript. Returning
+    False before `summarize_session` ever runs would leave the fallback
+    uncached and the row re-picked as a prefetch candidate on every tick
+    forever. It must instead fall through to an empty event list so the
     no-content path caches a fallback and the row drops out of the
     candidate list, same as the base-branch behavior for an
     unreachable/malformed session."""
@@ -1136,7 +1136,7 @@ def test_prefetch_with_engine_disabled_still_caches_fallback_and_drops_out(
 
     monkeypatch.setattr(settings_obj, "codex_viz_enabled", False)
     monkeypatch.setattr(settings_obj, "codex_sessions_dir", str(tmp_path / "no-such-codex-dir"))
-    # (#863 review round 3 finding X) Also isolate the Claude Code side, or
+    # Also isolate the Claude Code side, or
     # `_build_snapshot()` scans the operator's real `~/.claude/projects` —
     # not hermetic, and its runtime scales with the operator's own history.
     monkeypatch.setattr(settings_obj, "claude_code_projects_dir", str(tmp_path / "no-such-cc-dir"))
@@ -1165,13 +1165,15 @@ def test_prefetch_with_engine_disabled_still_caches_fallback_and_drops_out(
 
 @pytest.mark.unit
 def test_candidate_sessions_sort_agrees_with_is_terminal(monkeypatch):
-    """(#863 review) `_candidate_sessions` used to sort with
-    `TERMINAL_STATUSES` imported straight from `session_store`, which knows
-    nothing about the CLI statuses ("ended"/"inactive") that
-    `agent_viz_summary._is_terminal` also treats as terminal — two
-    definitions of terminal disagreeing inside one feature. A CLI row with
-    status "ended" must sort ahead of a "running" one (terminal summaries
-    are cached forever, so they're the more valuable prefetch target)."""
+    """`_candidate_sessions` must sort using the same terminal definition as
+    `agent_viz_summary._is_terminal`, not `TERMINAL_STATUSES` imported
+    straight from `session_store`, which knows nothing about the CLI
+    statuses ("ended"/"inactive") that `_is_terminal` also treats as
+    terminal — two definitions of terminal disagreeing inside one feature
+    would sort a CLI row with status "ended" as if it were still live. A
+    CLI row with status "ended" must sort ahead of a "running" one
+    (terminal summaries are cached forever, so they're the more valuable
+    prefetch target)."""
     from api.services import agent_viz_summary_prefetch as prefetch
     from api.routes import agents as agents_route
 

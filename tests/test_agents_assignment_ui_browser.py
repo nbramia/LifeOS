@@ -56,7 +56,7 @@ _MODEL_CATALOG = {
     "stale": False,
 }
 
-# Synthetic host registry (#883) — one of each `online` state: the API
+# Synthetic host registry — one of each `online` state: the API
 # host itself, an online registry host, an offline one, and one Tailscale
 # couldn't place (`online: null` -> "(unknown)").
 _HOST_CATALOG = {
@@ -264,7 +264,7 @@ def test_put_failure_surfaces_error_without_crashing(page: Page, web_base_url):
 
 
 # ---------------------------------------------------------------------------
-# #883: no false success toast; host picker as a registry dropdown
+# No false success toast; host picker as a registry dropdown
 # ---------------------------------------------------------------------------
 
 def test_successful_save_fires_no_error_callback(page: Page, web_base_url):
@@ -272,7 +272,7 @@ def test_successful_save_fires_no_error_callback(page: Page, web_base_url):
     `onError` call into a red toast, so a successful save must fire it
     ZERO times — not `onError('')`.
 
-    (round 1, finding M3) The template renders `[data-field='error']`
+    The template renders `[data-field='error']`
     `hidden` from the start, so asserting it's hidden after only a
     SUCCESSFUL save would pass even if `clearError()` were a no-op. This
     test fails a save first — driving the element visible — then
@@ -373,7 +373,7 @@ def test_host_select_lists_this_machine_plus_registry_hosts_with_markers(page: P
 
 
 def test_selecting_host_puts_bare_name(page: Page, web_base_url):
-    """(round 1, finding M2) Selects `laptop` — the `online: false` entry —
+    """Selects `laptop` — the `online: false` entry —
     rather than `studio-box` (`online: true`, whose label already equals
     its bare name). A mutation that writes the option's *label* instead of
     its *value* would leave `studio-box` green (label == value there
@@ -408,7 +408,7 @@ def test_unknown_saved_host_still_appears_selected_and_flagged(page: Page, web_b
 
 
 def test_effort_change_before_hosts_resolve_preserves_saved_host(page: Page, web_base_url):
-    """The synchronous-seed requirement (#883): the hosts fetch resolving
+    """The synchronous-seed requirement: the hosts fetch resolving
     asynchronously must never cause an early effort/engine change to write
     `host: null` over a card's already-saved host."""
     pending = []
@@ -447,18 +447,18 @@ def test_effort_change_before_hosts_resolve_preserves_saved_host(page: Page, web
     host_select = page.locator("#test-assignment-container [data-field='host']")
     expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
     assert host_select.input_value() == "studio-box"
-    # (round 1, finding M4) The seeded `(unknown)`-flagged option must be
-    # REPLACED once the real catalog lands and shows studio-box is a known
-    # registry host — a regression that kept the stale unknown flag around
-    # would pass every assertion above without this one.
+    # The seeded `(unknown)`-flagged option must be REPLACED once the real
+    # catalog lands and shows studio-box is a known registry host — a
+    # regression that kept the stale unknown flag around would pass every
+    # assertion above without this one.
     expect(host_select.locator("option[data-unknown='true']")).to_have_count(0)
 
 
 # ---------------------------------------------------------------------------
-# #901 round 1: A1 (live host value survives the catalog landing), R1
-# (a transient hosts-fetch failure retries next drawer, seed intact),
-# R2 (client-side TTL re-fetches instead of caching forever), M5 (the
-# flagged-unknown option survives an engine change).
+# Covers: live host value surviving the catalog landing; a transient
+# hosts-fetch failure retrying on the next drawer open with the seed
+# intact; client-side TTL re-fetching instead of caching forever; the
+# flagged-unknown option surviving an engine change.
 # ---------------------------------------------------------------------------
 
 def test_host_change_before_hosts_resolve_survives_catalog_landing(page: Page, web_base_url):
@@ -558,11 +558,10 @@ def test_transient_hosts_fetch_failure_falls_back_to_seed_and_retries_next_drawe
     assert host_select.input_value() == "studio-box"
     assert attempt["n"] == 1
 
-    # (round 2, finding R8) Half of round 1's R1 fix -- the early return
-    # on a falsy catalog -- was previously unpinned: a mutant that swapped
-    # `if (!catalog) return;` for `catalog = { hosts: [] };` produced an
-    # IDENTICAL DOM at this point, because populateHostOptions's own
-    # rebuild logic (given an empty hosts list and `current` still equal
+    # The early return on a falsy catalog needs a mutation-proof pin: a
+    # mutant that swaps `if (!catalog) return;` for `catalog = { hosts: [] };`
+    # produces an IDENTICAL DOM at this point, because populateHostOptions's
+    # own rebuild logic (given an empty hosts list and `current` still equal
     # to the seeded value) reconstructs the same two seed options. Pin it
     # by selecting away from the seeded host and back: the seeded
     # `data-unknown` option must still be present and re-selectable, and
@@ -676,12 +675,11 @@ def test_unknown_flagged_host_option_survives_engine_change(page: Page, web_base
 
 
 # ---------------------------------------------------------------------------
-# #901 round 2: A3 (rejected host/effort/model changes revert instead of
-# riding along on the next save), R6 (a permanently-failing hosts fetch
-# cools down instead of retrying once per drawer open), R7 (a failed/
-# skipped fetch shows a disabled "unavailable" marker), R8 (strengthens
-# round 1's R1 mutation proof), M6 (a stale failed fetch must not clobber
-# a newer successful cache entry).
+# Covers: a rejected host/effort/model change reverting instead of riding
+# along on the next save; a permanently-failing hosts fetch cooling down
+# instead of retrying once per drawer open; a failed/skipped fetch showing
+# a disabled "unavailable" marker; the falsy-catalog mutation proof; and a
+# stale failed fetch not clobbering a newer successful cache entry.
 # ---------------------------------------------------------------------------
 
 def test_rejected_host_save_reverts_then_next_save_sends_reverted_value(page: Page, web_base_url):
@@ -729,8 +727,9 @@ def test_rejected_host_save_reverts_then_next_save_sends_reverted_value(page: Pa
     error_el = page.locator("#test-assignment-container [data-field='error']")
     expect(error_el).to_contain_text("laptop is unreachable")
     # The select snaps back to the last-known-good host (studio-box), NOT
-    # left showing the rejected "laptop" (#850 finding 9's convention,
-    # applied here to the host/effort/model pickers for the first time).
+    # left showing the rejected "laptop" -- the same revert-on-failed-save
+    # convention every other drawer control follows, applied to the
+    # host/effort/model pickers.
     expect(host_select).to_have_value("studio-box")
 
     # A later, unrelated effort change must send the REVERTED host, not
@@ -827,9 +826,9 @@ def test_repeated_host_fetch_failures_cool_down_then_recover(page: Page, web_bas
     against a dead endpoint indefinitely. After the SECOND consecutive
     failure, a short cooldown suppresses further fetches; once it elapses,
     the very next drawer open retries for real and renders the full list.
-    (Round 1's R1 single-blip recovery must still hold -- the cooldown
-    only arms after a SECOND failure in a row, proven by the first two
-    opens below each issuing a real request.)"""
+    (A single-blip recovery must still hold -- the cooldown only arms
+    after a SECOND failure in a row, proven by the first two opens below
+    each issuing a real request.)"""
     attempt = {"n": 0}
     healthy = {"on": False}
 
@@ -855,7 +854,7 @@ def test_repeated_host_fetch_failures_cool_down_then_recover(page: Page, web_bas
         page.evaluate("() => { const c = document.getElementById('test-assignment-container'); if (c) c.remove(); }")
         _render(page, {"id": card_id, "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {}})
 
-    # Failure #1 -- a real fetch happens (round 1's R1 territory).
+    # Failure #1 -- a real fetch happens.
     with page.expect_response(lambda r: "/api/agents/hosts" in r.url):
         open_drawer("t30")
     assert attempt["n"] == 1
@@ -949,17 +948,17 @@ def test_stale_failed_fetch_does_not_clobber_a_newer_cache_entry(page: Page, web
 
 
 # ---------------------------------------------------------------------------
-# #901 round 3: A5 (overlapping saves are serialized so a rejected save can
-# no longer revert an accepted one, or vice versa), R9 (a revert to a host
-# whose option was removed re-seeds it, flagged, instead of silently
-# clearing to "this machine").
+# Covers: overlapping saves are serialized so a rejected save cannot revert
+# an accepted one, or vice versa; a revert to a host whose option was
+# removed re-seeds it, flagged, instead of silently clearing to
+# "this machine".
 # ---------------------------------------------------------------------------
 
 def test_serialized_save_lone_change_still_saves_immediately_and_sticks(page: Page, web_base_url):
     """Over-correction guard for A5's serialization: a single, non-
     overlapping change must still save right away and stick -- chaining
     onto an already-resolved `saveChain` must not add a meaningful delay
-    or drop the change."""
+    or drop the update."""
     _load_module(page, web_base_url)
     _render(page, {"id": "t60", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {"host": "laptop", "effort": "medium"}})
 
@@ -997,15 +996,14 @@ def test_serialized_saves_two_sequential_changes_both_land_in_order(page: Page, 
 
 
 def test_overlapping_saves_accepted_host_change_survives_a_later_rejected_effort_change(page: Page, web_base_url):
-    """(#901 round 3, finding A5, reproduction F1) With two saves in
-    flight -- an ACCEPTED host change that takes a while, and a REJECTED
-    effort change sent shortly after -- the accepted host must not be
-    silently reverted by the unrelated rejection, and the rejected effort
-    must revert to what was actually last committed. Before A5,
-    `lastSaved*` was reconstructed from the live controls at whichever
-    save resolved LAST -- here, the rejected one -- so the revert
-    clobbered a host the server had already committed, with no toast at
-    any point."""
+    """With two saves in flight -- an ACCEPTED host change that takes a
+    while, and a REJECTED effort change sent shortly after -- the accepted
+    host must not be silently reverted by the unrelated rejection, and the
+    rejected effort must revert to what was actually last committed.
+    Reconstructing `lastSaved*` from the live controls at whichever save
+    resolves LAST would let the rejected save clobber a host the server
+    had already committed, with no toast at any point -- serialization
+    guards against exactly that."""
     _load_module(page, web_base_url)
     page.evaluate(
         """(card) => {
@@ -1070,12 +1068,11 @@ def test_overlapping_saves_accepted_host_change_survives_a_later_rejected_effort
 
 
 def test_overlapping_saves_rejected_effort_reverts_even_when_the_accepted_save_settles_first(page: Page, web_base_url):
-    """(#901 round 3, finding A5, reproduction F2) Mirror image of the
-    test above: the ACCEPTED host change settles quickly, the REJECTED
-    effort change (sent shortly after) takes longer to come back. Before
-    A5, `lastSaved*` was captured from the live controls AFTER each
-    save's own `await` -- so the accepted save, resolving first while the
-    operator had already moved the effort control, recorded the
+    """Mirror image of the test above: the ACCEPTED host change settles
+    quickly, the REJECTED effort change (sent shortly after) takes longer
+    to come back. Capturing `lastSaved*` from the live controls AFTER each
+    save's own `await` would let the accepted save, resolving first while
+    the operator had already moved the effort control, record the
     operator's unconfirmed value as "last known good," making the
     later rejection's revert a no-op. The rejected value must still
     revert here, and must not ride along on the next save."""
@@ -1128,11 +1125,11 @@ def test_overlapping_saves_rejected_effort_reverts_even_when_the_accepted_save_s
 
 
 def test_unknown_saved_host_survives_a_rejected_save_racing_the_hosts_fetch(page: Page, web_base_url):
-    """(#901 round 3, finding R9) Three realistic preconditions stacked:
+    """Three realistic preconditions stacked:
     the card's saved host has dropped out of the registry (unknown,
     flagged); the operator clears the host to "this machine" WHILE `GET
-    /api/agents/hosts` is still in flight (round 1's A1 deliberately
-    supports changing the live selection mid-fetch); and that catalog
+    /api/agents/hosts` is still in flight (the live selection intentionally
+    supports changing mid-fetch); and that catalog
     landing's rebuild (still keyed off the live selection, now "") drops
     the flagged-unknown option entirely, right before the save is
     REJECTED. The naive `hostEl.value = lastSavedHost` then finds no

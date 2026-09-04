@@ -1,4 +1,4 @@
-"""Host catalog for the board's assignment picker (#883).
+"""Host catalog for the board's assignment picker.
 
 `GET /api/agents/hosts` (`api/routes/agent_assignment.py`) needs "what
 machines can a card be assigned to run on, and are they reachable" —
@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 
 _TAILSCALE_TIMEOUT_SECONDS = 1.5
 _HOST_CATALOG_TTL_SECONDS = 30
-# (#901 round 2, finding A4) How long a DEGRADED (build-failed) result stays
+# How long a DEGRADED (build-failed) result stays
 # cached before the next caller re-probes. Deliberately much shorter than
 # the normal TTL — a failure should retry soon, but a short negative TTL
 # still keeps a burst of concurrent failing callers down to one probe
@@ -79,7 +79,7 @@ StatusRunner = Callable[[], "subprocess.CompletedProcess"]
 
 
 def _default_status_runner() -> "subprocess.CompletedProcess":
-    # (#901 round 2, finding A2) No `text=True`: that decodes stdout AND
+    # No `text=True`: that decodes stdout AND
     # stderr eagerly inside subprocess.run and raises UnicodeDecodeError on
     # invalid bytes — a ValueError, which is NOT in _probe_peers's except
     # tuple below, so it would escape _build entirely and wipe the whole
@@ -140,29 +140,25 @@ class HostCatalog:
     `get()` coalesces concurrent cache misses behind an `asyncio.Lock`
     with post-acquire double-checked locking: N callers that all miss the
     cache at once share ONE `_build()` call rather than each spawning
-    their own `tailscale` probe (#901 round 1, finding R4). `_cached_at`
-    is stamped AFTER the build completes, not before — stamping first
-    would silently shorten the effective TTL by however long the build
-    took.
+    their own `tailscale` probe. `_cached_at` is stamped AFTER the build
+    completes, not before — stamping first would silently shorten the
+    effective TTL by however long the build took.
 
     A `_build()` that raises is handled INSIDE the lock rather than
-    letting the exception propagate to every waiter (#901 round 2, finding
-    A4): round 1's lock only coalesced the success path, so a raising
-    build re-ran once per queued waiter — a concurrent-failure storm
-    turned into a serialized queue of probes (measured: 30 concurrent
-    failures went from 1.2s/30 probes with no lock to 36s/30 probes with
-    the naive lock). The fix builds a probe-free DEGRADED result instead
-    — `degraded()`, every registry host at `online: null` — and caches it
-    under a much shorter `_HOST_CATALOG_NEGATIVE_TTL_SECONDS`, so a
-    failing probe costs one attempt per negative-TTL window rather than
-    one per waiter.
+    letting the exception propagate to every waiter: without that, a
+    raising build re-runs once per queued waiter, turning a
+    concurrent-failure storm into a serialized queue of probes. It builds
+    a probe-free DEGRADED result instead — `degraded()`, every registry
+    host at `online: null` — and caches it under a much shorter
+    `_HOST_CATALOG_NEGATIVE_TTL_SECONDS`, so a failing probe costs one
+    attempt per negative-TTL window rather than one per waiter.
 
     NOTE for tests: the `asyncio.Lock` binds to whichever event loop first
-    contends on it (#901 round 2, finding M9) — latent today because
-    production is one loop per process and every test either constructs
-    its own `HostCatalog()` or resets the module singleton (`_catalog`)
-    before driving it concurrently from more than one event loop /
-    `TestClient`. Do the same in any new test that touches the singleton.
+    contends on it — latent in production, where it's one loop per
+    process; every test either constructs its own `HostCatalog()` or
+    resets the module singleton (`_catalog`) before driving it
+    concurrently from more than one event loop / `TestClient`. Do the
+    same in any new test that touches the singleton.
     """
 
     status_runner: Optional[StatusRunner] = None
@@ -186,7 +182,7 @@ class HostCatalog:
     def _effective_ttl(self, ttl: int) -> int:
         # A cached DEGRADED result uses the short negative TTL regardless
         # of what the caller asked for — a build failure should retry soon
-        # even if the normal TTL is generous (#901 round 2, finding A4).
+        # even if the normal TTL is generous.
         return _HOST_CATALOG_NEGATIVE_TTL_SECONDS if self._cached_negative else ttl
 
     async def get(self, *, ttl_seconds: Optional[int] = None) -> dict:
@@ -219,10 +215,9 @@ class HostCatalog:
     def degraded(self) -> dict:
         """The same host list `_build()` produces, but with every non-API
         host forced to `online: null` and NO probe attempted — used both
-        when a build fails outright (#901 round 2, finding A4) and as the
-        route's last-resort fallback on a timeout (finding R5). Keeps the
-        registry intact rather than collapsing to just the API host, which
-        is what the pre-round-2 backstop did."""
+        when a build fails outright and as the route's last-resort
+        fallback on a timeout. Keeps the registry intact rather than
+        collapsing to just the API host."""
         return self._assemble([])
 
     def _assemble(self, peers: list[dict]) -> dict:
@@ -234,7 +229,7 @@ class HostCatalog:
         # API host's own ssh_target lookup — matching a registry key that
         # differs only in case from api_name requires the same
         # case-insensitive key on both sides, or the target lookup misses
-        # the entry the dedup guard just merged away (#901 round 1, M1).
+        # the entry the dedup guard just merged away.
         registry_by_key = {(name or "").strip().lower(): target for name, target in registry.items()}
 
         api_key = api_name.strip().lower()
@@ -270,8 +265,8 @@ class HostCatalog:
         self.probe_call_count += 1
         try:
             result = runner()
-        # (#901 round 2, finding A2) ValueError catches UnicodeDecodeError
-        # too — belt-and-braces alongside _default_status_runner no longer
+        # ValueError catches UnicodeDecodeError
+        # too — belt-and-braces alongside _default_status_runner not
         # passing `text=True`, in case a custom status_runner (or a future
         # change) still raises it directly.
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError) as exc:
@@ -283,7 +278,7 @@ class HostCatalog:
             return []
         stdout = getattr(result, "stdout", "") or ""
         if isinstance(stdout, bytes):
-            # (#901 round 3, finding M10) Belt-and-braces over the
+            # Belt-and-braces over the
             # `ValueError` catch just below: `json.loads` already accepts
             # `bytes` directly, and malformed bytes would raise
             # `UnicodeDecodeError` (a `ValueError`) from inside it, caught

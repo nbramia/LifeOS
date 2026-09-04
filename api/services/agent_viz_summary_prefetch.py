@@ -65,11 +65,12 @@ def _candidate_sessions() -> list[dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("prefetch snapshot build failed: %s", exc)
         return []
-    # (#863) Use the same terminal definition `summarize_session`/
+    # Use the same terminal definition `summarize_session`/
     # `_cache_if_terminal` cache against — `TERMINAL_STATUSES` from
     # `session_store` doesn't know about the CLI statuses ("ended",
-    # "inactive"), so sorting with it disagreed with `_is_terminal` and put
-    # sessions this module *will* cache forever into the "live" bucket.
+    # "inactive"), so sorting with it would disagree with `_is_terminal`
+    # and put sessions this module will cache forever into the "live"
+    # bucket.
     from api.services.agent_viz_summary import _is_terminal
 
     pending: list[dict[str, Any]] = []
@@ -78,10 +79,9 @@ def _candidate_sessions() -> list[dict[str, Any]]:
         # real string) once something is — including a terminal CLI
         # session's fallback that `_fallback_label` deliberately returns as
         # "" so the node falls through to `model_label` instead of echoing
-        # a raw id (#863 review round 2, finding M). A truthy check would
-        # treat that "" the same as "not yet cached" and re-pick the row
-        # forever, so check for cache presence (`is not None`), not
-        # truthiness, of the value (#863 review finding M/E interaction).
+        # a raw id. A truthy check would treat that "" the same as "not
+        # yet cached" and re-pick the row forever, so check for cache
+        # presence (`is not None`), not truthiness, of the value.
         if s.get("short_label") is not None:
             continue
         # is_subagent CC nodes synthesize from a parent transcript — skip.
@@ -103,22 +103,22 @@ async def _summarize_one(session: dict[str, Any]) -> bool:
 
     # Pull events the same way the /summary route does — mirror its
     # three-way dispatch (cc: / cx: / everything else) so Codex sessions
-    # get summarized too (#863 — Codex ids used to fall through to the
-    # LifeOS TranscriptStore, which returns [] for them).
+    # get summarized through the `cx:` branch rather than the LifeOS
+    # TranscriptStore, which returns [] for a Codex id.
     #
     # `_build_snapshot` emits a synthetic `cli_sessions` row (a hook-
     # registered session on another host) unconditionally — it isn't gated
     # by `claude_code_viz_enabled` / `codex_viz_enabled`. So when the engine
     # is disabled we can't read its transcript, but the row is still a
-    # prefetch candidate; returning False here (as an earlier version of
-    # this fix did) meant `summarize_session` never ran and the fallback
-    # was never cached, so the row was re-picked and retried every cooldown
-    # window forever — the exact failure mode this module exists to remove
-    # (#863 review). Falling through to an empty event list instead lets
-    # `summarize_session` take its deterministic no-content path, which
-    # caches the fallback for a terminal session (matching the base-branch
-    # behavior, where a disabled/unreachable engine's reader also just
-    # returns `[]` rather than raising).
+    # prefetch candidate; returning False here would mean `summarize_session`
+    # never runs and the fallback never caches, so the row would be
+    # re-picked and retried every cooldown window forever — the exact
+    # failure mode this module exists to remove. Falling through to an
+    # empty event list instead lets `summarize_session` take its
+    # deterministic no-content path, which caches the fallback for a
+    # terminal session (matching the base-branch behavior, where a
+    # disabled/unreachable engine's reader also just returns `[]` rather
+    # than raising).
     try:
         if sid.startswith("cc:"):
             from api.routes.agents import _claude_code_enabled
