@@ -83,32 +83,63 @@ D3-based force-directed graph that renders the selected person's network.
 - Clicking a node navigates to that person; hovering shows a tooltip with name and company.
 - Toggle the labels and reset-zoom controls in the toolbar.
 - Re-renders when the person selection changes.
-- Renders in well under a second regardless of how large the underlying contact
-  graph is, because the server returns a bounded neighborhood rather than the
-  full relationship set (see Bounded Neighborhood below); the client-side
-  strength slider then further narrows that bounded set to the ~25 first-degree
-  nodes the graph is designed to display at once.
+- Renders in roughly half a second on the real dataset regardless of how
+  large the underlying contact graph is, because the server returns a
+  bounded neighborhood rather than the full relationship set (see Bounded
+  Neighborhood below); the client-side strength slider then further narrows
+  that bounded set to the ~25 first-degree nodes the graph is designed to
+  display at once.
 
 ### Bounded Neighborhood
 
 `GET /api/crm/network?center_on=<id>` (used by the Graph tab) never loads
-every relationship. Instead it selects:
+every relationship. Node selection:
 
-1. The center person (degree 0).
-2. Up to `max_nodes - 1` of the center's strongest first-degree connections
-   (default `max_nodes=150`), ranked by an indexed per-person query.
-3. For `depth=2` (the Graph tab's default), up to
-   `max_second_degree_per_node` (default `10`) of each first-degree node's
-   own strongest connections, added in first-degree strength order until
-   `max_nodes` is reached.
+1. The center person (degree 0). If the center is hidden, it (and anything
+   reachable only through it) is dropped from the response the same way a
+   hidden person is dropped anywhere else in the CRM — the response can end
+   up with zero nodes if the hidden person also has no real relationships,
+   but that isn't guaranteed for every hidden person.
+2. The center's strongest first-degree connections (degree 1) — up to
+   `max_nodes - 1` when `depth=1`, or up to 75% of `max_nodes` when
+   `depth >= 2` (see the next point for why). Ranked by the same value the
+   response renders as edge weight: for an edge to the CRM owner, the other
+   person's `relationship_strength`; otherwise the pair's own
+   `pair_strength`. This ranking uses one indexed query for the center's own
+   relationships, not the full relationship table.
+3. For `depth=2` (the Graph tab's default), the *remaining* node budget goes
+   to deeper hops: each first-degree node, processed strongest first,
+   contributes up to `max_second_degree_per_node` (default `10`) of its own
+   strongest connections, ranked by a cheaper sum-of-shared-interaction-counts
+   proxy, until `max_nodes` is reached. First-degree selection reserving
+   ~25% of the budget for this tier (rather than consuming the whole budget
+   itself) is what makes second-degree nodes actually appear for a
+   well-connected center.
 
-Edges returned are the induced subgraph among exactly the selected nodes —
-every edge's endpoints are both present in the response, the center is
-always present, and every first-degree node has an edge to the center.
-"Strongest" for node *selection* is the sum of the relationship's
-shared-interaction counts (a cheap ranking proxy); the edge weight and
-strength values in the response are unchanged — computed the same way they
-always were.
+A relationship row referencing a legacy (merged-away) person id is resolved
+to its canonical id before any of this ranking or de-duplication, so a
+stale id in the underlying data can't produce a duplicate node or a
+first-degree node with no edge back to the center.
+
+Edge selection: every edge connecting the center to a first-degree node is
+always included, regardless of `max_edges` — this is what guarantees every
+first-degree node has an edge to the center. The remaining edge budget
+(`max_edges` minus those center edges) is filled with the strongest
+remaining edges among the selected nodes, by the same rendered edge weight.
+Without this cap, the induced subgraph among a well-connected center's
+neighbors is close to complete (up to `max_nodes` choose 2 edges) — capping
+it means the strength slider's bottom end may show fewer inter-node edges
+than an uncapped response would have.
+
+`category`, if set, is applied during first-degree selection over a window
+of the 3×`max_nodes` strongest candidates (categories computed via the same
+batched source-entity lookup `GET /people` uses), then the top slots are
+taken from the survivors — best-effort: a category concentrated outside
+that window is under-represented in the result. Deeper-hop candidates use a
+cheaper per-person category check with no batched fetch. `min_strength` is
+applied to already-selected nodes exactly as it always was — note it's
+currently a no-op in practice regardless of value, since it's validated to
+0.0–1.0 while `relationship_strength` is on a 0–100 scale.
 
 Query parameters:
 
@@ -116,11 +147,12 @@ Query parameters:
 |---|---|---|---|
 | `max_nodes` | 1–500 | 150 | Total nodes in the response, including the center |
 | `max_second_degree_per_node` | 0–50 | 10 | Second-(and deeper-)degree neighbors added per node at the previous depth |
-| `allow_full_graph` | bool | false | Opt-in to load every person and relationship (no `center_on`); ignores the two caps above |
+| `max_edges` | 1–20000 | 2000 | Target maximum edges; every edge touching the center is always included even if that alone exceeds this |
+| `allow_full_graph` | bool | false | Opt-in to load every person and relationship (no `center_on`); ignores the three caps above |
 
-The Graph tab always passes `max_nodes` and `max_second_degree_per_node`
-explicitly at their defaults, so the bounded contract is visible in the
-request rather than implicit.
+The Graph tab sends only `center_on` and `depth`, leaving the caps above at
+their server defaults so a future default change reaches the tab without a
+frontend edit.
 
 **Graph enhancements:**
 

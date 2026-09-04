@@ -366,6 +366,63 @@ class TestGetTopNeighbors:
         """A person with no relationships returns an empty list."""
         assert store.get_top_neighbors("lonely", limit=10) == []
 
+    def test_tied_scores_break_deterministically_by_id(self, store):
+        """Two relationships tied on the count-sum proxy resolve to a stable
+        order (by relationship id), not whatever order SQLite happens to
+        return (#896 review finding 9)."""
+        r1 = store.add(Relationship(person_a_id="center", person_b_id="tied1", shared_events_count=5))
+        r2 = store.add(Relationship(person_a_id="center", person_b_id="tied2", shared_events_count=5))
+        expected_order = sorted([r1.id, r2.id])
+
+        # Repeat a few times - a non-deterministic tiebreak would be free to
+        # vary across calls even against the same data.
+        for _ in range(3):
+            neighbors = store.get_top_neighbors("center", limit=10)
+            assert [r.id for r in neighbors] == expected_order
+
+    def test_shares_a_passed_in_connection(self, store):
+        """A caller-supplied `conn` is used (and left open) instead of the
+        store opening and closing its own (#896 review finding 11)."""
+        store.add(Relationship(person_a_id="center", person_b_id="other", shared_events_count=1))
+
+        conn = store.open_connection()
+        try:
+            neighbors = store.get_top_neighbors("center", limit=10, conn=conn)
+            assert len(neighbors) == 1
+            # Connection must still be usable - the store did not close it.
+            conn.execute("SELECT 1")
+        finally:
+            conn.close()
+
+
+class TestGetAllForPerson:
+    """Tests for RelationshipStore.get_all_for_person() (#896 review finding 5/10)."""
+
+    def test_returns_every_relationship_for_person_unordered(self, store):
+        """All relationships touching person_id come back, regardless of
+        which side of the row they're stored on."""
+        store.add(Relationship(person_a_id="center", person_b_id="a", shared_events_count=1))
+        store.add(Relationship(person_a_id="b", person_b_id="center", shared_events_count=2))
+        store.add(Relationship(person_a_id="x", person_b_id="y", shared_events_count=99))  # unrelated
+
+        rels = store.get_all_for_person("center")
+
+        others = {r.other_person("center") for r in rels}
+        assert others == {"a", "b"}
+
+    def test_no_relationships_returns_empty(self, store):
+        assert store.get_all_for_person("lonely") == []
+
+    def test_shares_a_passed_in_connection(self, store):
+        store.add(Relationship(person_a_id="center", person_b_id="other"))
+        conn = store.open_connection()
+        try:
+            rels = store.get_all_for_person("center", conn=conn)
+            assert len(rels) == 1
+            conn.execute("SELECT 1")  # still usable
+        finally:
+            conn.close()
+
 
 class TestGetEdgesAmong:
     """Tests for RelationshipStore.get_edges_among() (#870)."""
@@ -395,9 +452,12 @@ class TestGetEdgesAmong:
 
         assert len(edges) == 1
 
-    def test_chunks_beyond_sqlite_variable_limit(self, store):
+    def test_correct_with_more_ids_than_sqlite_variable_limit(self, store):
         """Correct results when the id set is larger than SQLite's default
-        999-variable limit, forcing the method to chunk its IN (...) queries."""
+        999-variable limit. The temp-table join this method uses (#896
+        review finding 4) has no `IN (...)` list at all, so there's no
+        chunking to reason about -- this just pins that a large id set
+        still works."""
         num_people = 1200
         ids = [f"person{i}" for i in range(num_people)]
 
@@ -417,3 +477,32 @@ class TestGetEdgesAmong:
             a, b = sorted([ids[i], ids[i + 1]])
             assert (a, b) in pairs
         assert not any("outsider" in pair for pair in pairs)
+
+    def test_shares_a_passed_in_connection(self, store):
+        """A caller-supplied `conn` is used (and left open) instead of the
+        store opening and closing its own (#896 review finding 11)."""
+        store.add(Relationship(person_a_id="a", person_b_id="b"))
+
+        conn = store.open_connection()
+        try:
+            edges = store.get_edges_among({"a", "b"}, conn=conn)
+            assert len(edges) == 1
+            conn.execute("SELECT 1")  # still usable
+        finally:
+            conn.close()
+
+    def test_two_calls_on_same_connection_do_not_collide(self, store):
+        """The temp table used internally is cleared/dropped between calls,
+        so reusing one connection for consecutive calls (as the network
+        endpoint does across its selection pass) doesn't leak stale rows."""
+        store.add(Relationship(person_a_id="a", person_b_id="b"))
+        store.add(Relationship(person_a_id="c", person_b_id="d"))
+
+        conn = store.open_connection()
+        try:
+            first = store.get_edges_among({"a", "b"}, conn=conn)
+            second = store.get_edges_among({"c", "d"}, conn=conn)
+            assert {(r.person_a_id, r.person_b_id) for r in first} == {("a", "b")}
+            assert {(r.person_a_id, r.person_b_id) for r in second} == {("c", "d")}
+        finally:
+            conn.close()

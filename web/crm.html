@@ -16951,10 +16951,10 @@
 
             try {
                 // Use the network endpoint with depth=2 for second-degree connections.
-                // max_nodes/max_second_degree_per_node are passed explicitly at their
-                // server-side defaults so the bounded neighborhood contract is visible
-                // here rather than implicit (#870).
-                const data = await api(`/network?center_on=${personId}&depth=2&max_nodes=150&max_second_degree_per_node=10`);
+                // Only depth/center_on are sent - max_nodes/max_second_degree_per_node/
+                // max_edges are left to the server's own defaults so a future default
+                // change reaches the tab without a frontend edit (#896 review finding 12).
+                const data = await api(`/network?center_on=${personId}&depth=2`);
 
                 if (!data.nodes || data.nodes.length === 0) {
                     container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🔗</div><p>No connections to visualize</p></div>';

@@ -459,67 +459,6 @@ class TestPersonEntityStore:
         result = temp_store.delete("fake-id")
         assert result is False
 
-    def test_get_by_ids_batch(self, temp_store):
-        """get_by_ids() returns a dict keyed by the requested ids (#870)."""
-        e1 = PersonEntity(canonical_name="Person One", emails=["one@test.com"])
-        e2 = PersonEntity(canonical_name="Person Two", emails=["two@test.com"])
-        temp_store.add(e1)
-        temp_store.add(e2)
-
-        result = temp_store.get_by_ids([e1.id, e2.id])
-
-        assert set(result.keys()) == {e1.id, e2.id}
-        assert result[e1.id].canonical_name == "Person One"
-        assert result[e2.id].canonical_name == "Person Two"
-
-    def test_get_by_ids_omits_missing(self, temp_store):
-        """An id with no matching entity is simply absent from the result."""
-        e1 = PersonEntity(canonical_name="Exists", emails=["exists@test.com"])
-        temp_store.add(e1)
-
-        result = temp_store.get_by_ids([e1.id, "does-not-exist"])
-
-        assert set(result.keys()) == {e1.id}
-
-    def test_get_by_ids_empty_input(self, temp_store):
-        """An empty id list returns an empty dict without querying."""
-        assert temp_store.get_by_ids([]) == {}
-
-    def test_get_by_ids_excludes_hidden_by_default(self, temp_store):
-        """Hidden entities are omitted unless include_hidden=True."""
-        entity = PersonEntity(canonical_name="Hidden Person", emails=["hidden@test.com"])
-        temp_store.add(entity)
-        temp_store.hide_person(entity.id, reason="test")
-
-        assert temp_store.get_by_ids([entity.id]) == {}
-        result = temp_store.get_by_ids([entity.id], include_hidden=True)
-        assert entity.id in result
-
-    def test_get_by_ids_follows_merge_chain(self, temp_store):
-        """A requested id that was merged into another resolves to the survivor."""
-        primary = PersonEntity(canonical_name="Primary", emails=["primary@test.com"])
-        temp_store.add(primary)
-        # Simulate a completed merge: the secondary id no longer has a row,
-        # but the merge map points it at the surviving primary.
-        temp_store._merged_ids["secondary-id"] = primary.id
-
-        result = temp_store.get_by_ids(["secondary-id"])
-
-        assert result["secondary-id"].id == primary.id
-
-    def test_get_by_ids_chunks_beyond_sqlite_variable_limit(self, temp_store):
-        """Correct results when the id list is larger than SQLite's default
-        999-variable limit, forcing the method to chunk its IN (...) queries."""
-        ids = []
-        for i in range(1200):
-            entity = PersonEntity(canonical_name=f"Person {i}", emails=[f"p{i}@test.com"])
-            temp_store.add(entity)
-            ids.append(entity.id)
-
-        result = temp_store.get_by_ids(ids)
-
-        assert set(result.keys()) == set(ids)
-
     def test_persistence(self, tmp_path):
         """Test that entities persist across store instances."""
         db_path = str(tmp_path / "test_persist.db")
