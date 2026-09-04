@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-04
 
 Engineering view of the agent worker — the stand-alone process that consumes `#agent`-tagged tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -400,7 +400,7 @@ Local Gemma's thinking toggle is a per-SESSION override (`local_executor.py`'s `
 
 ### Host registry and ssh spawn (#851)
 
-`LIFEOS_AGENT_HOSTS` (`{name: ssh_target}`, e.g. `{"laptop": "user@laptop.example"}`) maps a board-facing host name to an ssh target. `remote_spawn.py` is the shared mechanism:
+`LIFEOS_AGENT_HOSTS` (`{name: ssh_target}`, e.g. `{"laptop": "user@laptop.example"}`) maps a board-facing host name to an ssh target. The board's host picker (`GET /api/agents/hosts`) reads this same registry — see [Host catalog (#883)](#host-catalog-883) below. `remote_spawn.py` is the shared mechanism:
 
 - `resolve_host_target(host, api_host_name)` — empty/unset `host`, or a match on this API's own hostname, means local (returns `None`, the existing `spawn_fn` seam runs unchanged). Anything else must be a registry key or `resolve_host_target` raises `HostResolutionError` — the executor fails the task closed (`#agent-failed`, reason naming the host) **without ever calling `spawn_fn`**.
 - `build_remote_argv(argv, target, unset_env_names)` — wraps the exact local argv into `ssh -o BatchMode=yes -o ConnectTimeout=<setting> <target> -- <remote command>`. The remote command unsets every credential name `_clean_env` strips locally (mirrored via `env_names_matching_prefixes`, applied to the remote command's `env -u` prefix instead of the local Popen `env=` kwarg), then wraps the whole thing in `setsid bash -c 'echo "PGID:$$"; exec "$@"' _ …` so the remote process group id is captured as the very first stdout line. The executor strips that line (`read_remote_pgid_line`) before the normal event-stream parsing begins, and persists it via `SessionStore.set_remote_pgid`.
@@ -424,6 +424,19 @@ Two more 409s beyond the Assigned-state/tag/already-running checks: `_OPENING_GR
 ### Model catalog (#851)
 
 `GET /api/agents/models` (`model_catalog.py`) returns `{engines: {claude, codex, local, hermes}, refreshed_at, stale}`, each engine's list merged with `pricing.PRICING`. Sources: Anthropic via the SDK's own `models.list()` (never a hand-maintained table — that's exactly what went stale in `pricing.py` before #655/#656); Codex via its own `~/.codex/models_cache.json`, falling back to a live OpenAI models list only when `LIFEOS_OPENAI_API_KEY` is set; local via the running llama-server's `/v1/models` (`model_readout._probe_live_model`); Hermes via the last observed turn's model (`model_readout.get_hermes_models`) — never probed, since Hermes can serve a different model per turn. Cached for `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` (default 24h); a refresh failure (any single engine's fetch raising) falls back to the last successful catalog with `stale: true` rather than 500ing the picker.
+
+### Host catalog (#883)
+
+`GET /api/agents/hosts` (`host_catalog.py`) returns `{hosts: [{name, ssh_target, online, is_api_host}], refreshed_at}` — the source for the board's host picker. `HostCatalog` mirrors `ModelCatalog`'s injectable-everything TTL-cache pattern (`status_runner` + `clock` seams, `probe_call_count` for tests), kept deliberately simpler: one probe instead of four provider fetches, and a much shorter TTL (`_HOST_CATALOG_TTL_SECONDS`, 30s — reachability drifts minute to minute, unlike a model list) that's a module constant rather than a new setting.
+
+The list is always the API host itself (name from `remote_spawn.api_host_name()`, `is_api_host: true`, `online: true` unconditionally — the API process IS this host) plus every entry in `settings.agent_hosts`, deduplicated by name: a registry entry that happens to name the API host merges into that one row (carrying its `ssh_target`) rather than producing a duplicate. Unlike the model catalog, a cache MISS always re-reads `settings.agent_hosts` fresh — the registry is local config, not a network call, so there's no reason to let it drift stale between probes.
+
+Reachability for every other host comes from `tailscale status --json`, run through an injectable `status_runner` (`subprocess.run(..., timeout=_TAILSCALE_TIMEOUT_SECONDS)`, 1.5s — comfortably inside the endpoint's 2-second budget) inside `asyncio.to_thread`. A registry host is matched case-insensitively against each Tailscale peer (including `Self`) by comparing the registry name and the ssh_target — `user@` prefix and `:port` suffix stripped — against the peer's `HostName` and the first label of its `DNSName`. `online` is:
+
+- `true`/`false` — the probe ran, returned valid JSON, and matched this host to a peer; that peer's `Online` boolean.
+- `null` — the probe is inconclusive: `tailscale` isn't installed (`FileNotFoundError`), the command exited non-zero, the JSON didn't parse, it timed out (`subprocess.TimeoutExpired`), or it ran fine but simply found no matching peer. A host can be reachable over plain LAN ssh with no Tailscale involvement, so `false` would misrepresent "not probed" as "probed and down."
+
+The whole build degrades rather than raising — every probe failure mode above already resolves to `[]` peers (not an exception), and the route wraps the call in a last-resort `try`/`except` that falls back to just the API host entry if something still goes wrong, so the picker never sees a 500.
 
 ---
 

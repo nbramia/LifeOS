@@ -18,6 +18,10 @@
 //     `{engines: {claude: [...], codex: [...], local: [...], hermes: [...]},
 //     refreshed_at, stale}`, each entry `{id, label, pricing}` — the
 //     source for the model picker's options.
+//   - `GET /api/agents/hosts` (#883) returns
+//     `{hosts: [{name, ssh_target, online, is_api_host}], refreshed_at}`
+//     — the source for the host picker's options; `online` is
+//     `true`/`false`/`null` (null = unknown, never guessed).
 //
 // No build step, no framework — plain DOM, matching every other file in
 // this directory.
@@ -62,6 +66,20 @@ function loadModelCatalog(fetchImpl = fetch) {
   return _catalogPromise;
 }
 
+// Fetches the host registry once per page load and caches it — mirrors
+// loadModelCatalog above exactly. A fetch failure degrades to an empty
+// host list (the select still renders "this machine" plus any unknown
+// saved host — see renderAssignmentPickers's host-select handling).
+let _hostsPromise = null;
+function loadHostCatalog(fetchImpl = fetch) {
+  if (!_hostsPromise) {
+    _hostsPromise = fetchImpl('/api/agents/hosts')
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .catch(() => ({ hosts: [] }));
+  }
+  return _hostsPromise;
+}
+
 /**
  * Render the four assignment pickers into `container` for `card`.
  *
@@ -72,8 +90,11 @@ function loadModelCatalog(fetchImpl = fetch) {
  *   /api/tasks/{id} caller; defaults to a real fetch. Tests inject a fake.
  * @param {(fetchImpl?: Function) => Promise} [opts.loadCatalog] - override
  *   for tests; defaults to the module's cached `loadModelCatalog`.
+ * @param {(fetchImpl?: Function) => Promise} [opts.loadHosts] - override
+ *   for tests; defaults to the module's cached `loadHostCatalog`.
  * @param {Function} [opts.fetchImpl] - fetch override for the default
- *   catalog loader, when `opts.loadCatalog` isn't given.
+ *   catalog/host loaders, when `opts.loadCatalog`/`opts.loadHosts` isn't
+ *   given.
  * @param {() => void} [opts.onSaved] - called after a successful PUT.
  * @param {(message: string) => void} [opts.onError] - called with an error
  *   message on a failed PUT; defaults to a no-op (the caller — board.js's
@@ -82,6 +103,7 @@ function loadModelCatalog(fetchImpl = fetch) {
 export function renderAssignmentPickers(container, card, opts = {}) {
   const putTask = opts.putTask || defaultPutTask;
   const loadCatalog = opts.loadCatalog || (() => loadModelCatalog(opts.fetchImpl));
+  const loadHosts = opts.loadHosts || (() => loadHostCatalog(opts.fetchImpl));
   const onSaved = opts.onSaved || (() => {});
   const onError = opts.onError || (() => {});
 
@@ -114,8 +136,7 @@ export function renderAssignmentPickers(container, card, opts = {}) {
     </div>
     <div class="assignment-row" data-row="host" hidden>
       <label class="assignment-label">Host</label>
-      <input class="assignment-host" data-field="host" type="text"
-             value="${escapeHtml(currentHost)}" placeholder="this machine" />
+      <select class="assignment-host" data-field="host"></select>
     </div>
     <div class="assignment-ran" data-field="ran"></div>
     <div class="assignment-error" data-field="error" hidden></div>
@@ -162,15 +183,56 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   }
   loadCatalog().then(populateModelOptions);
 
-  function showError(message) {
-    if (message) {
-      errorEl.textContent = message;
-      errorEl.hidden = false;
-    } else {
-      errorEl.hidden = true;
-      errorEl.textContent = '';
+  // Host select: unlike the model select (which is safe to leave empty
+  // until the catalog resolves — a `model` field is simply omitted from
+  // the PUT until then, see save()'s comment below), a `host` field is
+  // never omitted — an early effort/engine change must still carry the
+  // card's saved host along. So the saved host is seeded as a selected
+  // option SYNCHRONOUSLY, before `GET /api/agents/hosts` has even been
+  // requested, rather than adding a second readiness flag: hostEl.value
+  // is correct from the very first render. Once the real host list
+  // resolves, populateHostOptions() rebuilds the options list against it
+  // — a saved host that IS in the registry gets its real online marker; a
+  // saved host that ISN'T stays as the same flagged-unknown option
+  // (`data-unknown="true"`) rather than disappearing.
+  function seedHostOptions() {
+    const optionsHtml = ['<option value="">this machine</option>'];
+    if (currentHost) {
+      optionsHtml.push(`<option value="${escapeHtml(currentHost)}" selected data-unknown="true">${escapeHtml(currentHost)} (unknown)</option>`);
     }
+    hostEl.innerHTML = optionsHtml.join('');
+  }
+  seedHostOptions();
+
+  function hostLabel(host) {
+    if (host.online === false) return `${host.name} (offline)`;
+    if (host.online === null || host.online === undefined) return `${host.name} (unknown)`;
+    return host.name;
+  }
+  function populateHostOptions(catalog) {
+    const hosts = (catalog && catalog.hosts) || [];
+    const known = hosts.some(h => h.name === currentHost);
+    const optionsHtml = ['<option value="">this machine</option>'];
+    for (const h of hosts) {
+      const selected = currentHost === h.name ? 'selected' : '';
+      optionsHtml.push(`<option value="${escapeHtml(h.name)}" ${selected}>${escapeHtml(hostLabel(h))}</option>`);
+    }
+    if (currentHost && !known) {
+      optionsHtml.push(`<option value="${escapeHtml(currentHost)}" selected data-unknown="true">${escapeHtml(currentHost)} (unknown)</option>`);
+    }
+    hostEl.innerHTML = optionsHtml.join('');
+  }
+  loadHosts().then(populateHostOptions);
+
+  function showError(message) {
+    errorEl.textContent = message;
+    errorEl.hidden = false;
     onError(message);
+  }
+
+  function clearError() {
+    errorEl.hidden = true;
+    errorEl.textContent = '';
   }
 
   // Every picker writes the SAME shape: the assignee tag (if it's the
@@ -197,7 +259,7 @@ export function renderAssignmentPickers(container, card, opts = {}) {
     if (tags) patch.tags = tags;
     try {
       await putTask(card.id, patch);
-      showError('');
+      clearError();
       onSaved();
     } catch (err) {
       showError(err && err.message ? err.message : String(err));

@@ -1,7 +1,7 @@
 # Agent Worker Setup
 
 > **Status:** Complete
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-04
 > **Audience:** Operators
 
 One-time setup for the external agent worker that picks up `#agent`-tagged tasks and executes them via Claude (Anthropic Managed Agents) or a local Gemma model.
@@ -496,6 +496,16 @@ works, since the value is passed straight to `ssh`. A host name not in
 this map fails the task closed (`#agent-failed`, reason naming the host)
 without ever attempting a connection; leaving `LIFEOS_AGENT_HOSTS` unset
 (the default, `{}`) disables every remote host.
+
+**The board's host picker (#883)** shows this same registry as a
+dropdown — the API host plus every name in `LIFEOS_AGENT_HOSTS` — rather
+than a free-text field, each marked `(offline)` or `(unknown)` when it
+isn't reachable. Reachability comes from `tailscale status --json` when
+the `tailscale` binary is available; without it (or if a host simply
+isn't a Tailscale peer — plain LAN ssh works fine without Tailscale at
+all) the marker is `(unknown)`, never a guessed `(offline)`. Nothing
+further to configure — the picker reads `LIFEOS_AGENT_HOSTS` fresh, the
+same registry the ssh spawn mechanism below uses.
 
 **ssh prerequisites, per remote machine:**
 

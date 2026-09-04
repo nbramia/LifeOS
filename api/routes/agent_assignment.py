@@ -21,6 +21,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
+from api.services.agent_worker.host_catalog import get_host_catalog
 from api.services.agent_worker.model_catalog import get_model_catalog
 from api.services.agent_worker.session_store import (
     CLI_STATUS_ENDED,
@@ -92,6 +93,32 @@ async def get_models() -> dict[str, Any]:
     list is sourced and cached.
     """
     return await get_model_catalog().get()
+
+
+@router.get("/hosts")
+async def get_hosts() -> dict[str, Any]:
+    """Registry of hosts a card's `host` field can target, with
+    reachability — the source for the board's host picker (#883).
+
+    `{hosts: [{name, ssh_target, online, is_api_host}], refreshed_at}` —
+    see `host_catalog.py` for how the list is built and `online` probed
+    and cached. Degrades to just the API host (`online: true`) rather
+    than 500ing if the catalog build itself raises unexpectedly — every
+    expected failure (missing tailscale, a bad probe, ...) is already
+    handled inside `HostCatalog`, so this is a last-resort backstop.
+    """
+    try:
+        return await get_host_catalog().get()
+    except Exception as exc:  # noqa: BLE001 — the picker must never 500
+        logger.warning("host catalog fetch failed: %s", exc)
+        from api.services.agent_worker.remote_spawn import api_host_name
+        return {
+            "hosts": [{
+                "name": api_host_name(), "ssh_target": None,
+                "online": True, "is_api_host": True,
+            }],
+            "refreshed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
 
 
 def _card_assignee(tags: list[str]) -> str | None:

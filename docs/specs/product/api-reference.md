@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-03
+**Last Updated:** 2026-09-04
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Three adjacent catalogs split out for size:
 
@@ -1110,6 +1110,10 @@ Card kill/resume/focus/registration endpoints are documented in [agent-viz.md §
 ### GET /api/agents/models
 
 Per-engine model catalog for the board's assignment pickers: `{engines: {claude: [...], codex: [...], local: [...], hermes: [...]}, refreshed_at, stale}`, each entry `{id, label, pricing}`. Cached for `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` (default 24h); `stale: true` means the last successful refresh, not this one, is being served.
+
+### GET /api/agents/hosts
+
+Host registry for the board's host picker (#883): `{hosts: [{name, ssh_target, online, is_api_host}], refreshed_at}`. The list is always the API host itself (`is_api_host: true`, `online: true`) plus every entry in `LIFEOS_AGENT_HOSTS`, deduplicated by name. `online` is `true`/`false` when a `tailscale status --json` probe ran successfully and matched the host to a peer, `null` when the signal is inconclusive — `tailscale` isn't installed, the probe failed/timed out, or it ran fine but simply found no matching peer (a host can still be reachable over plain LAN ssh). The probe is bounded well under 2 seconds and never fails the request. Cached for 30 seconds; see [agent-worker.md § Host catalog](../technical/agent-worker.md#host-catalog-883) for the probe/matching mechanism.
 
 ### POST /api/agents/board/cards/{id}/open
 

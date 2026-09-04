@@ -56,6 +56,19 @@ _MODEL_CATALOG = {
     "stale": False,
 }
 
+# Synthetic host registry (#883) — one of each `online` state: the API
+# host itself, an online registry host, an offline one, and one Tailscale
+# couldn't place (`online: null` -> "(unknown)").
+_HOST_CATALOG = {
+    "hosts": [
+        {"name": "desktop-box", "ssh_target": None, "online": True, "is_api_host": True},
+        {"name": "studio-box", "ssh_target": "operator@studio-box.example", "online": True, "is_api_host": False},
+        {"name": "laptop", "ssh_target": "operator@laptop.example", "online": False, "is_api_host": False},
+        {"name": "mystery-box", "ssh_target": "operator@mystery-box.example", "online": None, "is_api_host": False},
+    ],
+    "refreshed_at": "2026-01-01T00:00:00Z",
+}
+
 
 def _load_module(page: Page, base_url: str, *, api_handler=None):
     """Serve a page on the target origin, stub every /api/ call, and inject
@@ -64,6 +77,8 @@ def _load_module(page: Page, base_url: str, *, api_handler=None):
     def default_handler(route):
         if "/api/agents/models" in route.request.url:
             route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+        elif "/api/agents/hosts" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
         elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
             body = json.loads(route.request.post_data or "{}")
             route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": "t1", **body}))
@@ -88,17 +103,23 @@ def _load_module(page: Page, base_url: str, *, api_handler=None):
 
 
 def _render(page: Page, card: dict):
+    """Render with a fake, always-succeeding putTask. Also installs an
+    onError spy (`window.__errorCalls`) so tests can assert a successful
+    save fires it zero times, alongside the existing `window.__lastCalls`
+    PUT-call spy."""
     page.evaluate(
         """(card) => {
             const container = document.createElement('div');
             container.id = 'test-assignment-container';
             document.body.appendChild(container);
             window.__lastCalls = [];
+            window.__errorCalls = [];
             window.__renderAssignmentPickers(container, card, {
                 putTask: (id, patch) => {
                     window.__lastCalls.push({ id, patch });
                     return Promise.resolve({ id, ...patch });
                 },
+                onError: (message) => { window.__errorCalls.push(message); },
             });
         }""",
         card,
@@ -240,3 +261,146 @@ def test_put_failure_surfaces_error_without_crashing(page: Page, web_base_url):
     error_el = page.locator("#test-assignment-container [data-field='error']")
     expect(error_el).to_be_visible()
     expect(error_el).to_contain_text("save failed")
+
+
+# ---------------------------------------------------------------------------
+# #883: no false success toast; host picker as a registry dropdown
+# ---------------------------------------------------------------------------
+
+def test_successful_save_fires_no_error_callback(page: Page, web_base_url):
+    """The regression this issue exists for: `board.js` turns every
+    `onError` call into a red toast, so a successful save must fire it
+    ZERO times — not `onError('')`."""
+    _load_module(page, web_base_url)
+    _render(page, {"id": "t9", "title": "Fix the printer", "tags": ["codex"], "assignee": "codex", "fields": {}})
+
+    page.locator("[data-field='effort']").select_option("high")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 1  # the save did happen...
+    error_calls = page.evaluate("() => window.__errorCalls")
+    assert error_calls == []  # ...but onError was never called for it
+    error_el = page.locator("#test-assignment-container [data-field='error']")
+    expect(error_el).to_be_hidden()
+
+
+def test_failed_save_fires_onerror_exactly_once_with_response_detail(page: Page, web_base_url):
+    """Drives the REAL `defaultPutTask` (no `opts.putTask` override) against
+    a stubbed 4xx response, so this proves `onError`'s message is exactly
+    the server's `detail` — not a generic HTTP-status string — and fires
+    exactly once."""
+    def api_handler(route):
+        if "/api/agents/models" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+        elif "/api/agents/hosts" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+        elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
+            route.fulfill(
+                status=422, content_type="application/json",
+                body=json.dumps({"detail": "effort must be one of low/medium/high/max"}),
+            )
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    page.evaluate(
+        """(card) => {
+            const container = document.createElement('div');
+            container.id = 'test-assignment-container';
+            document.body.appendChild(container);
+            window.__errorCalls = [];
+            window.__renderAssignmentPickers(container, card, {
+                onError: (message) => { window.__errorCalls.push(message); },
+            });
+        }""",
+        {"id": "t14", "title": "Fix the printer", "tags": ["codex"], "assignee": "codex", "fields": {}},
+    )
+    page.locator("[data-field='effort']").select_option("high")
+    error_el = page.locator("#test-assignment-container [data-field='error']")
+    expect(error_el).to_contain_text("effort must be one of low/medium/high/max")  # waits for the async PUT
+    error_calls = page.evaluate("() => window.__errorCalls")
+    assert error_calls == ["effort must be one of low/medium/high/max"]
+
+
+def test_host_select_lists_this_machine_plus_registry_hosts_with_markers(page: Page, web_base_url):
+    _load_module(page, web_base_url)
+    _render(page, {"id": "t10", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {}})
+
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    options = host_select.locator("option")
+    expect(options).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
+    texts = options.all_inner_texts()
+    assert texts[0] == "this machine"
+    assert "desktop-box" in texts       # online: true, is_api_host — no marker
+    assert "studio-box" in texts        # online: true — no marker
+    assert "laptop (offline)" in texts  # online: false
+    assert "mystery-box (unknown)" in texts  # online: null
+
+
+def test_selecting_host_puts_bare_name(page: Page, web_base_url):
+    _load_module(page, web_base_url)
+    _render(page, {"id": "t11", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {}})
+
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))  # wait for the fetch
+
+    host_select.select_option("studio-box")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 1
+    assert calls[0]["patch"]["fields"]["host"] == "studio-box"
+
+
+def test_unknown_saved_host_still_appears_selected_and_flagged(page: Page, web_base_url):
+    _load_module(page, web_base_url)
+    _render(page, {
+        "id": "t12", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude",
+        "fields": {"host": "retired-box"},
+    })
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    # "this machine" + every registry host + the one flagged-unknown extra.
+    expect(host_select.locator("option")).to_have_count(2 + len(_HOST_CATALOG["hosts"]))
+    unknown_option = host_select.locator("option[data-unknown='true']")
+    expect(unknown_option).to_have_count(1)
+    expect(unknown_option).to_have_text("retired-box (unknown)")
+    assert host_select.input_value() == "retired-box"
+
+
+def test_effort_change_before_hosts_resolve_preserves_saved_host(page: Page, web_base_url):
+    """The synchronous-seed requirement (#883): the hosts fetch resolving
+    asynchronously must never cause an early effort/engine change to write
+    `host: null` over a card's already-saved host."""
+    pending = []
+
+    def api_handler(route):
+        if "/api/agents/models" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+        elif "/api/agents/hosts" in route.request.url:
+            pending.append(route)  # stashed — fulfilled later in the test
+        elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
+            body = json.loads(route.request.post_data or "{}")
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": "t13", **body}))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    _render(page, {
+        "id": "t13", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude",
+        "fields": {"host": "studio-box", "effort": "medium"},
+    })
+
+    # The hosts fetch hasn't resolved yet (stashed) — change effort now.
+    page.locator("[data-field='effort']").select_option("high")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 1
+    fields = calls[0]["patch"]["fields"]
+    assert fields["effort"] == "high"
+    assert fields["host"] == "studio-box"  # preserved, not nulled
+
+    # Now let the hosts fetch resolve — the saved host is a real registry
+    # entry, so the flagged-unknown seed option is replaced by the real one.
+    for route in pending:
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+    pending.clear()
+
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
+    assert host_select.input_value() == "studio-box"
