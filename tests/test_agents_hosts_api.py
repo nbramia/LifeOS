@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -184,6 +185,78 @@ def test_default_status_runner_invokes_tailscale_with_bounded_timeout(monkeypatc
     assert host_catalog_module._TAILSCALE_TIMEOUT_SECONDS < 2.0
 
 
+def test_default_status_runner_does_not_request_text_decoding(monkeypatch):
+    """(#901 round 2, finding A2) `subprocess.run(text=True)` decodes
+    stdout AND stderr eagerly and raises `UnicodeDecodeError` on invalid
+    bytes *inside* subprocess.run itself, before `_probe_peers`'s except
+    tuple ever gets a chance — that's a `ValueError`, which round 1's tuple
+    didn't catch, so a `tailscale` writing non-UTF-8 (a non-UTF-8 locale,
+    an accented device name in an error message, ...) wiped the whole
+    registry from the response. The runner must request raw bytes and let
+    `_probe_peers` decode defensively instead."""
+    calls = []
+
+    def _fake_run(*args, **kwargs):
+        calls.append(kwargs)
+        return _FakeResult(stdout="{}", returncode=0)
+
+    monkeypatch.setattr(host_catalog_module.subprocess, "run", _fake_run)
+    host_catalog_module._default_status_runner()
+
+    assert len(calls) == 1
+    assert calls[0].get("text") is not True
+
+
+@pytest.mark.asyncio
+async def test_online_null_on_non_utf8_stdout_bytes(registry, api_host):
+    """(#901 round 2, finding A2) `tailscale` writing non-UTF-8 bytes on
+    stdout must degrade every registry host to `online: null` — NOT vanish
+    them from the response the way an unhandled `UnicodeDecodeError`
+    (caught only by the route's blanket backstop, which used to ignore the
+    registry entirely) did before this fix."""
+    def _runner():
+        return _FakeResult(stdout=b"\xff\xfe not valid utf-8 {", returncode=0)
+    catalog = HostCatalog(status_runner=_runner, clock=_FrozenClock())
+    result = await catalog.get(ttl_seconds=86400)
+    by_name = {h["name"]: h for h in result["hosts"]}
+    assert set(by_name) == {"desktop-box", "studio-box", "laptop"}  # registry NOT dropped
+    assert by_name["studio-box"]["online"] is None
+    assert by_name["laptop"]["online"] is None
+    assert by_name["desktop-box"]["online"] is True  # API host unaffected
+
+
+@pytest.mark.asyncio
+async def test_online_true_from_valid_bytes_stdout(registry, api_host):
+    """Confirms `_probe_peers`'s bytes-decode path on the HAPPY path too —
+    a real `subprocess.run` without `text=True` returns bytes on success,
+    not just on failure."""
+    peers = {"pubkey-1": {"HostName": "studio-box", "DNSName": "studio-box.tailnet.ts.net.", "Online": True}}
+    payload = _status_json(peers).encode("utf-8")
+    def _runner():
+        return _FakeResult(stdout=payload, returncode=0)
+    catalog = HostCatalog(status_runner=_runner, clock=_FrozenClock())
+    result = await catalog.get(ttl_seconds=86400)
+    by_name = {h["name"]: h for h in result["hosts"]}
+    assert by_name["studio-box"]["online"] is True
+
+
+@pytest.mark.asyncio
+async def test_probe_degrades_on_value_error_from_runner(registry, api_host):
+    """Belt-and-braces half of #901 round 2's A2 fix: even if a custom
+    `status_runner` raises `UnicodeDecodeError` (a `ValueError` subclass)
+    directly — rather than it surfacing from stdout/stderr decoding inside
+    `_default_status_runner` — `_probe_peers` must degrade to `[]` rather
+    than letting it escape `_build`."""
+    def _raise():
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    catalog = HostCatalog(status_runner=_raise, clock=_FrozenClock())
+    result = await catalog.get(ttl_seconds=86400)
+    by_name = {h["name"]: h for h in result["hosts"]}
+    assert by_name["studio-box"]["online"] is None
+    assert by_name["laptop"]["online"] is None
+    assert by_name["desktop-box"]["online"] is True
+
+
 @pytest.mark.asyncio
 async def test_online_null_for_registry_host_absent_from_peer_list(registry, api_host):
     # tailscale runs fine, but only reports one of the two registry hosts.
@@ -289,6 +362,90 @@ async def test_concurrent_cold_get_calls_probe_exactly_once(registry, api_host):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_cold_get_calls_with_a_raising_build_probe_exactly_once(registry, api_host):
+    """(#901 round 2, finding A4) Round 1's lock only coalesced the SUCCESS
+    path — when `_build` raises, `_cached` never gets set, so every queued
+    waiter re-runs the double-check, misses, and executes its OWN probe
+    under the lock: a concurrent-failure storm turned into a serialized
+    queue of probes (measured: 30 concurrent failures went from 1.2s/30
+    probes with no lock to 36s/30 probes with the naive lock). The fix
+    handles a raising build INSIDE the lock and caches the degraded result,
+    so N concurrent failing misses must still share ONE probe — same
+    gating technique as the success-path test above, but the runner raises
+    instead of returning. (`RuntimeError`, not any of `_probe_peers`'s own
+    caught exception types, so this exercises `_build`/`get()`'s handling,
+    not `_probe_peers`'s.)"""
+    gate = threading.Event()
+
+    def _gated_raiser():
+        gate.wait(timeout=2.0)
+        raise RuntimeError("tailscale exploded")
+
+    catalog = HostCatalog(status_runner=_gated_raiser, clock=_FrozenClock())
+
+    async def _get():
+        return await catalog.get(ttl_seconds=86400)
+
+    tasks = [asyncio.create_task(_get()) for _ in range(5)]
+    await asyncio.sleep(0.05)
+    gate.set()
+    results = await asyncio.gather(*tasks)
+
+    assert catalog.probe_call_count == 1
+    assert all(r == results[0] for r in results)
+    by_name = {h["name"]: h for h in results[0]["hosts"]}
+    # Positive content, not just "it returned fast": the degraded result
+    # must still list EVERY registry host, each at online: null — the
+    # registry is preserved, unlike the pre-round-2 route backstop, which
+    # dropped it entirely.
+    assert set(by_name) == {"desktop-box", "studio-box", "laptop"}
+    assert by_name["studio-box"]["online"] is None
+    assert by_name["laptop"]["online"] is None
+    assert by_name["desktop-box"]["online"] is True
+
+
+@pytest.mark.asyncio
+async def test_negative_ttl_expires_and_a_later_call_reprobes_and_succeeds(registry, api_host):
+    """(#901 round 2, finding A4) A degraded result must not be cached
+    forever — it sits behind a much shorter negative TTL so the catalog
+    retries soon. This proves all three phases: (1) a failing build
+    degrades and probes once, (2) a second call still inside the negative
+    TTL is a cache hit (no second probe), (3) a call past the negative TTL
+    re-probes for real and — critically — SUCCEEDS with fresh content, not
+    just "attempted again"."""
+    clock = _FrozenClock()
+    attempts = {"n": 0}
+
+    def _runner():
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("tailscale exploded")
+        peers = {"pubkey-1": {"HostName": "studio-box", "DNSName": "studio-box.tailnet.ts.net.", "Online": True}}
+        return _FakeResult(stdout=_status_json(peers), returncode=0)
+
+    catalog = HostCatalog(status_runner=_runner, clock=clock)
+
+    first = await catalog.get(ttl_seconds=86400)
+    by_name = {h["name"]: h for h in first["hosts"]}
+    assert by_name["studio-box"]["online"] is None  # degraded
+    assert catalog.probe_call_count == 1
+
+    # Still inside the negative TTL -- must be a cache hit, not a re-probe.
+    clock.now += 1
+    second = await catalog.get(ttl_seconds=86400)
+    assert catalog.probe_call_count == 1
+    assert second == first
+
+    # Past the negative TTL -- the next call re-probes, and this time
+    # succeeds with real (non-degraded) content.
+    clock.now += host_catalog_module._HOST_CATALOG_NEGATIVE_TTL_SECONDS + 1
+    third = await catalog.get(ttl_seconds=86400)
+    assert catalog.probe_call_count == 2
+    by_name3 = {h["name"]: h for h in third["hosts"]}
+    assert by_name3["studio-box"]["online"] is True  # a REAL probe succeeded this time
+
+
+@pytest.mark.asyncio
 async def test_registry_read_fresh_on_cache_miss(api_host, monkeypatch):
     from config.settings import settings
     clock = _FrozenClock()
@@ -342,6 +499,16 @@ def test_get_hosts_endpoint_shape(client, monkeypatch):
 
 
 def test_get_hosts_endpoint_degrades_instead_of_500(client, monkeypatch):
+    """(#901 round 2, A2/A4/R5) `HostCatalog.get()` itself raising must
+    still degrade the route to a 200 — this test forces that by
+    monkeypatching `get` wholesale (bypassing HostCatalog's own internal
+    degrade-on-build-failure) so it exercises the route's OWN backstop,
+    `HostCatalog.degraded()`. `agent_hosts` is pinned to `{}` so the
+    result is environment-independent — `degraded()` reads the real
+    registry, unlike the pre-round-2 backstop, which ignored it."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
+
     async def _raise(self, ttl_seconds=None):
         raise RuntimeError("catalog build blew up")
     monkeypatch.setattr(host_catalog_module.HostCatalog, "get", _raise)
@@ -354,3 +521,43 @@ def test_get_hosts_endpoint_degrades_instead_of_500(client, monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["hosts"] == [{"name": "desktop-box", "ssh_target": None, "online": True, "is_api_host": True}]
+
+
+def test_get_hosts_route_times_out_and_degrades_with_registry_intact(client, monkeypatch):
+    """(#901 round 2, finding R5) The route's "hard 2-second ceiling" was
+    only ever an inference from the tailscale probe's own 1.5s timeout,
+    which doesn't cover asyncio.Lock queueing or event-loop scheduling —
+    measured up to 2.57s under concurrent load. This pins a REAL
+    mechanism: `HostCatalog.get()` is forced to hang for 10s (far past any
+    plausible ceiling), and the route must still respond well inside its
+    own budget, with the DEGRADED registry-at-online-null CONTENT (not
+    just "some 200") — proving the `asyncio.wait_for` wrapper is both
+    present and wired to the registry-preserving backstop from A4, not the
+    pre-round-2 one-row degenerate."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {"studio-box": "operator@studio-box.example"}, raising=False)
+
+    async def _hang(self, ttl_seconds=None):
+        await asyncio.sleep(10)
+        raise AssertionError("should never resolve — the route's wait_for must give up first")
+
+    monkeypatch.setattr(host_catalog_module.HostCatalog, "get", _hang)
+    monkeypatch.setattr(host_catalog_module, "_catalog", None)
+
+    from api.services.agent_worker import remote_spawn
+    monkeypatch.setattr(remote_spawn, "api_host_name", lambda: "desktop-box")
+
+    from api.routes import agent_assignment as agent_assignment_module
+
+    start = time.monotonic()
+    resp = client.get("/api/agents/hosts")
+    elapsed = time.monotonic() - start
+
+    assert resp.status_code == 200
+    assert elapsed < 2.0  # the route's own ceiling, not the 10s hang
+    assert elapsed < agent_assignment_module._HOSTS_ROUTE_TIMEOUT_SECONDS + 0.5
+    body = resp.json()
+    names = {h["name"] for h in body["hosts"]}
+    assert names == {"desktop-box", "studio-box"}  # registry preserved, not the one-row degenerate
+    non_api = next(h for h in body["hosts"] if not h["is_api_host"])
+    assert non_api["online"] is None

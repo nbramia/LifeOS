@@ -81,20 +81,46 @@ function loadModelCatalog(fetchImpl = fetch) {
 //     the page session. `populateHostOptions` below treats a `null`
 //     result as "leave the synchronous seed alone" — distinct from a
 //     catalog that resolved with a genuinely empty `hosts` list.
+//   - (#901 round 2, finding R6) a permanently failing endpoint must not
+//     be retried once per drawer open forever — after the SECOND
+//     consecutive failure, a short cooldown (`_HOSTS_FAILURE_COOLDOWN_MS`)
+//     suppresses further fetches so a dead endpoint costs one request per
+//     cooldown window rather than one per drawer open. A single transient
+//     blip (round 1's R1 territory) still retries on the very next drawer
+//     open — the cooldown only arms after a SECOND failure in a row.
 let _hostsCache = null; // { at: number (Date.now() ms), promise: Promise }
 const _HOSTS_CLIENT_TTL_MS = 30_000;
+let _hostsConsecutiveFailures = 0;
+let _hostsCooldownUntil = 0;
+const _HOSTS_FAILURE_COOLDOWN_MS = 10_000;
 function loadHostCatalog(fetchImpl = fetch) {
   const now = Date.now();
   if (_hostsCache && (now - _hostsCache.at) < _HOSTS_CLIENT_TTL_MS) {
     return _hostsCache.promise;
   }
+  if (_hostsConsecutiveFailures >= 2 && now < _hostsCooldownUntil) {
+    return Promise.resolve(null); // still cooling down -- skip the fetch entirely
+  }
   const promise = fetchImpl('/api/agents/hosts')
     .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+    .then(data => {
+      _hostsConsecutiveFailures = 0;
+      return data;
+    })
     .catch(() => {
-      _hostsCache = null; // don't poison the cache with a failure — retry next time
+      // (#901 round 2, finding M6) Only clear the cache if we're still the
+      // CURRENT entry — a slow fetch that fails after the TTL rolled and a
+      // newer fetch already cached a success must not clobber that newer
+      // entry.
+      if (_hostsCache === mine) _hostsCache = null;
+      _hostsConsecutiveFailures += 1;
+      if (_hostsConsecutiveFailures >= 2) {
+        _hostsCooldownUntil = Date.now() + _HOSTS_FAILURE_COOLDOWN_MS;
+      }
       return null;
     });
-  _hostsCache = { at: now, promise };
+  const mine = { at: now, promise };
+  _hostsCache = mine;
   return promise;
 }
 
@@ -130,6 +156,17 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   const currentEffort = fieldValue(card, 'effort');
   const currentHost = fieldValue(card, 'host');
   const ran = card.session || null;
+
+  // (#901 round 2, finding A3) Last-known-good values for the three
+  // fields every save() sends, seeded from the card and updated on each
+  // SUCCESSFUL save. A rejected save reverts the controls to these —
+  // mirroring how every other drawer control (title, notes, context,
+  // tags, the Assignee select in board.js) already snaps back on failure
+  // — so a host/effort/model change the server REJECTS can never ride
+  // along, silently, on the next unrelated save.
+  let lastSavedEffort = currentEffort;
+  let lastSavedHost = currentHost;
+  let lastSavedModel = currentModel;
 
   container.innerHTML = `
     <div class="assignment-row" data-row="engine">
@@ -228,10 +265,23 @@ export function renderAssignmentPickers(container, card, opts = {}) {
     return host.name;
   }
   function populateHostOptions(catalog) {
-    // `null` means the fetch failed (see loadHostCatalog) — leave the
-    // synchronous seed exactly as seedHostOptions() rendered it rather
-    // than collapsing it to just "this machine".
-    if (!catalog) return;
+    // `null` means the fetch failed, or was skipped by the R6 cooldown
+    // below (see loadHostCatalog) — leave the synchronous seed exactly as
+    // seedHostOptions() rendered it rather than collapsing it to just
+    // "this machine", but tell the operator the REGISTRY failed to load
+    // (#901 round 2, finding R7) — otherwise a card with no saved host
+    // shows exactly one option and reads as "no hosts are registered",
+    // not "the registry couldn't be loaded". The marker option is
+    // `disabled` so it can never become the selected value, and thus
+    // never rides along as `fields.host` on a later save.
+    if (!catalog) {
+      const unavailable = document.createElement('option');
+      unavailable.value = '__hosts_unavailable__';
+      unavailable.disabled = true;
+      unavailable.textContent = 'hosts unavailable — reopen to retry';
+      hostEl.appendChild(unavailable);
+      return;
+    }
     // Read the LIVE selection, not `currentHost` (the render-time
     // snapshot) — the operator may have already changed the host while
     // this fetch was in flight, and that live choice must win over the
@@ -288,9 +338,24 @@ export function renderAssignmentPickers(container, card, opts = {}) {
     if (tags) patch.tags = tags;
     try {
       await putTask(card.id, patch);
+      // (#901 round 2, finding A3) Record what actually stuck, so a LATER
+      // failed save has something correct to revert to.
+      lastSavedEffort = effortEl.value;
+      lastSavedHost = hostEl.value.trim();
+      if (catalogReady) lastSavedModel = modelEl.value;
       clearError();
       onSaved();
     } catch (err) {
+      // (#901 round 2, finding A3) The server REJECTED this change —
+      // revert the controls to their last-known-good values BEFORE
+      // surfacing the error, so the rejected choice can't ride along on
+      // the next unrelated save with no toast at all. Every other drawer
+      // control already does this on failure (board.js's title/notes/
+      // context/tags fields and the Assignee select); the assignment
+      // pickers didn't, until now.
+      effortEl.value = lastSavedEffort;
+      hostEl.value = lastSavedHost;
+      if (catalogReady) modelEl.value = lastSavedModel;
       showError(err && err.message ? err.message : String(err));
     }
   }

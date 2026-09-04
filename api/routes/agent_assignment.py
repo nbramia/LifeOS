@@ -12,6 +12,7 @@ which they do here.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import shlex
 import subprocess
@@ -33,6 +34,14 @@ from api.services.agent_worker.session_store import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
+
+# (#901 round 2, finding R5) The endpoint's "2-second budget" was only ever
+# an inference from the tailscale probe's own 1.5s timeout, which doesn't
+# cover asyncio.Lock queueing or event-loop scheduling — measured up to
+# 2.57s under concurrent load. This makes the ceiling a real mechanism:
+# just under 2s, comfortably above the probe timeout so a healthy build
+# still completes inside it.
+_HOSTS_ROUTE_TIMEOUT_SECONDS = 1.8
 
 # Recognized assignee tags, in the order checked. Mirrors preflight.py's
 # `_apply_tag_overrides` tag set for the CLI-spawning engines — "local" is
@@ -102,15 +111,32 @@ async def get_hosts() -> dict[str, Any]:
 
     `{hosts: [{name, ssh_target, online, is_api_host}], refreshed_at}` —
     see `host_catalog.py` for how the list is built and `online` probed
-    and cached. Degrades to just the API host (`online: true`) rather
-    than 500ing if the catalog build itself raises unexpectedly — every
-    expected failure (missing tailscale, a bad probe, ...) is already
-    handled inside `HostCatalog`, so this is a last-resort backstop.
+    and cached. `HostCatalog.get()` already degrades internally on a build
+    failure (registry intact, every non-API host `online: null` — #901
+    round 2, finding A4) rather than raising, but two more layers back
+    this up: a hard `_HOSTS_ROUTE_TIMEOUT_SECONDS` ceiling in case a build
+    somehow outlives it (finding R5), and a bare `except Exception` for
+    anything else that still goes wrong. Both fall back to
+    `HostCatalog.degraded()` — the same registry-at-`online: null` list,
+    not the pre-round-2 one-row degenerate — and log at `error` with a
+    traceback (dropping the operator's whole host list is not a quiet
+    `warning`-level event, finding A2). Only if `degraded()` itself somehow
+    raises does this fall back further, to a single API-host row.
     """
+    catalog = get_host_catalog()
     try:
-        return await get_host_catalog().get()
+        return await asyncio.wait_for(catalog.get(), timeout=_HOSTS_ROUTE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.error(
+            "host catalog fetch exceeded the %.1fs route budget; degrading to registry-at-online-null",
+            _HOSTS_ROUTE_TIMEOUT_SECONDS,
+        )
     except Exception as exc:  # noqa: BLE001 — the picker must never 500
-        logger.warning("host catalog fetch failed: %s", exc)
+        logger.exception("host catalog fetch failed: %s", exc)
+    try:
+        return catalog.degraded()
+    except Exception as exc:  # noqa: BLE001 — absolute last resort
+        logger.exception("host catalog degraded fallback failed: %s", exc)
         from api.services.agent_worker.remote_spawn import api_host_name
         return {
             "hosts": [{

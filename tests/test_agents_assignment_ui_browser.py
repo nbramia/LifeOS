@@ -547,13 +547,32 @@ def test_transient_hosts_fetch_failure_falls_back_to_seed_and_retries_next_drawe
 
     host_select = page.locator("#test-assignment-container [data-field='host']")
     # The failed fetch must leave the synchronous seed intact -- NOT
-    # collapse it to an empty catalog with nothing to pick from.
-    expect(host_select.locator("option")).to_have_count(2)
+    # collapse it to an empty catalog with nothing to pick from -- plus
+    # the R7 "hosts unavailable" marker so the operator knows the
+    # registry itself failed to load, not just "nothing is registered."
+    expect(host_select.locator("option")).to_have_count(3)
     texts = host_select.locator("option").all_inner_texts()
     assert texts[0] == "this machine"
     assert "studio-box (unknown)" in texts
+    assert any("hosts unavailable" in t for t in texts)
     assert host_select.input_value() == "studio-box"
     assert attempt["n"] == 1
+
+    # (round 2, finding R8) Half of round 1's R1 fix -- the early return
+    # on a falsy catalog -- was previously unpinned: a mutant that swapped
+    # `if (!catalog) return;` for `catalog = { hosts: [] };` produced an
+    # IDENTICAL DOM at this point, because populateHostOptions's own
+    # rebuild logic (given an empty hosts list and `current` still equal
+    # to the seeded value) reconstructs the same two seed options. Pin it
+    # by selecting away from the seeded host and back: the seeded
+    # `data-unknown` option must still be present and re-selectable, and
+    # picking it must still save the right value.
+    host_select.select_option("")
+    expect(host_select.locator("option[data-unknown='true']")).to_have_count(1)
+    host_select.select_option("studio-box")
+    assert host_select.input_value() == "studio-box"
+    calls = page.evaluate("() => window.__lastCalls")
+    assert calls[-1]["patch"]["fields"]["host"] == "studio-box"
 
     # A second drawer open retries -- and this time succeeds, replacing
     # the seed with the real registry list.
@@ -654,3 +673,276 @@ def test_unknown_flagged_host_option_survives_engine_change(page: Page, web_base
     expect(unknown_option).to_have_count(1)
     expect(unknown_option).to_have_text("retired-box (unknown)")
     assert host_select.input_value() == "retired-box"
+
+
+# ---------------------------------------------------------------------------
+# #901 round 2: A3 (rejected host/effort/model changes revert instead of
+# riding along on the next save), R6 (a permanently-failing hosts fetch
+# cools down instead of retrying once per drawer open), R7 (a failed/
+# skipped fetch shows a disabled "unavailable" marker), R8 (strengthens
+# round 1's R1 mutation proof), M6 (a stale failed fetch must not clobber
+# a newer successful cache entry).
+# ---------------------------------------------------------------------------
+
+def test_rejected_host_save_reverts_then_next_save_sends_reverted_value(page: Page, web_base_url):
+    """A3: a host change the server REJECTS must not ride along on the
+    next unrelated save. Every other drawer control (title, notes,
+    context, tags, the Assignee select) reverts to its last-known-good
+    value on a failed save -- the host/effort/model pickers must too, and
+    the NEXT save must send the reverted value, not the rejected one."""
+    reject_next_host = {"on": False}
+    puts = []
+
+    def api_handler(route):
+        if "/api/agents/hosts" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+        elif "/api/agents/models" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+        elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
+            body = json.loads(route.request.post_data or "{}")
+            puts.append(body)
+            if reject_next_host["on"] and body.get("fields", {}).get("host") == "laptop":
+                route.fulfill(status=409, content_type="application/json", body=json.dumps({"detail": "laptop is unreachable"}))
+                return
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": "t50", **body}))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    page.evaluate(
+        """(card) => {
+            const container = document.createElement('div');
+            container.id = 'test-assignment-container';
+            document.body.appendChild(container);
+            window.__errorCalls = [];
+            window.__renderAssignmentPickers(container, card, {
+                onError: (message) => { window.__errorCalls.push(message); },
+            });
+        }""",
+        {"id": "t50", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {"host": "studio-box", "effort": "medium"}},
+    )
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))  # wait for the catalog
+
+    reject_next_host["on"] = True
+    host_select.select_option("laptop")
+    error_el = page.locator("#test-assignment-container [data-field='error']")
+    expect(error_el).to_contain_text("laptop is unreachable")
+    # The select snaps back to the last-known-good host (studio-box), NOT
+    # left showing the rejected "laptop" (#850 finding 9's convention,
+    # applied here to the host/effort/model pickers for the first time).
+    expect(host_select).to_have_value("studio-box")
+
+    # A later, unrelated effort change must send the REVERTED host, not
+    # the rejected one -- and no toast, since this save succeeds.
+    reject_next_host["on"] = False
+    page.locator("[data-field='effort']").select_option("high")
+    expect(error_el).to_be_hidden()
+    last = puts[-1]["fields"]
+    assert last["effort"] == "high"
+    assert last["host"] == "studio-box"  # NOT "laptop"
+
+
+def test_successful_host_change_sticks_and_rides_along_on_next_save(page: Page, web_base_url):
+    """Positive counterpart to the A3 revert test above -- guarding
+    against over-correction. A SUCCESSFUL host change must still stick
+    (not be reverted by the same guard that reverts a rejected one), and
+    the next save must carry the newly-saved host forward. This also
+    exercises A1's live-value read alongside A3's revert tracking, since
+    both read/write the same `hostEl.value`."""
+    puts = []
+
+    def api_handler(route):
+        if "/api/agents/hosts" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+        elif "/api/agents/models" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+        elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
+            body = json.loads(route.request.post_data or "{}")
+            puts.append(body)
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": "t51", **body}))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    page.evaluate(
+        """(card) => {
+            const container = document.createElement('div');
+            container.id = 'test-assignment-container';
+            document.body.appendChild(container);
+            window.__renderAssignmentPickers(container, card, {});
+        }""",
+        {"id": "t51", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {"host": "studio-box", "effort": "medium"}},
+    )
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
+
+    host_select.select_option("laptop")
+    expect(host_select).to_have_value("laptop")
+
+    page.locator("[data-field='effort']").select_option("high")
+    expect(page.locator("#test-assignment-container [data-field='error']")).to_be_hidden()
+    assert puts[-1]["fields"]["host"] == "laptop"  # the successful change rode along
+    assert host_select.input_value() == "laptop"
+
+
+def test_failed_host_fetch_shows_unavailable_option_never_selectable(page: Page, web_base_url):
+    """R7: a failed (or R6-cooldown-skipped) `/api/agents/hosts` fetch
+    must tell the operator the registry itself failed to load -- not look
+    like "no hosts are registered." The appended option is disabled so it
+    can never become the selected value, and thus never rides along as
+    `fields.host` on the next save."""
+    def api_handler(route):
+        if "/api/agents/hosts" in route.request.url:
+            route.fulfill(status=503, content_type="application/json", body="{}")
+        elif "/api/agents/models" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+        elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
+            body = json.loads(route.request.post_data or "{}")
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": "t27", **body}))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    with page.expect_response(lambda r: "/api/agents/hosts" in r.url):
+        _render(page, {"id": "t27", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {}})
+
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    expect(host_select.locator("option")).to_have_count(2)  # "this machine" + the unavailable marker
+    unavailable = host_select.locator("option", has_text="hosts unavailable")
+    expect(unavailable).to_have_count(1)
+    assert unavailable.get_attribute("disabled") is not None
+    assert host_select.input_value() == ""  # still "this machine" -- the marker was never selected
+
+    # A save that doesn't touch the host at all must never send the
+    # marker's value.
+    page.locator("[data-field='effort']").select_option("high")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert calls[-1]["patch"]["fields"]["host"] is None
+
+
+def test_repeated_host_fetch_failures_cool_down_then_recover(page: Page, web_base_url):
+    """R6: a permanently failing `/api/agents/hosts` must not be retried
+    once per drawer open forever -- that costs one request per UI open
+    against a dead endpoint indefinitely. After the SECOND consecutive
+    failure, a short cooldown suppresses further fetches; once it elapses,
+    the very next drawer open retries for real and renders the full list.
+    (Round 1's R1 single-blip recovery must still hold -- the cooldown
+    only arms after a SECOND failure in a row, proven by the first two
+    opens below each issuing a real request.)"""
+    attempt = {"n": 0}
+    healthy = {"on": False}
+
+    def api_handler(route):
+        if "/api/agents/hosts" in route.request.url:
+            attempt["n"] += 1
+            if healthy["on"]:
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+            else:
+                route.fulfill(status=503, content_type="application/json", body="{}")
+        elif "/api/agents/models" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+        elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
+            body = json.loads(route.request.post_data or "{}")
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": "cooldown", **body}))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    page.clock.install()
+
+    def open_drawer(card_id):
+        page.evaluate("() => { const c = document.getElementById('test-assignment-container'); if (c) c.remove(); }")
+        _render(page, {"id": card_id, "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {}})
+
+    # Failure #1 -- a real fetch happens (round 1's R1 territory).
+    with page.expect_response(lambda r: "/api/agents/hosts" in r.url):
+        open_drawer("t30")
+    assert attempt["n"] == 1
+
+    # Failure #2 -- still a real fetch; this one arms the cooldown.
+    with page.expect_response(lambda r: "/api/agents/hosts" in r.url):
+        open_drawer("t31")
+    assert attempt["n"] == 2
+
+    # A third drawer opened immediately, still inside the cooldown window,
+    # must NOT issue a third request.
+    open_drawer("t32")
+    page.wait_for_timeout(100)
+    assert attempt["n"] == 2
+    host_select3 = page.locator("#test-assignment-container [data-field='host']")
+    expect(host_select3.locator("option")).to_have_count(2)  # this machine + unavailable marker
+
+    # Advance past the cooldown -- the endpoint recovers too -- and the
+    # next drawer open both retries AND renders the full list.
+    healthy["on"] = True
+    page.clock.fast_forward(11_000)
+    with page.expect_response(lambda r: "/api/agents/hosts" in r.url):
+        open_drawer("t33")
+    assert attempt["n"] == 3
+    host_select4 = page.locator("#test-assignment-container [data-field='host']")
+    expect(host_select4.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
+
+
+def test_stale_failed_fetch_does_not_clobber_a_newer_cache_entry(page: Page, web_base_url):
+    """M6: a slow fetch that fails AFTER a newer, faster fetch already
+    cached a success must not null out that newer cache entry -- only the
+    fetch that's still the current `_hostsCache` entry may clear it on
+    failure."""
+    responses = []  # stashed hosts-fetch routes, fulfilled out of order below
+
+    def api_handler(route):
+        if "/api/agents/hosts" in route.request.url:
+            responses.append(route)
+        elif "/api/agents/models" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+        elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
+            body = json.loads(route.request.post_data or "{}")
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": "clobber", **body}))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    def wait_for_stashed(n):
+        # Both stashed requests are deliberately left un-fulfilled by
+        # api_handler above, so neither `expect_response` nor
+        # `expect_request` (both wait for network EVENTS, and a route this
+        # test never calls .fulfill() on inline never completes one) can
+        # be used here -- poll the Python-side stash list instead.
+        for _ in range(100):
+            if len(responses) >= n:
+                return
+            page.wait_for_timeout(20)
+        raise AssertionError(f"expected {n} stashed /api/agents/hosts request(s), got {len(responses)}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    page.clock.install()
+
+    # Drawer #1 -- fetch #1 goes out and is stashed (deliberately left
+    # unfulfilled until after fetch #2 resolves, below).
+    _render(page, {"id": "t40", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {}})
+    wait_for_stashed(1)
+
+    # Past the client TTL, drawer #2 issues fetch #2 -- and it resolves
+    # (successfully) BEFORE the still-pending fetch #1 does.
+    page.clock.fast_forward(31_000)
+    page.evaluate("() => { document.getElementById('test-assignment-container').remove(); }")
+    _render(page, {"id": "t41", "title": "Deploy", "tags": ["codex"], "assignee": "codex", "fields": {}})
+    wait_for_stashed(2)
+    responses[1].fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+
+    host_select2 = page.locator("#test-assignment-container [data-field='host']")
+    expect(host_select2.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
+
+    # NOW let the stale fetch #1 fail. Its `.catch` must not clobber the
+    # cache entry fetch #2 just installed.
+    responses[0].fulfill(status=503, content_type="application/json", body="{}")
+    page.wait_for_timeout(100)
+
+    # A third drawer, still well within fetch #2's cache TTL, must be a
+    # cache hit -- no third request.
+    page.evaluate("() => { document.getElementById('test-assignment-container').remove(); }")
+    _render(page, {"id": "t42", "title": "Reindex", "tags": ["claude"], "assignee": "claude", "fields": {}})
+    page.wait_for_timeout(100)
+    assert len(responses) == 2  # still just the two -- no clobber-triggered refetch
+    host_select3 = page.locator("#test-assignment-container [data-field='host']")
+    expect(host_select3.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))
