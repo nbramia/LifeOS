@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-08-11
+> **Last Updated:** 2026-09-04
 
 Performance tracing and alerting for LifeOS.
 
@@ -65,6 +65,37 @@ ssh <user>@<server-ip> "cd ~/Code/LifeOS && ~/.venvs/lifeos/bin/python -m pytest
 ```
 
 Test queries and expected results are defined in `BENCHMARK_QUERIES` within the test file. Personal names/topics can be overridden via `tests/fixtures/benchmark_config.json` (gitignored).
+
+---
+
+## Route Timing
+
+Every HTTP request is timed, independently of the chat-turn tracing above (#877). Where perf tracing follows one chat turn through its LLM/tool stages, route timing answers a different question -- "what's slow right now, across the whole API" -- and catches regressions perf tracing can't see, like a CRM endpoint whose response quietly grows to ten seconds with no chat turn involved at all.
+
+### How It Works
+
+- `RouteTimingMiddleware` (`api/services/route_timing.py`) is a pure-ASGI middleware, registered last in `api/main.py` so it wraps outermost around this app's own middleware (CORS, the scoped gzip middleware) -- its duration and byte count cover the full response, including compression.
+- Being pure ASGI rather than `BaseHTTPMiddleware` means it never buffers a response: a streaming reply (SSE chat) is timed to completion via its final body chunk, with every chunk passed straight through.
+- Routes are keyed by **route template**, not the raw request path -- `request.scope["route"].path` (e.g. `/api/crm/people/{person_id}`), read after routing resolves it, falling back to `"<unmatched>"` for a 404. A raw path or query string never reaches a log line or the in-memory summary, so a person id in a URL is never exposed.
+- `/health*` and `/static/*` are excluded entirely (too frequent/trivial to matter). Everything else -- every `/api/*` call and every page route (`/crm`, `/me`, `/family`, `/relationship`, `/birthdays`, ...) -- is timed and recorded.
+- A request slower than `LIFEOS_SLOW_REQUEST_MS` (default 500ms) logs one WARNING with method, route template, status, duration, and response bytes. A request that raises is recorded and logged (if slow) with status 500, then re-raised.
+- Per-route stats live in `RouteTimingStore`, a thread-safe, bounded rolling window (last 200 samples) per `(method, route template)`. Process-local and reset on restart -- this is a live signal, not persisted history (#733 covers persisted rollups this can feed).
+
+### API Endpoint
+
+```bash
+# Per-route rolling summary: count, p50/p95/max duration, slow_count, last_slow_at
+curl http://localhost:8000/api/perf/routes | jq
+```
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `api/services/route_timing.py` | `RouteTimingMiddleware` and `RouteTimingStore` |
+| `api/routes/perf.py` | Adds `GET /api/perf/routes` to the existing perf router |
+| `config/settings.py` | `slow_request_ms` (`LIFEOS_SLOW_REQUEST_MS`, default 500) |
+| `tests/test_route_timing.py` | Middleware, store, endpoint, overhead, and thread-safety tests |
 
 ---
 
@@ -134,3 +165,4 @@ Services are tracked on-use, not by polling. Status updates when a service is ac
 
 - [Architecture](architecture.md) -- System architecture and code structure
 - [Data & Sync](data-and-sync.md) -- Data pipeline (alerting on sync failures)
+- [API Reference](../product/api-reference.md#get-apiperfroutes) -- `GET /api/perf/routes` request/response shape

@@ -55,6 +55,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends, journal_ingest
 from api.services.log_redaction import configure_telegram_log_redaction
+from api.services.route_timing import RouteTimingMiddleware
 from config.settings import settings
 
 # Configure root logging here, explicitly, rather than leaving it to whatever
@@ -345,6 +346,14 @@ class _ScopedGZipMiddleware:
 # ~2.5ms for 34,311 bytes — nearly half the blocking time on the loop for
 # ~3% more bytes on the wire, a better trade here.
 app.add_middleware(_ScopedGZipMiddleware, minimum_size=1024, compresslevel=6)
+
+# Route timing (#877): added last, which Starlette's middleware stack makes
+# the OUTERMOST of this app's own middleware (each `add_middleware` call
+# wraps *around* everything added before it) -- so its timing and byte
+# count cover the full response, including gzip compression performed by
+# `_ScopedGZipMiddleware` above and any header work CORS does. See
+# api/services/route_timing.py for what is recorded.
+app.add_middleware(RouteTimingMiddleware)
 
 # Include routers
 app.include_router(search.router)

@@ -497,6 +497,12 @@ Aggregate performance stats: avg/p50/p95/max per stage across recent traces.
 - `since` (string, optional): ISO timestamp to filter from
 - `limit` (int): Number of recent traces to aggregate (default: 100)
 
+### GET /api/perf/routes
+
+Rolling per-route request timing summary (#877) -- every HTTP request, not just chat turns. Backed by an in-memory rolling window (last 200 samples per route), process-local, reset on restart. See [Observability](../technical/observability.md#route-timing).
+
+Returns `{"routes": [...], "count": N}`; each row: `method`, `route` (route template, e.g. `/api/crm/people/{person_id}`, never the raw path), `count`, `p50_ms`, `p95_ms`, `max_ms`, `slow_count`, `last_slow_at`. Sorted by `p95_ms` descending.
+
 ---
 
 ## Memories Endpoints
@@ -999,3 +1005,4 @@ Get usage summary with stats for 24h, 7d, 30d, and all-time. Includes daily cost
 - [Client Surfaces](../technical/client-surfaces.md) — HTTP consumers and breaking-change policy
 - [CRM UI](crm-ui.md) — CRM index pointing at the four product sub-specs
 - [Configuration](../../guides/configuration.md) — Env vars referenced by several endpoints (LIFEOS_USER_NAME, LIFEOS_WORK_DOMAIN, etc.)
+- [Observability](../technical/observability.md#route-timing) — How `/api/perf/routes` is populated (`RouteTimingMiddleware`, the slow-request threshold)

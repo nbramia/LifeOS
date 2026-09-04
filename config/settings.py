@@ -311,6 +311,16 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, alias="LIFEOS_PORT")
     host: str = Field(default="0.0.0.0", alias="LIFEOS_HOST")
 
+    # Observability (#877): threshold for the request-timing middleware's
+    # slow-request warning log and the slow_count field in
+    # GET /api/perf/routes. Milliseconds, wall-clock, per request.
+    slow_request_ms: int = Field(
+        default=500,
+        alias="LIFEOS_SLOW_REQUEST_MS",
+        description="Requests slower than this (ms) get one WARNING log "
+                    "line and count toward slow_count in GET /api/perf/routes."
+    )
+
     # Host guard (#506): the ONE machine allowed to run this API server. A
     # second live server elsewhere writes to its own SQLite/Chroma copy that
     # silently diverges from the real one, so clients pointed at the wrong
