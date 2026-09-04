@@ -397,3 +397,22 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
         assert len(labels) == 5
         assert all((label or "").strip() != "?" for label in labels)
         assert errors == []
+
+    def test_panel_routing_badge_says_ask_not_a_model_name(self, page: Page, agents_base_url):
+        """panel.js's routingLabel() gains an `ask` arm (#863) — the side
+        panel's Routing badge must say "Ask", never fall through to the
+        default "Claude"."""
+        _open_agents2(page, agents_base_url)
+        page.locator("#search-input").fill("labeltest-ask")
+        result = page.locator(".search-result", has_text="labeltest-ask")
+        expect(result).to_be_visible()
+        result.click()
+        expect(page.locator("#panel [data-field=\"routing\"]")).to_have_text("Ask")
+
+    def test_panel_routing_badge_says_hermes(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        page.locator("#search-input").fill("labeltest-hermes")
+        result = page.locator(".search-result", has_text="labeltest-hermes")
+        expect(result).to_be_visible()
+        result.click()
+        expect(page.locator("#panel [data-field=\"routing\"]")).to_have_text("Hermes")
