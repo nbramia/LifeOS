@@ -1489,16 +1489,16 @@ class InteractionStore:
 
     def get_julianday(self, dt: datetime) -> float:
         """
-        SQLite's julianday() for a given datetime — for comparing against
-        julian-day-valued timestamps from get_person_julianday_timestamps
-        without reimplementing SQLite's own calendar conversion in Python
-        (and risking a float-precision or algorithm mismatch).
+        Julian day number for a given datetime, computed the same way
+        SQLite's julianday() computes it for a UTC or UTC-offset ISO8601
+        string (days since the Julian epoch, with 1970-01-01T00:00:00Z =
+        2440587.5) — avoids opening a connection to evaluate one scalar
+        (#897 review nit 3). A naive dt is treated as UTC, matching
+        SQLite's own treatment of an offset-less timestamp string.
         """
-        conn = self._get_connection()
-        try:
-            return conn.execute("SELECT julianday(?)", (dt.isoformat(),)).fetchone()[0]
-        finally:
-            conn.close()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (dt - datetime(1970, 1, 1, tzinfo=timezone.utc)).total_seconds() / 86400.0 + 2440587.5
 
     def get_conversation_context(
         self,

@@ -522,7 +522,7 @@ class TestMeFamilyLatency:
             pytest.skip("no family members in database to test with")
         return [m["id"] for m in members[:n]]
 
-    def test_me_interactions_3657_days_under_800ms(self, client):
+    def test_me_interactions_3657_days_under_1200ms(self, client):
         """
         #871's requested bound was 800ms (down from the pre-#871 measured
         6.4s). Reached via #897 review finding 3's proposed path: the
@@ -539,13 +539,19 @@ class TestMeFamilyLatency:
         samples): min 777ms / median 791ms / max 924ms, even on this shared
         dev host under heavy concurrent load from sibling agents (load
         average 11-21 during measurement) — down from 3.9-6.4s before this
-        PR's SQL rewrite. The bound below carries headroom above the
-        observed max for that contention rather than the literal 800ms, so
-        it doesn't flake under this host's own CPU load; tighten it if
-        re-measured consistently lower on a quiet host.
+        PR's SQL rewrite. The 1200ms bound below (and this test's name,
+        renamed per #897's verification-pass review) carries headroom above
+        that observed max for host contention rather than asserting the
+        literal 800ms target, which this test does not enforce; tighten it
+        if re-measured consistently lower on a quiet host. Best-of-5 samples
+        (like TestPeopleLatency's warm-latency tests), rather than this
+        class's usual best-of-3, to further reduce flakiness from transient
+        host-load spikes.
         """
         self._require_large_dataset()
-        elapsed = self._warm_latency_ms(client, "/api/crm/me/interactions?days_back=3657")
+        elapsed = self._warm_latency_ms(
+            client, "/api/crm/me/interactions?days_back=3657", samples=5
+        )
         assert elapsed < 1200
 
     def test_me_timeline_under_300ms(self, client):
