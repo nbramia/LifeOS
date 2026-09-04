@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-08-26
+> **Last Updated:** 2026-09-04
 
 LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that submit text and consume SSE without importing LifeOS Python modules. Endpoint and event **shapes** are defined in [api-reference.md](../product/api-reference.md); this doc covers **who consumes them**, **whisper-relay integration**, and **breaking-change policy**.
 
@@ -17,6 +17,8 @@ LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that subm
 | **whisper-relay** | Separate app → HTTP (voice transport API) | Server-side only: `POST /api/ask/stream`, handoff — via `src/voice_gateway/adapters/lifeos.py`; no browser UI after #21 |
 | **Voice (web)** | Browser → LifeOS reverse-proxy → whisper-relay | LifeOS `/chat` + `web/chat/voice.js`; proxies `/api/voice/*` — `api/routes/voice.py` |
 | MCP / Managed Agents | stdio or HTTP MCP | Tool catalog only — `mcp_server.py` |
+
+**Response compression (#874).** `api/main.py` applies `GZipMiddleware` scoped to `/api/crm/*` and `/api/people/*` only (`minimum_size=1024`), not app-wide. No SSE route documented on this page lives under either prefix, so every stream above stays uncompressed and unbuffered by construction — there is no exclusion list to maintain, and no gzip-vs-streaming interaction for a future endpoint to worry about unless it's added under one of those two prefixes.
 
 ---
 

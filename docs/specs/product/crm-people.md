@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-06-21
+**Last Updated:** 2026-09-04
 
 People management: the list and detail views at `/crm`, the contact-source model behind entity splitting/merging, the relationship-strength score that drives ranking and Dunbar circles, and the multi-stage fact-extraction pipeline that surfaces memorable personal details.
 
@@ -181,7 +181,7 @@ Main CRM page at `/crm`.
 
 Behavior:
 - Header shows total people count.
-- Real-time search (< 300 ms).
+- Real-time search (< 300 ms), debounced; a superseded query's response is discarded so the list always reflects what's currently typed, even if an earlier search's response arrives later (#874).
 - Category tabs (Work / Personal / Family).
 - Cards show avatar, name, company/category, interaction count, strength bar.
 - Cards sorted by relationship strength by default.

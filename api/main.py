@@ -37,15 +37,19 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
+import hashlib
 import logging
+import os
 import socket
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from email.utils import formatdate
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
+from starlette.middleware.gzip import GZipMiddleware
 
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -290,6 +294,39 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Gzip: scoped to the CRM/people JSON endpoints (#874) rather than applied
+# app-wide with an exclusion for streaming routes. A 300-person list is
+# ~216 KB and a person's full timeline ~620 KB, which matters on Tailscale
+# from a phone; those payloads live under /api/crm and /api/people.
+#
+# Scoping by an *allow*-list of path prefixes, instead of wrapping every
+# route in GZipMiddleware and trying to except the chat/agents/conversations
+# SSE endpoints by content-type, keeps `text/event-stream` responses out of
+# the gzip encoder by construction: Starlette's GZipMiddleware buffers each
+# chunk through a `gzip.GzipFile` before it can flush, which turns
+# token-by-token streaming into delayed, chunky output. None of the SSE
+# routes live under /api/crm or /api/people, so this scoping is sufficient
+# on its own — no separate exclusion list is needed.
+_GZIP_PATH_PREFIXES = ("/api/crm", "/api/people")
+
+
+class _ScopedGZipMiddleware:
+    """Apply `GZipMiddleware` only to requests under `_GZIP_PATH_PREFIXES`."""
+
+    def __init__(self, app, minimum_size: int = 1024) -> None:
+        self.app = app
+        self._gzip_app = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith(_GZIP_PATH_PREFIXES):
+            await self._gzip_app(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
+
+
+app.add_middleware(_ScopedGZipMiddleware, minimum_size=1024)
 
 # Include routers
 app.include_router(search.router)
@@ -909,13 +946,43 @@ async def chat_page():
     return {"message": "Chat page not found"}
 
 
-@app.get("/crm")
-async def crm_page():
-    """Serve the CRM UI."""
+_CRM_CACHE_CONTROL = "max-age=60, must-revalidate"
+
+
+def _crm_file_response(request: Request) -> Response:
+    """Serve `web/crm.html` with a short revalidation cache lifetime.
+
+    `FileResponse` on its own computes an ETag from the file's mtime/size but
+    never checks it against the request's `If-None-Match`, so every
+    navigation between Me/Family/Birthdays/a person page re-sent the full
+    ~750 KB page. This replicates Starlette's own ETag algorithm so the
+    header matches what `FileResponse` would have sent, and answers with a
+    bodyless 304 when the client's cached copy is still current.
+    """
     crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    if not crm_path.exists():
+        return JSONResponse({"message": "CRM page not found"}, status_code=404)
+
+    stat_result = os.stat(crm_path)
+    etag_base = f"{stat_result.st_mtime}-{stat_result.st_size}"
+    etag = f'"{hashlib.md5(etag_base.encode(), usedforsecurity=False).hexdigest()}"'
+    headers = {
+        "Cache-Control": _CRM_CACHE_CONTROL,
+        "ETag": etag,
+        "Last-Modified": formatdate(stat_result.st_mtime, usegmt=True),
+    }
+
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match and etag in (tag.strip() for tag in if_none_match.split(",")):
+        return Response(status_code=304, headers=headers)
+
+    return FileResponse(str(crm_path), stat_result=stat_result, headers=headers)
+
+
+@app.get("/crm")
+async def crm_page(request: Request):
+    """Serve the CRM UI."""
+    return _crm_file_response(request)
 
 
 @app.get("/agents")
@@ -947,81 +1014,54 @@ async def journal_trends_page():
 
 
 @app.get("/crm/{path:path}")
-async def crm_page_with_path(path: str):
+async def crm_page_with_path(request: Request, path: str):
     """Serve the CRM UI for any sub-path (client-side routing)."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/me")
-async def me_page():
+async def me_page(request: Request):
     """Serve the CRM UI for the 'Me' dashboard (owner's profile)."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/me/{path:path}")
-async def me_page_with_path(path: str):
+async def me_page_with_path(request: Request, path: str):
     """Serve the CRM UI for 'Me' sub-paths (client-side routing)."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/family")
-async def family_page():
+async def family_page(request: Request):
     """Serve the CRM UI for the Family dashboard."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/family/{path:path}")
-async def family_page_with_path(path: str):
+async def family_page_with_path(request: Request, path: str):
     """Serve the CRM UI for Family sub-paths (client-side routing)."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/relationship")
-async def relationship_page():
+async def relationship_page(request: Request):
     """Serve the CRM UI for the Relationship dashboard."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/relationship/{path:path}")
-async def relationship_page_with_path(path: str):
+async def relationship_page_with_path(request: Request, path: str):
     """Serve the CRM UI for Relationship sub-paths (client-side routing)."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/birthdays")
-async def birthdays_page():
+async def birthdays_page(request: Request):
     """Serve the CRM UI for the Birthdays page."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)
 
 
 @app.get("/birthdays/{path:path}")
-async def birthdays_page_with_path(path: str):
+async def birthdays_page_with_path(request: Request, path: str):
     """Serve the CRM UI for Birthdays sub-paths (client-side routing)."""
-    crm_path = Path(__file__).parent.parent / "web" / "crm.html"
-    if crm_path.exists():
-        return FileResponse(str(crm_path))
-    return {"message": "CRM page not found"}
+    return _crm_file_response(request)

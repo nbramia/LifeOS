@@ -8647,6 +8647,9 @@
         let people = [];
         let selectedPersonId = null;
         let searchQuery = '';
+        // AbortController for the in-flight people search, so a slower
+        // earlier response can't overwrite a newer query's results (#874).
+        let currentPeopleSearchController = null;
         // People list filters (multi-select)
         let peopleCategoryFilters = new Set(['self', 'family', 'personal']);  // Work excluded by default
         let peopleDunbarFilters = new Set(['0', '1', '2', '3', '4', '5', '6+']);
@@ -8655,7 +8658,6 @@
         let selectedForMerge = new Set();  // IDs selected for merge
         let mergePrimaryId = null;  // Primary person for merge
         let dunbarCircleMap = new Map();  // Map person ID to Dunbar circle
-        let dunbarCirclesInitialized = false;  // Track if global circles have been calculated
         let meInteractionsCache = null;  // Cache for "Me" page interactions
         let meInteractionsCacheYears = null; // Track which years setting the cache was loaded for
         // Config loaded from API
@@ -8985,30 +8987,6 @@
             }
         }
 
-        // Initialize Dunbar circles globally (called once on page load with ALL people)
-        async function initializeDunbarCircles() {
-            if (dunbarCirclesInitialized) return;
-
-            try {
-                // Fetch ALL people sorted by strength to calculate global circles
-                const data = await api('/people?sort=strength&limit=10000');
-                const allPeople = data.people || [];
-
-                console.log(`[Dunbar] Initializing with ${allPeople.length} people`);
-
-                if (allPeople.length === 0) {
-                    console.warn('[Dunbar] No people returned from API');
-                    return;
-                }
-
-                calculateAndStoreDunbarCircles(allPeople);
-                dunbarCirclesInitialized = true;
-                console.log(`[Dunbar] Initialized map with ${dunbarCircleMap.size} entries`);
-            } catch (error) {
-                console.error('[Dunbar] Failed to initialize:', error);
-            }
-        }
-
         // Calculate Dunbar circles from a list of people and store in global map
         function calculateAndStoreDunbarCircles(peopleList) {
             // Sort by relationship strength descending
@@ -9090,6 +9068,11 @@
         }
 
         // API helpers
+        // Pass { signal: abortController.signal } in `options` to make a call
+        // cancellable; a cancelled call rejects with a DOMException named
+        // "AbortError" (thrown by fetch() itself, before the response is
+        // ever inspected) that callers should treat as "superseded", not
+        // as a failure to report.
         async function api(path, options = {}) {
             const response = await fetch(`/api/crm${path}`, {
                 headers: { 'Content-Type': 'application/json' },
@@ -9335,6 +9318,17 @@
         async function loadPeople() {
             const listEl = document.getElementById('peopleList');
 
+            // Cancel whatever search is still in flight (if any) so its
+            // response — cached or not — can never land after this one and
+            // overwrite it. This also covers the cache-hit path below: it
+            // "wins" immediately, so nothing from a still-running earlier
+            // call should be allowed to render or cache over it afterward.
+            if (currentPeopleSearchController) {
+                currentPeopleSearchController.abort();
+            }
+            const searchController = new AbortController();
+            currentPeopleSearchController = searchController;
+
             // Build cache key from search query and dunbar filters
             const cacheKey = getSearchCacheKey(searchQuery, peopleDunbarFilters, peopleTagFilters);
             const cached = getCachedSearch(cacheKey);
@@ -9389,10 +9383,20 @@
                         params.set('tags', [...peopleTagFilters].join(','));
                         params.set('limit', '1000');  // Increase limit for tag filtering
                     }
-                    return api(`/people?${params}`);
+                    return api(`/people?${params}`, { signal: searchController.signal });
                 });
 
                 const results = await Promise.all(fetchPromises);
+
+                // A newer search may have started (and possibly already
+                // resolved from cache) while these requests were in flight.
+                // Abort() stops the network fetch when it's still pending,
+                // but if this one had already reached the browser before
+                // being superseded, abort() is a no-op — so check identity
+                // too and drop the response rather than render or cache it.
+                if (searchController.signal.aborted || currentPeopleSearchController !== searchController) {
+                    return;
+                }
 
                 // Merge and deduplicate results by person ID
                 const seenIds = new Set();
@@ -9421,6 +9425,10 @@
                 });
                 renderPeopleList();
             } catch (error) {
+                if (error.name === 'AbortError') {
+                    // Superseded by a newer search; nothing to report.
+                    return;
+                }
                 console.error('Failed to load people:', error);
                 listEl.innerHTML = '<div class="empty-state"><div class="empty-state-icon">⚠️</div><p>Failed to load people</p></div>';
             }
@@ -10077,7 +10085,10 @@
             // Check cache first - render immediately if available
             const cachedPerson = getCachedPerson(personId);
             if (cachedPerson) {
-                // Instant render from cache
+                // Instant render from cache. The cached object already
+                // carries source entities/relationships (it was populated
+                // from an include_related=true fetch), so this alone
+                // renders everything renderPersonDetail knows how to show.
                 renderPersonDetail(cachedPerson);
 
                 // Load data for the active tab
@@ -10088,8 +10099,8 @@
                     loadGraph(personId);
                 }
 
-                // Background refresh: fetch fresh data to update cache
-                api(`/people/${personId}`).then(person => {
+                // Background refresh: one fetch (with related data) to update the cache
+                api(`/people/${personId}?include_related=true`).then(person => {
                     if (selectedPersonId === personId) {
                         setCachedPerson(personId, person);
                         // Only re-render if data changed (compare key fields)
@@ -10099,7 +10110,6 @@
                     }
                 }).catch(err => console.warn('[Cache] Background refresh failed:', err));
 
-                loadRelatedData(personId);
                 return;
             }
 
@@ -10107,13 +10117,11 @@
             showPersonLoadingSkeleton();
 
             try {
-                // First: Load basic person data (fast, no related data)
-                const person = await api(`/people/${personId}`);
+                // Single fetch: person detail plus related data (source
+                // entities, relationships) in one round trip (#874).
+                const person = await api(`/people/${personId}?include_related=true`);
                 setCachedPerson(personId, person);
                 renderPersonDetail(person);
-
-                // Background: Load related data (source entities, relationships)
-                loadRelatedData(personId);
 
                 // Load data for the active tab
                 const activeTab = stayOnCurrentTab ? currentTab : document.querySelector('.tab.active')?.dataset.tab;
@@ -10262,18 +10270,6 @@
             // Called implicitly when renderPersonDetail populates the fields
         }
 
-        // Load related data in background (source entities, relationships)
-        async function loadRelatedData(personId) {
-            try {
-                const person = await api(`/people/${personId}?include_related=true`);
-                // Update source entities if still on same person
-                if (selectedPersonId === personId) {
-                    updateSourceEntities(person.source_entities || [], person.source_entity_count || 0);
-                }
-            } catch (error) {
-                console.error('Failed to load related data:', error);
-            }
-        }
 
         // Update source entities section
         function updateSourceEntities(sourceEntities, count) {
@@ -10480,14 +10476,17 @@
             document.getElementById('notesSaveBtn').style.display = 'none';
             document.getElementById('notesUnsavedIndicator').style.display = 'none';
 
-            // Source entities - show count if available, loading state for list
-            // (full list is loaded in background by loadRelatedData)
+            // Source entities - show count if available, loading state for list.
+            // loadPersonDetail always fetches with include_related=true, so
+            // person.source_entities is normally already present here; the
+            // branches below are a defensive fallback for a caller that
+            // doesn't.
             const sourceEntityCount = person.source_entity_count || 0;
             document.getElementById('sourceEntitiesCount').textContent = sourceEntityCount.toLocaleString();
             const listEl = document.getElementById('sourceEntitiesList');
 
-            // If source_entities included (from include_related=true), render them
-            // Otherwise show loading state - they'll be loaded by loadRelatedData
+            // If source_entities included (from include_related=true), render them.
+            // Otherwise show a loading state.
             if (person.source_entities && person.source_entities.length > 0) {
                 updateSourceEntities(person.source_entities, sourceEntityCount);
             } else if (sourceEntityCount > 0) {
