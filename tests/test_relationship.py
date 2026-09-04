@@ -394,6 +394,32 @@ class TestGetTopNeighbors:
         finally:
             conn.close()
 
+    def test_only_hydrates_up_to_limit_relationships(self, store, monkeypatch):
+        """The ranking and LIMIT happen in SQL, so from_row() is called at
+        most `limit` times -- not once per relationship touching the
+        person. An earlier version of this method fetched every
+        relationship for the person via get_all_for_person() and ranked in
+        Python, which fixed the tiebreak but turned a bounded fetch into an
+        unbounded one on the network-graph endpoint's hottest path (#896
+        review round 3, BLOCKER 2: measured at ~39,600 Relationship
+        constructions for one real request, ~0.356s of a 0.549s response)."""
+        for i in range(50):
+            store.add(Relationship(person_a_id="center", person_b_id=f"p{i}", shared_events_count=i))
+
+        original_from_row = Relationship.from_row.__func__
+        calls = []
+
+        def _counting_from_row(cls, row):
+            calls.append(1)
+            return original_from_row(cls, row)
+
+        monkeypatch.setattr(Relationship, "from_row", classmethod(_counting_from_row))
+
+        neighbors = store.get_top_neighbors("center", limit=5)
+
+        assert len(neighbors) == 5
+        assert len(calls) == 5, f"expected exactly 5 Relationship.from_row() calls, got {len(calls)}"
+
 
 class TestGetAllForPerson:
     """Tests for RelationshipStore.get_all_for_person() (#896 review finding 5/10)."""

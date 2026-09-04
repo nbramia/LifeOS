@@ -75,7 +75,17 @@ class _FakeRelationshipStore:
         )
 
 
-def _call_network_graph(person_store, rel_store, **overrides):
+class _FakeSourceEntityStore:
+    """Stands in for SourceEntityStore's batched category lookup."""
+
+    def __init__(self, sources_by_id: dict | None = None):
+        self._sources_by_id = sources_by_id or {}
+
+    def get_for_people_batch(self, canonical_person_ids, limit_per_person=50):
+        return {cid: self._sources_by_id.get(cid, []) for cid in canonical_person_ids}
+
+
+def _call_network_graph(person_store, rel_store, source_store=None, **overrides):
     """Call get_network_graph() directly with patched stores and sensible
     defaults for the query params it would otherwise get from FastAPI's
     Query(...) declarations."""
@@ -89,7 +99,8 @@ def _call_network_graph(person_store, rel_store, **overrides):
     kwargs.update(overrides)
 
     with patch("api.routes.crm.get_person_entity_store", return_value=person_store), \
-            patch("api.routes.crm.get_relationship_store", return_value=rel_store):
+            patch("api.routes.crm.get_relationship_store", return_value=rel_store), \
+            patch("api.routes.crm.get_source_entity_store", return_value=source_store or _FakeSourceEntityStore()):
         return get_network_graph(**kwargs)
 
 
@@ -342,3 +353,125 @@ class TestMaxEdgesAlwaysIncludesCentreEdges:
         edge_pairs = {frozenset((e.source, e.target)) for e in result.edges}
         assert frozenset(("a", "c")) in edge_pairs  # the stronger one
         assert frozenset(("a", "b")) not in edge_pairs  # the weaker one, dropped
+
+
+class TestCentreEdgeSkippedWhenCentreFiltered:
+    """#896 review round 3, MAJOR finding 3: emitting centre edges
+    unconditionally after only checking the OTHER endpoint broke edge
+    closure whenever the centre itself didn't survive the category/
+    min_strength filter."""
+
+    def test_no_edge_names_the_filtered_out_centre(self, monkeypatch):
+        monkeypatch.setattr(settings, "my_person_id", "nobody")
+
+        # Centre has no work signal at all -> categorised "personal" and
+        # will be filtered out by category="work" below. The first-degree
+        # candidate has a "work" signal (slack) so it survives selection.
+        center = PersonEntity(id="center", canonical_name="Center")
+        first = PersonEntity(id="first", canonical_name="First", sources=["slack"])
+
+        center_rels = [Relationship(person_a_id="center", person_b_id="first", shared_events_count=5)]
+
+        person_store = _FakePersonStore(people_by_id={"center": center, "first": first})
+        rel_store = _FakeRelationshipStore(center_rels=center_rels)
+
+        result = _call_network_graph(
+            person_store, rel_store, depth=1, max_nodes=150, category="work",
+        )
+
+        node_ids = {n.id for n in result.nodes}
+        assert "center" not in node_ids  # filtered out, as intended
+        assert "first" in node_ids
+
+        for edge in result.edges:
+            assert edge.source in node_ids
+            assert edge.target in node_ids
+        assert not any("center" in (e.source, e.target) for e in result.edges)
+
+
+class TestDegreeRelabeling:
+    """#896 review round 3, MINOR finding 4: a node with a genuine direct
+    relationship to the centre must be labeled degree 1 (and get its centre
+    edge) even if the first-degree budget cut it and it was only
+    re-discovered through a friend -- `degree` must mean "has a direct edge
+    to the centre," not "was found in the first selection pass."""
+
+    def test_direct_neighbor_that_missed_the_cut_is_relabeled_degree_one(self, monkeypatch):
+        monkeypatch.setattr(settings, "my_person_id", "nobody")
+
+        people = {"center": PersonEntity(id="center", canonical_name="Center")}
+        center_rels = []
+        # 8 genuine direct candidates; max_nodes=10 with depth>=2 caps
+        # first-degree at 75% = 7, so the weakest ("missed") gets excluded
+        # from the first pass despite having a real edge to the centre.
+        for i in range(8):
+            pid = f"first{i}" if i < 7 else "missed"
+            people[pid] = PersonEntity(id=pid, canonical_name=pid)
+            # Descending strength: first0 strongest, "missed" weakest.
+            center_rels.append(Relationship(
+                person_a_id="center", person_b_id=pid, shared_events_count=20 - i,
+            ))
+
+        # first0 (the strongest, definitely selected) is also directly
+        # connected to "missed" - this is how "missed" gets re-discovered
+        # as a second-degree candidate.
+        friend_rel = Relationship(person_a_id="first0", person_b_id="missed", shared_events_count=3)
+
+        person_store = _FakePersonStore(people_by_id=people)
+        rel_store = _FakeRelationshipStore(
+            center_rels=center_rels,
+            neighbor_rels_by_id={"first0": [friend_rel]},
+        )
+
+        result = _call_network_graph(
+            person_store, rel_store, depth=2, max_nodes=10, max_second_degree_per_node=5,
+        )
+
+        missed_node = next(n for n in result.nodes if n.id == "missed")
+        assert missed_node.degree == 1
+
+        edge_pairs = {frozenset((e.source, e.target)) for e in result.edges}
+        assert frozenset(("center", "missed")) in edge_pairs
+
+
+class TestCategoryPredicateConsistency:
+    """#896 review round 3, MINOR finding 5: selection used
+    compute_person_category() with batched source entities, while the
+    node-building filter re-checked with a different (raw attribute)
+    predicate -- a candidate could be selected under one decision and then
+    dropped under another. Fixed by having the node-building filter trust
+    an id already confirmed during selection instead of re-deriving a
+    possibly different answer."""
+
+    def test_candidate_confirmed_via_batched_sources_is_not_dropped_by_the_cheap_check(self, monkeypatch):
+        from api.services.source_entity import SourceEntity
+
+        monkeypatch.setattr(settings, "my_person_id", "nobody")
+
+        # No email/sources signal of its own -- compute_person_category(p, [])
+        # (the cheap check) would call this "personal." Only the batched
+        # source-entity fetch (a Slack source entity) reveals "work."
+        candidate = PersonEntity(id="candidate", canonical_name="Candidate")
+        center = PersonEntity(id="center", canonical_name="Center")
+
+        center_rels = [Relationship(person_a_id="center", person_b_id="candidate", shared_events_count=5)]
+
+        person_store = _FakePersonStore(people_by_id={"center": center, "candidate": candidate})
+        rel_store = _FakeRelationshipStore(center_rels=center_rels)
+        source_store = _FakeSourceEntityStore(
+            sources_by_id={"candidate": [SourceEntity(source_type="slack")]}
+        )
+
+        # Sanity: the cheap and batched computations really do disagree for
+        # this fixture, or the test proves nothing.
+        from api.services.person_entity import compute_person_category
+        assert compute_person_category(candidate, []) != "work"
+        assert compute_person_category(candidate, [SourceEntity(source_type="slack")]) == "work"
+
+        result = _call_network_graph(
+            person_store, rel_store, source_store=source_store,
+            depth=1, max_nodes=150, category="work",
+        )
+
+        node_ids = {n.id for n in result.nodes}
+        assert "candidate" in node_ids

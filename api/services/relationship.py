@@ -8,6 +8,7 @@ Relationships are discovered by analyzing shared contexts:
 - Co-mentions in notes
 """
 import sqlite3
+import contextlib
 import json
 import threading
 import uuid
@@ -27,6 +28,19 @@ TYPE_COWORKER = "coworker"
 TYPE_FRIEND = "friend"
 TYPE_FAMILY = "family"
 TYPE_INFERRED = "inferred"  # Discovered through shared contexts
+
+# Explicit column list matching Relationship.from_row()'s expected positional
+# order (see its "Row order" comment). Named rather than `SELECT *` so a
+# query using it doesn't silently depend on the table's physical column
+# order, and doesn't couple to a query adding its own extra columns
+# (#896 review finding 10 / round 3 blocker 2).
+_RELATIONSHIP_COLUMNS = (
+    "id, person_a_id, person_b_id, relationship_type, shared_contexts, "
+    "shared_events_count, shared_threads_count, first_seen_together, "
+    "last_seen_together, created_at, updated_at, shared_messages_count, "
+    "shared_whatsapp_count, shared_slack_count, is_linkedin_connection, "
+    "shared_phone_calls_count, shared_photos_count"
+)
 
 
 @dataclass
@@ -841,15 +855,33 @@ class RelationshipStore:
         """
         Get a person's strongest relationships without scanning the full table.
 
-        Fetches every relationship touching person_id via `get_all_for_person()`
-        (indexed, not a full-table scan) and ranks that small set in Python by
-        the sum of the shared-interaction count columns as a cheap proxy for
-        relationship strength, with the relationship id as a deterministic
-        tiebreak (#896 review finding 9). This proxy is NOT the same as
-        `Relationship.pair_strength` / `edge_weight` (which factor in recency
-        and diversity too) — it's a server-side ranking heuristic for picking
-        which neighbors to include in a bounded graph; the real strength
-        formula is still used for the edges actually returned.
+        Ranks and limits in SQL: an indexed WHERE (person_a_id/person_b_id)
+        narrows to this person's own rows, `ORDER BY <shared-interaction
+        count sum> DESC, id LIMIT ?` picks the top `limit` with a
+        deterministic tiebreak, and only those rows are ever hydrated into
+        `Relationship` objects. This proxy is NOT the same as
+        `Relationship.pair_strength` / `edge_weight` (which factor in
+        recency and diversity too) — it's a server-side ranking heuristic
+        for picking which neighbors to include in a bounded graph; the real
+        strength formula is still used for the edges actually returned.
+
+        An earlier version of this method fetched every relationship for
+        person_id via `get_all_for_person()` and ranked/limited in Python.
+        That fixed the tiebreak and removed a positional-`SELECT *`-plus-
+        computed-column coupling, but turned a bounded fetch into an
+        unbounded one on the hottest path in the network-graph endpoint's
+        selection loop: for a person with hundreds of relationships of
+        their own (a first-degree node during second-degree expansion,
+        not just the center), every one of those rows was hydrated just to
+        keep the top handful. Measured (#896 review round 3): 48
+        `get_top_neighbors` calls for one request pulled ~39,600
+        `Relationship.from_row()` constructions total, at ~9µs each
+        (JSON-decoding `shared_contexts` plus four `fromisoformat` calls) —
+        0.356s of a 0.549s request. Ranking and limiting in SQL again (with
+        an explicit column list, never `SELECT *`, so there's still no
+        positional coupling to a computed or reordered column) keeps both
+        of that version's fixes while hydrating only the rows actually
+        returned.
 
         Args:
             person_id: Canonical person ID
@@ -864,9 +896,25 @@ class RelationshipStore:
         if limit <= 0:
             return []
 
-        rels = self.get_all_for_person(person_id, conn=conn)
-        rels.sort(key=lambda r: (-r.total_shared_interactions, r.id))
-        return rels[:limit]
+        owns_conn = conn is None
+        if owns_conn:
+            conn = self._get_connection()
+        try:
+            cursor = conn.execute(f"""
+                SELECT {_RELATIONSHIP_COLUMNS}
+                FROM relationships
+                WHERE person_a_id = ? OR person_b_id = ?
+                ORDER BY (
+                    shared_events_count + shared_threads_count + shared_messages_count +
+                    shared_whatsapp_count + shared_slack_count + shared_phone_calls_count +
+                    shared_photos_count
+                ) DESC, id
+                LIMIT ?
+            """, (person_id, person_id, limit))
+            return [Relationship.from_row(row) for row in cursor.fetchall()]
+        finally:
+            if owns_conn:
+                conn.close()
 
     def get_edges_among(
         self, person_ids, conn: Optional[sqlite3.Connection] = None
@@ -926,7 +974,11 @@ class RelationshipStore:
                 results.append(rel)
             return results
         finally:
-            conn.execute("DROP TABLE IF EXISTS _network_edge_ids")
+            # If the connection is already in a bad state, letting this
+            # raise would mask whatever exception got us into `finally` in
+            # the first place (#896 review round 3 finding 6).
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("DROP TABLE IF EXISTS _network_edge_ids")
             if owns_conn:
                 conn.close()
 

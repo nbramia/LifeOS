@@ -95,11 +95,15 @@ D3-based force-directed graph that renders the selected person's network.
 `GET /api/crm/network?center_on=<id>` (used by the Graph tab) never loads
 every relationship. Node selection:
 
-1. The center person (degree 0). If the center is hidden, it (and anything
-   reachable only through it) is dropped from the response the same way a
-   hidden person is dropped anywhere else in the CRM — the response can end
-   up with zero nodes if the hidden person also has no real relationships,
-   but that isn't guaranteed for every hidden person.
+1. The center person (degree 0), resolved to its canonical id first — a
+   merged/legacy `center_on` id still resolves to the surviving person.
+   The center is always present in the response *unless it is hidden*, in
+   which case it (and anything reachable only through it) is dropped the
+   same way a hidden person is dropped anywhere else in the CRM — the
+   response can end up with zero nodes if the hidden person also has no
+   real relationships, but that isn't guaranteed for every hidden person.
+   If the center is filtered out this way, edges naming it are omitted too
+   (see Edge selection below).
 2. The center's strongest first-degree connections (degree 1) — up to
    `max_nodes - 1` when `depth=1`, or up to 75% of `max_nodes` when
    `depth >= 2` (see the next point for why). Ranked by the same value the
@@ -114,7 +118,11 @@ every relationship. Node selection:
    proxy, until `max_nodes` is reached. First-degree selection reserving
    ~25% of the budget for this tier (rather than consuming the whole budget
    itself) is what makes second-degree nodes actually appear for a
-   well-connected center.
+   well-connected center. A node that has a genuine direct relationship to
+   the center but missed the first-degree cut, and is then re-discovered
+   through a friend, is relabeled `degree: 1` (and given its own center
+   edge) rather than being shown as second-degree — `degree` always means
+   "has a direct edge to the center," not "was found in the first pass."
 
 A relationship row referencing a legacy (merged-away) person id is resolved
 to its canonical id before any of this ranking or de-duplication, so a
@@ -123,23 +131,36 @@ first-degree node with no edge back to the center.
 
 Edge selection: every edge connecting the center to a first-degree node is
 always included, regardless of `max_edges` — this is what guarantees every
-first-degree node has an edge to the center. The remaining edge budget
-(`max_edges` minus those center edges) is filled with the strongest
-remaining edges among the selected nodes, by the same rendered edge weight.
-Without this cap, the induced subgraph among a well-connected center's
-neighbors is close to complete (up to `max_nodes` choose 2 edges) — capping
-it means the strength slider's bottom end may show fewer inter-node edges
-than an uncapped response would have.
+first-degree node has an edge to the center — except when the center itself
+was dropped by the `category`/`min_strength` filters below, in which case no
+center edges are emitted (there is no center node left for them to connect
+to). The remaining edge budget (`max_edges` minus those center edges) is
+filled with the strongest remaining edges among the selected nodes, by the
+same rendered edge weight. Without this cap, the induced subgraph among a
+well-connected center's neighbors is close to complete (up to `max_nodes`
+choose 2 edges) — capping it means the strength slider's bottom end may
+show fewer inter-node edges than an uncapped response would have.
 
 `category`, if set, is applied during first-degree selection over a window
 of the 3×`max_nodes` strongest candidates (categories computed via the same
 batched source-entity lookup `GET /people` uses), then the top slots are
 taken from the survivors — best-effort: a category concentrated outside
 that window is under-represented in the result. Deeper-hop candidates use a
-cheaper per-person category check with no batched fetch. `min_strength` is
+cheaper per-person category check with no batched fetch. Every node's
+`category` field, and whether it survives this filter, both come from the
+same computation for that node (either the batched one during selection, or
+the cheap one otherwise) — an id is never selected under one category
+decision and then dropped, or kept, under a different one. `min_strength` is
 applied to already-selected nodes exactly as it always was — note it's
 currently a no-op in practice regardless of value, since it's validated to
 0.0–1.0 while `relationship_strength` is on a 0–100 scale.
+
+The Graph tab's own auto-selected strength-slider threshold
+(`calculateOptimalEdgeThreshold`) never picks a threshold that would hide
+every first-degree node, and returns 0 outright when every first-degree
+edge shares one weight (there's no discriminating threshold to pick in that
+case) — without this, bounding the edge set could put a real person's
+graph in a state where it rendered nothing at all on first load.
 
 Query parameters:
 

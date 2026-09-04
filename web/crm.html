@@ -16891,6 +16891,14 @@
             const weights = firstDegreeEdges.map(l => l.weight);
             const maxWeight = weights.reduce((a, b) => Math.max(a, b), 1);
             const minWeight = weights.reduce((a, b) => Math.min(a, b), Infinity);
+
+            // Every first-degree edge shares one weight - there's no
+            // discriminating threshold to pick, and forcing a minimum
+            // weightRange of 1 below would make even a 5% step exclude
+            // every edge (weight >= minWeight + 0.05), blanking the whole
+            // tab (#896 review round 3 finding 1).
+            if (maxWeight === minWeight) return 0;
+
             const weightRange = Math.max(1, maxWeight - minWeight);
 
             // Count first-degree nodes (excluding center)
@@ -16921,6 +16929,12 @@
                 });
 
                 const nodeCount = visibleNodes.size;
+
+                // Never pick a threshold that hides every first-degree
+                // node - being closer to the target count is worthless if
+                // the tab ends up blank (#896 review round 3 finding 1).
+                if (nodeCount === 0) break;
+
                 const diff = Math.abs(nodeCount - targetNodeCount);
 
                 if (diff < bestDiff) {

@@ -2671,6 +2671,13 @@ def get_network_graph(
         center_person = person_store.get_by_id(center_on)
         if not center_person:
             raise HTTPException(status_code=404, detail=f"Person '{center_on}' not found")
+        # A merged/legacy center id resolves to the surviving canonical
+        # person (get_by_id() above already followed the merge chain to
+        # fetch it) - without this, `all_people_dict` (canonical-keyed)
+        # never has an entry for the raw requested id, so the center
+        # silently drops out of the response even though it "exists"
+        # (#896 review round 3, not-verified note).
+        center_on = center_person.id
 
         # Exclude the CRM owner from 2nd+ degree traversal since they're
         # connected to everyone and would pollute the graph.
@@ -2678,6 +2685,14 @@ def get_network_graph(
 
         node_degrees[center_on] = 0
         frontier: list[str] = []
+        # Ids whose category match was already confirmed during selection
+        # (via compute_person_category, possibly with batched source
+        # entities) - the node-building filter below trusts these instead
+        # of re-checking with a cheaper/different computation, which is
+        # what let a node be selected under one category decision and then
+        # dropped (or kept) under a different one (#896 review round 3
+        # finding 5).
+        category_confirmed_ids: set[str] = set()
 
         # depth == 1 has no deeper tier, so first-degree gets the full
         # remaining budget; depth >= 2 reserves ~25% of max_nodes for
@@ -2687,6 +2702,17 @@ def get_network_graph(
         if max_nodes > 1:
             first_degree_limit = (max_nodes - 1) if depth < 2 else max(1, int(max_nodes * 0.75))
 
+        # Every one of the center's own direct relationships, canonicalised
+        # and de-duped (kept regardless of whether it makes the
+        # first_degree_limit cut) - used both to rank first-degree
+        # candidates and, after selection, to relabel any node that has a
+        # genuine direct center relationship as degree 1 even if it was
+        # only re-discovered through a friend (#896 review round 3
+        # finding 4: capping first-degree selection means a real direct
+        # connection can miss the cut and re-enter as a "second-degree"
+        # node, which is misleading and makes the degree filter lie).
+        all_direct_candidates: dict[str, Relationship] = {}
+
         with contextlib.closing(rel_store.open_connection()) as conn:
             if first_degree_limit > 0:
                 raw_rels = rel_store.get_all_for_person(center_on, conn=conn)
@@ -2694,7 +2720,6 @@ def get_network_graph(
                 # Canonicalise every neighbor id and de-dup, keeping the
                 # higher-weight relationship row when more than one raw row
                 # resolves to the same canonical id (#896 finding 1).
-                candidates: dict[str, Relationship] = {}
                 for rel in raw_rels:
                     other_raw = rel.other_person(center_on)
                     if not other_raw:
@@ -2703,19 +2728,19 @@ def get_network_graph(
                     if other_canonical == center_on:
                         continue  # self-loop after a merge
                     weight = _rendered_edge_weight(rel, center_on, other_canonical, my_person_id, all_people_dict)
-                    existing = candidates.get(other_canonical)
+                    existing = all_direct_candidates.get(other_canonical)
                     if existing is not None:
                         existing_weight = _rendered_edge_weight(
                             existing, center_on, other_canonical, my_person_id, all_people_dict
                         )
                         if weight <= existing_weight:
                             continue
-                    candidates[other_canonical] = rel
+                    all_direct_candidates[other_canonical] = rel
 
                 # Rank by the real rendered edge weight (not a proxy),
                 # deterministic tiebreak by canonical id (#896 finding 5/9).
                 ranked = sorted(
-                    candidates.items(),
+                    all_direct_candidates.items(),
                     key=lambda kv: (
                         -_rendered_edge_weight(kv[1], center_on, kv[0], my_person_id, all_people_dict),
                         kv[0],
@@ -2727,17 +2752,23 @@ def get_network_graph(
                     # candidates, compute categories via one batched
                     # source-entity fetch (same pattern as GET /people),
                     # filter, then take the top first_degree_limit of the
-                    # still-ranked survivors (#896 finding 6).
+                    # still-ranked survivors (#896 finding 6). Every id that
+                    # passes is recorded so the node-building filter below
+                    # trusts this decision instead of re-deriving a
+                    # possibly different one (#896 review round 3 finding 5).
                     window = ranked[:min(len(ranked), 3 * max_nodes)]
                     source_store = get_source_entity_store()
                     cat_sources_by_id = source_store.get_for_people_batch(
                         [cid for cid, _ in window], limit_per_person=_CATEGORY_BATCH_SOURCE_LIMIT
                     )
-                    selection_pool = [
-                        (cid, rel) for cid, rel in window
-                        if (cand_person := all_people_dict.get(cid)) is not None
-                        and compute_person_category(cand_person, cat_sources_by_id.get(cid, [])) == category
-                    ]
+                    selection_pool = []
+                    for cid, rel in window:
+                        cand_person = all_people_dict.get(cid)
+                        if cand_person is None:
+                            continue
+                        if compute_person_category(cand_person, cat_sources_by_id.get(cid, [])) == category:
+                            selection_pool.append((cid, rel))
+                            category_confirmed_ids.add(cid)
                 else:
                     selection_pool = ranked
 
@@ -2779,21 +2810,43 @@ def get_network_graph(
                             cand_person = all_people_dict.get(other_canonical)
                             if cand_person is None or compute_person_category(cand_person, []) != category:
                                 continue
+                            category_confirmed_ids.add(other_canonical)
                         node_degrees[other_canonical] = current_depth
                         next_frontier.append(other_canonical)
                 frontier = next_frontier
+
+        # A node that has a genuine direct relationship to the center is
+        # relabeled degree 1 even if it was only added above via a friend
+        # (#896 review round 3 finding 4) - and gets its guaranteed center
+        # edge, same as any other first-degree node.
+        for node_id, rel in all_direct_candidates.items():
+            if node_degrees.get(node_id, 0) > 1:
+                node_degrees[node_id] = 1
+                center_edges[node_id] = rel
     else:
         # Get all people (no center, all are degree 1) - unchanged full-graph path.
         node_degrees = {p.id: 1 for p in all_people_dict.values()}
 
-    # Filter by category and strength, then build nodes
+    # Filter by category and strength, then build nodes. category_confirmed_ids
+    # is empty for a non-centered (full-graph) request, so every person there
+    # is freshly checked below - same as always for that path.
+    if not center_on:
+        category_confirmed_ids: set[str] = set()
+
     for person_id, degree in node_degrees.items():
         person = all_people_dict.get(person_id)
         if not person:
             continue
 
-        # Apply filters
-        if category and person.category != category:
+        # The exact category this node will be labeled with - also the
+        # single predicate used for the filter below, so a node can never
+        # be selected under one category decision and dropped (or kept)
+        # under a different one (#896 review round 3 finding 5). An id
+        # already confirmed during selection (possibly via a batched,
+        # more-accurate source-entity lookup) is trusted as-is instead of
+        # being re-derived from this cheaper per-node call.
+        computed_category = compute_person_category(person, [])
+        if category and person_id not in category_confirmed_ids and computed_category != category:
             continue
         if person.relationship_strength < min_strength:
             continue
@@ -2803,7 +2856,7 @@ def get_network_graph(
         nodes.append(NetworkNode(
             id=person.id,
             name=person.display_name or person.canonical_name,
-            category=compute_person_category(person, []),
+            category=computed_category,
             strength=person.relationship_strength,
             interaction_count=interaction_count,
             degree=degree,
@@ -2818,13 +2871,18 @@ def get_network_graph(
         # Every edge touching the center is unconditionally included -
         # these are exactly the relationship rows used to select each
         # first-degree node, so this edge is never missing even for a
-        # legacy/merged neighbor id (#896 findings 1 and 2).
-        for neighbor_id, rel in center_edges.items():
-            if neighbor_id not in valid_node_ids:
-                continue  # dropped by the category/min_strength filter above
-            weight = _rendered_edge_weight(rel, center_on, neighbor_id, my_person_id, all_people_dict)
-            pair = (min(center_on, neighbor_id), max(center_on, neighbor_id))
-            edges_by_pair[pair] = _build_network_edge(rel, center_on, neighbor_id, weight)
+        # legacy/merged neighbor id (#896 findings 1 and 2) - UNLESS the
+        # center itself didn't survive the category/min_strength filter
+        # above, in which case it's not in the response at all and an edge
+        # naming it would violate "every edge's endpoints are both present"
+        # (#896 review round 3 finding 3).
+        if center_on in valid_node_ids:
+            for neighbor_id, rel in center_edges.items():
+                if neighbor_id not in valid_node_ids:
+                    continue  # dropped by the category/min_strength filter above
+                weight = _rendered_edge_weight(rel, center_on, neighbor_id, my_person_id, all_people_dict)
+                pair = (min(center_on, neighbor_id), max(center_on, neighbor_id))
+                edges_by_pair[pair] = _build_network_edge(rel, center_on, neighbor_id, weight)
 
         # Fill the remaining edge budget with the strongest non-center
         # edges among the selected nodes (#896 findings 2 and 4).
