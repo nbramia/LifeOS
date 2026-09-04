@@ -1,7 +1,7 @@
 # Testing Standards
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-19
+> **Last Updated:** 2026-09-04
 > **Audience:** All developers and AI agents
 
 Testing patterns and conventions for the LifeOS codebase.
@@ -87,6 +87,8 @@ Apply `pytestmark = pytest.mark.unit` at the module level for unit test files.
 That distinction is load-bearing: `browser and not requires_server` is the set the pre-push hook runs, so it is the only gate that catches a `web/` JS regression before it reaches `main`. Pushes must not depend on a shared server that other agents restart, so a browser test that needs one is excluded there and runs under `./scripts/test.sh browser` instead.
 
 Prefer the self-contained pattern for new frontend tests — it also means the test exercises the checkout under test rather than whatever a running server has deployed.
+
+The pre-push hook writes each suite's output to a per-branch, per-process log under `${TMPDIR:-/tmp}/lifeos-prepush/` and prints the resolved path before each run, so concurrent pushes from different worktrees never overwrite each other's log; logs past 4 days old are pruned automatically (`find -mtime +3` starts deleting at the 4-day mark, not 3). A branch name with non-ASCII characters or longer than 80 characters collapses to a less distinguishable slug in the filename, but the log path still stays unique (it's the process id, not the slug, that guarantees that). If the configured directory is unusable, the hook degrades instead of blocking the push: it tries a fixed fallback path, then a throwaway `lifeos-prepush.XXXXXX` directory, then (only if that `mktemp` call itself fails) a bare `mktemp -d`, which lands in a `tmp.XXXXXXXXXX`-style directory, then (as a true last resort) `/tmp` directly — printing which it used and why. Only a directory the hook actually created/manages this way is chmod'd to 0700 or pruned; any directory it doesn't own this way — the last resort, or a symlinked directory at any rung — is used to write the log but never tightened or swept, and gets a `lifeos-prepush-` filename prefix on its logs so they stay attributable.
 
 ## Fixture Patterns
 
