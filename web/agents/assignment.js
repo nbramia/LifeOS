@@ -152,11 +152,13 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   }
   updateVisibility();
 
+  let catalogReady = false;
   function populateModelOptions(catalog) {
     const engine = engineEl.value;
     const models = (catalog.engines && catalog.engines[engine]) || [];
     modelEl.innerHTML = '<option value="">engine default</option>'
       + models.map(m => `<option value="${escapeHtml(m.id)}" ${currentModel === m.id ? 'selected' : ''}>${escapeHtml(m.label || m.id)}</option>`).join('');
+    catalogReady = true;
   }
   loadCatalog().then(populateModelOptions);
 
@@ -176,16 +178,21 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   // `assigned_by: "board"` — that's what keeps preflight's routing
   // corroboration from ever second-guessing a board assignment (see
   // api/services/agent_worker/preflight.py's `_apply_route_corroboration`
-  // and assignment.py's module docstring).
+  // and assignment.py's module docstring). The `model` field is the one
+  // exception: it's omitted (not nulled) until the model catalog has
+  // populated the select. Before that, `modelEl.value` is always '' —
+  // regardless of what the card has saved — so sending `model: null` would
+  // wipe a previously saved model on the very first effort/host change of
+  // a page load, before `GET /api/agents/models` has resolved (#861).
   async function save(extra = {}) {
     const { tags, ...extraFields } = extra;  // `tags` is a top-level PUT key, not a field
     const fields = {
-      model: modelEl.value || null,
       effort: effortEl.value || null,
       host: hostEl.value.trim() || null,
       assigned_by: 'board',
       ...extraFields,
     };
+    if (catalogReady) fields.model = modelEl.value || null;
     const patch = { fields };
     if (tags) patch.tags = tags;
     try {

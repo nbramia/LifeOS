@@ -972,6 +972,9 @@ class TestAssignmentPickers:
         task_puts = []
         _open_board(page, agents_base_url, task_puts=task_puts)
         page.locator('[data-card-id="t7"]').click()
+        expect(
+            page.locator(".drawer-assignment [data-field='model'] option")
+        ).to_have_count(3)
         effort_select = page.locator(".drawer-assignment [data-field='effort']")
         expect(effort_select).to_be_visible()
         effort_select.select_option("high")
@@ -987,6 +990,9 @@ class TestAssignmentPickers:
         task_puts = []
         _open_board(page, agents_base_url, task_puts=task_puts)
         page.locator('[data-card-id="t7"]').click()
+        expect(
+            page.locator(".drawer-assignment [data-field='model'] option")
+        ).to_have_count(3)
         host_input = page.locator(".drawer-assignment [data-field='host']")
         expect(host_input).to_be_visible()
         host_input.fill("build-box-2")
