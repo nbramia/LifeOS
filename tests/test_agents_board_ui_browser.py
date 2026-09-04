@@ -178,7 +178,7 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                   schedule_puts: list, board_stream_frames: list, stream_gate: "threading.Event | None" = None,
                   lane_response: "list | None" = None, open_calls: "list | None" = None,
                   open_response: "dict | None" = None, task_posts: "list | None" = None,
-                  cancel_calls: "list | None" = None):
+                  cancel_calls: "list | None" = None, cancel_failures: "list | None" = None):
     """Stub d3 (offline CDN) + every /api/ call the page makes.
 
     `open_calls`: appended with each opened card id (POST
@@ -252,7 +252,10 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                         card["status"] = "cancelled"
             route.fulfill(
                 status=200, content_type="application/json",
-                body=json.dumps({"id": card_id, "lane": "done", "status": "cancelled", "tags": [], "killed": [], "failures": []}),
+                body=json.dumps({
+                    "id": card_id, "lane": "done", "status": "cancelled", "tags": [],
+                    "killed": [], "failures": cancel_failures or [],
+                }),
             )
             return
 
@@ -393,7 +396,7 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
 
 def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_puts=None, lane_status_code=None,
                  schedule_puts=None, board_stream_frames=None, stream_gate=None, lane_response=None,
-                 open_calls=None, open_response=None, task_posts=None, cancel_calls=None):
+                 open_calls=None, open_response=None, task_posts=None, cancel_calls=None, cancel_failures=None):
     _stub_routes(
         page,
         board_state if board_state is not None else _board_fixture(),
@@ -408,6 +411,7 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
         open_response,
         task_posts,
         cancel_calls,
+        cancel_failures,
     )
     page.goto(f"{base_url}/agents")
     page.wait_for_selector('[data-card-id="t1"]')
@@ -2123,6 +2127,23 @@ class TestAgentCardMoveRulesAndCancel:
         _open_board(page, agents_base_url, board_state=board_state)
         page.locator('[data-card-id="t12"]').click()
         expect(page.get_by_role("button", name="Resolve", exact=True)).to_be_visible()
+
+    def test_cancel_with_an_untorn_down_cli_session_toasts_a_warning(self, page: Page, agents_base_url):
+        """(#881 AR5 client-side) When Cancel's response carries `failures`
+        (a live CLI session it couldn't kill), the toast must say so
+        instead of a plain 'Cancelled.' success."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append(_unclaimed_agent_owned_card())
+        cancel_calls = []
+        _open_board(
+            page, agents_base_url, board_state=board_state, cancel_calls=cancel_calls,
+            cancel_failures=[{"session_id": "cx:live1", "reason": "a live codex CLI session (cx:live1) is still open"}],
+        )
+
+        page.locator('[data-card-id="t8"]').click()
+        page.get_by_role("button", name="Cancel", exact=True).click()
+        expect(page.locator(".toast.error")).to_contain_text("cx:live1", timeout=5000)
+        assert cancel_calls == ["t8"]
 
     def test_cancel_button_absent_for_a_me_card_with_cancel_refused_in_its_policy(self, page: Page, agents_base_url):
         """(#881 RC3) The production-shaped case: a `me`-assigned card
