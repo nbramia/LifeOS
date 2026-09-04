@@ -44,13 +44,13 @@ The board is backed by the vault task store (`LifeOS/Tasks/`) — every card is 
 
 ### Assignee
 
-Assignee is a single tag, one of `#me`, `#claude`, `#codex`, `#hermes`, `#local`. Dropping a card into Assigned sets that tag and clears any other assignee tag; dropping into Unassigned clears it. Setting an assignee here is a labeling action only — it does not dispatch the task to that engine. Wiring assignment to actual execution is a separate, later change (see the Kanban overhaul issue set); today the agent worker still only claims tasks carrying its own `#agent` tag, same as before this board existed.
+Assignee is a single tag, one of `#me`, `#claude`, `#codex`, `#hermes`, `#local`. Dropping a card into Assigned sets that tag and clears any other assignee tag; dropping into Unassigned clears it. Setting an assignee here is a labeling action only — it does not dispatch the task to that engine. The drawer's **Open** action starts a CLI session on an Assigned `#claude`/`#codex` card explicitly, and the worker reads the card's model/effort/host fields when it claims an `#agent` task (see [Card assignment](../technical/agent-worker.md#card-assignment-851)); today the agent worker still only claims tasks carrying its own `#agent` tag, same as before this board existed.
 
 ### Cards and the drawer
 
 A card shows its title, assignee chip, model/effort chips when the task carries those fields, a host chip when a linked session is running on a known machine, its other tags, and a pulsing dot when a linked session is actively running.
 
-Clicking a card opens a drawer: an editable title and notes (notes save on blur, stored as indented `> ` lines beneath the task — see [task-management.md](task-management.md)), pickers for assignee, tags, and context, and — when the card has a linked session — that session's live transcript feed, the same panel the Graph tab uses. Drawer actions: **Focus** (jump to the session's terminal pane), **Kill** (stop a running session), **Answer** (reply to the agent's pending question), **Accept** (move a Review card to Done), and **Resolve** (mark a manually-filed Human queue card handled).
+Clicking a card opens a drawer: an editable title and notes (notes save on blur, stored as indented `> ` lines beneath the task — see [task-management.md](task-management.md)), pickers for assignee, tags, and context, and — below those — model, effort, and host pickers for engines that accept them (`#claude`/`#codex` show all three, `#local` shows effort only, `#me`/`#hermes`/unassigned show none; model options come from the model catalog per engine, and host is free text checked against the registered hosts when the card is opened) that write the fields the executors actually read. When the card has a linked session, the drawer also shows that session's live transcript feed, the same panel the Graph tab uses. Drawer actions: **Open** (an Assigned card tagged `#claude` or `#codex` spawns the CLI on the card), **Focus** (jump to the session's terminal pane), **Kill** (stop a running session), **Answer** (reply to the agent's pending question), **Accept** (move a Review card to Done), and **Resolve** (mark a manually-filed Human queue card handled).
 
 A **New card** button opens a composer — title, optional notes, and an assignee picker — that creates a task through `POST /api/tasks`.
 
@@ -68,7 +68,7 @@ Filters AND-compose: free-text search (title and notes), lane, assignee (includi
 
 ### Out of scope (for now)
 
-Card reordering within a lane — file order is lane order. Model/effort pickers that actually change how a task runs. Opening a session on a different machine than the one serving `/agents`. See the Kanban overhaul issue set for what's next.
+Card reordering within a lane — file order is lane order. See the Kanban overhaul issue set for what's next.
 
 ---
 
@@ -264,14 +264,14 @@ All in `.env`. None are required — the defaults work for the standard LifeOS i
 | `LIFEOS_CLAUDE_CODE_VIZ_ENABLED` | Surface Claude Code CLI sessions alongside agent worker sessions. Set false to scope the viz to LifeOS sessions only. | `true` |
 | `LIFEOS_CLAUDE_CODE_PROJECTS_DIR` | Where to find Claude Code transcripts. | `~/.claude/projects` |
 | `LIFEOS_CLAUDE_CODE_LOOKBACK_DAYS` | Discovery window — older jsonl files are excluded from the snapshot (they can still be loaded by direct session id). | `7` |
-| `LIFEOS_CC_RESUME_ENABLED` | Enable the Resume and Focus buttons. | `false` |
+| `LIFEOS_CC_RESUME_ENABLED` | Enable the Resume and Focus buttons, and the board drawer's **Open** action for `#claude` cards. | `false` |
 | `LIFEOS_CC_RESUME_CMD` | Launcher command. Substitutions: `{session_id}`, `{cwd}`, `{session_id_url}`, `{cwd_url}`, `{inner_command}`. The default uses WezTerm's CLI to open a tab AND run the resume in one shot. | `wezterm cli spawn --cwd {cwd} -- {inner_command}` |
 | `LIFEOS_CC_RESUME_INNER_CMD` | The command run *inside* the spawned terminal — the actual `claude --resume` invocation. Substituted into `{inner_command}` of the launcher template. | `claude --dangerously-skip-permissions --resume {session_id}` |
 | `LIFEOS_CC_RESUME_ENV_FILE` | Optional `key=value` file pinning `DISPLAY` / `XAUTHORITY` / `WAYLAND_DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` for the spawned terminal. | `` (inherit systemd env) |
 | `LIFEOS_CODEX_VIZ_ENABLED` | Surface Codex CLI sessions alongside the other sources. | `true` |
 | `LIFEOS_CODEX_SESSIONS_DIR` | Where to find Codex rollout JSONLs. | `~/.codex/sessions` |
 | `LIFEOS_CODEX_LOOKBACK_DAYS` | Discovery window for Codex rollouts. | `7` |
-| `LIFEOS_CODEX_RESUME_ENABLED` | Enable Resume + Go To for `cx:` sessions. | `false` |
+| `LIFEOS_CODEX_RESUME_ENABLED` | Enable Resume + Go To for `cx:` sessions, and the board drawer's **Open** action for `#codex` cards. | `false` |
 | `LIFEOS_CODEX_RESUME_CMD` | Codex launcher template. Same substitution surface as `LIFEOS_CC_RESUME_CMD`. | `wezterm cli spawn --cwd {cwd} -- {inner_command}` |
 | `LIFEOS_CODEX_RESUME_INNER_CMD` | Inner command inside the spawned terminal — the actual `codex resume` invocation. | `codex resume {session_id}` |
 | `LIFEOS_AGENT_HOOK_TOKEN` | Bearer token required from `scripts/lifeos-agent-hook.sh` on `POST /api/agents/cli-sessions/events`. Empty (default) disables the endpoint (503) — a fresh clone accepts no cross-machine session data until this is set. | `` |

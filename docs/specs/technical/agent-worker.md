@@ -613,6 +613,7 @@ Full reference in [`agent-worker-setup.md`](../../guides/agent-worker-setup.md).
 - [Agent Worker — Product](../product/agent-worker.md) — What `#agent` does, consumer view
 - [Agent Worker — Setup](../../guides/agent-worker-setup.md) — Operator setup walkthrough
 - [Agent Viz — Technical](agent-viz.md) — `/agents` page that reads SessionStore + TranscriptStore here
+- [Agent Viz — Product](../product/agent-viz.md) — Board drawer pickers and Open action that write the card-assignment fields read here
 - [Task Management](../product/task-management.md) — How `#agent` tasks sit alongside regular tasks
 - [Human Queue](../../guides/human-queue.md) — Cards the worker's poll tick auto-resolves via `done_when`
 - [MCP Tools](../product/mcp-tools.md) — Standard MCP catalog including `lifeos_agent_*` family

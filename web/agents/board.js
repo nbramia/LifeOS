@@ -11,6 +11,7 @@
 import {
   TERMINAL, routingLabel, sourceLabelFor, escapeHtml, showToast, SessionPanel,
 } from './panel.js';
+import { renderAssignmentPickers } from './assignment.js';
 
 const LANES = [
   { id: 'unassigned',  label: 'Unassigned' },
@@ -590,6 +591,7 @@ export function initBoard() {
       </div>
       <label class="drawer-label">Tags</label>
       <input class="drawer-tags" data-field="tags" value="${escapeHtml(nonAssigneeTags.join(' '))}" placeholder="space-separated tags" />
+      <div class="drawer-assignment" data-field="assignment"></div>
       <div class="drawer-actions" data-field="actions"></div>
       <div class="drawer-session" data-field="session-panel"></div>
       ` : `
@@ -644,6 +646,15 @@ export function initBoard() {
       const value = assigneeEl.value;
       try {
         await moveCard(card.id, value ? 'assigned' : 'unassigned', value || undefined);
+        // moveCard already awaited fetchBoard(), so the board's own state is
+        // current — but updateOpenDrawer's `!focused` check skips the
+        // rebuild while the select (inside the drawer) still holds focus,
+        // which a native <select> keeps after a change event. Re-render
+        // explicitly so the model/effort/host pickers and the Open button
+        // reflect the new assignee immediately, not only once focus leaves
+        // the drawer (#859 review round 1 finding 1).
+        const fresh = findCard(card.id);
+        if (fresh) { renderDrawer(fresh); openCardSnapshot = fresh; }
       } catch (err) {
         // moveCard already toasted the failure and nothing was persisted —
         // re-render the drawer from the still-current card so the select
@@ -687,6 +698,22 @@ export function initBoard() {
       catch (err) { showToast(`Couldn't save tags: ${err.message}`, true); tagsEl.value = nonAssigneeTags.join(' '); }
     });
 
+    // The drawer's own Assignee select above is the one assignee writer —
+    // it already writes exactly one assignee tag through the lane endpoint
+    // and supports `me`, which the module's own engine select can't
+    // represent. So mount the model/effort/host pickers but hide the
+    // module's engine row to avoid a second, conflicting assignee control.
+    const assignmentEl = drawerEl.querySelector('[data-field="assignment"]');
+    if (assignmentEl) {
+      renderAssignmentPickers(assignmentEl, card, {
+        putTask,
+        onSaved: () => fetchBoard(),
+        onError: (message) => showToast(`Couldn't save assignment: ${message}`, true),
+      });
+      const engineRow = assignmentEl.querySelector('[data-row="engine"]');
+      if (engineRow) engineRow.hidden = true;
+    }
+
     renderDrawerActions(card);
     renderDrawerSession(card);
   }
@@ -695,6 +722,22 @@ export function initBoard() {
     const actionsEl = drawerEl.querySelector('[data-field="actions"]');
     if (!actionsEl) return;
     const buttons = [];
+
+    if (card.lane === 'assigned' && (card.assignee === 'claude' || card.assignee === 'codex')) {
+      buttons.push(['Open', async () => {
+        try {
+          const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/open`, { method: 'POST' });
+          if (!r.ok) {
+            const text = await r.text();
+            let msg = text;
+            try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+            throw new Error(msg || `HTTP ${r.status}`);
+          }
+          showToast('Opened.', false);
+          fetchBoard();
+        } catch (err) { showToast(`Open failed: ${err.message}`, true); }
+      }]);
+    }
 
     if (card.session && (card.session.source === 'claude_code' || card.session.source === 'codex')) {
       buttons.push(['Focus', async () => {

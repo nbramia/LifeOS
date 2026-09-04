@@ -38,6 +38,7 @@ Engineering view of the `/agents` page — endpoint shapes, ingest paths, status
 │    web/agents/board.js  — Kanban board, drag/drop, drawer                 │
 │    web/agents/graph.js  — D3 force-simulation graph (Graph tab, lazy-init)│
 │    web/agents/panel.js  — shared session-detail panel (both tabs)         │
+│    web/agents/assignment.js — model/effort/host pickers (board drawer)    │
 └─────────────────────────────┬────────────────────────────────────────────┘
                               │ HTTP + SSE
                               ▼
@@ -122,11 +123,12 @@ The issue's target is "reflects an external vault edit within ~3 seconds," and t
 
 ### Frontend module split
 
-`web/agents.html` used to be one 2,600-line file (inline CSS + a single IIFE covering the graph, side panel, filters, and search). It's now a shell (CSS + tab markup) plus three ES modules under `web/agents/`, served the same way `web/chat/`'s split (#360) is — `<script type="module">` tags resolving against the existing `/static` mount, no bundler:
+`web/agents.html` used to be one 2,600-line file (inline CSS + a single IIFE covering the graph, side panel, filters, and search). It's now a shell (CSS + tab markup) plus four ES modules under `web/agents/`, served the same way `web/chat/`'s split (#360) is — `<script type="module">` tags resolving against the existing `/static` mount, no bundler:
 
 - **`panel.js`** — the shared session-detail panel: header render, inline label edit, backfill + live SSE transcript tail, LLM summary fetch, and the kill/resume/focus actions, plus the small cross-cutting helpers (`routingLabel`, `escapeHtml`, `showToast`, `prettyPayload`, …) both other modules import. Exports a `SessionPanel` class constructed with a `container` element rather than hardcoded ids, so the Graph tab's side panel and the Board tab's drawer can each hold an independent instance without DOM id collisions (both tabs' markup stays mounted; only one is visible via `[hidden]`).
 - **`graph.js`** — the D3 force-simulation graph, filters, chips, and search, moved with the rendering/simulation/interaction code unchanged; only the panel-specific calls were swapped for a `SessionPanel` instance. Exports `initGraph()`, called once, lazily, the first time the operator opens the Graph tab — so loading the board (the default view) doesn't also open a second SSE connection (`/api/agents/stream`) nobody is watching.
 - **`board.js`** — the Kanban board: fetch + SSE, lane rendering, filters, and the drawer. Exports `initBoard()`, called immediately on page load.
+- **`assignment.js`** — the card-assignment pickers (engine/model/effort/host) that `board.js` mounts into the drawer; writes `model`/`effort`/`host` (+ `assigned_by`) through `PUT /api/tasks/{id}` and reads `GET /api/agents/models` for the model options. Standalone module from #851, wired in by #859.
 
 **Drag and drop is pointer-based, not the native HTML5 Drag and Drop API.** `draggable="true"` + `dragstart`/`dragover`/`drop` only fires through the browser's OS-level drag gesture — synthetic mouse events (Playwright's included) can't reliably trigger it, which would have made the server-free browser test (`tests/test_agents_board_ui_browser.py`) unable to drive a drag at all. `board.js` instead tracks `mousedown` → `mousemove` (past a 4px threshold, to distinguish a drag from a click) → `mouseup`, rendering a floating ghost card and using `document.elementFromPoint` to resolve the lane under the cursor. The trailing `click` event that a `mouseup` also fires is suppressed via a `suppressNextClick` flag set only when a real drag happened, so the same gesture never both moves a card and opens its drawer.
 
