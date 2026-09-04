@@ -479,7 +479,7 @@ def _cache_put(session_id: str, last_activity_at: float, result: SummaryResult,
     grace window (`_LIVE_REFRESH_GRACE_SECONDS`) and the error-fallback TTL
     (`_FAILURE_FALLBACK_TTL_SECONDS`).
     """
-    if len(_cache) >= _CACHE_MAX:
+    if session_id not in _cache and len(_cache) >= _CACHE_MAX:
         _cache.pop(next(iter(_cache)))
     _cache[session_id] = (last_activity_at, time.time(), result, is_error_fallback)
 
