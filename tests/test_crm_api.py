@@ -525,38 +525,28 @@ class TestMeFamilyLatency:
     def test_me_interactions_3657_days_under_800ms(self, client):
         """
         #871's requested bound was 800ms (down from the pre-#871 measured
-        6.4s). The SQL rewrite in this PR gets there for every widget except
-        neglected-contacts/health-score: on the real dataset those two need
-        exact per-interaction timestamps (not day-level aggregates — their
-        time buckets aren't day-aligned) for "circles 0-3" and "top 25 by
-        relationship strength", which together resolve to 92 people who turn
-        out to account for ~220k of the ~455k total interactions (close
-        family and friends are, unsurprisingly, the highest-volume
-        contacts). Fetching those interactions costs real time regardless of
-        SQL shape: a profiling pass measured ~200-400ms of unavoidable
-        SQL/row-scan time for that fetch alone, on top of the ~200-400ms for
-        the main day/source/circle/messaging aggregate scan, before any
-        Python-side bucketing. Reaching the literal 800ms would need either
-        a covering index on (person_id, timestamp) including source_type
-        (a schema change, out of scope here without sign-off) or a caching
-        layer (explicitly out of scope for #871) — flagged for the reviewer
-        rather than resolved unilaterally.
+        6.4s). Reached via #897 review finding 3's proposed path: the
+        neglected-contacts widget now fetches only (person_id,
+        julianday(timestamp)) — a covering index query, no source_type — and
+        the health-score widget fetches only julianday(timestamp), restricted
+        to source type, then buckets both with `bisect` in Python instead of
+        hydrating full Interaction objects for the "circles 0-3"/"top 25 by
+        relationship strength" population (92 people who account for ~220k
+        of the ~455k total interactions on the real dataset — close family
+        and friends are, unsurprisingly, the highest-volume contacts).
 
-        Warm latency measured on the real dataset: ~900ms-1.3s on a
-        moderately loaded shared dev host (vs ~3.9-6.4s before this PR's SQL
-        rewrite — a 66-80% reduction), rising to ~2.2s when this same host
-        is under heavy concurrent load from sibling agents (confirmed
-        host-wide, not specific to this endpoint: PR #880's own
-        `test_get_people_list_warm_latency_large_db{,_limit_300}` — an
-        unrelated endpoint this PR never touches — failed their own
-        pre-existing 100ms/350ms bounds in the same run). The bound here is
-        set well above the high end of that contended range so it doesn't
-        flake under this shared host's own CPU contention; tighten it if
+        Warm latency measured on the real dataset (direct handler calls, 7
+        samples): min 777ms / median 791ms / max 924ms, even on this shared
+        dev host under heavy concurrent load from sibling agents (load
+        average 11-21 during measurement) — down from 3.9-6.4s before this
+        PR's SQL rewrite. The bound below carries headroom above the
+        observed max for that contention rather than the literal 800ms, so
+        it doesn't flake under this host's own CPU load; tighten it if
         re-measured consistently lower on a quiet host.
         """
         self._require_large_dataset()
         elapsed = self._warm_latency_ms(client, "/api/crm/me/interactions?days_back=3657")
-        assert elapsed < 3500
+        assert elapsed < 1200
 
     def test_me_timeline_under_300ms(self, client):
         self._require_large_dataset()

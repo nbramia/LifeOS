@@ -181,11 +181,26 @@ def test_me_page_sizes_heatmap_from_span(page: Page, crm_base_url):
             break
         page.wait_for_timeout(50)
 
+    # renderMeDashboard() and loadMeHeatMap() both call loadMeInteractions()
+    # right after the page loads; give a duplicate request (the bug this
+    # pins) time to show up before counting.
+    page.wait_for_timeout(300)
+
     span_requests = [r for r in requests_seen if r["path"] == "/api/crm/me/interactions/span"]
     me_interactions_requests = [r for r in requests_seen if r["path"] == "/api/crm/me/interactions"]
 
     assert span_requests, "Me page never called /api/crm/me/interactions/span"
     assert me_interactions_requests, "Me page never called /api/crm/me/interactions"
+
+    # renderMeDashboard() and loadMeHeatMap() both route through
+    # loadMeInteractions() on the same tick; it must memoize the in-flight
+    # request so they share one, not fire the full-window fetch twice
+    # (#897 review finding 2).
+    assert len(me_interactions_requests) == 1, (
+        f"Expected exactly one /me/interactions request (in-flight requests "
+        f"should be shared across callers), got {len(me_interactions_requests)}: "
+        f"{me_interactions_requests}"
+    )
 
     expected_days_back = str(SPAN_YEARS * 365 + 7)
     days_back_values = {

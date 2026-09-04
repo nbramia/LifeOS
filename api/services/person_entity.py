@@ -1100,6 +1100,18 @@ class PersonEntityStore:
         """All ids currently marked hidden (`WHERE hidden = 1`)."""
         return self.get_ids_where("hidden", 1)
 
+    def get_merged_secondary_ids(self) -> set[str]:
+        """
+        All ids that were merged into another (surviving) person — the keys
+        of the durable merged-id mapping. In practice every one of these is
+        already hidden too (merge_people.py sets hidden=1 on the secondary),
+        so this is mostly a defensive belt-and-suspenders exclusion for
+        anywhere that can't otherwise rely on get_all()'s own merged-id
+        filtering (e.g. a caller building an exclude list without a full
+        get_all() call, like the /me/interactions/span endpoint).
+        """
+        return set(self._merged_ids.keys())
+
     def get_totals(self) -> dict[str, int]:
         """
         Lifetime interaction totals across non-hidden, non-merged people,

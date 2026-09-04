@@ -83,6 +83,29 @@ def _get_strength_override(person_id: str) -> float | None:
     return STRENGTH_OVERRIDES_BY_ID.get(person_id)
 
 
+def _me_exclude_ids(person_store, all_people: Optional[list] = None) -> list[str]:
+    """
+    Self + hidden + peripheral + merged-secondary person ids — the
+    population both /me/interactions and /me/interactions/span exclude.
+
+    Pass `all_people` (from a get_all() the caller already has, e.g.
+    /me/interactions) to derive peripheral ids from it directly instead of
+    an extra query. Without it, peripheral ids come from a targeted
+    `is_peripheral_contact = 1` query — the lightweight path
+    /me/interactions/span uses to stay well under its own latency budget.
+    Merged-secondary ids are normally already hidden (merge_people.py sets
+    hidden=1 on the secondary), so including them here is mostly a
+    defensive belt-and-suspenders exclusion (#897 review finding 6).
+    """
+    hidden_ids = person_store.get_hidden_ids()
+    if all_people is not None:
+        peripheral_ids = {p.id for p in all_people if p.is_peripheral_contact}
+    else:
+        peripheral_ids = person_store.get_ids_where("is_peripheral_contact", 1)
+    merged_ids = person_store.get_merged_secondary_ids()
+    return [MY_PERSON_ID] + list(hidden_ids | peripheral_ids | merged_ids)
+
+
 def _bucket_counts_by_period(
     items: list, time_points: list[datetime], get_ts=lambda item: item.timestamp,
 ) -> list[int]:
@@ -3224,7 +3247,9 @@ def get_me_interactions(
     all_people = person_store.get_all()
     person_lookup = {p.id: p for p in all_people}
 
-    # Get hidden person IDs to exclude from metrics (targeted query)
+    # Get hidden person IDs (targeted query) — used on its own below by the
+    # network-growth widget, which checks self/hidden/peripheral/orphaned
+    # separately rather than via one combined exclude set.
     hidden_person_ids = person_store.get_hidden_ids()
 
     # Get peripheral contact IDs to exclude from counts
@@ -3233,7 +3258,10 @@ def get_me_interactions(
         p.id for p in all_people if p.is_peripheral_contact
     }
 
-    exclude_ids = [MY_PERSON_ID] + list(hidden_person_ids) + list(peripheral_person_ids)
+    # Self + hidden + peripheral + merged-secondary — shared with
+    # /me/interactions/span so both exclude the same population (#897
+    # review finding 6).
+    exclude_ids = _me_exclude_ids(person_store, all_people)
     # A separate set for Python-side `in` checks (e.g. filtering window_rows
     # below): `exclude_ids` itself stays a list because SQL query building
     # needs an ordered sequence of params, but a list `in` check is O(n) per
@@ -3272,8 +3300,8 @@ def get_me_interactions(
     # since every widget below iterates them anyway. This also folds in the
     # same "known (non-orphaned) person id" check the old code applied via
     # `if i.person_id in person_lookup`, and what used to be three separate
-    # full-window queries (get_daily_source_counts, get_person_counts for
-    # by_circle, get_person_month_counts for messaging) into one.
+    # full-window queries (one each for day-level, person-level, and
+    # per-month breakdowns) into one.
     # "Only count SENT emails" is the /me dashboard's one global rule
     # (gmail_sent_only=True), matching the single upstream
     # `if source == 'gmail' ... continue` the old code applied once to a
@@ -3320,8 +3348,18 @@ def get_me_interactions(
     ]
 
     # ---- Top contacts (last 30 days) ----
+    # `pool_start_date`/`pool_end_date` reproduce the original algorithm's
+    # outer `all_interactions` pool (bounded to `days_back`, day-string,
+    # including its end-date exclusion quirk — see _range_predicate) ANDed
+    # with the exact "last 30 days" lower-bound check the old Python code
+    # applied within it. Without the pool bound, this query would look
+    # further back than `days_back` whenever the caller asks for a shorter
+    # window than 30 days (#897 review finding 1). There is no exact upper
+    # bound here — the old `if ts >= thirty_days_ago:` check had none of its
+    # own either, relying entirely on the pool's own end_date.
     top_counts = interaction_store.get_person_counts(
-        thirty_days_ago, now, exclude_person_ids=exclude_ids, gmail_sent_only=True, exact=True,
+        thirty_days_ago, None, exclude_person_ids=exclude_ids, gmail_sent_only=True, exact=True,
+        pool_start_date=start_date, pool_end_date=end_date,
     )
     top_contacts = []
     for person_id, count in sorted(top_counts.items(), key=lambda x: -x[1])[:10]:
@@ -3333,15 +3371,23 @@ def get_me_interactions(
         ))
 
     # ---- Trend data (warming and cooling) ----
-    # The "previous" bucket excludes its upper edge so it never double-counts
-    # the exact instant where the "recent" bucket begins (matching the old
-    # `if ts >= trend_recent_start: ... elif ts >= trend_previous_start:`).
+    # Same pool-clamping as top_contacts above: a trend period longer than
+    # half of `days_back` (e.g. trend_period="year" with a short
+    # `days_back`) must not reach further back than the outer window did in
+    # the original algorithm (#897 review finding 1).
+    # The "previous" bucket also excludes its upper edge so it never
+    # double-counts the exact instant where the "recent" bucket begins
+    # (matching the old `if ts >= trend_recent_start: ... elif ts >=
+    # trend_previous_start:`) — that boundary is unrelated to the pool and
+    # stays an exact julianday comparison.
     recent_counts = interaction_store.get_person_counts(
-        trend_recent_start, now, exclude_person_ids=exclude_ids, gmail_sent_only=True, exact=True,
+        trend_recent_start, None, exclude_person_ids=exclude_ids, gmail_sent_only=True, exact=True,
+        pool_start_date=start_date, pool_end_date=end_date,
     )
     previous_counts = interaction_store.get_person_counts(
         trend_previous_start, trend_recent_start, exclude_person_ids=exclude_ids,
         gmail_sent_only=True, exact=True, end_inclusive=False,
+        pool_start_date=start_date, pool_end_date=end_date,
     )
     warming = []
     cooling = []
@@ -3385,103 +3431,15 @@ def get_me_interactions(
     personal_family_people.sort(key=lambda p: p.relationship_strength or 0, reverse=True)
     top_25_ids = [p.id for p in personal_family_people[:25]]
 
-    # 2. Neglected Contacts candidates (computed here, alongside top_25_ids,
-    # so both can share ONE fetch below — see the comment on
-    # close_contact_interactions for why that matters on the production
-    # dataset).
+    # 2. Neglected Contacts candidates.
     # People in circles 0-3 who haven't been contacted in longer than their typical gap
     neglect_candidate_ids = [
         pid for pid, circle in circle_map.items()
         if pid != MY_PERSON_ID and circle <= 3 and pid not in peripheral_person_ids
     ]
 
-    # Fetch this window's interactions for the union of both candidate sets
-    # in ONE query (still subject to the same self/hidden/peripheral
-    # exclusions as everything else), instead of two separate fetches. On
-    # the production dataset these sets overlap heavily — the closest
-    # family/friends are both top-ranked by relationship strength AND
-    # circle 0-3 — and each such person can have tens of thousands of
-    # interactions over a 10-year window, so fetching (and hydrating) them
-    # twice roughly doubled this section's cost for no benefit. Fetched as
-    # lightweight (person_id, timestamp, source_type) tuples rather than
-    # full Interaction objects — neither widget below needs title, snippet,
-    # links, or ids, and building an Interaction per row (not just parsing
-    # its timestamp) is what actually dominates at this scale.
-    close_contact_ids = sorted(set(top_25_ids) | set(neglect_candidate_ids))
-    # No exclude_person_ids here: close_contact_ids is a small, specifically
-    # named set (chosen by relationship strength or Dunbar circle, both of
-    # which already exclude hidden/self by construction), so a hidden or
-    # peripheral id landing in it is at most a rare edge case (a peripheral
-    # person could theoretically rank in the top 25 by strength) — checked
-    # for below via exclude_id_set instead of paying for a SQL `NOT IN`
-    # against ~9,500 ids on every row of an otherwise narrow, indexed query.
-    close_contact_timestamps = interaction_store.get_person_timestamps(
-        start_date, end_date, person_ids=close_contact_ids,
-    ) if close_contact_ids else []
-
-    # Filter to personal interactions with top 25 family/personal contacts
-    # (excluding peripheral, the one case top_25_ids doesn't already rule
-    # out — see the comment on close_contact_timestamps)
-    top_25_id_set = set(top_25_ids) - exclude_id_set
-    personal_interaction_ts = [
-        ts for pid, ts, source_type in close_contact_timestamps
-        if pid in top_25_id_set and (source_type or "").lower() in HEALTH_INTERACTION_TYPES
-    ]
-
-    # Current health score will be calculated after we build the history
-    health_score = 0
-
-    neglect_candidate_id_set = set(neglect_candidate_ids)
-    neglected = []
-    person_interaction_dates = defaultdict(list)
-    for pid, ts, _source_type in close_contact_timestamps:
-        if pid not in neglect_candidate_id_set:
-            continue
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        person_interaction_dates[pid].append(ts)
-
-    for person_id, dates in person_interaction_dates.items():
-        person = person_lookup.get(person_id)
-        if not person:
-            continue
-        circle = circle_map.get(person_id, 7)
-        if circle > 3:  # Only alert for circles 0-3
-            continue
-        if len(dates) < 5:  # Need meaningful history to establish pattern
-            continue
-        dates_sorted = sorted(dates)
-        # Calculate typical gap (median of gaps, excluding outliers)
-        gaps = [(dates_sorted[i+1] - dates_sorted[i]).days for i in range(len(dates_sorted)-1)]
-        if not gaps:
-            continue
-        # Use median of gaps
-        gaps_sorted = sorted(gaps)
-        typical_gap = gaps_sorted[len(gaps_sorted)//2]
-        # Minimum based on circle - closer relationships have lower thresholds
-        min_gap = {0: 3, 1: 5, 2: 7, 3: 14}.get(circle, 14)
-        if typical_gap < min_gap:
-            typical_gap = min_gap
-        # Days since last contact
-        last_contact = dates_sorted[-1]
-        days_since = (now - last_contact).days
-        # Alert if 1.5x typical gap has passed (was 2x, now more sensitive)
-        if days_since > typical_gap * 1.5:
-            neglected.append(NeglectedContact(
-                person_id=person_id,
-                person_name=person.canonical_name,
-                days_since_contact=days_since,
-                typical_gap_days=typical_gap,
-                dunbar_circle=circle,
-            ))
-    # Sort by circle (closer first), then by how overdue they are
-    neglected.sort(key=lambda x: (x.dunbar_circle, -(x.days_since_contact / x.typical_gap_days)))
-
-    # 2b. Health Score History (longitudinal) - using "vs. average" approach
-    # Count personal interactions per period, score relative to average
-    health_score_history = []
-
-    # Determine time points based on health_period
+    # Determine health-score time points now (moved up from where they used
+    # to live, right before the SQL-side bucket query below).
     if health_period == "month":
         total_days = 61  # ~2 months
         num_points = 9
@@ -3495,12 +3453,92 @@ def get_me_interactions(
     time_points = [now - timedelta(days=int(i * total_days / (num_points - 1))) for i in range(num_points)]
     time_points = sorted(time_points)  # oldest first
 
-    # Raw personal interaction counts for each period (see
-    # _bucket_counts_by_period's docstring for why this isn't a direct
-    # per-interaction-per-bucket nested loop on this dataset).
-    health_raw_counts = _bucket_counts_by_period(
-        personal_interaction_ts, time_points, get_ts=lambda ts: ts,
-    )
+    # SQL-side bucket counts for the health score (#897 review finding 3):
+    # one SUM(CASE ...) per time-point bucket over the top-25 population,
+    # instead of fetching every one of their interactions and bisecting in
+    # Python. On the production dataset "top 25 by relationship strength"
+    # still means hundreds of thousands of interactions (the closest
+    # family/friends are, unsurprisingly, the highest-volume contacts), so
+    # this is the difference between returning ~13 numbers and
+    # hydrating/parsing every row. `pool_start_date`/`pool_end_date`
+    # reproduce the original algorithm's outer `all_interactions` pool
+    # bound (day-string, matching get_all_in_range), since the old
+    # `personal_interactions` this fed from was filtered from that same
+    # pool.
+    health_raw_counts = interaction_store.get_bucketed_counts(
+        time_points, person_ids=top_25_ids, exclude_person_ids=exclude_ids,
+        source_types=HEALTH_INTERACTION_TYPES,
+        pool_start_date=start_date, pool_end_date=end_date,
+    ) if top_25_ids else [0] * len(time_points)
+
+    # Current health score will be calculated after we build the history
+    health_score = 0
+
+    # A covering (person_id, timestamp)-index query — no source_type, since
+    # neglected-contacts considers every interaction type, unlike health
+    # score — restricted to a small, specifically named set of people
+    # (#897 review finding 3). Returns julian-day floats directly so the
+    # gap-median calculation below is plain float subtraction (1.0 == one
+    # day) instead of building a datetime per row.
+    # No exclude_person_ids here: neglect_candidate_ids already excludes
+    # self and peripheral explicitly above, and hidden implicitly (it's
+    # built from circle_map, which is derived from all_people —
+    # get_all()'s default already excludes hidden) — measured ~120ms faster
+    # without a redundant `NOT IN (~9,500)` clause on a query already
+    # restricted to a couple dozen people (#897 review finding 3).
+    neglect_jd_rows = interaction_store.get_person_julianday_timestamps(
+        start_date, end_date, person_ids=neglect_candidate_ids,
+    ) if neglect_candidate_ids else []
+    now_jd = interaction_store.get_julianday(now)
+
+    neglected = []
+    person_interaction_jds = defaultdict(list)
+    for pid, jd in neglect_jd_rows:
+        person_interaction_jds[pid].append(jd)
+
+    for person_id, jds in person_interaction_jds.items():
+        person = person_lookup.get(person_id)
+        if not person:
+            continue
+        circle = circle_map.get(person_id, 7)
+        if circle > 3:  # Only alert for circles 0-3
+            continue
+        if len(jds) < 5:  # Need meaningful history to establish pattern
+            continue
+        jds_sorted = sorted(jds)
+        # Calculate typical gap (median of gaps, excluding outliers). Every
+        # gap here is between consecutive sorted timestamps, so it's always
+        # >= 0 — int() truncation matches timedelta.days' floor exactly.
+        gaps = [int(jds_sorted[i + 1] - jds_sorted[i]) for i in range(len(jds_sorted) - 1)]
+        if not gaps:
+            continue
+        # Use median of gaps
+        gaps_sorted = sorted(gaps)
+        typical_gap = gaps_sorted[len(gaps_sorted)//2]
+        # Minimum based on circle - closer relationships have lower thresholds
+        min_gap = {0: 3, 1: 5, 2: 7, 3: 14}.get(circle, 14)
+        if typical_gap < min_gap:
+            typical_gap = min_gap
+        # Days since last contact
+        last_contact_jd = jds_sorted[-1]
+        days_since = int(now_jd - last_contact_jd)
+        # Alert if 1.5x typical gap has passed (was 2x, now more sensitive)
+        if days_since > typical_gap * 1.5:
+            neglected.append(NeglectedContact(
+                person_id=person_id,
+                person_name=person.canonical_name,
+                days_since_contact=days_since,
+                typical_gap_days=typical_gap,
+                dunbar_circle=circle,
+            ))
+    # Sort by circle (closer first), then by how overdue they are
+    neglected.sort(key=lambda x: (x.dunbar_circle, -(x.days_since_contact / x.typical_gap_days)))
+
+    # 2b. Health Score History (longitudinal) - using "vs. average" approach
+    # Count personal interactions per period, score relative to average.
+    # `time_points` and `health_raw_counts` were already computed above,
+    # alongside top_25_ids, so the SQL bucket query could use them directly.
+    health_score_history = []
 
     # Calculate average for normalization
     if health_raw_counts:
@@ -3752,7 +3790,9 @@ def get_me_interactions(
 def get_me_interactions_span():
     """
     Get the earliest and latest interaction dates, excluding self, hidden,
-    and peripheral people — the same population /me/interactions aggregates.
+    peripheral, and merged-secondary people — the same population
+    /me/interactions aggregates (both use the shared `_me_exclude_ids`
+    helper, #897 review finding 6).
 
     The Me dashboard calls this first to size its heatmap window from the
     actual span of data, instead of requesting a fixed 10 years and shrinking
@@ -3761,9 +3801,7 @@ def get_me_interactions_span():
     person_store = get_person_entity_store()
     interaction_store = get_interaction_store()
 
-    hidden_person_ids = person_store.get_hidden_ids()
-    peripheral_person_ids = person_store.get_ids_where("is_peripheral_contact", 1)
-    exclude_ids = [MY_PERSON_ID] + list(hidden_person_ids) + list(peripheral_person_ids)
+    exclude_ids = _me_exclude_ids(person_store)
 
     earliest, latest = interaction_store.get_span(exclude_person_ids=exclude_ids)
 
@@ -4076,8 +4114,13 @@ def get_family_interactions(
     ]
 
     # ---- Top contacts (last 30 days) ----
+    # `pool_start_date`/`pool_end_date` clip this to the outer `days_back`
+    # window, matching the original algorithm's `all_interactions` pool
+    # (#897 review finding 1 — same fix as /me/interactions). No exact upper
+    # bound: the old `if ts >= thirty_days_ago:` check had none of its own.
     top_counts = interaction_store.get_person_counts(
-        thirty_days_ago, now, person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID], exact=True,
+        thirty_days_ago, None, person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID],
+        exact=True, pool_start_date=start_date, pool_end_date=end_date,
     )
     top_contacts = []
     for person_id, count in sorted(top_counts.items(), key=lambda x: -x[1])[:10]:
@@ -4089,12 +4132,15 @@ def get_family_interactions(
         ))
 
     # ---- Trends (warming and cooling) ----
+    # Same pool-clamping as top_contacts above (#897 review finding 1).
     recent_counts = interaction_store.get_person_counts(
-        trend_recent_start, now, person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID], exact=True,
+        trend_recent_start, None, person_ids=selected_ids, exclude_person_ids=[MY_PERSON_ID],
+        exact=True, pool_start_date=start_date, pool_end_date=end_date,
     )
     previous_counts = interaction_store.get_person_counts(
         trend_previous_start, trend_recent_start, person_ids=selected_ids,
         exclude_person_ids=[MY_PERSON_ID], exact=True, end_inclusive=False,
+        pool_start_date=start_date, pool_end_date=end_date,
     )
     warming = []
     cooling = []

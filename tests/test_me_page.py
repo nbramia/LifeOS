@@ -77,12 +77,14 @@ class TestMeInteractionsEndpoint:
     Python loop over every hydrated Interaction in the window to a single SQL
     GROUP BY query (get_daily_person_source_counts, grouped by day + person +
     source and filtered in Python instead of via a SQL exclude list — see
-    that method's docstring for why), plus small id-restricted
-    get_person_timestamps()/get_all_in_range() calls for widgets that need
-    exact per-interaction timestamps (health score, neglected contacts,
-    tracked relationships). These tests mock those new methods directly; full
-    correctness of the aggregation math itself (identical output to the
-    pre-#871 implementation) is covered by the oracle tests in
+    that method's docstring for why). #897's review follow-up moved the
+    health-score and neglected-contacts widgets to SQL too:
+    get_bucketed_counts (a CASE-per-bucket SUM, replacing a fetch +
+    _bucket_counts_by_period) and get_person_julianday_timestamps (a
+    covering person_id+timestamp query, replacing get_person_timestamps).
+    These tests mock those new methods directly; full correctness of the
+    aggregation math itself (identical output to the pre-#871
+    implementation) is covered by the oracle tests in
     tests/test_me_family_aggregates_oracle.py against a real synthetic DB.
     """
 
@@ -127,6 +129,7 @@ class TestMeInteractionsEndpoint:
         ]
         person_store.get_all.return_value = people
         person_store.get_hidden_ids.return_value = set()
+        person_store.get_merged_secondary_ids.return_value = set()
 
         # Mock interaction store: two imessage interactions with person-1/-2,
         # already reflected as SQL-grouped output rather than raw rows.
@@ -136,7 +139,9 @@ class TestMeInteractionsEndpoint:
             ((now - timedelta(days=2)).strftime('%Y-%m-%d'), "person-2", "imessage", 1),
         ]
         interaction_store.get_person_counts.return_value = {"person-1": 1, "person-2": 1}
-        interaction_store.get_person_timestamps.return_value = []
+        interaction_store.get_bucketed_counts.side_effect = lambda time_points, **kwargs: [0] * len(time_points)
+        interaction_store.get_person_julianday_timestamps.return_value = []
+        interaction_store.get_julianday.return_value = 0.0
         interaction_store.get_all_in_range.return_value = []
         interaction_store.get_first_interaction_dates.return_value = {}
 
@@ -232,13 +237,16 @@ class TestMeInteractionsEndpoint:
             )
         ]
         person_store.get_hidden_ids.return_value = set()
+        person_store.get_merged_secondary_ids.return_value = set()
 
         interaction_store = MagicMock()
         interaction_store.get_daily_person_source_counts.return_value = [
             ((now - timedelta(days=5)).strftime('%Y-%m-%d'), "person-1", "imessage", 1),
         ]
         interaction_store.get_person_counts.return_value = {"person-1": 1}
-        interaction_store.get_person_timestamps.return_value = []
+        interaction_store.get_bucketed_counts.side_effect = lambda time_points, **kwargs: [0] * len(time_points)
+        interaction_store.get_person_julianday_timestamps.return_value = []
+        interaction_store.get_julianday.return_value = 0.0
         interaction_store.get_all_in_range.return_value = []
         interaction_store.get_first_interaction_dates.return_value = {}
 

@@ -647,6 +647,40 @@ def _seed_synthetic_dataset(istore, pstore):
     _add_person(pstore, "p-boundary", "Boundary", category="personal", circle=6, strength=5)
     _add_interaction(istore, "p-boundary", days_ago=30, source_type="whatsapp", tz_offset_hours=-7)
 
+    # P_OLD_FRIEND: personal, circle 4 — interactions older than 365 days,
+    # so a trend_period="year" window (previous bucket 365-730 days ago)
+    # reaching further back than a days_back=365 pool must NOT surface them
+    # (#897 review finding 1's exact repro case: 2 * trend_days > days_back).
+    _add_person(pstore, "p-old-friend", "Old Friend", category="personal", circle=4, strength=30)
+    for days_ago in (400, 420, 450):
+        _add_interaction(istore, "p-old-friend", days_ago=days_ago, source_type="imessage")
+
+    # A "today" interaction, to pin the pre-existing end-date exclusion
+    # quirk (#897 review finding 8): the day-string `<=` bound against
+    # `'<end> 23:59:59'` lexically excludes any row dated exactly on the
+    # end day, so this must never show up in daily/top_contacts/trend
+    # output even though it's within every window tested here.
+    _add_interaction(istore, "p-healthy", days_ago=0, source_type="imessage")
+
+
+def _assert_me_interactions_matches_oracle(result, expected):
+    """Shared field-by-field comparison used by every days_back/trend_period
+    combination TestMeInteractionsOracle exercises."""
+    assert result.total_count == expected["total_count"]
+    assert result.by_source == expected["by_source"]
+    assert result.by_month == expected["by_month"]
+    assert result.by_circle == expected["by_circle"]
+    assert [d.model_dump() for d in result.daily] == expected["daily"]
+    assert _as_set([tc.model_dump() for tc in result.top_contacts]) == _as_set(expected["top_contacts"])
+    assert _as_set([w.model_dump() for w in result.warming]) == _as_set(expected["warming"])
+    assert _as_set([c.model_dump() for c in result.cooling]) == _as_set(expected["cooling"])
+    assert _as_set([n.model_dump() for n in result.neglected_contacts]) == _as_set(expected["neglected_contacts"])
+    assert result.relationship_health_score == expected["relationship_health_score"]
+    assert result.health_score_average == expected["health_score_average"]
+    assert [h.model_dump() for h in result.health_score_history] == expected["health_score_history"]
+    assert result.tracked_relationships == []
+    assert expected["tracked_relationships"] == []
+
 
 class TestMeInteractionsOracle:
     def test_matches_oracle_on_synthetic_dataset(self, monkeypatch, stores):
@@ -660,20 +694,61 @@ class TestMeInteractionsOracle:
         expected = oracle_me_interactions(istore, pstore, MY_PERSON_ID, days_back=365)
         result = get_me_interactions(days_back=365)
 
-        assert result.total_count == expected["total_count"]
-        assert result.by_source == expected["by_source"]
-        assert result.by_month == expected["by_month"]
-        assert result.by_circle == expected["by_circle"]
-        assert [d.model_dump() for d in result.daily] == expected["daily"]
-        assert _as_set([tc.model_dump() for tc in result.top_contacts]) == _as_set(expected["top_contacts"])
-        assert _as_set([w.model_dump() for w in result.warming]) == _as_set(expected["warming"])
-        assert _as_set([c.model_dump() for c in result.cooling]) == _as_set(expected["cooling"])
-        assert _as_set([n.model_dump() for n in result.neglected_contacts]) == _as_set(expected["neglected_contacts"])
-        assert result.relationship_health_score == expected["relationship_health_score"]
-        assert result.health_score_average == expected["health_score_average"]
-        assert [h.model_dump() for h in result.health_score_history] == expected["health_score_history"]
-        assert result.tracked_relationships == []
-        assert expected["tracked_relationships"] == []
+        _assert_me_interactions_matches_oracle(result, expected)
+
+    def test_matches_oracle_when_trend_window_exceeds_days_back_quarter(self, monkeypatch, stores):
+        """#897 review finding 1: days_back=30 with the default
+        trend_period="quarter" (90-day trend windows) means
+        2 * trend_days (180) > days_back (30) — the trend/top-contact
+        queries must clip to the days_back pool exactly like the original
+        Python implementation's `all_interactions` fetch did, not reach
+        further back than days_back on their own."""
+        istore, pstore = stores
+        _seed_synthetic_dataset(istore, pstore)
+
+        monkeypatch.setattr('api.routes.crm.get_interaction_store', lambda: istore)
+        monkeypatch.setattr('api.routes.crm.get_person_entity_store', lambda: pstore)
+        monkeypatch.setattr('api.routes.crm.MY_PERSON_ID', MY_PERSON_ID)
+
+        expected = oracle_me_interactions(
+            istore, pstore, MY_PERSON_ID, days_back=30, trend_period="quarter",
+        )
+        result = get_me_interactions(days_back=30, trend_period="quarter")
+
+        _assert_me_interactions_matches_oracle(result, expected)
+        # p-friend's "previous" trend interactions (100-140 days ago) exist
+        # but are outside the 30-day pool, so they must not count — without
+        # the pool clamp, previous_count would be 5 (cooling); clamped,
+        # it's 0 (warming, since the pool's own 2 recent-window rows still
+        # count). A regression here would mean either the test dataset
+        # stopped exercising the clamp, or the clamp itself broke.
+        friend_warming = next((w for w in result.warming if w.person_id == "p-friend"), None)
+        assert friend_warming is not None, "p-friend should warm once the 90-180 day pool is clipped away"
+        assert friend_warming.previous_count == 0
+        assert not any(c.person_id == "p-friend" for c in result.cooling)
+
+    def test_matches_oracle_when_trend_window_exceeds_days_back_year(self, monkeypatch, stores):
+        """#897 review finding 1's exact reproduction: days_back=365 with
+        trend_period="year" (365-day trend windows) means
+        2 * trend_days (730) > days_back (365) — the "previous" bucket
+        would otherwise reach back to 730 days and pick up p-old-friend's
+        400-450-day-old interactions, which the original algorithm's
+        365-day-bounded pool never contained."""
+        istore, pstore = stores
+        _seed_synthetic_dataset(istore, pstore)
+
+        monkeypatch.setattr('api.routes.crm.get_interaction_store', lambda: istore)
+        monkeypatch.setattr('api.routes.crm.get_person_entity_store', lambda: pstore)
+        monkeypatch.setattr('api.routes.crm.MY_PERSON_ID', MY_PERSON_ID)
+
+        expected = oracle_me_interactions(
+            istore, pstore, MY_PERSON_ID, days_back=365, trend_period="year",
+        )
+        result = get_me_interactions(days_back=365, trend_period="year")
+
+        _assert_me_interactions_matches_oracle(result, expected)
+        assert not any(w.person_id == "p-old-friend" for w in result.warming)
+        assert not any(c.person_id == "p-old-friend" for c in result.cooling)
 
     def test_neglected_contact_identified_correctly(self, monkeypatch, stores):
         """Sanity check on top of the oracle diff: the specific close contact
@@ -738,6 +813,22 @@ class TestMeStatsOracle:
         assert result.total_messages == 70
 
 
+def _assert_family_interactions_matches_oracle(result, expected):
+    """Shared field-by-field comparison for TestFamilyInteractionsOracle."""
+    assert result.selected_ids == expected["selected_ids"]
+    assert result.selected_names == expected["selected_names"]
+    assert result.total_count == expected["total_count"]
+    assert result.by_source == expected["by_source"]
+    assert result.by_month == expected["by_month"]
+    assert [d.model_dump() for d in result.daily] == expected["daily"]
+    assert _as_set([tc.model_dump() for tc in result.top_contacts]) == _as_set(expected["top_contacts"])
+    assert _as_set([w.model_dump() for w in result.warming]) == _as_set(expected["warming"])
+    assert _as_set([c.model_dump() for c in result.cooling]) == _as_set(expected["cooling"])
+    assert result.relationship_health_score == expected["relationship_health_score"]
+    assert result.health_score_average == expected["health_score_average"]
+    assert [h.model_dump() for h in result.health_score_history] == expected["health_score_history"]
+
+
 class TestFamilyInteractionsOracle:
     def test_matches_oracle_on_synthetic_dataset(self, monkeypatch, stores):
         istore, pstore = stores
@@ -751,18 +842,39 @@ class TestFamilyInteractionsOracle:
         expected = oracle_family_interactions(istore, pstore, MY_PERSON_ID, selected_ids, days_back=365)
         result = get_family_interactions(person_ids=",".join(selected_ids), days_back=365)
 
-        assert result.selected_ids == expected["selected_ids"]
-        assert result.selected_names == expected["selected_names"]
-        assert result.total_count == expected["total_count"]
-        assert result.by_source == expected["by_source"]
-        assert result.by_month == expected["by_month"]
-        assert [d.model_dump() for d in result.daily] == expected["daily"]
-        assert _as_set([tc.model_dump() for tc in result.top_contacts]) == _as_set(expected["top_contacts"])
-        assert _as_set([w.model_dump() for w in result.warming]) == _as_set(expected["warming"])
-        assert _as_set([c.model_dump() for c in result.cooling]) == _as_set(expected["cooling"])
-        assert result.relationship_health_score == expected["relationship_health_score"]
-        assert result.health_score_average == expected["health_score_average"]
-        assert [h.model_dump() for h in result.health_score_history] == expected["health_score_history"]
+        _assert_family_interactions_matches_oracle(result, expected)
+
+    def test_matches_oracle_when_trend_window_exceeds_days_back(self, monkeypatch, stores):
+        """#897 review finding 1 also applies to /family/interactions: a
+        trend window longer than half of days_back must clip to the
+        days_back pool, matching the original algorithm's `all_interactions`
+        fetch (bounded to days_back) rather than reaching further back on
+        its own."""
+        istore, pstore = stores
+        _seed_synthetic_dataset(istore, pstore)
+        selected_ids = ["p-friend", "p-old-friend"]
+
+        monkeypatch.setattr('api.routes.crm.get_interaction_store', lambda: istore)
+        monkeypatch.setattr('api.routes.crm.get_person_entity_store', lambda: pstore)
+        monkeypatch.setattr('api.routes.crm.MY_PERSON_ID', MY_PERSON_ID)
+
+        expected = oracle_family_interactions(
+            istore, pstore, MY_PERSON_ID, selected_ids, days_back=30, trend_period="quarter",
+        )
+        result = get_family_interactions(
+            person_ids=",".join(selected_ids), days_back=30, trend_period="quarter",
+        )
+
+        _assert_family_interactions_matches_oracle(result, expected)
+        # p-old-friend has no interactions within 180 days of "now" at all,
+        # so it must never appear in either bucket; p-friend's 100-140-day
+        # "previous" interactions are outside the 30-day pool, so it warms
+        # (2 recent, 0 previous) rather than cools (2 recent, 5 previous).
+        assert not any(w.person_id == "p-old-friend" for w in result.warming)
+        assert not any(c.person_id == "p-old-friend" for c in result.cooling)
+        friend_warming = next((w for w in result.warming if w.person_id == "p-friend"), None)
+        assert friend_warming is not None
+        assert friend_warming.previous_count == 0
 
     def test_gmail_received_not_excluded_unlike_me_dashboard(self, monkeypatch, stores):
         """Family/interactions has no "sent email only" rule — a real

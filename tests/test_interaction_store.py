@@ -1347,48 +1347,157 @@ class TestMeFamilyAggregates:
         )
         assert counts.get("p1") == 1
 
-    # ---- get_person_month_counts ----
+    # ---- get_daily_person_source_counts ----
 
-    def test_get_person_month_counts(self, temp_store):
-        now = datetime.now(timezone.utc)
-        self._add(temp_store, "p1", timestamp=now, source_type="whatsapp")
-        self._add(temp_store, "p1", timestamp=now, source_type="whatsapp")
-        self._add(temp_store, "p1", timestamp=now, source_type="gmail")  # excluded by source filter
-        self._add(temp_store, "p2", timestamp=now, source_type="imessage")
-
-        rows = temp_store.get_person_month_counts(
-            now - timedelta(days=1), now + timedelta(days=1),
-            source_types=["imessage", "whatsapp"],
-        )
-        as_dict = {(month, pid): cnt for month, pid, cnt in rows}
-        month_key = now.strftime('%Y-%m')
-        assert as_dict.get((month_key, "p1")) == 2
-        assert as_dict.get((month_key, "p2")) == 1
-        assert len([r for r in rows if r[1] == "p1"]) == 1  # one grouped row, not two
-
-    # ---- get_person_source_counts ----
-
-    def test_get_person_source_counts(self, temp_store):
+    def test_get_daily_person_source_counts_groups_by_day_person_and_source(self, temp_store):
         now = datetime.now(timezone.utc)
         self._add(temp_store, "p1", timestamp=now, source_type="imessage")
         self._add(temp_store, "p1", timestamp=now, source_type="imessage")
-        self._add(temp_store, "p1", timestamp=now, source_type="gmail")
+        self._add(temp_store, "p1", timestamp=now, source_type="gmail", title="→ Hi")
         self._add(temp_store, "p2", timestamp=now, source_type="phone")
 
-        result = temp_store.get_person_source_counts(now - timedelta(days=1), now + timedelta(days=1))
-        assert result["p1"] == {"imessage": 2, "gmail": 1}
-        assert result["p2"] == {"phone": 1}
+        rows = temp_store.get_daily_person_source_counts(
+            now - timedelta(days=1), now + timedelta(days=1),
+        )
+        as_dict = {(day, pid, source): cnt for day, pid, source, cnt in rows}
+        day_key = now.strftime('%Y-%m-%d')
+        assert as_dict.get((day_key, "p1", "imessage")) == 2
+        assert as_dict.get((day_key, "p1", "gmail")) == 1
+        assert as_dict.get((day_key, "p2", "phone")) == 1
+        # One grouped row for p1's two imessage rows, not two individual rows.
+        assert len([r for r in rows if r[1] == "p1" and r[2] == "imessage"]) == 1
 
-    # ---- get_last_interaction_per_person ----
-
-    def test_get_last_interaction_per_person(self, temp_store):
+    def test_get_daily_person_source_counts_gmail_sent_only(self, temp_store):
         now = datetime.now(timezone.utc)
-        self._add(temp_store, "p1", timestamp=now - timedelta(days=10))
-        self._add(temp_store, "p1", timestamp=now - timedelta(days=1))
-        self._add(temp_store, "p2", timestamp=now - timedelta(days=5))
+        self._add(temp_store, "p1", timestamp=now, source_type="gmail", title="→ Sent")
+        self._add(temp_store, "p1", timestamp=now, source_type="gmail", title="← Received")
 
-        result = temp_store.get_last_interaction_per_person()
-        assert result["p1"] > result["p2"]
+        rows = temp_store.get_daily_person_source_counts(
+            now - timedelta(days=1), now + timedelta(days=1), gmail_sent_only=True,
+        )
+        total = sum(cnt for _, pid, source, cnt in rows if pid == "p1" and source == "gmail")
+        assert total == 1
+
+    # ---- get_person_julianday_timestamps ----
+
+    def test_get_person_julianday_timestamps_restricted_and_covering(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now, source_type="imessage")
+        self._add(temp_store, "p1", timestamp=now - timedelta(days=1), source_type="gmail", title="← Received")
+        self._add(temp_store, "p2", timestamp=now, source_type="imessage")
+
+        rows = temp_store.get_person_julianday_timestamps(
+            now - timedelta(days=2), now + timedelta(days=1), person_ids=["p1"],
+        )
+        # Both of p1's rows returned regardless of source_type (unlike the
+        # health-score path, neglected-contacts considers every interaction
+        # type) and p2 is excluded by person_ids.
+        assert len(rows) == 2
+        assert all(pid == "p1" for pid, _jd in rows)
+        jds = sorted(jd for _pid, jd in rows)
+        # The two interactions are ~1 day apart.
+        assert 0.9 < (jds[1] - jds[0]) < 1.1
+
+    def test_get_person_julianday_timestamps_exclude_person_ids(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now)
+        self._add(temp_store, "p2", timestamp=now)
+
+        rows = temp_store.get_person_julianday_timestamps(
+            now - timedelta(days=1), now + timedelta(days=1),
+            person_ids=["p1", "p2"], exclude_person_ids=["p2"],
+        )
+        assert {pid for pid, _jd in rows} == {"p1"}
+
+    def test_get_julianday_matches_person_julianday_timestamps(self, temp_store):
+        """get_julianday(now) should be directly comparable to (and roughly
+        equal to, for a "now" timestamp) the julianday values
+        get_person_julianday_timestamps returns for a row stored at "now"."""
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now)
+
+        # end_date is a day-string bound (not exact) here, and its own
+        # calendar day is excluded (the documented end-date quirk — see
+        # _range_predicate) — push the upper bound into tomorrow so "now"'s
+        # row isn't sitting on that excluded boundary.
+        rows = temp_store.get_person_julianday_timestamps(
+            now - timedelta(days=1), now + timedelta(days=1), person_ids=["p1"],
+        )
+        assert len(rows) == 1
+        stored_jd = rows[0][1]
+        now_jd = temp_store.get_julianday(now)
+        assert abs(now_jd - stored_jd) < 0.0001  # well under a second
+
+    # ---- get_bucketed_counts ----
+
+    def test_get_bucketed_counts_matches_manual_bucketing(self, temp_store):
+        now = datetime.now(timezone.utc)
+        # One interaction per day for the last 5 days.
+        for days_ago in range(5):
+            self._add(temp_store, "p1", timestamp=now - timedelta(days=days_ago), source_type="imessage")
+
+        # Three time points 2 days apart: buckets are
+        # (points[0]-2d, points[0]], (points[0], points[1]], (points[1], points[2]].
+        points = [now - timedelta(days=4), now - timedelta(days=2), now]
+        counts = temp_store.get_bucketed_counts(points, person_ids=["p1"])
+        assert len(counts) == 3
+        assert sum(counts) == 5  # every interaction falls in exactly one bucket
+
+    def test_get_bucketed_counts_respects_source_types_and_exclusion(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now, source_type="imessage")
+        self._add(temp_store, "p1", timestamp=now, source_type="vault")  # excluded by source_types
+        self._add(temp_store, "p2", timestamp=now, source_type="imessage")  # excluded by exclude_person_ids
+
+        counts = temp_store.get_bucketed_counts(
+            [now], person_ids=["p1", "p2"], exclude_person_ids=["p2"],
+            source_types=["imessage"],
+        )
+        assert counts == [1]
+
+    def test_get_bucketed_counts_empty_time_points(self, temp_store):
+        assert temp_store.get_bucketed_counts([]) == []
+
+    # ---- _range_predicate pool_start_date/pool_end_date (#897 review finding 1) ----
+
+    def test_pool_bounds_clip_an_exact_window_that_extends_before_the_pool(self, temp_store):
+        """
+        Reproduces #897 review finding 1: an exact-mode window (e.g. a trend
+        period) that reaches further back than the outer "pool" window
+        (e.g. days_back) must be clipped to the pool, matching the original
+        Python implementation's `all_interactions` (bounded by days_back)
+        plus a precise per-item comparison within it.
+        """
+        now = datetime.now(timezone.utc)
+        pool_start = now - timedelta(days=10)  # e.g. "days_back=10"
+        exact_start = now - timedelta(days=30)  # e.g. a 30-day trend window
+
+        self._add(temp_store, "p1", timestamp=now - timedelta(days=5))  # inside the pool
+        self._add(temp_store, "p1", timestamp=now - timedelta(days=20))  # before the pool
+
+        # Without pool bounds: both rows count (the exact window alone
+        # reaches back 30 days).
+        unclipped = temp_store.get_person_counts(exact_start, now, exact=True)
+        assert unclipped.get("p1") == 2
+
+        # With pool bounds: only the row inside the pool counts.
+        clipped = temp_store.get_person_counts(
+            exact_start, now, exact=True, pool_start_date=pool_start, pool_end_date=now,
+        )
+        assert clipped.get("p1") == 1
+
+    def test_get_person_counts_no_exact_end_bound(self, temp_store):
+        """end_date=None with exact=True omits the exact upper bound
+        entirely (matching e.g. the original `if ts >= thirty_days_ago:`
+        check, which had no upper cutoff of its own)."""
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now)
+
+        counts = temp_store.get_person_counts(
+            now - timedelta(days=1), None, exact=True,
+            pool_start_date=now - timedelta(days=2), pool_end_date=now + timedelta(days=1),
+        )
+        assert counts.get("p1") == 1
 
     # ---- get_all_in_range: new person_ids restriction ----
 
