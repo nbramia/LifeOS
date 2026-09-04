@@ -1,4 +1,4 @@
-"""Redaction of Telegram bot tokens from log records (#519).
+"""Redaction of secrets and personal data from log records (#519, #904).
 
 The Telegram Bot API embeds the bot token directly in the request path
 (``https://api.telegram.org/bot<digits>:<secret>/<method>``). ``httpx``'s
@@ -22,6 +22,18 @@ Call ``configure_telegram_log_redaction()`` once per process, after the
 process's own root logging setup (``logging.basicConfig`` or equivalent) has
 run — it needs at least one handler already attached to root for the filter
 to have something to attach to.
+
+A third, unrelated filter lives here too for the same reason: uvicorn's own
+access logger (``uvicorn.access``) writes the full request line — path *and*
+query string — for every request, at INFO, regardless of what any route
+handler logs. `#904 <https://github.com/nbramia/LifeOS/issues/904>`_ fixed
+the CRM people-list handler's own log line, but the raw text typed into the
+CRM search box (``GET /api/crm/people?q=<text>``) still reached
+``logs/server.log`` this way — a gap the handler-level fix structurally
+cannot close, since it only ever sees the parsed query parameter, never the
+access logger's own line. ``RequestQueryStringRedactionFilter`` /
+``install_query_string_redaction_filter()`` strip everything from the first
+``?`` onward in that line, for every route, not just this one.
 """
 from __future__ import annotations
 
@@ -95,3 +107,87 @@ def configure_telegram_log_redaction() -> None:
     least one handler)."""
     silence_noisy_http_loggers()
     install_telegram_redaction_filter()
+
+
+# Matches the query string (and the `?` that introduces it) in a request
+# line, e.g. "GET /api/crm/people?q=alex&limit=5 HTTP/1.1" -- everything from
+# `?` up to the next whitespace (the URL itself never contains a literal,
+# unencoded space or `?`).
+QUERY_STRING_PATTERN = re.compile(r"\?\S*")
+
+REDACTED_QUERY_STRING = "?<redacted>"
+
+
+class RequestQueryStringRedactionFilter(logging.Filter):
+    """Strips the query string from uvicorn's access-log request line.
+
+    uvicorn's access logger (``uvicorn.access``) logs the full request line
+    -- including the raw query string -- for every request, independent of
+    anything a route handler itself logs. That's how `q=<search text>` from
+    the CRM people list's search box (personal data: names, partial emails)
+    reaches `logs/server.log` even after the handler's own log line (#904)
+    stops naming it. Never drops a record, only redacts in place.
+
+    #907 review round 2: ``uvicorn.logging.AccessFormatter.formatMessage``
+    does not call ``record.getMessage()`` at all -- it unconditionally
+    unpacks ``record.args`` as a 5-tuple
+    (``client_addr, method, full_path, http_version, status_code``) and
+    rebuilds the request line from those fields. An earlier version of this
+    filter rewrote ``record.msg`` to the redacted line and cleared
+    ``record.args`` to make ``getMessage()`` return the safe string -- which
+    is exactly right for a *generic* ``logging.Formatter``, but broke
+    uvicorn's formatter: unpacking ``()`` into five names raises
+    ``ValueError: not enough values to unpack``, and that exception, not an
+    access line, is what actually reached ``logs/server.log`` (as a 79-line
+    "Logging error" traceback per request). The fix has to redact
+    ``args[2]`` (the piece the formatter actually reads) in place and leave
+    the 5-tuple shape intact. The ``record.msg``-based rewrite is kept only
+    as a fallback for a record that isn't shaped like uvicorn's own
+    access-log call.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str) and "?" in args[2]:
+            path, _, _query = args[2].partition("?")
+            record.args = (args[0], args[1], path + REDACTED_QUERY_STRING, args[3], args[4])
+            return True
+
+        # Fallback: a record not shaped like uvicorn's access-log call (that
+        # call always hits the branch above). Kept belt-and-braces for any
+        # other caller of this filter, formatted the ordinary way via
+        # record.getMessage()/record.msg.
+        try:
+            message = record.getMessage()
+        except Exception:
+            # Don't let a malformed record (bad % args, etc.) break logging.
+            return True
+
+        if "?" in message:
+            record.msg = QUERY_STRING_PATTERN.sub(REDACTED_QUERY_STRING, message, count=1)
+            record.args = ()
+
+        return True
+
+
+def install_query_string_redaction_filter() -> None:
+    """Install `RequestQueryStringRedactionFilter` directly on the
+    `uvicorn.access` logger. Idempotent.
+
+    Not attached via the root logger's handlers (the pattern the Telegram
+    filter above uses): uvicorn's default logging config gives
+    `uvicorn.access` `propagate=False` and its own dedicated handler, so a
+    record logged there never reaches root's handlers at all -- the filter
+    has to sit on the logger itself to see it.
+
+    Call this after `uvicorn.access` has already been configured (uvicorn's
+    own `Config.configure_logging()` runs `logging.config.dictConfig()`,
+    which resets that logger's filters). In the normal startup path
+    (`uvicorn.run("api.main:app", ...)`, as `scripts/server.sh` uses), that
+    dictConfig call happens during `Config.__init__`, strictly before the
+    app string is imported and this module's own `uvicorn.access` logger's
+    filters would be reset -- so this is safe to call at import time here.
+    """
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, RequestQueryStringRedactionFilter) for f in access_logger.filters):
+        access_logger.addFilter(RequestQueryStringRedactionFilter())

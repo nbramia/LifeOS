@@ -8,6 +8,7 @@ Tests are organized by endpoint group:
 - Sync health and status
 - Statistics
 """
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -36,6 +37,44 @@ def sample_person_id(client):
     pytest.skip("No people in database to test")
 
 
+class TestCRMConfig:
+    """Tests for GET /api/crm/config."""
+
+    def test_photos_enabled_reflects_settings_when_false(self, client):
+        """#907 review round 2, finding 2: the server side of #875's
+        photos_enabled field (web/crm.html's loadCRMConfig() reads it to
+        decide whether to ever request an avatar) had no test -- deleting
+        `photos_enabled=settings.photos_enabled` from get_crm_config()
+        left every other test in this repo green, because
+        CRMConfigResponse.photos_enabled defaults to False and this host
+        (at authoring time) had no Photos library configured -- the
+        mutation and the real answer coincided. Forces False explicitly
+        (rather than asserting against whatever settings.photos_enabled
+        happens to be on the machine running the suite, e.g. a Mac with a
+        real Photos library configured) so this pins the False case
+        unconditionally; the next test below forces the True case, so the
+        field can't be silently hardcoded to one value and still pass
+        both."""
+        from unittest.mock import patch, PropertyMock
+        from config.settings import Settings
+
+        with patch.object(Settings, "photos_enabled", new_callable=PropertyMock, return_value=False):
+            response = client.get("/api/crm/config")
+
+        assert response.status_code == 200
+        assert response.json()["photos_enabled"] is False
+
+    def test_photos_enabled_reflects_settings_when_true(self, client):
+        from unittest.mock import patch, PropertyMock
+        from config.settings import Settings
+
+        with patch.object(Settings, "photos_enabled", new_callable=PropertyMock, return_value=True):
+            response = client.get("/api/crm/config")
+
+        assert response.status_code == 200
+        assert response.json()["photos_enabled"] is True
+
+
 class TestPersonEndpoints:
     """Tests for /api/crm/people endpoints."""
 
@@ -48,6 +87,43 @@ class TestPersonEndpoints:
         assert "total" in data
         assert "offset" in data
         assert "count" in data
+
+    def test_get_people_list_has_profile_photo_field(self, client):
+        """#875: every row must carry `has_profile_photo` as a plain bool, so
+        the client can decide whether to request an avatar without probing
+        each person first."""
+        response = client.get("/api/crm/people?limit=50")
+        assert response.status_code == 200
+        people = response.json()["people"]
+        if not people:
+            pytest.skip("No people in database to test")
+        for person in people:
+            assert "has_profile_photo" in person
+            assert isinstance(person["has_profile_photo"], bool)
+
+    def test_person_detail_has_profile_photo_matches_list(self, client):
+        """#875: the detail endpoint must agree with the list endpoint for
+        the same person -- both derive `has_profile_photo` from
+        `person.photo_count` via the same `_person_to_detail_response`
+        helper, so a divergence here would mean one path stopped setting it."""
+        response = client.get("/api/crm/people?limit=20")
+        people = response.json()["people"]
+        if not people:
+            pytest.skip("No people in database to test")
+        for person in people[:10]:
+            detail = client.get(f"/api/crm/people/{person['id']}")
+            assert detail.status_code == 200
+            assert detail.json()["has_profile_photo"] == person["has_profile_photo"]
+
+    def test_list_people_never_logs_the_search_query(self, client, caplog):
+        """#904: the search box's contents are personal data (names, partial
+        emails) -- the list handler's own log line must carry counts and
+        timing only, never the raw `q` (or other filter values)."""
+        distinctive_query = "zzz-synthetic-search-marker-not-a-real-name-9f3c"
+        with caplog.at_level(logging.INFO, logger="api.routes.crm"):
+            response = client.get(f"/api/crm/people?q={distinctive_query}&limit=5")
+        assert response.status_code == 200
+        assert distinctive_query not in caplog.text
 
     def test_get_people_with_search(self, client):
         """GET /people with search query works."""

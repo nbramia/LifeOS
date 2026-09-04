@@ -45,6 +45,8 @@ List/search people with filters.
 - `limit` (int): Results per page (default: 50)
 - `offset` (int): Pagination offset
 
+Each returned person carries `has_profile_photo` (bool, from `photo_count > 0`) alongside the usual fields, so a client can request `GET /api/photos/profile/{id}` only for people flagged true instead of probing everyone (#875). `GET /api/crm/people/{id}` carries the same field for consistency.
+
 ### GET /api/crm/people/{id}
 
 Get person detail with source entities.

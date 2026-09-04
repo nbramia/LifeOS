@@ -103,6 +103,141 @@ class TestTelegramTokenRedactionFilter:
         assert result is True
 
 
+class TestRequestQueryStringRedactionFilter:
+    """#904: uvicorn's own access logger (`uvicorn.access`) logs the full
+    request line -- path and query string -- for every request at INFO,
+    independent of anything a route handler logs. That's how the CRM people
+    list's raw search text (`?q=<text>`) reached `logs/server.log` even
+    after the handler's own log line stopped naming it."""
+
+    def setup_method(self, method):
+        self._access_logger = logging.getLogger("uvicorn.access")
+        self._filters_before = list(self._access_logger.filters)
+
+    def teardown_method(self, method):
+        self._access_logger.filters = self._filters_before
+
+    @staticmethod
+    def _uvicorn_access_record(path_with_query: str) -> logging.LogRecord:
+        """Builds a LogRecord the way uvicorn's h11 protocol implementation
+        actually logs one: `access_logger.info('%s - "%s %s HTTP/%s" %d',
+        client_addr, method, path_with_query_string, http_version, status)`
+        -- msg is the raw format string, args carry the query string, not a
+        pre-formatted message."""
+        return logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg='%s - "%s %s HTTP/%s" %d',
+            args=("127.0.0.1:54644", "GET", path_with_query, "1.1", 200),
+            exc_info=None,
+        )
+
+    def test_redacts_query_string_from_access_log_line(self):
+        from api.services.log_redaction import (
+            RequestQueryStringRedactionFilter,
+            REDACTED_QUERY_STRING,
+        )
+
+        marker = "ZZQMARKER7788"
+        record = self._uvicorn_access_record(
+            f"/api/crm/people?q={marker}&sort=strength&limit=5"
+        )
+        result = RequestQueryStringRedactionFilter().filter(record)
+
+        assert result is True  # never drops the record
+        message = record.getMessage()
+        assert marker not in message
+        assert REDACTED_QUERY_STRING in message
+        # The rest of the request line is still useful for diagnostics.
+        assert "GET /api/crm/people?<redacted> HTTP/1.1" in message
+        assert "200" in message
+
+    def test_redacted_record_survives_uvicorns_actual_access_formatter(self):
+        """#907 review round 2 (BLOCKER): uvicorn.logging.AccessFormatter
+        does not call record.getMessage() at all -- it unconditionally
+        unpacks record.args as a 5-tuple and rebuilds the request line from
+        those fields. An earlier version of this filter rewrote record.msg
+        and cleared record.args to (), which made getMessage() look correct
+        (the test above) while silently breaking that unpack: formatting
+        the record for real raised `ValueError: not enough values to
+        unpack`, which is what production's uvicorn.access logger actually
+        emitted -- a 79-line traceback per request with a query string,
+        not an access line. This test would have caught it; the one above
+        could not, because it never involves the real formatter."""
+        from uvicorn.logging import AccessFormatter
+        from api.services.log_redaction import (
+            RequestQueryStringRedactionFilter,
+            REDACTED_QUERY_STRING,
+        )
+
+        marker = "ZZQMARKER7788"
+        record = self._uvicorn_access_record(
+            f"/api/crm/people?q={marker}&sort=strength&limit=5"
+        )
+        RequestQueryStringRedactionFilter().filter(record)
+
+        # The 5-tuple shape AccessFormatter.formatMessage() unpacks must
+        # survive -- this is the regression guard for the fix itself.
+        assert isinstance(record.args, tuple) and len(record.args) == 5
+
+        # uvicorn's actual default access-log format string (config.py's
+        # LOGGING_CONFIG["formatters"]["access"]["fmt"]).
+        fmt = '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+        formatter = AccessFormatter(fmt, use_colors=False)
+
+        formatted = formatter.format(record)  # must not raise
+
+        assert marker not in formatted
+        assert REDACTED_QUERY_STRING in formatted
+        assert "GET /api/crm/people?<redacted> HTTP/1.1" in formatted
+        assert "200" in formatted
+
+    def test_leaves_query_string_free_requests_untouched(self):
+        from api.services.log_redaction import RequestQueryStringRedactionFilter
+
+        record = self._uvicorn_access_record("/health")
+        RequestQueryStringRedactionFilter().filter(record)
+        assert record.getMessage() == '127.0.0.1:54644 - "GET /health HTTP/1.1" 200'
+
+    def test_does_not_raise_on_bad_percent_args(self):
+        from api.services.log_redaction import RequestQueryStringRedactionFilter
+
+        record = logging.LogRecord(
+            name="uvicorn.access", level=logging.INFO, pathname=__file__, lineno=1,
+            msg="%s %s", args=("only one",), exc_info=None,
+        )
+        result = RequestQueryStringRedactionFilter().filter(record)
+        assert result is True
+
+    def test_install_attaches_filter_to_uvicorn_access_logger(self):
+        from api.services.log_redaction import (
+            install_query_string_redaction_filter,
+            RequestQueryStringRedactionFilter,
+        )
+
+        install_query_string_redaction_filter()
+        assert any(
+            isinstance(f, RequestQueryStringRedactionFilter)
+            for f in self._access_logger.filters
+        )
+
+    def test_install_is_idempotent(self):
+        from api.services.log_redaction import (
+            install_query_string_redaction_filter,
+            RequestQueryStringRedactionFilter,
+        )
+
+        install_query_string_redaction_filter()
+        install_query_string_redaction_filter()
+        count = sum(
+            1 for f in self._access_logger.filters
+            if isinstance(f, RequestQueryStringRedactionFilter)
+        )
+        assert count == 1
+
+
 class TestConfigureTelegramLogRedaction:
     def setup_method(self, method):
         self._root = logging.getLogger()

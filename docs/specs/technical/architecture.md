@@ -23,11 +23,11 @@ api/
 │   ├── calendar.py            # Calendar integration
 │   ├── chat.py                # Streaming chat with agentic pipeline
 │   ├── conversations.py       # Conversation history
-│   ├── crm.py                 # CRM endpoints (~5,100 LOC)
-│   ├── crm_models/            # CRM Pydantic models and helpers
+│   ├── crm.py                 # CRM endpoints + models (~5,100 LOC) -- see below
+│   ├── crm_models/            # NOT wired into the app -- see "CRM Models Package"
 │   │   ├── __init__.py        # Re-exports models and utils
-│   │   ├── models.py          # All Pydantic models (~600 LOC)
-│   │   └── _utils.py          # Shared helper functions
+│   │   ├── models.py          # Unused parallel Pydantic models (~600 LOC)
+│   │   └── _utils.py          # is_family_member() is kept in sync by a test
 │   ├── _proxy.py              # Shared reverse-proxy router factory (agent/hermes)
 │   ├── agent_proxy.py         # Agent text-backend reverse proxy
 │   ├── hermes_proxy.py        # Hermes text-backend reverse proxy + persona envelope
@@ -201,39 +201,29 @@ db_path = get_crm_db_path()  # Returns "data/crm.db"
 
 ## CRM Models Package (api/routes/crm_models/)
 
-The CRM models package consolidates Pydantic models and utilities for the CRM API.
+**Not currently wired into the running API.** The Pydantic models the CRM API
+actually serves — `PersonDetailResponse` (including `has_profile_photo`,
+added in #875), `PersonListResponse`, `TimelineItem`, and the rest — are
+defined directly inside `api/routes/crm.py`, alongside the route handlers
+that use them; `api/main.py` mounts only `crm.router`. `crm_models/` is a
+separate, parallel module tree (`models.py`, `_utils.py`, `__init__.py`)
+that predates or anticipated a split of `crm.py` into smaller files but was
+never finished wiring up — nothing in `api/main.py` or `api/routes/crm.py`
+imports from it.
 
-### Importing Models
+It isn't dead code, though: `api.routes.crm_models._utils.is_family_member`
+is a second, independent implementation of the family-matching logic that
+`api.services.person_entity._is_family_member` also implements for the live
+path, and `tests/test_family_matching.py` exercises both directly so the two
+can't silently drift apart. Anyone touching family-matching rules needs to
+update both. If `crm_models/` is ever finished and wired up (or removed),
+that test and this note both need to move with it.
+
+### Importing the family-matching utility
 
 ```python
-from api.routes.crm_models import (
-    PersonDetailResponse,
-    TimelineItem,
-    NetworkGraphResponse,
-)
+from api.routes.crm_models._utils import is_family_member
 ```
-
-### Importing Utilities
-
-```python
-from api.routes.crm_models import (
-    compute_person_category,
-    person_to_detail_response,
-    MY_PERSON_ID,
-)
-```
-
-### Models Reference
-
-| Category | Models |
-|----------|--------|
-| Person | PersonDetailResponse, PersonListResponse, PersonUpdateRequest, PersonMergeRequest, PersonSplitRequest |
-| Timeline | TimelineItem, TimelineResponse, AggregatedTimelineResponse |
-| Relationships | RelationshipResponse, RelationshipDetailResponse, ConnectionResponse |
-| Network | NetworkNode, NetworkEdge, NetworkGraphResponse |
-| Facts | PersonFactResponse, PersonFactsResponse, FactExtractionResponse |
-| Dashboard | MeStatsResponse, MeInteractionsResponse, FamilyInteractionsResponse |
-| Health | SyncHealthResponse, ReviewQueueResponse |
 
 ---
 
@@ -271,12 +261,13 @@ from api.routes import (
 
 ### CRM Models
 
+`api/routes/crm.py` defines and uses its own response models directly — they
+aren't re-exported for other modules to import. The one thing from
+`api/routes/crm_models/` that another module does import (see [CRM Models
+Package](#crm-models-package-apiroutescrm_models) above):
+
 ```python
-from api.routes.crm_models import (
-    PersonDetailResponse, TimelineItem, NetworkGraphResponse,
-    compute_person_category, person_to_detail_response,
-    MY_PERSON_ID, FAMILY_EXACT_NAMES,
-)
+from api.routes.crm_models._utils import is_family_member
 ```
 
 ---

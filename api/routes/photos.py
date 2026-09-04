@@ -409,12 +409,22 @@ def get_photo_thumbnail(uuid: str):
 
 
 @router.get("/profile/{person_id}")
+@router.head("/profile/{person_id}", include_in_schema=False)
 def get_profile_photo(person_id: str):
     """
     Get a profile photo thumbnail for a person.
 
     Returns the most recent photo of the person that has a thumbnail available.
-    Use this for avatars/profile pictures in the UI.
+    Use this for avatars/profile pictures in the UI. Also accepts HEAD --
+    stacking a `@router.head` registration on the same function (rather than
+    branching on the request method ourselves) lets Starlette's `FileResponse`
+    handle it natively, which gives a `HEAD` response the exact same headers
+    (`etag`, `last-modified`, `content-length`, `accept-ranges`) a `GET` would
+    carry, just without the body -- a hand-rolled `HEAD` branch returning a
+    bare `Response` could not match that (#907 review finding 3). It also
+    avoids FastAPI's "duplicate operation ID" warning that a single
+    `@router.api_route(methods=["GET", "HEAD"])` registration triggers
+    (finding 5), since GET and HEAD are now separate routes.
     """
     _check_photos_enabled()
 
@@ -444,10 +454,12 @@ def get_profile_photo(person_id: str):
                     headers={"Cache-Control": "public, max-age=3600"}  # Cache for 1 hour
                 )
 
-    # No photo available
+    # No photo available. Cache the miss too, so repeated list renders for
+    # people without a photo don't re-request it every time.
     raise HTTPException(
         status_code=404,
-        detail=f"No profile photo available for person {person_id}"
+        detail=f"No profile photo available for person {person_id}",
+        headers={"Cache-Control": "public, max-age=3600"},
     )
 
 
