@@ -16,14 +16,19 @@ shape). `interaction_count` is the number of interactions that went into
 computing the result -- the caller uses it, together with `updated_at`, to
 decide whether a stored month is still fresh.
 
-Known gap (#899 review finding 8): nothing currently deletes a person's
-rows here on merge or delete -- `scripts/merge_people.py` and
-`scripts/cleanup_orphaned_records.py` cover `person_facts`,
-`relationships`, `link_overrides`, and `source_entities`, but not this
-table, so a merged/deleted person's tone rows orphan indefinitely. A prior
-`delete_for_person()` method existed for this but had no caller and was
-removed per AGENTS.md Simplicity; wiring cleanup into one of those scripts
-is a reasonable follow-up rather than in-scope work here.
+Rows for a merged-away or deleted person don't orphan (#910): when two
+people are merged, `scripts/merge_people.py` deletes the absorbed
+person's rows here in the same crm.db transaction it clears
+`person_facts` in -- deliberately *not* re-keyed onto the survivor (a
+re-keyed row could collide with a `period_key` the survivor already has,
+since the primary key here is `(person_id, period_key)`) and deliberately
+leaving the survivor's own rows untouched (unlike `person_facts`, a
+survivor's stale row self-heals via the ordinary interaction-count
+freshness check in `api/routes/crm.py`'s
+`analyze_relationship_tone_detailed` the next time tone analysis runs for
+it, so there's nothing here that needs forcing). `scripts/cleanup_orphaned_records.py`
+separately reports and removes any row whose person id no longer exists
+at all, guarded for installs where this table hasn't been created yet.
 """
 import json
 import logging

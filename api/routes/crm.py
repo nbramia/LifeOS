@@ -1017,6 +1017,7 @@ def merge_people(request: PersonMergeRequest):
             'interactions_updated': 0,
             'source_entities_updated': 0,
             'facts_cleared': 0,
+            'tone_rows_cleared': 0,
             'emails_merged': 0,
             'phones_merged': 0,
             'aliases_added': 0,
