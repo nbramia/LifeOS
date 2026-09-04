@@ -578,10 +578,19 @@ class TestPersonEntityStoreSearchHelpers:
         assert len(store.list_recent(limit=2)) == 2
 
 
+@pytest.mark.slow
 @pytest.mark.integration
 class TestSearchPeopleLatency:
     """#872: GET /api/people/search must stay fast against the production
-    dataset. Skips cleanly on a fresh clone with no data/crm.db."""
+    dataset. Skips cleanly on a fresh clone with no data/crm.db.
+
+    Also marked `slow` (alongside `integration`, matching the pattern in
+    test_query_router.py/test_summarizer.py) purely so the module-level
+    `unit` mark on this file doesn't sweep it into the pre-push hook's
+    `-m "unit and not slow"` gate: a hard wall-clock bound is unreliable
+    there, where pytest-xdist runs ~16 workers in parallel on the same
+    host and contends with this test's own timing.
+    """
 
     def _person_count(self):
         import sqlite3
@@ -608,9 +617,16 @@ class TestSearchPeopleLatency:
         client = TestClient(app)
         client.get("/api/people/search", params={"q": "a"})  # warm
 
-        start = time.perf_counter()
-        resp = client.get("/api/people/search", params={"q": "a"})
-        elapsed_ms = (time.perf_counter() - start) * 1000
+        # Best of several samples (same approach as test_crm_api.py's
+        # _warm_latency_ms) rather than a single call: this host runs many
+        # concurrent agent sessions, and one unlucky sample sharing a CPU
+        # quantum with unrelated work isn't a real regression.
+        samples = []
+        for _ in range(5):
+            start = time.perf_counter()
+            resp = client.get("/api/people/search", params={"q": "a"})
+            samples.append((time.perf_counter() - start) * 1000)
+            assert resp.status_code == 200
+        elapsed_ms = min(samples)
 
-        assert resp.status_code == 200
-        assert elapsed_ms < 200, f"?q=a took {elapsed_ms:.1f}ms, expected under 200ms"
+        assert elapsed_ms < 200, f"?q=a took {elapsed_ms:.1f}ms (best of 5), expected under 200ms"
