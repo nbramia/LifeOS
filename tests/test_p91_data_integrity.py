@@ -9,6 +9,7 @@ Tests must pass before P9.1 can be considered complete.
 NOTE: These tests require direct database access and will be skipped if
 the server is running (database locked). Stop the server to run these tests.
 """
+import math
 import os
 import re
 import sqlite3
@@ -87,19 +88,32 @@ class TestR1CleanDatabase:
 class TestR2EntityResolution:
     """R2: Correct Entity Resolution - People must actually be mentioned in linked notes."""
 
-    # Known unverifiable links, as of the last audit. These are not necessarily
-    # wrong: Granola rewrites note bodies after indexing, so an interaction
-    # created when a name was present can outlive the text that justified it.
-    # The point of the ceiling is to catch *new* bad links without pretending
-    # the existing backlog is clean. Lower it when links are cleaned up.
-    #
-    # The remainder was audited individually: it is dominated by one close
-    # family member appearing across journal and therapy notes that discuss
-    # her without naming her. The links resolution actually got wrong — vault
-    # mentions attached to people whose name is an initial plus a surname,
-    # which matched any extracted name sharing that letter (#551) — were
-    # removed, along with two non-person entities parsed out of note text.
-    MAX_UNVERIFIABLE_LINKS = 28
+    # A vault interaction is unverifiable when its linked person's name isn't
+    # found in the note's text or declared frontmatter. Some unverifiable
+    # links are not necessarily wrong: Granola rewrites note bodies after
+    # indexing, so an interaction created when a name was present can outlive
+    # the text that justified it. The ceiling is expressed as a share of rows
+    # checked, not an absolute count, so it scales with the size of the vault
+    # rather than drifting out of date as the vault grows.
+    UNVERIFIABLE_CEILING_FRACTION = 0.015
+
+    @staticmethod
+    def _unverifiable_ceiling(checked: int) -> int:
+        """Maximum unverifiable links allowed for a given number of checked
+        rows: a fraction of checked rows, rounded up, with a floor of 1."""
+        return max(1, math.ceil(checked * TestR2EntityResolution.UNVERIFIABLE_CEILING_FRACTION))
+
+    @staticmethod
+    def _format_unverifiable_failure(checked: int, unverifiable_ids: list[str], ceiling: int) -> str:
+        """Failure message for the unverifiable-link ceiling: counts plus up
+        to ten offending interaction ids. Never includes names or note
+        content."""
+        return (
+            f"Vault links that cannot be traced to their note rose to "
+            f"{len(unverifiable_ids)} (ceiling {ceiling}) out of {checked} checked. "
+            f"New entity-resolution false positives are the likely cause.\n"
+            + "\n".join(f"  {iid}" for iid in unverifiable_ids[:10])
+        )
 
     @staticmethod
     def _declared_people(content: str) -> list[str]:
@@ -140,7 +154,7 @@ class TestR2EntityResolution:
         store = get_person_entity_store()
         conn = sqlite3.connect(get_interaction_db_path())
         rows = conn.execute("""
-            SELECT person_id, source_id, title FROM interactions
+            SELECT id, person_id, source_id FROM interactions
             WHERE source_type IN ('vault', 'granola')
             AND source_id LIKE '/%'
         """).fetchall()
@@ -150,10 +164,10 @@ class TestR2EntityResolution:
         valid_two_letter_names = {'ed', 'al', 'jo', 'bo', 'ty', 'lu', 'li', 'an'}
 
         content_cache: dict[str, str] = {}
-        unverifiable = []
+        unverifiable_ids: list[str] = []
         checked = 0
 
-        for person_id, source_id, title in rows:
+        for interaction_id, person_id, source_id in rows:
             if not os.path.exists(source_id):
                 continue
             person = store.get_by_id(person_id)
@@ -198,22 +212,13 @@ class TestR2EntityResolution:
             ):
                 continue
 
-            unverifiable.append({
-                'person': person.canonical_name,
-                'file': source_id,
-                'title': title,
-            })
+            unverifiable_ids.append(interaction_id)
 
         assert checked > 0, "No vault interactions found to verify"
 
-        assert len(unverifiable) <= self.MAX_UNVERIFIABLE_LINKS, (
-            f"Vault links that cannot be traced to their note rose to "
-            f"{len(unverifiable)} (ceiling {self.MAX_UNVERIFIABLE_LINKS}) "
-            f"out of {checked} checked. New entity-resolution false positives "
-            f"are the likely cause.\n"
-            + "\n".join(
-                f"  {fp['person']} <- {fp['file']}" for fp in unverifiable[:5]
-            )
+        ceiling = self._unverifiable_ceiling(checked)
+        assert len(unverifiable_ids) <= ceiling, (
+            self._format_unverifiable_failure(checked, unverifiable_ids, ceiling)
         )
 
 class TestR3VaultLinks:

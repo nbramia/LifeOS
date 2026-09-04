@@ -275,6 +275,8 @@ class TestMyPersonIdConstant:
     def test_my_person_id_is_valid_uuid(self):
         """MY_PERSON_ID should be a valid UUID string. Needs a real configured
         settings.my_person_id — empty (not a UUID) in a clean checkout."""
+        if not MY_PERSON_ID:
+            pytest.skip("settings.my_person_id not configured (LIFEOS_MY_PERSON_ID missing from .env)")
         import uuid
         # Should not raise
         uuid.UUID(MY_PERSON_ID)

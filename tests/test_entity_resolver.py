@@ -200,6 +200,12 @@ class TestResolveByName:
         a clean checkout, it falls through to the generic "Work/" branch —
         so this needs a real configured settings.current_work_path.
         """
+        from config.settings import settings
+        if settings.current_work_path in ("", "Work/"):
+            pytest.skip(
+                "settings.current_work_path not configured beyond the generic default "
+                "(LIFEOS_CURRENT_WORK_PATH missing from .env)"
+            )
         # Use Work/ML path which is a known context pattern
         result = populated_resolver.resolve_by_name(
             "New Colleague",
