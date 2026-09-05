@@ -56,9 +56,10 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 
 # Parallelize unit tests across all cores via pytest-xdist. --dist loadscope
-# keeps every test in a module on the same worker, which avoids cross-module
-# ordering surprises from shared singletons. Browser/integration runs stay
-# serial (single shared server + Playwright), so they don't use this.
+# keeps a test class (or a module's top-level functions) on one worker, which
+# avoids ordering surprises from shared singletons within a group.
+# Browser/integration runs stay serial (single shared server + Playwright),
+# so they don't use this.
 PYTEST_PARALLEL=(-n auto --dist loadscope)
 
 # Activate virtual environment (located outside Documents for faster startup)

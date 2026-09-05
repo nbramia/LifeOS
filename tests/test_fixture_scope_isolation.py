@@ -118,3 +118,12 @@ def test_local_ui_driver_fixtures_are_module_scoped(request, fixture_name):
         "loop is torn down at the end of each test file; see the comment above "
         "the overrides) appears to be missing or has regressed."
     )
+    expected_is_generator = _EXPECTED_IS_GENERATOR[fixture_name]
+    actual_is_generator = inspect.isgeneratorfunction(defs[-1].func)
+    assert actual_is_generator == expected_is_generator, (
+        f"tests/conftest.py's `{fixture_name}` override is "
+        f"{'a generator' if actual_is_generator else 'a plain function'} but upstream's "
+        f"fixture is {'a generator' if expected_is_generator else 'a plain function'} -- "
+        "the override must delegate with `yield from` for a generator upstream and "
+        "`return` otherwise, or callers get a generator object instead of the real value."
+    )
