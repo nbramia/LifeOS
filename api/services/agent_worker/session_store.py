@@ -13,6 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 
 # Anchored to the repo root (this file's own location), NOT the caller's
@@ -1712,12 +1713,11 @@ class SessionStore:
         Unlike the main `sessions` table, `cli_sessions.task_id` isn't a
         primary key (a card can be opened, closed, and reopened, each a
         distinct row) — so this is a direct, unbounded query, not a lookup.
-        Added for the Cancel endpoint (#881 AR5): a live cc:/cx: CLI session
-        can't be found via `get()` (that's the `sessions` table, keyed by
-        task_id) or via the 200-row `list_sessions()` snapshot window
-        (`cli_sessions` isn't in that table at all) — Cancel needs to know
-        one exists so it can report it as un-torn-down instead of silently
-        claiming success.
+        A live cc:/cx: CLI session can't be found via `get()` (that's the
+        `sessions` table, keyed by task_id) or via the 200-row
+        `list_sessions()` snapshot window (`cli_sessions` isn't in that
+        table at all) — this is how a caller (Cancel, the board's claim
+        check) finds out one exists at all.
         """
         with self._connect() as conn:
             rows = conn.execute(
@@ -1725,6 +1725,38 @@ class SessionStore:
                 (task_id,),
             ).fetchall()
         return [self._row_to_cli_session(r) for r in rows]
+
+    def has_live_session(
+        self,
+        task_id: str,
+        status: str | None = None,
+        tags: Iterable[str] | None = None,
+    ) -> bool:
+        """True if a non-terminal `sessions` row or a non-`ended`
+        `cli_sessions` row actually backs `task_id` — as opposed to a task
+        whose `status` merely reads `in_progress` with nothing behind it (a
+        vault edit or an API status write can set that with no session at
+        all). The board's claim rule keys its status-derived claim on this,
+        not on status alone (`api.services.agent_board.is_claimed`).
+
+        When `status` and `tags` are both given, short-circuits to `False`
+        without querying anything when `agent_board.status_claim_possible`
+        says the answer can't matter for the claim check anyway — the
+        common case, so a policy read over many cards doesn't pay for a
+        lookup per card.
+        """
+        if status is not None or tags is not None:
+            from api.services import agent_board
+
+            if not agent_board.status_claim_possible(status or "", tags or []):
+                return False
+        target = self.get(task_id)
+        if target is not None and target.status not in TERMINAL_STATUSES:
+            return True
+        for cli in self.list_cli_sessions_for_task(task_id):
+            if cli.status != CLI_STATUS_ENDED:
+                return True
+        return False
 
     @staticmethod
     def _row_to_cli_session(row: sqlite3.Row) -> CliSession:

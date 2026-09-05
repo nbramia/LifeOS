@@ -116,7 +116,7 @@ class TestGetBoard:
         assert card["assignee"] == "me"
 
     def test_agent_owned_card_policy_block_reflects_the_shared_decision_function(self, client, stores):
-        """#881: the card's `policy` block must come from the same
+        """The card's `policy` block comes from the same
         `evaluate_card_action` the write paths enforce — the drawer and
         board read this instead of re-deriving the rules in JS."""
         task_manager, *_ = stores
@@ -129,9 +129,9 @@ class TestGetBoard:
         assert policy["cancel"] == {"allowed": True, "reason": None}
         assert policy["assignee"] == {"allowed": True, "reason": None}
         assert policy["fields"] == {"allowed": True, "reason": None}
-        # (#881 RC5) `lanes` lists ONLY refused lanes now — the allowed
-        # ones (unassigned/assigned) are simply absent, not present-and-
-        # true, matching what onCardDropped already assumes client-side.
+        # `lanes` lists ONLY refused lanes — the allowed ones
+        # (unassigned/assigned) are simply absent, not present-and-true,
+        # matching what onCardDropped already assumes client-side.
         assert "unassigned" not in policy["lanes"]
         assert "assigned" not in policy["lanes"]
         assert policy["lanes"]["in_progress"]["allowed"] is False
@@ -141,11 +141,18 @@ class TestGetBoard:
             "agent-owned cards are managed by the agent — reassign, unassign, "
             "or cancel this card instead"
         )
+        # `scheduled` is refused for every card unconditionally — it's
+        # emitted here too (not just `review`), so a consumer following
+        # "absent means allowed" never has to special-case the one lane no
+        # task can ever land in directly.
+        assert policy["lanes"]["scheduled"] == {
+            "allowed": False, "reason": "lane 'scheduled' cannot be set directly",
+        }
 
     def test_me_assigned_card_policy_block_is_all_allowed(self, client, stores):
-        """#881: a `me`-assigned card is unaffected — every lane, the
-        assignee picker, the field pickers, all allowed; cancel refused
-        (cancel is agent-cards-only)."""
+        """A `me`-assigned card is unaffected — every lane, the assignee
+        picker, the field pickers, all allowed; cancel refused (cancel is
+        agent-cards-only)."""
         task_manager, *_ = stores
         task = task_manager.create("My own task", tags=["me"])
         r = client.get("/api/agents/board")
@@ -159,14 +166,15 @@ class TestGetBoard:
             "allowed": False,
             "reason": "cancel is only available for agent-assigned cards",
         }
-        # (#881 RC5) Positive case: every SETTABLE lane is allowed for a
-        # plain `me` card, so only "review" appears (it 400s "cannot be set
-        # directly" for every card, unconditionally) — not
-        # `{lane: {allowed: true}}` for the other five. This is the direct
-        # proof of RC5's "absence means allowed" contract on the one card
-        # type where every real move really is allowed.
+        # Positive case: every SETTABLE lane is allowed for a plain `me`
+        # card, so only the two every-card-unconditional 400s ("review"
+        # and "scheduled") appear — not `{lane: {allowed: true}}` for the
+        # other five. This is the direct proof of the "absence means
+        # allowed" contract on the one card type where every real move
+        # really is allowed.
         assert policy["lanes"] == {
             "review": {"allowed": False, "reason": "lane 'review' cannot be set directly"},
+            "scheduled": {"allowed": False, "reason": "lane 'scheduled' cannot be set directly"},
         }
 
     def test_claimed_card_policy_block_refuses_everything_but_cancel(self, client, stores):
@@ -572,15 +580,15 @@ class TestMoveBoardCard:
         assert "accepted" in updated.tags
         assert updated.status == "done"
 
-    # -- #881: claimed cards now refuse EVERY lane, not just in_progress/done --
+    # -- claimed cards refuse EVERY lane, not just in_progress/done --
 
     @pytest.mark.parametrize("worker_tag", ["agent-running", "agent-blocked"])
     @pytest.mark.parametrize("target_lane", ["unassigned", "assigned", "human_queue"])
     def test_worker_owned_card_cannot_be_dropped_on_any_lane(
         self, client, stores, worker_tag, target_lane,
     ):
-        """#881 extends round-2 finding 1's In-progress/Done-only guard to
-        every lane — a human could otherwise still silently detach a live
+        """Every lane is refused for a claimed card, not just In progress
+        and Done — a human could otherwise still silently detach a live
         worker task by dragging it to Unassigned, Assigned, or Human queue."""
         task_manager, *_ = stores
         task = task_manager.create("Being worked by the agent", tags=["codex", worker_tag])
@@ -600,16 +608,17 @@ class TestMoveBoardCard:
         updated = task_manager.get(task.id)
         assert sorted(updated.tags) == sorted(["codex", worker_tag])
 
-    # -- #881: an unclaimed agent-owned card also refuses Human queue/Done --
+    # -- an unclaimed agent-owned card also refuses Human queue/Done --
 
     @pytest.mark.parametrize("target_lane", ["human_queue", "done"])
     @pytest.mark.parametrize("engine", ["claude", "codex", "hermes", "local"])
     def test_agent_owned_unclaimed_card_cannot_be_dropped_on_human_queue_or_done(
         self, client, stores, engine, target_lane,
     ):
-        """#881: dragging an unclaimed agent-assigned card straight to Human
-        queue or Done used to silently close or re-route work handed to an
-        agent — now refused; reassign, unassign, or Cancel instead."""
+        """Dragging an unclaimed agent-assigned card straight to Human
+        queue or Done is refused, so work handed to an agent can't be
+        silently closed or re-routed that way; reassign, unassign, or
+        Cancel instead."""
         task_manager, *_ = stores
         task = task_manager.create("Handed to the agent", tags=[engine])
         inbox = task_manager.tasks_dir / "Inbox.md"
@@ -629,8 +638,8 @@ class TestMoveBoardCard:
     def test_agent_owned_unclaimed_card_can_still_be_reassigned_or_unassigned(
         self, client, stores, engine, target_lane,
     ):
-        """#881 leaves this path open — only Human queue/Done and In
-        progress are refused for an unclaimed agent-owned card."""
+        """Only Human queue/Done and In progress are refused for an
+        unclaimed agent-owned card — Unassigned/Assigned stay open."""
         task_manager, *_ = stores
         task = task_manager.create("Handed to the agent", tags=[engine])
         body = {"lane": target_lane}
@@ -700,6 +709,35 @@ class TestCancelBoardCard:
         assert updated.status == "cancelled"
         assert "agent-running" not in updated.tags
 
+    def test_cancel_claimed_bare_agent_card_with_no_assignee_tears_down_and_cancels(
+        self, client, stores, monkeypatch,
+    ):
+        """The no-assignee claimed shape (the worker's own claim swap on a
+        bare `#agent` queue card never adds an engine-specific assignee
+        tag) is still agent-owned — Cancel must work on it exactly like an
+        engine-assigned claimed card, tearing down the live session and
+        marking the task cancelled."""
+        task_manager, _sched, session_store, transcript_store = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("A bare #agent card the worker claimed", tags=["agent", "agent-running"])
+        assert task.tags == ["agent", "agent-running"]  # no assignee tag at all
+        root = session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "cancelled"
+        assert body["lane"] == "done"
+        assert body["killed"] == [root.session_id]
+        assert body["failures"] == []
+        assert session_store.get_by_session_id(root.session_id).status == STATUS_FAILED
+        root_events = transcript_store.read(root.session_id)
+        assert any(e["kind"] == "operator_killed" for e in root_events)
+
+        updated = task_manager.get(task.id)
+        assert updated.status == "cancelled"
+        assert "agent-running" not in updated.tags
+
     def test_cancel_review_card_is_409(self, client, stores):
         task_manager, *_ = stores
         task = task_manager.create("Pending review", tags=["codex", "agent-completed"], status="done")
@@ -739,7 +777,7 @@ class TestCancelBoardCard:
         assert r.status_code == 404
 
     def test_cancel_finds_session_outside_the_snapshot_window(self, client, stores, monkeypatch):
-        """(#881 AR1) The session lookup is a direct primary-key read
+        """The session lookup is a direct primary-key read
         (task_id is the `sessions` table's PRIMARY KEY), not bounded by the
         200-row, most-recently-started window `_build_snapshot`'s
         `list_sessions(limit=200)` uses for display — a session that
@@ -770,7 +808,7 @@ class TestCancelBoardCard:
     def test_cancel_surfaces_a_live_cli_session_as_a_failure_instead_of_silent_success(
         self, client, stores, monkeypatch,
     ):
-        """(#881 AR5) A live cc:/cx: CLI session (opened via the board's
+        """A live cc:/cx: CLI session (opened via the board's
         Open button) lives in the separate `cli_sessions` table, keyed by
         its own session_id, not task_id — Cancel can't tear it down (a
         separate issue), but it must not silently claim a teardown it
@@ -778,7 +816,7 @@ class TestCancelBoardCard:
         session is reported under `failures`."""
         task_manager, _sched, session_store, _transcript = stores
         monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
-        # (#881 AR4) status="in_progress" with no agent-running tag is what
+        # status="in_progress" with no agent-running tag is what
         # cli_session_event leaves behind after Open spawns a session.
         task = task_manager.create("Opened via a CLI session", tags=["codex"], status="in_progress")
         session_store.record_cli_session_event(
@@ -794,6 +832,33 @@ class TestCancelBoardCard:
         assert len(body["failures"]) == 1
         assert body["failures"][0]["session_id"] == "cx:live1"
         assert "cx:live1" in body["failures"][0]["reason"]
+
+    def test_cancel_repeated_after_a_cli_warning_reports_the_same_failure_again(
+        self, client, stores, monkeypatch,
+    ):
+        """A second Cancel call on a card whose CLI session is still open
+        must report that failure again, not `failures: []` — the
+        already-cancelled short-circuit runs AFTER the CLI lookup now, not
+        before it, so a repeat click still tells the operator the CLI
+        session needs closing manually."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Opened via a CLI session", tags=["codex"], status="in_progress")
+        session_store.record_cli_session_event(
+            engine="codex", event="user_prompt_submit", session_id="live1",
+            host="some-host", prompt="do the thing", task_id=task.id,
+        )
+
+        r1 = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r1.status_code == 200
+        assert len(r1.json()["failures"]) == 1
+
+        r2 = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r2.status_code == 200
+        body2 = r2.json()
+        assert body2["killed"] == []
+        assert len(body2["failures"]) == 1
+        assert body2["failures"][0]["session_id"] == "cx:live1"
 
     def test_cancel_ignores_an_already_ended_cli_session(self, client, stores, monkeypatch):
         """Positive case for AR5: a CLI session that already ended must NOT
@@ -815,7 +880,7 @@ class TestCancelBoardCard:
         assert r.json()["failures"] == []
 
     def test_cancel_on_already_cancelled_me_card_is_409_not_idempotent_200(self, client, stores):
-        """(#881 RC2) Ownership must be checked before the idempotence
+        """Ownership must be checked before the idempotence
         short-circuit — a `me` card that somehow already carries
         status="cancelled" (not a state Cancel itself ever produces, since
         it refuses `me` cards) must still 409 for the real reason, not
@@ -827,7 +892,7 @@ class TestCancelBoardCard:
         assert r.json()["detail"] == "cancel is only available for agent-assigned cards"
 
     def test_cancel_on_already_cancelled_review_card_is_409_not_idempotent_200(self, client, stores):
-        """(#881 RC2) Same as above for a pending-review card."""
+        """Same as above for a pending-review card."""
         task_manager, *_ = stores
         task = task_manager.create(
             "A review card, cancelled some other way", tags=["codex", "agent-completed"], status="cancelled",
@@ -837,7 +902,7 @@ class TestCancelBoardCard:
         assert r.json()["detail"] == "accept or reject the review"
 
     def test_cancel_on_already_done_agent_card_is_409(self, client, stores):
-        """(#881 RC2) evaluate_card_action now refuses Cancel on any
+        """evaluate_card_action refuses Cancel on any
         terminal-status agent-owned card, not just an already-cancelled
         one — an accepted/finished card has nothing left to cancel."""
         task_manager, *_ = stores
@@ -850,7 +915,7 @@ class TestCancelBoardCard:
         assert updated.status == "done"  # nothing written
 
     def test_cancel_policy_is_refused_once_the_card_is_already_cancelled(self, client, stores, monkeypatch):
-        """(#881 RC2) `policy.cancel.allowed` must go False once a card is
+        """`policy.cancel.allowed` must go False once a card is
         already cancelled — the drawer's Cancel button must disappear
         instead of staying offered for a pointless second click."""
         task_manager, *_ = stores
@@ -864,7 +929,7 @@ class TestCancelBoardCard:
         assert card["policy"]["cancel"]["allowed"] is False
 
     def test_cancel_skips_teardown_for_already_terminal_session(self, client, stores, monkeypatch):
-        """(#881 RC4) A claimed card whose linked session already reached a
+        """A claimed card whose linked session already reached a
         terminal status (e.g. it finished between the board loading and the
         operator clicking Cancel) must not attempt teardown."""
         task_manager, _sched, session_store, _transcript = stores
@@ -888,7 +953,7 @@ class TestCancelBoardCard:
         assert session_store.get_by_session_id(session.session_id).status == STATUS_COMPLETED
 
     def test_cancel_invalidates_the_board_cache(self, client, stores, monkeypatch):
-        """(#881 RC4) Cancel must invalidate the shared stream-tick board
+        """Cancel must invalidate the shared stream-tick board
         cache like the lane/accept endpoints do, so the very next tick
         reflects the cancellation instead of serving a pre-write board for
         up to `_BOARD_CACHE_TTL` more seconds."""
@@ -900,6 +965,66 @@ class TestCancelBoardCard:
         r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
         assert r.status_code == 200
         assert agents_route._board_cache is None
+
+    def test_cancel_teardown_failure_does_not_write_cancelled_and_reports_stopped_sessions(
+        self, client, stores, monkeypatch,
+    ):
+        """If `_kill_session_subtree` raises partway through (a real
+        teardown failure, distinct from the already-modeled
+        `managed_failure` outcome), Cancel must NOT mark the task
+        cancelled — claiming a cancellation the teardown didn't actually
+        finish would strand a still-running session behind a card that
+        looks done. The error reports what was already stopped."""
+        task_manager, *_ = stores
+        task = task_manager.create("Being worked by the agent", tags=["codex", "agent-running"])
+        session_store = stores[2]
+        session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+
+        async def _raise(*a, **kw):
+            raise agents_route.SubtreeTeardownError(
+                "teardown failed for session sess-abc: boom", killed=["sess-already-stopped"], failures=[],
+            )
+
+        monkeypatch.setattr(agents_route, "_kill_session_subtree", _raise)
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 500
+        assert "sess-already-stopped" in r.json()["detail"]
+        assert "not marked cancelled" in r.json()["detail"]
+        updated = task_manager.get(task.id)
+        assert updated.status != "cancelled"
+        assert "agent-running" in updated.tags
+
+    def test_cancel_write_conflict_after_successful_teardown_invites_a_retry(
+        self, client, stores, monkeypatch,
+    ):
+        """A `TaskConflictError` on the final write, AFTER the session was
+        already torn down, must say the session is already stopped and
+        invite a retry — not the generic conflict text, which would read
+        like an ordinary refusal and hide that the teardown already
+        happened."""
+        from api.services.task_manager import TaskConflictError
+
+        task_manager, *_ = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Being worked by the agent", tags=["codex", "agent-running"])
+        session_store = stores[2]
+        session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+
+        orig_update = task_manager.update
+
+        def _conflict_once(*a, **kw):
+            if kw.get("status") == "cancelled":
+                raise TaskConflictError("too many conflicting writes")
+            return orig_update(*a, **kw)
+
+        monkeypatch.setattr(task_manager, "update", _conflict_once)
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        detail = r.json()["detail"]
+        assert "already stopped" in detail
+        assert "retry" in detail
 
 
 # ---------------------------------------------------------------------------

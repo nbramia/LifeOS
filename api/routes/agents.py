@@ -849,10 +849,10 @@ async def stream_snapshots() -> StreamingResponse:
 _BOARD_STREAM_INTERVAL = 0.5
 
 
-def _card_policy(task) -> dict[str, Any]:
-    """Server-computed policy block for a task card (#881) — the ONLY
-    source of truth for which human moves are allowed on this card. The
-    drawer and the board both read this instead of re-implementing
+def _card_policy(task, session_store: SessionStore) -> dict[str, Any]:
+    """Server-computed policy block for a task card — the ONLY source of
+    truth for which human moves are allowed on this card. The drawer and
+    the board both read this instead of re-implementing
     `agent_board.evaluate_card_action`'s rules in JS, so they can't drift
     out of sync with each other or with the write paths that enforce them
     (the lane endpoint, the cancel endpoint, and the guarded
@@ -860,24 +860,31 @@ def _card_policy(task) -> dict[str, Any]:
     """
     from api.services import agent_board
 
+    has_live = session_store.has_live_session(task.id, status=task.status, tags=task.tags)
+
     def _outcome(action: str, target_lane: str | None = None) -> dict[str, Any]:
-        error = agent_board.evaluate_card_action(task.status, task.tags, action, target_lane)
+        error = agent_board.evaluate_card_action(
+            task.status, task.tags, action, target_lane, has_live_session=has_live,
+        )
         return {"allowed": error is None, "reason": error[1] if error else None}
 
-    # (#881 RC5) `lanes` lists ONLY refused lanes — an absent lane means
-    # allowed, which every client-side reader (`web/agents/board.js`'s
+    # `lanes` lists ONLY refused lanes — an absent lane means allowed,
+    # which every client-side reader (`web/agents/board.js`'s
     # `onCardDropped`/`renderDrawerActions`) already treats it as. Emitting
-    # every lane regardless of outcome was 555-1261 bytes per card that
-    # GET /board/stream re-serializes to compute its change signature every
-    # 0.5s, purely to say "yes" for the common case.
+    # every lane regardless of outcome would be 555-1261 bytes per card
+    # that GET /board/stream re-serializes to compute its change signature
+    # every 0.5s, purely to say "yes" for the common case. Iterates over
+    # every lane including `scheduled` (not just `TASK_LANES`) so a
+    # consumer following "absent means allowed" never has to special-case
+    # the one lane no task can ever land in directly.
     lanes_refused = {
         lane: outcome
-        for lane in agent_board.TASK_LANES
+        for lane in agent_board.LANES
         if not (outcome := _outcome("lane_move", lane))["allowed"]
     }
 
     return {
-        "claimed": agent_board.is_claimed(task.status, task.tags),
+        "claimed": agent_board.is_claimed(task.status, task.tags, has_live),
         "agent_owned": agent_board.is_agent_owned(task.tags),
         "cancel": _outcome("cancel"),
         "assignee": _outcome("assignee_change"),
@@ -887,7 +894,8 @@ def _card_policy(task) -> dict[str, Any]:
 
 
 def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
-                open_question_by_task: dict[str, dict[str, Any]]) -> dict[str, Any]:
+                open_question_by_task: dict[str, dict[str, Any]],
+                session_store: SessionStore) -> dict[str, Any]:
     from api.services import agent_board
 
     candidates = sessions_by_task.get(task.id) or []
@@ -915,7 +923,7 @@ def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
             }
             if pq else None
         ),
-        "policy": _card_policy(task),
+        "policy": _card_policy(task, session_store),
     }
 
 
@@ -963,7 +971,7 @@ def _build_board() -> dict[str, Any]:
     lanes: dict[str, list[dict[str, Any]]] = {lane: [] for lane in agent_board.LANES}
     for task in tasks:
         lane = agent_board.derive_lane(task.status, task.tags)
-        lanes[lane].append(_task_card(task, sessions_by_task, open_question_by_task))
+        lanes[lane].append(_task_card(task, sessions_by_task, open_question_by_task, session_store))
 
     for entry in scheduler_store.list_all():
         bucket = "scheduled" if agent_board.is_schedule_active(entry.enabled, entry.next_trigger_at) else "done"
@@ -1067,7 +1075,11 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
     if task is None:
         raise HTTPException(status_code=404, detail="card not found")
 
-    plan = agent_board.plan_lane_move(task.status, task.tags, body.lane, body.assignee)
+    session_store = _get_session_store()
+    has_live = session_store.has_live_session(card_id, status=task.status, tags=task.tags)
+    plan = agent_board.plan_lane_move(
+        task.status, task.tags, body.lane, body.assignee, has_live_session=has_live,
+    )
     if plan.error is not None:
         status_code, detail = plan.error
         raise HTTPException(status_code=status_code, detail=detail)
@@ -1129,12 +1141,15 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
 
 @router.post("/board/cards/{card_id}/cancel")
 async def cancel_board_card(card_id: str) -> dict[str, Any]:
-    """Cancel an agent-assigned card (#881): kill its live session (and
-    every descendant in its subtree) if one exists, then mark the task
+    """Cancel an agent-assigned card: kill its live session (and every
+    descendant in its subtree) if one exists, then mark the task
     `cancelled`. Available on any agent-assigned card that isn't in
     Review — unlike a lane drag, Cancel works whether or not the worker
-    has claimed the card yet. Idempotent — calling this on an
-    already-cancelled card is a no-op that touches no session.
+    has claimed the card yet. Idempotent for the worker-owned session —
+    calling this again on an already-cancelled card touches no session —
+    but a live cc:/cx: CLI session (see below) is reported as a failure on
+    every call, not just the first, since only the worker-owned session
+    was ever really torn down.
     """
     from api.services import agent_board
     from api.services.task_manager import get_task_manager, TaskConflictError
@@ -1144,11 +1159,11 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
     if task is None:
         raise HTTPException(status_code=404, detail="card not found")
 
-    # (#881 RC2) Ownership/review is checked before the idempotence
-    # short-circuit below — a `me` card or a pending-review card that
-    # somehow already carries status="cancelled" (not a state Cancel
-    # itself ever produces, since it refuses both) must still get its real
-    # refusal reason, not a misleading 200 "no-op cancel" success.
+    # Ownership/review is checked before the idempotence short-circuit
+    # below — a `me` card or a pending-review card that somehow already
+    # carries status="cancelled" (not a state Cancel itself ever produces,
+    # since it refuses both) must still get its real refusal reason, not a
+    # misleading 200 "no-op cancel" success.
     if agent_board.is_review_pending(task.tags):
         raise HTTPException(
             status_code=agent_board.REVIEW_UNRESOLVED_ERROR[0],
@@ -1160,35 +1175,16 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
             detail=agent_board.CANCEL_NOT_AGENT_OWNED_ERROR[1],
         )
 
-    if task.status == "cancelled":
-        lane = agent_board.derive_lane(task.status, task.tags)
-        return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags), "killed": [], "failures": []}
-
-    error = agent_board.evaluate_card_action(task.status, task.tags, "cancel")
-    if error is not None:
-        status_code, detail = error
-        raise HTTPException(status_code=status_code, detail=detail)
-
-    killed: list[str] = []
-    failures: list[dict[str, str]] = []
     session_store = _get_session_store()
 
-    # (#881 AR1) Direct primary-key lookup — `task_id` is the `sessions`
-    # table's PRIMARY KEY — instead of `_build_snapshot()`'s 200-row,
-    # most-recently-started window (what the board's own display uses).
-    # That window silently missed a still-running session older than the
-    # 200 most recent, so Cancel would mark the task cancelled while the
-    # worker kept running and spending (round-1 finding AR1).
-    target = session_store.get(card_id)
-    if target is not None and target.status not in TERMINAL_STATUSES:
-        killed, failures = await _kill_session_subtree(target, "cancelled from the board")
-
-    # (#881 AR5) A live cc:/cx: CLI session (opened via the board's Open
-    # button) lives in the separate `cli_sessions` table, keyed by its own
-    # session_id, not task_id — the lookup above can never find it, and
-    # actually killing a CLI process is a separate issue. Cancel must not
-    # silently claim a teardown it didn't perform, so surface it as a
-    # failure instead (round-1 finding AR5).
+    # A live cc:/cx: CLI session (opened via the board's Open button)
+    # lives in the separate `cli_sessions` table, keyed by its own
+    # session_id, not task_id — actually killing a CLI process is a
+    # separate concern, so this is always a reported failure, never a
+    # teardown. Looked up before the idempotent already-cancelled
+    # short-circuit below (and before the worker-session teardown) so a
+    # repeat Cancel call on a card whose CLI session is still open reports
+    # that failure every time, not just the first.
     try:
         live_cli_sessions = [
             cli for cli in session_store.list_cli_sessions_for_task(card_id)
@@ -1197,14 +1193,59 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — never block cancel on this lookup
         logger.warning("cli_sessions lookup for cancel of %s failed: %s", card_id, exc)
         live_cli_sessions = []
-    for cli in live_cli_sessions:
-        failures.append({
+    cli_failures = [
+        {
             "session_id": cli.session_id,
             "reason": (
                 f"a live {cli.engine} CLI session ({cli.session_id}) is still open "
                 "and can't be killed by Cancel yet — close it manually"
             ),
-        })
+        }
+        for cli in live_cli_sessions
+    ]
+
+    if task.status == "cancelled":
+        lane = agent_board.derive_lane(task.status, task.tags)
+        return {
+            "id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags),
+            "killed": [], "failures": cli_failures,
+        }
+
+    has_live = session_store.has_live_session(card_id, status=task.status, tags=task.tags)
+    error = agent_board.evaluate_card_action(task.status, task.tags, "cancel", has_live_session=has_live)
+    if error is not None:
+        status_code, detail = error
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    killed: list[str] = []
+    subtree_failures: list[dict[str, str]] = []
+
+    # Direct primary-key lookup — `task_id` is the `sessions` table's
+    # PRIMARY KEY — instead of `_build_snapshot()`'s 200-row,
+    # most-recently-started window (what the board's own display uses),
+    # which can silently miss a still-running session older than the 200
+    # most recent and let Cancel mark the task cancelled while the worker
+    # keeps running and spending.
+    target = session_store.get(card_id)
+    if target is not None and target.status not in TERMINAL_STATUSES:
+        try:
+            killed, subtree_failures = await _kill_session_subtree(target, "cancelled from the board")
+        except SubtreeTeardownError as exc:
+            # Teardown genuinely failed partway through — the task is NOT
+            # marked cancelled, since claiming a cancellation the teardown
+            # didn't actually finish would strand a still-running session
+            # behind a card that looks done. Report what was already
+            # stopped so the operator isn't left guessing.
+            stopped = ", ".join(exc.killed) or "none"
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"{exc} — sessions already stopped: {stopped}; the task was "
+                    "not marked cancelled, check session status and retry"
+                ),
+            ) from exc
+
+    failures = subtree_failures + cli_failures
 
     # Strip the tags that would otherwise keep the card out of Done —
     # `derive_lane` ranks Human queue and In progress above Done, so a
@@ -1216,7 +1257,17 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
     try:
         task = task_manager.update(card_id, status="cancelled", tags=new_tags)
     except TaskConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # The session (if any) is already torn down at this point — only
+        # the task write conflicted. Say so and invite a retry, rather
+        # than the generic conflict text, which would read like an
+        # ordinary refusal and hide that the teardown already happened.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"the session was already stopped, but the task update conflicted "
+                f"({exc}) — retry the cancel to finish it"
+            ),
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if task is None:
@@ -1604,12 +1655,29 @@ def _maybe_managed_driver():
         return None
 
 
+class SubtreeTeardownError(Exception):
+    """Raised when `_kill_session_subtree` fails partway through a subtree
+    — an actual exception from `teardown_session` itself, distinct from
+    the already-modeled `managed_failure` outcome (a single member's
+    managed-agent teardown failing in an expected way, which still counts
+    as "handled" and doesn't raise). Carries whatever the loop had already
+    accomplished before the failure — `killed`/`failures` — so a caller
+    like Cancel can report exactly what happened rather than losing that
+    information to a bare exception.
+    """
+
+    def __init__(self, message: str, killed: list[str], failures: list[dict[str, str]]):
+        super().__init__(message)
+        self.killed = killed
+        self.failures = failures
+
+
 async def _kill_session_subtree(target: Session, reason: str) -> tuple[list[str], list[dict[str, str]]]:
     """Tear down `target` and every descendant in its subtree. Target gets
     an `operator_killed` transcript event; descendants get `cascade_killed`.
 
-    Shared by the operator kill endpoint and Cancel (#881) — both need the
-    exact same subtree teardown, so this is the one place it's written.
+    Shared by the operator kill endpoint and Cancel — both need the exact
+    same subtree teardown, so this is the one place it's written.
     Caller is responsible for the `TERMINAL_STATUSES` pre-check; this
     function still no-ops any subtree member that's already terminal by
     the time it runs.
@@ -1644,13 +1712,18 @@ async def _kill_session_subtree(target: Session, reason: str) -> tuple[list[str]
                         "reason": reason,
                         "managed_remote": s.managed_agent_session_id,
                     }
-                result = _teardown(
-                    session_store, transcript_store, s,
-                    transcript_kind=kind,
-                    transcript_payload=payload,
-                    managed_driver=driver,
-                    remote_kill_runner=_remote_kill_runner,
-                )
+                try:
+                    result = _teardown(
+                        session_store, transcript_store, s,
+                        transcript_kind=kind,
+                        transcript_payload=payload,
+                        managed_driver=driver,
+                        remote_kill_runner=_remote_kill_runner,
+                    )
+                except Exception as exc:  # noqa: BLE001 — surfaced as SubtreeTeardownError
+                    raise SubtreeTeardownError(
+                        f"teardown failed for session {s.session_id}: {exc}", killed, failures,
+                    ) from exc
                 killed.append(s.session_id)
                 if result.get("managed_failure"):
                     failures.append({

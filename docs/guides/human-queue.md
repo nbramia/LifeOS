@@ -155,9 +155,9 @@ The **Morning Briefing** proactive reminder's prompt
 `manage_human_queue` (action `list`) and report cards shown as 24h old or
 older, skipping the section when there are none.
 
-If your Morning Briefing scheduler entry was seeded before this section
-existed (or before it was renamed from "Waiting on You" — #881), it won't
-pick up the change on its own. Re-running
+An existing Morning Briefing scheduler entry keeps whatever prompt text it
+was seeded with; it does not pick up an edit to `MORNING_BRIEFING_PROMPT` on
+its own. Re-running
 `scripts/seed_proactive_reminders.py --force` does **not** update it —
 `--force` only skips the by-name existence check, and `SchedulerStore.create`
 always inserts a new entry, so it would leave you with two Morning Briefing

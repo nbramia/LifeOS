@@ -163,11 +163,11 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   const currentHost = fieldValue(card, 'host');
   const ran = card.session || null;
 
-  // (#881) `card.policy` is the server's own decision (see _card_policy in
+  // `card.policy` is the server's own decision (see _card_policy in
   // api/routes/agents.py) — this module never re-derives the rule, it just
   // disables-and-explains. A card with no `policy` at all (a schedule card
-  // never reaches this module; a pre-#881 fixture/caller might) defaults
-  // to allowed, matching every other policy read in the board UI.
+  // never reaches this module) defaults to allowed, matching every other
+  // policy read in the board UI.
   const fieldsPolicy = (card.policy && card.policy.fields) || { allowed: true, reason: null };
   const fieldsDisabled = fieldsPolicy.allowed === false;
 
