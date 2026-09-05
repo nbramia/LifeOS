@@ -532,7 +532,7 @@ GRAPH_SNAPSHOT_RUNNING = {
             "total_output_tokens": 20,
             "total_dollars": 0.01,
             "spawn_depth": 0,
-            "label": "graph-resume-target",
+            "label": "Graph resume target session",
             "custom_label": None,
             "short_label": None,
             "is_subagent": False,
@@ -583,8 +583,8 @@ def _open_graph_panel_on_running_session(page: Page, base_url, pending_stream_ro
     # the Graph tab's static markup is unhidden.
     page.wait_for_selector("#search-input")
     page.select_option("#filter-recency", "all")
-    page.locator("#search-input").fill("graph-resume-target")
-    result = page.locator(".search-result", has_text="graph-resume-target")
+    page.locator("#search-input").fill("resume target session")
+    result = page.locator(".search-result", has_text="resume target session")
     expect(result).to_be_visible()
     result.click()
 
