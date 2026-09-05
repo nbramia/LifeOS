@@ -747,8 +747,16 @@ def build_snapshot(
     limit: int = 200,
     cache_ttl: float = _CACHE_TTL,
     now: float | None = None,
+    live_counts: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Return `(sessions, edges)` for the /agents snapshot. Cached."""
+    """Return `(sessions, edges)` for the /agents snapshot. Cached.
+
+    `live_counts`: see the identical parameter on the Claude Code
+    adapter's `build_snapshot` — pass `{}` to guarantee no row is promoted
+    to `running` by a local process scan (used by the remote transcript
+    mirror). `None` (default) preserves today's behavior: scan local
+    `codex` processes via `live_codex_cwd_counts()`.
+    """
     now_t = now if now is not None else time.time()
     key = _cache_key(sessions_dir, lookback_days)
     if cache_ttl > 0:
@@ -758,7 +766,7 @@ def build_snapshot(
                 return list(entry.sessions), list(entry.edges)
 
     sessions: list[dict[str, Any]] = []
-    cwd_counts = live_codex_cwd_counts(now=now_t)
+    cwd_counts = live_counts if live_counts is not None else live_codex_cwd_counts(now=now_t)
 
     parsed_by_cwd: dict[str, list[SessionMeta]] = {}
     for meta in discover_sessions(sessions_dir, lookback_days=lookback_days, limit=limit, now=now_t):

@@ -866,12 +866,21 @@ def build_snapshot(
     limit: int = 200,
     cache_ttl: float = _CACHE_TTL,
     now: float | None = None,
+    live_counts: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return `(sessions, edges)` for the /agents snapshot. Cached.
 
     Edges include parent→subagent spawn edges. Subagent nodes are synthetic;
     they don't have their own jsonl. The cache is bypassed entirely when
     `cache_ttl <= 0` (no read, no write) so tests get a fresh snapshot.
+
+    `live_counts`: pass a `{cwd: count}` map to use instead of
+    scanning THIS machine's own processes — `{}` guarantees no row is
+    promoted to `running` by a local process scan, which is what the
+    remote transcript mirror needs (a mirrored session never has a
+    process on this host; its liveness must come only from hook events).
+    `None` (the default) preserves today's behavior exactly: scan local
+    `claude` processes via `live_claude_cwd_counts()`.
     """
     now_t = now if now is not None else time.time()
     key = _cache_key(projects_dir, lookback_days)
@@ -884,7 +893,7 @@ def build_snapshot(
     sessions: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     # One process-scan per snapshot tick — shared across every session.
-    cwd_counts = live_claude_cwd_counts(now=now_t)
+    cwd_counts = live_counts if live_counts is not None else live_claude_cwd_counts(now=now_t)
     # First pass: parse every discovered session with mtime-only status.
     # Process-detection promotion is layered on per-cwd below so we don't
     # over-attribute `running` to historical sessions sharing a project dir.

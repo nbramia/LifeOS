@@ -658,6 +658,44 @@
   }
   .panel-resume:hover { background: var(--accent); color: var(--bg-primary); }
   .panel-resume:disabled { opacity: 0.6; cursor: progress; }
+  .panel-resume-host {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 0.7rem;
+    line-height: 1;
+    padding: 0.3rem 0.35rem;
+    border-radius: 4px;
+    float: right;
+    margin-right: 0.5rem;
+    max-width: 9rem;
+  }
+  .resume-command {
+    margin-top: 0.4rem;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .resume-command[hidden] { display: none; }
+  .resume-command code {
+    flex: 1;
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    background: var(--bg-elev);
+    border-radius: 4px;
+    padding: 0.25rem 0.4rem;
+    word-break: break-all;
+  }
+  .resume-command button {
+    font-size: 0.7rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    border-radius: 4px;
+    padding: 0.2rem 0.45rem;
+    cursor: pointer;
+  }
+  .resume-command button:hover { background: var(--accent); color: var(--bg-primary); }
   .panel-focus {
     background: var(--bg-card);
     border: 1px solid var(--text-dim);

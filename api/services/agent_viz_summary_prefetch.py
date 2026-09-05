@@ -123,17 +123,19 @@ async def _summarize_one(session: dict[str, Any]) -> bool:
         if sid.startswith("cc:"):
             from api.routes.agents import _claude_code_enabled
             if _claude_code_enabled():
-                from config.settings import settings
-                from api.services.claude_code import session_ingest as cc
-                events = cc.read_normalized_events(sid, settings.claude_code_projects_dir)
+                # Mirror-aware — a mirrored session's transcript isn't
+                # under the local claude_code_projects_dir; falls back to
+                # each registered host's mirrored copy the same way
+                # /events does.
+                from api.routes.agents import _read_cli_transcript_events
+                events = _read_cli_transcript_events(sid)
             else:
                 events = []
         elif sid.startswith("cx:"):
             from api.routes.agents import _codex_enabled
             if _codex_enabled():
-                from config.settings import settings
-                from api.services.codex import session_ingest as cx
-                events = cx.read_normalized_events(sid, settings.codex_sessions_dir)
+                from api.routes.agents import _read_cli_transcript_events
+                events = _read_cli_transcript_events(sid)
             else:
                 events = []
         else:

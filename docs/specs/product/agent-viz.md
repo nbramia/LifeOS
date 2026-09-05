@@ -141,6 +141,24 @@ A Claude Code or Codex session doesn't have to run on the machine hosting the AP
 
 This is opt-in: the endpoint is disabled (503) until an operator sets `LIFEOS_AGENT_HOOK_TOKEN`, and each machine needs the installer run once plus a small local env file with the API URL and that same token. See [guides/agents-go-to.md](../../guides/agents-go-to.md) for setup.
 
+### Remote session parity
+
+Registration alone gives a remote session status and a prompt preview, but
+not the rest — token counts, dollar cost, tool-call counts, and the
+transcript feed only exist for a jsonl this API host can read off its own
+disk. For every host in the [operator's host registry](../../guides/agent-worker-setup.md#card-assignment-running-a-card-on-another-machine-851),
+a background loop periodically pulls that host's Claude Code and Codex
+transcript files onto this box over ssh (read-only, incremental — see
+[technical/agent-viz.md](../technical/agent-viz.md#remote-transcript-mirror)
+for the mechanism). The ingest scans those mirrored copies alongside the
+local ones, so a remote session reaches full parity with a local one:
+real tokens, cost, tool calls, and a live transcript feed in the drawer,
+merged with the registration event's status the same way a local
+transcript already merges (event status wins; token/cost detail stays
+transcript-derived). A mirrored session's `running` status can only come
+from a registration event, never from a process scan on this machine — a
+transcript existing here doesn't mean the CLI is actually running here.
+
 ---
 
 ## Graph tab — Status semantics
@@ -254,15 +272,33 @@ Resume + Go To are **off by default** because spawning GUI terminals from a syst
 
 A session registered from another host (see "Cross-machine CLI session registration" above) resumes and focuses over ssh when that host is one of the operator's registered hosts (see [Card assignment](../technical/agent-worker.md#card-assignment-851)) — the same launcher runs remotely, so Resume and Go To work wherever the session actually lives. Only a host the operator hasn't registered still 409s: the error names that host, so the operator knows to go there instead of getting a silent no-op or a misleading 404.
 
+### Resume here
+
+Next to Resume, the drawer offers a small host picker listing this API's
+own machine plus every registered host — "resume here" lets the operator
+choose where the session should actually open, regardless of which
+machine it originally ran on:
+
+- Choosing this API's own machine or a registered host launches there over
+  the same mechanism as above (locally, or over ssh), overriding the
+  session's recorded host.
+- Choosing a machine that isn't this API host and isn't registered can't
+  be launched from here — the drawer instead shows the exact resume
+  command (`cd <cwd> && claude --resume <id>` or the Codex equivalent) as
+  copyable text, so the operator can paste it into a terminal on that
+  machine themselves. The command is omitted when the session's cwd
+  can't be resolved — there's nothing to show.
+
 ---
 
 ## Privacy and exposure
 
-- The transcript scan and Resume/Go To/kill primitives only ever touch **this** machine. Cross-machine visibility is opt-in and one-directional: another machine's hook posts a small lifecycle event (host, cwd, branch, status, a truncated prompt preview) to this API — this API never reaches out to, or reads files from, another machine.
+- The Resume/Go To/kill primitives act only on **this** machine and on a registered host over ssh (see below); the local transcript scan reads only this machine's own transcript directories. Cross-machine visibility is otherwise opt-in and one-directional: another machine's hook posts a small lifecycle event (host, cwd, branch, status, a truncated prompt preview) to this API.
+- The transcript mirror is the one path where this API reads files from another machine: for each host in `LIFEOS_AGENT_HOSTS` (empty by default), unless `LIFEOS_AGENT_TRANSCRIPT_MIRROR_ENABLED` is disabled, it pulls that host's Claude Code and Codex transcripts read-only over ssh onto this box. Nothing is ever written back to a remote host.
 - The registration endpoint (`POST /api/agents/cli-sessions/events`) is bearer-token gated and disabled by default (503 until `LIFEOS_AGENT_HOOK_TOKEN` is set) — unlike the kill/resume endpoints below, it's meant to be reachable over Tailscale, since that's the whole point.
 - Transcript payloads are truncated to 240 chars in the feed previews — click an event to see the full payload only on demand. A registered session's prompt preview is truncated to 200 characters at the source.
 - The kill, resume, and pane-bind (`/cc-pane-bind`, `/cx-pane-bind`) endpoints are **local-network only**. They must not be exposed via Tailscale Funnel or the public MCP HTTP transport (the gates live in [api/routes/agents.py](../../../api/routes/agents.py); see the technical spec for the threat model). Resume and Go To act on sessions recorded as running on this API's own host directly, and on a registered host over ssh; a session on an unregistered host returns an error naming that host instead.
-- Claude Code ingest is strictly read-only — LifeOS opens jsonl files for reading and never writes back.
+- Claude Code ingest is strictly read-only — LifeOS opens jsonl files for reading and never writes back, whether the file lives on this machine or in the transcript mirror.
 
 ---
 
@@ -286,6 +322,9 @@ All in `.env`. None are required — the defaults work for the standard LifeOS i
 | `LIFEOS_CODEX_RESUME_CMD` | Codex launcher template. Same substitution surface as `LIFEOS_CC_RESUME_CMD`. | `wezterm cli spawn --cwd {cwd} -- {inner_command}` |
 | `LIFEOS_CODEX_RESUME_INNER_CMD` | Inner command inside the spawned terminal — the actual `codex resume` invocation. | `codex resume {session_id}` |
 | `LIFEOS_AGENT_HOOK_TOKEN` | Bearer token required from `scripts/lifeos-agent-hook.sh` on `POST /api/agents/cli-sessions/events`. Empty (default) disables the endpoint (503) — a fresh clone accepts no cross-machine session data until this is set. | `` |
+| `LIFEOS_AGENT_TRANSCRIPT_MIRROR_ENABLED` | Enable the remote transcript mirror loop. Safe on by default — with no hosts in `LIFEOS_AGENT_HOSTS` it never runs anything. | `true` |
+| `LIFEOS_AGENT_TRANSCRIPT_MIRROR_DIR` | Local directory the mirror writes into, one subdirectory per registered host. A relative path resolves against the repo root, not the process's working directory. | `data/agent-transcript-mirror` |
+| `LIFEOS_AGENT_TRANSCRIPT_MIRROR_INTERVAL_SECONDS` | How often each registered host's transcripts are re-pulled. Each pull is incremental, so a short interval costs little when nothing changed. | `120` |
 
 ---
 
