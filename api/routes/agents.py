@@ -657,7 +657,9 @@ async def set_session_label(session_id: str, body: LabelOverrideRequest) -> dict
     """Set or clear an operator-pinned manual label for a session node.
 
     A non-empty label overrides the auto-derived node name (AI short_label /
-    task description) everywhere it's shown. An empty label clears the
+    task description) everywhere it's shown, unless it equals the session's
+    own raw id (session id, prefix-stripped session id, or task id), which
+    the graph node and search dropdown skip. An empty label clears the
     override and reverts the node to auto-naming. Durable across restarts.
     """
     custom = agent_viz_label_override.set_override(session_id, body.label)

@@ -22,6 +22,13 @@ markup and aren't wired up until `initGraph()` runs.
 (completed + ended), the route filter's `hermes`/`ask` options, and that no
 rendered node label is a literal '?' — using a second synthetic snapshot
 (`SNAPSHOT2`) on a single host so the host filter doesn't interfere.
+
+`TestSearchDropdownRawIdGuard` exercises the search dropdown's raw-id guard
+using a third synthetic snapshot (`SNAPSHOT3`) of sessions whose labels are
+raw identifiers under each of the ways `isRawIdValue` recognizes one.
+`TestSearchDropdownLabelSourcePrecedence` covers `custom_label` precedence
+and the `short_label`/summary match tiers, including a stubbed summary
+search response, using a fourth synthetic snapshot (`SNAPSHOT4`).
 """
 import http.server
 import json
@@ -558,3 +565,325 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
         expect(result).to_be_visible()
         result.click()
         expect(page.locator("#panel [data-field=\"routing\"]")).to_have_text("Hermes")
+
+
+# ---------------------------------------------------------------------------
+# Search-dropdown title guard: the dropdown must never render a raw id
+# (session id, a "cc:"/"cx:"-stripped session id, or task_id) as a result
+# title, on any match tier. Same server-free pattern as above, one host.
+# ---------------------------------------------------------------------------
+
+SNAPSHOT3 = {
+    "sessions": [
+        {
+            "session_id": "sess_rawid_exact",
+            "task_id": "t-exact",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "local",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 5,
+            "total_output_tokens": 5,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "sess_rawid_exact",
+            "short_label": "sess_rawid_exact",
+            "model_label": "Local",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_rawid_task",
+            "task_id": "t-orphan-deleted",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "local",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 5,
+            "total_output_tokens": 5,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "t-orphan-deleted",
+            "short_label": "t-orphan-deleted",
+            "model_label": "Local",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "cc:0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "task_id": None,
+            "status": "running",
+            "status_inferred": False,
+            "routing": "claude_code",
+            "source": "claude_code",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 10,
+            "total_output_tokens": 20,
+            "total_dollars": 0.01,
+            "spawn_depth": 0,
+            "label": "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "short_label": "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "prompt_preview": "fix the synthetic widget parser",
+            "model_label": "Claude Code",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_rawid_human",
+            "task_id": "t-human",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "local",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 5,
+            "total_output_tokens": 5,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "dropdowntest-real-title",
+            "short_label": "",
+            "model_label": "Local",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+    ],
+    "edges": [],
+    "generated_at": 1234567890,
+}
+
+
+def _open_agents3(page: Page, base_url):
+    def handler(route):
+        if "/stream" in route.request.url:
+            route.fulfill(status=200, content_type="text/event-stream", body="")
+            return
+        if "/api/agents/snapshot" in route.request.url:
+            body = SNAPSHOT3
+        elif "/api/agents/board" in route.request.url:
+            body = {"lanes": {}, "generated_at": 0}
+        else:
+            body = {}
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(body))
+
+    page.route("**/api/**", handler)
+    page.goto(f"{base_url}/agents")
+    page.click('[data-tab="graph"]')
+    page.wait_for_selector("#filter-route")
+    page.select_option("#filter-recency", "all")
+    page.locator("#filter-terminal").check()
+    page.wait_for_timeout(400)
+
+
+class TestSearchDropdownRawIdGuard:
+    """The search dropdown's title goes through the same raw-id guard as the
+    graph node: the label tier is the path a stubbed snapshot reaches through
+    `buildSearchResults`, and `nodeLabel` is the single precedence chain."""
+
+    def test_exact_session_id_label_never_titles_the_result(self, page: Page, agents_base_url):
+        _open_agents3(page, agents_base_url)
+        page.locator("#search-input").fill("sess_rawid_exact")
+        result = page.locator(".search-result", has_text="Local")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "Local"
+        assert "sess_rawid_exact" not in title
+
+    def test_task_id_label_never_titles_the_result(self, page: Page, agents_base_url):
+        _open_agents3(page, agents_base_url)
+        page.locator("#search-input").fill("t-orphan")
+        result = page.locator(".search-result", has_text="Local")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "Local"
+        assert "t-orphan-deleted" not in title
+
+    def test_prefix_stripped_id_label_falls_through_to_prompt_preview(self, page: Page, agents_base_url):
+        _open_agents3(page, agents_base_url)
+        page.locator("#search-input").fill("0e6b2c14")
+        result = page.locator(".search-result", has_text="fix the synthetic widget parser")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "fix the synthetic widget parser"
+        assert "0e6b2c14" not in title
+
+    def test_real_label_still_titles_the_result(self, page: Page, agents_base_url):
+        _open_agents3(page, agents_base_url)
+        page.locator("#search-input").fill("dropdowntest-real")
+        result = page.locator(".search-result", has_text="dropdowntest-real-title")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "dropdowntest-real-title"
+
+    def test_no_result_title_is_ever_id_shaped(self, page: Page, agents_base_url):
+        _open_agents3(page, agents_base_url)
+        page.locator("#search-input").fill("e")
+        results = page.locator(".search-result")
+        expect(results).to_have_count(4)
+        titles = results.locator(".sr-name").all_inner_texts()
+
+        raw_ids = {
+            "sess_rawid_exact", "sess_rawid_task",
+            "cc:0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "sess_rawid_human",
+            "t-exact", "t-orphan-deleted", "t-human",
+        }
+        assert all(title not in raw_ids for title in titles)
+        assert set(titles) == {"Local", "fix the synthetic widget parser", "dropdowntest-real-title"}
+
+
+def _bare_session(session_id, task_id, **overrides):
+    base = {
+        "session_id": session_id,
+        "task_id": task_id,
+        "status": "running",
+        "status_inferred": False,
+        "routing": "local",
+        "source": "lifeos_agent",
+        "host": "host-1",
+        "started_at": 1000,
+        "last_activity_at": 2000,
+        "total_input_tokens": 5,
+        "total_output_tokens": 5,
+        "total_dollars": 0.0,
+        "spawn_depth": 0,
+        "label": "",
+        "short_label": "",
+        "model_label": "Local",
+        "decoded_cwd": "/home/synthetic/proj-a",
+    }
+    base.update(overrides)
+    return base
+
+
+SNAPSHOT4 = {
+    "sessions": [
+        _bare_session(
+            "custlblid-001", "task-001",
+            custom_label="custlblid-001",
+        ),
+        _bare_session(
+            "sess-custom-real", "task-002",
+            custom_label="dropdowntest-custom-name",
+            label="dropdowntest-stale-label",
+        ),
+        _bare_session(
+            "sess-shortlabel-distinct", "task-003",
+            label="dropdowntest-long-label",
+            short_label="dropdowntest-short",
+        ),
+        _bare_session(
+            "sess-rawid-shortlabel-only", "task-004",
+            short_label="sess-rawid-shortlabel-only",
+        ),
+        _bare_session(
+            "sess-summary-match-only", "task-005",
+        ),
+        _bare_session(
+            "sess-shortlabel-vs-custom", "task-006",
+            custom_label="dropdowntest-operator-name",
+            label="dropdowntest-ingest-name",
+            short_label="dropdowntest-llm-short",
+        ),
+    ],
+    "edges": [],
+    "generated_at": 1234567890,
+}
+
+
+def _open_agents4(page: Page, base_url, search_matches=None):
+    def handler(route):
+        if "/stream" in route.request.url:
+            route.fulfill(status=200, content_type="text/event-stream", body="")
+            return
+        if "/api/agents/snapshot" in route.request.url:
+            body = SNAPSHOT4
+        elif "/api/agents/board" in route.request.url:
+            body = {"lanes": {}, "generated_at": 0}
+        elif "/api/agents/search" in route.request.url:
+            body = {"matches": search_matches or []}
+        else:
+            body = {}
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(body))
+
+    page.route("**/api/**", handler)
+    page.goto(f"{base_url}/agents")
+    page.click('[data-tab="graph"]')
+    page.wait_for_selector("#filter-route")
+    page.select_option("#filter-recency", "all")
+    page.locator("#filter-terminal").check()
+    page.wait_for_timeout(400)
+
+
+class TestSearchDropdownLabelSourcePrecedence:
+    """The label-tier title comes from the matched field's own value
+    (`custom_label || label`), guarded by `isRawIdValue` the same way the
+    node's `custom_label` slot is, and distinct from `sessionDisplayName`
+    (`nodeLabel`)'s separate precedence order — using a fourth synthetic
+    snapshot (`SNAPSHOT4`) built for these cases specifically."""
+
+    def test_custom_label_equal_to_session_id_never_titles_the_result(self, page: Page, agents_base_url):
+        _open_agents4(page, agents_base_url)
+        page.locator("#search-input").fill("custlblid-001")
+        result = page.locator(".search-result", has_text="Local")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "Local"
+        assert "custlblid-001" not in title
+
+    def test_custom_label_wins_over_stale_label_in_label_tier_title(self, page: Page, agents_base_url):
+        _open_agents4(page, agents_base_url)
+        page.locator("#search-input").fill("dropdowntest-custom")
+        result = page.locator(".search-result", has_text="dropdowntest-custom-name")
+        expect(result).to_be_visible()
+        name_el = result.locator(".sr-name")
+        assert name_el.inner_text() == "dropdowntest-custom-name"
+        assert "dropdowntest-stale-label" not in name_el.inner_text()
+        assert name_el.locator("mark").count() > 0
+
+    def test_label_tier_title_uses_matched_fields_own_value_not_short_label(self, page: Page, agents_base_url):
+        _open_agents4(page, agents_base_url)
+        page.locator("#search-input").fill("dropdowntest-long")
+        result = page.locator(".search-result", has_text="dropdowntest-long-label")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "dropdowntest-long-label"
+        assert title != "dropdowntest-short"
+
+    def test_short_label_and_summary_tier_titles_are_guarded_via_stubbed_search(self, page: Page, agents_base_url):
+        matches = [
+            {"session_id": "sess-rawid-shortlabel-only", "field": "short_label", "snippet": "rawid short label match"},
+            {"session_id": "sess-summary-match-only", "field": "summary", "snippet": "a synthetic summary match"},
+        ]
+        _open_agents4(page, agents_base_url, search_matches=matches)
+        page.locator("#search-input").fill("zz")
+        page.wait_for_timeout(400)
+        results = page.locator(".search-result")
+        expect(results).to_have_count(2)
+        titles = results.locator(".sr-name").all_inner_texts()
+        badges = results.locator(".sr-badge").all_inner_texts()
+        assert all(title == "Local" for title in titles)
+        assert "sess-rawid-shortlabel-only" not in titles
+        assert {b.lower() for b in badges} == {"label", "summary"}
+
+    def test_short_label_tier_title_uses_short_label_not_display_name(self, page: Page, agents_base_url):
+        matches = [
+            {"session_id": "sess-shortlabel-vs-custom", "field": "short_label", "snippet": "llm short label match"},
+        ]
+        _open_agents4(page, agents_base_url, search_matches=matches)
+        page.locator("#search-input").fill("llm-short")
+        page.wait_for_timeout(400)
+        result = page.locator(".search-result", has_text="dropdowntest-llm-short")
+        expect(result).to_be_visible()
+        name_el = result.locator(".sr-name")
+        assert name_el.inner_text() == "dropdowntest-llm-short"
+        assert name_el.inner_text() != "dropdowntest-operator-name"
+        assert name_el.locator("mark").count() > 0

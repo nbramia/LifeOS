@@ -298,7 +298,7 @@ export function initGraph() {
     };
   }
 
-  // Shared by `nodeLabel` and `sessionDisplayName` below — a raw identifier
+  // Shared by `nodeLabel` and `searchResultTitle` below — a raw identifier
   // (the session id itself, that id with a known CLI prefix ("cc:"/"cx:")
   // stripped, or the row's task_id)
   // is never a real label, wherever it might render: the graph node, or
@@ -320,8 +320,8 @@ export function initGraph() {
   }
 
   function nodeLabel(d) {
-    // Precedence, first non-empty wins. `label` and `short_label` are
-    // each skipped when they're not a human label but the raw identifier
+    // Precedence, first non-empty wins. `custom_label`, `short_label`, and
+    // `label` are each skipped when they're not a human label but the raw identifier
     // the row fell back to (`isRawIdValue` above) — since both ingests and
     // `_label_for_session` fall back to exactly that raw id when there's no
     // real title, and `_fallback_label` (agent_viz_summary.py) can cache
@@ -329,7 +329,7 @@ export function initGraph() {
     // precedence list, so it needs the identical guard or the raw id leaks
     // through one slot higher. Never emits '?'.
     const candidates = [
-      d.custom_label,
+      isRawIdValue(d, d.custom_label) ? '' : d.custom_label,
       isRawIdValue(d, d.short_label) ? '' : d.short_label,
       isRawIdValue(d, d.label) ? '' : d.label,
       d.prompt_preview,
@@ -646,23 +646,17 @@ export function initGraph() {
   const SEARCH_BADGE = { label: 'name', short_label: 'label', summary: 'summary' };
 
   function sessionDisplayName(s) {
-    // Same raw-id guard `nodeLabel` uses — this feeds the search-results
-    // sort order and (via `renderSearchResults` below) the dropdown title
-    // whenever the matched field isn't rendered from its own raw value.
-    // Not independently browser-testable through `#search-input` today:
-    // `buildSearchResults`'s 'label' tier only matches when
-    // `custom_label || label` is truthy, and `renderSearchResults` then
-    // renders that same truthy `label` directly
-    // (`r.session.label || sessionDisplayName(r.session)`) rather than
-    // through this function — so a search that matches on a raw-id
-    // `label` never reaches this guard in the first place, a gap in
-    // `renderSearchResults` itself that this function's guard does not
-    // cover. This function's guard covers the paths that DO route through
-    // it: the dropdown's sort comparator, and any title that falls through
-    // because the matched field's own value is empty.
-    const shortLabel = isRawIdValue(s, s.short_label) ? '' : s.short_label;
-    const label = isRawIdValue(s, s.label) ? '' : s.label;
-    return s.custom_label || shortLabel || label || s.session_id.slice(0, 8);
+    // The dropdown's display name is the node's label: one precedence chain
+    // (`nodeLabel`, with its `isRawIdValue` guard), so the dropdown cannot
+    // show an id the node refuses.
+    return nodeLabel(s);
+  }
+
+  // Title for a dropdown result: the matched field's own value, unless that
+  // value is a raw id (`isRawIdValue`) — then the display name.
+  function searchResultTitle(s, field) {
+    const own = field === 'label' ? (s.custom_label || s.label) : field === 'short_label' ? s.short_label : '';
+    return (isRawIdValue(s, own) ? '' : own) || sessionDisplayName(s);
   }
 
   function highlightMatch(text, q) {
@@ -721,9 +715,7 @@ export function initGraph() {
       if (labelText) html += `<div class="search-group-label">${labelText}</div>`;
       html += `<div class="search-group ${groupClass}">`;
       for (const r of items) {
-        const titleText = r.field === 'label' ? (r.session.label || sessionDisplayName(r.session))
-          : r.field === 'short_label' ? (r.session.short_label || sessionDisplayName(r.session))
-          : sessionDisplayName(r.session);
+        const titleText = searchResultTitle(r.session, r.field);
         const snippetHtml = r.field === 'summary'
           ? `<div class="sr-snippet">${highlightMatch(r.snippet, q)}</div>`
           : '';
