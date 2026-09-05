@@ -361,6 +361,46 @@ def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
     }
 
 
+def _read_cli_transcript_events(session_id: str) -> list[dict[str, Any]]:
+    """Normalized events for a `cc:`/`cx:` session.
+
+    Tries the local transcript root first, then each mirrored remote
+    host's copy in turn — the first non-empty
+    result wins. Used by `/events`, `/stream`, `/summary`, and the viz
+    prefetcher so a mirrored session's transcript reads identically to a
+    local one. Raises `ValueError` (mirrors `read_normalized_events`) for
+    an id that fails validation or carries neither prefix.
+    """
+    from config.settings import settings
+    from api.services import agent_transcript_mirror as mirror
+
+    if session_id.startswith("cc:"):
+        from api.services.claude_code import session_ingest as cc
+
+        events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+        if events:
+            return events
+        for host_dir in mirror.mirrored_transcript_dirs("claude_code"):
+            events = cc.read_normalized_events(session_id, host_dir)
+            if events:
+                return events
+        return []
+
+    if session_id.startswith("cx:"):
+        from api.services.codex import session_ingest as cx
+
+        events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+        if events:
+            return events
+        for host_dir in mirror.mirrored_transcript_dirs("codex"):
+            events = cx.read_normalized_events(session_id, host_dir)
+            if events:
+                return events
+        return []
+
+    raise ValueError(f"unsupported session_id prefix: {session_id!r}")
+
+
 def _build_snapshot() -> dict[str, Any]:
     session_store = _get_session_store()
     transcript_store = _get_transcript_store()
@@ -436,6 +476,81 @@ def _build_snapshot() -> dict[str, Any]:
     session_dicts.extend(cx_sessions)
     edges.extend(cx_edges)
 
+    # Mirrored remote transcripts: merge alongside the local cc/cx
+    # rows above. A session already present from a LOCAL transcript wins on
+    # id collision — a mirror lags behind by up to one interval, so if this
+    # host somehow has both, the fresher local copy is preferred. Popping a
+    # match from cli_by_id here (like the cc/cx blocks above) means status
+    # comes from hook events and detail from the mirrored transcript; with
+    # no hook row the mirrored row's own `host` (the remote host name) is
+    # left untouched rather than overwritten with this API host's name.
+    try:
+        from api.services import agent_transcript_mirror
+        mirrored_cc, mirrored_cx, mirrored_edges = agent_transcript_mirror.mirrored_snapshot()
+    except Exception as exc:  # noqa: BLE001 — never break the snapshot on a mirror failure
+        logger.warning("mirrored transcript snapshot failed: %s", exc)
+        mirrored_cc, mirrored_cx, mirrored_edges = [], [], []
+
+    local_ids = {sd.get("session_id") for sd in session_dicts}
+    # Ids the mirrored merge loop below actually APPENDED a row for, mapped
+    # to the SOURCE HOST that row came from. A mirrored edge (below) is kept
+    # only when both its endpoints are ids appended here AND both came from
+    # the same host's batch: a local id collision leaves that id pointing at
+    # the local row, not the mirrored one an edge was derived from, and two
+    # different mirrored hosts can carry the same parent session id — so the
+    # host is recorded per id rather than tracked as flat membership alone.
+    appended_mirrored_host_by_id: dict[str, str] = {}
+    for sd in (*mirrored_cc, *mirrored_cx):
+        sid = sd.get("session_id") or ""
+        if not sid or sid in local_ids:
+            continue
+        sd.setdefault(
+            "short_label",
+            _short_label_for_snapshot(
+                sid,
+                sd.get("last_activity_at") or 0.0,
+                sd.get("status") or "",
+            ),
+        )
+        sd["custom_label"] = agent_viz_label_override.get_override(sid)
+        # Capture the mirror's own source host BEFORE the hook overlay below
+        # can rewrite `sd["host"]` to the hook-reported hostname — a
+        # subagent row has no hook row of its own, so it keeps the mirror
+        # directory's host, and comparing that against a parent's
+        # hook-overlaid host would falsely disagree whenever the registry
+        # key differs from the remote machine's actual hostname.
+        source_host = sd.get("host") or ""
+        cli = cli_by_id.pop(sid, None)
+        if cli is not None:
+            _apply_cli_session_to_dict(sd, cli)
+        session_dicts.append(sd)
+        local_ids.add(sid)
+        appended_mirrored_host_by_id[sid] = source_host
+
+    # Extend edges with the mirrored hosts' own parent-subagent spawn
+    # edges — the local cc/cx blocks above already do this
+    # (`edges.extend(cc_edges)` / `edges.extend(cx_edges)`); this does the
+    # same for the mirrored merge. An edge survives only when both endpoints
+    # were appended by the loop above AND both came from the same host's
+    # batch (`appended_mirrored_host_by_id`): a local id collision leaves
+    # that id pointing at the local row rather than the mirrored one the
+    # edge came from, and a session id can be present on two different
+    # mirrored hosts at once, so matching on id alone is not sufficient.
+    # Also dedupe on `(from, to, type)`: a session mirrored from two hosts,
+    # or an id collision, can otherwise emit the identical spawn edge twice.
+    seen_mirrored_edges: set[tuple[Any, Any, Any]] = set()
+    for e in mirrored_edges:
+        frm, to = e.get("from"), e.get("to")
+        frm_host = appended_mirrored_host_by_id.get(frm)
+        to_host = appended_mirrored_host_by_id.get(to)
+        if frm_host is None or to_host is None or frm_host != to_host:
+            continue
+        key = (frm, to, e.get("type"))
+        if key in seen_mirrored_edges:
+            continue
+        seen_mirrored_edges.add(key)
+        edges.append(e)
+
     # Whatever's left in cli_by_id had no local transcript — a remote host,
     # or (rarely) a local hook post that raced ahead of the transcript
     # scan's cache. Bound to the same recency window the transcript scan
@@ -467,6 +582,11 @@ def _build_snapshot() -> dict[str, Any]:
         "sessions": session_dicts,
         "edges": edges,
         "generated_at": int(time.time()),
+        # So the drawer's "resume here" host picker can offer THIS
+        # machine even when `GET /api/agents/hosts` isn't reachable —
+        # every page already polls /snapshot, so no extra request is
+        # needed for the frontend's fallback list.
+        "api_host": api_host_name(),
     }
 
 
@@ -541,10 +661,7 @@ async def get_session_events(
         if not _claude_code_enabled():
             raise HTTPException(status_code=404, detail="claude_code viz disabled")
         try:
-            from config.settings import settings
-            from api.services.claude_code import session_ingest as cc
-
-            events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+            events = _read_cli_transcript_events(session_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         tail = events[-limit:] if len(events) > limit else events
@@ -554,10 +671,7 @@ async def get_session_events(
         if not _codex_enabled():
             raise HTTPException(status_code=404, detail="codex viz disabled")
         try:
-            from config.settings import settings
-            from api.services.codex import session_ingest as cx
-
-            events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+            events = _read_cli_transcript_events(session_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         tail = events[-limit:] if len(events) > limit else events
@@ -592,16 +706,23 @@ async def get_session_summary(session_id: str) -> dict[str, Any]:
         if not _claude_code_enabled():
             raise HTTPException(status_code=404, detail="claude_code viz disabled")
         try:
-            from config.settings import settings
-            from api.services.claude_code import session_ingest as cc
-
-            events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+            events = _read_cli_transcript_events(session_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         # Find this CC session in the cached snapshot to pull label + activity.
         cc_sessions, _ = _claude_code_snapshot()
         match = next((s for s in cc_sessions if s.get("session_id") == session_id), None)
+        if match is None:
+            # Not a local transcript — check every mirrored host too, so a
+            # remote session's summary still gets a real label/status
+            # instead of falling back to the bare session_id below.
+            try:
+                from api.services import agent_transcript_mirror
+                mirrored_cc, _mirrored_cx, _mirrored_edges = agent_transcript_mirror.mirrored_snapshot()
+                match = next((s for s in mirrored_cc if s.get("session_id") == session_id), None)
+            except Exception as exc:  # noqa: BLE001 — summary still works with defaults
+                logger.warning("mirrored snapshot lookup failed for %s: %s", session_id, exc)
         if match:
             label = str(match.get("label") or session_id)
             last_activity = float(match.get("last_activity_at") or 0.0)
@@ -610,15 +731,19 @@ async def get_session_summary(session_id: str) -> dict[str, Any]:
         if not _codex_enabled():
             raise HTTPException(status_code=404, detail="codex viz disabled")
         try:
-            from config.settings import settings
-            from api.services.codex import session_ingest as cx
-
-            events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+            events = _read_cli_transcript_events(session_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         cx_sessions, _ = _codex_snapshot()
         match = next((s for s in cx_sessions if s.get("session_id") == session_id), None)
+        if match is None:
+            try:
+                from api.services import agent_transcript_mirror
+                _mirrored_cc, mirrored_cx, _mirrored_edges = agent_transcript_mirror.mirrored_snapshot()
+                match = next((s for s in mirrored_cx if s.get("session_id") == session_id), None)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("mirrored snapshot lookup failed for %s: %s", session_id, exc)
         if match:
             label = str(match.get("label") or session_id)
             last_activity = float(match.get("last_activity_at") or 0.0)
@@ -1416,6 +1541,10 @@ class CCResumeRequest(BaseModel):
     """Body for POST /api/agents/sessions/{id}/resume — accepts overrides
     for the spawn env when the systemd-inherited env isn't enough."""
     extra_env: dict[str, str] = {}
+    # "Resume here": an explicit target machine, overriding the
+    # session's recorded host. Blank/unset resumes where the session ran.
+    # See `_resolve_target_host`.
+    target_host: str | None = Field(default=None, max_length=255)
 
 
 class CCPaneBindRequest(BaseModel):
@@ -1903,6 +2032,121 @@ def _check_session_host_or_409(session_id: str) -> str | None:
     return target
 
 
+def _resume_command_text(session_id: str) -> str:
+    """Render the exact resume command for `session_id`, cwd-portable
+    (`cd <cwd> && ...`) so it's paste-able into any terminal.
+
+    Called from THREE sites: `_resolve_target_host`'s 400 `detail.command`
+    field, for a target the operator picked that this API can't launch on
+    itself; and the codex and Claude Code launchers' own 400 branches,
+    when `Popen`'s child `os.chdir` fails because the
+    resolved cwd doesn't exist/isn't a directory/isn't accessible on this
+    host. The launchers still build their own `inner_rendered`
+    independently for their SUCCESS path, and the renderings differ: this
+    function prepends `cd <cwd> && `, theirs doesn't. Do not refactor the
+    launchers' success-path rendering through it without accounting for
+    that difference — only their 400 branches call this function, to
+    render the copyable command text. Resolves cwd via the same
+    local-then-mirrored lookup `/focus` uses, falling back to the
+    `cli_sessions` row's own `cwd` when neither has a transcript for this
+    id — the common case for a remote-hosted session this API has never
+    mirrored. Returns `""` — never raises — when the id can't be
+    resolved at all, or when no cwd resolves for it, so a caller never
+    renders a command missing its `cd`; the drawer suppresses the
+    command box entirely on an empty string.
+    """
+    import shlex
+
+    from config.settings import settings
+
+    if session_id.startswith("cx:"):
+        from api.services.codex import session_ingest as cx
+        try:
+            bare = cx.validate_session_id(session_id)
+        except ValueError:
+            return ""
+        cwd = ""
+        try:
+            cwd = _lookup_cx_session_meta(session_id).decoded_cwd or ""
+        except HTTPException:
+            pass
+        template = (settings.codex_resume_inner_cmd or "").strip()
+    elif session_id.startswith("cc:"):
+        from api.services.claude_code import session_ingest as cc
+        try:
+            bare = cc.validate_session_id(session_id)
+        except ValueError:
+            return ""
+        if ":agent:" in bare:
+            bare = bare.split(":agent:", 1)[0]
+        cwd = ""
+        try:
+            meta, bare = _lookup_cc_session_meta(session_id)
+            cwd = meta.decoded_cwd or ""
+        except HTTPException:
+            pass
+        template = (settings.cc_resume_inner_cmd or "").strip()
+    else:
+        return ""
+
+    if not cwd:
+        try:
+            cli = _get_session_store().get_cli_session(session_id)
+        except Exception:  # noqa: BLE001 — a store error must not break command rendering
+            cli = None
+        if cli is not None and cli.cwd:
+            cwd = cli.cwd
+
+    inner = template.replace("{session_id}", bare).replace("{cwd}", cwd)
+    if not inner:
+        return ""
+    if not cwd:
+        # No cwd resolved at all (local scan missed,
+        # no mirrored transcript, no cli_sessions row) — rendering the
+        # inner command WITHOUT `cd <cwd> &&` would offer a command that
+        # resumes in whatever directory the operator happens to be in,
+        # not the session's actual project. Render nothing rather than a
+        # misleading command; the caller (the drawer) suppresses the
+        # command box entirely when this returns "".
+        return ""
+    return f"cd {shlex.quote(cwd)} && {inner}"
+
+
+def _resolve_target_host(session_id: str, target_host: str | None) -> str | None:
+    """Resolve resume/focus's launch target, honoring an explicit
+    `target_host` override ("resume here").
+
+    - Unset/blank `target_host`: falls through to
+      `_check_session_host_or_409` (including its 409 for an
+      unregistered host).
+    - `target_host` equal to this API host's own name: launch locally
+      (`None`) — OVERRIDES the session's recorded host, which is the
+      whole point of "resume here".
+    - `target_host` a key in `settings.agent_hosts`: launch there over
+      ssh (its target string) — also an override of the recorded host.
+    - Anything else: 400 with a `detail` object carrying `error` and the
+      full resume `command` text, so the caller can offer it for copying
+      rather than trying to launch somewhere this API can't reach.
+    """
+    target_host = (target_host or "").strip()
+    if not target_host:
+        return _check_session_host_or_409(session_id)
+    if target_host == api_host_name():
+        return None
+    from config.settings import settings
+
+    target = settings.agent_hosts.get(target_host)
+    if target:
+        return target
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error": f"host {target_host!r} is not this API host and not in LIFEOS_AGENT_HOSTS",
+            "command": _resume_command_text(session_id),
+        },
+    )
+
+
 async def _resume_codex_session(
     session_id: str,
     body: "CCResumeRequest | None",
@@ -1943,10 +2187,16 @@ async def _resume_codex_session(
         # a remote session's rollout file isn't under this API's local
         # `codex_sessions_dir`; its cwd comes from the `cli_sessions` row.
         cli = _get_session_store().get_cli_session(session_id)
-        if cli is None or not cli.cwd:
-            raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
-        from types import SimpleNamespace
-        target = SimpleNamespace(decoded_cwd=cli.cwd)
+        if cli is not None and cli.cwd:
+            from types import SimpleNamespace
+            target = SimpleNamespace(decoded_cwd=cli.cwd)
+        else:
+            # No cli_sessions row — e.g. a "resume here" targeted at
+            # a session known only from its mirrored transcript. Fall back
+            # to the transcript's own cwd via the same lookup /focus uses.
+            target = _lookup_cx_session_meta(session_id)
+            if not target.decoded_cwd:
+                raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
     else:
         # Widen lookback for resume so older sessions are still resolvable.
         metas = cx.discover_sessions(
@@ -1954,15 +2204,31 @@ async def _resume_codex_session(
             lookback_days=max(int(settings.codex_lookback_days), 365),
         )
         target = next((m for m in metas if m.raw_session_id == bare), None)
-        if target is None:
-            raise HTTPException(status_code=404, detail=f"session {session_id} not found")
         # Codex stores cwd inside session_meta, populated by parse_session. The
         # snapshot prepopulates it but on a fresh resume call we may need to
         # re-parse to recover it (cheap — one jsonl read).
-        if not target.decoded_cwd:
+        if target is not None and not target.decoded_cwd:
             target, _ = cx.parse_session(target)
-        if not target.decoded_cwd:
-            raise HTTPException(status_code=404, detail=f"session {session_id} has no cwd")
+        if target is None or not target.decoded_cwd:
+            # The local scan missed — e.g. "resume here" targeted at this
+            # API host for a session whose transcript lives on another
+            # (mirrored) machine. Fall through to the same mirror-aware
+            # chain `_resume_command_text` performs: the mirrored-
+            # transcript lookup, then the `cli_sessions` row's own cwd,
+            # before giving up.
+            try:
+                target = _lookup_cx_session_meta(session_id)
+            except HTTPException:
+                target = None
+            if target is None or not target.decoded_cwd:
+                cli = _get_session_store().get_cli_session(session_id)
+                if cli is not None and cli.cwd:
+                    from types import SimpleNamespace
+                    target = SimpleNamespace(decoded_cwd=cli.cwd)
+                else:
+                    target = None
+        if target is None or not target.decoded_cwd:
+            raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
 
     inner_template = (settings.codex_resume_inner_cmd or "").strip()
     inner_rendered = (
@@ -2009,9 +2275,37 @@ async def _resume_codex_session(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail=f"resume binary not found: {exc}") from exc
     except OSError as exc:
+        # A mirrored session's cwd is the REMOTE
+        # machine's path — on this (local, non-ssh) branch it's used as-is
+        # for `Popen(cwd=...)`, which may not exist, may not be a
+        # directory, or may not be traversable on THIS host when the
+        # session was mirrored from elsewhere (e.g. "resume here" back
+        # onto the API host for a session whose transcript lives only on
+        # a remote box). Depending on which, `Popen`'s child `os.chdir`
+        # raises `FileNotFoundError` (ENOENT), `NotADirectoryError`
+        # (ENOTDIR — the cwd is a regular file), or `PermissionError`
+        # (EACCES) — all `OSError` subclasses. Checking `exc.filename ==
+        # popen_cwd` FIRST, across all three, is what makes the
+        # discrimination exact: only the child's `os.chdir` failure blames
+        # the cwd itself as `exc.filename`; a missing-executable
+        # `FileNotFoundError` blames argv[0] instead, and no other
+        # `Popen` failure carries the cwd as its filename at all. Without
+        # this, the cwd case renders a 500 that (for the ENOENT case)
+        # misleadingly blames "resume binary not found" when the binary is
+        # fine, and — because a 500's `detail` is a bare string — skips
+        # the copyable-command fallback `panel.js` already knows how to
+        # render for a 400.
+        if not remote_ssh_target and popen_cwd and exc.filename == popen_cwd:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": f"cwd {popen_cwd!r} does not exist on this host",
+                    "command": _resume_command_text(session_id),
+                },
+            ) from exc
+        if isinstance(exc, FileNotFoundError):
+            raise HTTPException(status_code=500, detail=f"resume binary not found: {exc}") from exc
         raise HTTPException(status_code=500, detail=f"resume spawn failed: {exc}") from exc
 
     clipboard_text = ""
@@ -2112,10 +2406,12 @@ async def resume_claude_code_session(
     if not session_id.startswith("cx:") and not session_id.startswith("cc:"):
         raise HTTPException(status_code=400, detail="resume is only available for Claude Code or Codex sessions")
 
-    # (#849/#851) A session registered on a different, but REGISTERED
-    # (settings.agent_hosts), host resumes over ssh; an unregistered host
+    # An explicit `target_host` ("resume here") overrides the session's
+    # recorded host; unset falls through to `_check_session_host_or_409` —
+    # a session registered on a different, but REGISTERED
+    # (settings.agent_hosts), host resumes over ssh, an unregistered host
     # still 409s rather than silently no-op'ing.
-    remote_ssh_target = _check_session_host_or_409(session_id)
+    remote_ssh_target = _resolve_target_host(session_id, body.target_host if body else None)
 
     if session_id.startswith("cx:"):
         return await _resume_codex_session(session_id, body, remote_ssh_target=remote_ssh_target)
@@ -2163,10 +2459,16 @@ async def _resume_claude_code_launcher(
         # from the `cli_sessions` row instead (populated by the remote
         # host's own hook script over HTTP, host-agnostic by design — #849).
         cli = _get_session_store().get_cli_session(session_id)
-        if cli is None or not cli.cwd:
-            raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
-        from types import SimpleNamespace
-        target = SimpleNamespace(decoded_cwd=cli.cwd)
+        if cli is not None and cli.cwd:
+            from types import SimpleNamespace
+            target = SimpleNamespace(decoded_cwd=cli.cwd)
+        else:
+            # No cli_sessions row — e.g. a "resume here" targeted at
+            # a session known only from its mirrored transcript. Fall back
+            # to the transcript's own cwd via the same lookup /focus uses.
+            target, _bare_unused = _lookup_cc_session_meta(session_id)
+            if not target.decoded_cwd:
+                raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
     else:
         # Find the matching jsonl to recover the working directory.
         metas = cc.discover_sessions(
@@ -2174,6 +2476,24 @@ async def _resume_claude_code_launcher(
             lookback_days=max(int(settings.claude_code_lookback_days), 365),  # widen lookback for resume
         )
         target = next((m for m in metas if m.raw_session_id == bare), None)
+        if target is None or not target.decoded_cwd:
+            # The local scan missed — e.g. "resume here" targeted at this
+            # API host for a session whose transcript lives on another
+            # (mirrored) machine. Fall through to the same mirror-aware
+            # chain `_resume_command_text` performs: the mirrored-
+            # transcript lookup, then the `cli_sessions` row's own cwd,
+            # before giving up.
+            try:
+                target, _bare_unused = _lookup_cc_session_meta(session_id)
+            except HTTPException:
+                target = None
+            if target is None or not target.decoded_cwd:
+                cli = _get_session_store().get_cli_session(session_id)
+                if cli is not None and cli.cwd:
+                    from types import SimpleNamespace
+                    target = SimpleNamespace(decoded_cwd=cli.cwd)
+                else:
+                    target = None
         if target is None or not target.decoded_cwd:
             raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
 
@@ -2247,9 +2567,31 @@ async def _resume_claude_code_launcher(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail=f"resume binary not found: {exc}") from exc
     except OSError as exc:
+        # Same cross-machine cwd mismatch as the codex
+        # launcher above: a mirrored session's cwd is the REMOTE machine's
+        # path, so on this local branch it may not exist, may not be a
+        # directory, or may not be traversable on this host at all. The
+        # child's `os.chdir` raises `FileNotFoundError` (ENOENT),
+        # `NotADirectoryError` (ENOTDIR — the cwd is a regular file), or
+        # `PermissionError` (EACCES) — all `OSError` subclasses — with
+        # `exc.filename` set to the cwd; a missing-executable
+        # `FileNotFoundError` blames argv[0] instead, and no other `Popen`
+        # failure carries the cwd as its filename. Checking `exc.filename
+        # == popen_cwd` across all three fails with a 400 carrying the
+        # copyable command instead of letting the ENOENT case fall through
+        # to a 500 that misleadingly blames the resume binary rather than
+        # the cwd.
+        if not remote_ssh_target and popen_cwd and exc.filename == popen_cwd:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": f"cwd {popen_cwd!r} does not exist on this host",
+                    "command": _resume_command_text(session_id),
+                },
+            ) from exc
+        if isinstance(exc, FileNotFoundError):
+            raise HTTPException(status_code=500, detail=f"resume binary not found: {exc}") from exc
         raise HTTPException(status_code=500, detail=f"resume spawn failed: {exc}") from exc
 
     # Push a cwd-portable form of the inner command to the system
@@ -2410,6 +2752,33 @@ def _lookup_cc_session_meta(session_id: str):
                 )
                 return meta, bare
 
+    # Not under the local projects dir — check every mirrored
+    # remote host's copy too, so /focus's FD-probe fallback and the
+    # summary path can resolve a mirrored session the same way a local
+    # one resolves above.
+    from api.services import agent_transcript_mirror as mirror
+
+    for host_dir in mirror.mirrored_transcript_dirs("claude_code"):
+        for proj in host_dir.iterdir():
+            if not proj.is_dir():
+                continue
+            candidate = proj / f"{bare}.jsonl"
+            if candidate.exists():
+                try:
+                    mtime = candidate.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                project_key = proj.name
+                meta = SessionMeta(
+                    session_id=CC_PREFIX + bare,
+                    raw_session_id=bare,
+                    project_key=project_key,
+                    decoded_cwd=decode_project_key(project_key),
+                    jsonl_path=str(candidate),
+                    mtime=mtime,
+                )
+                return meta, bare
+
     raise HTTPException(status_code=404, detail=f"session {session_id} not found")
 
 
@@ -2433,6 +2802,18 @@ def _lookup_cx_session_meta(session_id: str):
         lookback_days=max(int(settings.codex_lookback_days), 365),
     )
     target = next((m for m in metas if m.raw_session_id == bare), None)
+    if target is None:
+        # Not local — check every mirrored remote host's copy too.
+        from api.services import agent_transcript_mirror as mirror
+
+        for host_dir in mirror.mirrored_transcript_dirs("codex"):
+            metas = cx.discover_sessions(
+                sessions_dir=host_dir,
+                lookback_days=max(int(settings.codex_lookback_days), 365),
+            )
+            target = next((m for m in metas if m.raw_session_id == bare), None)
+            if target is not None:
+                break
     if target is None:
         raise HTTPException(status_code=404, detail=f"session {session_id} not found")
     if not target.decoded_cwd:
@@ -2558,7 +2939,10 @@ async def cc_pane_bind(request: Request, body: CCPaneBindRequest) -> dict[str, A
 
 
 @router.post("/sessions/{session_id}/focus")
-async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
+async def focus_claude_code_session(
+    session_id: str,
+    body: CCResumeRequest | None = None,
+) -> dict[str, Any]:
     """Activate the WezTerm pane running this Claude Code session.
 
     Resolution order:
@@ -2586,9 +2970,10 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
     if not session_id.startswith("cc:") and not is_cx:
         raise HTTPException(status_code=400, detail="focus is only available for Claude Code or Codex sessions")
 
-    # (#849/#851) A session registered on a different, but REGISTERED host
-    # resumes over ssh; an unregistered host still 409s.
-    remote_ssh_target = _check_session_host_or_409(session_id)
+    # A session registered on a different, but REGISTERED
+    # host resumes over ssh; an unregistered host still 409s. An explicit
+    # `target_host` ("resume here") overrides the session's recorded host.
+    remote_ssh_target = _resolve_target_host(session_id, body.target_host if body else None)
 
     try:
         from config.settings import settings
@@ -2716,12 +3101,9 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
 
 async def _stream_claude_code_session(session_id: str, backfill: int):
     """Per-session SSE generator for Claude Code (cc:-prefixed) sessions."""
-    from config.settings import settings
-    from api.services.claude_code import session_ingest as cc
-
     yield ": ok\n\n"
     try:
-        events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+        events = _read_cli_transcript_events(session_id)
     except Exception as exc:  # noqa: BLE001
         yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
         return
@@ -2738,7 +3120,7 @@ async def _stream_claude_code_session(session_id: str, backfill: int):
     while True:
         await asyncio.sleep(1.0)
         try:
-            events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+            events = _read_cli_transcript_events(session_id)
         except Exception:
             events = []
         if len(events) > line_count:
@@ -2769,12 +3151,9 @@ async def _stream_codex_session(session_id: str, backfill: int):
     `/sessions/{id}/stream` only dispatched `cc:` here, so opening a Codex
     session's panel fell through to the LifeOS transcript store and 400'd.)
     """
-    from config.settings import settings
-    from api.services.codex import session_ingest as cx
-
     yield ": ok\n\n"
     try:
-        events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+        events = _read_cli_transcript_events(session_id)
     except Exception as exc:  # noqa: BLE001
         yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
         return
@@ -2789,7 +3168,7 @@ async def _stream_codex_session(session_id: str, backfill: int):
     while True:
         await asyncio.sleep(1.0)
         try:
-            events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+            events = _read_cli_transcript_events(session_id)
         except Exception:
             events = []
         if len(events) > line_count:

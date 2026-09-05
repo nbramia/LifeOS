@@ -936,6 +936,34 @@ class Settings(BaseSettings):
                     "ConnectTimeout=<this>`). Applies to remote spawn, remote "
                     "kill, and remote resume/focus alike."
     )
+    # Mirrors each registered host's Claude Code / Codex transcripts onto
+    # this box over ssh+rsync so a remote session shows tokens, cost, and a
+    # transcript feed on /agents exactly like a local one.
+    agent_transcript_mirror_enabled: bool = Field(
+        default=True,
+        alias="LIFEOS_AGENT_TRANSCRIPT_MIRROR_ENABLED",
+        description="When true, a background loop periodically pulls new "
+                    "Claude Code and Codex transcript files from every host "
+                    "in LIFEOS_AGENT_HOSTS. Safe to leave on by default: "
+                    "agent_hosts defaults to {}, so with no hosts registered "
+                    "the mirror never runs anything."
+    )
+    agent_transcript_mirror_dir: str = Field(
+        default="data/agent-transcript-mirror",
+        alias="LIFEOS_AGENT_TRANSCRIPT_MIRROR_DIR",
+        description="Root directory the transcript mirror writes into, one "
+                    "subdirectory per registered host "
+                    "(`<root>/<host>/claude_code/`, `<root>/<host>/codex/`). "
+                    "Read-only mirror of remote data — never written to by "
+                    "anything else."
+    )
+    agent_transcript_mirror_interval_seconds: int = Field(
+        default=120,
+        alias="LIFEOS_AGENT_TRANSCRIPT_MIRROR_INTERVAL_SECONDS",
+        description="How often the transcript mirror loop re-pulls each "
+                    "registered host. Each pull is an incremental rsync, so "
+                    "a short interval costs little when nothing changed."
+    )
     agent_model_catalog_ttl_seconds: int = Field(
         default=86400,
         alias="LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS",

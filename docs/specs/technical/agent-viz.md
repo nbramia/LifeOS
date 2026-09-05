@@ -19,14 +19,15 @@ Engineering view of the `/agents` page — endpoint shapes, ingest paths, status
 7. [Status inference (Claude Code)](#status-inference-claude-code)
 8. [Live process detection](#live-process-detection)
 9. [Cross-machine CLI session registration](#cross-machine-cli-session-registration)
-10. [Snapshot caching](#snapshot-caching)
-11. [D3 force-graph](#d3-force-graph)
-12. [Side-panel SSE](#side-panel-sse)
-13. [Operator kill](#operator-kill)
-14. [Claude Code resume + Go To](#claude-code-resume--go-to)
-15. [Worker resilience](#worker-resilience)
-16. [Security boundaries](#security-boundaries)
-17. [Related Documents](#related-documents)
+10. [Remote transcript mirror](#remote-transcript-mirror)
+11. [Snapshot caching](#snapshot-caching)
+12. [D3 force-graph](#d3-force-graph)
+13. [Side-panel SSE](#side-panel-sse)
+14. [Operator kill](#operator-kill)
+15. [Claude Code resume + Go To](#claude-code-resume--go-to)
+16. [Worker resilience](#worker-resilience)
+17. [Security boundaries](#security-boundaries)
+18. [Related Documents](#related-documents)
 
 ---
 
@@ -78,12 +79,12 @@ All under `/api/agents`. Local-network only, with one deliberate exception: `POS
 |---|---|
 | `GET /snapshot` | One-shot full snapshot. Use for first-paint or when the SSE stream drops. |
 | `GET /stream` | SSE: emits a full snapshot every 2s. Tolerant to per-tick failures (yields an `error` event and continues). |
-| `GET /sessions/{id}/events?limit=N` | Last N transcript events (default 200, max 2000). Dispatches by `cc:` prefix to the Claude Code ingest path. |
-| `GET /sessions/{id}/stream?backfill=N` | Per-session SSE: backfill last N events (default 50, max 500), then live-tail. Closes cleanly when the session reaches terminal status (LifeOS) or after 5 min idle (Claude Code). |
+| `GET /sessions/{id}/events?limit=N` | Last N transcript events (default 200, max 2000). Dispatches by `cc:` prefix to the Claude Code ingest path. Falls back to each mirrored host's copy of the transcript when the local scan finds nothing. |
+| `GET /sessions/{id}/stream?backfill=N` | Per-session SSE: backfill last N events (default 50, max 500), then live-tail. Closes cleanly when the session reaches terminal status (LifeOS) or after 5 min idle (Claude Code). Same local-then-mirrored fallback as `/events`. |
 | `POST /sessions/{id}/kill` | Operator kill — body `{reason: ""}`. LifeOS sessions only. Cascades to descendants in the subtree. |
 | `PUT /sessions/{id}/label` | Set or clear an operator-pinned manual label — body `{label: ""}`. Non-empty pins a custom node name that overrides the auto-derived label and AI summary label everywhere it's shown, except where it is itself the row's raw id (`session_id`, the prefix-stripped id, or `task_id`), which the graph node and search dropdown skip; empty clears it. Durable in `data/agent_viz_label_overrides.db` (in-process cache, lazy-loaded). Works for both LifeOS and `cc:` sessions. |
-| `POST /sessions/{id}/resume` | Resume a Claude Code session — body `{extra_env: {}}`. `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. Spawns a WezTerm tab via `wezterm cli spawn`, captures the pane id from stdout, and stores `session_id → pane_id` in `data/cc_wezterm.db` so Focus can target it later. 409 if the `cli_sessions` row for this id records a `host` other than this API's own (see [Cross-machine CLI session registration](#cross-machine-cli-session-registration)). |
-| `POST /sessions/{id}/focus` | Activate the WezTerm pane for this session (Go To). `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. Resolves the pane id from the cached mapping first, then falls back to an FD probe (lsof + /proc + wezterm cli list) so it works for sessions never opened via Resume. 404 only when both the cache *and* the probe come up empty; 410 when the pane existed but is gone and no replacement is found. Same 409-for-remote-host rule as `/resume`. |
+| `POST /sessions/{id}/resume` | Resume a Claude Code or Codex session — body `{extra_env: {}, target_host: null}`. `cc:`/`cx:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED` / `LIFEOS_CODEX_RESUME_ENABLED`. Spawns a WezTerm tab via `wezterm cli spawn`, captures the pane id from stdout, and stores `session_id → pane_id` in `data/cc_wezterm.db` so Focus can target it later. `target_host` ("resume here") overrides the launch target: unset/blank falls through to `_check_session_host_or_409` — 409 if the `cli_sessions` row for this id records a `host` other than this API's own and that host isn't registered (see [Cross-machine CLI session registration](#cross-machine-cli-session-registration)); set to this API's own host name or a `LIFEOS_AGENT_HOSTS` entry launches there instead, regardless of the session's recorded host; set to anything else 400s with `detail = {error, command}` — `command` is the exact resume command, cwd-prefixed, for the operator to copy and run themselves. |
+| `POST /sessions/{id}/focus` | Activate the WezTerm pane for this session (Go To). `cc:`/`cx:`-prefixed ids. Gated on `LIFEOS_CC_RESUME_ENABLED` for `cc:` ids, `LIFEOS_CODEX_RESUME_ENABLED` for `cx:` ids. Resolves the pane id from the cached mapping first, then falls back to an FD probe (lsof + /proc + wezterm cli list) so it works for sessions never opened via Resume. 404 only when both the cache *and* the probe come up empty; 410 when the pane existed but is gone and no replacement is found. Same `target_host` override and 409/400 rules as `/resume`. |
 | `POST /cc-pane-bind` | Localhost-only endpoint called by the Claude Code SessionStart hook. Body `{session_id, pane_id, cwd}`. Upserts the mapping in `cc_wezterm.db` so Go To can target newly-started `claude` invocations without a probe. 403 from non-loopback callers. |
 | `POST /cx-pane-bind` | Codex sibling of `/cc-pane-bind`. Same body shape and localhost-only gate; keys `cx:`-prefixed rows in the same store. |
 | `POST /cli-sessions/events` | Cross-machine session registration (#849) — see [Cross-machine CLI session registration](#cross-machine-cli-session-registration). Bearer-token gated, reachable from any host. Body `{engine, event, session_id, host, cwd?, transcript_path?, branch?, model?, prompt_preview?, task_id?, pane_id?, wezterm_pid?}`. |
@@ -144,9 +145,12 @@ A successful drop always re-fetches the board (`fetchBoard()`) rather than mutat
 {
   "sessions": [{ /* see below */ }],
   "edges":    [{ "from": "<parent_session_id>", "to": "<child_session_id>", "type": "spawn" }],
-  "generated_at": 1716777600
+  "generated_at": 1716777600,
+  "api_host": "this-api-host"
 }
 ```
+
+`api_host` is `api_host_name()` — the same value every session row's own `host` falls back to. It lets the drawer's "resume here" host picker (`web/agents/panel.js`) offer THIS machine as a launch target from `/snapshot` alone, when `GET /api/agents/hosts` is unreachable or fails — see [Resume target host](#resume-target-host) below.
 
 One session row, unified shape (both sources):
 
@@ -184,6 +188,7 @@ One session row, unified shape (both sources):
 | `host` | str | The machine this session is running on (#849). Always present — LifeOS and locally-scanned CLI rows get the API's own host (`api_host_name()`); a row that also has (or only has) a `cli_sessions` registration gets that row's `host` instead. |
 | `branch` | str \| null | Git branch of the session's cwd, from the most recent registration event. Only present on a session with at least one `cli_sessions` row. |
 | `prompt_preview` | str \| null | Most recent user prompt, truncated to 200 chars, from the most recent `user_prompt_submit` registration event. Only present on a session with at least one `cli_sessions` row. |
+| `mirrored` | bool | Present and `true` only on a row ingested from a mirrored remote host's transcript — see [Remote transcript mirror](#remote-transcript-mirror) below. |
 
 ---
 
@@ -312,6 +317,55 @@ Worker (`lifeos_agent`) rows use `s.host or api_host_name()` directly in `_sessi
 `scripts/lifeos-agent-hook.sh` is a single portable script (bash 3.2-compatible for macOS) that serves every hook event — engine and event name are passed as argv (`lifeos-agent-hook.sh claude_code session_start`). It reads the hook's JSON stdin payload via `jq`, adds the hostname (`hostname` with any domain suffix stripped), the cwd's git branch (`git -C "$cwd" rev-parse --abbrev-ref HEAD`), and `$LIFEOS_TASK_ID`, and POSTs to `/cli-sessions/events` with `curl --max-time 2`. It sources a small env file (`~/.config/lifeos/agent-hook.env`, override via `$LIFEOS_AGENT_HOOK_ENV`) for `LIFEOS_API_URL` / `LIFEOS_AGENT_HOOK_TOKEN` — values already in the environment take precedence over the file. Every non-fatal condition (missing `jq`/`curl`, empty stdin, no token configured, API unreachable) exits 0 silently and writes nothing to stdout, so it can never block or corrupt the CLI's own hook processing. Pane fields are included only when `$WEZTERM_PANE` is set — unlike `claude-session-pane.sh`, running outside WezTerm is a normal case, not a silent no-op, since registration doesn't depend on a pane to exist.
 
 `scripts/install-agent-hooks.sh` appends one entry per event to `~/.claude/settings.json` and `~/.codex/hooks.json` (overridable via `LIFEOS_CLAUDE_SETTINGS` / `LIFEOS_CODEX_HOOKS` for testing), identifying a prior install by the substring `lifeos-agent-hook.sh` in an existing entry's `command` so re-running it is a no-op. Every other tool's entries — Orca, atuin, a legacy `claude-session-pane.sh` / `codex-session-pane.sh` entry — are left untouched. Writes via temp file + `mv`. The installed command wraps the absolute path of the script in *this* checkout so a moved or deleted checkout degrades to a no-op instead of an error: `bash -c 's="<path>"; [ -x "$s" ] && exec "$s" <engine> <event>; exit 0'`. It never writes the token itself — it prints setup instructions for the operator.
+
+---
+
+## Remote transcript mirror
+
+`api/services/agent_transcript_mirror.py` closes the gap registration alone leaves: a `cli_sessions` row gives a remote session status and a prompt preview, but token counts, cost, tool-call counts, and the transcript feed all require an actual jsonl on this host's filesystem. The mirror pulls one, read-only, over ssh+rsync.
+
+### Layout
+
+`mirror_root()` (default `data/agent-transcript-mirror`, `LIFEOS_AGENT_TRANSCRIPT_MIRROR_DIR`) holds one subdirectory per registered host, mirroring each source directory's own internal structure so the existing `discover_sessions()` scanners work against it unmodified:
+
+```
+<mirror_root>/<host>/claude_code/<encoded-cwd>/<session>.jsonl
+<mirror_root>/<host>/codex/<year>/<month>/<day>/rollout-*.jsonl
+```
+
+`host_dirs(host)` sanitizes `host` before deriving these paths via a positive allowlist (alphanumeric first/last character, `.`/`-`/`_` allowed in the middle only, nothing starting with `-` or `.`, no `/`, `\`, or whitespace anywhere) rather than a reject-list — a malformed `LIFEOS_AGENT_HOSTS` key that would otherwise be misread as an rsync/ssh option (`-e`, `--delete`, `~`, `$HOME`) is rejected (`ValueError`) before ever reaching a path join, so it can't write outside the mirror root.
+
+### The pull
+
+`mirror_host(host, ssh_target, *, runner=...)` runs one `rsync` invocation per engine (`-rtz`, `--include=*/ --include=*.jsonl --exclude=*`, a `--` separator before the source/destination positionals so an `agent_hosts` value beginning with `-` can't be misread as a flag, over `ssh -o BatchMode=yes -o ConnectTimeout=<agent_ssh_connect_timeout>`, its own `--timeout` bounding a half-open connection). Read-only pull: no `--delete` on the remote side, never a push. `-t` (preserve mtimes) is what makes rsync's default quick-check (size + mtime) skip an unchanged file on the next tick — the source `remote_dir` string (`claude_code_projects_dir` / `codex_sessions_dir`, which may contain `~`) is passed through verbatim so the REMOTE shell expands it, never this process. `runner` is an injectable `Callable[[list[str]], subprocess.CompletedProcess]` (mirrors `remote_spawn.kill_remote_process_group`'s seam) so tests never shell out.
+
+Both engines are attempted even if one fails (a host that only runs one CLI shouldn't lose the other engine's mirror). Exit codes 23 ("partial transfer due to error") and 24 ("partial transfer due to vanished source files") are treated as SUCCESS — both are the expected outcome of pulling a transcript a live CLI is actively writing to, not a real failure — but are still worth knowing about: the diagnostic stderr line (`_diagnostic_stderr_line`, the first non-blank line that's neither rsync's own generic trailer nor ssh's benign "Permanently added ... to the list of known hosts" first-connect notice) is logged at `debug` every time, and at `warning` once per `(host, engine, message)` for the life of the process when it specifically names a source directory rsync couldn't enter (`change_dir ... failed`) — so a host that legitimately never runs one engine, or has a permissions problem, is surfaced exactly once per `(host, engine, message)` rather than on every tick. Any OTHER exit code produces one `warning` line for the host — `host <name> failed: <diagnostic line>` — and a `MirrorResult(ok=False)`; nothing raises. `mirror_once(*, runner=...)` mirrors every host in `settings.agent_hosts` except the API's own host (`remote_spawn.api_host_name()`) concurrently in a small `ThreadPoolExecutor`, so one slow or unreachable host never delays another. `start()`/`stop()` wrap this in an `asyncio.to_thread`-driven interval loop (`agent_transcript_mirror_interval_seconds`, default 120s), wired into `api/main.py`'s lifespan next to `agent_viz_summary_prefetch`'s identical shape; a no-op — no task scheduled, no per-tick logging — when disabled or when `agent_hosts` is empty.
+
+### Ingest + status merge
+
+`mirrored_snapshot()` walks every host subdirectory that exists and calls the SAME `cc.build_snapshot()` / `cx.build_snapshot()` the local scan uses, pointed at the mirrored directory instead of the local one, then stamps every row `host = <mirrored host name>` and `mirrored = True`.
+
+`_build_snapshot()` merges these rows in one pass, placed after the existing local cc/cx blocks and before the leftover-`cli_sessions` synthetic-row pass: a mirrored row whose `session_id` already appears among the locally-discovered rows is skipped (local transcript wins — it can only be fresher, since the mirror lags by up to one interval); otherwise it's popped against the same `cli_by_id` map the local rows already consume from, so `_apply_cli_session_to_dict` applies identically — **status comes from the hook event, token/cost/tool-call detail from the mirrored transcript**. When there's no matching hook row, the mirrored row's own `host` (the remote host's name) is left as-is rather than overwritten with `api_host_name()` — that overwrite is only correct for a row that genuinely ran on this API host.
+
+`mirrored_snapshot()` also returns each host's own parent-subagent spawn edges, which `_build_snapshot()` extends `edges` with. An edge is kept only when both endpoints are ids the merge loop above actually *appended* a row for, and both endpoints came from the same source host's batch (`appended_mirrored_host_by_id`, a dict mapping each appended id to the host it was appended from) — not the broader `local_ids`, which contains every id whether appended or skipped for a collision. Keying on the source host, not just id membership, is what tells apart two distinct cases: a session id that lost an id collision to a local transcript (its edge must not attach to the unrelated local row that won the collision), and a session id present on *two mirrored hosts* (an edge from one host's batch must not attach to the other host's unrelated parent row, since they merely happen to share an id). Edges are also deduped on `(from, to, type)`: the same session mirrored from two hosts, or an id collision on the child end, can otherwise derive the identical edge twice.
+
+Each mirrored row is copied (`dict(row)`) before `mirrored_snapshot()` stamps `host`/`mirrored`/demotion onto it — `cc.build_snapshot()`/`cx.build_snapshot()` return `list(entry.sessions)`, a shallow copy of the *list* whose row dicts are the same objects the 30s ingest cache (see "Snapshot caching" below) holds, so mutating them in place would corrupt the cache. Without the copy, `_build_snapshot()`'s hook-event overlay (`_apply_cli_session_to_dict`, applied to the SAME dict just above) would write a genuine `status="running", status_inferred=False` into the cached entry; if that hook row then vanished and a rebuild happened inside the cache TTL, `_demote_inferred_running` (guarded on `status_inferred is True`) couldn't correct the now-`False` cached row, replaying `running` with no hook evidence behind it at all.
+
+### Liveness exclusion
+
+Both `cc.build_snapshot()` and `cx.build_snapshot()` take an optional `live_counts: dict[str, int] | None = None`. `None` (every existing caller) scans this machine's own processes via `live_claude_cwd_counts()` / `live_codex_cwd_counts()`. `mirrored_snapshot()` passes `{}`, guaranteeing a mirrored row's cwd can never match a "live" entry — a mirrored transcript existing on this host says nothing about whether the CLI process is actually running here, so the per-cwd process-count promotion to authoritative `running` (see "Live process detection" above) must never fire for one.
+
+`live_counts={}` alone isn't sufficient, though: `_infer_status`'s mtime-under-10-minutes branch returns inferred `running` regardless of `live_counts` — it's a separate rule from the process-scan branch, and rsync preserves the remote mtime, so a freshly-pulled mirrored transcript trips it every time. `mirrored_snapshot()` closes this by demoting an inferred `running` row (`status_inferred is True`) to `inactive` before returning it. `_build_snapshot()`'s existing hook-event overlay (`_apply_cli_session_to_dict`) then restores `running` afterwards for any row that also has a matching `cli_sessions` entry reporting it — so a mirrored session's `running` status can, in the end, only come from that merged event row, via this demote-then-restore step rather than from the mtime-based inference alone.
+
+### Events, stream, and summary
+
+`_read_cli_transcript_events(session_id)` (in `api/routes/agents.py`) tries the local transcript root first, then each mirrored host's copy in turn via `mirrored_transcript_dirs(engine)`, returning the first non-empty result — used by `GET /sessions/{id}/events`, `/stream`, `/summary`, and the viz prefetcher (`agent_viz_summary_prefetch._summarize_one`) so a mirrored session's transcript reads identically to a local one everywhere the API reads events. `_lookup_cc_session_meta` / `_lookup_cx_session_meta` (the `/focus` FD-probe's session-metadata resolver) apply the same local-then-mirrored search, so a mirrored-only session (no live `cli_sessions` row) still resolves for `/focus` and for `_resume_command_text`'s cwd lookup rather than a bare "not found."
+
+### Resume target host
+
+`CCResumeRequest.target_host` (optional, on both `/resume` and `/focus`) lets the operator override the launch target regardless of the session's recorded host — `_resolve_target_host(session_id, target_host)`: blank/unset falls through to `_check_session_host_or_409` (including its 409); a value equal to `api_host_name()` launches locally; a value in `settings.agent_hosts` launches over ssh to that target; anything else 400s with `detail = {"error": ..., "command": <the resume command text>}` so the drawer can render it for copying. `_resume_command_text(session_id)` is called from THREE sites — `_resolve_target_host`'s 400 above, plus both launcher functions' own cwd-failure 400 branches described below — but only for rendering that copyable command text; the launchers still build their own `inner_rendered` independently for their success path, and it isn't a byte-for-byte match: this function prepends `cd <cwd> && `. It resolves cwd local-transcript-first, then mirrored, then the `cli_sessions` row's own `cwd` as a last resort — the common case for a `target_host` override on a session this host has never mirrored. When no cwd resolves at all, it returns `""` rather than a bare inner command missing its `cd`, which would otherwise resume in whatever directory the operator's terminal happens to be in; the drawer suppresses the command box entirely on an empty string.
+
+The two launcher functions (`_resume_claude_code_launcher`, `_resume_codex_session`) have their own local (`target_host` is this API host, or unset) fallback chain, independent of `_resume_command_text`'s cwd resolution: the local `discover_sessions` scan first, then the same mirrored-transcript lookup `/focus` uses, then the `cli_sessions` row's own `cwd` as a last resort — so "resume here" onto this API host also resolves a cwd for a session this host has only ever seen mirrored or via a hook event, not just one with a local transcript. Because a mirrored session's cwd is the REMOTE machine's path, that cwd may not exist, may not be a directory, or may not be accessible on this host at all on the local (non-ssh) branch; the child's failed `os.chdir` then raises `FileNotFoundError` (ENOENT), `NotADirectoryError` (ENOTDIR — the cwd is a regular file), or `PermissionError` (EACCES) — all `OSError` subclasses — and the launcher distinguishes a cwd failure from any other spawn failure via `exc.filename` (set to the cwd by the failed `os.chdir`, never to argv[0] for these three) checked in a single merged `except OSError` handler: a cwd failure 400s with the copyable command (calling `_resume_command_text` above) instead of falling through to a 500 — "resume binary not found" specifically preserved for a genuine missing-executable `FileNotFoundError`, "resume spawn failed" for anything else.
 
 ---
 
@@ -521,3 +575,4 @@ Per-source guarantees:
 - [Observability](observability.md) — Adjacent traces / health surfaces
 - [Task Management — Technical](task-management.md) — `TaskManager`, the store the board's cards are read from
 - [Scheduler — Technical](scheduler.md) — `SchedulerStore`, the store the Scheduled column is read from
+- [Agent Worker Setup — Guide](../../guides/agent-worker-setup.md#remote-session-parity-transcript-mirror) — Operator setup for the host registry and the transcript mirror's settings/prerequisites

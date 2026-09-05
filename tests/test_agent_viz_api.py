@@ -57,6 +57,17 @@ def test_snapshot_empty(client, stores):
 
 
 @pytest.mark.unit
+def test_snapshot_reports_api_host(client, stores, monkeypatch):
+    """The drawer's "resume here" host picker needs the
+    API host's own name to build its fallback list even when
+    `GET /api/agents/hosts` isn't reachable — /snapshot must carry it."""
+    monkeypatch.setattr(agents_route, "api_host_name", lambda: "synthetic-api-host")
+    r = client.get("/api/agents/snapshot")
+    assert r.status_code == 200
+    assert r.json()["api_host"] == "synthetic-api-host"
+
+
+@pytest.mark.unit
 def test_snapshot_sessions_and_edges(client, stores):
     session_store, transcript_store = stores
     parent = session_store.create(task_id="root-task", status=STATUS_RUNNING, routing="claude")

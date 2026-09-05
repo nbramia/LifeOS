@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-09-04
+**Last Updated:** 2026-09-05
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -259,6 +259,16 @@ See [guides/agent-worker-setup.md § Card assignment](agent-worker-setup.md#card
 | `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` | int (seconds) | `86400` | How long `GET /api/agents/models` caches each engine's model list before re-querying providers. |
 | `LIFEOS_CODEX_MODELS_CACHE_PATH` | str | `~/.codex/models_cache.json` | Path to the Codex CLI's own model-catalog cache, read by the model catalog endpoint for the codex engine's picker list. |
 | `LIFEOS_OPENAI_API_KEY` | str | *(empty)* | Optional OpenAI API key, used ONLY as the model-catalog fallback when `LIFEOS_CODEX_MODELS_CACHE_PATH` is missing/unreadable. Never used to run turns — Codex sessions are subscription-billed through the CLI itself, never the API. |
+
+## Remote Session Parity (transcript mirror)
+
+Pulls each `LIFEOS_AGENT_HOSTS` entry's Claude Code and Codex transcripts onto this box over ssh+rsync so a remote session shows tokens, cost, and a transcript feed on `/agents` exactly like a local one. See [guides/agent-worker-setup.md § Remote session parity: transcript mirror](agent-worker-setup.md#remote-session-parity-transcript-mirror) for the operator walkthrough and [specs/technical/agent-viz.md § Remote transcript mirror](../specs/technical/agent-viz.md#remote-transcript-mirror) for the mechanism.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_AGENT_TRANSCRIPT_MIRROR_ENABLED` | bool | `true` | Whether the background loop pulls transcripts from every `LIFEOS_AGENT_HOSTS` entry. Safe to leave on: with no hosts registered the mirror has nothing to pull. |
+| `LIFEOS_AGENT_TRANSCRIPT_MIRROR_DIR` | str | `data/agent-transcript-mirror` | Root directory the mirror writes into, one subdirectory per registered host. A relative path resolves against the repo root, not the process's working directory. Read-only mirror of remote data — nothing else writes here. |
+| `LIFEOS_AGENT_TRANSCRIPT_MIRROR_INTERVAL_SECONDS` | int (seconds) | `120` | How often the mirror loop re-pulls each registered host. Each pull is an incremental rsync, so a short interval costs little when nothing changed. |
 
 ## Claude Code Orchestration (`/claude` Telegram command)
 

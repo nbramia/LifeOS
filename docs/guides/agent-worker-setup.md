@@ -1,7 +1,7 @@
 # Agent Worker Setup
 
 > **Status:** Complete
-> **Last Updated:** 2026-09-04
+> **Last Updated:** 2026-09-05
 > **Audience:** Operators
 
 One-time setup for the external agent worker that picks up `#agent`-tagged tasks and executes them via Claude (Anthropic Managed Agents) or a local Gemma model.
@@ -554,6 +554,42 @@ The Apple Data Agent's own export/import pipeline
 ([operations.md](operations.md)) is the supported path for cross-machine
 Apple data, not this mechanism.
 
+### Remote session parity: transcript mirror
+
+Once a host is in the registry above, `/agents` can also mirror its
+Claude Code and Codex transcripts onto this box — the difference between a
+remote session showing only status and a prompt preview versus real token
+counts, cost, tool calls, and a live transcript feed. See
+[product/agent-viz.md § Remote session parity](../specs/product/agent-viz.md#remote-session-parity)
+for what the operator sees and
+[technical/agent-viz.md § Remote transcript mirror](../specs/technical/agent-viz.md#remote-transcript-mirror)
+for the mechanism.
+
+**Settings** are all in `.env`, all optional, and safe on a fresh install
+since `LIFEOS_AGENT_HOSTS` defaults to `{}` (the mirror is a no-op with
+nothing registered) — see [configuration.md § Remote Session Parity](configuration.md#remote-session-parity-transcript-mirror)
+for the full variable reference, including that a relative
+`LIFEOS_AGENT_TRANSCRIPT_MIRROR_DIR` resolves against the repo root, not
+the process's working directory.
+
+**What a registered host needs, beyond the ssh prerequisites above:**
+
+- The same key-based, non-interactive ssh auth already required for card
+  assignment — the mirror reuses it, no separate credential.
+- `rsync` installed on both this box and the remote machine (the same
+  pattern `scripts/apple_data_agent.sh` uses for the Apple export
+  pipeline) — the mirror pull runs `rsync` locally, over ssh to the
+  remote side.
+- Nothing else — the mirror never writes to the remote host. It only
+  reads `~/.claude/projects/` and `~/.codex/sessions/` (or whatever
+  `LIFEOS_CLAUDE_CODE_PROJECTS_DIR` / `LIFEOS_CODEX_SESSIONS_DIR` are set
+  to, assumed the same relative-to-home layout on every registered host)
+  and pulls `*.jsonl` files one-way onto this box.
+
+An unreachable host is skipped with one log line and never blocks another
+host's pull or the API's own responsiveness — see the technical doc for
+the concurrency and failure-isolation details.
+
 ## Working directory: run a local or cloud card in an isolated checkout
 
 By default the local (`#local`) and remote (`#cloud`) routes run wherever
@@ -648,5 +684,6 @@ suggestions to keep iteration cheap:
 - [Human Queue](human-queue.md) — `done_when` auto-resolve checks require this worker to be running
 - [Agent Worker — Technical](../specs/technical/agent-worker.md#card-assignment-851) — Host registry and ssh spawn mechanism this guide's setup section covers operationally
 - [Agent Worker — Technical § Working directory](../specs/technical/agent-worker.md#working-directory-925) — Guard implementation this guide's working-directory section covers operationally
+- [Agent Viz — Technical](../specs/technical/agent-viz.md#remote-transcript-mirror) — The transcript mirror mechanism this guide's setup section covers operationally
 - [Operations](operations.md) — Apple Data Agent export/import, the supported path for cross-machine Apple data this guide's remote-host section can't reach
 - Epic [#98](https://github.com/nbramia/LifeOS/issues/98) — full agent-worker design

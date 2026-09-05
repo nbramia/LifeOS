@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-04
+**Last Updated:** 2026-09-05
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Four adjacent catalogs split out for size:
 
@@ -712,6 +712,8 @@ Get usage summary with stats for 24h, 7d, 30d, and all-time. Includes daily cost
 ## Card Assignment Endpoints (#851)
 
 Card kill/resume/focus/registration endpoints are documented in [agent-viz.md § Endpoints](../technical/agent-viz.md#endpoints) alongside the rest of the `/agents` operator-control surface, per item 6 of this file's Table of Contents. These two are new to this issue and don't fit that page's visualization framing, so they're listed here instead — full mechanism in [agent-worker.md § Card assignment](../technical/agent-worker.md#card-assignment-851).
+
+`POST /sessions/{id}/resume` and `/focus` also accept an optional `target_host` in the body — "resume here". Full contract in [agent-viz.md § Resume target host](../technical/agent-viz.md#resume-target-host).
 
 ### GET /api/agents/models
 
