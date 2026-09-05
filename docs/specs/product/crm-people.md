@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-09-04
+**Last Updated:** 2026-09-05
 
 People management: the list and detail views at `/crm`, the contact-source model behind entity splitting/merging, the relationship-strength score that drives ranking and Dunbar circles, and the multi-stage fact-extraction pipeline that surfaces memorable personal details.
 
@@ -219,6 +219,16 @@ Detail panel that slides in when a person is selected. Shows contact info (email
 ```
 
 Timeline, Connections, and Graph tabs are covered in their respective specs ([crm-interactions.md](crm-interactions.md), [crm-graph.md](crm-graph.md)).
+
+### Tone card
+
+The Overview tab shows a compact Tone card for any person who isn't the owner and has message (iMessage/WhatsApp) interactions; it's hidden otherwise. It loads with the cheap, LLM-free `compute=false` read of `POST /api/crm/relationship/tone-analysis` (see [api-crm.md](api-crm.md#tone-analysis) and [crm-analytics.md](crm-analytics.md#tone-analysis-apis)) and shows:
+- **Not analyzed** — a short explainer and an "Analyze tone" button, when nothing is stored yet.
+- **Analyzed** — a trend label, average, a small sparkline of monthly combined scores (a stale month rendered as a distinct dashed marker), and "through \<month\>", with a refresh control.
+- **Computing** — a disabled control and progress text, while a `compute=true` request is in flight.
+- **Failure** — the stored data plus a one-line notice, if a `compute=true` attempt came back without refreshing anything.
+
+Switching to a different person cancels a still-in-flight tone request for the one left behind. This card is independent of the Relationship page's own Tone Evolution chart ([crm-analytics.md](crm-analytics.md#communication-visualizations)), which always shows separate user/partner scores for the configured partner.
 
 ---
 

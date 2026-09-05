@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-04
+**Last Updated:** 2026-09-05
 
 Every `/api/crm/*` HTTP endpoint. Split out of the main [api-reference.md](api-reference.md) because the CRM endpoint catalog is large enough to deserve its own file. For the consumer view of the CRM features these endpoints back, see the [CRM specs](crm-ui.md).
 
@@ -592,11 +592,16 @@ Delete/dismiss an insight.
 
 ### POST /api/crm/relationship/tone-analysis
 
-Analyze tone/sentiment in iMessage conversations over time. Samples messages monthly and uses Claude to classify emotional warmth (0–100 scale).
+Compact monthly tone summary for `person_id`: one combined (user+partner average) score per stored month, plus a trend and average. Backed by the same persisted store, chunked-LLM pipeline, and per-person lock as the detailed endpoint below -- both share one implementation, so freshness, staleness, and failure semantics are identical between them.
+
+With `compute=false` (the default) this never calls the LLM: it reads only what's already persisted, at the cost of one lightweight per-month count query. `compute=true` runs the same stale-month recompute pass the detailed endpoint uses before reading back. Either way it never returns a 500 for an LLM failure or unavailability.
 
 **Query parameters:**
 - `person_id` (string, optional): Target person (defaults to partner)
 - `months` (int): Months to analyze (default: 12)
+- `compute` (bool, optional): Recompute any stale or missing month before responding (default: false)
+
+**Response:** a month with no stored result at all is left out of `monthly_tones` entirely -- unlike the detailed endpoint, this never reports it with a placeholder score. A stored month whose freshness check finds it stale (or that a `compute=true` attempt couldn't refresh) is still included, with its last stored score and `"status": "stale"`. `analyzed_through` is the most recent month with a stored result, or `null` when `monthly_tones` is empty (in which case `trend` is `"not-analyzed"`). `person_id` defaults to the configured partner when omitted; an unconfigured partner and an unrecognized `person_id` both resolve to this same empty/`not-analyzed` shape rather than a 404.
 
 ### POST /api/crm/relationship/tone-analysis-detailed
 

@@ -5334,11 +5334,14 @@ class RelationshipInsightsResponse(BaseModel):
 
 
 class ToneDataPoint(BaseModel):
-    """A single month's tone data."""
+    """A single month's tone data in the compact (combined-score) shape
+    returned by `/relationship/tone-analysis`. Only a month with a stored
+    result is ever represented this way -- a month nothing was ever
+    computed for is left out of `monthly_tones` entirely rather than
+    appearing here with a placeholder score."""
     month: str  # YYYY-MM
-    tone: str  # warm, neutral, tense, etc.
-    score: float  # 0-100 scale
-    sample_count: int = 0
+    score: float  # combined_score, 0-100 scale
+    status: Optional[str] = None  # None = fresh; "stale" = last stored score, not recomputed this request
 
 
 class ToneDataPointDetailed(BaseModel):
@@ -5353,9 +5356,14 @@ class ToneDataPointDetailed(BaseModel):
 
 
 class ToneAnalysisResponse(BaseModel):
-    """Response for tone analysis endpoint."""
+    """Compact tone summary for `/relationship/tone-analysis`: one combined
+    score per stored month, no per-person breakdown. `analyzed_through` is
+    the most recent month with a stored result, or None when
+    `monthly_tones` is empty."""
     monthly_tones: list[ToneDataPoint]
-    trend: str  # stable-positive, improving, declining, variable
+    trend: str  # not-analyzed, insufficient-data, stable-positive, stable-neutral, improving, declining, variable
+    average: float
+    analyzed_through: Optional[str] = None
     generated_at: str
 
 
@@ -5502,148 +5510,60 @@ def delete_relationship_insight(insight_id: str):
 
 
 @router.post("/relationship/tone-analysis", response_model=ToneAnalysisResponse)
-def analyze_relationship_tone(person_id: Optional[str] = None, months: int = 12):
+def analyze_relationship_tone(person_id: Optional[str] = None, months: int = 12, compute: bool = False):
     """
-    Analyze tone/sentiment in iMessage conversations over time.
+    Compact monthly relationship-tone summary for `person_id`: one combined
+    score per stored month plus trend/average, backed by the exact same
+    persisted store, chunked-LLM pipeline, and per-person lock as
+    `/relationship/tone-analysis-detailed` (both share `_run_tone_analysis`
+    -- this handler never runs a second implementation of that pipeline).
 
-    Samples messages from each month and uses Claude to classify emotional tone.
-    Returns monthly tone scores and overall trend.
+    This endpoint never triggers automatic LLM computation: `compute`
+    defaults to `False`, in which case it only reads whatever is already
+    persisted (plus one lightweight per-month COUNT query to size the
+    window and flag stale months -- no row scan, no LLM call). Only an
+    explicit `compute=true` from the caller runs the recompute path, and
+    even then only for months the freshness check finds stale.
+
+    Never raises for an LLM failure or unavailability. A month that
+    couldn't be (re)computed is either served with its last stored score
+    (`status="stale"`) or, if nothing was ever stored for it, left out of
+    `monthly_tones` entirely -- unlike the detailed endpoint, which reports
+    such a month with a placeholder score and `status="error"`. When no
+    month in the window has any stored result, this returns 200 with an
+    empty `monthly_tones` and `trend="not-analyzed"`.
+
+    `person_id` defaults to the configured partner (`PARTNER_PERSON_ID`)
+    when omitted. An unconfigured partner and an unrecognized `person_id`
+    both resolve to no data rather than a 404 -- indistinguishable from a
+    real person who simply has no interactions in the window -- so both
+    also return the empty/`not-analyzed` shape.
     """
-    from api.services.llm_client import get_anthropic_llm
-    from datetime import datetime, timezone, timedelta
-
     target_id = person_id or PARTNER_PERSON_ID
-    interaction_store = get_interaction_store()
+    detailed = _run_tone_analysis(target_id, months, refresh=False, compute=compute)
 
-    # Get date range
-    now = datetime.now(timezone.utc)
-    start_date = now - timedelta(days=months * 30)
+    stored_points = [t for t in detailed.monthly_tones if t.status != "error"]
 
-    # Fetch iMessage interactions for this person
-    interactions = interaction_store.get_for_person(
-        person_id=target_id,
-        source_type="imessage",
-        limit=5000,
+    if not stored_points:
+        return ToneAnalysisResponse(
+            monthly_tones=[],
+            trend="not-analyzed",
+            average=50.0,
+            analyzed_through=None,
+            generated_at=detailed.generated_at,
+        )
+
+    scores = [t.combined_score for t in stored_points]
+    return ToneAnalysisResponse(
+        monthly_tones=[
+            ToneDataPoint(month=t.month, score=t.combined_score, status=t.status)
+            for t in stored_points
+        ],
+        trend=_derive_trend(scores),
+        average=round(sum(scores) / len(scores), 1),
+        analyzed_through=stored_points[-1].month,
+        generated_at=detailed.generated_at,
     )
-
-    # Group by month (interactions are Interaction objects, not dicts)
-    by_month: dict[str, list] = {}
-    for interaction in interactions:
-        dt = interaction.timestamp
-        if dt < start_date:
-            continue
-        month_key = dt.strftime("%Y-%m")
-        if month_key not in by_month:
-            by_month[month_key] = []
-        by_month[month_key].append(interaction)
-
-    if not by_month:
-        return ToneAnalysisResponse(
-            monthly_tones=[],
-            trend="insufficient-data",
-            generated_at=now.isoformat(),
-        )
-
-    # Sample messages for tone analysis (max 20 per month)
-    sampled_text = []
-    for month in sorted(by_month.keys()):
-        month_msgs = by_month[month][:20]
-        messages = []
-        for msg in month_msgs:
-            title = msg.title or ""
-            if title:
-                messages.append(title)
-        if messages:
-            sampled_text.append(f"=== {month} ===\n" + "\n".join(messages[:10]))
-
-    if not sampled_text:
-        return ToneAnalysisResponse(
-            monthly_tones=[],
-            trend="insufficient-data",
-            generated_at=now.isoformat(),
-        )
-
-    # Use local LLM to analyze tone
-    client = get_anthropic_llm()
-
-    partner_name = _get_partner_name() or "their partner"
-    prompt = f"""Analyze the emotional warmth of these iMessage conversations between {settings.user_name} and {partner_name} over time.
-
-For each month provided, rate the overall emotional warmth on a scale from 0 to 100:
-- 100 = Extremely warm and supportive: Affectionate, loving, deeply connected, emotionally present
-- 75 = Warm: Friendly, caring, engaged, positive
-- 50 = Neutral: Everyday logistics, matter-of-fact, neither warm nor cold
-- 25 = Cool: Brief, distant, minimal emotional engagement
-- 0 = Cold and dismissive: Tense, frustrated, disconnected, hostile
-
-Look for indicators like:
-- Terms of endearment, "I love you", affectionate language → Higher scores
-- Supportive statements, showing care, asking about feelings → Higher scores
-- Purely transactional/logistical messages → Middle scores
-- Short, curt responses, lack of warmth → Lower scores
-- Conflict, frustration, criticism → Lower scores
-
-Return ONLY valid JSON with a score for EACH month listed:
-{{
-  "monthly_tones": [
-    {{"month": "2025-03", "score": 72}},
-    {{"month": "2025-04", "score": 65}}
-  ],
-  "trend": "stable-positive"
-}}
-
-Trend options: stable-positive, stable-neutral, improving, declining, variable
-
-MESSAGES:
-{chr(10).join(sampled_text)}"""
-
-    try:
-        response = client.create(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2048,
-        )
-
-        response_text = response.text
-
-        # Parse JSON
-        if "```json" in response_text:
-            json_start = response_text.find("```json") + 7
-            json_end = response_text.find("```", json_start)
-            response_text = response_text[json_start:json_end].strip()
-        elif "```" in response_text:
-            json_start = response_text.find("```") + 3
-            json_end = response_text.find("```", json_start)
-            response_text = response_text[json_start:json_end].strip()
-
-        import json
-        data = json.loads(response_text)
-
-        monthly_tones = []
-        for item in data.get("monthly_tones", []):
-            score = float(item.get("score", 50))
-            # Derive tone label from score (0-100 scale)
-            if score >= 75:
-                tone = "warm"
-            elif score >= 50:
-                tone = "neutral"
-            else:
-                tone = "cool"
-            monthly_tones.append(ToneDataPoint(
-                month=item.get("month", ""),
-                tone=tone,
-                score=score,
-                sample_count=len(by_month.get(item.get("month", ""), [])),
-            ))
-
-        return ToneAnalysisResponse(
-            monthly_tones=monthly_tones,
-            trend=data.get("trend", "variable"),
-            generated_at=now.isoformat(),
-        )
-
-    except Exception as e:
-        logger.error(f"Tone analysis failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Tone analysis failed: {str(e)}")
 
 
 # Stored tone results older than this are recomputed even if the
@@ -5900,28 +5820,35 @@ def _chunked(items: list, size: int):
         yield items[i:i + size]
 
 
-@router.post("/relationship/tone-analysis-detailed", response_model=ToneAnalysisDetailedResponse)
-def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: int = 12, refresh: bool = False):
+def _run_tone_analysis(
+    target_id: str, months: int, refresh: bool, compute: bool,
+) -> ToneAnalysisDetailedResponse:
     """
-    Analyze tone/sentiment separately for the user and their partner in iMessage conversations.
+    Shared assembly for both `/relationship/tone-analysis` and
+    `/relationship/tone-analysis-detailed`: the only implementation of the
+    persisted tone-analysis pipeline. Returns the full per-person detailed
+    shape; each route handler adapts it to its own response model.
 
     Freshness is decided from a lightweight per-month COUNT query
     (`get_monthly_interaction_counts_in_range`) that never loads a single
     interaction row -- a fully-cached response touches storage only, no
-    row scan and no LLM call. Only when at least one month is stale does
-    the handler fetch and bucket the actual messages (by calendar month
-    first, then by week within that month) to build LLM prompts, chunked
-    at `TONE_MAX_MONTHS_PER_LLM_CALL` months per call so one slow or
-    timed-out call can't blank the whole window. Results are persisted per
+    row scan and no LLM call. When `compute` is `False`, that's as far as
+    this ever goes: stale and missing months are reported as such (see
+    below) but never recomputed, and the LLM is never called. When
+    `compute` is `True` and at least one month is stale, the handler fetches
+    and buckets the actual messages (by calendar month first, then by week
+    within that month) to build LLM prompts, chunked at
+    `TONE_MAX_MONTHS_PER_LLM_CALL` months per call so one slow or timed-out
+    call can't blank the whole window. Results are persisted per
     person/month in `tone_analysis_results`
     (api/services/tone_analysis_store.py): a month is served from storage
     when its stored interaction count still matches the current count and
     the result is within the freshness window (`TONE_FRESHNESS_DAYS`).
-    Pass `refresh=true` to force recomputation of every month in the window
-    regardless of freshness.
+    `refresh=True` marks every month in the window stale regardless of the
+    freshness check, so `compute=True` recomputes all of them.
 
     Never discards a good stored result and never raises for an LLM
-    failure or unavailability: a stale month that couldn't be recomputed
+    failure or unavailability: a stale month that couldn't be (re)computed
     this request is returned with its last stored score and
     `status="stale"` if one exists, or `status="error"` only if nothing
     was ever stored for it (ADR-025 fallback preserved via
@@ -5931,7 +5858,6 @@ def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: 
     from api.services.tone_analysis_store import get_tone_analysis_store
     from datetime import datetime, timezone, timedelta
 
-    target_id = person_id or PARTNER_PERSON_ID
     interaction_store = get_interaction_store()
     tone_store = get_tone_analysis_store()
 
@@ -5988,10 +5914,12 @@ def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: 
     # and tying up a threadpool worker indefinitely. This only affects the
     # *same* person -- other people and unrelated endpoints (e.g. GET
     # /api/crm/config) are unaffected, since the handler still runs off
-    # the event loop.
+    # the event loop. `compute=False` skips this whole block -- no lock,
+    # no LLM -- leaving every stale/missing month to be reported as such
+    # by the assembly step below.
     results_by_month: dict = {}
     model_name = ""
-    if stale_months:
+    if compute and stale_months:
         lock = _get_tone_analysis_lock(target_id)
         lock_acquired = lock.acquire(timeout=TONE_LOCK_TIMEOUT_SECONDS)
         try:
@@ -6123,3 +6051,15 @@ def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: 
         partner_average=round(partner_overall, 1),
         generated_at=now.isoformat(),
     )
+
+
+@router.post("/relationship/tone-analysis-detailed", response_model=ToneAnalysisDetailedResponse)
+def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: int = 12, refresh: bool = False):
+    """
+    Analyze tone/sentiment separately for the user and their partner in
+    iMessage conversations, always attempting to recompute any stale or
+    missing month (see `_run_tone_analysis`, which this delegates to with
+    `compute=True`).
+    """
+    target_id = person_id or PARTNER_PERSON_ID
+    return _run_tone_analysis(target_id, months, refresh=refresh, compute=True)
