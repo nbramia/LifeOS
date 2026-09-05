@@ -1,4 +1,4 @@
-"""Browser test for the /agents Graph tab redesign (#864) — label
+"""Browser test for the /agents Graph tab — label
 precedence against a linked card's title, the lane colour legend, the
 five-engine shape legend, question/error/subagent badges, host columns,
 the HTML hover card, synchronous click and double-click focus, zoom
@@ -465,12 +465,18 @@ class TestStreamTickUpdatesNodeSize:
         page.click('[data-tab="graph"]')
         page.wait_for_selector("#filter-route")
         page.select_option("#filter-recency", "all")
-        page.wait_for_timeout(1200)
-        r = page.evaluate(
+        # Poll instead of a fixed sleep — how long the browser takes to
+        # receive and parse the SSE body (one static chunk carrying two
+        # queued events) varies with machine load; the assertion is about
+        # the final rendered value, not about it appearing within a
+        # specific window.
+        radius_fn = (
             "() => { const g = [...document.querySelectorAll('.node')]"
             ".find(n => n.__data__.session_id === 'sess-tick');"
             " return g ? +g.querySelector('.node-shape').getAttribute('r') : null; }"
         )
+        page.wait_for_function(f"() => {{ const r = ({radius_fn})(); return r !== null && r >= 35; }}", timeout=8000)
+        r = page.evaluate(radius_fn)
         assert r is not None and r >= 35
         assert errors == []
 

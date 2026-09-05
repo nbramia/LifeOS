@@ -551,7 +551,7 @@ def test_snapshot_passes_through_board_assignment_fields(client, stores):
 
 
 # ---------------------------------------------------------------------------
-# `lane` + `pending_question` (#864) — additive snapshot-row fields the
+# `lane` + `pending_question` — additive snapshot-row fields the
 # graph reads for node colour and the question badge. Both are computed the
 # same way for /snapshot and /stream (both call `_build_snapshot`), so one
 # stream-path test below is enough to cover that they agree.

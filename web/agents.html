@@ -232,7 +232,7 @@
     grid-template-columns: 1fr var(--panel-width, 360px);
     height: calc(100vh - 56px - 41px - 34px);
   }
-  /* Lane + engine legend (#864) — sits between the filters bar and the
+  /* Lane + engine legend — sits between the filters bar and the
      graph, visible only while the Graph tab is active. */
   .legend-bar {
     display: flex;
@@ -283,7 +283,7 @@
     cursor: pointer;
   }
   #graph-zoom-fit:hover, #graph-zoom-reset:hover { border-color: var(--accent); }
-  /* HTML hover card (#864) — replaces the native SVG <title> tooltip. Never
+  /* HTML hover card — replaces the native SVG <title> tooltip. Never
      intercepts pointer events so it can't itself trigger mouseleave on the
      node underneath it. */
   .hover-card {
@@ -310,7 +310,7 @@
   .hover-card .hc-row { display: flex; gap: 0.4rem; justify-content: space-between; }
   .hover-card .hc-label { color: var(--text-dim); }
   .hover-card .hc-value { color: var(--text-secondary); text-align: right; word-break: break-word; }
-  /* Host column headers (#864) — SVG text in the zoomable viewport group,
+  /* Host column headers — SVG text in the zoomable viewport group,
      so they pan/zoom with the nodes they label. */
   .host-column-label {
     font: 12px system-ui, -apple-system, sans-serif;
@@ -319,7 +319,7 @@
     pointer-events: none;
     user-select: none;
   }
-  /* Node badges (#864) — question ring/glyph, error count, and the
+  /* Node badges — question ring/glyph, error count, and the
      collapsed-subagent-count badge. Offset from the node so they never
      collide with its label. */
   .node-badge-question { pointer-events: none; }
@@ -482,7 +482,7 @@
   .badge.status-ended { color: var(--completed); border-color: var(--completed); }
   .badge.status-failed,
   .badge.status-budget_exceeded { color: var(--failed); border-color: var(--failed); }
-  /* Model / engine / host / effort chips (#864) — display-only metadata,
+  /* Model / engine / host / effort chips — display-only metadata,
      never the node/panel name (that's the `.label` above). */
   .panel-chips {
     display: flex;
@@ -1113,7 +1113,7 @@
     font-weight: 600;
     color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
-    /* Lane accent (#864) — the same colour the graph tab uses for this
+    /* Lane accent — the same colour the graph tab uses for this
        lane's node fill (web/agents/lanes.js), so the board and graph read
        as one system. Colour set inline per-lane by board.js. */
     border-top: 3px solid var(--border);

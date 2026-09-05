@@ -1,6 +1,6 @@
 // web/agents/graph.js
 //
-// The Graph tab (#850) — the force-directed session map. Node rendering,
+// The Graph tab — the force-directed session map. Node rendering,
 // simulation, filters, chips, and search live here; the side panel's
 // rendering, event feed, label edit, and summary fetch come from the
 // shared `SessionPanel` in ./panel.js (also used by the Board tab's
@@ -49,7 +49,7 @@ export function initGraph() {
   let selectedSessionId = null;
   let apiHost = '';
 
-  // Subagent trees (#864) — a session with `parent_session_id` set is
+  // Subagent trees — a session with `parent_session_id` set is
   // hidden by default and its parent renders a count badge; clicking the
   // badge toggles that parent's id in this set.
   const expandedParents = new Set();
@@ -223,7 +223,7 @@ export function initGraph() {
   let _lastSimKey = '';
   let _simStopTimer = null;
 
-  // Host columns (#864) — the x-position signal is which host a session
+  // Host columns — the x-position signal is which host a session
   // runs on, not recency (recency stays a filter — see `applyFilters`
   // below). Recomputed every render from the currently-visible set so an
   // idle host's column disappears once nothing on it is shown.
@@ -345,7 +345,7 @@ export function initGraph() {
     });
   }
 
-  // Subagent trees (#864): a session with `parent_session_id` set is
+  // Subagent trees: a session with `parent_session_id` set is
   // dropped from the visible set unless its parent is in
   // `expandedParents` — collapsing it into a count badge on the parent
   // instead. A child whose parent isn't itself in the filtered set (e.g.
@@ -951,7 +951,7 @@ export function initGraph() {
   }
 
   // Expands every collapsed ancestor of `s` so a search hit inside a
-  // collapsed subagent tree becomes visible (#864).
+  // collapsed subagent tree becomes visible.
   function expandAncestorsFor(s) {
     const byId = new Map(allSessions.map(x => [x.session_id, x]));
     let current = s;

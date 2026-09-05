@@ -6,7 +6,7 @@
 // force simulation or a stubbed page. `web/agents/graph.js` imports these
 // for node rendering; `web/agents/panel.js` imports `nodeLabel`,
 // `isRawIdValue`, and `routingLabel` for the side panel's header, tooltip,
-// and rename prefill (#942) and re-exports `routingLabel` so existing
+// and rename prefill and re-exports `routingLabel` so existing
 // importers (`web/agents/board.js`, `web/agents/graph.js`) are unaffected —
 // this module never imports FROM panel.js, so the two never form a cycle.
 
@@ -125,7 +125,7 @@ export function ringWidthForToolCalls(toolCalls) {
   return clamp(1 + Math.log2(1 + n), 1, 6);
 }
 
-// Search dropdown tiers (issue #252) — a match's `field` names which tier
+// Search dropdown tiers — a match's `field` names which tier
 // it belongs to and which badge it renders. `isKnownSearchField` is an
 // own-property check (not a plain `field in SEARCH_TIER`) so a `field`
 // value that happens to name an `Object.prototype` member (e.g.

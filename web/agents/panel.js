@@ -742,7 +742,7 @@ export class SessionPanel {
     if (!labelEl || labelEl.querySelector('#label-edit-input')) return;
     // A raw-id `custom_label` never happens (the operator didn't type it),
     // but `label` falls back to the raw session/task id whenever there's no
-    // real title (#942) — prefilling that here would let a blur-without-
+    // real title — prefilling that here would let a blur-without-
     // typing save the raw id as a permanent `custom_label`. Guard both the
     // same way `nodeLabel` does, rather than reusing `nodeLabel` itself:
     // its further fallbacks (prompt preview, routing name) are display-only

@@ -572,7 +572,7 @@ class TestBoardLoad:
     def test_lane_headers_carry_the_shared_lane_colour_accent(self, page: Page, agents_base_url):
         """Each lane header's `border-top-color` is `laneColor(lane.id)`
         (web/agents/lanes.js) — the same palette the graph tab uses for its
-        node fill, so the board and graph read as one system (#864)."""
+        node fill, so the board and graph read as one system."""
         _open_board(page, agents_base_url)
         colors = page.evaluate(
             """() => Array.from(document.querySelectorAll('.board-lane')).map(el => ({

@@ -604,7 +604,7 @@ def _build_snapshot() -> dict[str, Any]:
         sd["custom_label"] = agent_viz_label_override.get_override(cli.session_id)
         session_dicts.append(sd)
 
-    # Board lane + pending-question fields (additive; #864) — applied last,
+    # Board lane + pending-question fields, additive — applied last,
     # uniformly, to every row regardless of source (local, cc/cx, mirrored,
     # or synthetic-remote), so a row built by any branch above still ends up
     # with both fields set.

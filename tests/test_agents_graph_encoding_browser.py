@@ -1,4 +1,4 @@
-"""Browser test for web/agents/graph_encoding.js (#864) — the graph's pure
+"""Browser test for web/agents/graph_encoding.js — the graph's pure
 encoding functions (label precedence, engine shape, lane colour, node size,
 search-tier validation, hover-card rows), unit-tested in isolation via the
 same `add_script_tag` harness `tests/test_agents_assignment_ui_browser.py`
