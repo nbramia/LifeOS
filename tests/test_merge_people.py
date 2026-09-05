@@ -19,6 +19,23 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def reset_relationship_store_singleton():
+    """Clear the process-wide RelationshipStore singleton around each test.
+
+    scripts.merge_people reaches the store through
+    api.services.relationship.get_relationship_store(), a singleton keyed to
+    whichever db_path first constructs it. Without this reset, a test that
+    exercises the real singleton (rather than patching it) leaves it pointed
+    at its own temporary crm.db for the rest of the worker's tests.
+    """
+    from api.services.relationship import reset_relationship_store
+
+    reset_relationship_store()
+    yield
+    reset_relationship_store()
+
+
 class TestMergedIdsTracking:
     """Tests for merged ID persistence and chain following."""
 
@@ -382,7 +399,7 @@ class TestMergePeopleToneAnalysisResults:
         interactions_db_path = str(tmp_path / "interactions.db")
 
         person_store = PersonEntityStore(crm_db_path)
-        RelationshipStore(crm_db_path)  # table only -- no rows needed
+        rel_store = RelationshipStore(crm_db_path)  # table only -- no rows needed
         SourceEntityStore(crm_db_path)  # table only -- no rows needed
         fact_store = PersonFactStore(crm_db_path)
         tone_store = ToneAnalysisStore(crm_db_path)
@@ -420,6 +437,7 @@ class TestMergePeopleToneAnalysisResults:
         monkeypatch.setattr("scripts.merge_people.get_interaction_db_path", lambda: interactions_db_path)
         monkeypatch.setattr("scripts.merge_people.MERGED_IDS_FILE", tmp_path / "merged_ids.json")
         monkeypatch.setattr("scripts.merge_people.MERGE_LOG_FILE", tmp_path / "merge_log.json")
+        monkeypatch.setattr("api.services.relationship.get_relationship_store", lambda *a, **k: rel_store)
         # Post-merge side effects unrelated to tone_analysis_results cleanup --
         # stubbed rather than wired up for real to keep this fixture from
         # growing into a second copy of person_entity/interaction fixtures.
@@ -480,7 +498,7 @@ class TestMergePeopleToneAnalysisResults:
         interactions_db_path = str(tmp_path / "interactions.db")
 
         person_store = PersonEntityStore(crm_db_path)
-        RelationshipStore(crm_db_path)
+        rel_store = RelationshipStore(crm_db_path)
         SourceEntityStore(crm_db_path)
         PersonFactStore(crm_db_path)
         InteractionStore(interactions_db_path, strict=False)
@@ -494,6 +512,7 @@ class TestMergePeopleToneAnalysisResults:
         monkeypatch.setattr("scripts.merge_people.get_interaction_db_path", lambda: interactions_db_path)
         monkeypatch.setattr("scripts.merge_people.MERGED_IDS_FILE", tmp_path / "merged_ids.json")
         monkeypatch.setattr("scripts.merge_people.MERGE_LOG_FILE", tmp_path / "merge_log.json")
+        monkeypatch.setattr("api.services.relationship.get_relationship_store", lambda *a, **k: rel_store)
         monkeypatch.setattr("api.services.person_stats.refresh_person_stats", lambda *a, **k: {})
         monkeypatch.setattr("api.services.relationship_metrics.update_strength_for_person", lambda *a, **k: None)
 

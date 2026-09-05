@@ -1054,3 +1054,10 @@ def get_relationship_store(db_path: Optional[str] = None) -> RelationshipStore:
             if _relationship_store is None:
                 _relationship_store = RelationshipStore(db_path)
     return _relationship_store
+
+
+def reset_relationship_store() -> None:
+    """Reset singleton (for testing)."""
+    global _relationship_store
+    with _relationship_store_lock:
+        _relationship_store = None
