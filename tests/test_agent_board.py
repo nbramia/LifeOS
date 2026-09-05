@@ -120,6 +120,43 @@ class TestDeriveLanePriority:
 
 
 # ---------------------------------------------------------------------------
+# lane_for_session — the graph node's lane, mirroring the board card's
+# lane for a linked task, or derived from the session's own status alone
+# when it has none.
+# ---------------------------------------------------------------------------
+
+class TestLaneForSession:
+    def test_linked_task_uses_derive_lane(self):
+        # task_status is not None -> the task's own derived lane wins,
+        # regardless of the session's own status.
+        assert agent_board.lane_for_session("running", "done", []) == "done"
+
+    def test_linked_task_review_tag(self):
+        assert agent_board.lane_for_session(
+            "completed", "done", ["agent-completed"],
+        ) == "review"
+
+    @pytest.mark.parametrize("status,lane", [
+        ("running", "in_progress"),
+        ("claimed", "in_progress"),
+        ("yielded", "in_progress"),
+        ("blocked", "human_queue"),
+        ("completed", "done"),
+        ("ended", "done"),
+        ("failed", "done"),
+        ("budget_exceeded", "done"),
+    ])
+    def test_no_linked_task_maps_from_session_status(self, status, lane):
+        assert agent_board.lane_for_session(status, None, None) == lane
+
+    def test_no_linked_task_unknown_status_is_unassigned(self):
+        assert agent_board.lane_for_session("inactive", None, None) == "unassigned"
+
+    def test_no_linked_task_empty_status_is_unassigned(self):
+        assert agent_board.lane_for_session("", None, None) == "unassigned"
+
+
+# ---------------------------------------------------------------------------
 # plan_lane_move
 # ---------------------------------------------------------------------------
 

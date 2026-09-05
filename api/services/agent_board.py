@@ -317,6 +317,39 @@ def evaluate_card_action(
     raise AssertionError(f"unhandled action {action!r} despite CARD_ACTIONS validation above")
 
 
+# Session statuses that map to a board lane when a session carries no
+# linked task (see `lane_for_session` below).
+_SESSION_STATUS_LANES: dict[str, str] = {
+    "running": "in_progress",
+    "claimed": "in_progress",
+    "yielded": "in_progress",
+    "blocked": "human_queue",
+    "completed": "done",
+    "ended": "done",
+    "failed": "done",
+    "budget_exceeded": "done",
+}
+
+
+def lane_for_session(
+    session_status: str,
+    task_status: Optional[str],
+    task_tags: Optional[Iterable[str]] = None,
+) -> str:
+    """Derive the board lane a session's node should render in.
+
+    A session linked to a task (`task_status is not None`) always takes that
+    task's own derived lane (`derive_lane`), so the graph's node colour
+    always agrees with that card's column on the board. A session with no
+    linked task (most CLI and ad hoc sessions) instead maps from its own
+    status: `running`/`claimed`/`yielded` -> in_progress, `blocked` ->
+    human_queue, a terminal status -> done, anything else -> unassigned.
+    """
+    if task_status is not None:
+        return derive_lane(task_status, task_tags or [])
+    return _SESSION_STATUS_LANES.get((session_status or "").lower(), "unassigned")
+
+
 @dataclass
 class LaneMovePlan:
     """What a `PUT /board/cards/{id}/lane` request should write, or why not.

@@ -551,6 +551,107 @@ def test_snapshot_passes_through_board_assignment_fields(client, stores):
 
 
 # ---------------------------------------------------------------------------
+# `lane` + `pending_question` (#864) — additive snapshot-row fields the
+# graph reads for node colour and the question badge. Both are computed the
+# same way for /snapshot and /stream (both call `_build_snapshot`), so one
+# stream-path test below is enough to cover that they agree.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_snapshot_reports_lane_from_linked_task(client, stores, monkeypatch):
+    session_store, _ = stores
+    session_store.create(task_id="t-lane-linked", status=STATUS_RUNNING, routing="local")
+
+    class StubTask:
+        status = "done"
+        tags = ["agent-completed"]
+
+    class StubManager:
+        def get(self, task_id):
+            return StubTask() if task_id == "t-lane-linked" else None
+
+    monkeypatch.setattr("api.services.task_manager.get_task_manager", lambda: StubManager())
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    # The task's own derived lane ("review", from agent-completed) wins over
+    # the session's own "running" status.
+    assert sess["lane"] == "review"
+
+
+@pytest.mark.unit
+def test_snapshot_reports_lane_from_session_status_when_task_unknown(client, stores, monkeypatch):
+    session_store, _ = stores
+
+    class StubManager:
+        def get(self, task_id):
+            return None
+
+    monkeypatch.setattr("api.services.task_manager.get_task_manager", lambda: StubManager())
+    session_store.create(task_id="t-lane-unknown", status=STATUS_BLOCKED, routing="local")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["lane"] == "human_queue"
+
+
+@pytest.mark.unit
+def test_snapshot_reports_pending_question_for_session(client, stores):
+    session_store, _ = stores
+    s = session_store.create(task_id="t-pending-q", status=STATUS_BLOCKED, routing="local")
+    session_store.create_pending_question(
+        session_id=s.session_id, task_id="t-pending-q",
+        question="Which branch should this target?", sent_message_id=1,
+    )
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["pending_question"]["question"] == "Which branch should this target?"
+    assert sess["pending_question"]["session_id"] == s.session_id
+
+
+@pytest.mark.unit
+def test_snapshot_pending_question_is_null_when_none_open(client, stores):
+    session_store, _ = stores
+    session_store.create(task_id="t-no-pending-q", status=STATUS_RUNNING, routing="local")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["pending_question"] is None
+
+
+@pytest.mark.unit
+def test_stream_reports_lane_and_pending_question(stores):
+    """`/stream` emits the same snapshot payload `/snapshot` does — the
+    first SSE event carries the full snapshot with no artificial delay
+    (the generator yields it before its first `asyncio.sleep`).
+
+    Drives the route's `StreamingResponse.body_iterator` directly rather
+    than through an HTTP client: the endpoint's generator runs forever
+    (`while True`), and stopping after its first `event: snapshot` chunk
+    here — instead of after a full HTTP round trip — means this test never
+    waits on (or races) the generator's `asyncio.sleep(2.0)` between ticks.
+    """
+    import asyncio
+
+    session_store, _ = stores
+    s = session_store.create(task_id="t-stream-lane", status=STATUS_BLOCKED, routing="local")
+    session_store.create_pending_question(
+        session_id=s.session_id, task_id="t-stream-lane",
+        question="Proceed?", sent_message_id=1,
+    )
+
+    async def _first_snapshot_chunk() -> str:
+        resp = await agents_route.stream_snapshots()
+        parts = []
+        async for chunk in resp.body_iterator:
+            parts.append(chunk if isinstance(chunk, str) else chunk.decode())
+            if "event: snapshot" in parts[-1]:
+                break
+        return "".join(parts)
+
+    raw = asyncio.run(_first_snapshot_chunk())
+    data_line = next(line for line in raw.splitlines() if line.startswith("data:"))
+    payload = json.loads(data_line[len("data:"):].strip())
+    sess = next(x for x in payload["sessions"] if x["session_id"] == s.session_id)
+    assert sess["lane"] == "human_queue"
+    assert sess["pending_question"]["question"] == "Proceed?"
+
+
+# ---------------------------------------------------------------------------
 # Summary search (issue #252) — GET /api/agents/search + the cache-only
 # search_cached_summaries helper. Seeds the disk cache directly so no LLM runs.
 # ---------------------------------------------------------------------------
