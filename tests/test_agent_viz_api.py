@@ -487,7 +487,7 @@ def test_model_label_hermes_completed_session_is_frozen(client, stores):
 
 @pytest.mark.unit
 def test_model_label_hermes_whitespace_only_model_degrades_to_plain_hermes(client, stores):
-    """(round-1 review, R-4) A whitespace-only reported model (e.g. a
+    """A whitespace-only reported model (e.g. a
     malformed upstream `usage` event) must not render as `Hermes ·    ` —
     `SessionStore.set_hermes_model` strips before its falsy guard, so this
     is indistinguishable from no turn having been observed yet. A real,
