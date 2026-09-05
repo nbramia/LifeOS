@@ -298,7 +298,7 @@ export function initGraph() {
     };
   }
 
-  // Shared by `nodeLabel` and `sessionDisplayName` below — a raw identifier
+  // Shared by `nodeLabel` and `searchResultTitle` below — a raw identifier
   // (the session id itself, that id with a known CLI prefix ("cc:"/"cx:")
   // stripped, or the row's task_id)
   // is never a real label, wherever it might render: the graph node, or
@@ -320,8 +320,8 @@ export function initGraph() {
   }
 
   function nodeLabel(d) {
-    // Precedence, first non-empty wins. `label` and `short_label` are
-    // each skipped when they're not a human label but the raw identifier
+    // Precedence, first non-empty wins. `custom_label`, `short_label`, and
+    // `label` are each skipped when they're not a human label but the raw identifier
     // the row fell back to (`isRawIdValue` above) — since both ingests and
     // `_label_for_session` fall back to exactly that raw id when there's no
     // real title, and `_fallback_label` (agent_viz_summary.py) can cache

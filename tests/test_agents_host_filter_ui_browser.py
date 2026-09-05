@@ -786,6 +786,12 @@ SNAPSHOT4 = {
         _bare_session(
             "sess-summary-match-only", "task-005",
         ),
+        _bare_session(
+            "sess-shortlabel-vs-custom", "task-006",
+            custom_label="dropdowntest-operator-name",
+            label="dropdowntest-ingest-name",
+            short_label="dropdowntest-llm-short",
+        ),
     ],
     "edges": [],
     "generated_at": 1234567890,
@@ -820,7 +826,7 @@ def _open_agents4(page: Page, base_url, search_matches=None):
 class TestSearchDropdownLabelSourcePrecedence:
     """The label-tier title comes from the matched field's own value
     (`custom_label || label`), guarded by `isRawIdValue` the same way the
-    node's `custom_label` slot now is, and distinct from `sessionDisplayName`
+    node's `custom_label` slot is, and distinct from `sessionDisplayName`
     (`nodeLabel`)'s separate precedence order — using a fourth synthetic
     snapshot (`SNAPSHOT4`) built for these cases specifically."""
 
@@ -867,3 +873,17 @@ class TestSearchDropdownLabelSourcePrecedence:
         assert all(title == "Local" for title in titles)
         assert "sess-rawid-shortlabel-only" not in titles
         assert {b.lower() for b in badges} == {"label", "summary"}
+
+    def test_short_label_tier_title_uses_short_label_not_display_name(self, page: Page, agents_base_url):
+        matches = [
+            {"session_id": "sess-shortlabel-vs-custom", "field": "short_label", "snippet": "llm short label match"},
+        ]
+        _open_agents4(page, agents_base_url, search_matches=matches)
+        page.locator("#search-input").fill("llm-short")
+        page.wait_for_timeout(400)
+        result = page.locator(".search-result", has_text="dropdowntest-llm-short")
+        expect(result).to_be_visible()
+        name_el = result.locator(".sr-name")
+        assert name_el.inner_text() == "dropdowntest-llm-short"
+        assert name_el.inner_text() != "dropdowntest-operator-name"
+        assert name_el.locator("mark").count() > 0
