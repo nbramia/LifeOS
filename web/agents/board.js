@@ -12,16 +12,7 @@ import {
   TERMINAL, routingLabel, sourceLabelFor, escapeHtml, showToast, SessionPanel,
 } from './panel.js';
 import { renderAssignmentPickers } from './assignment.js';
-
-const LANES = [
-  { id: 'unassigned',  label: 'Unassigned' },
-  { id: 'assigned',    label: 'Assigned' },
-  { id: 'in_progress', label: 'In progress' },
-  { id: 'human_queue', label: 'Human queue' },
-  { id: 'scheduled',   label: 'Scheduled' },
-  { id: 'review',      label: 'Review' },
-  { id: 'done',        label: 'Done' },
-];
+import { LANES, laneColor } from './lanes.js';
 
 const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local'];
 // plan_lane_move (api/services/agent_board.py) 409s a lane=in_progress move
@@ -413,7 +404,7 @@ export function initBoard() {
         .filter(cardMatchesFilters);
 
       column.innerHTML = `
-        <div class="board-lane-header">${escapeHtml(lane.label)} <span class="board-lane-count">${cards.length}</span></div>
+        <div class="board-lane-header" style="border-top-color:${laneColor(lane.id)}">${escapeHtml(lane.label)} <span class="board-lane-count">${cards.length}</span></div>
         ${DIRECT_LANE_IDS.has(lane.id) ? `<button type="button" class="board-lane-add" data-lane="${lane.id}" title="New card in ${escapeHtml(lane.label)}">+</button>` : ''}
       `;
       const addBtn = column.querySelector('.board-lane-add');

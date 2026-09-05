@@ -1,12 +1,13 @@
 // web/agents/graph.js
 //
-// The Graph tab (#850) — the force-directed session graph that used to be
-// the whole /agents page. Node rendering, simulation, filters, chips, and
-// search are unchanged from the pre-#850 single-file web/agents.html; the
-// only structural change is that the side panel's rendering, event feed,
-// label edit, and summary fetch now come from the shared
-// `SessionPanel` in ./panel.js (also used by the Board tab's drawer)
-// instead of being duplicated inline.
+// The Graph tab (#850) — the force-directed session map. Node rendering,
+// simulation, filters, chips, and search live here; the side panel's
+// rendering, event feed, label edit, and summary fetch come from the
+// shared `SessionPanel` in ./panel.js (also used by the Board tab's
+// drawer), and the pure encoding functions (label precedence, engine
+// shape, lane colour, node size, hover-card content, search-tier
+// validation) live in ./graph_encoding.js so they're unit-testable without
+// a DOM or d3 (see tests/test_agents_graph_encoding_browser.py).
 //
 // `initGraph()` is called once, lazily, the first time the operator opens
 // the Graph tab (see web/agents.html) — the graph's own snapshot fetch + SSE
@@ -14,9 +15,14 @@
 // also open a second live connection nobody is looking at.
 
 import {
-  STATUS_COLORS, TERMINAL, routingLabel, sourceLabelFor,
-  escapeHtml, showToast, SessionPanel,
+  STATUS_COLORS, TERMINAL, escapeHtml, showToast, SessionPanel,
 } from './panel.js';
+import { LANES } from './lanes.js';
+import {
+  nodeLabel, isRawIdValue, engineOf, ENGINE_SHAPES, shapeTagFor,
+  radiusForActiveSeconds, ringWidthForToolCalls, laneColor,
+  isKnownSearchField, SEARCH_TIER, SEARCH_BADGE, hoverCardRows,
+} from './graph_encoding.js';
 
 export function initGraph() {
   const filterTerminalEl = document.getElementById('filter-terminal');
@@ -30,12 +36,37 @@ export function initGraph() {
   const panelEl = document.getElementById('panel');
   const panelOuterEl = document.getElementById('panel-outer');
   const panelResizerEl = document.getElementById('panel-resizer');
+  const hoverCardEl = document.getElementById('graph-hover-card');
+  const zoomFitBtn = document.getElementById('graph-zoom-fit');
+  const zoomResetBtn = document.getElementById('graph-zoom-reset');
+  const laneLegendEl = document.getElementById('graph-lane-legend');
+  const engineLegendEl = document.getElementById('graph-engine-legend');
   // Operator chooses recency manually → don't auto-flip on include-finished toggle.
   let recencyManuallySet = false;
 
   let allSessions = [];
   let allEdges = [];
   let selectedSessionId = null;
+  let apiHost = '';
+
+  // Subagent trees (#864) — a session with `parent_session_id` set is
+  // hidden by default and its parent renders a count badge; clicking the
+  // badge toggles that parent's id in this set.
+  const expandedParents = new Set();
+
+  function renderLegend() {
+    if (laneLegendEl) {
+      laneLegendEl.innerHTML = LANES.map(l =>
+        `<span class="legend-item"><span class="legend-swatch" style="background:${laneColor(l.id)}"></span>${escapeHtml(l.label)}</span>`
+      ).join('');
+    }
+    if (engineLegendEl) {
+      engineLegendEl.innerHTML = Object.values(ENGINE_SHAPES).map(info =>
+        `<span class="legend-item"><span class="legend-glyph legend-glyph-${info.glyph}"></span>${escapeHtml(info.label)}</span>`
+      ).join('');
+    }
+  }
+  renderLegend();
 
   // 1-hop descendants (via parent_session_id) for the kill-modal preview.
   function descendantsOf(session) {
@@ -132,14 +163,19 @@ export function initGraph() {
   const VIEW_W = 1600;
   const VIEW_H = 1100;
   svg.attr('viewBox', `0 0 ${VIEW_W} ${VIEW_H}`);
+  svg.attr('data-zoom-k', '1');
   svg.style('overflow', 'visible');
   const viewport = svg.append('g').attr('class', 'viewport');
+  const columnLayer = viewport.append('g').attr('class', 'host-columns');
   const linkLayer = viewport.append('g').attr('class', 'links');
   const nodeLayer = viewport.append('g').attr('class', 'nodes');
 
   const zoom = d3.zoom()
     .scaleExtent([0.2, 5])
-    .on('zoom', (event) => { viewport.attr('transform', event.transform); });
+    .on('zoom', (event) => {
+      viewport.attr('transform', event.transform);
+      svg.attr('data-zoom-k', event.transform.k);
+    });
   svg.call(zoom);
   svg.style('cursor', 'grab');
   svg.on('mousedown.cursor', () => svg.style('cursor', 'grabbing'));
@@ -149,33 +185,83 @@ export function initGraph() {
     if (event.target === svg.node() && selectedSessionId) closePanel();
   });
 
-  let visibleCount = 0;
-  let _lastVisibleIdsKey = '';
-  let _nodeClickTimer = null;
-  function recencyRailSpan() {
-    if (visibleCount <= 1) return 0;
-    return Math.min(0.84, 0.15 + 0.15 * Math.log2(visibleCount));
+  function transitionMs() {
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    return reduced ? 0 : 300;
   }
 
-  function recencyTargetX(s) {
-    const span = recencyRailSpan();
-    const nowSec = Date.now() / 1000;
-    const ageSec = Math.max(0, nowSec - (s.last_activity_at || nowSec));
-    const ageNorm = Math.min(ageSec, 86400) / 86400;
-    return VIEW_W * (0.5 + span / 2 - ageNorm * span);
+  function zoomFit() {
+    const nodes = nodeLayer.selectAll('.node').data();
+    if (!nodes.length) return;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    nodes.forEach(d => {
+      const pad = nodeRadius(d) + 24 + (d._labelW ? d._labelW / 2 : 0);
+      minX = Math.min(minX, d.x - pad); maxX = Math.max(maxX, d.x + pad);
+      minY = Math.min(minY, d.y - pad); maxY = Math.max(maxY, d.y + pad);
+    });
+    const w = Math.max(1, maxX - minX);
+    const h = Math.max(1, maxY - minY);
+    const rect = svg.node().getBoundingClientRect();
+    const boxW = rect.width || VIEW_W;
+    const boxH = rect.height || VIEW_H;
+    const scale = Math.max(0.2, Math.min(5, 0.9 / Math.max(w / boxW, h / boxH)));
+    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+    const tx = boxW / 2 - scale * cx;
+    const ty = boxH / 2 - scale * cy;
+    svg.transition().duration(transitionMs())
+      .call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+  }
+
+  function zoomReset() {
+    svg.transition().duration(transitionMs()).call(zoom.transform, d3.zoomIdentity);
+  }
+
+  if (zoomFitBtn) zoomFitBtn.addEventListener('click', zoomFit);
+  if (zoomResetBtn) zoomResetBtn.addEventListener('click', zoomReset);
+
+  let visibleCount = 0;
+  let _lastSimKey = '';
+  let _simStopTimer = null;
+
+  // Host columns (#864) — the x-position signal is which host a session
+  // runs on, not recency (recency stays a filter — see `applyFilters`
+  // below). Recomputed every render from the currently-visible set so an
+  // idle host's column disappears once nothing on it is shown.
+  let columnHosts = [];
+  let columnCenters = new Map();
+
+  function hostOf(s) {
+    return s.host || apiHost || 'unknown';
+  }
+
+  const LANE_ORDER = LANES.map(l => l.id);
+  function laneIndex(d) {
+    const i = LANE_ORDER.indexOf(d.lane);
+    return i >= 0 ? i : LANE_ORDER.length;
+  }
+
+  const COLUMN_HEADER_H = 60;
+  function laneTargetY(d) {
+    const bands = LANE_ORDER.length + 1;
+    const usable = VIEW_H - COLUMN_HEADER_H - 20;
+    const bandH = usable / bands;
+    return COLUMN_HEADER_H + laneIndex(d) * bandH + bandH / 2;
+  }
+
+  function columnTargetX(d) {
+    const c = columnCenters.get(hostOf(d));
+    return c == null ? VIEW_W / 2 : c;
   }
 
   const simulation = d3.forceSimulation()
     .force('link', d3.forceLink().id(d => d.session_id).distance(80).strength(0.04))
     .force('charge', d3.forceManyBody().strength(-220).distanceMax(600))
-    .force('center-y', d3.forceY(VIEW_H / 2).strength(0.12))
-    .force('recency-x', d3.forceX(recencyTargetX).strength(0.18))
+    .force('col-x', d3.forceX(columnTargetX).strength(0.22))
+    .force('lane-y', d3.forceY(laneTargetY).strength(0.16))
     .force('collide', d3.forceCollide().radius(d => collideRadius(d)).strength(0.9))
     .alphaDecay(0.025)
     .alphaMin(0.001)
     .velocityDecay(0.45);
-
-  setTimeout(() => simulation.alpha(0).stop(), 8000);
 
   simulation.on('tick', () => {
     nodeLayer.selectAll('.node').attr('transform', d => `translate(${d.x},${d.y})`);
@@ -259,6 +345,37 @@ export function initGraph() {
     });
   }
 
+  // Subagent trees (#864): a session with `parent_session_id` set is
+  // dropped from the visible set unless its parent is in
+  // `expandedParents` — collapsing it into a count badge on the parent
+  // instead. A child whose parent isn't itself in the filtered set (e.g.
+  // the parent was filtered out) is shown directly — there's nothing to
+  // collapse it into.
+  function applyCollapse(filtered) {
+    const ids = new Set(filtered.map(s => s.session_id));
+    return filtered.filter(s => {
+      if (!s.parent_session_id) return true;
+      if (!ids.has(s.parent_session_id)) return true;
+      return expandedParents.has(s.parent_session_id);
+    });
+  }
+
+  // Direct-child counts per parent (in the filtered set, before collapse) —
+  // used both for the badge's hidden-count text and to decide whether the
+  // badge should render at all. A parent with children keeps its badge
+  // visible even fully expanded (0 currently hidden): otherwise expanding
+  // would remove the only affordance that collapses it back.
+  function totalChildCounts(filtered) {
+    const ids = new Set(filtered.map(s => s.session_id));
+    const counts = new Map();
+    for (const s of filtered) {
+      if (!s.parent_session_id) continue;
+      if (!ids.has(s.parent_session_id)) continue;
+      counts.set(s.parent_session_id, (counts.get(s.parent_session_id) || 0) + 1);
+    }
+    return counts;
+  }
+
   function applyRecencyDefault() {
     if (recencyManuallySet || !filterRecencyEl) return;
     filterRecencyEl.value = filterTerminalEl.checked ? '604800' : '1800';
@@ -273,74 +390,23 @@ export function initGraph() {
     return `rgba(${r}, ${g}, ${b}, ${alpha})`;
   }
 
-  function sizeForTokens(totalTokens) {
-    const t = Math.max(0, totalTokens || 0);
-    const grown = Math.log10(t + 10) * 6;
-    return Math.min(56, Math.max(14, 14 + grown));
-  }
-
   function nodeRadius(d) {
-    return sizeForTokens(
-      (d.total_input_tokens || 0)
-      + (d.total_output_tokens || 0)
-      + (d.total_cache_creation_tokens || 0)
-      + (d.total_cache_read_tokens || 0)
-    );
+    return radiusForActiveSeconds(d.total_active_seconds);
   }
 
+  // Fill = the session's board lane colour (shared with the board — see
+  // web/agents/lanes.js); status stays visible via the stroke: a thicker
+  // border for `blocked`, and reduced fill opacity once a session is
+  // terminal. The live-pulse animation (`.pulsing`, CSS keyframe) is
+  // unchanged.
   function nodeColors(d) {
-    const c = STATUS_COLORS[d.status] || '#6b7280';
+    const fillHex = laneColor(d.lane);
     const isTerm = TERMINAL.has(d.status);
     return {
-      fill: isTerm ? hexWithAlpha(c, 0.35) : hexWithAlpha(c, 0.85),
-      stroke: c,
+      fill: isTerm ? hexWithAlpha(fillHex, 0.35) : hexWithAlpha(fillHex, 0.85),
+      stroke: STATUS_COLORS[d.status] || '#6b7280',
       borderWidth: d.status === 'blocked' ? 4 : 2,
     };
-  }
-
-  // Shared by `nodeLabel` and `searchResultTitle` below — a raw identifier
-  // (the session id itself, that id with a known CLI prefix ("cc:"/"cx:")
-  // stripped, or the row's task_id)
-  // is never a real label, wherever it might render: the graph node, or
-  // the search-results dropdown. Compared by equality (after trimming),
-  // not by `startsWith`: a `startsWith` check never matches a prefixed
-  // session id ("cc:<uuid>".startsWith("<uuid>") is false), which let raw
-  // ids through as labels.
-  function isRawIdValue(d, value) {
-    const norm = (v) => (v || '').toString().trim();
-    const sessionId = norm(d.session_id);
-    const bareSessionId = sessionId.replace(/^(cc|cx):/, '');
-    const taskId = norm(d.task_id);
-    const v = norm(value);
-    return !!v && (
-      v === sessionId ||
-      v === bareSessionId ||
-      (!!taskId && v === taskId)
-    );
-  }
-
-  function nodeLabel(d) {
-    // Precedence, first non-empty wins. `custom_label`, `short_label`, and
-    // `label` are each skipped when they're not a human label but the raw identifier
-    // the row fell back to (`isRawIdValue` above) — since both ingests and
-    // `_label_for_session` fall back to exactly that raw id when there's no
-    // real title, and `_fallback_label` (agent_viz_summary.py) can cache
-    // that same raw id as `short_label`, which sits ABOVE `label` in this
-    // precedence list, so it needs the identical guard or the raw id leaks
-    // through one slot higher. Never emits '?'.
-    const candidates = [
-      isRawIdValue(d, d.custom_label) ? '' : d.custom_label,
-      isRawIdValue(d, d.short_label) ? '' : d.short_label,
-      isRawIdValue(d, d.label) ? '' : d.label,
-      d.prompt_preview,
-      d.model_label,
-      routingLabel(d.routing),
-    ];
-    for (const c of candidates) {
-      const trimmed = (c || '').toString().trim();
-      if (trimmed) return trimmed;
-    }
-    return d.session_id.slice(0, 8);
   }
 
   const LABEL_CHAR_W = 6.6;
@@ -401,19 +467,6 @@ export function initGraph() {
     return Math.max(r + 14, enclose);
   }
 
-  function nodeTitle(d) {
-    return [
-      d.label,
-      d.decoded_cwd ? `cwd: ${d.decoded_cwd}` : null,
-      `source: ${sourceLabelFor(d)}`,
-      `status: ${d.status}`,
-      `routing: ${routingLabel(d.routing)}`,
-      `tokens: ${d.total_input_tokens} in / ${d.total_output_tokens} out`,
-      `cost: $${(d.total_dollars || 0).toFixed(4)}`,
-      d.last_event_kind ? `last: ${d.last_event_kind}` : null,
-    ].filter(Boolean).join('\n');
-  }
-
   function isActivelyWriting(d) {
     const nowSec = Date.now() / 1000;
     return d.status === 'running'
@@ -421,11 +474,26 @@ export function initGraph() {
       && (nowSec - d.last_activity_at) < 60;
   }
 
-  function nodeShapeTag(d) {
-    if (d.source === 'claude_code' || d.source === 'codex'
-        || d.routing === 'claude_code' || d.routing === 'codex') return 'rect';
-    if (!d.routing || d.routing === 'local') return 'polygon';
-    return 'circle';
+  // Regular-hexagon points, flat-top, centered on the origin.
+  function hexagonPoints(r) {
+    const pts = [];
+    for (let i = 0; i < 6; i++) {
+      const angle = (Math.PI / 3) * i - Math.PI / 2;
+      pts.push(`${(r * Math.cos(angle)).toFixed(2)},${(r * Math.sin(angle)).toFixed(2)}`);
+    }
+    return pts.join(' ');
+  }
+
+  // Five-point star path, centered on the origin.
+  function starPath(r) {
+    const outer = r, inner = r * 0.42;
+    let d = '';
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? outer : inner;
+      const angle = (Math.PI / 5) * i - Math.PI / 2;
+      d += (i === 0 ? 'M' : 'L') + (rad * Math.cos(angle)).toFixed(2) + ',' + (rad * Math.sin(angle)).toFixed(2) + ' ';
+    }
+    return d + 'Z';
   }
 
   function applyShapeAttrs(sel) {
@@ -433,8 +501,10 @@ export function initGraph() {
       const el = d3.select(this);
       const r = nodeRadius(d);
       const colors = nodeColors(d);
+      const glyph = ENGINE_SHAPES[engineOf(d)].glyph;
       el.attr('fill', colors.fill).attr('stroke', colors.stroke)
         .attr('stroke-width', colors.borderWidth)
+        .attr('data-shape', glyph)
         .classed('pulsing', isActivelyWriting(d));
       if (this.tagName === 'circle') {
         el.attr('r', r);
@@ -445,15 +515,114 @@ export function initGraph() {
           .attr('rx', Math.min(side * 0.22, 12))
           .attr('ry', Math.min(side * 0.22, 12));
       } else if (this.tagName === 'polygon') {
-        const h = r * 1.4;
-        el.attr('points', `0,${-h} ${h},0 0,${h} ${-h},0`);
+        if (glyph === 'hexagon') {
+          el.attr('points', hexagonPoints(r * 1.15));
+        } else {
+          const h = r * 1.4;
+          el.attr('points', `0,${-h} ${h},0 0,${h} ${-h},0`);
+        }
+      } else if (this.tagName === 'path') {
+        el.attr('d', starPath(r * 1.2));
       }
     });
   }
 
+  // Secondary tool-call ring — a thin accent circle around the node whose
+  // width is `ringWidthForToolCalls(tool_call_count)`.
+  function applyToolRing(sel) {
+    sel.each(function(d) {
+      const r = nodeRadius(d);
+      const width = ringWidthForToolCalls(d.tool_call_count);
+      d3.select(this)
+        .attr('r', r + 4 + width / 2)
+        .attr('stroke-width', width);
+    });
+  }
+
+  // Badges: a question ring+glyph when a pending question is open for the
+  // operator, an error count, and (on a collapsed parent) the hidden-
+  // descendant count. All three are offset from the label, positioned at
+  // fixed corners of the node so they never collide with it.
+  function applyBadges(sel) {
+    sel.each(function(d) {
+      const g = d3.select(this);
+      const r = nodeRadius(d);
+      const hasQuestion = !!d.pending_question;
+      g.select('.node-badge-question-ring')
+        .style('display', hasQuestion ? '' : 'none')
+        .attr('cx', r * 0.85).attr('cy', -r * 0.85).attr('r', 8);
+      g.select('text.node-badge-question')
+        .style('display', hasQuestion ? '' : 'none')
+        .attr('x', r * 0.85).attr('y', -r * 0.85)
+        .text('?');
+
+      const errorCount = d.error_count || 0;
+      g.select('text.node-badge-errors')
+        .style('display', errorCount > 0 ? '' : 'none')
+        .attr('x', r * 0.85).attr('y', r * 0.85 + 4)
+        .text(errorCount > 99 ? '99+' : String(errorCount));
+
+      const totalChildren = d._totalChildren || 0;
+      const hiddenChildren = d._collapsedChildren || 0;
+      g.select('text.node-badge-children')
+        .style('display', totalChildren > 0 ? '' : 'none')
+        .attr('x', -r * 0.85).attr('y', -r * 0.85 + 4)
+        .text(hiddenChildren > 0 ? '+' + (hiddenChildren > 99 ? '99+' : hiddenChildren) : '−');
+    });
+  }
+
+  function showHoverCard(event, d) {
+    if (!hoverCardEl) return;
+    const rows = hoverCardRows(d);
+    hoverCardEl.innerHTML = `<div class="hc-title">${escapeHtml(nodeLabel(d))}</div>`
+      + rows.map(([label, value]) =>
+        `<div class="hc-row"><span class="hc-label">${escapeHtml(label)}</span><span class="hc-value">${escapeHtml(String(value))}</span></div>`
+      ).join('');
+    positionHoverCard(event);
+    hoverCardEl.hidden = false;
+  }
+
+  function positionHoverCard(event) {
+    if (!hoverCardEl) return;
+    const pad = 16;
+    hoverCardEl.style.left = (event.clientX + pad) + 'px';
+    hoverCardEl.style.top = (event.clientY + pad) + 'px';
+  }
+
+  function hideHoverCard() {
+    if (hoverCardEl) hoverCardEl.hidden = true;
+  }
+
+  function toggleParentExpanded(sessionId) {
+    if (expandedParents.has(sessionId)) expandedParents.delete(sessionId);
+    else expandedParents.add(sessionId);
+    renderGraph(allSessions, allEdges);
+  }
+
   function renderGraph(sessions, snapshotEdges) {
-    const visible = applyFilters(sessions);
+    const filtered = applyFilters(sessions);
+    const visible = applyCollapse(filtered);
+    const totalCounts = totalChildCounts(filtered);
     const visibleIds = new Set(visible.map(s => s.session_id));
+
+    const hosts = [...new Set(visible.map(hostOf))].sort();
+    const colWidth = VIEW_W / Math.max(1, hosts.length);
+    columnHosts = hosts;
+    columnCenters = new Map(hosts.map((h, i) => [h, colWidth * (i + 0.5)]));
+    const hostCounts = new Map();
+    for (const h of visible.map(hostOf)) hostCounts.set(h, (hostCounts.get(h) || 0) + 1);
+
+    const columnSel = columnLayer.selectAll('text.host-column-label')
+      .data(hosts, h => h)
+      .join(
+        enter => enter.append('text').attr('class', 'host-column-label'),
+        update => update,
+        exit => exit.remove()
+      );
+    columnSel
+      .attr('x', h => columnCenters.get(h))
+      .attr('y', 28)
+      .text(h => `${h} · ${hostCounts.get(h)}`);
 
     const visibleLinks = (snapshotEdges || [])
       .filter(e => visibleIds.has(e.from) && visibleIds.has(e.to))
@@ -471,11 +640,13 @@ export function initGraph() {
     nodeLayer.selectAll('.node').each(function(d) { oldById.set(d.session_id, d); });
     const merged = visible.map(s => {
       const prev = oldById.get(s.session_id);
-      if (prev) {
-        Object.assign(prev, s);
-        return prev;
-      }
-      return Object.assign({ x: recencyTargetX(s), y: VIEW_H / 2 }, s);
+      const row = prev ? Object.assign(prev, s) : Object.assign(
+        { x: columnTargetX(s), y: laneTargetY(s) }, s,
+      );
+      const total = totalCounts.get(s.session_id) || 0;
+      row._totalChildren = total;
+      row._collapsedChildren = expandedParents.has(s.session_id) ? 0 : total;
+      return row;
     });
 
     const sel = nodeLayer.selectAll('.node')
@@ -498,44 +669,62 @@ export function initGraph() {
           if (!event.active) simulation.alphaTarget(0);
         }))
       .on('click', (event, d) => {
-        if (_nodeClickTimer) clearTimeout(_nodeClickTimer);
-        _nodeClickTimer = setTimeout(() => {
-          _nodeClickTimer = null;
-          if (d.session_id === selectedSessionId) closePanel();
-          else openPanel(d.session_id);
-        }, 220);
+        if (d.session_id === selectedSessionId) closePanel();
+        else openPanel(d.session_id);
       })
       .on('dblclick', (event, d) => {
-        const isCli = d.source === 'claude_code' || d.source === 'codex';
+        const engine = engineOf(d);
+        const isCli = engine === 'claude_code' || engine === 'codex';
         if (!isCli || d.is_subagent) return;
         event.preventDefault();
         event.stopPropagation();
-        if (_nodeClickTimer) { clearTimeout(_nodeClickTimer); _nodeClickTimer = null; }
         focusSessionQuick(d);
-      });
-    entered.append(d => document.createElementNS('http://www.w3.org/2000/svg', nodeShapeTag(d)))
+      })
+      .on('mouseenter', (event, d) => showHoverCard(event, d))
+      .on('mousemove', (event) => positionHoverCard(event))
+      .on('mouseleave', () => hideHoverCard());
+    entered.append(d => document.createElementNS('http://www.w3.org/2000/svg', shapeTagFor(engineOf(d))))
       .attr('class', 'node-shape');
-    entered.append('title');
+    entered.append('circle').attr('class', 'node-ring-tools')
+      .attr('fill', 'none').attr('stroke', 'rgba(232,232,237,0.35)');
     entered.append('text').attr('class', 'node-label');
+    entered.append('circle').attr('class', 'node-badge-question-ring')
+      .attr('fill', 'none').attr('stroke', 'var(--accent, #6366f1)').attr('stroke-width', 2);
+    entered.append('text').attr('class', 'node-badge-question')
+      .attr('text-anchor', 'middle').attr('font-size', 11).attr('fill', 'var(--accent, #6366f1)');
+    entered.append('text').attr('class', 'node-badge-errors')
+      .attr('text-anchor', 'middle').attr('font-size', 10).attr('fill', '#f87171');
+    entered.append('text').attr('class', 'node-badge-children')
+      .attr('text-anchor', 'middle').attr('font-size', 10).attr('fill', '#e8e8ed')
+      .style('cursor', 'pointer')
+      .on('click', (event, d) => { event.stopPropagation(); toggleParentExpanded(d.session_id); });
 
     const all = entered.merge(sel);
     applyShapeAttrs(all.select('.node-shape'));
+    applyToolRing(all.select('.node-ring-tools'));
     all.select('text.node-label').each(renderNodeLabel);
-    all.select('title').text(d => nodeTitle(d));
+    applyBadges(all);
 
     sel.exit().remove();
 
     visibleCount = merged.length;
     simulation.nodes(merged);
     simulation.force('link').links(visibleLinks);
-    const visibleIdsKey = visible.map(s => s.session_id).sort().join('|');
-    if (visibleIdsKey !== _lastVisibleIdsKey) {
-      _lastVisibleIdsKey = visibleIdsKey;
+    // Restart when either the visible-id set OR any node's size changed —
+    // a snapshot tick that only updates `total_active_seconds` must still
+    // reheat the layout so a grown node's collide radius is honored.
+    const idsKey = visible.map(s => s.session_id).sort().join('|');
+    const sizeKey = visible.map(s => `${s.session_id}:${Math.round(nodeRadius(s))}`).sort().join('|');
+    const simKey = idsKey + '::' + sizeKey;
+    if (simKey !== _lastSimKey) {
+      _lastSimKey = simKey;
       simulation.alpha(0.3).restart();
+      if (_simStopTimer) clearTimeout(_simStopTimer);
+      _simStopTimer = setTimeout(() => simulation.alpha(0).stop(), 8000);
     }
 
     emptyStateEl.style.display = visible.length === 0 ? '' : 'none';
-    updateChips(visible);
+    updateChips(filtered);
     updateCwdOptions(allSessions);
     updateHostOptions(allSessions);
     applySelectionStyles();
@@ -601,6 +790,7 @@ export function initGraph() {
   function applySnapshot(snap) {
     allSessions = snap.sessions || [];
     allEdges = snap.edges || [];
+    apiHost = snap.api_host || apiHost;
     renderGraph(allSessions, allEdges);
     if (selectedSessionId) {
       const s = allSessions.find(x => x.session_id === selectedSessionId);
@@ -642,9 +832,6 @@ export function initGraph() {
   let searchActiveIndex = -1;
   let searchDebounceTimer = null;
 
-  const SEARCH_TIER = { label: 0, short_label: 1, summary: 2 };
-  const SEARCH_BADGE = { label: 'name', short_label: 'label', summary: 'summary' };
-
   function sessionDisplayName(s) {
     // The dropdown's display name is the node's label: one precedence chain
     // (`nodeLabel`, with its `isRawIdValue` guard), so the dropdown cannot
@@ -677,6 +864,7 @@ export function initGraph() {
     const entries = new Map();
 
     function consider(sessionId, field, snippet) {
+      if (!isKnownSearchField(field)) return;
       const s = byId.get(sessionId);
       if (!s) return;
       const prev = entries.get(sessionId);
@@ -762,6 +950,17 @@ export function initGraph() {
     }
   }
 
+  // Expands every collapsed ancestor of `s` so a search hit inside a
+  // collapsed subagent tree becomes visible (#864).
+  function expandAncestorsFor(s) {
+    const byId = new Map(allSessions.map(x => [x.session_id, x]));
+    let current = s;
+    while (current && current.parent_session_id) {
+      expandedParents.add(current.parent_session_id);
+      current = byId.get(current.parent_session_id);
+    }
+  }
+
   function panToNode(sessionId, delay) {
     const run = () => {
       let target = null;
@@ -780,15 +979,18 @@ export function initGraph() {
     const s = allSessions.find(x => x.session_id === sessionId);
     if (!s) return;
     const visibleIds = new Set(applyFilters(allSessions).map(x => x.session_id));
-    const wasHidden = !visibleIds.has(sessionId);
-    if (wasHidden) {
-      relaxFiltersFor(s);
+    const wasFilteredOut = !visibleIds.has(sessionId);
+    const wasCollapsed = !!(s.parent_session_id && !expandedParents.has(s.parent_session_id));
+    const needsRerender = wasFilteredOut || wasCollapsed;
+    if (wasFilteredOut) relaxFiltersFor(s);
+    if (wasCollapsed) expandAncestorsFor(s);
+    if (needsRerender) {
       releasePins();
       renderGraph(allSessions, allEdges);
     }
     hideSearchResults();
     openPanel(sessionId);
-    panToNode(sessionId, wasHidden ? 400 : 0);
+    panToNode(sessionId, needsRerender ? 400 : 0);
   }
 
   async function fetchSummaryMatches(q) {

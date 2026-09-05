@@ -569,6 +569,23 @@ class TestBoardLoad:
         card = page.locator('[data-card-id="t3"]')
         expect(card.locator(".board-card-question")).to_contain_text("Which environment?")
 
+    def test_lane_headers_carry_the_shared_lane_colour_accent(self, page: Page, agents_base_url):
+        """Each lane header's `border-top-color` is `laneColor(lane.id)`
+        (web/agents/lanes.js) — the same palette the graph tab uses for its
+        node fill, so the board and graph read as one system (#864)."""
+        _open_board(page, agents_base_url)
+        colors = page.evaluate(
+            """() => Array.from(document.querySelectorAll('.board-lane')).map(el => ({
+                lane: el.dataset.lane,
+                color: getComputedStyle(el.querySelector('.board-lane-header')).borderTopColor,
+            }))"""
+        )
+        by_lane = {c["lane"]: c["color"] for c in colors}
+        assert len(by_lane) >= 2
+        # Every rendered lane has a real accent colour, and no two lanes
+        # share one.
+        assert len(set(by_lane.values())) == len(by_lane)
+
 
 class TestDragBetweenLanes:
     def test_drag_issues_lane_put_with_expected_body(self, page: Page, agents_base_url):
