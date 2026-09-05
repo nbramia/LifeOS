@@ -56,9 +56,10 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 
 # Parallelize unit tests across all cores via pytest-xdist. --dist loadscope
-# keeps every test in a module on the same worker, which avoids cross-module
-# ordering surprises from shared singletons. Browser/integration runs stay
-# serial (single shared server + Playwright), so they don't use this.
+# keeps a test class (or a module's top-level functions) on one worker, which
+# avoids ordering surprises from shared singletons within a group.
+# Browser/integration runs stay serial (single shared server + Playwright),
+# so they don't use this.
 PYTEST_PARALLEL=(-n auto --dist loadscope)
 
 # Activate virtual environment (located outside Documents for faster startup)
@@ -214,6 +215,19 @@ run_changed_test_files() {
 }
 
 # Start server in background for tests using server.sh
+#
+# Deliberately holds no PID anywhere, file or variable. server.sh's own
+# get_server_pid() identifies the server by port (`lsof -ti :$PORT`), not by
+# a PID handed to it, and it owns the whole start/stop lifecycle
+# (kill_server, health-check wait, etc.) -- so test.sh has nothing to track.
+# The server itself is one shared resource on a single hardcoded port:
+# server.sh's `start` kills and replaces whatever is listening there before
+# launching, so two test.sh runs that both need a server contend for that
+# one port regardless of any PID file -- that is server.sh's contract, not
+# something a PID path, fixed or per-run, could change. test.sh deliberately
+# leaves the started server running after the run: a leftover server from a
+# previous run is cleaned up the next time any `start_server_background`
+# call happens, not on this script's exit.
 start_server_background() {
     log_info "Starting server for tests (takes 30-60s for ML model loading)..."
 
@@ -221,18 +235,6 @@ start_server_background() {
     if ! "$SCRIPT_DIR/server.sh" start; then
         log_error "Server failed to start. Check logs: $PROJECT_DIR/logs/server.log"
         exit 1
-    fi
-}
-
-# Stop background test server
-stop_test_server() {
-    if [ -f /tmp/lifeos_test_server.pid ]; then
-        PID=$(cat /tmp/lifeos_test_server.pid)
-        if kill -0 $PID 2>/dev/null; then
-            kill $PID
-            log_info "Stopped test server (PID: $PID)"
-        fi
-        rm /tmp/lifeos_test_server.pid
     fi
 }
 

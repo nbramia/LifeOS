@@ -21,6 +21,12 @@ import os
 import time
 
 import pytest
+# pytest-playwright registers as a pytest plugin via entry_points, so it is
+# already loaded for every pytest invocation in this venv regardless of
+# marker selection -- this import adds no new cost. The module-scoped
+# playwright/browser fixture overrides at the bottom of this file delegate
+# to upstream's own bodies through it instead of copying them.
+import pytest_playwright.pytest_playwright as _pw_plugin
 
 # Lightweight (no chromadb/torch at module scope) -- used below to build
 # _LIVE_VECTORSTORE_COLLECTIONS without hardcoding these as string literals.
@@ -908,3 +914,97 @@ def _no_local_telegram_bots_override(tmp_path_factory, monkeypatch):
     """
     missing = tmp_path_factory.mktemp("no-local-bots") / "telegram_bots.local.json"
     monkeypatch.setattr("config.settings._TELEGRAM_BOTS_LOCAL_FILE", missing, raising=False)
+
+
+# ---------------------------------------------------------------------------
+# pytest-playwright's browser fixtures, re-scoped from session to module.
+#
+# Why: pytest-playwright's `playwright`/`browser_type`/`browser` fixtures are
+# session-scoped upstream -- one Chromium process and one Playwright driver
+# connection shared for a worker's whole lifetime. The sync API's driver
+# connection runs its event loop inside a *greenlet*, not a real OS thread
+# (playwright/sync_api/_context_manager.py, PlaywrightContextManager.__enter__):
+# `self._loop.run_until_complete(self._connection.run_as_sync())` is entered
+# once and from then on is only ever *parked* via greenlet switches whenever
+# the test thread calls back into Playwright -- the call does not return
+# until `pw.stop()` (the `playwright` fixture's teardown) runs. `asyncio`'s
+# per-thread "currently running loop" marker is cleared only in
+# `run_forever`'s `finally`, which fires only when that call genuinely
+# returns. With a session-scoped driver, therefore, once ANY test in a
+# worker process has used Playwright's sync API the marker stays pointed at
+# Playwright's loop for the rest of that worker's life, across every other
+# test file the worker runs afterward -- and the next `async def` test on
+# that worker (pytest-asyncio, `asyncio_mode = "auto"`) fails with
+# `RuntimeError: Runner.run() cannot be called from a running event loop`
+# despite having nothing to do with Playwright. `--dist loadscope` groups tests
+# by class for tests inside a class, by module for top-level functions, and
+# hands scope groups to workers largest-first (pytest-xdist's
+# `--loadscope-reorder` is on by default; command-line order only breaks
+# ties), so which groups share a worker process, and in what sequence, shifts
+# with the selection -- a worker can run a browser file's scope group and
+# then an unrelated file's async test in the same process. The minimal,
+# deterministic reproducer needs no xdist at all -- a single process running
+# a browser file before an `async def` test:
+#   pytest tests/test_voice_mic_block_ui_browser.py tests/test_agents_board_api.py::TestBoardStream -q
+# The failure that module scope prevents is also reproducible against the
+# session-scoped upstream fixtures the way it actually showed up in the full
+# suite, under real parallelism:
+#   pytest tests/test_agents_assignment_ui_browser.py tests/test_agents_board_ui_browser.py \
+#          tests/test_agents_host_filter_ui_browser.py tests/test_agents_board_api.py -n 4
+# -- with the browser files listed first; the async tests must land on a
+# worker whose driver loop is already parked, and under the size-ordered
+# hand-out this file order gets them there reliably on a four-worker run
+# while the reverse order does not. See AGENTS.md § Testing.
+#
+# Module scope tears the driver connection -- and the loop it parks -- down
+# at the end of every test FILE, before any other file's tests (including
+# unrelated async ones) run on the same worker. `context`/`page` build on
+# `browser` at function scope upstream (their definitions carry no `scope=`
+# argument, and nothing in this repo overrides them), so this only changes
+# how often the underlying browser process itself is recycled; per-test
+# context/page isolation is untouched. All five fixtures move together:
+# pytest forbids a broader-scoped fixture depending on a narrower one, so
+# any of them left at session scope while `playwright` is module-scoped
+# raises ScopeMismatch.
+#
+# Each override delegates to pytest_playwright's own fixture body via
+# `.__wrapped__` (the plain function `@pytest.fixture` wraps on pytest >= 8's
+# `FixtureFunctionDefinition`) instead of copying it, so what the fixtures
+# DO always matches the installed plugin; only their scope differs.
+# tests/test_fixture_scope_isolation.py fails loudly if a pytest-playwright
+# upgrade renames or reshapes any of the five, rather than this delegation
+# silently passing arguments in the wrong shape.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def playwright():
+    yield from _pw_plugin.playwright.__wrapped__()
+
+
+@pytest.fixture(scope="module")
+def browser_type(playwright, browser_name):
+    return _pw_plugin.browser_type.__wrapped__(playwright, browser_name)
+
+
+@pytest.fixture(scope="module")
+def browser_context_args(pytestconfig, playwright, device, base_url, _pw_artifacts_folder):
+    return _pw_plugin.browser_context_args.__wrapped__(
+        pytestconfig, playwright, device, base_url, _pw_artifacts_folder
+    )
+
+
+@pytest.fixture(scope="module")
+def launch_browser(browser_type_launch_args, browser_type, connect_options):
+    return _pw_plugin.launch_browser.__wrapped__(
+        browser_type_launch_args, browser_type, connect_options
+    )
+
+
+@pytest.fixture(scope="module")
+def browser(launch_browser):
+    yield from _pw_plugin.browser.__wrapped__(launch_browser)
+
+
+# A guard test for this delegation lives in
+# tests/test_fixture_scope_isolation.py, not here -- conftest.py is a plugin
+# module pytest never collects tests from.

@@ -332,8 +332,9 @@ echo "passed ($(tail -1 "$LOG"))"
 #
 # Deliberately a second pytest process, not another marker in the run above:
 # pytest-playwright's sync API leaves its own event loop current, so any async
-# test that lands after a browser test in the same process is silently never
-# awaited. Under `-n auto` that ordering is nondeterministic.
+# test that lands after a browser test in the same process fails with
+# `RuntimeError: Runner.run() cannot be called from a running event loop`.
+# Under `-n auto` that ordering is nondeterministic.
 #
 # -p no:cacheprovider keeps this run out of .pytest_cache so it can't disturb
 # the unit run's --ff ordering data.
