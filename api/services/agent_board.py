@@ -58,6 +58,17 @@ def _norm_tags(tags: Iterable[str]) -> set[str]:
     return {str(t).lstrip("#").lower() for t in (tags or [])}
 
 
+def normalize_tags(tags: Iterable[str]) -> set[str]:
+    """Public wrapper around the internal tag normalization above — `#`
+    stripped, lowercased. Exposed for write paths outside this module (e.g.
+    `api/routes/tasks.py`'s claimed-card tags guard) that need to compare
+    raw tag *sets* themselves rather than only a single derived value like
+    `derive_assignee`'s first-match-wins result, which a second assignee
+    tag or a dropped claim tag can slip past unnoticed.
+    """
+    return _norm_tags(tags)
+
+
 def derive_assignee(tags: Iterable[str]) -> Optional[str]:
     """Return the single assignee tag on `tags`, or None.
 
@@ -110,6 +121,202 @@ def derive_lane(status: str, tags: Iterable[str]) -> str:
     return "unassigned"
 
 
+WORKER_OWNED_ERROR: tuple[int, str] = (
+    409,
+    "the worker owns this task while it is running or waiting on an "
+    "answer — answer or kill the session first",
+)
+REVIEW_ERROR: tuple[int, str] = (409, "accept the review first")
+AGENT_ONLY_CLAIM_ERROR: tuple[int, str] = (409, "only the worker claims agent-assigned tasks")
+AGENT_OWNED_MANAGED_ERROR: tuple[int, str] = (
+    409,
+    "agent-owned cards are managed by the agent — reassign, unassign, or "
+    "cancel this card instead",
+)
+REVIEW_UNRESOLVED_ERROR: tuple[int, str] = (409, "accept or reject the review")
+CANCEL_NOT_AGENT_OWNED_ERROR: tuple[int, str] = (
+    409,
+    "cancel is only available for agent-assigned cards",
+)
+CANCEL_ALREADY_FINISHED_ERROR: tuple[int, str] = (
+    409,
+    "this card is already finished — nothing to cancel",
+)
+
+# The actions every server write path that can touch an agent-owned card's
+# lane, assignee, or status funnels through `evaluate_card_action`.
+CARD_ACTIONS: tuple[str, ...] = ("lane_move", "assignee_change", "field_edit", "cancel")
+
+
+def status_claim_possible(status: str, tags: Iterable[str]) -> bool:
+    """True iff a live-session lookup could change the claim outcome for
+    this status/tags pair — i.e. no claim tag is present, but the status
+    and assignee combination is the one shape a live CLI-opened session
+    produces. Callers that can afford I/O use this to decide whether a
+    session-store lookup is worth paying for before calling `is_claimed`
+    with `has_live_session=True`; skipping it whenever this returns False
+    is always safe, since `is_claimed` ignores `has_live_session` in every
+    other case. Pure — the live-session lookup itself lives in
+    `SessionStore`.
+    """
+    tset = _norm_tags(tags)
+    if tset & {RUNNING_TAG, BLOCKED_TAG}:
+        return False
+    if (status or "").lower() != "in_progress":
+        return False
+    if COMPLETED_TAG in tset and ACCEPTED_TAG not in tset:
+        return False
+    return derive_assignee(tset) in AGENT_ASSIGNEES
+
+
+def is_claimed(status: str, tags: Iterable[str], has_live_session: bool = False) -> bool:
+    """True once the worker owns the card — actively running it, or waiting
+    on an answer from the operator (`agent-running` / `agent-blocked`
+    tag present, regardless of `has_live_session`), OR a live session is
+    genuinely open on an agent-owned, non-review card whose status is
+    `in_progress` (the state left behind the moment a `#claude`/`#codex`
+    card's Open button spawns a CLI session, before the worker's own claim
+    ever adds `agent-running`). That's still a live agent session the
+    board must protect the same way, or a human could reassign/unassign/
+    edit right out from under it — but `status == "in_progress"` alone
+    isn't enough proof: a plain vault edit or an API status write can set
+    that with no session behind it at all, and the board's own reassign
+    move can leave a stale `in_progress` status on a card whose assignee
+    just changed. `has_live_session` is the caller's own answer to "is
+    there actually a session" (see `SessionStore.has_live_session`) —
+    this function stays pure and takes that answer as given rather than
+    querying for it.
+
+    Excludes a pending Review card (`agent-completed` without `accepted`):
+    the same status can linger at `in_progress` after the worker completes
+    a card that was earlier opened via a CLI session (nothing resets it),
+    and Review must stay reachable through the accept-by-drag Done
+    carve-out rather than being swallowed by this status-derived claim.
+    """
+    tset = _norm_tags(tags)
+    if tset & {RUNNING_TAG, BLOCKED_TAG}:
+        return True
+    if not has_live_session:
+        return False
+    if (status or "").lower() != "in_progress":
+        return False
+    if COMPLETED_TAG in tset and ACCEPTED_TAG not in tset:
+        return False  # Review — see docstring
+    return derive_assignee(tset) in AGENT_ASSIGNEES
+
+
+def is_agent_owned(tags: Iterable[str]) -> bool:
+    """True when the card is managed by an agent rather than a human —
+    either its assignee tag names an agent engine, or the worker has
+    already claimed it (`agent-running`/`agent-blocked`) even with no
+    engine-specific assignee tag at all. The worker selects candidates by
+    the bare `agent` queue tag alone and its claim swap
+    (`agent` -> `agent-running`) never touches assignee tags, so a card
+    can be claimed while `derive_assignee` still returns `None` — that
+    shape must still count as agent-owned, or Cancel (and every other
+    agent-owned-only action) would refuse the one card that most needs
+    it, with no assignee tag left to edit it back to a workable state."""
+    tset = _norm_tags(tags)
+    return derive_assignee(tset) in AGENT_ASSIGNEES or bool(tset & {RUNNING_TAG, BLOCKED_TAG})
+
+
+def is_review_pending(tags: Iterable[str]) -> bool:
+    """True for a worker-completed card the operator hasn't accepted yet."""
+    tset = _norm_tags(tags)
+    return COMPLETED_TAG in tset and ACCEPTED_TAG not in tset
+
+
+def evaluate_card_action(
+    current_status: str,
+    current_tags: Iterable[str],
+    action: str,
+    target_lane: Optional[str] = None,
+    has_live_session: bool = False,
+) -> Optional[tuple[int, str]]:
+    """The one decision every server write path consults before touching an
+    agent-owned card's lane, assignee, or status.
+
+    `None` means the action is allowed; `(http_status, detail)` means it's
+    refused and the caller should raise an `HTTPException` with that shape
+    and perform no write. Pure — no I/O, no vault or scheduler access;
+    `has_live_session` is the caller's own answer to whether a live agent
+    session actually backs this card (see `is_claimed`).
+
+    The intent (see docs/specs/product/agent-viz.md's Lanes section): a
+    human may assign, reassign, unassign, or cancel an agent-owned card
+    before the worker claims it; once claimed (`agent-running` /
+    `agent-blocked`, or a live session on an `in_progress` card), every
+    drag and every assignee/model/effort/host edit is refused — Answer,
+    Kill, and Accept are the only actions left. A card assigned to `me`,
+    or with no assignee, is entirely unaffected by any of this — every
+    rule below for those matches ordinary human-card behavior exactly.
+    """
+    if action not in CARD_ACTIONS:
+        # Every caller passes a literal from CARD_ACTIONS, so reaching here
+        # at all means a caller bug; fail closed instead of falling through
+        # to an implicit allow.
+        raise ValueError(f"unknown card action: {action!r}")
+
+    claimed = is_claimed(current_status, current_tags, has_live_session)
+    agent_owned = is_agent_owned(current_tags)
+    is_review = is_review_pending(current_tags)
+
+    if action == "lane_move":
+        if target_lane not in LANES:
+            return (400, f"unknown lane '{target_lane}'")
+        if target_lane in ("review", "scheduled"):
+            return (400, f"lane '{target_lane}' cannot be set directly")
+        # The worker owns this card while it's actively running or waiting
+        # on an answer — every drag is refused, on every lane, since a
+        # human dragging it anywhere would silently detach a live task
+        # from the process actually working it.
+        if claimed:
+            return WORKER_OWNED_ERROR
+        if is_review:
+            # A pending review (agent-completed, not yet accepted) must be
+            # accepted or rejected before it can be reassigned to work or
+            # handed to a human — only Done (the accept path) may act on it
+            # directly.
+            if target_lane in ("in_progress", "human_queue"):
+                return REVIEW_ERROR
+            return None
+        if agent_owned:
+            if target_lane == "in_progress":
+                # Only the worker claims agent-assigned tasks (swaps #agent
+                # -> #agent-running itself); a human dragging such a card to
+                # In progress would desync the tag from the actual claim
+                # state.
+                return AGENT_ONLY_CLAIM_ERROR
+            if target_lane in ("human_queue", "done"):
+                # Agent-owned cards are managed by the agent — a human may
+                # reassign, unassign, or cancel, but not silently close or
+                # re-route work that was handed to an agent.
+                return AGENT_OWNED_MANAGED_ERROR
+        return None
+
+    if action in ("assignee_change", "field_edit"):
+        return WORKER_OWNED_ERROR if claimed else None
+
+    if action == "cancel":
+        if is_review:
+            return REVIEW_UNRESOLVED_ERROR
+        if not agent_owned:
+            return CANCEL_NOT_AGENT_OWNED_ERROR
+        # A card that's already finished — accepted-and-done, or cancelled
+        # some other way than through this endpoint's own idempotent
+        # short-circuit — has nothing left to cancel. The route
+        # (`cancel_board_card`) still special-cases "already cancelled" as
+        # a 200 no-op, but only AFTER checking ownership/review above, so a
+        # `me` or Review card that happens to already carry
+        # status="cancelled" gets its real refusal reason instead of a
+        # misleading success.
+        if (current_status or "").lower() in ("done", "cancelled"):
+            return CANCEL_ALREADY_FINISHED_ERROR
+        return None
+
+    raise AssertionError(f"unhandled action {action!r} despite CARD_ACTIONS validation above")
+
+
 @dataclass
 class LaneMovePlan:
     """What a `PUT /board/cards/{id}/lane` request should write, or why not.
@@ -128,35 +335,27 @@ def plan_lane_move(
     current_tags: Iterable[str],
     target_lane: str,
     assignee: Optional[str] = None,
+    has_live_session: bool = False,
 ) -> LaneMovePlan:
     """Compute the status/tags write for a card dropped into `target_lane`.
 
     Pure — the caller reads the current task, applies this plan via
     `TaskManager.update`, and (optionally) re-derives the lane from the
     written task to confirm it landed where expected. Never touches the
-    vault or scheduler directly.
+    vault or scheduler directly. The decision of whether the move is
+    allowed at all lives in `evaluate_card_action` — this function only
+    computes the resulting write once that's cleared it. `has_live_session`
+    passes straight through to that check (see `is_claimed`).
     """
+    error = evaluate_card_action(
+        current_status, current_tags, "lane_move", target_lane, has_live_session=has_live_session,
+    )
+    if error is not None:
+        return LaneMovePlan(error=error)
+
     tags_list = [str(t) for t in (current_tags or [])]
     tset_lower = {t.lstrip("#").lower() for t in tags_list}
-    current_assignee = derive_assignee(tags_list)
-    # The worker owns this card while it's actively running or waiting on an
-    # answer — dropping it on In progress or Done would desync the tag from
-    # the worker's own claim state (round-2 finding 1: the round-1 strip of
-    # these tags let a card silently detach from a live worker task).
-    worker_owned = bool(tset_lower & {RUNNING_TAG, BLOCKED_TAG})
-    worker_owned_error = (
-        409,
-        "the worker owns this task while it is running or waiting on an "
-        "answer — answer or kill the session first",
-    )
-    # A pending review (agent-completed, not yet accepted) must be accepted
-    # or rejected before it can be reassigned to work or handed to a human —
-    # only Done (the accept path) may act on it directly (round-2 finding 2a).
-    is_review = COMPLETED_TAG in tset_lower and ACCEPTED_TAG not in tset_lower
-    review_error = (409, "accept the review first")
-
-    if target_lane not in LANES:
-        return LaneMovePlan(error=(400, f"unknown lane '{target_lane}'"))
+    is_review = is_review_pending(tags_list)
 
     if target_lane == "unassigned":
         # Dropping into Unassigned clears the assignee tag.
@@ -175,15 +374,6 @@ def plan_lane_move(
         return LaneMovePlan(tags=new_tags)
 
     if target_lane == "in_progress":
-        if worker_owned:
-            return LaneMovePlan(error=worker_owned_error)
-        # Only the worker claims agent-assigned tasks (swaps #agent ->
-        # #agent-running itself); a human dragging such a card to In
-        # progress would desync the tag from the actual claim state.
-        if current_assignee in AGENT_ASSIGNEES:
-            return LaneMovePlan(error=(409, "only the worker claims agent-assigned tasks"))
-        if is_review:
-            return LaneMovePlan(error=review_error)
         # A card can arrive here from Human queue (#human) — strip it so it
         # actually leaves Human queue instead of derive_lane immediately
         # pulling it back (Human queue outranks In progress).
@@ -194,13 +384,9 @@ def plan_lane_move(
         return LaneMovePlan(status="in_progress")
 
     if target_lane == "human_queue":
-        if is_review:
-            return LaneMovePlan(error=review_error)
         return LaneMovePlan(status="blocked")
 
     if target_lane == "done":
-        if worker_owned:
-            return LaneMovePlan(error=worker_owned_error)
         # A card can arrive here from Human queue — strip `human` so it
         # actually leaves that lane (it outranks Done in derive_lane). A
         # pending agent-completed review also needs the `accepted` tag or
@@ -219,7 +405,8 @@ def plan_lane_move(
     # Review and Scheduled are derived — Review from the worker's
     # agent-completed/accepted tags (use POST .../accept instead), Scheduled
     # from the scheduler store. Neither is directly settable by dragging a
-    # card there.
+    # card there. Unreachable given evaluate_card_action's checks above;
+    # kept as a defensive fallback.
     return LaneMovePlan(error=(400, f"lane '{target_lane}' cannot be set directly"))
 
 

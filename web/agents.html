@@ -1112,6 +1112,15 @@
      disagree, so a mismatch here silently makes the JS branch dead. */
   .drawer-notes-autosize { overflow-y: auto; resize: none; max-height: 66.667vh; }
   .drawer-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+  /* Visible reason text next to a picker or action the board's own
+     policy has disabled — disable-and-explain, never hide. A distinct
+     element/style from .assignment-error below: this is a normal
+     explanation, not a failed-save error, and must not paint an ordinary
+     "can't change this right now" reason the same alarming red as a real
+     save failure. --text-secondary (5.39:1 on this drawer's background)
+     rather than --text-dim (2.77:1) — this text is the only explanation
+     the operator gets for a refused action, so it needs to clear WCAG AA. */
+  .drawer-field-reason { color: var(--text-secondary); font-size: 0.75rem; margin-top: 0.3rem; }
   .drawer-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.75rem; }
   .drawer-action {
     background: var(--bg-card);
@@ -1123,6 +1132,8 @@
     cursor: pointer;
   }
   .drawer-action:hover { border-color: var(--accent); }
+  .drawer-action:disabled { opacity: 0.5; cursor: default; }
+  .drawer-action:disabled:hover { border-color: var(--border); }
   .drawer-session { margin-top: 0.75rem; border-top: 1px solid var(--border); padding-top: 0.5rem; }
   .drawer-session .panel-header { padding: 0; border: none; }
   .drawer-session .events { max-height: 40vh; padding: 0.5rem 0; }

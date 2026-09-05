@@ -182,6 +182,52 @@ def test_changing_engine_updates_tags_and_saves(page: Page, web_base_url):
     assert calls[0]["patch"]["fields"]["assigned_by"] == "board"
 
 
+def test_all_pickers_including_engine_disabled_when_fields_policy_refuses(page: Page, web_base_url):
+    """`board.js` hides the engine row inside its own drawer, but this
+    module is also usable directly (as this test file does), where the
+    row IS visible, and must not leave it silently editable while every
+    other picker is disabled."""
+    _load_module(page, web_base_url)
+    _render(page, {
+        "id": "t9", "title": "Migrate the database", "tags": ["codex", "agent-running"],
+        "assignee": "codex", "fields": {},
+        "policy": {"fields": {"allowed": False, "reason": "the worker owns this task"}},
+    })
+    container = page.locator("#test-assignment-container")
+    expect(container.locator("[data-field='assignee']")).to_be_disabled()
+    expect(container.locator("[data-field='model']")).to_be_disabled()
+    expect(container.locator("[data-field='effort']")).to_be_disabled()
+    expect(container.locator("[data-field='host']")).to_be_disabled()
+
+
+def test_fields_policy_allowed_leaves_engine_and_pickers_enabled(page: Page, web_base_url):
+    """Positive case for RC8: a card with no policy refusal (the common
+    case — every test above this one already relies on this implicitly)
+    leaves the engine select enabled too, not just the model/effort/host
+    pickers."""
+    _load_module(page, web_base_url)
+    _render(page, {"id": "t10", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {}})
+    container = page.locator("#test-assignment-container")
+    expect(container.locator("[data-field='assignee']")).to_be_enabled()
+    expect(container.locator("[data-field='effort']")).to_be_enabled()
+
+
+def test_fields_disabled_reason_renders_in_neutral_element_not_error(page: Page, web_base_url):
+    """The disabled-fields explanation renders in its own
+    `.drawer-field-reason` element, not `.assignment-error` — that one is
+    reserved for a genuinely failed save, so a normal explanation doesn't
+    paint red."""
+    _load_module(page, web_base_url)
+    _render(page, {
+        "id": "t11", "title": "Migrate the database", "tags": ["codex", "agent-running"],
+        "assignee": "codex", "fields": {},
+        "policy": {"fields": {"allowed": False, "reason": "the worker owns this task while it is running"}},
+    })
+    container = page.locator("#test-assignment-container")
+    expect(container.locator("[data-field='fields-reason']")).to_contain_text("the worker owns this task")
+    expect(container.locator("[data-field='error']")).to_be_hidden()
+
+
 def test_shows_what_actually_ran_from_session(page: Page, web_base_url):
     _load_module(page, web_base_url)
     _render(page, {

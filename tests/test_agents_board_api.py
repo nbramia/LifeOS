@@ -22,7 +22,13 @@ import api.services.task_manager as task_manager_module
 import api.services.scheduler_store as scheduler_store_module
 from api.services.task_manager import TaskManager
 from api.services.scheduler_store import SchedulerStore
-from api.services.agent_worker.session_store import STATUS_BLOCKED, SessionStore
+from api.services.agent_worker.session_store import (
+    STATUS_BLOCKED,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_RUNNING,
+    SessionStore,
+)
 from api.services.agent_worker.transcript_store import TranscriptStore
 
 pytestmark = pytest.mark.unit
@@ -103,11 +109,87 @@ class TestGetBoard:
         card = assigned[0]
         for key in (
             "id", "title", "notes", "status", "tags", "assignee", "fields",
-            "context", "updated_at", "session", "pending_question",
+            "context", "updated_at", "session", "pending_question", "policy",
         ):
             assert key in card
         assert card["title"] == "Ping the vendor"
         assert card["assignee"] == "me"
+
+    def test_agent_owned_card_policy_block_reflects_the_shared_decision_function(self, client, stores):
+        """The card's `policy` block comes from the same
+        `evaluate_card_action` the write paths enforce — the drawer and
+        board read this instead of re-deriving the rules in JS."""
+        task_manager, *_ = stores
+        task = task_manager.create("Handed to the agent", tags=["codex"])
+        r = client.get("/api/agents/board")
+        card = next(c for c in r.json()["lanes"]["assigned"] if c["id"] == task.id)
+        policy = card["policy"]
+        assert policy["claimed"] is False
+        assert policy["agent_owned"] is True
+        assert policy["cancel"] == {"allowed": True, "reason": None}
+        assert policy["assignee"] == {"allowed": True, "reason": None}
+        assert policy["fields"] == {"allowed": True, "reason": None}
+        # `lanes` lists ONLY refused lanes — the allowed ones
+        # (unassigned/assigned) are simply absent, not present-and-true,
+        # matching what onCardDropped already assumes client-side.
+        assert "unassigned" not in policy["lanes"]
+        assert "assigned" not in policy["lanes"]
+        assert policy["lanes"]["in_progress"]["allowed"] is False
+        assert policy["lanes"]["human_queue"]["allowed"] is False
+        assert policy["lanes"]["done"]["allowed"] is False
+        assert policy["lanes"]["human_queue"]["reason"] == (
+            "agent-owned cards are managed by the agent — reassign, unassign, "
+            "or cancel this card instead"
+        )
+        # `scheduled` is refused for every card unconditionally — it's
+        # emitted here too (not just `review`), so a consumer following
+        # "absent means allowed" never has to special-case the one lane no
+        # task can ever land in directly.
+        assert policy["lanes"]["scheduled"] == {
+            "allowed": False, "reason": "lane 'scheduled' cannot be set directly",
+        }
+
+    def test_me_assigned_card_policy_block_is_all_allowed(self, client, stores):
+        """A `me`-assigned card is unaffected — every lane, the assignee
+        picker, the field pickers, all allowed; cancel refused (cancel is
+        agent-cards-only)."""
+        task_manager, *_ = stores
+        task = task_manager.create("My own task", tags=["me"])
+        r = client.get("/api/agents/board")
+        card = next(c for c in r.json()["lanes"]["assigned"] if c["id"] == task.id)
+        policy = card["policy"]
+        assert policy["claimed"] is False
+        assert policy["agent_owned"] is False
+        assert policy["assignee"]["allowed"] is True
+        assert policy["fields"]["allowed"] is True
+        assert policy["cancel"] == {
+            "allowed": False,
+            "reason": "cancel is only available for agent-assigned cards",
+        }
+        # Positive case: every SETTABLE lane is allowed for a plain `me`
+        # card, so only the two every-card-unconditional 400s ("review"
+        # and "scheduled") appear — not `{lane: {allowed: true}}` for the
+        # other five. This is the direct proof of the "absence means
+        # allowed" contract on the one card type where every real move
+        # really is allowed.
+        assert policy["lanes"] == {
+            "review": {"allowed": False, "reason": "lane 'review' cannot be set directly"},
+            "scheduled": {"allowed": False, "reason": "lane 'scheduled' cannot be set directly"},
+        }
+
+    def test_claimed_card_policy_block_refuses_everything_but_cancel(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Being worked by the agent", tags=["codex", "agent-running"])
+        r = client.get("/api/agents/board")
+        card = next(c for c in r.json()["lanes"]["in_progress"] if c["id"] == task.id)
+        policy = card["policy"]
+        assert policy["claimed"] is True
+        assert policy["agent_owned"] is True
+        assert policy["assignee"]["allowed"] is False
+        assert policy["fields"]["allowed"] is False
+        assert policy["cancel"]["allowed"] is True
+        for lane in ("unassigned", "assigned", "in_progress", "human_queue", "done"):
+            assert policy["lanes"][lane]["allowed"] is False, lane
         assert card["session"] is None
         assert card["pending_question"] is None
 
@@ -497,6 +579,452 @@ class TestMoveBoardCard:
         updated = task_manager.get(task.id)
         assert "accepted" in updated.tags
         assert updated.status == "done"
+
+    # -- claimed cards refuse EVERY lane, not just in_progress/done --
+
+    @pytest.mark.parametrize("worker_tag", ["agent-running", "agent-blocked"])
+    @pytest.mark.parametrize("target_lane", ["unassigned", "assigned", "human_queue"])
+    def test_worker_owned_card_cannot_be_dropped_on_any_lane(
+        self, client, stores, worker_tag, target_lane,
+    ):
+        """Every lane is refused for a claimed card, not just In progress
+        and Done — a human could otherwise still silently detach a live
+        worker task by dragging it to Unassigned, Assigned, or Human queue."""
+        task_manager, *_ = stores
+        task = task_manager.create("Being worked by the agent", tags=["codex", worker_tag])
+        inbox = task_manager.tasks_dir / "Inbox.md"
+        before = inbox.read_bytes()
+
+        body = {"lane": target_lane}
+        if target_lane == "assigned":
+            body["assignee"] = "me"
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json=body)
+        assert r.status_code == 409
+        assert r.json()["detail"] == (
+            "the worker owns this task while it is running or waiting on an "
+            "answer — answer or kill the session first"
+        )
+        assert inbox.read_bytes() == before
+        updated = task_manager.get(task.id)
+        assert sorted(updated.tags) == sorted(["codex", worker_tag])
+
+    # -- an unclaimed agent-owned card also refuses Human queue/Done --
+
+    @pytest.mark.parametrize("target_lane", ["human_queue", "done"])
+    @pytest.mark.parametrize("engine", ["claude", "codex", "hermes", "local"])
+    def test_agent_owned_unclaimed_card_cannot_be_dropped_on_human_queue_or_done(
+        self, client, stores, engine, target_lane,
+    ):
+        """Dragging an unclaimed agent-assigned card straight to Human
+        queue or Done is refused, so work handed to an agent can't be
+        silently closed or re-routed that way; reassign, unassign, or
+        Cancel instead."""
+        task_manager, *_ = stores
+        task = task_manager.create("Handed to the agent", tags=[engine])
+        inbox = task_manager.tasks_dir / "Inbox.md"
+        before = inbox.read_bytes()
+
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": target_lane})
+        assert r.status_code == 409
+        assert r.json()["detail"] == (
+            "agent-owned cards are managed by the agent — reassign, unassign, "
+            "or cancel this card instead"
+        )
+        assert inbox.read_bytes() == before
+        assert task_manager.get(task.id).tags == [engine]
+
+    @pytest.mark.parametrize("target_lane", ["unassigned", "assigned"])
+    @pytest.mark.parametrize("engine", ["claude", "codex", "hermes", "local"])
+    def test_agent_owned_unclaimed_card_can_still_be_reassigned_or_unassigned(
+        self, client, stores, engine, target_lane,
+    ):
+        """Only Human queue/Done and In progress are refused for an
+        unclaimed agent-owned card — Unassigned/Assigned stay open."""
+        task_manager, *_ = stores
+        task = task_manager.create("Handed to the agent", tags=[engine])
+        body = {"lane": target_lane}
+        if target_lane == "assigned":
+            body["assignee"] = "codex"
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json=body)
+        assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# POST /api/agents/board/cards/{id}/cancel
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestCancelBoardCard:
+    def test_cancel_unclaimed_card_sets_status_no_session_touched(self, client, stores, monkeypatch):
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Handed to the agent, never claimed", tags=["codex"])
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "cancelled"
+        assert body["lane"] == "done"
+        assert body["killed"] == []
+        updated = task_manager.get(task.id)
+        assert updated.status == "cancelled"
+        assert updated.cancelled_date is not None
+
+        board = client.get("/api/agents/board").json()
+        done_ids = [c["id"] for c in board["lanes"]["done"]]
+        assert task.id in done_ids
+
+    def test_cancel_claimed_card_kills_session_and_descendants(self, client, stores, monkeypatch):
+        """A claimed card's live session (and its whole subtree) is torn
+        down the same way Kill does, then the task is marked cancelled."""
+        task_manager, _sched, session_store, transcript_store = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Being worked by the agent", tags=["codex", "agent-running"])
+        root = session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+        child = session_store.create(
+            task_id="child-of-" + task.id,
+            status=STATUS_RUNNING,
+            routing="local",
+            parent_session_id=root.session_id,
+            root_session_id=root.session_id,
+            spawn_depth=1,
+        )
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "cancelled"
+        assert body["lane"] == "done"
+        assert set(body["killed"]) == {root.session_id, child.session_id}
+        assert body["failures"] == []
+
+        assert session_store.get_by_session_id(root.session_id).status == STATUS_FAILED
+        assert session_store.get_by_session_id(child.session_id).status == STATUS_FAILED
+        root_events = transcript_store.read(root.session_id)
+        assert any(e["kind"] == "operator_killed" for e in root_events)
+        child_events = transcript_store.read(child.session_id)
+        assert any(e["kind"] == "cascade_killed" for e in child_events)
+
+        updated = task_manager.get(task.id)
+        assert updated.status == "cancelled"
+        assert "agent-running" not in updated.tags
+
+    def test_cancel_claimed_bare_agent_card_with_no_assignee_tears_down_and_cancels(
+        self, client, stores, monkeypatch,
+    ):
+        """The no-assignee claimed shape (the worker's own claim swap on a
+        bare `#agent` queue card never adds an engine-specific assignee
+        tag) is still agent-owned — Cancel must work on it exactly like an
+        engine-assigned claimed card, tearing down the live session and
+        marking the task cancelled."""
+        task_manager, _sched, session_store, transcript_store = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("A bare #agent card the worker claimed", tags=["agent", "agent-running"])
+        assert task.tags == ["agent", "agent-running"]  # no assignee tag at all
+        root = session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "cancelled"
+        assert body["lane"] == "done"
+        assert body["killed"] == [root.session_id]
+        assert body["failures"] == []
+        assert session_store.get_by_session_id(root.session_id).status == STATUS_FAILED
+        root_events = transcript_store.read(root.session_id)
+        assert any(e["kind"] == "operator_killed" for e in root_events)
+
+        updated = task_manager.get(task.id)
+        assert updated.status == "cancelled"
+        assert "agent-running" not in updated.tags
+
+    def test_cancel_review_card_is_409(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Pending review", tags=["codex", "agent-completed"], status="done")
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        assert r.json()["detail"] == "accept or reject the review"
+        updated = task_manager.get(task.id)
+        assert updated.status == "done"
+        assert "accepted" not in updated.tags
+
+    def test_cancel_non_agent_owned_card_is_409(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("A plain me-assigned card", tags=["me"])
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        assert r.json()["detail"] == "cancel is only available for agent-assigned cards"
+
+    def test_cancel_is_idempotent(self, client, stores, monkeypatch):
+        task_manager, *_ = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Handed to the agent", tags=["codex"])
+
+        r1 = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r1.status_code == 200
+        updated_at_1 = task_manager.get(task.id).updated_at
+
+        r2 = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r2.status_code == 200
+        body2 = r2.json()
+        assert body2["status"] == "cancelled"
+        assert body2["killed"] == []
+        # Second call is a true no-op — no write, so updated_at is unchanged.
+        assert task_manager.get(task.id).updated_at == updated_at_1
+
+    def test_cancel_missing_card_is_404(self, client, stores):
+        r = client.post("/api/agents/board/cards/nope/cancel")
+        assert r.status_code == 404
+
+    def test_cancel_finds_session_outside_the_snapshot_window(self, client, stores, monkeypatch):
+        """The session lookup is a direct primary-key read
+        (task_id is the `sessions` table's PRIMARY KEY), not bounded by the
+        200-row, most-recently-started window `_build_snapshot`'s
+        `list_sessions(limit=200)` uses for display — a session that
+        started before the 200 most recent must still be found and torn
+        down, not silently skipped."""
+        import sqlite3
+
+        task_manager, _sched, session_store, transcript_store = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Old but still running", tags=["codex", "agent-running"])
+        target = session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+
+        with sqlite3.connect(str(session_store.db_path)) as conn:
+            # Push the target far into the past, then seed 200 sessions
+            # that all sort ahead of it in `ORDER BY started_at DESC`.
+            conn.execute("UPDATE sessions SET started_at = 0 WHERE task_id = ?", (task.id,))
+            conn.commit()
+        for i in range(200):
+            session_store.create(task_id=f"padding-{i}", status=STATUS_COMPLETED, routing="claude")
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["killed"] == [target.session_id]
+        assert body["status"] == "cancelled"
+        assert session_store.get_by_session_id(target.session_id).status == STATUS_FAILED
+
+    def test_cancel_surfaces_a_live_cli_session_as_a_failure_instead_of_silent_success(
+        self, client, stores, monkeypatch,
+    ):
+        """A live cc:/cx: CLI session (opened via the board's
+        Open button) lives in the separate `cli_sessions` table, keyed by
+        its own session_id, not task_id — Cancel can't tear it down (a
+        separate issue), but it must not silently claim a teardown it
+        didn't perform. The task is still marked cancelled; the untorn-down
+        session is reported under `failures`."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        # status="in_progress" with no agent-running tag is what
+        # cli_session_event leaves behind after Open spawns a session.
+        task = task_manager.create("Opened via a CLI session", tags=["codex"], status="in_progress")
+        session_store.record_cli_session_event(
+            engine="codex", event="user_prompt_submit", session_id="live1",
+            host="some-host", prompt="do the thing", task_id=task.id,
+        )
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "cancelled"
+        assert body["killed"] == []
+        assert len(body["failures"]) == 1
+        assert body["failures"][0]["session_id"] == "cx:live1"
+        assert "cx:live1" in body["failures"][0]["reason"]
+
+    def test_cancel_repeated_after_a_cli_warning_reports_the_same_failure_again(
+        self, client, stores, monkeypatch,
+    ):
+        """A second Cancel call on a card whose CLI session is still open
+        must report that failure again, not `failures: []` — the
+        already-cancelled short-circuit runs AFTER the CLI lookup now, not
+        before it, so a repeat click still tells the operator the CLI
+        session needs closing manually."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Opened via a CLI session", tags=["codex"], status="in_progress")
+        session_store.record_cli_session_event(
+            engine="codex", event="user_prompt_submit", session_id="live1",
+            host="some-host", prompt="do the thing", task_id=task.id,
+        )
+
+        r1 = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r1.status_code == 200
+        assert len(r1.json()["failures"]) == 1
+
+        r2 = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r2.status_code == 200
+        body2 = r2.json()
+        assert body2["killed"] == []
+        assert len(body2["failures"]) == 1
+        assert body2["failures"][0]["session_id"] == "cx:live1"
+
+    def test_cancel_ignores_an_already_ended_cli_session(self, client, stores, monkeypatch):
+        """Positive case for AR5: a CLI session that already ended must NOT
+        show up as an untorn-down failure — only a still-live one does."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Opened then closed via CLI", tags=["codex"])
+        session_store.record_cli_session_event(
+            engine="codex", event="session_start", session_id="ended1",
+            host="some-host", task_id=task.id,
+        )
+        session_store.record_cli_session_event(
+            engine="codex", event="session_end", session_id="ended1",
+            host="some-host", task_id=task.id,
+        )
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        assert r.json()["failures"] == []
+
+    def test_cancel_on_already_cancelled_me_card_is_409_not_idempotent_200(self, client, stores):
+        """Ownership must be checked before the idempotence
+        short-circuit — a `me` card that somehow already carries
+        status="cancelled" (not a state Cancel itself ever produces, since
+        it refuses `me` cards) must still 409 for the real reason, not
+        silently look like a successful no-op cancel."""
+        task_manager, *_ = stores
+        task = task_manager.create("A plain me card, already cancelled", tags=["me"], status="cancelled")
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        assert r.json()["detail"] == "cancel is only available for agent-assigned cards"
+
+    def test_cancel_on_already_cancelled_review_card_is_409_not_idempotent_200(self, client, stores):
+        """Same as above for a pending-review card."""
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "A review card, cancelled some other way", tags=["codex", "agent-completed"], status="cancelled",
+        )
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        assert r.json()["detail"] == "accept or reject the review"
+
+    def test_cancel_on_already_done_agent_card_is_409(self, client, stores):
+        """evaluate_card_action refuses Cancel on any
+        terminal-status agent-owned card, not just an already-cancelled
+        one — an accepted/finished card has nothing left to cancel."""
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Already accepted and done", tags=["codex", "agent-completed", "accepted"], status="done",
+        )
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        updated = task_manager.get(task.id)
+        assert updated.status == "done"  # nothing written
+
+    def test_cancel_policy_is_refused_once_the_card_is_already_cancelled(self, client, stores, monkeypatch):
+        """`policy.cancel.allowed` must go False once a card is
+        already cancelled — the drawer's Cancel button must disappear
+        instead of staying offered for a pointless second click."""
+        task_manager, *_ = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Handed to the agent", tags=["codex"])
+        r1 = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r1.status_code == 200
+
+        board = client.get("/api/agents/board").json()
+        card = next(c for c in board["lanes"]["done"] if c["id"] == task.id)
+        assert card["policy"]["cancel"]["allowed"] is False
+
+    def test_cancel_skips_teardown_for_already_terminal_session(self, client, stores, monkeypatch):
+        """A claimed card whose linked session already reached a
+        terminal status (e.g. it finished between the board loading and the
+        operator clicking Cancel) must not attempt teardown."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Already finished", tags=["codex", "agent-running"])
+        session = session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="claude")
+
+        called = []
+        orig = agents_route._kill_session_subtree
+
+        async def _spy(*a, **kw):
+            called.append(True)
+            return await orig(*a, **kw)
+
+        monkeypatch.setattr(agents_route, "_kill_session_subtree", _spy)
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        assert r.json()["killed"] == []
+        assert called == []
+        assert session_store.get_by_session_id(session.session_id).status == STATUS_COMPLETED
+
+    def test_cancel_invalidates_the_board_cache(self, client, stores, monkeypatch):
+        """Cancel must invalidate the shared stream-tick board
+        cache like the lane/accept endpoints do, so the very next tick
+        reflects the cancellation instead of serving a pre-write board for
+        up to `_BOARD_CACHE_TTL` more seconds."""
+        task_manager, *_ = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Handed to the agent", tags=["codex"])
+        monkeypatch.setattr(agents_route, "_board_cache", (time.monotonic(), {"lanes": {}, "generated_at": 0}))
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        assert agents_route._board_cache is None
+
+    def test_cancel_teardown_failure_does_not_write_cancelled_and_reports_stopped_sessions(
+        self, client, stores, monkeypatch,
+    ):
+        """If `_kill_session_subtree` raises partway through (a real
+        teardown failure, distinct from the already-modeled
+        `managed_failure` outcome), Cancel must NOT mark the task
+        cancelled — claiming a cancellation the teardown didn't actually
+        finish would strand a still-running session behind a card that
+        looks done. The error reports what was already stopped."""
+        task_manager, *_ = stores
+        task = task_manager.create("Being worked by the agent", tags=["codex", "agent-running"])
+        session_store = stores[2]
+        session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+
+        async def _raise(*a, **kw):
+            raise agents_route.SubtreeTeardownError(
+                "teardown failed for session sess-abc: boom", killed=["sess-already-stopped"], failures=[],
+            )
+
+        monkeypatch.setattr(agents_route, "_kill_session_subtree", _raise)
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 500
+        assert "sess-already-stopped" in r.json()["detail"]
+        assert "not marked cancelled" in r.json()["detail"]
+        updated = task_manager.get(task.id)
+        assert updated.status != "cancelled"
+        assert "agent-running" in updated.tags
+
+    def test_cancel_write_conflict_after_successful_teardown_invites_a_retry(
+        self, client, stores, monkeypatch,
+    ):
+        """A `TaskConflictError` on the final write, AFTER the session was
+        already torn down, must say the session is already stopped and
+        invite a retry — not the generic conflict text, which would read
+        like an ordinary refusal and hide that the teardown already
+        happened."""
+        from api.services.task_manager import TaskConflictError
+
+        task_manager, *_ = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Being worked by the agent", tags=["codex", "agent-running"])
+        session_store = stores[2]
+        session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+
+        orig_update = task_manager.update
+
+        def _conflict_once(*a, **kw):
+            if kw.get("status") == "cancelled":
+                raise TaskConflictError("too many conflicting writes")
+            return orig_update(*a, **kw)
+
+        monkeypatch.setattr(task_manager, "update", _conflict_once)
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        detail = r.json()["detail"]
+        assert "already stopped" in detail
+        assert "retry" in detail
 
 
 # ---------------------------------------------------------------------------
