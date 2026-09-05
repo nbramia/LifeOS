@@ -15,6 +15,14 @@
 // a Board-tab drawer can each hold their own instance without id collisions.
 // Rendering/behavior is otherwise unchanged.
 
+import { nodeLabel, isRawIdValue, routingLabel, engineOf, ENGINE_SHAPES } from './graph_encoding.js';
+
+// Re-exported so existing importers (web/agents/board.js, web/agents/graph.js)
+// keep working unchanged — the definition itself lives in graph_encoding.js
+// so that module can use it without importing this one back (which would
+// form a cycle, since this module imports `nodeLabel` from it).
+export { routingLabel };
+
 export const STATUS_COLORS = {
   running:   '#34d399',
   claimed:   '#60a5fa',
@@ -32,20 +40,37 @@ export const STATUS_COLORS = {
 // treated as terminal. Only 'ended' (an explicit SessionEnd event) is.
 export const TERMINAL = new Set(['completed', 'failed', 'budget_exceeded', 'ended']);
 
-export function routingLabel(routing) {
-  if (!routing || routing === 'local') return 'Local';
-  if (routing === 'claude_code' || routing === 'code') return 'Claude Code';
-  if (routing === 'codex') return 'Codex';
-  if (routing === 'remote') return 'Remote';  // #809: #cloud tag, not Anthropic
-  if (routing === 'hermes') return 'Hermes';  // #850: was falling through to 'Claude'
-  if (routing === 'ask') return 'Ask';  // waiting on the operator, not a model
-  return 'Claude';
-}
-
 export function sourceLabelFor(d) {
   if (d.source === 'claude_code') return 'Claude Code CLI';
   if (d.source === 'codex') return 'Codex CLI';
   return 'LifeOS agent';
+}
+
+// The panel's Routing badge text. For a Hermes-routed session that has
+// taken at least one turn, `model_label` carries the honest per-session
+// "Hermes · <model>" attribution (`_model_label_for_routing` on the
+// server) — shown in preference to the plain routing name so the operator
+// can see which model actually answered. A Hermes session with no turn
+// yet (`model_label` is still plain "Hermes") and every non-Hermes session
+// render exactly `routingLabel(s.routing)`, unchanged.
+function routingBadgeText(s) {
+  if (s.routing === 'hermes' && (s.model_label || '').startsWith('Hermes')) {
+    return s.model_label;
+  }
+  return routingLabel(s.routing);
+}
+
+// The panel's `.panel-chips` row — model, engine, host, and effort, each as
+// a small chip, never as the header's name text (that's `nodeLabel(s)`
+// above). Shared by the graph panel and the board drawer, since both mount
+// a `SessionPanel`.
+function panelChipsHtml(s) {
+  const chips = [];
+  if (s.model_label) chips.push(s.model_label);
+  chips.push(ENGINE_SHAPES[engineOf(s)].label);
+  if (s.host) chips.push(s.host);
+  if (s.effort) chips.push(s.effort);
+  return chips.map(c => `<span class="badge panel-chip">${escapeHtml(c)}</span>`).join('');
 }
 
 // Single source of truth for whether a session should
@@ -361,14 +386,15 @@ export class SessionPanel {
     const inferredHint = s.status_inferred ? ' (inferred)' : '';
     const sourceLabel = sourceLabelFor(s);
     if (!root.querySelector('#label-edit-input')) {
-      setText('label', s.custom_label || s.label || s.session_id);
+      setText('label', nodeLabel(s));
     }
     setText('status', s.status + inferredHint);
     setText('source', sourceLabel);
-    setText('routing', routingLabel(s.routing));
+    setText('routing', routingBadgeText(s));
     setText('cost', '$' + (s.total_dollars || 0).toFixed(4));
     setText('tokens', `${s.total_input_tokens || 0}↓ / ${s.total_output_tokens || 0}↑`);
     setText('cwd-hint', s.decoded_cwd || '');
+    setHtml('panel-chips', panelChipsHtml(s));
 
     const statusBadge = root.querySelector('[data-field="status"]');
     if (statusBadge) statusBadge.className = `badge status-${escapeAttr(s.status)}`;
@@ -438,7 +464,7 @@ export class SessionPanel {
         ${canResume ? `<button class="panel-resume" data-action="resume" title="Open a new wezterm tab and run claude --resume"${showResume ? '' : ' hidden'}>Resume</button>` : ''}
         ${canResume ? `<select class="panel-resume-host" data-action="resume-host" title="Resume on this machine"${showResume ? '' : ' hidden'}></select>` : ''}
         ${showGoTo ? '<button class="panel-focus" data-action="focus" title="Jump to the existing wezterm pane for this session (or run Resume if there isn\'t one).">Go To</button>' : ''}
-        <div class="label" data-field="label" title="Click to rename this session">${escapeHtml(s.custom_label || s.label || s.session_id)}</div>
+        <div class="label" data-field="label" title="Click to rename this session">${escapeHtml(nodeLabel(s))}</div>
         <div class="cwd-hint" data-field="cwd-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-all">${s.decoded_cwd ? escapeHtml(s.decoded_cwd) : ''}</div>
         ${s.branch ? `<div class="branch-hint" data-field="branch-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.1rem">branch: ${escapeHtml(s.branch)}</div>` : ''}
         <div class="meta" data-field="meta">
@@ -446,11 +472,12 @@ export class SessionPanel {
           <span class="badge status-${safeStatus}" data-field="status">${escapeHtml(s.status + inferredHint)}</span>
           <span class="badge" data-field="source">${escapeHtml(sourceLabel)}</span>
           ${s.host ? `<span class="badge" data-field="host" title="Machine this session is running on">${escapeHtml(s.host)}</span>` : ''}
-          <span class="badge" data-field="routing">${escapeHtml(routingLabel(s.routing))}</span>
+          <span class="badge" data-field="routing">${escapeHtml(routingBadgeText(s))}</span>
           <span class="badge" data-field="cost">$${(s.total_dollars || 0).toFixed(4)}</span>
           <span class="badge" data-field="tokens">${s.total_input_tokens || 0}↓ / ${s.total_output_tokens || 0}↑</span>
           <span data-field="depth">${s.spawn_depth ? `<span class="badge">depth ${s.spawn_depth}</span>` : ''}</span>
         </div>
+        <div class="panel-chips" data-field="panel-chips">${panelChipsHtml(s)}</div>
         ${s.prompt_preview ? `<div class="prompt-preview-hint" data-field="prompt-preview-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-word">“${escapeHtml(s.prompt_preview)}”</div>` : ''}
         ${canResume ? `
         <div class="resume-command" data-field="resume-command" hidden>
@@ -657,11 +684,11 @@ export class SessionPanel {
     backdrop.innerHTML = `
       <div class="modal" role="dialog" aria-labelledby="kill-title">
         <h2 id="kill-title">Kill agent session?</h2>
-        <div class="target">${escapeHtml(session.label || session.session_id)}</div>
+        <div class="target">${escapeHtml(nodeLabel(session))}</div>
         ${descendants.length > 0 ? `
           <div class="descendants">
             Will also kill ${descendants.length} descendant${descendants.length === 1 ? '' : 's'}:
-            ${descendants.slice(0, 5).map(d => `<div>• ${escapeHtml(d.label || d.session_id)}</div>`).join('')}
+            ${descendants.slice(0, 5).map(d => `<div>• ${escapeHtml(nodeLabel(d))}</div>`).join('')}
             ${descendants.length > 5 ? `<div>…and ${descendants.length - 5} more</div>` : ''}
           </div>
         ` : ''}
@@ -713,7 +740,16 @@ export class SessionPanel {
     const root = this.container;
     const labelEl = root.querySelector('[data-field="label"]');
     if (!labelEl || labelEl.querySelector('#label-edit-input')) return;
-    const current = s.custom_label || s.label || '';
+    // A raw-id `custom_label` never happens (the operator didn't type it),
+    // but `label` falls back to the raw session/task id whenever there's no
+    // real title (#942) — prefilling that here would let a blur-without-
+    // typing save the raw id as a permanent `custom_label`. Guard both the
+    // same way `nodeLabel` does, rather than reusing `nodeLabel` itself:
+    // its further fallbacks (prompt preview, routing name) are display-only
+    // text, not something a save-on-blur should ever persist as the name.
+    const realCustom = isRawIdValue(s, s.custom_label) ? '' : (s.custom_label || '');
+    const realLabel = isRawIdValue(s, s.label) ? '' : (s.label || '');
+    const current = realCustom || realLabel;
     const input = document.createElement('input');
     input.id = 'label-edit-input';
     input.type = 'text';
@@ -733,7 +769,7 @@ export class SessionPanel {
       if (done) return;
       done = true;
       if (save) this._saveLabelEdit(s, input.value);
-      else labelEl.textContent = s.custom_label || s.label || s.session_id;
+      else labelEl.textContent = nodeLabel(s);
     };
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); finish(true); }
@@ -745,7 +781,7 @@ export class SessionPanel {
   async _saveLabelEdit(s, rawValue) {
     const root = this.container;
     const labelEl = root.querySelector('[data-field="label"]');
-    const fallback = () => { if (labelEl) labelEl.textContent = s.custom_label || s.label || s.session_id; };
+    const fallback = () => { if (labelEl) labelEl.textContent = nodeLabel(s); };
     try {
       const r = await fetch(`/api/agents/sessions/${encodeURIComponent(s.session_id)}/label`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -755,7 +791,7 @@ export class SessionPanel {
       const data = await r.json();
       const custom = data.custom_label || null;
       s.custom_label = custom;
-      if (labelEl) labelEl.textContent = custom || s.label || s.session_id;
+      if (labelEl) labelEl.textContent = nodeLabel(s);
       this.onLabelSaved(s.session_id, custom);
     } catch (err) {
       console.warn('label save failed', err);
