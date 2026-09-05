@@ -183,11 +183,10 @@ def test_changing_engine_updates_tags_and_saves(page: Page, web_base_url):
 
 
 def test_all_pickers_including_engine_disabled_when_fields_policy_refuses(page: Page, web_base_url):
-    """(#881 RC8) `board.js` hides the engine row inside its own drawer, so
-    a missing `disabled` there was unreachable through the board UI — but
-    this module is also usable directly (as this test file does), where
-    the row IS visible, and must not leave it silently editable while
-    every other picker is disabled."""
+    """`board.js` hides the engine row inside its own drawer, but this
+    module is also usable directly (as this test file does), where the
+    row IS visible, and must not leave it silently editable while every
+    other picker is disabled."""
     _load_module(page, web_base_url)
     _render(page, {
         "id": "t9", "title": "Migrate the database", "tags": ["codex", "agent-running"],
@@ -214,7 +213,7 @@ def test_fields_policy_allowed_leaves_engine_and_pickers_enabled(page: Page, web
 
 
 def test_fields_disabled_reason_renders_in_neutral_element_not_error(page: Page, web_base_url):
-    """(#881 RC6) The disabled-fields explanation must render in its own
+    """The disabled-fields explanation renders in its own
     `.drawer-field-reason` element, not `.assignment-error` — that one is
     reserved for a genuinely failed save, so a normal explanation doesn't
     paint red."""

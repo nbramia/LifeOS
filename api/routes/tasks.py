@@ -10,11 +10,25 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from api.services import human_queue
+from api.services.agent_worker.session_store import SessionStore
 from api.services.task_manager import get_task_manager, Task, TaskConflictError, VALID_STATUSES
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+
+# Lazy module-level singleton, mirroring api/routes/agents.py's own
+# `_get_session_store()` — needed here to answer "is there actually a live
+# session behind this card's claim" before a tags write can be allowed to
+# touch a claim tag (see `_has_live_session` below).
+_session_store: SessionStore | None = None
+
+
+def _get_session_store() -> SessionStore:
+    global _session_store
+    if _session_store is None:
+        _session_store = SessionStore()
+    return _session_store
 
 
 def _require_valid_status(status: Optional[str]) -> None:
@@ -521,50 +535,108 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
     manager = get_task_manager()
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
 
-    # (#881) The board's assignment pickers stamp `fields.assigned_by:
-    # "board"` on every write (see web/agents/assignment.js) — that marker,
-    # and only that marker, routes the request through the same
-    # claimed-card guard the lane endpoint enforces, so a claimed card's
-    # model/effort/host or assignee can't be changed through the drawer
-    # while dragging it is refused. A request without the marker (agent-
-    # side or vault-side writes) never pays for the extra task read.
+    # The board's assignment pickers stamp `fields.assigned_by: "board"` on
+    # every write (see web/agents/assignment.js) — that marker routes a
+    # model/effort/host change through the same claimed-card guard the
+    # lane endpoint enforces, so those fields can't be changed through the
+    # drawer while dragging the card is refused. A request without the
+    # marker (agent-side or vault-side writes) never pays for the extra
+    # task read for this check.
     fields_patch = updates.get("fields")
-    if fields_patch and str(fields_patch.get("assigned_by", "")).strip().lower() == "board":
+    is_board_marked = bool(
+        fields_patch and str(fields_patch.get("assigned_by", "")).strip().lower() == "board"
+    )
+    # A board-marked `status` patch reaches the same claimed-card lock-down
+    # as model/effort/host — the board itself never sends one this way
+    # (lane moves go through the lane endpoint), but nothing stops another
+    # caller stamping the marker onto a raw status write, and a claimed
+    # card's status is exactly what the worker owns while it's running.
+    board_marked_field_change = is_board_marked and (
+        bool({"model", "effort", "host"} & set((fields_patch or {}).keys()))
+        or "status" in updates
+    )
+    needs_current = "tags" in updates or board_marked_field_change
+    current = manager.get(task_id) if needs_current else None
+    if needs_current and current is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if current is not None:
         from api.services import agent_board
 
-        current = manager.get(task_id)
-        if current is None:
-            raise HTTPException(status_code=404, detail="Task not found")
-
-        if {"model", "effort", "host"} & set(fields_patch.keys()):
-            error = agent_board.evaluate_card_action(current.status, current.tags, "field_edit")
+        if board_marked_field_change:
+            has_live = _get_session_store().has_live_session(
+                task_id, status=current.status, tags=current.tags,
+            )
+            error = agent_board.evaluate_card_action(
+                current.status, current.tags, "field_edit", has_live_session=has_live,
+            )
             if error is not None:
                 raise HTTPException(status_code=error[0], detail=error[1])
 
         if "tags" in updates:
-            # (#881 AR2/AR3) Compare the normalized assignee-tag *and*
-            # claim-tag SETS, not just `derive_assignee`'s single
-            # first-match-wins value — that value is blind to two holes a
-            # free-text tags patch can slip through on a claimed card:
-            #   - AR2: adding a SECOND assignee tag alongside the existing
-            #     one (`["claude","agent-running"]` -> `["claude",
+            # Compare the normalized assignee-tag *and* claim-tag SETS,
+            # not just `derive_assignee`'s single first-match-wins value —
+            # that value is blind to two holes a free-text tags patch can
+            # otherwise slip through on a claimed card:
+            #   - adding a SECOND assignee tag alongside the existing one
+            #     (`["claude","agent-running"]` -> `["claude",
             #     "agent-running","codex"]`) still derives "claude" (first
-            #     match in ASSIGNEE_TAGS order), so the old single-value
-            #     comparison saw no change and never ran the guard.
-            #   - AR3: dropping `agent-running`/`agent-blocked` from the
-            #     tags box (the drawer's Tags field used to show them as
-            #     ordinary editable tokens) also leaves the derived
-            #     assignee unchanged, so the same blind spot let a claimed
-            #     card's claim tag be silently stripped through this path.
+            #     match in ASSIGNEE_TAGS order), so a single-value
+            #     comparison would see no change and never run the guard.
+            #   - dropping `agent-running`/`agent-blocked` from the tags
+            #     box also leaves the derived assignee unchanged, so the
+            #     same blind spot would let a claimed card's claim tag be
+            #     silently stripped through this path.
+            # This check runs on every tags patch regardless of the
+            # `assigned_by` marker — the marker only gates the
+            # model/effort/host check above, since the drawer's Tags field
+            # writes a bare `{"tags": [...]}` patch with no `fields` key at
+            # all, so a marker-gated guard here could never fire for the
+            # request the product actually sends. The guard keys on the
+            # card's own claim state (computed from ITS OWN tags/status,
+            # never trusted from the request), not on who's asking.
             old_tags = agent_board.normalize_tags(current.tags)
             new_tags = agent_board.normalize_tags(updates["tags"])
             assignee_tag_set = set(agent_board.ASSIGNEE_TAGS)
-            claim_tag_set = {agent_board.RUNNING_TAG, agent_board.BLOCKED_TAG}
+            # Every lifecycle tag the worker or the accept endpoint writes
+            # is off-limits to a bare tags PUT, not just the two claim
+            # tags — `agent-completed` and `accepted` are just as
+            # unreachable through any legitimate HTTP caller, and letting
+            # either be manufactured this way would fake a Review state
+            # (or a fake accept out of one) the same way a manufactured
+            # claim tag fakes a claim.
+            claim_tag_set = {
+                agent_board.RUNNING_TAG, agent_board.BLOCKED_TAG,
+                agent_board.COMPLETED_TAG, agent_board.ACCEPTED_TAG,
+            }
+
+            added_claim_tags = (new_tags & claim_tag_set) - (old_tags & claim_tag_set)
+            if added_claim_tags:
+                # A claim/lifecycle tag (`agent-running`/`agent-blocked`/
+                # `agent-completed`/`accepted`) is written only by the
+                # worker (through `/swap-tag`) or the accept endpoint — no
+                # other HTTP caller in this codebase adds one via a plain
+                # PUT. Refuse it here unconditionally rather than only when
+                # the card is already claimed: an unclaimed (including
+                # `me`) card gaining one of these through this path would
+                # fake a claim or a review state on the very next policy
+                # read, which is a false state this endpoint must never
+                # manufacture.
+                raise HTTPException(
+                    status_code=agent_board.WORKER_OWNED_ERROR[0],
+                    detail=agent_board.WORKER_OWNED_ERROR[1],
+                )
+
             if (
                 (old_tags & assignee_tag_set) != (new_tags & assignee_tag_set)
                 or (old_tags & claim_tag_set) != (new_tags & claim_tag_set)
             ):
-                error = agent_board.evaluate_card_action(current.status, current.tags, "assignee_change")
+                has_live = _get_session_store().has_live_session(
+                    task_id, status=current.status, tags=current.tags,
+                )
+                error = agent_board.evaluate_card_action(
+                    current.status, current.tags, "assignee_change", has_live_session=has_live,
+                )
                 if error is not None:
                     raise HTTPException(status_code=error[0], detail=error[1])
 

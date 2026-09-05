@@ -1192,11 +1192,10 @@ class TestFuzzySuppressionBatch5:
         """#852: the morning briefing must surface open Human-queue cards
         by naming the list tool the orchestrator calls to check them."""
         from scripts.seed_proactive_reminders import MORNING_BRIEFING_PROMPT
-        # #881: the section HEADING specifically, not just the phrase
+        # Checks the section HEADING specifically, not just the phrase
         # "Human queue" — which also appears in the body text below the
         # heading ("check the Human queue"), so a plain substring check
-        # would pass even if the heading itself still read "Waiting on
-        # You".
+        # would pass even if the heading itself read something else.
         assert "**Human queue**" in MORNING_BRIEFING_PROMPT
         assert "**Waiting on You**" not in MORNING_BRIEFING_PROMPT
         assert "manage_human_queue" in MORNING_BRIEFING_PROMPT
