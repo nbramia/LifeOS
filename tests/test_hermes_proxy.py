@@ -1784,6 +1784,58 @@ async def test_usage_store_failure_is_logged_and_never_breaks_the_relay(
     assert "hermes turn persistence" in caplog.text
 
 
+async def test_chat_hermes_turn_never_touches_any_agent_sessions_hermes_model(
+    usage_proxy_client, agent_session_store,
+):
+    """`/chat`'s Hermes proxy path (this route, `ask_stream`)
+    threads no session id into `_HermesTurnPersister` — `observe()`/
+    `_handle_usage()`/`finalize()` never reference a `SessionStore` at all
+    (see `_HermesTurnPersister`'s class docstring) — so a real turn's own
+    `usage` event, which DOES update `model_readout.py`'s process-wide
+    `/api/health` reading (asserted below as proof this turn actually
+    ran), must change NO agent session's `hermes_model`. That includes the
+    deterministic `sess_herm<hash>` conversation-anchor row
+    `resolve_hermes_caller_session_id` creates for this same
+    conversation — it is inert (never dispatched, see `hermes_session.py`'s
+    docstring), so plain `Hermes` staying its honest label depends on this
+    turn never writing to it.
+
+    Uses the SAME conversation id the request resolves its caller session
+    against and the id the stub backend's own SSE stream reports, so the
+    two match — this is what makes the mutation proof below meaningful (a
+    regression that writes `hermes_model` from the turn's OWN observed
+    conversation id would otherwise silently target a different, unrelated
+    session and pass vacuously). Also seeds an UNRELATED, pre-existing
+    agent-worker Hermes session (a board-assigned task, not this turn's own
+    conversation anchor) and asserts it is untouched too — proving this
+    isn't just the anchor row's own inertness but that a real `/chat` turn
+    writes to no `SessionStore` row at all."""
+    from api.services import model_readout
+    from api.services.agent_worker.hermes_session import _deterministic_session_id
+
+    unrelated = agent_session_store.create(
+        task_id="t-unrelated-hermes-board-task", routing="hermes",
+    )
+
+    conversation_id = "usage-conv-1"  # matches _USAGE_SSE_CHUNKS' own conversation_id event
+    resp = await usage_proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": "what's 2+2?", "conversation_id": conversation_id},
+    )
+    assert resp.status_code == 200
+
+    # Proof the turn actually happened and reported a model — the
+    # process-wide readout did observe it.
+    assert model_readout._hermes_chat_last_model == "deepseek-v3-fireworks"
+
+    anchor_id = _deterministic_session_id(conversation_id)
+    anchor = agent_session_store.get_by_session_id(anchor_id)
+    assert anchor is not None
+    assert anchor.hermes_model is None
+
+    assert agent_session_store.get(unrelated.task_id).hermes_model is None
+
+
 class TestHermesTurnPersisterDirect:
     """Direct, non-HTTP tests of `_HermesTurnPersister` — the SSE frame
     reassembly and store-write logic in isolation from the transport."""

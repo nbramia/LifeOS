@@ -403,11 +403,7 @@ def test_model_label_hermes_routing_ignores_the_board_model_picker(client, store
     """`Session.model` is the board's operator-chosen model *picker* value
     (`SessionStore.set_assignment`) — `HermesExecutor` never reads or writes
     it, so it must not affect the Hermes badge. A session with a picker
-    `model` set still reads plain "Hermes": the badge is plain "Hermes"
-    unconditionally, never a `Hermes · <model>` suffix sourced from a
-    process-wide "last observed" reading, since that reading is a
-    cross-session misattribution and not merely decoupled from the
-    picker."""
+    `model` set but no turn taken yet still reads plain "Hermes"."""
     session_store, _ = stores
     session_store.create(
         task_id="t-herm-picker", status=STATUS_RUNNING, routing="hermes",
@@ -415,6 +411,98 @@ def test_model_label_hermes_routing_ignores_the_board_model_picker(client, store
     )
     sess = client.get("/api/agents/snapshot").json()["sessions"][0]
     assert sess["model_label"] == "Hermes"
+
+
+# ---------------------------------------------------------------------------
+# Per-session Hermes-reported model. `Session.hermes_model` is
+# written only by `HermesExecutor.execute` for the session it executes (see
+# tests/test_agent_worker_hermes_executor.py for that write path); these
+# tests pin the honest-attribution rules from the READ side (the snapshot's
+# `model_label`), using `SessionStore.set_hermes_model` directly to stand in
+# for "a turn already happened and reported a model" without spinning up a
+# real Hermes backend.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_model_label_hermes_routing_shows_the_sessions_own_reported_model(client, stores):
+    session_store, _ = stores
+    session_store.create(task_id="t-herm-model", status=STATUS_RUNNING, routing="hermes")
+    session_store.set_hermes_model("t-herm-model", "deepseek-v4-flash")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["model_label"] == "Hermes · deepseek-v4-flash"
+
+
+@pytest.mark.unit
+def test_model_label_hermes_two_concurrent_sessions_never_cross_attribute(client, stores):
+    """Two Hermes sessions running different models each report
+    their own — neither's badge changes when the OTHER takes a turn. A
+    process-wide "last observed" value would let session beta's turn
+    retroactively relabel session alpha; `hermes_model` is per-session so
+    it cannot."""
+    session_store, _ = stores
+    session_store.create(task_id="t-herm-alpha", status=STATUS_RUNNING, routing="hermes")
+    session_store.create(task_id="t-herm-beta", status=STATUS_RUNNING, routing="hermes")
+
+    # Interleaved: alpha reports first, then beta, then alpha again with a
+    # DIFFERENT model — at every point, each session's own snapshot row
+    # must reflect only its own most recent report.
+    session_store.set_hermes_model("t-herm-alpha", "model-alpha-1")
+    sessions = {s["task_id"]: s for s in client.get("/api/agents/snapshot").json()["sessions"]}
+    assert sessions["t-herm-alpha"]["model_label"] == "Hermes · model-alpha-1"
+    assert sessions["t-herm-beta"]["model_label"] == "Hermes"
+
+    session_store.set_hermes_model("t-herm-beta", "model-beta-1")
+    sessions = {s["task_id"]: s for s in client.get("/api/agents/snapshot").json()["sessions"]}
+    assert sessions["t-herm-alpha"]["model_label"] == "Hermes · model-alpha-1"
+    assert sessions["t-herm-beta"]["model_label"] == "Hermes · model-beta-1"
+
+    session_store.set_hermes_model("t-herm-alpha", "model-alpha-2")
+    sessions = {s["task_id"]: s for s in client.get("/api/agents/snapshot").json()["sessions"]}
+    assert sessions["t-herm-alpha"]["model_label"] == "Hermes · model-alpha-2"
+    assert sessions["t-herm-beta"]["model_label"] == "Hermes · model-beta-1"
+
+
+@pytest.mark.unit
+def test_model_label_hermes_completed_session_is_frozen(client, stores):
+    """A completed session's reported model does not change
+    after the fact, even when another Hermes session takes a turn with a
+    different model afterward."""
+    session_store, _ = stores
+    session_store.create(task_id="t-herm-done", status=STATUS_RUNNING, routing="hermes")
+    session_store.set_hermes_model("t-herm-done", "model-final")
+    session_store.update_status("t-herm-done", STATUS_COMPLETED)
+
+    before = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert before["status"] == STATUS_COMPLETED
+    assert before["model_label"] == "Hermes · model-final"
+
+    session_store.create(task_id="t-herm-later", status=STATUS_RUNNING, routing="hermes")
+    session_store.set_hermes_model("t-herm-later", "model-unrelated")
+
+    sessions = {s["task_id"]: s for s in client.get("/api/agents/snapshot").json()["sessions"]}
+    assert sessions["t-herm-done"]["model_label"] == "Hermes · model-final"
+    assert sessions["t-herm-later"]["model_label"] == "Hermes · model-unrelated"
+
+
+@pytest.mark.unit
+def test_model_label_hermes_whitespace_only_model_degrades_to_plain_hermes(client, stores):
+    """A whitespace-only reported model (e.g. a
+    malformed upstream `usage` event) must not render as `Hermes ·    ` —
+    `SessionStore.set_hermes_model` strips before its falsy guard, so this
+    is indistinguishable from no turn having been observed yet. A real,
+    non-empty model with incidental surrounding whitespace is still
+    recorded (stripped), proving this isn't a blanket rejection of every
+    model containing whitespace."""
+    session_store, _ = stores
+    session_store.create(task_id="t-herm-blank", status=STATUS_RUNNING, routing="hermes")
+    session_store.set_hermes_model("t-herm-blank", "   ")
+    session_store.create(task_id="t-herm-padded", status=STATUS_RUNNING, routing="hermes")
+    session_store.set_hermes_model("t-herm-padded", "  model-padded  ")
+
+    sessions = {s["task_id"]: s for s in client.get("/api/agents/snapshot").json()["sessions"]}
+    assert sessions["t-herm-blank"]["model_label"] == "Hermes"
+    assert sessions["t-herm-padded"]["model_label"] == "Hermes · model-padded"
 
 
 @pytest.mark.unit
