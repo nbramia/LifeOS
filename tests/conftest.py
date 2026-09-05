@@ -938,19 +938,23 @@ def _no_local_telegram_bots_override(tmp_path_factory, monkeypatch):
 # `RuntimeError: Runner.run() cannot be called from a running event loop`
 # despite having nothing to do with Playwright. `--dist loadscope` groups tests
 # by class for tests inside a class, by module for top-level functions, and
-# hands scope groups out to workers in collection order, so a worker can run
-# a browser file's scope group and then an unrelated file's async test in the
-# same process. The minimal, deterministic reproducer needs no xdist at all
-# -- a single process running a browser file before an `async def` test:
+# hands scope groups to workers largest-first (pytest-xdist's
+# `--loadscope-reorder` is on by default; command-line order only breaks
+# ties), so which groups share a worker process, and in what sequence, shifts
+# with the selection -- a worker can run a browser file's scope group and
+# then an unrelated file's async test in the same process. The minimal,
+# deterministic reproducer needs no xdist at all -- a single process running
+# a browser file before an `async def` test:
 #   pytest tests/test_voice_mic_block_ui_browser.py tests/test_agents_board_api.py::TestBoardStream -q
 # The failure that module scope prevents is also reproducible against the
 # session-scoped upstream fixtures the way it actually showed up in the full
 # suite, under real parallelism:
 #   pytest tests/test_agents_assignment_ui_browser.py tests/test_agents_board_ui_browser.py \
 #          tests/test_agents_host_filter_ui_browser.py tests/test_agents_board_api.py -n 4
-# -- the browser files must be listed BEFORE test_agents_board_api.py, since
-# collection order decides hand-out order and the async tests must land on
-# a worker whose driver loop is already parked; see AGENTS.md § Testing.
+# -- with the browser files listed first; the async tests must land on a
+# worker whose driver loop is already parked, and under the size-ordered
+# hand-out this file order gets them there reliably on a four-worker run
+# while the reverse order does not. See AGENTS.md § Testing.
 #
 # Module scope tears the driver connection -- and the loop it parks -- down
 # at the end of every test FILE, before any other file's tests (including
