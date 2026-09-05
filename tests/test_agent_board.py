@@ -582,13 +582,14 @@ def _expected_outcome(assignee, condition, action, target_lane=None):
     target_lane) combination, per the rule text — `None` for allowed,
     `(status_code, detail)` for refused."""
     # A card is agent-owned once EITHER its assignee tag names an agent
-    # engine, OR it already carries a worker claim tag with no
-    # engine-specific assignee at all — the shape left behind when the
-    # worker claims a bare `#agent` queue card without ever writing one
-    # (the worker's own claim swap only ever touches `agent`/claim tags,
-    # never assignee tags). Without the second half, that card would
-    # refuse Cancel too (agent-owned-only) with no assignee tag left to
-    # edit it back to a workable state.
+    # engine, OR it already carries a worker claim tag — regardless of
+    # whether an assignee tag is also present. The claim-tag branch covers
+    # both the bare-`#agent`-queue-card shape with no engine-specific
+    # assignee at all (the worker's own claim swap only ever touches
+    # `agent`/claim tags, never assignee tags) and a card the worker
+    # claimed while it still carries `#me`. Without that branch, either
+    # shape would refuse Cancel too (agent-owned-only) with no assignee tag
+    # left to edit it back to a workable state.
     agent_owned = assignee in ("claude", "codex", "hermes", "local") or condition in (
         "agent_running", "agent_blocked",
     )

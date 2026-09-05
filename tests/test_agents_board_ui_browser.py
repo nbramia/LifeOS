@@ -2250,3 +2250,106 @@ class TestAgentCardMoveRulesAndCancel:
         _open_board(page, agents_base_url)
         page.locator('[data-card-id="t2"]').click()
         expect(page.get_by_role("button", name="Cancel", exact=True)).to_have_count(0)
+
+    def test_removing_agent_marker_tag_leaves_other_editable_tags_via_tags_box(self, page: Page, agents_base_url):
+        """AR2's positive case, missing until now: `agent` is the worker's
+        queue marker, not a claim tag (LIFECYCLE_TAGS is an explicit set,
+        not a prefix match on `agent-`/`agent`), so an unclaimed `me` card
+        must still show it — and any operator label that merely starts
+        with `agent-` — as an editable Tags-box token, and clearing just
+        `agent` must save with everything else intact."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append({
+            "kind": "task", "id": "t13", "title": "Operator queue card",
+            "notes": "", "status": "todo",
+            "tags": ["me", "agent", "agent-notes", "notes"], "assignee": "me",
+            "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+
+        page.locator('[data-card-id="t13"]').click()
+        tags = page.locator(".drawer-tags")
+        expect(tags).to_be_enabled()
+        expect(tags).to_have_value("agent agent-notes notes")
+
+        tags.fill("agent-notes notes")  # remove "agent"
+        page.locator(".drawer-title").click()  # blur the tags field
+        assert any(
+            sorted(p.get("tags") or []) == ["agent-notes", "me", "notes"] for p in task_puts
+        ), task_puts
+        assert not any("agent" in (p.get("tags") or []) for p in task_puts)
+
+    def test_kill_disabled_for_a_claude_code_cli_backed_live_session(self, page: Page, agents_base_url):
+        """RC1's positive case, missing until now: a claimed card whose
+        linked session is a live Claude Code CLI pane (opened via the
+        drawer's Open button, not started by the worker) renders Kill
+        disabled with the "close it manually" reason — Kill has no way to
+        tear down a CLI process the way it kills a LifeOS-agent session,
+        the same limitation Cancel already reports for the same shape."""
+        board_state = copy.deepcopy(_board_fixture())
+        card = _claimed_agent_owned_card(card_id="t14", title="CLI-backed claimed card")
+        card["session"] = {
+            "session_id": "cc:cli-live-1", "status": "running",
+            "host": "test-host", "routing": "claude_code",
+            "model_label": "Sonnet", "source": "claude_code",
+        }
+        board_state["lanes"]["in_progress"].append(card)
+        _open_board(page, agents_base_url, board_state=board_state)
+
+        page.locator('[data-card-id="t14"]').click()
+        kill_btn = page.get_by_role("button", name="Kill", exact=True)
+        expect(kill_btn).to_be_visible()
+        expect(kill_btn).to_be_disabled()
+        expect(page.locator('[data-field="kill-reason"]')).to_contain_text("close it manually")
+
+    def test_tags_blur_reads_fresh_board_state_after_a_deferred_frame(self, page: Page, agents_base_url):
+        """AR1's client half, missing until now: the Tags-box blur handler
+        must read the CURRENT board state (`findCard(card.id)`), not the
+        stale card snapshot closed over at render time — otherwise a claim
+        tag the worker writes while the operator is mid-edit in this field
+        gets silently dropped on save instead of preserved. Follows the
+        established deferred-frame pattern (see TestLiveUpdates): the
+        frame is withheld behind `stream_gate` until the drawer is open and
+        the Tags field holds focus, and an unrelated card (t1) carries the
+        proof-of-arrival signal since the drawer itself doesn't rebuild
+        while focused."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append({
+            "kind": "task", "id": "t15", "title": "Unclaimed claude card",
+            "notes": "", "status": "todo", "tags": ["claude", "notes"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        board_stream_frames: list[str] = []
+        task_puts = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+            task_puts=task_puts,
+        )
+        page.locator('[data-card-id="t15"]').click()
+        tags = page.locator(".drawer-tags")
+        expect(tags).to_have_value("notes")
+        tags.fill("notes extra")  # typed; focus stays in the tags field
+
+        # Signal on a DIFFERENT card (t1) proves the frame actually landed;
+        # the real change is the worker claiming t15 mid-edit.
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t15":
+                card["tags"] = ["claude", "agent-running", "notes"]
+                card["status"] = "in_progress"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text("urgent", timeout=5000)
+        expect(tags).to_have_value("notes extra")  # drawer not rebuilt while focused
+
+        page.locator(".drawer-title").click()  # blur the tags field
+        assert any("agent-running" in (p.get("tags") or []) for p in task_puts), task_puts

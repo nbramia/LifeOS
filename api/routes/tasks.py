@@ -20,7 +20,8 @@ router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 # Lazy module-level singleton, mirroring api/routes/agents.py's own
 # `_get_session_store()` — needed here to answer "is there actually a live
 # session behind this card's claim" before a tags write can be allowed to
-# touch a claim tag (see `_has_live_session` below).
+# touch a claim tag (see `SessionStore.has_live_session`, called through
+# `_get_session_store()` below).
 _session_store: SessionStore | None = None
 
 
@@ -605,6 +606,13 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
             # either be manufactured this way would fake a Review state
             # (or a fake accept out of one) the same way a manufactured
             # claim tag fakes a claim.
+            # Deliberately narrower than board.js's client-side
+            # LIFECYCLE_TAGS, which also hides agent-failed/
+            # agent-budget-exceeded from the Tags box: those two are
+            # terminal outcomes `derive_lane`/`is_claimed` never look at,
+            # so manufacturing either one through a bare tags PUT can't
+            # fake a lane or a claim the way a RUNNING/BLOCKED/COMPLETED/
+            # ACCEPTED tag could — there's no state here worth guarding.
             claim_tag_set = {
                 agent_board.RUNNING_TAG, agent_board.BLOCKED_TAG,
                 agent_board.COMPLETED_TAG, agent_board.ACCEPTED_TAG,
