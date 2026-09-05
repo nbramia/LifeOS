@@ -465,6 +465,27 @@ def _fallback_label(label: str) -> str:
     return result
 
 
+def _cache_put(session_id: str, last_activity_at: float, result: SummaryResult,
+               *, is_error_fallback: bool = False) -> None:
+    """Insert into the in-process cache, enforcing `_CACHE_MAX`.
+
+    Every write path funnels through this helper so the `_CACHE_MAX` bound is
+    enforced uniformly — a stray direct assignment (e.g. a disk-hit promotion
+    in `summarize_session` / `get_cached_summary`) must not sidestep the cap
+    and grow the cache unbounded. When at capacity, evicts the oldest-inserted
+    entry (dict insertion order) and then writes the new one. Eviction applies
+    only to a genuinely new key at capacity; re-putting a key already present
+    updates its entry in place and keeps its FIFO position.
+
+    `created_at` is stamped wall-clock at write time; it feeds the live-session
+    grace window (`_LIVE_REFRESH_GRACE_SECONDS`) and the error-fallback TTL
+    (`_FAILURE_FALLBACK_TTL_SECONDS`).
+    """
+    if session_id not in _cache and len(_cache) >= _CACHE_MAX:
+        _cache.pop(next(iter(_cache)))
+    _cache[session_id] = (last_activity_at, time.time(), result, is_error_fallback)
+
+
 def _cache_if_terminal(session_id: str, last_activity_at: float, status: str,
                         result: SummaryResult, *, is_error_fallback: bool = False) -> None:
     """Cache `result` for a session whose status is terminal, so it drops out
@@ -481,10 +502,7 @@ def _cache_if_terminal(session_id: str, last_activity_at: float, status: str,
     expires."""
     if not _is_terminal(status):
         return
-    now = time.time()
-    if len(_cache) >= _CACHE_MAX:
-        _cache.pop(next(iter(_cache)))
-    _cache[session_id] = (last_activity_at, now, result, is_error_fallback)
+    _cache_put(session_id, last_activity_at, result, is_error_fallback=is_error_fallback)
     if not is_error_fallback:
         _disk_put(session_id, last_activity_at, result)
 
@@ -531,7 +549,7 @@ async def summarize_session(
     # fallback never does — so this is never an error fallback.
     disk_hit = _disk_get(session_id, last_activity_at, status)
     if disk_hit is not None:
-        _cache[session_id] = (last_activity_at, time.time(), disk_hit, False)
+        _cache_put(session_id, last_activity_at, disk_hit)
         return disk_hit
 
     ctx = _extract_context(events)
@@ -598,10 +616,7 @@ async def summarize_session(
         return fallback
 
     result = SummaryResult(short_label=short_label, summary=summary)
-    if len(_cache) >= _CACHE_MAX:
-        _cache.pop(next(iter(_cache)))
-    now = time.time()
-    _cache[session_id] = (last_activity_at, now, result, False)
+    _cache_put(session_id, last_activity_at, result)
     _disk_put(session_id, last_activity_at, result)
     return result
 
@@ -626,7 +641,7 @@ def get_cached_summary(session_id: str, last_activity_at: float, status: str = "
             return cached_result
     disk = _disk_get(session_id, last_activity_at, status)
     if disk is not None:
-        _cache[session_id] = (last_activity_at, time.time(), disk, False)
+        _cache_put(session_id, last_activity_at, disk)
         return disk
     return None
 

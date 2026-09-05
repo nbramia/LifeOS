@@ -1260,3 +1260,158 @@ def test_put_label_sets_and_clears(client, stores, label_override_db):
     snap2 = client.get("/api/agents/snapshot").json()
     sess2 = next(x for x in snap2["sessions"] if x["session_id"] == s.session_id)
     assert sess2["custom_label"] is None
+
+
+# ---------------------------------------------------------------------------
+# _cache_put _CACHE_MAX enforcement. Every in-process cache write funnels
+# through _cache_put so the cap is enforced uniformly — a stray direct
+# assignment (disk-hit promotions, terminal/ttl caching) must not grow the
+# cache unbounded. When at capacity, the oldest-inserted entry (dict
+# insertion order) is evicted and the new one stored.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_cache_put_enforces_cache_max(summary_db, monkeypatch):
+    from api.services import agent_viz_summary as avs
+
+    avs._cache.clear()
+    small_max = 3
+    monkeypatch.setattr(avs, "_CACHE_MAX", small_max)
+    try:
+        for i in range(small_max + 5):
+            avs._cache_put(
+                f"sid-{i}",
+                float(i),
+                avs.SummaryResult(short_label=f"L{i}", summary=f"S{i}"),
+            )
+        # Never exceeds the cap.
+        assert len(avs._cache) == small_max
+
+        # Oldest-inserted entries were evicted first; the newest survive.
+        for i in range(small_max + 5 - small_max, small_max + 5):
+            assert f"sid-{i}" in avs._cache
+        assert "sid-0" not in avs._cache
+    finally:
+        avs._cache.clear()
+
+
+@pytest.mark.unit
+def test_cache_put_repeat_key_at_capacity_evicts_nothing(summary_db, monkeypatch):
+    """Re-putting a key already in the cache at capacity must not pop an
+    unrelated entry — the eviction check is keyed on whether `session_id`
+    is a genuinely new entry, not on the cache's size alone."""
+    from api.services import agent_viz_summary as avs
+
+    avs._cache.clear()
+    small_max = 3
+    monkeypatch.setattr(avs, "_CACHE_MAX", small_max)
+    try:
+        for key in ("a", "b", "c"):
+            avs._cache_put(key, 0.0, avs.SummaryResult(short_label=key, summary=key))
+        avs._cache_put("c", 1.0, avs.SummaryResult(short_label="c2", summary="c2"))
+        avs._cache_put("a", 1.0, avs.SummaryResult(short_label="a2", summary="a2"))
+        avs._cache_put("b", 1.0, avs.SummaryResult(short_label="b2", summary="b2"))
+        assert len(avs._cache) == 3
+        assert set(avs._cache) == {"a", "b", "c"}
+        assert list(avs._cache) == ["a", "b", "c"]
+        assert avs._cache["a"][2].short_label == "a2"
+        assert avs._cache["a"][0] == 1.0
+    finally:
+        avs._cache.clear()
+
+
+@pytest.mark.unit
+def test_cache_if_terminal_evicts_at_capacity(summary_db, monkeypatch):
+    """Sanity that _cache_if_terminal (a _cache_put caller) also stays capped."""
+    from api.services import agent_viz_summary as avs
+
+    avs._cache.clear()
+    small_max = 3
+    monkeypatch.setattr(avs, "_CACHE_MAX", small_max)
+    try:
+        for i in range(small_max + 3):
+            avs._cache_if_terminal(
+                f"t-{i}",
+                float(i),
+                STATUS_COMPLETED,
+                avs.SummaryResult(short_label=f"L{i}", summary=f"S{i}"),
+            )
+        assert len(avs._cache) == small_max
+        assert "t-0" not in avs._cache  # oldest evicted
+        for i in range(small_max + 3 - small_max, small_max + 3):
+            assert f"t-{i}" in avs._cache
+    finally:
+        avs._cache.clear()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("entry_point", ["get_cached_summary", "summarize_session"])
+def test_disk_hit_promotion_respects_cache_max(summary_db, monkeypatch, entry_point):
+    """Both the synchronous and async disk-hit promotion sites bound the
+    in-process cache at `_CACHE_MAX`, evicting the oldest entry first — a
+    stray direct `_cache[...] = ...` at either site would let the cache
+    grow past the cap on a disk-hit-heavy workload."""
+    import asyncio
+
+    from api.services import agent_viz_summary as avs
+
+    small_max = 5
+    monkeypatch.setattr(avs, "_CACHE_MAX", small_max)
+    sids = [f"disk-hit-{i}" for i in range(small_max + 3)]
+    try:
+        for sid in sids:
+            summary_db(sid, f"Label {sid}", f"Summary for {sid}")  # seeds disk only
+            if entry_point == "get_cached_summary":
+                promoted = avs.get_cached_summary(sid, 1_000_000.0, status=STATUS_COMPLETED)
+            else:
+                promoted = asyncio.run(avs.summarize_session(
+                    sid, label=f"Label {sid}", last_activity_at=1_000_000.0,
+                    events=[], status=STATUS_COMPLETED,
+                ))
+            assert promoted is not None
+            assert len(avs._cache) <= small_max
+
+        assert len(avs._cache) == small_max
+        assert list(avs._cache) == sids[3:]
+    finally:
+        avs._cache.clear()
+
+
+@pytest.mark.unit
+def test_real_summary_write_site_respects_cache_max(summary_db, monkeypatch):
+    """The real-summary write site at the tail of `summarize_session` (the
+    LLM-success path, distinct from the no-content/error fallbacks above)
+    must also bound the in-process cache at `_CACHE_MAX` — a stray direct
+    `_cache[...] = ...` there would let the cache grow past the cap."""
+    import asyncio
+
+    from api.services import agent_viz_summary as avs
+
+    calls: list = []
+
+    async def _succeed(*args, **kwargs):
+        calls.append(1)
+        return json.dumps({"short_label": "Ship The Feature", "summary": "Shipped it."})
+
+    monkeypatch.setattr(avs, "generate_text", _succeed)
+    small_max = 5
+    monkeypatch.setattr(avs, "_CACHE_MAX", small_max)
+    sids = [f"real-summary-{i}" for i in range(small_max + 3)]
+    events = [
+        {"kind": "user_message", "payload": {"text": "do the thing"}},
+        {"kind": "assistant_message", "payload": {"text": "done"}},
+    ]
+    try:
+        for sid in sids:
+            asyncio.run(avs.summarize_session(
+                sid, label=f"Label {sid}", last_activity_at=1_000_000.0,
+                events=events, status=STATUS_COMPLETED,
+            ))
+            assert len(avs._cache) <= small_max
+
+        assert len(calls) == len(sids)
+        assert len(avs._cache) == small_max
+        assert list(avs._cache) == sids[3:]
+    finally:
+        avs._cache.clear()
