@@ -395,12 +395,12 @@ def test_two_real_hermes_turns_interleaved_never_cross_attribute_on_the_real_sna
 
     # Each `execute()` call resolves a caller session id via a bare
     # `SessionStore()` (see `_resolve_caller_session_id` in
-    # `api/routes/hermes_proxy.py`) — same tmp-path db the fixture above
-    # redirects `sa`/`sb` to. Constructing one here, before the two threads
-    # start, forces its schema/WAL init to happen once, up front, instead of
-    # racing two threads against the same not-yet-initialized file: mirrors
-    # production, where the worker's db is initialized at startup long
-    # before any turn.
+    # `api/routes/hermes_proxy.py`), which constructs against the
+    # DEFAULT-path store (`agent_sessions.db`) — a different file from the
+    # explicitly-pathed store `sa`/`sb` live in. Constructing one here,
+    # before the two threads start, forces its schema/WAL init to happen
+    # once, up front, so both threads find it already created instead of
+    # racing the first-time `PRAGMA journal_mode=WAL`.
     from api.services.agent_worker.session_store import SessionStore as _SS
     _SS()
 
