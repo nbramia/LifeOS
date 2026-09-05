@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-09-04
+**Last Updated:** 2026-09-05
 
 The aggregated views that sit alongside the people list: Family Dashboard (`/family`), Me Dashboard (`/me`, the CRM landing page), Birthdays Page (`/birthdays`), and Relationship Dashboard (`/relationship`). Each surfaces interaction patterns and insights derived from the CRM data model.
 
@@ -254,7 +254,7 @@ Each panel has a refresh button to re-extract insights on demand.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /api/crm/relationship/tone-analysis` | Aggregated tone analysis over configurable months (samples up to 20 messages per month). |
+| `POST /api/crm/relationship/tone-analysis` | Compact combined-score summary for any person: one score per stored month plus trend/average. `compute=false` (default) only reads what's persisted, no LLM call; `compute=true` runs the same recompute pass as the detailed endpoint. Shares the same store, chunking, and per-person lock as the detailed endpoint below -- one implementation behind both. Used by the person-overview Tone card (see [crm-people.md](crm-people.md)); the Relationship page's own Tone Evolution chart uses the detailed endpoint instead. |
 | `POST /api/crm/relationship/tone-analysis-detailed` | Separate user/partner tone scores, one overall score per person per stale month, persisted so only stale months are ever recomputed. A stale month that couldn't be recomputed keeps its last stored score (the chart renders it as a dimmed point); `refresh=true` forces full recomputation. Full freshness/recompute mechanics and query parameters in [api-crm.md](api-crm.md#post-apicrmrelationshiptone-analysis-detailed); storage schema in [data-and-sync.md § Store Locations](../technical/data-and-sync.md#store-locations). |
 
 ---
