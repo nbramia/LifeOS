@@ -232,6 +232,51 @@ class TestFiveEngineShapes:
         shapes = {r["shape"] for r in rows}
         assert shapes == {"square", "hexagon", "star", "diamond", "circle"}
 
+    def test_routing_change_on_existing_node_updates_its_shape(self, page: Page, agents_base_url):
+        """`/snapshot` reports `routing: local` (diamond) for a session;
+        `/stream`'s one queued event reports `routing: codex` (hexagon) for
+        the SAME session id — only the stream-delivered shape can end up
+        rendered, since nothing else in the page re-fetches `/snapshot`."""
+        local_row = _row(session_id="sess-routing-change", routing="local", host="build-host",
+                          label="Routing change target", model_label="Local", lane="in_progress")
+        codex_row = dict(local_row, routing="codex", source="codex", model_label="Codex")
+        snap_local = {"sessions": [local_row], "edges": [], "generated_at": 1, "api_host": "build-host"}
+        snap_codex = {"sessions": [codex_row], "edges": [], "generated_at": 2, "api_host": "build-host"}
+        stream_body = ": ok\n\nevent: snapshot\ndata: " + json.dumps(snap_codex) + "\n\n"
+
+        def handler(route):
+            url = route.request.url
+            if "/api/agents/stream" in url:
+                route.fulfill(status=200, content_type="text/event-stream", body=stream_body)
+                return
+            if "/api/agents/snapshot" in url:
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(snap_local))
+                return
+            if "/api/agents/board" in url:
+                route.fulfill(status=200, content_type="application/json",
+                               body=json.dumps({"lanes": {}, "generated_at": 0}))
+                return
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+        page.set_viewport_size({"width": 1280, "height": 800})
+        page.route("**/api/**", handler)
+        page.goto(f"{agents_base_url}/agents")
+        page.click('[data-tab="graph"]')
+        page.wait_for_selector("#filter-route")
+        page.select_option("#filter-recency", "all")
+        page.wait_for_function(
+            "() => { const g = [...document.querySelectorAll('.node')]"
+            ".find(n => n.__data__.session_id === 'sess-routing-change');"
+            " return g && g.querySelector('.node-shape').getAttribute('data-shape') === 'hexagon'; }",
+            timeout=8000,
+        )
+        shape = page.evaluate(
+            "() => { const g = [...document.querySelectorAll('.node')]"
+            ".find(n => n.__data__.session_id === 'sess-routing-change');"
+            " return g.querySelector('.node-shape').getAttribute('data-shape'); }"
+        )
+        assert shape == "hexagon"
+
 
 class TestBadges:
     def test_pending_question_badge_present_for_hermes_row(self, page: Page, agents_base_url):
