@@ -402,3 +402,56 @@ def test_read_normalized_events_unknown_id(tmp_path):
     root = tmp_path / "sessions"
     _write_rollout(root, "session-real", [_session_meta()])
     assert cx.read_normalized_events("cx:session-missing", sessions_dir=root) == []
+
+
+# ---------------------------------------------------------------------------
+# Snapshot cache (#934): liveness-keyed cache + per-row copies
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_build_snapshot_cache_keyed_by_live_counts(tmp_path, monkeypatch):
+    """`live_counts` is part of the cache key so a liveness-scoped caller
+    (`{}` from the remote transcript mirror) never aliases into a caller
+    that scans this machine's processes (`None`) (#934)."""
+    root = tmp_path / "sessions"
+    _write_rollout(root, "cx-livekey", [_session_meta(), _turn_context()])
+    cx.invalidate_cache()
+
+    calls = {"n": 0}
+    real_discover = cx.discover_sessions
+
+    def _spy(*args, **kwargs):
+        calls["n"] += 1
+        return real_discover(*args, **kwargs)
+
+    monkeypatch.setattr(cx, "discover_sessions", _spy)
+
+    a1, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts=None)
+    a2, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts=None)
+    assert calls["n"] == 1  # same key -> cache hit
+    assert a1 == a2
+
+    _, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts={})
+    assert calls["n"] == 2  # different key -> rescanned
+
+    _, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts={})
+    assert calls["n"] == 2  # {} entry now warm
+
+
+@pytest.mark.unit
+def test_snapshot_cache_returns_per_row_copies(tmp_path):
+    """Returned rows are shallow copies of the cached dicts (#934)."""
+    root = tmp_path / "sessions"
+    _write_rollout(root, "cx-rowcopy", [_session_meta(), _turn_context()])
+    cx.invalidate_cache()
+
+    s1, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60)
+    wid = s1[0]["session_id"]
+    s1[0]["guest_field"] = "should-not-leak"
+    s1[0]["status"] = "running"
+
+    s2, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60)
+    row2 = next(r for r in s2 if r["session_id"] == wid)
+    assert row2.get("guest_field") is None
+    assert row2["status"] != "running"

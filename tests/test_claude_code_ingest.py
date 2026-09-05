@@ -847,3 +847,80 @@ def test_live_process_detection_ignores_wrapper_binaries(monkeypatch):
     monkeypatch.setattr(_psutil, "process_iter", _fake_iter)
     counts = cc.live_claude_cwd_counts()
     assert counts == {"/home/syn/Code/A": 1}
+
+
+# ---------------------------------------------------------------------------
+# Snapshot cache (#934): liveness-keyed cache + per-row copies
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_build_snapshot_cache_keyed_by_live_counts(tmp_path, monkeypatch):
+    """`live_counts` is part of the cache key, so a snapshot built under one
+    liveness signal never collides with one built under another (#934).
+
+    A fresh mtime session would read `running` under `live_counts=None`
+    (mtime-only `_infer_status` branch) unless the JSONL is forced old. We
+    force it old so BOTH calls would otherwise produce identical cache keys
+    and alias: under the pre-fix code the second call would be served the
+    first's cached rows (with the first caller's liveness overlay), which is
+    the cross-signal aliasing bug.
+    """
+    proj = tmp_path / "-home-syn-Code-LiveKey"
+    jsonl = proj / "live-key-sess.jsonl"
+    jsonl.parent.mkdir(parents=True, exist_ok=True)
+    jsonl.write_text(json.dumps(_assistant_event()) + "\n")
+    # Force mtime old so neither liveness map promotes it — isolating the
+    # cache-key behavior from status inference.
+    old = time.time() - 2 * 3600
+    os.utime(jsonl, (old, old))
+    cc.invalidate_cache()
+
+    calls = {"n": 0}
+    real_discover = cc.discover_sessions
+
+    def _spy(*args, **kwargs):
+        calls["n"] += 1
+        return real_discover(*args, **kwargs)
+
+    monkeypatch.setattr(cc, "discover_sessions", _spy)
+
+    a1, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=60, live_counts=None)
+    a2, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=60, live_counts=None)
+    # Same key: second call is a cache hit.
+    assert calls["n"] == 1
+    assert a1 == a2
+
+    # Different key: a liveness-scoped caller misses the cache and rescans.
+    b, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=60, live_counts={})
+    assert calls["n"] == 2
+
+    # And the `{}` variant hits ITS OWN cached entry, not the None one.
+    b2, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=60, live_counts={})
+    assert calls["n"] == 2  # still 2 — b2 served from the {} cache entry
+
+
+@pytest.mark.unit
+def test_snapshot_cache_returns_per_row_copies(tmp_path):
+    """`build_snapshot()` returns shallow copies of each cached row dict, so
+    a caller mutating a returned row can't write into the cache's own entry
+    while it's warm (#934)."""
+    proj = tmp_path / "-home-syn-Code-RowCopy"
+    jsonl = proj / "row-copy-sess.jsonl"
+    jsonl.parent.mkdir(parents=True, exist_ok=True)
+    jsonl.write_text(json.dumps(_assistant_event()) + "\n")
+    cc.invalidate_cache()
+
+    s1, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=60)
+    assert len(s1) == 1
+    wid = s1[0]["session_id"]
+
+    # Mutate a returned row (what the /agents route's label/hook overlay does).
+    s1[0]["guest_field"] = "should-not-leak"
+    s1[0]["status"] = "running"
+
+    # A warm-cache hit must observe the cache's own pristine dicts.
+    s2, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=60)
+    row2 = next(r for r in s2 if r["session_id"] == wid)
+    assert row2.get("guest_field") is None
+    assert row2["status"] != "running"
