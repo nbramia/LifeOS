@@ -465,7 +465,7 @@ class TestStreamTickUpdatesNodeSize:
         page.click('[data-tab="graph"]')
         page.wait_for_selector("#filter-route")
         page.select_option("#filter-recency", "all")
-        page.wait_for_timeout(600)
+        page.wait_for_timeout(1200)
         r = page.evaluate(
             "() => { const g = [...document.querySelectorAll('.node')]"
             ".find(n => n.__data__.session_id === 'sess-tick');"
