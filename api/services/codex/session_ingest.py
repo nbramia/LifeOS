@@ -733,7 +733,7 @@ class _CacheEntry:
     edges: list[dict[str, Any]] = field(default_factory=list)
 
 
-_snapshot_cache: dict[tuple[str, int], _CacheEntry] = {}
+_snapshot_cache: dict[tuple[Any, ...], _CacheEntry] = {}
 _snapshot_cache_lock = threading.Lock()
 
 
@@ -741,7 +741,7 @@ def _cache_key(
     sessions_dir: str | Path | None,
     lookback_days: int,
     live_counts: dict[str, int] | None,
-) -> tuple:
+) -> tuple[Any, ...]:
     """Cache key for the snapshot builder.
 
     Includes the liveness map (`live_counts`) so a caller that scopes the
@@ -822,8 +822,9 @@ def build_snapshot(
                 sessions=[dict(row) for row in sessions],
                 edges=list(edges),
             )
-    # Per-row copies on the cache-write path too — see the Claude Code
-    # adapter's identical comment (#934).
+    # Per-row copies on the cache-write path too: the returned rows are
+    # distinct objects from the ones the cache entry now owns, so a caller
+    # mutating a returned row can never corrupt a warm cache.
     return [dict(row) for row in sessions], list(edges)
 
 

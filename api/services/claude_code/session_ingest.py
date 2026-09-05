@@ -852,7 +852,7 @@ class _CacheEntry:
     edges: list[dict[str, Any]] = field(default_factory=list)
 
 
-_snapshot_cache: dict[tuple[str, int], _CacheEntry] = {}
+_snapshot_cache: dict[tuple[Any, ...], _CacheEntry] = {}
 _snapshot_cache_lock = threading.Lock()
 
 
@@ -860,7 +860,7 @@ def _cache_key(
     projects_dir: str | Path | None,
     lookback_days: int,
     live_counts: dict[str, int] | None,
-) -> tuple:
+) -> tuple[Any, ...]:
     """Cache key for the snapshot builder.
 
     Includes the liveness map (`live_counts`) so a caller that scopes the
@@ -910,9 +910,9 @@ def build_snapshot(
             entry = _snapshot_cache.get(key)
             if entry and entry.expires_at > now_t:
                 # Per-row shallow copies so a caller mutating a row
-                # (e.g. the /agents route's label/hook overlay) can never
-                # write back into this cache's own dicts while the entry is
-                # still warm (#934). The list copy alone would alias them.
+                # (e.g. the /agents route's label/hook overlay) never
+                # writes back into this cache's own dicts while the entry is
+                # still warm. The list copy alone would alias them.
                 return [dict(row) for row in entry.sessions], list(entry.edges)
 
     sessions: list[dict[str, Any]] = []
@@ -967,7 +967,7 @@ def build_snapshot(
             )
     # Per-row copies on the cache-write path too: the returned rows are
     # distinct objects from the ones the cache entry now owns, so a caller
-    # mutating a returned row can never corrupt a warm cache (#934).
+    # mutating a returned row can never corrupt a warm cache.
     return [dict(row) for row in sessions], list(edges)
 
 

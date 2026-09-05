@@ -405,7 +405,7 @@ def test_read_normalized_events_unknown_id(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Snapshot cache (#934): liveness-keyed cache + per-row copies
+# Snapshot cache: liveness-keyed cache + per-row copies
 # ---------------------------------------------------------------------------
 
 
@@ -413,7 +413,7 @@ def test_read_normalized_events_unknown_id(tmp_path):
 def test_build_snapshot_cache_keyed_by_live_counts(tmp_path, monkeypatch):
     """`live_counts` is part of the cache key so a liveness-scoped caller
     (`{}` from the remote transcript mirror) never aliases into a caller
-    that scans this machine's processes (`None`) (#934)."""
+    that scans this machine's processes (`None`)."""
     root = tmp_path / "sessions"
     _write_rollout(root, "cx-livekey", [_session_meta(), _turn_context()])
     cx.invalidate_cache()
@@ -441,17 +441,32 @@ def test_build_snapshot_cache_keyed_by_live_counts(tmp_path, monkeypatch):
 
 @pytest.mark.unit
 def test_snapshot_cache_returns_per_row_copies(tmp_path):
-    """Returned rows are shallow copies of the cached dicts (#934)."""
+    """Returned rows are shallow copies of the cached dicts, so a caller
+    mutating a returned row can't write into the cache's own entry while
+    it's warm — on both the cache-populate call and a subsequent
+    cache-hit call."""
     root = tmp_path / "sessions"
     _write_rollout(root, "cx-rowcopy", [_session_meta(), _turn_context()])
     cx.invalidate_cache()
 
-    s1, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60)
+    # `live_counts={}` on every call so no local process scan can promote
+    # the row to an authoritative `running`.
+    s1, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts={})
     wid = s1[0]["session_id"]
-    s1[0]["guest_field"] = "should-not-leak"
-    s1[0]["status"] = "running"
+    s1[0]["status"] = "mutated"
+    s1[0]["status_inferred"] = False
+    s1[0]["host"] = "x"
 
-    s2, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60)
+    s2, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts={})
     row2 = next(r for r in s2 if r["session_id"] == wid)
-    assert row2.get("guest_field") is None
-    assert row2["status"] != "running"
+    assert row2 is not s1[0]
+    assert row2["status"] != "mutated"
+    assert row2["status_inferred"] is True
+    assert "host" not in row2
+
+    # Mutate the cache-hit result too, covering the cache-hit copy path.
+    row2["status"] = "mutated2"
+    s3, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts={})
+    row3 = next(r for r in s3 if r["session_id"] == wid)
+    assert row3 is not row2
+    assert row3["status"] != "mutated2"

@@ -215,7 +215,7 @@ Per snapshot tick the route calls `session_store.list_sessions(limit=200)` (newe
 |---|---|
 | `discover_sessions(projects_dir, lookback_days)` | Walks `<projects_dir>/<project_key>/*.jsonl`, returns one `SessionMeta` per file modified within the window, newest-first. |
 | `parse_session(meta)` | Reads the jsonl, sums usage, extracts label / subagents / last event kind, infers status. |
-| `build_snapshot(...)` | Combines discovery + parse + process detection + subagent expansion. Cached 30s per `(projects_dir, lookback_days)`. |
+| `build_snapshot(...)` | Combines discovery + parse + process detection + subagent expansion. Cached 30s per `(projects_dir, lookback_days, live_counts)`; returns per-row copies. |
 | `read_normalized_events(session_id)` | For the `/sessions/{id}/events` and `/stream` endpoints. |
 | `validate_session_id(session_id)` | Path-traversal guard. Rejects `/`, `\`, `..`, anything outside `[A-Za-z0-9_\-:]`. Strips the `cc:` prefix and returns the bare id. |
 
@@ -351,7 +351,7 @@ Both engines are attempted even if one fails (a host that only runs one CLI shou
 
 `mirrored_snapshot()` also returns each host's own parent-subagent spawn edges, which `_build_snapshot()` extends `edges` with. An edge is kept only when both endpoints are ids the merge loop above actually *appended* a row for, and both endpoints came from the same source host's batch (`appended_mirrored_host_by_id`, a dict mapping each appended id to the host it was appended from) — not the broader `local_ids`, which contains every id whether appended or skipped for a collision. Keying on the source host, not just id membership, is what tells apart two distinct cases: a session id that lost an id collision to a local transcript (its edge must not attach to the unrelated local row that won the collision), and a session id present on *two mirrored hosts* (an edge from one host's batch must not attach to the other host's unrelated parent row, since they merely happen to share an id). Edges are also deduped on `(from, to, type)`: the same session mirrored from two hosts, or an id collision on the child end, can otherwise derive the identical edge twice.
 
-Each mirrored row is copied (`dict(row)`) before `mirrored_snapshot()` stamps `host`/`mirrored`/demotion onto it — `cc.build_snapshot()`/`cx.build_snapshot()` return `list(entry.sessions)`, a shallow copy of the *list* whose row dicts are the same objects the 30s ingest cache (see "Snapshot caching" below) holds, so mutating them in place would corrupt the cache. Without the copy, `_build_snapshot()`'s hook-event overlay (`_apply_cli_session_to_dict`, applied to the SAME dict just above) would write a genuine `status="running", status_inferred=False` into the cached entry; if that hook row then vanished and a rebuild happened inside the cache TTL, `_demote_inferred_running` (guarded on `status_inferred is True`) couldn't correct the now-`False` cached row, replaying `running` with no hook evidence behind it at all.
+`cc.build_snapshot()`/`cx.build_snapshot()` hand back per-row copies (`[dict(row) for row in ...]`) on both the cache-hit and cache-populate paths, so `_build_snapshot()`'s hook-event overlay (`_apply_cli_session_to_dict`, applied to the SAME dict `mirrored_snapshot()` stamps `host`/`mirrored`/demotion onto) writes to a row the 30s ingest cache (see "Snapshot caching" below) doesn't own — a warm-cache read on the next tick observes the cache's own pristine row, so an event overlay from an earlier tick can never survive past the hook row that produced it. `mirrored_snapshot()`'s own `dict(row)` copy before stamping `host`/`mirrored`/demotion is defensive layering on top of that guarantee rather than the only thing preventing cache corruption.
 
 ### Liveness exclusion
 
@@ -375,7 +375,7 @@ The two launcher functions (`_resume_claude_code_launcher`, `_resume_codex_sessi
 
 Two caches:
 
-1. **`_snapshot_cache`** in `session_ingest.py` — keyed by `(projects_dir, lookback_days)`, TTL 30s. The whole `(sessions, edges)` tuple is memoized so a single SSE tick across many connected clients doesn't re-walk the projects dir. Bypass with `cache_ttl=0` (used by tests).
+1. **`_snapshot_cache`** in `session_ingest.py` — keyed by `(projects_dir, lookback_days, live_counts)`, TTL 30s. The whole `(sessions, edges)` tuple is memoized so a single SSE tick across many connected clients doesn't re-walk the projects dir; `build_snapshot()` returns per-row copies of the cached session dicts on every call, so a caller mutating a returned row never writes into the cache. Bypass with `cache_ttl=0` (used by tests).
 
 2. **`_label_cache`** in `agents.py` — keyed by session id, capped at 500 entries. Labels are derived from the first 5 transcript events and don't change once a non-fallback label has been resolved.
 

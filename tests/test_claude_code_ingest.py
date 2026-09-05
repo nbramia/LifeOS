@@ -850,21 +850,20 @@ def test_live_process_detection_ignores_wrapper_binaries(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Snapshot cache (#934): liveness-keyed cache + per-row copies
+# Snapshot cache: liveness-keyed cache + per-row copies
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 def test_build_snapshot_cache_keyed_by_live_counts(tmp_path, monkeypatch):
     """`live_counts` is part of the cache key, so a snapshot built under one
-    liveness signal never collides with one built under another (#934).
+    liveness signal never collides with one built under another.
 
-    A fresh mtime session would read `running` under `live_counts=None`
-    (mtime-only `_infer_status` branch) unless the JSONL is forced old. We
-    force it old so BOTH calls would otherwise produce identical cache keys
-    and alias: under the pre-fix code the second call would be served the
-    first's cached rows (with the first caller's liveness overlay), which is
-    the cross-signal aliasing bug.
+    A fresh mtime session reads `running` under `live_counts=None`
+    (mtime-only `_infer_status` branch) unless the JSONL is forced old, so
+    the fixture forces it old: this isolates the cache-key behavior from
+    status inference and makes both liveness signals produce comparable
+    session dicts.
     """
     proj = tmp_path / "-home-syn-Code-LiveKey"
     jsonl = proj / "live-key-sess.jsonl"
@@ -904,23 +903,35 @@ def test_build_snapshot_cache_keyed_by_live_counts(tmp_path, monkeypatch):
 def test_snapshot_cache_returns_per_row_copies(tmp_path):
     """`build_snapshot()` returns shallow copies of each cached row dict, so
     a caller mutating a returned row can't write into the cache's own entry
-    while it's warm (#934)."""
+    while it's warm — on both the cache-populate call and a subsequent
+    cache-hit call."""
     proj = tmp_path / "-home-syn-Code-RowCopy"
     jsonl = proj / "row-copy-sess.jsonl"
     jsonl.parent.mkdir(parents=True, exist_ok=True)
     jsonl.write_text(json.dumps(_assistant_event()) + "\n")
     cc.invalidate_cache()
 
-    s1, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=60)
+    # `live_counts={}` on every call so no local process scan can promote
+    # the row to an authoritative `running`.
+    s1, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=60, live_counts={})
     assert len(s1) == 1
     wid = s1[0]["session_id"]
 
     # Mutate a returned row (what the /agents route's label/hook overlay does).
-    s1[0]["guest_field"] = "should-not-leak"
-    s1[0]["status"] = "running"
+    s1[0]["status"] = "mutated"
+    s1[0]["status_inferred"] = False
+    s1[0]["host"] = "x"
 
-    # A warm-cache hit must observe the cache's own pristine dicts.
-    s2, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=60)
+    s2, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=60, live_counts={})
     row2 = next(r for r in s2 if r["session_id"] == wid)
-    assert row2.get("guest_field") is None
-    assert row2["status"] != "running"
+    assert row2 is not s1[0]
+    assert row2["status"] != "mutated"
+    assert row2["status_inferred"] is True
+    assert "host" not in row2
+
+    # Mutate the cache-hit result too, covering the cache-hit copy path.
+    row2["status"] = "mutated2"
+    s3, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=60, live_counts={})
+    row3 = next(r for r in s3 if r["session_id"] == wid)
+    assert row3 is not row2
+    assert row3["status"] != "mutated2"
