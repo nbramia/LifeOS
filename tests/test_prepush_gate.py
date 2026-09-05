@@ -286,7 +286,7 @@ def test_log_paths_differ_by_branch(tmp_path):
 
 
 @pytest.mark.unit
-def test_unit_and_browser_log_paths_differ(tmp_path):
+def test_unit_and_ui_suite_log_paths_differ(tmp_path):
     """A browser-test failure must not clobber the unit-run's output."""
     log, browser_log = _log_paths(_run_hook(tmp_path, "refs/heads/feat/gamma"))
     assert log != browser_log
@@ -456,7 +456,7 @@ def test_real_unit_failure_names_existing_log_with_failure_text(stub_python, tmp
 
 
 @pytest.mark.unit
-def test_real_browser_failure_does_not_clobber_unit_log(stub_python, tmp_path):
+def test_ui_suite_failure_does_not_clobber_unit_log(stub_python, tmp_path):
     """A browser-stage failure must name the BROWSER log, and the unit log
     (from the same run, which passed) must survive untouched."""
     result = _run_real_hook(
