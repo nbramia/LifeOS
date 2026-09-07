@@ -233,16 +233,18 @@ class TestFiveEngineShapes:
         assert shapes == {"square", "hexagon", "star", "diamond", "circle"}
 
     def test_routing_change_on_existing_node_updates_its_shape(self, page: Page, agents_base_url):
-        """`/snapshot` reports `routing: local` (diamond) for a session;
-        `/stream`'s one queued event reports `routing: codex` (hexagon) for
-        the SAME session id — only the stream-delivered shape can end up
+        """`/snapshot` reports `routing: local` (a `<polygon>` diamond) for a
+        session; `/stream`'s one queued event reports `routing: claude_code`
+        (a `<rect>` square) for the SAME session id — a tag-crossing
+        transition (`polygon` -> `rect`), not just a different `data-shape`
+        on the same tag. Only the stream-delivered shape can end up
         rendered, since nothing else in the page re-fetches `/snapshot`."""
         local_row = _row(session_id="sess-routing-change", routing="local", host="build-host",
                           label="Routing change target", model_label="Local", lane="in_progress")
-        codex_row = dict(local_row, routing="codex", source="codex", model_label="Codex")
+        cc_row = dict(local_row, routing="claude_code", source="claude_code", model_label="Claude Code")
         snap_local = {"sessions": [local_row], "edges": [], "generated_at": 1, "api_host": "build-host"}
-        snap_codex = {"sessions": [codex_row], "edges": [], "generated_at": 2, "api_host": "build-host"}
-        stream_body = ": ok\n\nevent: snapshot\ndata: " + json.dumps(snap_codex) + "\n\n"
+        snap_cc = {"sessions": [cc_row], "edges": [], "generated_at": 2, "api_host": "build-host"}
+        stream_body = ": ok\n\nevent: snapshot\ndata: " + json.dumps(snap_cc) + "\n\n"
 
         def handler(route):
             url = route.request.url
@@ -267,15 +269,19 @@ class TestFiveEngineShapes:
         page.wait_for_function(
             "() => { const g = [...document.querySelectorAll('.node')]"
             ".find(n => n.__data__.session_id === 'sess-routing-change');"
-            " return g && g.querySelector('.node-shape').getAttribute('data-shape') === 'hexagon'; }",
+            " return g && g.querySelector('.node-shape').getAttribute('data-shape') === 'square'; }",
             timeout=8000,
         )
-        shape = page.evaluate(
+        result = page.evaluate(
             "() => { const g = [...document.querySelectorAll('.node')]"
             ".find(n => n.__data__.session_id === 'sess-routing-change');"
-            " return g.querySelector('.node-shape').getAttribute('data-shape'); }"
+            " const el = g.querySelector('.node-shape');"
+            " return { tag: el.tagName.toLowerCase(), shape: el.getAttribute('data-shape'),"
+            " width: el.getAttribute('width') }; }"
         )
-        assert shape == "hexagon"
+        assert result["tag"] == "rect"
+        assert result["shape"] == "square"
+        assert result["width"] is not None and float(result["width"]) > 0
 
 
 class TestBadges:

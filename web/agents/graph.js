@@ -725,6 +725,20 @@ export function initGraph() {
       .on('click', (event, d) => { event.stopPropagation(); toggleParentExpanded(d.session_id); });
 
     const all = entered.merge(sel);
+    // A routing change on an existing node can change its engine (and
+    // therefore its shape's SVG tag, e.g. a `<polygon>` diamond becoming a
+    // `<rect>` square) — `applyShapeAttrs` below only sets attributes on
+    // whatever tag is already there, so swap the element itself first
+    // whenever the wanted tag doesn't match the one currently mounted.
+    all.each(function(d) {
+      const shapeEl = this.querySelector('.node-shape');
+      const wantedTag = shapeTagFor(engineOf(d));
+      if (shapeEl && shapeEl.tagName.toLowerCase() !== wantedTag) {
+        const replacement = document.createElementNS('http://www.w3.org/2000/svg', wantedTag);
+        replacement.setAttribute('class', 'node-shape');
+        shapeEl.replaceWith(replacement);
+      }
+    });
     applyShapeAttrs(all.select('.node-shape'));
     applyToolRing(all.select('.node-ring-tools'));
     all.select('text.node-label').each(renderNodeLabel);
