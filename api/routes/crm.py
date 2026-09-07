@@ -5335,13 +5335,14 @@ class RelationshipInsightsResponse(BaseModel):
 
 class ToneDataPoint(BaseModel):
     """A single month's tone data in the compact (combined-score) shape
-    returned by `/relationship/tone-analysis`. Only a month with a stored
-    result is ever represented this way -- a month nothing was ever
-    computed for is left out of `monthly_tones` entirely rather than
-    appearing here with a placeholder score."""
+    returned by `/relationship/tone-analysis`. Carries the same months, in
+    the same order, as `ToneDataPointDetailed` -- including a month with no
+    stored result at all, which carries a placeholder `score` and
+    `status="error"`, exactly mirroring the detailed shape's own
+    placeholder convention."""
     month: str  # YYYY-MM
-    score: float  # combined_score, 0-100 scale
-    status: Optional[str] = None  # None = fresh; "stale" = last stored score, not recomputed this request
+    score: float  # combined_score, 0-100 scale (placeholder 50.0 when status="error")
+    status: Optional[str] = None  # None = fresh; "stale" = last stored score, not recomputed; "error" = never stored
 
 
 class ToneDataPointDetailed(BaseModel):
@@ -5357,13 +5358,16 @@ class ToneDataPointDetailed(BaseModel):
 
 class ToneAnalysisResponse(BaseModel):
     """Compact tone summary for `/relationship/tone-analysis`: one combined
-    score per stored month, no per-person breakdown. `analyzed_through` is
-    the most recent month with a stored result, or None when
-    `monthly_tones` is empty."""
+    score per month in the window, no per-person breakdown. `trend` and
+    `average` are derived only from months with a real (non-"error")
+    score; `average` is None and `analyzed_through` is None when no month
+    has one. `status` is the top-level outcome of this request -- see
+    `analyze_relationship_tone`'s docstring for the four values."""
     monthly_tones: list[ToneDataPoint]
     trend: str  # not-analyzed, insufficient-data, stable-positive, stable-neutral, improving, declining, variable
-    average: float
+    average: Optional[float] = None
     analyzed_through: Optional[str] = None
+    status: str  # "ok", "no-messages", "in-progress", "failed"
     generated_at: str
 
 
@@ -5513,55 +5517,79 @@ def delete_relationship_insight(insight_id: str):
 def analyze_relationship_tone(person_id: Optional[str] = None, months: int = 12, compute: bool = False):
     """
     Compact monthly relationship-tone summary for `person_id`: one combined
-    score per stored month plus trend/average, backed by the exact same
-    persisted store, chunked-LLM pipeline, and per-person lock as
+    score per month in the window plus trend/average, backed by the exact
+    same persisted store, chunked-LLM pipeline, and per-person lock as
     `/relationship/tone-analysis-detailed` (both share `_run_tone_analysis`
     -- this handler never runs a second implementation of that pipeline).
+    `monthly_tones` mirrors the detailed endpoint's months exactly,
+    including a placeholder-scored `status="error"` entry for a month
+    nothing was ever stored for.
 
     This endpoint never triggers automatic LLM computation: `compute`
     defaults to `False`, in which case it only reads whatever is already
     persisted (plus one lightweight per-month COUNT query to size the
     window and flag stale months -- no row scan, no LLM call). Only an
     explicit `compute=true` from the caller runs the recompute path, and
-    even then only for months the freshness check finds stale.
+    even then only for months the freshness check finds stale. Never
+    raises for an LLM failure or unavailability.
 
-    Never raises for an LLM failure or unavailability. A month that
-    couldn't be (re)computed is either served with its last stored score
-    (`status="stale"`) or, if nothing was ever stored for it, left out of
-    `monthly_tones` entirely -- unlike the detailed endpoint, which reports
-    such a month with a placeholder score and `status="error"`. When no
-    month in the window has any stored result, this returns 200 with an
-    empty `monthly_tones` and `trend="not-analyzed"`.
+    The top-level `status` field is this request's own outcome, one of:
+    - `"ok"`: at least one month has a real (non-"error") score, or none
+      do but nothing was ever attempted for this person (the ordinary
+      first-load state -- there is a window to analyze, it just hasn't
+      been yet).
+    - `"no-messages"`: the window contains no analyzable iMessage
+      interactions at all (the pipeline reads `source_type="imessage"`
+      only), so there is nothing to compute regardless of `compute`.
+    - `"in-progress"`: `compute=true` was passed but another request for
+      this same person already held the per-person lock and this one
+      timed out waiting for it (`TONE_LOCK_TIMEOUT_SECONDS`) -- the other
+      computation is still running, not failed.
+    - `"failed"`: `compute=true` was passed, the lock was acquired, every
+      stale month's LLM call failed or was unavailable, and nothing was
+      ever stored for any month in the window.
+    `"in-progress"` and `"failed"` can only be returned when `compute=true`
+    -- a `compute=false` read only ever returns `"ok"` or `"no-messages"`.
 
     `person_id` defaults to the configured partner (`PARTNER_PERSON_ID`)
     when omitted. An unconfigured partner and an unrecognized `person_id`
-    both resolve to no data rather than a 404 -- indistinguishable from a
-    real person who simply has no interactions in the window -- so both
-    also return the empty/`not-analyzed` shape.
+    both resolve to no interactions in the window rather than a 404 --
+    indistinguishable from a real person with no iMessage history -- so
+    both return `status="no-messages"`.
     """
     target_id = person_id or PARTNER_PERSON_ID
-    detailed = _run_tone_analysis(target_id, months, refresh=False, compute=compute)
+    detailed, lock_contended = _run_tone_analysis(target_id, months, refresh=False, compute=compute)
 
-    stored_points = [t for t in detailed.monthly_tones if t.status != "error"]
-
-    if not stored_points:
+    if not detailed.monthly_tones:
         return ToneAnalysisResponse(
             monthly_tones=[],
             trend="not-analyzed",
-            average=50.0,
+            average=None,
             analyzed_through=None,
+            status="no-messages",
             generated_at=detailed.generated_at,
         )
 
-    scores = [t.combined_score for t in stored_points]
+    scored = [t for t in detailed.monthly_tones if t.status != "error"]
+    if scored:
+        status = "ok"
+    elif lock_contended:
+        status = "in-progress"
+    elif compute:
+        status = "failed"
+    else:
+        status = "ok"
+
+    scores = [t.combined_score for t in scored]
     return ToneAnalysisResponse(
         monthly_tones=[
             ToneDataPoint(month=t.month, score=t.combined_score, status=t.status)
-            for t in stored_points
+            for t in detailed.monthly_tones
         ],
-        trend=_derive_trend(scores),
-        average=round(sum(scores) / len(scores), 1),
-        analyzed_through=stored_points[-1].month,
+        trend=_derive_trend(scores) if scores else "not-analyzed",
+        average=round(sum(scores) / len(scores), 1) if scores else None,
+        analyzed_through=scored[-1].month if scored else None,
+        status=status,
         generated_at=detailed.generated_at,
     )
 
@@ -5822,12 +5850,16 @@ def _chunked(items: list, size: int):
 
 def _run_tone_analysis(
     target_id: str, months: int, refresh: bool, compute: bool,
-) -> ToneAnalysisDetailedResponse:
+) -> tuple[ToneAnalysisDetailedResponse, bool]:
     """
     Shared assembly for both `/relationship/tone-analysis` and
     `/relationship/tone-analysis-detailed`: the only implementation of the
-    persisted tone-analysis pipeline. Returns the full per-person detailed
-    shape; each route handler adapts it to its own response model.
+    persisted tone-analysis pipeline. Returns `(response, lock_contended)`:
+    the full per-person detailed shape (each route handler adapts it to
+    its own response model) plus whether this call's own attempt to
+    acquire the per-person lock timed out because another request already
+    held it. `lock_contended` is always `False` when `compute` is `False`
+    (the lock is never touched) or when nothing was stale to begin with.
 
     Freshness is decided from a lightweight per-month COUNT query
     (`get_monthly_interaction_counts_in_range`) that never loads a single
@@ -5883,7 +5915,7 @@ def _run_tone_analysis(
             user_average=50.0,
             partner_average=50.0,
             generated_at=now.isoformat(),
-        )
+        ), False
 
     all_months = sorted(month_interaction_counts.keys())
     user_name = settings.user_name if settings.user_name else "User"
@@ -5919,9 +5951,11 @@ def _run_tone_analysis(
     # by the assembly step below.
     results_by_month: dict = {}
     model_name = ""
+    lock_contended = False
     if compute and stale_months:
         lock = _get_tone_analysis_lock(target_id)
         lock_acquired = lock.acquire(timeout=TONE_LOCK_TIMEOUT_SECONDS)
+        lock_contended = not lock_acquired
         try:
             if lock_acquired:
                 # Re-check under the lock: a concurrent request may have
@@ -6050,7 +6084,7 @@ def _run_tone_analysis(
         user_average=round(user_overall, 1),
         partner_average=round(partner_overall, 1),
         generated_at=now.isoformat(),
-    )
+    ), lock_contended
 
 
 @router.post("/relationship/tone-analysis-detailed", response_model=ToneAnalysisDetailedResponse)
@@ -6062,4 +6096,5 @@ def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: 
     `compute=True`).
     """
     target_id = person_id or PARTNER_PERSON_ID
-    return _run_tone_analysis(target_id, months, refresh=refresh, compute=True)
+    detailed, _lock_contended = _run_tone_analysis(target_id, months, refresh=refresh, compute=True)
+    return detailed
