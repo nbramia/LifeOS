@@ -17,9 +17,9 @@
 
 import { nodeLabel, isRawIdValue, routingLabel, engineOf, ENGINE_SHAPES } from './graph_encoding.js';
 
-// Re-exported so existing importers (web/agents/board.js, web/agents/graph.js)
-// keep working unchanged — the definition itself lives in graph_encoding.js
-// so that module can use it without importing this one back (which would
+// Re-exported so importers (web/agents/board.js, web/agents/graph.js) can
+// import `routingLabel` from either module — the definition itself lives in
+// graph_encoding.js so that module doesn't import this one back (which would
 // form a cycle, since this module imports `nodeLabel` from it).
 export { routingLabel };
 
@@ -52,7 +52,7 @@ export function sourceLabelFor(d) {
 // server) — shown in preference to the plain routing name so the operator
 // can see which model actually answered. A Hermes session with no turn
 // yet (`model_label` is still plain "Hermes") and every non-Hermes session
-// render exactly `routingLabel(s.routing)`, unchanged.
+// render exactly `routingLabel(s.routing)`.
 function routingBadgeText(s) {
   if (s.routing === 'hermes' && (s.model_label || '').startsWith('Hermes')) {
     return s.model_label;

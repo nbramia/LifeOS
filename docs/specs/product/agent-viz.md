@@ -106,7 +106,7 @@ by host. Each node is one session:
 | **Secondary ring** | A thin accent ring around the node sized by tool-call count. |
 | **Question badge** | A small ring + `?` glyph, offset from the label, when a pending question is open for the operator on this session. |
 | **Error badge** | A count, offset from the label, when `error_count > 0`. |
-| **Collapsed-subagent badge** | On a parent with subagents: `+N` for the currently-hidden descendant count, or a plain collapse glyph once fully expanded. Click to toggle. |
+| **Collapsed-subagent badge** | On a parent with subagents: `+N` for the currently-hidden direct-child count, or a plain collapse glyph once fully expanded. Click to toggle. |
 | **White pulsing border** | Session is `running` AND has written to its transcript in the last 60 seconds (i.e. *actively producing output right now*) |
 | **Edge** | Spawn relationship — parent → subagent. Hidden while the subagent side is collapsed. |
 | **Position** | Columns group nodes by host (column header: `<host> · <count>`); inside a column, a lane sub-band groups nodes by the same lane the fill colour encodes. Recency is a filter only, not a position signal. |

@@ -401,8 +401,7 @@ export function initGraph() {
   // Fill = the session's board lane colour (shared with the board — see
   // web/agents/lanes.js); status stays visible via the stroke: a thicker
   // border for `blocked`, and reduced fill opacity once a session is
-  // terminal. The live-pulse animation (`.pulsing`, CSS keyframe) is
-  // unchanged.
+  // terminal. The live-pulse animation is a CSS keyframe via `.pulsing`.
   function nodeColors(d) {
     const fillHex = laneColor(d.lane);
     const isTerm = TERMINAL.has(d.status);
