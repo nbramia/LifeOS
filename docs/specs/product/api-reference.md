@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-05
+**Last Updated:** 2026-09-07
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Four adjacent catalogs split out for size:
 
@@ -387,12 +387,19 @@ Update a task (description, status, context, priority, due_date, tags,
 notes, fields). `fields` merges into the task's operator/unknown fields — a
 string value sets a field, a `null` value removes it.
 
-When `fields.assigned_by` is `"board"` (the marker the `/agents` board's
-own pickers stamp on every write) and the patch changes `model`, `effort`,
-`host`, or the derived assignee, this endpoint enforces the same
-claimed-card rule the board's lane endpoint does — **409** on a card the
-worker has claimed, with no write. Requests without that marker (agent-
-side or vault-side writes) are unaffected. See [Agent Viz —
+A patch that includes a `tags` key is checked regardless of whether
+`fields.assigned_by` is `"board"`: adding any of the worker's lifecycle
+tags (`agent-running`, `agent-blocked`, `agent-completed`, `accepted`)
+returns **409** no matter the card's current claim state, and a patch that
+changes the normalized assignee-tag set or the claim-tag set on an
+already-claimed card returns **409** with the same claimed-card reason the
+board's lane endpoint uses. When `fields.assigned_by` is `"board"` (the
+marker the `/agents` board's own pickers stamp on every write) and the
+patch changes `model`, `effort`, or `host` in `fields`, or carries a raw
+`status` key, this endpoint enforces the claimed-card rule on that
+field-edit path too — **409** on a card the worker has claimed, with no
+write. Requests that carry neither a `tags` key nor the board marker are
+unaffected. See [Agent Viz —
 Product](agent-viz.md#human-moves-on-agent-owned-cards).
 
 ### PUT /api/tasks/{id}/complete
@@ -481,10 +488,13 @@ tag. `review` and `scheduled` can't be set directly (derived from a tag
 and the scheduler store, respectively) and return **400**.
 
 Four **409** cases, no write in any of them:
-- The card is worker-owned (`agent-running` or `agent-blocked` tag
-  present) — **every** `lane` is refused, not just `in_progress`/`done`
-  — the worker owns this card while it's running or waiting on an answer;
-  answer the question or kill the session first.
+- The card is worker-owned — `agent-running`/`agent-blocked` tag present,
+  or the card's status is `in_progress` with a live CLI session actually
+  linked to it (opened via the drawer's **Open** action on an Assigned
+  `#claude`/`#codex` card, before the worker itself ever adds
+  `agent-running`) — **every** `lane` is refused; the worker owns this
+  card while it's running or waiting on an answer; answer the question or
+  kill the session first.
 - The card's assignee is an agent engine that hasn't been claimed by the
   worker yet and `lane` is `in_progress` — only the agent worker claims
   agent-assigned tasks.
@@ -520,16 +530,22 @@ accepted.
 ### POST /api/agents/board/cards/{id}/cancel
 
 Cancel an agent-assigned card — available whether or not the worker has
-claimed it, unlike a lane drag. If a live session is linked, kills it and
-every descendant in its subtree (the same teardown `POST
-/sessions/{id}/kill` performs), then marks the task `cancelled`, which
-derives to the Done lane (behind "include cancelled"). Idempotent: calling
-this on an already-cancelled card returns the current state and touches no
-session. Returns **409** `"accept or reject the review"` for a pending
-review, or **409** `"cancel is only available for agent-assigned cards"`
-for a card whose assignee isn't an agent engine (`#me` or unassigned).
-Response: `{id, lane, status, tags, killed: [session_id, ...], failures:
-[{session_id, reason}, ...]}`.
+claimed it, unlike a lane drag. A card counts as agent-assigned if its
+assignee tag names an agent engine (`#claude`/`#codex`/`#hermes`/`#local`)
+OR it already carries `agent-running`/`agent-blocked` even with no
+assignee tag at all — the shape a claimed bare `#agent` queue card is left
+in. If a live session is linked, kills it and every descendant in its
+subtree (the same teardown `POST /sessions/{id}/kill` performs), then
+marks the task `cancelled`, which derives to the Done lane (behind
+"include cancelled"). Idempotent: calling this on an already-`cancelled`
+card returns the current state and touches no session. Returns **409**
+`"accept or reject the review"` for a pending review, **409** `"cancel is
+only available for agent-assigned cards"` for a card that is neither
+engine-assigned nor claimed (`#me` or unassigned), and **409**
+`"this card is already finished — nothing to cancel"` for a
+card whose status is already `done` (e.g. accepted). Response: `{id, lane,
+status, tags, killed: [session_id, ...], failures: [{session_id, reason},
+...]}`.
 
 ### GET /api/agents/pending-questions
 
