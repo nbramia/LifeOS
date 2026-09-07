@@ -60,15 +60,19 @@ function routingBadgeText(s) {
   return routingLabel(s.routing);
 }
 
-// The panel's `.panel-chips` row — model, engine, host, and effort, each as
-// a small chip, never as the header's name text (that's `nodeLabel(s)`
-// above). Shared by the graph panel and the board drawer, since both mount
-// a `SessionPanel`.
+// The panel's `.panel-chips` row — model and effort, each as a small chip,
+// never as the header's name text (that's `nodeLabel(s)` above). Shared by
+// the graph panel and the board drawer, since both mount a `SessionPanel`.
+// The engine chip is skipped whenever the model chip already names the
+// engine (e.g. "Hermes · deepseek-v3" already names Hermes; a Claude Code
+// session's model chip equals its engine chip), since the model chip
+// carries the same information more specifically. The host chip is
+// skipped entirely — the meta row above already shows a host badge.
 function panelChipsHtml(s) {
   const chips = [];
   if (s.model_label) chips.push(s.model_label);
-  chips.push(ENGINE_SHAPES[engineOf(s)].label);
-  if (s.host) chips.push(s.host);
+  const engineLabel = ENGINE_SHAPES[engineOf(s)].label;
+  if (!(s.model_label && s.model_label.startsWith(engineLabel))) chips.push(engineLabel);
   if (s.effort) chips.push(s.effort);
   return chips.map(c => `<span class="badge panel-chip">${escapeHtml(c)}</span>`).join('');
 }

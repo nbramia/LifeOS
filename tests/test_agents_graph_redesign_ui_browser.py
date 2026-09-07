@@ -730,6 +730,19 @@ class TestPanelRawIdGuardAndHermesBadge:
         routing_text = page.locator('[data-field="routing"]').inner_text()
         assert routing_text == "Claude Code"
 
+    def test_claude_code_chips_row_does_not_duplicate_engine_name(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url)
+        page.evaluate(
+            """() => {
+                const g = [...document.querySelectorAll('.node')]
+                  .find(n => n.__data__.session_id === 'cc:redesign-parent');
+                g.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }"""
+        )
+        page.wait_for_timeout(200)
+        chips_text = page.locator('[data-field="panel-chips"]').inner_text()
+        assert chips_text.count("Claude Code") == 1
+
 
 class TestSearchUnknownFieldGuard:
     def test_unknown_field_match_is_skipped_summary_match_renders(self, page: Page, agents_base_url):
