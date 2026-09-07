@@ -1151,12 +1151,14 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
     """Cancel an agent-assigned card: kill its live session (and every
     descendant in its subtree) if one exists, then mark the task
     `cancelled`. Available on any agent-assigned card that isn't in
-    Review — unlike a lane drag, Cancel works whether or not the worker
-    has claimed the card yet. Idempotent for the worker-owned session —
-    calling this again on an already-cancelled card touches no session —
-    but a live cc:/cx: CLI session (see below) is reported as a failure on
-    every call, not just the first, since only the worker-owned session
-    was ever really torn down.
+    Review and isn't already finished (status `done`, e.g. accepted, is
+    refused; an already-`cancelled` card short-circuits to an idempotent
+    200 below) — unlike a lane drag, Cancel works whether or not the
+    worker has claimed the card yet. Idempotent for the worker-owned
+    session — calling this again on an already-cancelled card touches no
+    session — but a live cc:/cx: CLI session (see below) is reported as a
+    failure on every call, not just the first, since only the
+    worker-owned session was ever really torn down.
     """
     from api.services import agent_board
     from api.services.task_manager import get_task_manager, TaskConflictError

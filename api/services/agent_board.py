@@ -247,7 +247,7 @@ def evaluate_card_action(
     before the worker claims it; once claimed (`agent-running` /
     `agent-blocked`, or a live session on an `in_progress` card), every
     drag and every assignee/model/effort/host edit is refused — Answer,
-    Kill, and Accept are the only actions left. A card assigned to `me`,
+    Kill, Accept, and Cancel are the actions that remain. A card assigned to `me`,
     or with no assignee, is entirely unaffected by any of this — every
     rule below for those matches ordinary human-card behavior exactly.
     """
