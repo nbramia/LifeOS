@@ -585,15 +585,21 @@ export function initGraph() {
       + rows.map(([label, value]) =>
         `<div class="hc-row"><span class="hc-label">${escapeHtml(label)}</span><span class="hc-value">${escapeHtml(String(value))}</span></div>`
       ).join('');
-    positionHoverCard(event);
+    // Unhide before positioning — `positionHoverCard` measures the card's
+    // rendered size to clamp it inside the viewport, which needs it laid
+    // out (non-`hidden`) first.
     hoverCardEl.hidden = false;
+    positionHoverCard(event);
   }
 
   function positionHoverCard(event) {
     if (!hoverCardEl) return;
     const pad = 16;
-    hoverCardEl.style.left = (event.clientX + pad) + 'px';
-    hoverCardEl.style.top = (event.clientY + pad) + 'px';
+    const rect = hoverCardEl.getBoundingClientRect();
+    const left = Math.max(0, Math.min(event.clientX + pad, window.innerWidth - rect.width - pad));
+    const top = Math.max(0, Math.min(event.clientY + pad, window.innerHeight - rect.height - pad));
+    hoverCardEl.style.left = left + 'px';
+    hoverCardEl.style.top = top + 'px';
   }
 
   function hideHoverCard() {

@@ -399,6 +399,21 @@ class TestHoverCard:
         )
         assert hidden is True
 
+    def test_hover_card_clamped_near_bottom_right_of_viewport(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url)
+        result = page.evaluate(
+            """() => {
+                const g = [...document.querySelectorAll('.node')]
+                  .find(n => n.__data__.session_id === 'sess-hermes');
+                g.dispatchEvent(new MouseEvent('mouseenter', { clientX: 1270, clientY: 790 }));
+                const box = document.getElementById('graph-hover-card').getBoundingClientRect();
+                return { right: box.right, bottom: box.bottom };
+            }"""
+        )
+        viewport = page.viewport_size
+        assert result["right"] <= viewport["width"]
+        assert result["bottom"] <= viewport["height"]
+
 
 class TestClickAndDoubleClick:
     def test_single_click_opens_panel_synchronously(self, page: Page, agents_base_url):
