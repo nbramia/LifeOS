@@ -101,7 +101,7 @@ export function initGraph() {
         .filter(d => d.session_id === sessionId)
         .each(function(d) { d.custom_label = customLabel; })
         .select('text.node-label')
-        .text(d => nodeLabel(d));
+        .each(renderNodeLabel);
     },
     onSummaryFetched: (sessionId, shortLabel) => {
       const s = allSessions.find(x => x.session_id === sessionId);
@@ -110,7 +110,7 @@ export function initGraph() {
         .filter(d => d.session_id === sessionId)
         .each(function(d) { d.short_label = shortLabel; })
         .select('text.node-label')
-        .text(d => nodeLabel(d));
+        .each(renderNodeLabel);
     },
   });
 
