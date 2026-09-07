@@ -536,13 +536,42 @@ class TestZoomControls:
         page.click("#graph-zoom-fit")
         page.wait_for_timeout(400)
         k_after_fit = float(page.get_attribute("#graph-svg", "data-zoom-k"))
+        assert k_after_fit > 0
+
+        # After Fit, the union of every visible node's client rect must lie
+        # inside the svg's own client rect and cover a real majority of it
+        # — not a small box tucked into a corner (the symptom of computing
+        # scale/translate in viewBox units against a CSS-pixel client box).
+        boxes = page.evaluate(
+            """() => {
+                const toBox = (r) => ({ left: r.left, right: r.right, top: r.top, bottom: r.bottom,
+                                          width: r.width, height: r.height });
+                const svgBox = toBox(document.getElementById('graph-svg').getBoundingClientRect());
+                const nodes = [...document.querySelectorAll('.node')];
+                let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+                for (const n of nodes) {
+                    const r = n.getBoundingClientRect();
+                    minX = Math.min(minX, r.left); maxX = Math.max(maxX, r.right);
+                    minY = Math.min(minY, r.top); maxY = Math.max(maxY, r.bottom);
+                }
+                return { svg: svgBox, union: { left: minX, right: maxX, top: minY, bottom: maxY } };
+            }"""
+        )
+        svg = boxes["svg"]
+        union = boxes["union"]
+        slack = 5  # anti-aliasing / sub-pixel rounding
+        assert union["left"] >= svg["left"] - slack
+        assert union["top"] >= svg["top"] - slack
+        assert union["right"] <= svg["right"] + slack
+        assert union["bottom"] <= svg["bottom"] + slack
+        span_w = union["right"] - union["left"]
+        span_h = union["bottom"] - union["top"]
+        assert span_w >= 0.6 * svg["width"] or span_h >= 0.6 * svg["height"]
+
         page.click("#graph-zoom-reset")
         page.wait_for_timeout(400)
         k_after_reset = float(page.get_attribute("#graph-svg", "data-zoom-k"))
         assert abs(k_after_reset - 1.0) < 0.01
-        # Fit isn't required to differ from 1, but the attribute must track
-        # every zoom event — assert it's a positive, finite number.
-        assert k_after_fit > 0
 
 
 class TestStreamTickUpdatesNodeSize:

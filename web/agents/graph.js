@@ -205,13 +205,13 @@ export function initGraph() {
     });
     const w = Math.max(1, maxX - minX);
     const h = Math.max(1, maxY - minY);
-    const rect = svg.node().getBoundingClientRect();
-    const boxW = rect.width || VIEW_W;
-    const boxH = rect.height || VIEW_H;
-    const scale = Math.max(0.2, Math.min(5, 0.9 / Math.max(w / boxW, h / boxH)));
+    // `zoom.transform` operates in the SVG's viewBox coordinate space (same
+    // space node `x`/`y` are already in — see `panToNode`), not CSS pixels,
+    // so the fit box is `VIEW_W`/`VIEW_H`, never the element's client rect.
+    const scale = Math.max(0.2, Math.min(5, 0.9 / Math.max(w / VIEW_W, h / VIEW_H)));
     const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-    const tx = boxW / 2 - scale * cx;
-    const ty = boxH / 2 - scale * cy;
+    const tx = VIEW_W / 2 - scale * cx;
+    const ty = VIEW_H / 2 - scale * cy;
     svg.transition().duration(transitionMs())
       .call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
   }
