@@ -104,6 +104,21 @@ class TestNodeLabel:
         assert label == "Hermes"
         assert "deepseek" not in label.lower()
 
+    def test_real_label_outranks_short_label(self, page: Page, web_base_url):
+        """`label` is the linked card's title for a card-linked session —
+        more authoritative than `short_label`, the AI-generated summary —
+        so a row carrying both real values renders `label`."""
+        _load_module(page, web_base_url)
+        d = {"session_id": "sess_bothreal", "label": "Fix the flaky graph test",
+             "short_label": "graph test fix"}
+        assert _call(page, "nodeLabel", d) == "Fix the flaky graph test"
+
+    def test_short_label_used_when_label_is_a_raw_id(self, page: Page, web_base_url):
+        _load_module(page, web_base_url)
+        d = {"session_id": "sess_rawlabel", "label": "sess_rawlabel",
+             "short_label": "investigate the regression"}
+        assert _call(page, "nodeLabel", d) == "investigate the regression"
+
     def test_falls_back_to_routing_label_when_nothing_else_is_real(self, page: Page, web_base_url):
         _load_module(page, web_base_url)
         d = {"session_id": "sess_12345678", "label": "sess_12345678", "routing": None}

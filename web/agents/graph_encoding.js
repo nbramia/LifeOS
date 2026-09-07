@@ -42,18 +42,21 @@ export function isRawIdValue(d, value) {
   );
 }
 
-// Precedence, first non-empty wins. `custom_label`, `short_label`, and
-// `label` are each skipped when they're not a human label but the raw
-// identifier the row fell back to (`isRawIdValue` above). `model_label`
-// is never a candidate here — it renders only as a chip (the hover card,
-// the panel's `.panel-chips` row, the Hermes routing badge), never as the
-// node/panel/tooltip name, so two sessions running the same model don't
-// read as the same node. Never emits '?'.
+// Precedence, first non-empty wins. `custom_label`, `label`, and
+// `short_label` are each skipped when they're not a human label but the raw
+// identifier the row fell back to (`isRawIdValue` above). `label` outranks
+// `short_label`: for a card-linked session, `label` is the linked card's
+// title (`_label_for_session` on the server), which is more authoritative
+// than an LLM-generated summary. `model_label` is never a candidate here —
+// it renders only as a chip (the hover card, the panel's `.panel-chips`
+// row, the Hermes routing badge), never as the node/panel/tooltip name, so
+// two sessions running the same model don't read as the same node. Never
+// emits '?'.
 export function nodeLabel(d) {
   const candidates = [
     isRawIdValue(d, d.custom_label) ? '' : d.custom_label,
-    isRawIdValue(d, d.short_label) ? '' : d.short_label,
     isRawIdValue(d, d.label) ? '' : d.label,
+    isRawIdValue(d, d.short_label) ? '' : d.short_label,
     d.prompt_preview,
     routingLabel(d.routing),
   ];

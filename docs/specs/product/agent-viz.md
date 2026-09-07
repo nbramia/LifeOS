@@ -112,13 +112,13 @@ by host. Each node is one session:
 | **Position** | Columns group nodes by host (column header: `<host> · <count>`); inside a column, a lane sub-band groups nodes by the same lane the fill colour encodes. Recency is a filter only, not a position signal. |
 
 **Node label** — the text under each node, first non-empty of: an
-operator-pinned custom label, the AI-generated short summary, the derived
-label (task description for LifeOS, first non-empty user message for
-Claude Code — the same value a linked board card shows as its title), the
+operator-pinned custom label, the derived label (task description for
+LifeOS, first non-empty user message for Claude Code — the same value a
+linked board card shows as its title), the AI-generated short summary, the
 most recent prompt preview (cross-machine CLI sessions), the routing name,
 then the first 8 characters of the session id as a last resort. The
-operator-pinned custom label, the AI-generated short summary, and the
-derived label are each skipped when they're not a real label but the raw
+operator-pinned custom label, the derived label, and the AI-generated
+short summary are each skipped when they're not a real label but the raw
 id the row fell back to (the session id, that id with its `cc:`/`cx:` CLI
 prefix stripped, or the row's task id). The model badge (`model_label`)
 is never a candidate here — it renders only as a chip (the hover card, the
