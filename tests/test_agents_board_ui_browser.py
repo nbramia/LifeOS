@@ -570,21 +570,31 @@ class TestBoardLoad:
         expect(card.locator(".board-card-question")).to_contain_text("Which environment?")
 
     def test_lane_headers_carry_the_shared_lane_colour_accent(self, page: Page, agents_base_url):
-        """Each lane header's `border-top-color` is `laneColor(lane.id)`
+        """Each lane header's `border-top-color` equals `laneColor(lane.id)`
         (web/agents/lanes.js) — the same palette the graph tab uses for its
         node fill, so the board and graph read as one system."""
         _open_board(page, agents_base_url)
-        colors = page.evaluate(
-            """() => Array.from(document.querySelectorAll('.board-lane')).map(el => ({
-                lane: el.dataset.lane,
-                color: getComputedStyle(el.querySelector('.board-lane-header')).borderTopColor,
-            }))"""
+        result = page.evaluate(
+            """async () => {
+                const { laneColor } = await import('/static/agents/lanes.js');
+                const normalize = (hex) => {
+                    const probe = document.createElement('div');
+                    probe.style.color = hex;
+                    document.body.appendChild(probe);
+                    const rgb = getComputedStyle(probe).color;
+                    probe.remove();
+                    return rgb;
+                };
+                return Array.from(document.querySelectorAll('.board-lane')).map(el => ({
+                    lane: el.dataset.lane,
+                    actual: getComputedStyle(el.querySelector('.board-lane-header')).borderTopColor,
+                    expected: normalize(laneColor(el.dataset.lane)),
+                }));
+            }"""
         )
-        by_lane = {c["lane"]: c["color"] for c in colors}
-        assert len(by_lane) >= 2
-        # Every rendered lane has a real accent colour, and no two lanes
-        # share one.
-        assert len(set(by_lane.values())) == len(by_lane)
+        assert len(result) >= 2
+        for row in result:
+            assert row["actual"] == row["expected"], row
 
 
 class TestDragBetweenLanes:
