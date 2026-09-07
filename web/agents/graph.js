@@ -568,6 +568,9 @@ export function initGraph() {
 
       const totalChildren = d._totalChildren || 0;
       const hiddenChildren = d._collapsedChildren || 0;
+      g.select('.node-badge-children-hit')
+        .style('display', totalChildren > 0 ? '' : 'none')
+        .attr('cx', -r * 0.85).attr('cy', -r * 0.85 + 1).attr('r', 9);
       g.select('text.node-badge-children')
         .style('display', totalChildren > 0 ? '' : 'none')
         .attr('x', -r * 0.85).attr('y', -r * 0.85 + 4)
@@ -704,6 +707,12 @@ export function initGraph() {
       .attr('text-anchor', 'middle').attr('font-size', 11).attr('fill', 'var(--accent, #6366f1)');
     entered.append('text').attr('class', 'node-badge-errors')
       .attr('text-anchor', 'middle').attr('font-size', 10).attr('fill', '#f87171');
+    // A transparent circle behind the badge text, sized for a real click
+    // target — the text glyph alone renders only a few pixels tall.
+    entered.append('circle').attr('class', 'node-badge-children-hit')
+      .attr('fill', 'transparent')
+      .style('cursor', 'pointer').style('pointer-events', 'all')
+      .on('click', (event, d) => { event.stopPropagation(); toggleParentExpanded(d.session_id); });
     entered.append('text').attr('class', 'node-badge-children')
       .attr('text-anchor', 'middle').attr('font-size', 10).attr('fill', '#e8e8ed')
       .style('cursor', 'pointer')
