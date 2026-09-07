@@ -453,6 +453,82 @@ class TestClickAndDoubleClick:
         page.wait_for_timeout(300)
         assert focus_calls == []
 
+    def test_double_click_routing_derived_subagent_does_not_focus(self, page: Page, agents_base_url):
+        """A row surfaced by `_session_to_dict` on the server carries no
+        `is_subagent` key at all (only rows this test suite's own fixtures
+        set it on do) — the dblclick guard must still catch it via
+        `parent_session_id` alone."""
+        child = _row(session_id="cc:routing-derived-child", routing="claude_code",
+                      source="claude_code", host="build-host",
+                      label="Routing-derived child", parent_session_id="cc:redesign-parent")
+        del child["is_subagent"]
+        snapshot = dict(SNAPSHOT, sessions=SNAPSHOT["sessions"] + [child])
+        focus_calls = []
+        _open_agents(page, agents_base_url, snapshot=snapshot, focus_calls=focus_calls)
+        # Expand the parent so this child node renders (collapsed by default).
+        badge = page.evaluate(
+            "() => { const g = [...document.querySelectorAll('.node')]"
+            ".find(n => n.__data__.session_id === 'cc:redesign-parent');"
+            " const b = g.querySelector('.node-badge-children');"
+            " const box = b.getBoundingClientRect();"
+            " return { x: box.x + box.width / 2, y: box.y + box.height / 2 }; }"
+        )
+        page.mouse.click(badge["x"], badge["y"])
+        page.wait_for_timeout(300)
+        page.evaluate(
+            """() => {
+                const g = [...document.querySelectorAll('.node')]
+                  .find(n => n.__data__.session_id === 'cc:routing-derived-child');
+                g.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+            }"""
+        )
+        page.wait_for_timeout(300)
+        assert focus_calls == []
+
+    def test_real_doubleclick_cli_node_opens_panel_once_and_focuses_once(self, page: Page, agents_base_url):
+        """A browser-emitted double-click (not a synthetic single `dblclick`
+        dispatch) fires click(detail=1), click(detail=2), dblclick in
+        sequence — the panel must open from the first click and stay open
+        (not toggle closed by the second), focus must fire exactly once,
+        and the zoom transform must be untouched by d3's own double-click
+        zoom, which is disabled."""
+        focus_calls = []
+        _open_agents(page, agents_base_url, focus_calls=focus_calls)
+        k_before = float(page.get_attribute("#graph-svg", "data-zoom-k"))
+        pos = page.evaluate(
+            "() => { const g = [...document.querySelectorAll('.node')]"
+            ".find(n => n.__data__.session_id === 'cc:redesign-parent');"
+            " const box = g.getBoundingClientRect();"
+            " return { x: box.x + box.width / 2, y: box.y + box.height / 2 }; }"
+        )
+        page.mouse.dblclick(pos["x"], pos["y"])
+        page.wait_for_timeout(400)
+        header = page.locator('[data-field="label"]')
+        expect(header).to_be_visible()
+        assert "flaky graph test" in header.inner_text()
+        assert len(focus_calls) == 1
+        k_after = float(page.get_attribute("#graph-svg", "data-zoom-k"))
+        assert abs(k_after - k_before) < 0.01
+
+    def test_real_doubleclick_non_cli_node_opens_panel_and_does_not_zoom(self, page: Page, agents_base_url):
+        focus_calls = []
+        _open_agents(page, agents_base_url, focus_calls=focus_calls)
+        k_before = float(page.get_attribute("#graph-svg", "data-zoom-k"))
+        pos = page.evaluate(
+            "() => { const g = [...document.querySelectorAll('.node')]"
+            ".find(n => n.__data__.session_id === 'sess-local');"
+            " const box = g.getBoundingClientRect();"
+            " return { x: box.x + box.width / 2, y: box.y + box.height / 2 }; }"
+        )
+        page.mouse.dblclick(pos["x"], pos["y"])
+        page.wait_for_timeout(400)
+        header = page.locator('[data-field="label"]')
+        expect(header).to_be_visible()
+        assert "Local blocked task" in header.inner_text()
+        assert focus_calls == []
+        k_after = float(page.get_attribute("#graph-svg", "data-zoom-k"))
+        assert abs(k_after - k_before) < 0.01
+
 
 class TestZoomControls:
     def test_fit_changes_zoom_k_and_reset_returns_to_one(self, page: Page, agents_base_url):

@@ -177,6 +177,10 @@ export function initGraph() {
       svg.attr('data-zoom-k', event.transform.k);
     });
   svg.call(zoom);
+  // d3.zoom's own double-click-to-zoom would otherwise fire alongside the
+  // node dblclick handler below on every double-click anywhere on the
+  // canvas, including non-CLI nodes that have no focus action of their own.
+  svg.on('dblclick.zoom', null);
   svg.style('cursor', 'grab');
   svg.on('mousedown.cursor', () => svg.style('cursor', 'grabbing'));
   svg.on('mouseup.cursor',   () => svg.style('cursor', 'grab'));
@@ -669,13 +673,19 @@ export function initGraph() {
           if (!event.active) simulation.alphaTarget(0);
         }))
       .on('click', (event, d) => {
+        // `event.detail` is the click count in the browser's own
+        // click/click/dblclick sequence — the second click of a
+        // double-click carries `detail === 2`. Ignoring it here means a
+        // real double-click only ever opens the panel (from the first
+        // click) and never also toggles it back closed.
+        if (event.detail > 1) return;
         if (d.session_id === selectedSessionId) closePanel();
         else openPanel(d.session_id);
       })
       .on('dblclick', (event, d) => {
         const engine = engineOf(d);
         const isCli = engine === 'claude_code' || engine === 'codex';
-        if (!isCli || d.is_subagent) return;
+        if (!isCli || d.is_subagent || d.parent_session_id) return;
         event.preventDefault();
         event.stopPropagation();
         focusSessionQuick(d);
