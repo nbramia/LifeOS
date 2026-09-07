@@ -452,19 +452,17 @@ def mirrored_snapshot(
                 sessions, cc_edges = cc.build_snapshot(
                     projects_dir=cc_dir, cache_ttl=cache_ttl, live_counts={},
                 )
-                # `build_snapshot()` returns `list(entry.sessions)` — a
-                # shallow copy of the LIST, so these row dicts are the
-                # SAME objects `cc`'s own ingest cache holds. Copying each
-                # row here, before mutating it, keeps that cache's dicts
-                # untouched — otherwise `host`/`mirrored` and (via
-                # `_demote_inferred_running` and the hook overlay
-                # `_build_snapshot` applies afterward) `status`/
-                # `status_inferred` get written straight into the cached
-                # entry, so a rebuild inside `cache_ttl` after the hook row
-                # that produced the overlay has vanished (pruned, or a
-                # failed `list_cli_sessions()` call) would otherwise replay
-                # the stale cached mutation instead of recomputing it, in
-                # violation of AC 7.
+                # `cc.build_snapshot()` hands back per-row copies
+                # (`[dict(row) for row in ...]`), so `cc`'s own ingest
+                # cache is already protected from mutation by this
+                # function or by `_build_snapshot`'s later hook overlay.
+                # Copying again here is defensive layering: it keeps
+                # `host`/`mirrored` and (via `_demote_inferred_running`
+                # and the hook overlay `_build_snapshot` applies
+                # afterward) `status`/`status_inferred` off any row
+                # object shared with what `cc.build_snapshot()` returned,
+                # rather than the only thing standing between a stale
+                # cached mutation and AC 7.
                 sessions = [dict(row) for row in sessions]
                 for row in sessions:
                     row["host"] = host_name
@@ -481,7 +479,8 @@ def mirrored_snapshot(
                     sessions_dir=cx_dir, cache_ttl=cache_ttl, live_counts={},
                 )
                 # See the identical comment in the claude_code branch
-                # above — same aliasing against `cx`'s own ingest cache.
+                # above — same defensive layering against `cx`'s own
+                # ingest cache.
                 sessions = [dict(row) for row in sessions]
                 for row in sessions:
                     row["host"] = host_name
