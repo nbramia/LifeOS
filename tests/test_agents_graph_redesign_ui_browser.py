@@ -234,11 +234,14 @@ class TestFiveEngineShapes:
 
     def test_routing_change_on_existing_node_updates_its_shape(self, page: Page, agents_base_url):
         """`/snapshot` reports `routing: local` (a `<polygon>` diamond) for a
-        session; `/stream`'s one queued event reports `routing: claude_code`
-        (a `<rect>` square) for the SAME session id — a tag-crossing
-        transition (`polygon` -> `rect`), not just a different `data-shape`
-        on the same tag. Only the stream-delivered shape can end up
-        rendered, since nothing else in the page re-fetches `/snapshot`."""
+        session; a later `/stream` event reports `routing: claude_code` (a
+        `<rect>` square) for the SAME session id — a tag-crossing transition
+        (`polygon` -> `rect`), not just a different `data-shape` on the same
+        tag. The `/stream` response is held back (not fulfilled) until the
+        diamond has actually rendered, so this exercises the real d3 update
+        path (an existing bound node changing shape) rather than racing
+        `/snapshot` and `/stream` and asserting on whichever happens to
+        finish last."""
         local_row = _row(session_id="sess-routing-change", routing="local", host="build-host",
                           label="Routing change target", model_label="Local", lane="in_progress")
         cc_row = dict(local_row, routing="claude_code", source="claude_code", model_label="Claude Code")
@@ -246,10 +249,14 @@ class TestFiveEngineShapes:
         snap_cc = {"sessions": [cc_row], "edges": [], "generated_at": 2, "api_host": "build-host"}
         stream_body = ": ok\n\nevent: snapshot\ndata: " + json.dumps(snap_cc) + "\n\n"
 
+        pending_stream_route = {}
+
         def handler(route):
             url = route.request.url
             if "/api/agents/stream" in url:
-                route.fulfill(status=200, content_type="text/event-stream", body=stream_body)
+                # Hold the response open — released explicitly below, once
+                # the local/diamond render is confirmed on the page.
+                pending_stream_route["route"] = route
                 return
             if "/api/agents/snapshot" in url:
                 route.fulfill(status=200, content_type="application/json", body=json.dumps(snap_local))
@@ -266,6 +273,23 @@ class TestFiveEngineShapes:
         page.click('[data-tab="graph"]')
         page.wait_for_selector("#filter-route")
         page.select_option("#filter-recency", "all")
+
+        page.wait_for_function(
+            "() => { const g = [...document.querySelectorAll('.node')]"
+            ".find(n => n.__data__.session_id === 'sess-routing-change');"
+            " return g && g.querySelector('.node-shape').getAttribute('data-shape') === 'diamond'; }",
+            timeout=8000,
+        )
+        initial = page.evaluate(
+            "() => { const g = [...document.querySelectorAll('.node')]"
+            ".find(n => n.__data__.session_id === 'sess-routing-change');"
+            " return g.querySelector('.node-shape').tagName.toLowerCase(); }"
+        )
+        assert initial == "polygon"
+
+        pending_stream_route["route"].fulfill(
+            status=200, content_type="text/event-stream", body=stream_body)
+
         page.wait_for_function(
             "() => { const g = [...document.querySelectorAll('.node')]"
             ".find(n => n.__data__.session_id === 'sess-routing-change');"
