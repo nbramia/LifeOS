@@ -357,11 +357,15 @@ def test_hook_overlay_does_not_leak_into_ingest_cache_within_ttl(
     status_inferred=False` — the failure mode AC 7 rules out ("a remote
     session's `running` status comes only from hook events").
 
-    Mutation-proved: reverting `cc.build_snapshot()`'s cache-hit-path copy
-    (`return [dict(row) for row in entry.sessions], list(entry.edges)`
-    back to `return list(entry.sessions), list(entry.edges)`) makes this
-    fail — the second snapshot stays `running`/`status_inferred: False`
-    instead of demoting back to the transcript-inferred status."""
+    This test pins the route-observable behavior at the `/api/agents/snapshot`
+    level rather than mutation-proving `cc.build_snapshot()`'s own copy
+    semantics — `mirrored_snapshot()` makes its own `dict(row)` copy of
+    every row before stamping `host`/`mirrored`/the demotion onto it, so
+    this test still passes even if `cc.build_snapshot()`'s cache-hit-path
+    copy is reverted to alias the cache's own dicts. The per-row-copy
+    guarantee at the ingest layer is mutation-proved directly by
+    `test_snapshot_cache_returns_per_row_copies` in
+    `tests/test_claude_code_ingest.py`."""
     import sqlite3
 
     session_store, _ = stores
