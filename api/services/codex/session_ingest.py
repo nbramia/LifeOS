@@ -770,11 +770,15 @@ def build_snapshot(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return `(sessions, edges)` for the /agents snapshot. Cached.
 
+    On both the cache-hit and cache-populate paths, the returned session
+    rows are per-row shallow copies, so a caller may mutate them without
+    touching the cache.
+
     `live_counts`: see the identical parameter on the Claude Code
     adapter's `build_snapshot` — pass `{}` to guarantee no row is promoted
     to `running` by a local process scan (used by the remote transcript
-    mirror). `None` (default) preserves today's behavior: scan local
-    `codex` processes via `live_codex_cwd_counts()`.
+    mirror). `None` (default) scans local `codex` processes via
+    `live_codex_cwd_counts()`.
     """
     now_t = now if now is not None else time.time()
     key = _cache_key(sessions_dir, lookback_days, live_counts)

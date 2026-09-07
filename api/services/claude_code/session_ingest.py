@@ -839,7 +839,7 @@ def subagent_session_dict(parent: SessionMeta, subagent: dict[str, Any]) -> dict
 # Discovery + parse is the expensive op (touches the filesystem and reads
 # every active jsonl). Cache the snapshot dicts for a short window so the
 # 2s SSE tick doesn't hammer disk. The cache is keyed by (projects_dir,
-# lookback_days) so callers with different scopes (e.g. tests) don't
+# lookback_days, live_counts) so callers with different scopes (e.g. tests) don't
 # cross-contaminate, and guarded by a lock so concurrent FastAPI threads
 # can't see a partially-written entry.
 _CACHE_TTL = 30.0
@@ -894,14 +894,17 @@ def build_snapshot(
     Edges include parent→subagent spawn edges. Subagent nodes are synthetic;
     they don't have their own jsonl. The cache is bypassed entirely when
     `cache_ttl <= 0` (no read, no write) so tests get a fresh snapshot.
+    On both the cache-hit and cache-populate paths, the returned session
+    rows are per-row shallow copies, so a caller may mutate them without
+    touching the cache.
 
     `live_counts`: pass a `{cwd: count}` map to use instead of
     scanning THIS machine's own processes — `{}` guarantees no row is
     promoted to `running` by a local process scan, which is what the
     remote transcript mirror needs (a mirrored session never has a
     process on this host; its liveness must come only from hook events).
-    `None` (the default) preserves today's behavior exactly: scan local
-    `claude` processes via `live_claude_cwd_counts()`.
+    `None` (the default) scans local `claude` processes via
+    `live_claude_cwd_counts()`.
     """
     now_t = now if now is not None else time.time()
     key = _cache_key(projects_dir, lookback_days, live_counts)
