@@ -471,9 +471,15 @@ export function renderAssignmentPickers(container, card, opts = {}) {
       // select is deliberately NOT reverted here — board.js owns the
       // Assignee select and hides this module's engine row, so there's
       // no user-reachable path that leaves it stale.
-      restoreSelect(effortEl, lastSavedEffort);
-      restoreSelect(hostEl, lastSavedHost);
-      restoreSelect(modelEl, lastSavedModel);
+      // Only snap a control back when it still holds exactly what THIS
+      // save sent. A control the operator has already moved on to
+      // something newer keeps that newer value here -- the operator's
+      // later edit already queued its own save through the chain below,
+      // so it reaches the server on its own turn rather than getting
+      // overwritten by this revert.
+      if (effortEl.value === sentEffort) restoreSelect(effortEl, lastSavedEffort);
+      if (hostEl.value.trim() === sentHost) restoreSelect(hostEl, lastSavedHost);
+      if (modelEl.value === sentModel) restoreSelect(modelEl, lastSavedModel);
       showError(err && err.message ? err.message : String(err));
     }
   }
@@ -487,8 +493,14 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   // the chain itself never rejects and a failed save can't break saving
   // for subsequent changes.
   let saveChain = Promise.resolve();
+  // Counts saves that have been queued but haven't settled yet -- a
+  // caller (board.js) reads `isSaving()` below to know whether a card
+  // snapshot it holds could predate a save still in flight through this
+  // chain, before using that snapshot to rebuild these pickers.
+  let pendingSaves = 0;
   function save(extra = {}) {
-    const task = saveChain.then(() => runSave(extra));
+    pendingSaves += 1;
+    const task = saveChain.then(() => runSave(extra)).finally(() => { pendingSaves -= 1; });
     saveChain = task;
     return task;
   }
@@ -513,7 +525,18 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   effortEl.addEventListener('change', () => save());
   hostEl.addEventListener('change', () => save());
 
-  return { engineEl, modelEl, effortEl, hostEl };
+  return {
+    engineEl, modelEl, effortEl, hostEl,
+    // Whether a save queued through `save()` above hasn't settled yet --
+    // a card snapshot taken while this is true is not safe to rebuild
+    // these pickers from.
+    isSaving: () => pendingSaves > 0,
+    // Resolves once every save queued through `save()` so far has settled
+    // (accepted or reverted) -- a caller that needs to rebuild these
+    // pickers while `isSaving()` is true can chain onto this instead of
+    // re-seeding them from a pre-save snapshot.
+    whenIdle: () => saveChain,
+  };
 }
 
 async function defaultPutTask(taskId, patch) {
