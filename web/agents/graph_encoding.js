@@ -52,6 +52,37 @@ export function isRawIdValue(d, value) {
 // row, the Hermes routing badge), never as the node/panel/tooltip name, so
 // two sessions running the same model don't read as the same node. Never
 // emits '?'.
+// 1-hop-and-beyond descendants of `session` (via `parent_session_id`) among
+// `sessions` — the same subtree the kill endpoint itself tears down
+// (`_kill_session_subtree`, api/routes/agents.py), so the confirmation
+// modal's cascade preview (./session_actions.js's `openKillModal`) names
+// exactly what a Kill click actually takes with it. One function so the
+// Graph tab's side panel (which already holds every known session) and the
+// Board drawer (which fetches `/api/agents/snapshot` on demand for this)
+// can never disagree about what "descendants" means.
+export function descendantsOf(sessions, session) {
+  if (!session) return [];
+  const childrenOf = new Map();
+  for (const x of (sessions || [])) {
+    if (!x.parent_session_id) continue;
+    if (!childrenOf.has(x.parent_session_id)) childrenOf.set(x.parent_session_id, []);
+    childrenOf.get(x.parent_session_id).push(x);
+  }
+  const out = [];
+  const queue = [session.session_id];
+  const seen = new Set([session.session_id]);
+  while (queue.length) {
+    const sid = queue.shift();
+    for (const child of (childrenOf.get(sid) || [])) {
+      if (seen.has(child.session_id)) continue;
+      seen.add(child.session_id);
+      out.push(child);
+      queue.push(child.session_id);
+    }
+  }
+  return out;
+}
+
 export function nodeLabel(d) {
   const candidates = [
     isRawIdValue(d, d.custom_label) ? '' : d.custom_label,

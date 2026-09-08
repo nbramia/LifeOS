@@ -265,20 +265,23 @@ def test_demoted_status_is_a_showresume_eligible_status():
     """Ties `_demote_inferred_running`'s hardcoded
     demotion target to the frontend's `showResumeFor` acceptance set, so a
     change to either side that breaks the pairing is caught here rather
-    than only by a live drawer. `web/agents/panel.js`'s `showResumeFor`
-    accepts exactly `{"inactive", "yielded"}` plus the TERMINAL statuses
-    (`completed`, `failed`, `budget_exceeded`, `ended` — see `TERMINAL` in
-    `web/agents/panel.js`); demoting to anything outside that set (e.g.
-    "blocked", "idle") would hide Resume on every freshly-mirrored session."""
+    than only by a live drawer. `web/agents/session_actions.js`'s
+    `showResumeFor` (re-exported by `web/agents/panel.js` for the Board
+    drawer's and the Graph panel's shared action row) accepts exactly
+    `{"inactive", "yielded"}` plus the TERMINAL statuses (`completed`,
+    `failed`, `budget_exceeded`, `ended` — see `TERMINAL` in
+    `web/agents/session_actions.js`); demoting to anything outside that set
+    (e.g. "blocked", "idle") would hide Resume on every freshly-mirrored
+    session."""
     import re
 
-    panel_js = Path(__file__).resolve().parent.parent / "web" / "agents" / "panel.js"
-    source = panel_js.read_text(encoding="utf-8")
-    # `updateMeta` and `_renderHeader` both call a single shared
+    session_actions_js = Path(__file__).resolve().parent.parent / "web" / "agents" / "session_actions.js"
+    source = session_actions_js.read_text(encoding="utf-8")
+    # The shared action row's `decideActions` calls a single
     # `showResumeFor(s)` function — anchor on that function body (not
-    # `const showResume = ...`, which isn't the definition site) so this
-    # binds the one copy both call sites share, rather than a copy that
-    # could drift.
+    # `visible: showResumeFor(s)`, which isn't the definition site) so this
+    # binds the one copy both the drawer's and the panel's action rows
+    # share, rather than a copy that could drift.
     match = re.search(
         r"function showResumeFor\(s\) \{[\s\S]*?status === '(\w+)' \|\| s\.status === '(\w+)'\)",
         source,
