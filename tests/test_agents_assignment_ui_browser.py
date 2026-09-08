@@ -243,11 +243,11 @@ def test_shows_what_actually_ran_from_session(page: Page, web_base_url):
 
 
 def test_effort_change_before_catalog_resolves_does_not_clear_model(page: Page, web_base_url):
-    """#861 regression: changing effort/host before GET /api/agents/models
-    resolves must not send `model: null` and clear a previously saved model
-    field — the model select's options (and thus its value) don't exist yet
-    on the first drawer open of a page load, so `save()` must omit the
-    `model` key entirely until the catalog has populated the select."""
+    """Changing effort/host before GET /api/agents/models resolves must not
+    send `model: null` and clear a saved model field — the model select
+    seeds the saved value as a selected option synchronously, before the
+    catalog fetch is even requested, so `save()` carries the saved model
+    forward on the very first save of a page load."""
     pending = []
 
     def api_handler(route):
@@ -272,7 +272,7 @@ def test_effort_change_before_catalog_resolves_does_not_clear_model(page: Page, 
     fields = calls[0]["patch"]["fields"]
     assert fields["effort"] == "high"
     assert fields["assigned_by"] == "board"
-    assert "model" not in fields  # omitted, not nulled — must not clear the saved model
+    assert fields["model"] == "claude-sonnet-5"  # carried forward, not nulled
 
     # Now let the catalog resolve (fulfill every stashed models route).
     for route in pending:
@@ -288,6 +288,292 @@ def test_effort_change_before_catalog_resolves_does_not_clear_model(page: Page, 
     assert len(calls) == 2
     fields2 = calls[1]["patch"]["fields"]
     assert fields2["model"] == "claude-sonnet-5"
+
+
+def test_host_change_before_catalog_resolves_does_not_clear_model(page: Page, web_base_url):
+    """The saved-model guarantee covers a HOST change, not just an effort
+    change — changing the host picker while GET /api/agents/models is
+    still in flight must not send `model: null` and clear a saved
+    model field."""
+    pending = []
+
+    def api_handler(route):
+        if "/api/agents/models" in route.request.url:
+            pending.append(route)  # stashed — fulfilled later in the test
+        elif "/api/agents/hosts" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+        elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
+            body = json.loads(route.request.post_data or "{}")
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": "t62", **body}))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    _render(page, {
+        "id": "t62", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude",
+        "fields": {"model": "claude-sonnet-5", "effort": "medium"},
+    })
+
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))  # wait for the host catalog
+
+    # The models fetch hasn't resolved yet (stashed) — change host now.
+    host_select.select_option("laptop")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 1
+    fields = calls[0]["patch"]["fields"]
+    assert fields["host"] == "laptop"
+    assert fields["model"] == "claude-sonnet-5"  # carried forward, not nulled
+
+    # Now let the model catalog resolve.
+    for route in pending:
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+    pending.clear()
+
+    container = page.locator("#test-assignment-container")
+    expect(container.locator("[data-field='model'] option")).to_have_count(3)  # default + 2 claude models
+
+    # Once the catalog is ready, effort changes carry the saved model along.
+    page.locator("[data-field='effort']").select_option("low")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 2
+    assert calls[1]["patch"]["fields"]["model"] == "claude-sonnet-5"
+
+
+# ---------------------------------------------------------------------------
+# Covers: a saved model absent from the engine's catalog round-tripping on
+# every save, on first paint (catalog fetch still pending) and on the
+# normal path (catalog already resolved without it); explicitly clearing
+# the model; a known saved model rendering with no unknown flag; and the
+# unknown-flagged option surviving an engine change.
+# ---------------------------------------------------------------------------
+
+def test_unknown_model_survives_effort_change_before_catalog_resolves_on_first_paint(page: Page, web_base_url):
+    """The synchronous-seed requirement for an unknown model: a saved model
+    absent from the catalog round-trips on the very first save of a page
+    load, before GET /api/agents/models has resolved, and stays selected
+    and flagged once the catalog lands without it."""
+    pending = []
+
+    def api_handler(route):
+        if "/api/agents/models" in route.request.url:
+            pending.append(route)  # stashed — fulfilled later in the test
+        elif "/api/agents/hosts" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+        elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
+            body = json.loads(route.request.post_data or "{}")
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": "t30", **body}))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    _render(page, {
+        "id": "t30", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude",
+        "fields": {"model": "claude-legacy-9", "effort": "medium"},
+    })
+
+    # Catalog hasn't resolved yet (its route is stashed) — change effort now.
+    page.locator("[data-field='effort']").select_option("high")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 1
+    assert calls[0]["patch"]["fields"]["model"] == "claude-legacy-9"
+
+    # Now let the catalog resolve, without that model id in the claude list.
+    empty_claude_catalog = {
+        "engines": {"claude": [], "codex": [], "local": [], "hermes": []},
+        "refreshed_at": "2026-01-01T00:00:00Z",
+        "stale": False,
+    }
+    for route in pending:
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(empty_claude_catalog))
+    pending.clear()
+
+    model_select = page.locator("#test-assignment-container [data-field='model']")
+    unknown_option = model_select.locator("option[data-unknown='true']")
+    expect(unknown_option).to_have_count(1)
+    expect(unknown_option).to_have_text("claude-legacy-9 (unknown)")
+    assert model_select.input_value() == "claude-legacy-9"
+
+    # A second effort change still carries the model along.
+    page.locator("[data-field='effort']").select_option("low")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 2
+    assert calls[1]["patch"]["fields"]["model"] == "claude-legacy-9"
+
+
+def test_unknown_saved_model_resolved_catalog_without_it(page: Page, web_base_url):
+    """Normal path, not a race with a still-pending fetch: a saved model
+    absent from an already-resolved catalog renders selected and flagged
+    unknown, and round-trips on the next unrelated save."""
+    _load_module(page, web_base_url)
+    _render(page, {
+        "id": "t31", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude",
+        "fields": {"model": "claude-legacy-9", "effort": "medium"},
+    })
+
+    model_select = page.locator("#test-assignment-container [data-field='model']")
+    expect(model_select.locator("option")).to_have_count(4)  # default + 2 claude models + the unknown extra
+    unknown_option = model_select.locator("option[data-unknown='true']")
+    expect(unknown_option).to_have_count(1)
+    expect(unknown_option).to_have_text("claude-legacy-9 (unknown)")
+    assert unknown_option.get_attribute("value") == "claude-legacy-9"  # bare id, not the labeled text
+    assert model_select.input_value() == "claude-legacy-9"
+
+    page.locator("[data-field='effort']").select_option("high")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 1
+    assert calls[0]["patch"]["fields"]["model"] == "claude-legacy-9"
+
+
+def test_selecting_engine_default_model_puts_null(page: Page, web_base_url):
+    _load_module(page, web_base_url)
+    _render(page, {
+        "id": "t32", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude",
+        "fields": {"model": "claude-sonnet-5"},
+    })
+    model_select = page.locator("#test-assignment-container [data-field='model']")
+    expect(model_select.locator("option")).to_have_count(3)  # wait for the fetch
+
+    model_select.select_option("")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 1
+    assert calls[0]["patch"]["fields"]["model"] is None
+
+
+def test_known_saved_model_renders_normal_label_no_unknown_option(page: Page, web_base_url):
+    _load_module(page, web_base_url)
+    _render(page, {
+        "id": "t33", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude",
+        "fields": {"model": "claude-sonnet-5"},
+    })
+    model_select = page.locator("#test-assignment-container [data-field='model']")
+    expect(model_select.locator("option")).to_have_count(3)  # default + 2 claude models, no unknown extra
+    texts = model_select.locator("option").all_inner_texts()
+    assert "Claude Sonnet 5" in texts
+    expect(model_select.locator("option[data-unknown='true']")).to_have_count(0)
+    assert model_select.input_value() == "claude-sonnet-5"
+
+
+def test_unknown_flagged_model_option_survives_engine_change(page: Page, web_base_url):
+    """Switching engines re-renders the model list against the new
+    engine's catalog rather than reseeding from the render-time snapshot.
+    A saved model absent from every engine's catalog stays selected and
+    flagged across an engine change between two engines that both show the
+    model picker."""
+    _load_module(page, web_base_url)
+    _render(page, {
+        "id": "t34", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude",
+        "fields": {"model": "claude-legacy-9"},
+    })
+    model_select = page.locator("#test-assignment-container [data-field='model']")
+    expect(model_select.locator("option[data-unknown='true']")).to_have_count(1)
+    assert model_select.input_value() == "claude-legacy-9"
+
+    # claude -> codex: both show the model picker.
+    page.locator("[data-field='assignee']").select_option("codex")
+    unknown_option = model_select.locator("option[data-unknown='true']")
+    expect(unknown_option).to_have_count(1)
+    expect(unknown_option).to_have_text("claude-legacy-9 (unknown)")
+    assert model_select.input_value() == "claude-legacy-9"
+
+    # codex -> claude: still survives.
+    page.locator("[data-field='assignee']").select_option("claude")
+    unknown_option = model_select.locator("option[data-unknown='true']")
+    expect(unknown_option).to_have_count(1)
+    expect(unknown_option).to_have_text("claude-legacy-9 (unknown)")
+    assert model_select.input_value() == "claude-legacy-9"
+
+
+def test_foreign_model_dropped_to_engine_default_even_via_a_hidden_model_row(page: Page, web_base_url):
+    """populateModelOptions() drops the live model selection to "engine
+    default" whenever it's absent from the CURRENT engine's catalog but
+    present in some OTHER engine's catalog in the same fetch — a model id
+    is only valid for the catalog it came from. The decision is made at
+    render time against every engine in the fetched catalog, not against
+    whichever engine the picker happens to have last held, so it fires
+    even hopping through an engine (`local`) whose own catalog is empty
+    and whose model row is hidden — nothing user-visible about that hop
+    would otherwise hint that the value underneath it just changed.
+    Distinct from test_unknown_flagged_model_option_survives_engine_change
+    above, whose model is absent from every engine's catalog and therefore
+    survives untouched."""
+    _load_module(page, web_base_url)
+    _render(page, {
+        "id": "t35", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude",
+        "fields": {"model": "claude-sonnet-5", "effort": "medium"},
+    })
+    model_select = page.locator("#test-assignment-container [data-field='model']")
+    expect(model_select.locator("option")).to_have_count(3)  # wait for the catalog
+    assert model_select.input_value() == "claude-sonnet-5"
+
+    # claude -> local: local's own catalog is empty and hides the model
+    # row, but claude's catalog (fetched in the same response) lists
+    # claude-sonnet-5 -- dropped immediately.
+    page.locator("[data-field='assignee']").select_option("local")
+    assert model_select.input_value() == ""
+    expect(model_select.locator("option[data-unknown='true']")).to_have_count(0)
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 1
+    assert calls[0]["patch"]["fields"]["model"] is None
+
+    # local -> codex: stays cleared, the PUT still carries null.
+    page.locator("[data-field='assignee']").select_option("codex")
+    assert model_select.input_value() == ""
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 2
+    assert calls[1]["patch"]["fields"]["model"] is None
+
+
+def test_model_change_before_catalog_resolves_survives_catalog_landing(page: Page, web_base_url):
+    """The model mirror of
+    test_host_change_before_hosts_resolve_survives_catalog_landing:
+    populateModelOptions() must read the LIVE select value at render
+    time, not the `currentModel` snapshot captured when the drawer first
+    opened — reading the snapshot would revert the operator's choice the
+    moment the catalog arrives, and a later unrelated save would then
+    resurrect the cleared model server-side."""
+    pending = []
+
+    def api_handler(route):
+        if "/api/agents/models" in route.request.url:
+            pending.append(route)  # stashed — fulfilled later in the test
+        elif "/api/agents/hosts" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+        elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
+            body = json.loads(route.request.post_data or "{}")
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": "t36", **body}))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    _render(page, {
+        "id": "t36", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude",
+        "fields": {"model": "claude-sonnet-5", "effort": "medium"},
+    })
+
+    model_select = page.locator("#test-assignment-container [data-field='model']")
+    # The models fetch hasn't resolved yet (stashed) — pick "engine
+    # default" right now, clearing the saved model, still inside the
+    # stashed window.
+    model_select.select_option("")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 1
+    assert calls[0]["patch"]["fields"]["model"] is None
+
+    # Now let the catalog land — the operator's LIVE choice ("engine
+    # default", value "") must survive, not revert to the stale
+    # "claude-sonnet-5".
+    for route in pending:
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+    pending.clear()
+    expect(model_select.locator("option")).to_have_count(3)  # default + 2 claude models
+    assert model_select.input_value() == ""  # NOT reverted to "claude-sonnet-5"
+
+    # A later, unrelated effort change must not resurrect the cleared model.
+    page.locator("[data-field='effort']").select_option("high")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert len(calls) == 2
+    assert calls[1]["patch"]["fields"]["model"] is None  # still cleared, not "claude-sonnet-5"
 
 
 def test_put_failure_surfaces_error_without_crashing(page: Page, web_base_url):
@@ -786,6 +1072,66 @@ def test_rejected_host_save_reverts_then_next_save_sends_reverted_value(page: Pa
     last = puts[-1]["fields"]
     assert last["effort"] == "high"
     assert last["host"] == "studio-box"  # NOT "laptop"
+
+
+def test_rejected_model_save_reverts_then_next_save_sends_reverted_value(page: Page, web_base_url):
+    """The model mirror of
+    test_rejected_host_save_reverts_then_next_save_sends_reverted_value: a
+    model change the server REJECTS must not ride along on the next
+    unrelated save, and exactly one error is surfaced for the rejection."""
+    reject_next_model = {"on": False}
+    puts = []
+
+    def api_handler(route):
+        if "/api/agents/hosts" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+        elif "/api/agents/models" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+        elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
+            body = json.loads(route.request.post_data or "{}")
+            puts.append(body)
+            if reject_next_model["on"] and body.get("fields", {}).get("model") == "claude-opus-5":
+                route.fulfill(status=409, content_type="application/json", body=json.dumps({"detail": "claude-opus-5 is unavailable"}))
+                return
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": "t52", **body}))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    page.evaluate(
+        """(card) => {
+            const container = document.createElement('div');
+            container.id = 'test-assignment-container';
+            document.body.appendChild(container);
+            window.__errorCalls = [];
+            window.__renderAssignmentPickers(container, card, {
+                onError: (message) => { window.__errorCalls.push(message); },
+            });
+        }""",
+        {"id": "t52", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {"model": "claude-sonnet-5", "effort": "medium"}},
+    )
+    model_select = page.locator("#test-assignment-container [data-field='model']")
+    expect(model_select.locator("option")).to_have_count(3)  # wait for the catalog
+
+    reject_next_model["on"] = True
+    model_select.select_option("claude-opus-5")
+    error_el = page.locator("#test-assignment-container [data-field='error']")
+    expect(error_el).to_contain_text("claude-opus-5 is unavailable")
+    # The select snaps back to the last-known-good model (claude-sonnet-5),
+    # NOT left showing the rejected "claude-opus-5" -- the same
+    # revert-on-failed-save convention every other drawer control follows.
+    expect(model_select).to_have_value("claude-sonnet-5")
+
+    # A later, unrelated effort change must send the REVERTED model, not
+    # the rejected one -- and no toast, since this save succeeds.
+    reject_next_model["on"] = False
+    page.locator("[data-field='effort']").select_option("high")
+    expect(error_el).to_be_hidden()
+    last = puts[-1]["fields"]
+    assert last["effort"] == "high"
+    assert last["model"] == "claude-sonnet-5"  # NOT "claude-opus-5"
+    error_calls = page.evaluate("() => window.__errorCalls")
+    assert len(error_calls) == 1  # exactly one error surfaced, for the rejection
 
 
 def test_successful_host_change_sticks_and_rides_along_on_next_save(page: Page, web_base_url):
