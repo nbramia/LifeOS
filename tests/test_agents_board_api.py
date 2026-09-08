@@ -418,6 +418,11 @@ class TestBoardStream:
             assert second.startswith("event: board\n")
             first_board = json.loads(second.split("data: ", 1)[1])
             assert task.id in [c["id"] for c in first_board["lanes"]["unassigned"]]
+            # The streamed frame carries the same api_host field GET
+            # /api/agents/board does, so a client reading the SSE stream
+            # can tell a card's assigned host apart from "this machine"
+            # too.
+            assert first_board["api_host"] == agents_route.api_host_name()
 
             # Round-2 finding 10: without a mutation, ticks must not emit —
             # the signature-diff suppression, not "any frame that shows up".

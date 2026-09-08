@@ -462,7 +462,9 @@ and the SSE update cadence.
 
 Full board view model, always built fresh (never cached): `{lanes:
 {unassigned, assigned, in_progress, human_queue, scheduled, review, done},
-generated_at}`. `kind` (`"task"` | `"schedule"`) is the first field of every
+generated_at, api_host}`. `api_host` names the machine running the API, so
+a client can tell a card's assigned host (`fields.host`) apart from "this
+machine". `kind` (`"task"` | `"schedule"`) is the first field of every
 card and the only discriminator between the two shapes below — both kinds
 can land in the `done` lane. Each task card carries `kind: "task"`, `id,
 title, notes, status, tags, assignee, fields, context, updated_at, session

@@ -974,6 +974,34 @@ class TestHostAssignmentChipAndFilter:
             },
             "pending_question": None,
         })
+        board_state["lanes"]["assigned"].append({
+            # Assigned to a host, ran on that same host — the duplicate
+            # case: exactly one chip (the assigned-host chip) renders, not
+            # both.
+            "kind": "task", "id": "t11", "title": "Assigned and ran on the same host",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"host": "build-box-5"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "s-t11", "status": "completed",
+                "host": "build-box-5", "routing": "claude_code",
+            },
+            "pending_question": None,
+        })
+        board_state["lanes"]["assigned"].append({
+            # No assignment at all, but a linked session ran somewhere —
+            # the ran-on chip still renders exactly as it does without F1's
+            # suppression logic in play.
+            "kind": "task", "id": "t12", "title": "No assignment, but a session ran",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "s-t12", "status": "completed",
+                "host": "build-box-6", "routing": "claude_code",
+            },
+            "pending_question": None,
+        })
         return board_state
 
     def test_assigned_host_chip_renders_distinctly_from_ran_on_chip(self, page: Page, agents_base_url):
@@ -994,6 +1022,18 @@ class TestHostAssignmentChipAndFilter:
         expect(page.locator('[data-card-id="t10"] .board-chip-assigned-host')).to_have_text("build-box-3")
         expect(page.locator('[data-card-id="t10"] .board-chip-host')).to_have_text("build-box-4")
 
+        # t11: assigned to and ran on the same host -> exactly one chip,
+        # the assigned-host chip, reading that name; the ran-on chip is
+        # suppressed rather than repeating it.
+        expect(page.locator('[data-card-id="t11"] .board-chip-assigned-host')).to_have_text("build-box-5")
+        expect(page.locator('[data-card-id="t11"] .board-chip-host')).to_have_count(0)
+        expect(page.locator('[data-card-id="t11"] .board-chip-assigned-host, [data-card-id="t11"] .board-chip-host')).to_have_count(1)
+
+        # t12: no assignment, but a linked session ran -> the ran-on chip
+        # still renders (no assignment chip was rendered to suppress it).
+        expect(page.locator('[data-card-id="t12"] .board-chip-assigned-host')).to_have_count(0)
+        expect(page.locator('[data-card-id="t12"] .board-chip-host')).to_have_text("build-box-6")
+
     def test_host_filter_options_include_an_assignment_only_host(self, page: Page, agents_base_url):
         board_state = self._board_with_host_cards()
         _open_board(page, agents_base_url, board_state=board_state)
@@ -1004,7 +1044,6 @@ class TestHostAssignmentChipAndFilter:
         page.set_viewport_size({"width": 1280, "height": 800})
         board_state = self._board_with_host_cards()
         _open_board(page, agents_base_url, board_state=board_state)
-        lane_count_before = page.locator(".board-lane").count()
 
         page.locator("#board-filter-host").select_option("build-box-2")
         expect(page.locator('[data-card-id="t8"]')).to_be_visible()
@@ -1018,7 +1057,23 @@ class TestHostAssignmentChipAndFilter:
         expect(page.locator('[data-card-id="t10"]')).to_be_visible()
         expect(page.locator('[data-card-id="t8"]')).to_have_count(0)
 
-        assert page.locator(".board-lane").count() == lane_count_before
+        # Acceptance criterion 4 ("leaves lane layout intact at 1280x800"):
+        # the page never grows a horizontal scrollbar, and every lane
+        # column filtering left on screen still has real width rather than
+        # collapsing to zero. `body` has `overflow: hidden` and #board-lanes
+        # is the element that actually carries `overflow-x: auto`, so it
+        # (not document.documentElement, which never grows past the
+        # viewport no matter how wide the lanes get) is where a real
+        # overflow would show up.
+        scroll_width, client_width = page.locator("#board-lanes").evaluate(
+            "el => [el.scrollWidth, el.clientWidth]"
+        )
+        assert scroll_width == client_width, (scroll_width, client_width)
+        lane_widths = page.locator(".board-lane").evaluate_all(
+            "els => els.map(e => e.getBoundingClientRect().width)"
+        )
+        assert lane_widths, "no lane columns rendered"
+        assert all(w > 0 for w in lane_widths), lane_widths
 
 
 class TestTabSwitching:

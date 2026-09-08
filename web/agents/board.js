@@ -322,13 +322,21 @@ export function initBoard() {
     // payload), every non-empty fields.host is treated as "other" — fail
     // visible rather than silently hiding the assignment.
     const assignedHost = card.fields && card.fields.host;
+    let assignedChipRendered = false;
     if (assignedHost && assignedHost !== board.api_host) {
       chips.push(`<span class="board-chip board-chip-assigned-host" title="assigned host">${escapeHtml(assignedHost)}</span>`);
+      assignedChipRendered = true;
     }
     // Observation chip: session.host is where a linked session DID run —
     // distinct from the assignment above (both render, distinguishably,
-    // when they differ).
-    if (card.session && card.session.host) chips.push(`<span class="board-chip board-chip-host" title="ran on">${escapeHtml(card.session.host)}</span>`);
+    // when they differ). Suppressed when it would repeat the assignment
+    // chip actually rendered above (the steady state once a worker
+    // dispatches to fields.host: the session it creates records that same
+    // host, so showing both would print the identical hostname twice on a
+    // narrow lane).
+    if (card.session && card.session.host && !(assignedChipRendered && card.session.host === assignedHost)) {
+      chips.push(`<span class="board-chip board-chip-host" title="ran on">${escapeHtml(card.session.host)}</span>`);
+    }
     for (const t of (card.tags || [])) {
       if (ASSIGNEES.includes(t.toLowerCase())) continue;  // already shown as the assignee chip
       chips.push(`<span class="board-chip board-chip-tag">#${escapeHtml(t)}</span>`);
