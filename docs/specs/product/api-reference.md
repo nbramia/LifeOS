@@ -597,7 +597,7 @@ Delete a schedule.
 
 ### POST /api/scheduler/{id}/trigger
 
-Manually fire a schedule (for testing).
+Manually fire a schedule immediately. For a `once` schedule this consumes it: the fire disables it and clears its next-fire time, exactly as an unattended fire would.
 
 ### POST /api/scheduler/send
 

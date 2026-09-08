@@ -148,7 +148,7 @@ curl -X POST http://localhost:8000/api/scheduler \
 - **List:** `GET /api/scheduler`, `lifeos_schedule_list`, or "list my schedules"
 - **Update:** `PUT /api/scheduler/{id}`, or edit the line in Obsidian
 - **Delete:** `DELETE /api/scheduler/{id}`, or "delete the … schedule"
-- **Test-fire:** `POST /api/scheduler/{id}/trigger`
+- **Trigger now:** `POST /api/scheduler/{id}/trigger` — fires immediately; for a `once` schedule this consumes it (disables it and clears its next fire), the same as if it had fired on its own.
 - **Pause all:** set `enabled: false` in `LifeOS/Scheduler/Scheduler.md`
 
 ## Obsidian Dashboard

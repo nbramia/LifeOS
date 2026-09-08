@@ -223,10 +223,106 @@ class TestUpdateScheduleValidation:
         assert resp.status_code == 200
         assert mock_store.update.call_args.kwargs["schedule_value"] == "0 7 * * *"
 
+    def test_type_change_alone_validated_against_the_stored_value_and_rejected(self, client, mock_store):
+        """A PUT that changes only schedule_type (no schedule_value in the
+        same request) validates the entry's STORED value against the NEW
+        type -- a bare type change that would leave the stored value
+        unparsable under its own type is rejected before anything is
+        written, rather than writing a schedule whose stored value no
+        longer matches its type."""
+        mock_store.get.return_value = _sample_entry(schedule_type="cron", schedule_value="0 9 * * *")
+        resp = client.put("/api/scheduler/sch-1", json={"schedule_type": "once"})
+        assert resp.status_code == 422
+        assert "0 9 * * *" in resp.text
+        mock_store.update.assert_not_called()
+
+    def test_type_and_value_together_convert_in_one_write(self, client, mock_store):
+        """The positive counterpart: submitting schedule_type and
+        schedule_value together lets a conversion succeed in a single
+        write, even though the entry's stored value doesn't parse under
+        the new type on its own."""
+        mock_store.get.return_value = _sample_entry(schedule_type="cron", schedule_value="0 9 * * *")
+        resp = client.put("/api/scheduler/sch-1", json={
+            "schedule_type": "once", "schedule_value": "2026-06-03T15:05:00",
+        })
+        assert resp.status_code == 200
+        kwargs = mock_store.update.call_args.kwargs
+        assert kwargs["schedule_type"] == "once"
+        assert kwargs["schedule_value"] == "2026-06-03T15:05:00"
+
     def test_no_fields_present_skips_all_validation(self, client, mock_store):
         resp = client.put("/api/scheduler/sch-1", json={"name": "Renamed"})
         assert resp.status_code == 200
         mock_store.update.assert_called_once()
+
+
+class TestScheduleTypeConversionAgainstARealStore:
+    """End-to-end proof of a cron<->once conversion against a real
+    SchedulerStore (not a mock), so a passing test means the stored entry
+    itself ends up correct -- not just that the mock received the right
+    kwargs."""
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        return SchedulerStore(vault_path=tmp_path / "vault", index_path=tmp_path / "idx.json")
+
+    def test_cron_to_once_conversion_succeeds_with_a_real_next_fire_time(self, client, store):
+        entry = store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="notify", message_type="static", message_content="hi",
+        )
+        with patch("api.routes.scheduler.get_scheduler_store", return_value=store):
+            resp = client.put(f"/api/scheduler/{entry.id}", json={
+                "schedule_type": "once", "schedule_value": "2099-06-03T15:05:00",
+            })
+        assert resp.status_code == 200
+        refreshed = store.get(entry.id)
+        assert refreshed.schedule_type == "once"
+        assert refreshed.schedule_value == "2099-06-03T15:05:00"
+        assert refreshed.next_trigger_at is not None
+
+    def test_once_to_cron_conversion_succeeds_with_a_real_next_fire_time(self, client, store):
+        entry = store.create(
+            name="One-off", schedule_type="once", schedule_value="2099-06-03T15:05:00",
+            action="notify", message_type="static", message_content="hi",
+        )
+        with patch("api.routes.scheduler.get_scheduler_store", return_value=store):
+            resp = client.put(f"/api/scheduler/{entry.id}", json={
+                "schedule_type": "cron", "schedule_value": "0 9 * * 6",
+            })
+        assert resp.status_code == 200
+        refreshed = store.get(entry.id)
+        assert refreshed.schedule_type == "cron"
+        assert refreshed.schedule_value == "0 9 * * 6"
+        assert refreshed.next_trigger_at is not None
+
+    def test_bare_type_change_that_would_strand_the_entry_leaves_it_completely_unchanged(self, client, store):
+        """The regression this guards against: a cron entry whose type
+        flips to "once" alone (schedule_value still the cron string) used
+        to write successfully, recompute next_trigger_at as None via the
+        swallowed parse error, and drop out of the active/Done bucketing.
+        The entry must come back byte-for-byte identical after the
+        rejected PUT."""
+        entry = store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="notify", message_type="static", message_content="hi",
+        )
+        before = store.get(entry.id)
+        with patch("api.routes.scheduler.get_scheduler_store", return_value=store):
+            resp = client.put(f"/api/scheduler/{entry.id}", json={"schedule_type": "once"})
+        assert resp.status_code == 422
+        after = store.get(entry.id)
+        assert after.schedule_type == before.schedule_type == "cron"
+        assert after.schedule_value == before.schedule_value == "0 9 * * 6"
+        assert after.next_trigger_at == before.next_trigger_at
+        assert after.next_trigger_at is not None
 
 
 class TestListBots:

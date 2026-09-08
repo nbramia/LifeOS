@@ -967,6 +967,7 @@ export function initBoard() {
           <div data-row="executor" ${card.action === 'agent' ? '' : 'hidden'}>
             <label class="drawer-label">Executor</label>
             <select class="drawer-select" data-field="executor">
+              <option value="" ${!card.executor ? 'selected' : ''}>default route</option>
               ${SCHEDULE_EXECUTORS.map(e => `<option value="${e}" ${card.executor === e ? 'selected' : ''}>${e}</option>`).join('')}
             </select>
           </div>
@@ -980,7 +981,7 @@ export function initBoard() {
       <div class="drawer-schedule-info" data-field="next-fire-preview"></div>
       <div class="drawer-schedule-info" data-field="last-run-info"></div>
       <div class="drawer-actions" data-field="actions">
-        <button class="drawer-action" data-action="trigger-now">Trigger now</button>
+        <button class="drawer-action" data-action="trigger-now">${card.schedule_type === 'once' ? 'Trigger now (disables this one-off)' : 'Trigger now'}</button>
       </div>
       `}
     `;
@@ -1114,7 +1115,11 @@ export function initBoard() {
   // a successful save. A rejected save shows the server's `detail` inline
   // next to the offending field (schedule value, timezone) or as a toast
   // (every other field), and snaps the control back to the last value the
-  // server actually accepted.
+  // server actually accepted. The schedule type select is the one
+  // exception: changing it only updates the value field's label and
+  // placeholder locally — it saves together with the schedule value, on
+  // the value field's own blur, so a type and a value that doesn't parse
+  // under it can never reach the server in the same write (see below).
   function renderScheduleDrawerFields(card) {
     const msgEl = drawerEl.querySelector('[data-field="message-content"]');
     msgEl.addEventListener('blur', async () => {
@@ -1126,7 +1131,16 @@ export function initBoard() {
 
     const enabledEl = drawerEl.querySelector('[data-field="enabled"]');
     enabledEl.addEventListener('change', async () => {
-      try { await putSchedule(card.id, { enabled: enabledEl.checked }); await fetchBoard(); }
+      try {
+        const resp = await putSchedule(card.id, { enabled: enabledEl.checked });
+        // The store recomputes next_trigger_at for an enabled change too
+        // (clearing it on disable) — refresh the preview from the
+        // response the same way the type/value/timezone saves do, since
+        // updateOpenDrawer skips its own rebuild while this checkbox
+        // holds focus.
+        previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        await fetchBoard();
+      }
       catch (err) { showToast(`Couldn't update enabled: ${err.message}`, true); enabledEl.checked = !!card.enabled; }
     });
 
@@ -1175,26 +1189,28 @@ export function initBoard() {
       botRow.hidden = isAgent;
     }
 
-    typeEl.addEventListener('change', async () => {
+    typeEl.addEventListener('change', () => {
+      // Type-only, with no matching value, is unsaveable by construction
+      // (a cron string and an ISO datetime never parse as each other) —
+      // saving it here would either write a type/value pair the server
+      // rejects, or one it accepts but that leaves a live schedule
+      // pointed at the wrong parser. So this only updates the label and
+      // placeholder; the value field's blur handler below carries the
+      // type along with whatever value the operator enters to match it,
+      // so a conversion always reaches the server as one matched pair.
       updateValueLabel(typeEl.value);
-      try {
-        const resp = await putSchedule(card.id, { schedule_type: typeEl.value });
-        lastSavedType = typeEl.value;
-        previewEl.textContent = formatNextFire(resp.next_trigger_at);
-        await fetchBoard();
-      } catch (err) {
-        showToast(`Couldn't save schedule type: ${err.message}`, true);
-        typeEl.value = lastSavedType;
-        updateValueLabel(lastSavedType);
-      }
     });
 
     valueEl.addEventListener('blur', async () => {
       const value = valueEl.value;
-      if (value === (lastSavedValue || '')) return;
+      const typeChanged = typeEl.value !== lastSavedType;
+      if (value === (lastSavedValue || '') && !typeChanged) return;
+      const patch = { schedule_value: value };
+      if (typeChanged) patch.schedule_type = typeEl.value;
       try {
-        const resp = await putSchedule(card.id, { schedule_value: value });
+        const resp = await putSchedule(card.id, patch);
         lastSavedValue = value;
+        if (typeChanged) lastSavedType = typeEl.value;
         valueErrorEl.hidden = true;
         valueErrorEl.textContent = '';
         previewEl.textContent = formatNextFire(resp.next_trigger_at);
@@ -1203,6 +1219,10 @@ export function initBoard() {
         valueErrorEl.textContent = err.message;
         valueErrorEl.hidden = false;
         valueEl.value = lastSavedValue || '';
+        if (typeChanged) {
+          typeEl.value = lastSavedType;
+          updateValueLabel(lastSavedType);
+        }
       }
     });
 
@@ -1261,26 +1281,41 @@ export function initBoard() {
     });
 
     // The bot select only ever offers names the API accepts — the empty
-    // option (primary) plus whatever GET /api/scheduler/bots returns —
-    // so picking an unaccepted name is structurally impossible. A failed
-    // fetch disables the select and shows the reason as visible text next
-    // to it, mirroring the host dropdown's unavailable-registry pattern
-    // (web/agents/assignment.js), rather than silently offering nothing.
+    // "default (primary)" option (distinguishable from the registry's own
+    // "primary" row) plus whatever GET /api/scheduler/bots returns — so
+    // picking an unaccepted name is structurally impossible. A stored name
+    // the registry response doesn't include (a bot renamed after the
+    // schedule was written) is appended as a selected, flagged-unknown
+    // option instead of leaving the select with no matching value, and a
+    // failed fetch disables the select and shows the reason as visible
+    // text next to it while still keeping that stored value visible the
+    // same way — mirroring the host dropdown's pattern
+    // (web/agents/assignment.js's seedHostOptions/populateHostOptions).
     loadBotCatalog().then(catalog => {
+      const stored = card.bot || '';
       if (!catalog) {
+        const optionsHtml = ['<option value="">default (primary)</option>'];
+        if (stored) {
+          optionsHtml.push(`<option value="${escapeHtml(stored)}" selected data-unknown="true">${escapeHtml(stored)} (unknown)</option>`);
+        }
+        botEl.innerHTML = optionsHtml.join('');
+        botEl.value = stored;
         botEl.disabled = true;
-        botEl.innerHTML = '<option value="">unavailable</option>';
         botReasonEl.textContent = 'bot registry unavailable — reopen to retry';
         botReasonEl.hidden = false;
         return;
       }
       const names = catalog.bots || [];
-      const options = ['<option value="">primary</option>'];
+      const known = names.includes(stored);
+      const options = ['<option value="">default (primary)</option>'];
       for (const name of names) {
-        options.push(`<option value="${escapeHtml(name)}" ${card.bot === name ? 'selected' : ''}>${escapeHtml(name)}</option>`);
+        options.push(`<option value="${escapeHtml(name)}" ${stored === name ? 'selected' : ''}>${escapeHtml(name)}</option>`);
+      }
+      if (stored && !known) {
+        options.push(`<option value="${escapeHtml(stored)}" selected data-unknown="true">${escapeHtml(stored)} (unknown)</option>`);
       }
       botEl.innerHTML = options.join('');
-      botEl.value = card.bot || '';
+      botEl.value = stored;
       botEl.disabled = false;
       botReasonEl.hidden = true;
       botReasonEl.textContent = '';
