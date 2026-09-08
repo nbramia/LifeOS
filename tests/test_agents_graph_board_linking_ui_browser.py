@@ -357,6 +357,32 @@ class TestSharedFilters:
         _open_agents(page, agents_base_url)  # a fresh goto() — same origin, same localStorage
         assert page.input_value("#board-filter-assignee") == "codex"
 
+    def test_host_filter_applies_across_tabs_and_survives_reload(self, page: Page, agents_base_url):
+        """`host` is one of the seven shared keys, but its `<select>` options
+        are populated asynchronously from snapshot/board data (unlike the
+        other six, which are static markup) — a naive sync can silently fail
+        to apply a persisted/cross-tab host value before the real option
+        exists. Needs two distinct hosts in the fixture: the single-host
+        SNAPSHOT/BOARD fixtures above auto-hide the host filter entirely."""
+        two_host_snapshot = dict(SNAPSHOT, sessions=[
+            dict(CLUSTER_1, host="host-a"),
+            dict(UNLINKED, host="host-b"),
+        ])
+        card_a = dict(CLUSTER_CARD, session=dict(CLUSTER_1, host="host-a"))
+        card_b = dict(QUESTION_CARD, session=dict(QUESTION_SESSION, host="host-b"))
+        two_host_board = dict(BOARD, lanes=dict(
+            BOARD["lanes"],
+            in_progress=[card_a],
+            human_queue=[card_b],
+        ))
+        _open_agents(page, agents_base_url, snapshot=two_host_snapshot, board=two_host_board)
+        page.select_option("#board-filter-host", "host-b")
+        page.wait_for_timeout(200)
+        _go_to_graph(page)
+        assert page.input_value("#filter-host") == "host-b"
+        _open_agents(page, agents_base_url, snapshot=two_host_snapshot, board=two_host_board)
+        assert page.input_value("#board-filter-host") == "host-b"
+
     def test_clear_resets_every_shared_filter(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)
         page.select_option("#board-filter-assignee", "codex")
