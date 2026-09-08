@@ -218,8 +218,12 @@ export function initBoard() {
   let _lastHostKey = '';
   let _lastContextKey = '';
   function updateFilterOptions() {
+    // Unions the assignment (fields.host — where a card WILL run) with the
+    // observation (session.host — where a session DID run), so a host a
+    // card is assigned to but hasn't run a session on yet still appears in
+    // the option list.
     const hosts = [...new Set(
-      allCards().map(c => c.session && c.session.host).filter(Boolean)
+      allCards().flatMap(c => [c.session && c.session.host, c.fields && c.fields.host]).filter(Boolean)
     )].sort();
     const hostKey = hosts.join('|');
     if (hostFilterEl && hostKey !== _lastHostKey) {
@@ -264,8 +268,12 @@ export function initBoard() {
 
     const hostSel = hostFilterEl?.value || 'all';
     if (hostSel !== 'all') {
-      const host = card.session && card.session.host;
-      if (host !== hostSel) return false;
+      // Matches on either the assignment or the observation — a
+      // card matches a selected host when its fields.host names it OR its
+      // linked session ran on it.
+      const sessionHost = card.session && card.session.host;
+      const assignedHost = card.fields && card.fields.host;
+      if (sessionHost !== hostSel && assignedHost !== hostSel) return false;
     }
 
     const tagQuery = (tagFilterEl?.value || '').trim().toLowerCase().replace(/^#/, '');
@@ -306,7 +314,29 @@ export function initBoard() {
     if (card.assignee) chips.push(`<span class="board-chip board-chip-assignee">${escapeHtml(card.assignee)}</span>`);
     if (card.fields && card.fields.model) chips.push(`<span class="board-chip">${escapeHtml(card.fields.model)}</span>`);
     if (card.fields && card.fields.effort) chips.push(`<span class="board-chip">${escapeHtml(card.fields.effort)}</span>`);
-    if (card.session && card.session.host) chips.push(`<span class="board-chip board-chip-host">${escapeHtml(card.session.host)}</span>`);
+    // Assignment chip: fields.host is where the card WILL run,
+    // written by the drawer's host dropdown. Rendered only when it names a
+    // machine other than the API host — a card assigned to "this machine"
+    // shows no assignment chip, matching the drawer's own "this machine"
+    // empty-choice semantics. If board.api_host is missing (older/broken
+    // payload), every non-empty fields.host is treated as "other" — fail
+    // visible rather than silently hiding the assignment.
+    const assignedHost = card.fields && card.fields.host;
+    let assignedChipRendered = false;
+    if (assignedHost && assignedHost !== board.api_host) {
+      chips.push(`<span class="board-chip board-chip-assigned-host" title="assigned host">${escapeHtml(assignedHost)}</span>`);
+      assignedChipRendered = true;
+    }
+    // Observation chip: session.host is where a linked session DID run —
+    // distinct from the assignment above (both render, distinguishably,
+    // when they differ). Suppressed when it would repeat the assignment
+    // chip actually rendered above (the steady state once a worker
+    // dispatches to fields.host: the session it creates records that same
+    // host, so showing both would print the identical hostname twice on a
+    // narrow lane).
+    if (card.session && card.session.host && !(assignedChipRendered && card.session.host === assignedHost)) {
+      chips.push(`<span class="board-chip board-chip-host" title="ran on">${escapeHtml(card.session.host)}</span>`);
+    }
     for (const t of (card.tags || [])) {
       if (ASSIGNEES.includes(t.toLowerCase())) continue;  // already shown as the assignee chip
       chips.push(`<span class="board-chip board-chip-tag">#${escapeHtml(t)}</span>`);

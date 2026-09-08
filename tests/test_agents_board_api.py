@@ -83,6 +83,14 @@ class TestGetBoard:
         }
         assert "generated_at" in body
 
+    def test_board_carries_api_host(self, client, stores, monkeypatch):
+        """The board's own payload names the API host, so the client
+        can tell a card's assigned host (`fields.host`) apart from "this
+        machine" without a separate round trip."""
+        monkeypatch.setattr(agents_route, "api_host_name", lambda: "board-api-host")
+        body = client.get("/api/agents/board").json()
+        assert body["api_host"] == "board-api-host"
+
     def test_get_board_never_served_from_stream_cache(self, client, stores):
         """Round-2 finding 6(a): GET /board must always build fresh — it
         must never read the TTL'd cache the stream's own tick uses.
@@ -410,6 +418,11 @@ class TestBoardStream:
             assert second.startswith("event: board\n")
             first_board = json.loads(second.split("data: ", 1)[1])
             assert task.id in [c["id"] for c in first_board["lanes"]["unassigned"]]
+            # The streamed frame carries the same api_host field GET
+            # /api/agents/board does, so a client reading the SSE stream
+            # can tell a card's assigned host apart from "this machine"
+            # too.
+            assert first_board["api_host"] == agents_route.api_host_name()
 
             # Round-2 finding 10: without a mutation, ticks must not emit —
             # the signature-diff suppression, not "any frame that shows up".
