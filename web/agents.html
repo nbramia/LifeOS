@@ -1135,6 +1135,13 @@
   .drawer-action:hover { border-color: var(--accent); }
   .drawer-action:disabled { opacity: 0.5; cursor: default; }
   .drawer-action:disabled:hover { border-color: var(--border); }
+  .drawer-action.danger {
+    background: var(--failed);
+    color: var(--bg-primary);
+    border-color: var(--failed);
+    font-weight: 600;
+  }
+  .drawer-action.danger:hover { filter: brightness(1.15); border-color: var(--failed); }
   .drawer-session { margin-top: 0.75rem; border-top: 1px solid var(--border); padding-top: 0.5rem; }
   .drawer-session .panel-header { padding: 0; border: none; }
   .drawer-session .events { max-height: 40vh; padding: 0.5rem 0; }

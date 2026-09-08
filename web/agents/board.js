@@ -909,6 +909,7 @@ export function initBoard() {
       <textarea class="drawer-notes" data-field="message-content" placeholder="Message…">${escapeHtml(card.message_content || '')}</textarea>
       <label class="drawer-label"><input type="checkbox" data-field="enabled" ${card.enabled ? 'checked' : ''} /> Enabled</label>
       <div class="drawer-schedule-hint">Name, message, and enabled save here through the scheduler API — for schedule type, timing, or executor, use the existing scheduler UI.</div>
+      <div class="drawer-actions" data-field="actions"></div>
       `}
     `;
     drawerEl.querySelector('[data-action="drawer-close"]').onclick = closeDrawer;
@@ -940,6 +941,7 @@ export function initBoard() {
         try { await putSchedule(card.id, { enabled: enabledEl.checked }); await fetchBoard(); }
         catch (err) { showToast(`Couldn't update enabled: ${err.message}`, true); enabledEl.checked = !!card.enabled; }
       });
+      renderDrawerActions(card);
       return;
     }
 
@@ -1179,10 +1181,15 @@ export function initBoard() {
       }]);
     }
 
+    // Delete is offered for every card the drawer can open — a task card
+    // (any lane, including review) or a scheduled card — and always sits
+    // last, after Cancel. It's the only drawer action styled `danger`.
+    buttons.push(['Delete', () => openDeleteModal(card), { danger: true }]);
+
     for (const [label, handler, opts] of buttons) {
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = 'drawer-action';
+      btn.className = opts && opts.danger ? 'drawer-action danger' : 'drawer-action';
       btn.textContent = label;
       if (opts && opts.reason) {
         // Disable-and-explain rather than hide, matching every other
@@ -1200,6 +1207,124 @@ export function initBoard() {
         actionsEl.appendChild(btn);
       }
     }
+  }
+
+  // Delete confirmation, mirroring panel.js's openKillModal — title,
+  // `.target` naming the card, cancel + danger confirm that disables and
+  // relabels itself while the request is in flight and re-enables on
+  // failure. A task card with a live, killable session (not a CLI-backed
+  // one, which this endpoint can't tear down) kills that session and its
+  // subagents first and only deletes once the kill succeeds; a CLI-backed
+  // live session is deleted without a kill attempt, since the operator has
+  // to close that pane by hand. A scheduled card never carries a session,
+  // so it always deletes straight through.
+  function openDeleteModal(card) {
+    const isTask = card.kind === 'task';
+    const label = isTask ? (card.title || card.id) : (card.name || card.id);
+    // Maps a card to its kill decision and note text — called both here
+    // (against the live card, not the possibly-stale drawer snapshot,
+    // since `updateOpenDrawer` skips rebuilding the drawer while it holds
+    // focus) and again at confirm time.
+    function killDecision(c) {
+      const hasLiveSession = !!(c.session && !TERMINAL.has(c.session.status));
+      const isCliSession = !!(c.session && (c.session.source === 'claude_code' || c.session.source === 'codex'));
+      const needsKill = isTask && hasLiveSession && !isCliSession;
+      let noteHtml;
+      if (needsKill) {
+        noteHtml = `<div class="descendants">Deleting this card will kill the running session and its subagents first, then remove the card. This can't be undone.</div>`;
+      } else if (isTask && hasLiveSession && isCliSession) {
+        noteHtml = `<div class="descendants">This card has a live ${escapeHtml(sourceLabelFor(c.session))} session that can't be killed from here — close its pane manually. Deleting removes the card. This can't be undone.</div>`;
+      } else {
+        noteHtml = `<div class="descendants">This can't be undone.</div>`;
+      }
+      return { needsKill, noteHtml };
+    }
+    let { needsKill, noteHtml } = killDecision(findCard(card.id) || card);
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-labelledby="delete-title">
+        <h2 id="delete-title">Delete card?</h2>
+        <div class="target">${escapeHtml(label)}</div>
+        ${noteHtml}
+        <div class="actions">
+          <button id="delete-cancel">Cancel</button>
+          <button class="danger" id="delete-confirm">Delete</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(backdrop);
+    // Guards dismissal (backdrop click / Cancel) while a confirm is in
+    // flight — without it, clicking the backdrop mid-request removes the
+    // modal out from under the confirm handler, which then re-enables a
+    // detached button on failure instead of the modal staying open.
+    let pending = false;
+    const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
+    backdrop.addEventListener('click', e => { if (!pending && e.target === backdrop) cleanup(); });
+    backdrop.querySelector('#delete-cancel').onclick = () => { if (!pending) cleanup(); };
+    backdrop.querySelector('#delete-confirm').onclick = async () => {
+      const confirmBtn = backdrop.querySelector('#delete-confirm');
+      // Re-resolve the card from the live board rather than trusting the
+      // snapshot captured when the modal opened — `updateOpenDrawer` skips
+      // rebuilding the drawer while it holds focus, so a card the worker
+      // claims after the drawer opened can still show a session-less
+      // snapshot here. Falls back to the captured `card` if it's vanished
+      // from the board entirely.
+      const fresh = findCard(card.id) || card;
+      const { needsKill: freshNeedsKill, noteHtml: freshNoteHtml } = killDecision(fresh);
+      if (freshNeedsKill && !needsKill) {
+        // The disclosed note didn't promise a kill but one is now
+        // required — update the note in place and make the operator
+        // confirm again against accurate text rather than killing a
+        // session they were never told about.
+        needsKill = freshNeedsKill;
+        backdrop.querySelector('.descendants').outerHTML = freshNoteHtml;
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = 'Delete';
+        return;
+      }
+      pending = true;
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = 'Deleting…';
+      try {
+        if (freshNeedsKill) {
+          const kr = await fetch(`/api/agents/sessions/${encodeURIComponent(fresh.session.session_id)}/kill`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),
+          });
+          if (!kr.ok) {
+            const text = await kr.text();
+            let msg = text;
+            try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+            throw new Error(`Kill failed: HTTP ${kr.status}: ${msg}`);
+          }
+          const killResult = await kr.json();
+          const failures = killResult.failures || [];
+          if (failures.length > 0) {
+            throw new Error(`Kill failed: ${failures.map(f => f.reason || f.session_id).join('; ')}`);
+          }
+        }
+        const deleteUrl = isTask
+          ? `/api/tasks/${encodeURIComponent(card.id)}`
+          : `/api/scheduler/${encodeURIComponent(card.id)}`;
+        const dr = await fetch(deleteUrl, { method: 'DELETE' });
+        if (!dr.ok) {
+          const text = await dr.text();
+          let msg = text;
+          try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+          throw new Error(msg || `HTTP ${dr.status}`);
+        }
+        pending = false;
+        cleanup();
+        closeDrawer();
+        showToast('Deleted.', false);
+        await fetchBoard();
+      } catch (err) {
+        showToast(`Delete failed: ${err.message}`, true);
+        pending = false;
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = 'Delete';
+      }
+    };
   }
 
   function openAnswerPrompt(card) {
