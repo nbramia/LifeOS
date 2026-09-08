@@ -999,9 +999,10 @@ export function initBoard() {
       </div>
       <div class="drawer-schedule-info" data-field="next-fire-preview"></div>
       <div class="drawer-schedule-info" data-field="last-run-info"></div>
-      <div class="drawer-actions" data-field="actions">
+      <div class="drawer-actions" data-field="schedule-actions">
         <button class="drawer-action" data-action="trigger-now">${card.schedule_type === 'once' ? 'Trigger now (disables this one-off)' : 'Trigger now'}</button>
       </div>
+      <div class="drawer-actions" data-field="actions"></div>
       `}
     `;
     drawerEl.querySelector('[data-action="drawer-close"]').onclick = closeDrawer;
