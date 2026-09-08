@@ -209,7 +209,16 @@ export function initBoard() {
       const current = hostFilterEl.value;
       hostFilterEl.innerHTML = '<option value="all">all hosts</option>'
         + hosts.map(h => `<option value="${escapeHtml(h)}">${escapeHtml(h)}</option>`).join('');
-      if (current && (current === 'all' || hosts.includes(current))) hostFilterEl.value = current;
+      // `host` is shared (linking.js) — the persisted/cross-tab value wins
+      // over the select's own pre-repopulation value once it's actually a
+      // valid option, so a host filter restored from localStorage before
+      // this option list existed yet still lands once it can.
+      const preferred = getFilters().host;
+      if (preferred && (preferred === 'all' || hosts.includes(preferred))) {
+        hostFilterEl.value = preferred;
+      } else if (current && (current === 'all' || hosts.includes(current))) {
+        hostFilterEl.value = current;
+      }
     }
 
     const contexts = [...new Set(

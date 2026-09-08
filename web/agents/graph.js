@@ -456,7 +456,14 @@ export function initGraph() {
     const current = filterHostEl.value;
     filterHostEl.innerHTML = '<option value="all">all</option>'
       + hosts.map(h => `<option value="${escapeHtml(h)}">${escapeHtml(h)}</option>`).join('');
-    if (current && (current === 'all' || hosts.includes(current))) {
+    // `host` is shared (linking.js) — the persisted/cross-tab value wins
+    // over the select's own pre-repopulation value once it's actually a
+    // valid option, so a host filter restored from localStorage before
+    // this option list existed yet still lands once it can.
+    const preferred = getFilters().host;
+    if (preferred && (preferred === 'all' || hosts.includes(preferred))) {
+      filterHostEl.value = preferred;
+    } else if (current && (current === 'all' || hosts.includes(current))) {
       filterHostEl.value = current;
     }
     const wrap = filterHostEl.closest('label');
@@ -469,13 +476,13 @@ export function initGraph() {
     const recencyRaw = filterRecencyEl ? filterRecencyEl.value : 'all';
     const recencySec = (recencyRaw === 'all') ? null : Number(recencyRaw);
     const cwdSel = filterCwdEl ? filterCwdEl.value : 'all';
-    const hostSel = filterHostEl ? filterHostEl.value : 'all';
-    // Lane/assignee/tag/engine ("route") are the shared filters —
+    // Lane/assignee/tag/engine ("route")/host are the shared filters —
     // read straight from the shared store rather than trusting the DOM
     // mirror (`#filter-lane` etc., kept in sync by `syncSharedControls`
     // below) is always up to date.
     const shared = getFilters();
     const route = shared.engine;
+    const hostSel = shared.host;
     const laneSet = new Set(shared.lanes);
     const assigneeSel = shared.assignee;
     const tagQuery = (shared.tag || '').trim().toLowerCase();
@@ -490,9 +497,10 @@ export function initGraph() {
       if (hostSel !== 'all' && s.host !== hostSel) return false;
       if (route !== 'all' && routingFilterValue(s) !== route) return false;
       if (status !== 'all' && s.status !== status) return false;
-      // `s.lane` is only ever absent from a row a fixture from before card/host anchors existed
-      // synthesized without it — treat that as "not excludable by lane"
-      // rather than hiding it, since a real snapshot row always carries one.
+      // `s.lane` is only ever absent from a fixture synthesized without it
+      // (predating card/host anchors) — treat that as "not excludable by
+      // lane" rather than hiding it, since a real snapshot row always
+      // carries one.
       if (s.lane != null && !laneSet.has(s.lane)) return false;
       if (assigneeSel !== 'all') {
         if (assigneeSel === 'unassigned') { if (s.assignee) return false; }
@@ -1202,7 +1210,7 @@ export function initGraph() {
       setFilter('recency', filterRecencyEl.value);
     });
   }
-  [filterStatusEl, filterCwdEl, filterHostEl].filter(Boolean).forEach(el =>
+  [filterStatusEl, filterCwdEl].filter(Boolean).forEach(el =>
     el.addEventListener('change', onFilterChange)
   );
 
@@ -1212,6 +1220,7 @@ export function initGraph() {
   // single select) sets the shared `lanes` array to just the chosen lane,
   // or every lane id for "all".
   if (filterRouteEl) filterRouteEl.addEventListener('change', () => setFilter('engine', filterRouteEl.value));
+  if (filterHostEl) filterHostEl.addEventListener('change', () => setFilter('host', filterHostEl.value));
   if (filterLaneEl) {
     filterLaneEl.addEventListener('change', () => {
       const v = filterLaneEl.value;
@@ -1469,6 +1478,14 @@ export function initGraph() {
 
   function syncSharedFilterControls(state) {
     if (filterRouteEl && filterRouteEl.value !== state.engine) filterRouteEl.value = state.engine;
+    // Only assigns when the shared host is already a valid option — the
+    // options list itself is dynamic (`updateHostOptions`, above), which
+    // also re-applies the shared value once a host that wasn't options yet
+    // becomes one.
+    if (filterHostEl && filterHostEl.value !== state.host) {
+      const validHosts = [...filterHostEl.options].map(o => o.value);
+      if (validHosts.includes(state.host)) filterHostEl.value = state.host;
+    }
     if (filterLaneEl) {
       const want = laneSelectValueFor(state);
       if (filterLaneEl.value !== want) filterLaneEl.value = want;
