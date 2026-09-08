@@ -124,7 +124,8 @@
   .chip.spend strong { color: var(--accent); }
   .filters {
     display: flex;
-    gap: 0.75rem;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.75rem;
     align-items: center;
     padding: 0.5rem 1.25rem;
     border-bottom: 1px solid var(--border);
@@ -229,8 +230,100 @@
   main {
     display: grid;
     grid-template-columns: 1fr var(--panel-width, 360px);
-    height: calc(100vh - 56px - 41px);
+    height: calc(100vh - 56px - 41px - 34px);
   }
+  /* Lane + engine legend — sits between the filters bar and the
+     graph, visible only while the Graph tab is active. */
+  .legend-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.25rem;
+    padding: 0.4rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-primary);
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+  }
+  .legend-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    align-items: center;
+  }
+  .legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    white-space: nowrap;
+  }
+  .legend-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+    display: inline-block;
+  }
+  .legend-glyph {
+    width: 11px;
+    height: 11px;
+    display: inline-block;
+    background: var(--text-secondary);
+  }
+  .legend-glyph-circle { border-radius: 50%; }
+  .legend-glyph-square { border-radius: 2px; }
+  .legend-glyph-diamond { transform: rotate(45deg); width: 9px; height: 9px; }
+  .legend-glyph-hexagon { clip-path: polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%); }
+  .legend-glyph-star { clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%); }
+  #graph-zoom-fit, #graph-zoom-reset {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.75rem;
+    cursor: pointer;
+  }
+  #graph-zoom-fit:hover, #graph-zoom-reset:hover { border-color: var(--accent); }
+  /* HTML hover card. Never intercepts pointer events so it can't itself
+     trigger mouseleave on the node underneath it. */
+  .hover-card {
+    position: fixed;
+    z-index: 50;
+    pointer-events: none;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.5rem 0.65rem;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    max-width: 260px;
+  }
+  .hover-card[hidden] { display: none; }
+  .hover-card .hc-title {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 0.3rem;
+    word-break: break-word;
+  }
+  .hover-card .hc-row { display: flex; gap: 0.4rem; justify-content: space-between; }
+  .hover-card .hc-label { color: var(--text-dim); }
+  .hover-card .hc-value { color: var(--text-secondary); text-align: right; word-break: break-word; }
+  /* Host column headers — SVG text in the zoomable viewport group,
+     so they pan/zoom with the nodes they label. */
+  .host-column-label {
+    font: 12px system-ui, -apple-system, sans-serif;
+    fill: var(--text-dim);
+    text-anchor: middle;
+    pointer-events: none;
+    user-select: none;
+  }
+  /* Node badges — question ring/glyph, error count, and the
+     collapsed-subagent-count badge. Offset from the node so they never
+     collide with its label. */
+  .node-badge-question { pointer-events: none; }
+  .node-badge-errors { pointer-events: none; }
+  .node-badge-children { font-weight: 600; }
   /* Drag handle on the left edge of the side panel — col-resize cursor,
      pure CSS visual feedback on hover/active. Drag logic in JS persists
      the width to localStorage so it survives reload. */
@@ -388,6 +481,22 @@
   .badge.status-ended { color: var(--completed); border-color: var(--completed); }
   .badge.status-failed,
   .badge.status-budget_exceeded { color: var(--failed); border-color: var(--failed); }
+  /* Model / engine / host / effort chips — display-only metadata,
+     never the node/panel name (that's the `.label` above). */
+  .panel-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    margin-top: 0.35rem;
+  }
+  .panel-chips .panel-chip {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    font-size: 0.68rem;
+    color: var(--text-secondary);
+  }
   .panel-empty {
     flex: 1;
     display: flex;
@@ -1003,6 +1112,10 @@
     font-weight: 600;
     color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
+    /* Lane accent — the same colour the graph tab uses for this
+       lane's node fill (web/agents/lanes.js), so the board and graph read
+       as one system. Colour set inline per-lane by board.js. */
+    border-top: 3px solid var(--border);
     display: flex;
     justify-content: space-between;
   }
@@ -1188,11 +1301,6 @@
     <span class="chip">recent <strong id="chip-recent">0</strong></span>
     <span class="chip" title="Claude Code CLI sessions (shown as boxes)">cc <strong id="chip-cc">0</strong></span>
     <span class="chip spend" title="API-billed spend: only LifeOS agent worker sessions (Claude Code CLI uses your subscription, not the API).">API spend <strong id="chip-spend">$0.00</strong></span>
-    <span class="chip legend" title="Node shapes: circle = cloud agent (Claude) · diamond = local agent · square = Claude Code CLI">
-      <span style="opacity:0.6">●</span> cloud &nbsp;
-      <span style="opacity:0.6">◆</span> local &nbsp;
-      <span style="opacity:0.6">■</span> cli
-    </span>
   </div>
 </header>
 
@@ -1295,7 +1403,13 @@
         <option value="failed">failed</option>
       </select>
     </label>
+    <button type="button" id="graph-zoom-fit" title="Fit all visible nodes into the viewport">Fit</button>
+    <button type="button" id="graph-zoom-reset" title="Reset zoom and pan">Reset</button>
     <span style="margin-left:auto;color:var(--text-dim);font-size:0.75rem" id="connection-state">connecting…</span>
+  </div>
+  <div class="legend-bar" id="graph-legend">
+    <span class="legend-group" id="graph-lane-legend" title="Node fill colour = board lane"></span>
+    <span class="legend-group" id="graph-engine-legend" title="Node shape = engine"></span>
   </div>
   <main>
     <section id="graph">
@@ -1305,6 +1419,7 @@
         <div class="label">No agent sessions yet</div>
         <div class="hint">Sessions will appear here when an <code>#agent</code> task is claimed.</div>
       </div>
+      <div class="hover-card" id="graph-hover-card" hidden></div>
     </section>
     <aside class="panel" id="panel-outer">
       <div class="panel-resizer" id="panel-resizer" title="Drag to resize"></div>

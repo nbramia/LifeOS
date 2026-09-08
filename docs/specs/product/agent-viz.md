@@ -42,6 +42,8 @@ The board is backed by the vault task store (`LifeOS/Tasks/`) — every card is 
 | **Review** | The agent worker's `#agent-completed` tag is set and the card hasn't been accepted yet. |
 | **Done** | Status `done` or `cancelled` (cancelled cards are hidden behind the "include cancelled" filter by default whenever the Done column is shown), plus scheduler entries that have fired (one-off) or been disabled (recurring). Hidden by default in the lane filter below — the least useful lane day to day. |
 
+Each lane header carries a small accent colour — the same palette the Graph tab uses for a node's fill, so a session's lane reads identically on both tabs.
+
 ### Human moves on agent-owned cards
 
 A card is agent-owned once its assignee is `#claude`, `#codex`, `#hermes`, or `#local`, OR the worker has already claimed it (see below) even with no assignee tag at all — the shape a bare `#agent` queue card is left in, since the worker's claim only ever swaps its own lifecycle tag and never adds an engine-specific assignee. An agent-owned card is managed by the agent — dragging one is more restricted than dragging a `#me` or unassigned card, which can be dragged between every lane a human may drop a card into.
@@ -93,38 +95,68 @@ Card reordering within a lane — file order is lane order. See the Kanban overh
 
 ## Graph tab — what you see
 
-The Graph tab is a force-directed graph of sessions, laid out left-to-right by recency. Each node is one session:
+The Graph tab is a force-directed session map, laid out in labelled columns
+by host. Each node is one session:
 
 | Encoding | Meaning |
 |---|---|
-| **Shape — circle** | Cloud agent — routed to Claude (`routing: claude`) |
-| **Shape — diamond** | Local agent — routed to local Gemma (`routing: local`) |
-| **Shape — rounded square** | CLI session — Claude Code (`source: claude_code`, ids prefixed `cc:`) or Codex (`source: codex`, ids prefixed `cx:`). Tell them apart via the `source` badge in the side panel or the `model_label` chip on the node. |
-| **Color** | Status — green running, blue claimed, amber blocked / paused, grey done, red failed |
-| **Size** | Log-scaled by total tokens (input + output + cache). A 100k-token session is roughly 2× a 1k-token session, not 100×. Capped so one fat node can't dominate the canvas. |
+| **Fill colour** | The session's board lane (the same lane a linked task shows in on the Board tab) — a lane colour legend on the graph tab lists every lane and its swatch. A session's fill uses reduced opacity once it's terminal; the stroke stays the status colour, thicker for `blocked`. |
+| **Shape** | Engine: square = Claude Code, hexagon = Codex, star = Hermes (also covers the `#cloud`/remote-provider path), diamond = Local, circle = Claude (the Managed Agents cloud model). A shape legend on the graph tab names all five. |
+| **Size** | A monotonic function of `total_active_seconds` (floored and capped) — how long the session has actually been working, not how much it's cached. Two sessions with equal active time render the same size regardless of token counts. |
+| **Secondary ring** | A thin accent ring around the node sized by tool-call count. |
+| **Question badge** | A small ring + `?` glyph, offset from the label, when a pending question is open for the operator on this session. |
+| **Error badge** | A count, offset from the label, when `error_count > 0`. |
+| **Collapsed-subagent badge** | On a parent with subagents: `+N` for the currently-hidden direct-child count, or a plain collapse glyph once fully expanded. Click to toggle. |
 | **White pulsing border** | Session is `running` AND has written to its transcript in the last 60 seconds (i.e. *actively producing output right now*) |
-| **Edge** | Spawn relationship — parent → subagent |
-| **X position** | Last-activity recency. Most recent sessions to the right, ≥24h old pinned to the left. The recency rail compresses around center when few nodes are visible — one filtered-down node ends up centered, two sit on a narrow band — and stretches to the full width as more nodes appear. |
-| **Edge styling** | Plain curved paths (no arrowheads) between parents and subagents. When a node is selected, edges adjacent to it brighten to white. |
+| **Edge** | Spawn relationship — parent → subagent. Hidden while the subagent side is collapsed. |
+| **Position** | Columns group nodes by host (column header: `<host> · <count>`); inside a column, a lane sub-band groups nodes by the same lane the fill colour encodes. Recency is a filter only, not a position signal. |
 
-Shape encodes *where the agent runs*, not whether it is a subagent — a Task/Agent-tool subagent takes the same shape as any other session with its routing (a Claude Code subagent is a rounded square, like its parent). Subagents are distinguished by the spawn edge connecting them to their parent, not by shape.
+**Node label** — the text under each node, first non-empty of: an
+operator-pinned custom label, the derived label (task description for
+LifeOS, first non-empty user message for Claude Code — the same value a
+linked board card shows as its title), the AI-generated short summary, the
+most recent prompt preview (cross-machine CLI sessions), the routing name,
+then the first 8 characters of the session id as a last resort. The
+operator-pinned custom label, the derived label, and the AI-generated
+short summary are each skipped when they're not a real label but the raw
+id the row fell back to (the session id, that id with its `cc:`/`cx:` CLI
+prefix stripped, or the row's task id). The model badge (`model_label`)
+is never a candidate here — it renders only as a chip (the hover card, the
+side panel's chip row, the Hermes routing badge), so two sessions on the
+same model never read as the same node. A node never renders a bare `?`.
 
-The simulation converges in ~8 seconds and then stops, so the graph stops jittering once it settles. New snapshots arrive every 2 seconds and only nudge nodes whose positions are now misleading.
+### Subagent trees
 
-**Node label** — the text under each node, first non-empty of: an operator-pinned custom label, the AI-generated short summary, the derived label (task description for LifeOS, first non-empty user message for Claude Code), the most recent prompt preview (cross-machine CLI sessions), the routing/model badge, then the session id as a last resort. The operator-pinned custom label, the AI-generated short summary, and the derived label are each skipped when they're not a real label but the raw id the row fell back to (the session id, that id with its `cc:`/`cx:` CLI prefix stripped, or the row's task id) — including a short summary the summarizer itself derived from that same raw id, which it also declines to reformat and hand back. A node never renders a bare `?`; in practice the routing/model badge always resolves to something, so the session-id fallback is a safety net rather than something you'll see on screen.
+A session with a parent (a Task/Agent-tool subagent) is hidden by default;
+its parent shows the collapsed-subagent badge above. Clicking the badge
+expands the children (and their own spawn edges) into view; clicking again
+collapses them back. Searching for a session inside a collapsed tree
+expands its ancestors automatically so the match is visible.
 
-### Canvas controls
+### Hover card and canvas controls
 
-The graph mirrors `/crm/graph`'s pointer model:
+Hovering a node shows an HTML card near the cursor — name, host,
+branch or cwd, model and effort, cost, duration, and the last event kind —
+with no delay; moving off hides it.
 
-- **Drag a node** — pins it where you drop it. Useful when you want to inspect a busy cluster without the simulation nudging things around.
+- **Drag a node** — pins it where you drop it.
 - **Drag the empty background** — pans the whole graph.
 - **Scroll-wheel / pinch** — zooms in and out (0.2× – 5×).
-- **Click a node** — opens its transcript in the side panel and highlights its parent/child relationships (selected node gets a thick white border, 1-hop neighbors get a thinner white border, everything else dims).
-- **Click the same node again, or click empty background** — deselects and closes the panel.
+- **Fit / Reset buttons** — Fit frames every visible node into the
+  viewport; Reset returns to the default pan/zoom.
+- **Click a node** — opens its transcript in the side panel immediately
+  (no artificial delay) and highlights its parent/child relationships
+  (selected node gets a thick white border, 1-hop neighbors get a thinner
+  white border, everything else dims).
+- **Double-click a non-subagent Claude Code or Codex node** — jumps focus
+  to its terminal (see [Operator controls — resume and Go To](#graph-tab--operator-controls--resume-and-go-to)); the side panel opening on the first click of the pair is expected.
+- **Click the same node again, or click empty background** — deselects and closes the panel. Double-clicking a non-subagent Claude Code or Codex node is the exception: the pair's first click closes the panel and the double-click reopens it on that same session as focus jumps to its terminal.
 - **Filter change** — releases any drag-pinned positions and resets the pan/zoom transform so the new visible set lays out from scratch at the natural scale.
 
-Between filter operations the simulation **freezes after settling** (~6s). Snapshot ticks every 2s only re-energize the layout if the visible-id set actually changed — new session appeared or one dropped out. Same-set snapshots leave settled nodes alone, so the graph no longer jitters every couple seconds at rest.
+The simulation restarts whenever the visible-id set OR any visible node's
+size changes (a session growing in active seconds reheats the layout, not
+just a session appearing or disappearing), and auto-stops 8 seconds after
+its last restart.
 
 ---
 
@@ -173,7 +205,7 @@ transcript existing here doesn't mean the CLI is actually running here.
 
 ## Graph tab — Status semantics
 
-A node's color is its status. The set is slightly different per source — same broad categories, different precise meaning:
+A node's stroke colour is its status. The set is slightly different per source — same broad categories, different precise meaning:
 
 | Status | LifeOS agent worker | CLI (Claude Code or Codex) |
 |---|---|---|
@@ -225,13 +257,14 @@ Chips re-compute after every snapshot tick, so toggling `include finished` immed
 
 Clicking any node opens a panel on the right with that session's metadata header and a live-tailing event feed. The panel header carries:
 
-- **Label** — the operator-pinned custom label if set, else the derived label (task description for LifeOS, first non-empty user message for Claude Code), else the session id. The AI-generated short summary and the most recent prompt preview (cross-machine CLI sessions) are shown as their own separate rows below the header, not folded into this name — see the **Node label** precedence in [Graph tab — what you see](#graph-tab--what-you-see) for the fuller chain the *graph node* uses instead. **Click it to rename:** the title becomes a text box prepopulated with the current name; Enter (or clicking away) saves, Escape cancels. A manual name is pinned durably and overrides every other source everywhere the node is named (graph node, panel, search), except that a manual name identical to the row's own raw id is skipped by the graph node and the search dropdown the same way any other raw-id label is. Saving an empty value clears the override and reverts to auto-naming.
+- **Label** — the same precedence chain the graph node uses (see **Node label** in [Graph tab — what you see](#graph-tab--what-you-see)), so the header never shows a session's raw id when the node or the search dropdown wouldn't. **Click it to rename:** the title becomes a text box. It opens prepopulated with the current custom label or derived label, or empty when neither is a real name (only a raw id) — so blurring without typing never persists a raw id as the custom label. Enter (or clicking away) saves, Escape cancels. A manual name is pinned durably and overrides every other source everywhere the node is named (graph node, panel, search), except that a manual name identical to the row's own raw id is skipped by the graph node and the search dropdown the same way any other raw-id label is. Saving an empty value clears the override and reverts to auto-naming.
 - **cwd** — Claude Code only; the project directory the session was opened in.
 - **Branch** — the git branch of that cwd, when a registration event supplied one. Blank for sessions with no cross-machine registration (e.g. a local Claude Code transcript with no hook installed).
-- **Status badge** — same status the node is colored by, with `(inferred)` if applicable.
+- **Status badge** — the status the node's stroke encodes, with `(inferred)` if applicable.
 - **Source** — `LifeOS agent` or `Claude Code`.
 - **Host badge** — the machine the session is running on.
-- **Routing** — a plain badge, one of `Local`, `Claude Code`, `Codex`, `Remote`, `Hermes`, `Ask` (parked waiting on the operator, no model running), or `Claude` — never a model name. It shows the raw routing value for every routing, `Hermes` included. The model a Hermes session actually ran on is recorded per session and carried in the snapshot's `model_label` field as `Hermes · <model>` once one of that session's own turns reports a model, but in practice no surface of the page renders that enriched value: the Routing badge is always plain, and the graph node reaches `model_label` only as a late name fallback that a card with a title never gets to — see **Node label** in [Graph tab — what you see](#graph-tab--what-you-see), and [Agent Viz — Technical § LifeOS agent ingest](../technical/agent-viz.md#lifeos-agent-ingest) for how the value is written and read.
+- **Routing** — a plain badge, one of `Local`, `Claude Code`, `Codex`, `Remote`, `Hermes`, `Ask` (parked waiting on the operator, no model running), or `Claude` — never a model name, EXCEPT for a Hermes session that has taken at least one turn: its badge shows `model_label` (`Hermes · <model>`, the honest per-session attribution the server records once that session's own turn reports a model) instead of the plain `Hermes` name. A Hermes session with no turn yet, and every non-Hermes session, show exactly the plain routing name.
+- **`.panel-chips` row** — small chips below the header: `model_label` and the engine name (from the same five-engine mapping the node's shape uses), each dropped when its text already equals the Routing badge's text above it, plus the effort when present. The host is not repeated here — the meta row's host badge already shows it. Display-only metadata, never the header's name.
 - **Cost** — `total_dollars` to 4 decimals. For Claude Code, this is cache-aware accounting (separately tracking input, output, cache_creation @ 1.25× and cache_read @ 0.10×).
 - **Tokens** — `input↓ / output↑`.
 - **Depth badge** — if the session is a child, shows spawn depth.

@@ -402,6 +402,31 @@ def _read_cli_transcript_events(session_id: str) -> list[dict[str, Any]]:
     raise ValueError(f"unsupported session_id prefix: {session_id!r}")
 
 
+def _lane_for_session_dict(sd: dict[str, Any]) -> str:
+    """`agent_board.lane_for_session`, wired to a snapshot row's `task_id`.
+
+    The task lookup mirrors `_label_for_session`'s (a cheap in-memory dict
+    read on the `TaskManager` singleton) — a session dict with no `task_id`,
+    or whose task isn't found, derives its lane from its own status alone.
+    """
+    from api.services import agent_board
+
+    task_id = sd.get("task_id")
+    task_status: str | None = None
+    task_tags: list[str] = []
+    if task_id:
+        try:
+            from api.services.task_manager import get_task_manager
+
+            task = get_task_manager().get(task_id)
+            if task is not None:
+                task_status = task.status
+                task_tags = list(task.tags)
+        except Exception as exc:  # noqa: BLE001 — defensive: never break the snapshot on a lane lookup
+            logger.debug("task_manager lookup failed for %s: %s", task_id, exc)
+    return agent_board.lane_for_session(sd.get("status"), task_status, task_tags)
+
+
 def _build_snapshot() -> dict[str, Any]:
     session_store = _get_session_store()
     transcript_store = _get_transcript_store()
@@ -578,6 +603,22 @@ def _build_snapshot() -> dict[str, Any]:
         )
         sd["custom_label"] = agent_viz_label_override.get_override(cli.session_id)
         session_dicts.append(sd)
+
+    # Board lane + pending-question fields, additive — applied last,
+    # uniformly, to every row regardless of source (local, cc/cx, mirrored,
+    # or synthetic-remote), so a row built by any branch above still ends up
+    # with both fields set.
+    try:
+        open_question_by_session = {
+            q["session_id"]: q for q in session_store.list_open_questions()
+        }
+    except Exception as exc:  # noqa: BLE001 — never break the snapshot on a store error
+        logger.warning("open questions read failed: %s", exc)
+        open_question_by_session = {}
+    for sd in session_dicts:
+        sd["lane"] = _lane_for_session_dict(sd)
+        pq = open_question_by_session.get(sd.get("session_id"))
+        sd["pending_question"] = _pending_question_view(pq) if pq else None
 
     return {
         "sessions": session_dicts,
@@ -900,6 +941,21 @@ def _card_policy(task, session_store: SessionStore) -> dict[str, Any]:
     }
 
 
+def _pending_question_view(pq: dict[str, Any]) -> dict[str, Any]:
+    """The `pending_question` shape rendered on both a board task card
+    (`_task_card`) and a snapshot session row (`_build_snapshot`) — one
+    function so the two can never disagree about what a raw
+    `pending_questions` row (`session_store.list_open_questions()`) means.
+    """
+    return {
+        "id": pq["id"],
+        "session_id": pq["session_id"],
+        "question": pq["question"],
+        "asked_at": pq["sent_at"],
+        "bot": pq.get("bot"),
+    }
+
+
 def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
                 open_question_by_task: dict[str, dict[str, Any]],
                 session_store: SessionStore) -> dict[str, Any]:
@@ -920,16 +976,7 @@ def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
         "context": task.context,
         "updated_at": task.updated_at,
         "session": session,
-        "pending_question": (
-            {
-                "id": pq["id"],
-                "session_id": pq["session_id"],
-                "question": pq["question"],
-                "asked_at": pq["sent_at"],
-                "bot": pq.get("bot"),
-            }
-            if pq else None
-        ),
+        "pending_question": _pending_question_view(pq) if pq else None,
         "policy": _card_policy(task, session_store),
     }
 
