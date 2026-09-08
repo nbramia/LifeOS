@@ -8238,6 +8238,20 @@
                                     <div class="contact-grid-compact" id="contactInfoCompact"></div>
                                 </div>
 
+                                <!-- Tone: hidden for the owner's own page and for anyone with no
+                                     iMessage history at all (person.sources must include
+                                     'imessage' -- the tone pipeline only ever reads iMessage, so a
+                                     WhatsApp/Slack/phone-only person can never have anything to
+                                     show here); shown/hidden by updatePersonToneCard() -->
+                                <div class="overview-panel" id="personToneCard" style="display: none;">
+                                    <div class="overview-panel-header">
+                                        <span class="overview-panel-title">Tone</span>
+                                    </div>
+                                    <div id="personToneContent">
+                                        <div class="viz-loading" style="text-align: left; padding: 0;">Loading...</div>
+                                    </div>
+                                </div>
+
                                 <!-- Notes -->
                                 <div class="notes-panel-compact">
                                     <div class="overview-panel-header" style="display: flex; justify-content: space-between; align-items: center;">
@@ -8712,6 +8726,35 @@
         // AbortController for the in-flight people search, so a slower
         // earlier response can't overwrite a newer query's results.
         let currentPeopleSearchController = null;
+        // AbortController for the in-flight person-overview tone summary
+        // request, so a person switch (or a second click of "Analyze"/
+        // refresh) can't let a stale response render over a newer one.
+        let personToneController = null;
+        // Whether the tone summary currently in flight (or most recently
+        // rendered) for the overview card was a compute=true attempt --
+        // mirrors toneCacheWasRefreshAttempt on the Relationship page, used
+        // the same way: an attempt that came back with nothing new is worth
+        // a one-line failure notice, an ordinary compute=false load is not.
+        let personToneWasComputeAttempt = false;
+        // The `months` value the overview Tone card always requests -- it
+        // never overrides the backend's own default, so this is only used
+        // client-side for display text ("No iMessage in the last N months").
+        const TONE_CARD_MONTHS = 12;
+        // Whether the overview Tone card is currently in "another
+        // computation is already running" mode, entered only from a
+        // compute=true response with status "in-progress" and left only
+        // once a compute=false poll turns up a real score or the poll
+        // budget below is exhausted -- a plain compute=false response can
+        // never itself report "in-progress" (see analyzePersonTone's
+        // docstring), so this flag is what keeps the card in that state
+        // across the polls in between.
+        let personToneInProgressMode = false;
+        // Handle for the pending "poll again in 5s" timeout, and how many
+        // polls have fired so far for the current in-progress wait.
+        let personTonePollTimer = null;
+        let personTonePollAttempts = 0;
+        const TONE_POLL_INTERVAL_MS = 5000;
+        const TONE_POLL_MAX_ATTEMPTS = 60; // 60 * 5s = 5 minutes
         // People list filters (multi-select)
         let peopleCategoryFilters = new Set(['self', 'family', 'personal']);  // Work excluded by default
         let peopleDunbarFilters = new Set(['0', '1', '2', '3', '4', '5', '6+']);
@@ -10694,6 +10737,10 @@
             // Hero stats row
             renderHeroStats(person);
 
+            // Tone card (not the owner's own page, and only when there are
+            // message interactions to analyze)
+            updatePersonToneCard(person);
+
             // Heat map calendar - load with max years, then auto-select based on actual data
             // Start with 10 years to get all data, will be adjusted after loading
             heatmapYears = 10;
@@ -12469,6 +12516,288 @@
         // of every month in the window, bypassing the freshness cache.
         function refreshToneAnalysis() {
             loadToneAnalysis(true);
+        }
+
+        // ===============================
+        // Person overview Tone card
+        // ===============================
+        // Compact combined-score summary shown on a person's overview tab
+        // (not the Relationship page's own Tone Evolution card, which is
+        // unaffected by any of this). Backed by the compact
+        // POST /relationship/tone-analysis endpoint.
+
+        // Shown only for a person who isn't the owner and has ever had
+        // iMessage history -- gated on person.sources including 'imessage',
+        // already available on the person object with no extra request.
+        // The tone pipeline only ever reads source_type="imessage", so a
+        // WhatsApp/Slack/phone-only person can never have anything for it
+        // to show; the specific 12-month window can still turn up empty
+        // even for an iMessage person (status "no-messages" below handles
+        // that distinctly from "not yet analyzed").
+        function updatePersonToneCard(person) {
+            const card = document.getElementById('personToneCard');
+            if (!card) return;
+
+            const hasImessage = Array.isArray(person.sources) && person.sources.includes('imessage');
+            if (isMyPage(person.id) || !hasImessage) {
+                card.style.display = 'none';
+                if (personToneController) {
+                    personToneController.abort();
+                    personToneController = null;
+                }
+                stopPersonTonePolling();
+                personToneInProgressMode = false;
+                return;
+            }
+
+            card.style.display = '';
+            personToneWasComputeAttempt = false;
+            stopPersonTonePolling();
+            personToneInProgressMode = false;
+            const content = document.getElementById('personToneContent');
+            if (content) {
+                content.innerHTML = '<div class="viz-loading" style="text-align: left; padding: 0;">Loading...</div>';
+            }
+            loadPersonToneSummary(person.id, false);
+        }
+
+        // Fetch the compact tone summary for `personId`. `compute=false`
+        // (the default) only reads whatever is already stored, at the cost
+        // of one lightweight query -- never an LLM call; the "Analyze
+        // tone"/refresh control and the in-progress poll below are the
+        // only paths that pass `compute=true` / re-read while waiting.
+        // A person switch (or a second call for the same person) aborts
+        // whatever tone request is still in flight, and the response is
+        // dropped if it arrives after either that abort or a further
+        // person switch -- the in-flight AbortController is checked for
+        // identity, the same pattern loadPeople() uses for search requests.
+        async function loadPersonToneSummary(personId, compute = false) {
+            if (personToneController) {
+                personToneController.abort();
+            }
+            const controller = new AbortController();
+            personToneController = controller;
+            if (compute) {
+                personToneWasComputeAttempt = true;
+            }
+
+            try {
+                const params = new URLSearchParams({ person_id: personId });
+                if (compute) params.set('compute', 'true');
+                const data = await api(`/relationship/tone-analysis?${params}`, {
+                    method: 'POST',
+                    signal: controller.signal,
+                });
+                if (personToneController !== controller || selectedPersonId !== personId) {
+                    return; // superseded by a later request or a person switch
+                }
+                renderPersonToneCard(personId, data);
+            } catch (error) {
+                if (error?.name === 'AbortError') return;
+                if (personToneController !== controller || selectedPersonId !== personId) {
+                    return;
+                }
+                console.error('Failed to load person tone summary:', error);
+                const content = document.getElementById('personToneContent');
+                if (content) {
+                    content.innerHTML = '<div class="viz-loading" style="text-align: left; padding: 0;">Unable to load tone analysis</div>';
+                }
+            }
+        }
+
+        // "Analyze tone" / refresh control: forces the persisted pipeline
+        // to (re)compute any stale or missing month for this person. A
+        // fresh click always resets any earlier in-progress poll (see
+        // schedulePersonTonePoll) so its budget doesn't carry over.
+        function analyzePersonTone(personId) {
+            if (selectedPersonId !== personId) return;
+            stopPersonTonePolling();
+            personToneInProgressMode = false;
+            const content = document.getElementById('personToneContent');
+            if (content) {
+                content.innerHTML = `
+                    <div style="font-size: 0.75rem; color: var(--text-muted);">Analyzing tone…</div>
+                    <button class="extract-facts-btn" id="personToneActionBtn" disabled style="margin-top: 0.5rem; opacity: 0.5;">Analyze tone</button>
+                `;
+            }
+            loadPersonToneSummary(personId, true);
+        }
+
+        // Cancel any pending "poll again in 5s" timeout and reset its
+        // attempt counter. Called on every person switch/reload and at the
+        // start of a fresh Analyze click, and also once polling itself
+        // decides it's done (real data arrived, or the budget ran out).
+        function stopPersonTonePolling() {
+            if (personTonePollTimer) {
+                clearTimeout(personTonePollTimer);
+                personTonePollTimer = null;
+            }
+            personTonePollAttempts = 0;
+        }
+
+        // Schedule the next compute=false re-read while status is
+        // "in-progress" (another request holds this person's lock).
+        // Self-terminates via TONE_POLL_MAX_ATTEMPTS -- renderPersonToneCard
+        // checks that count on each poll's response and drops out of
+        // in-progress mode (never rendering "failed") once it's exhausted.
+        function schedulePersonTonePoll(personId) {
+            personTonePollAttempts++;
+            personTonePollTimer = setTimeout(() => {
+                if (selectedPersonId !== personId) {
+                    stopPersonTonePolling();
+                    return;
+                }
+                loadPersonToneSummary(personId, false);
+            }, TONE_POLL_INTERVAL_MS);
+        }
+
+        // "YYYY-MM" -> "Mon YYYY", parsed as local-time year/month (not
+        // `new Date(monthKey + '-01')`, which parses as UTC midnight and can
+        // roll back a day west of UTC -- same reasoning as the Relationship
+        // page's own month-label formatting in renderToneTimeline()).
+        function formatToneMonth(monthKey) {
+            if (!monthKey) return '';
+            const [y, m] = monthKey.split('-').map(Number);
+            return new Date(y, m - 1, 1).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+        }
+
+        // "YYYY-MM" -> an absolute month number (year*12+month), so points
+        // can be positioned by real calendar distance rather than array
+        // index -- a month with zero interactions (and therefore absent
+        // from `monthlyTones` entirely) then leaves genuine empty space
+        // instead of being silently compressed out.
+        function toneMonthToAbsolute(monthKey) {
+            const [y, m] = monthKey.split('-').map(Number);
+            return y * 12 + m;
+        }
+
+        // Small inline sparkline of monthly combined scores (0-100),
+        // positioned by calendar-month distance (see toneMonthToAbsolute).
+        // A "stale" month (a real, stored score the server couldn't
+        // refresh this load) is a dimmed, dashed dot still on the line; an
+        // "error" month (nothing was ever stored for it -- mirroring the
+        // detailed endpoint's own placeholder) gets its own small "not
+        // analysed" marker off the line entirely, at its own calendar
+        // position, exactly like the Relationship page's error markers.
+        // The connecting line breaks wherever two consecutive real scores
+        // aren't calendar-adjacent months, whether the gap is an error
+        // month or one with no interactions at all.
+        function buildPersonToneSparkline(monthlyTones) {
+            const width = 220;
+            const height = 36;
+            const topPad = 4;
+            const chartHeight = height - topPad * 2;
+
+            const absValues = monthlyTones.map(t => toneMonthToAbsolute(t.month));
+            const minAbs = Math.min(...absValues);
+            const maxAbs = Math.max(...absValues);
+            const span = Math.max(1, maxAbs - minAbs);
+            const xFor = (abs) => (width * (abs - minAbs)) / span;
+
+            const scoredPoints = monthlyTones
+                .map((t, i) => ({ t, abs: absValues[i] }))
+                .filter(({ t }) => t.status !== 'error')
+                .map(({ t, abs }) => ({
+                    x: xFor(abs),
+                    y: topPad + chartHeight - (t.score / 100) * chartHeight,
+                    abs,
+                    stale: t.status === 'stale',
+                }));
+
+            let path = '';
+            scoredPoints.forEach((p, i) => {
+                if (i === 0) {
+                    path = `M ${p.x.toFixed(1)} ${p.y.toFixed(1)}`;
+                } else if (p.abs === scoredPoints[i - 1].abs + 1) {
+                    path += ` L ${p.x.toFixed(1)} ${p.y.toFixed(1)}`;
+                } else {
+                    path += ` M ${p.x.toFixed(1)} ${p.y.toFixed(1)}`;
+                }
+            });
+
+            const dots = scoredPoints.map(p => `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="2.5" ` +
+                (p.stale
+                    ? `fill="none" stroke="var(--text-muted)" stroke-width="1.5" stroke-dasharray="2,2"`
+                    : `fill="var(--people)"`) +
+                ` />`).join('');
+
+            const errorDots = monthlyTones
+                .map((t, i) => ({ t, abs: absValues[i] }))
+                .filter(({ t }) => t.status === 'error')
+                .map(({ abs }) => {
+                    const x = xFor(abs);
+                    const y = topPad + chartHeight / 2;
+                    return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2" fill="none" stroke="var(--text-muted)" stroke-width="1" stroke-dasharray="1,1" opacity="0.6" />`;
+                }).join('');
+
+            return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" style="display: block;">
+                <path d="${path}" fill="none" stroke="var(--people)" stroke-width="1.5" opacity="0.7" />
+                ${dots}
+                ${errorDots}
+            </svg>`;
+        }
+
+        // Render the fetched compact summary into the card's content area.
+        // `data.status` drives which of the card's states this renders --
+        // see analyze_relationship_tone's docstring (api/routes/crm.py)
+        // for what each value means server-side.
+        function renderPersonToneCard(personId, data) {
+            const content = document.getElementById('personToneContent');
+            if (!content) return;
+
+            const tones = data.monthly_tones || [];
+            const scored = tones.filter(t => t.status !== 'error');
+
+            if (data.status === 'in-progress') {
+                personToneInProgressMode = true;
+            }
+
+            if (personToneInProgressMode) {
+                if (scored.length > 0 || personTonePollAttempts >= TONE_POLL_MAX_ATTEMPTS) {
+                    // Either real data landed, or this has waited long
+                    // enough -- either way, stop polling and fall through
+                    // to the ordinary rendering below (never "failed").
+                    personToneInProgressMode = false;
+                    stopPersonTonePolling();
+                } else {
+                    content.innerHTML = '<div style="font-size: 0.75rem; color: var(--text-muted);">Another analysis is already running for this person -- checking back shortly…</div>';
+                    schedulePersonTonePoll(personId);
+                    return;
+                }
+            }
+
+            if (data.status === 'no-messages') {
+                stopPersonTonePolling();
+                content.innerHTML = `<div class="viz-loading" style="text-align: left; padding: 0;">No iMessage in the last ${TONE_CARD_MONTHS} months.</div>`;
+                return;
+            }
+
+            const failed = data.status === 'failed' ||
+                (personToneWasComputeAttempt && scored.length > 0 && scored.every(t => t.status === 'stale'));
+            const failedNotice = failed
+                ? '<div class="tone-refresh-failed-notice" style="text-align: left; font-size: 0.7rem; color: var(--text-muted); background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 4px; padding: 0.25rem 0.5rem; margin-bottom: 0.35rem;">Analysis failed; showing what is available</div>'
+                : '';
+
+            if (scored.length === 0) {
+                content.innerHTML = `
+                    ${failedNotice}
+                    <div class="viz-loading" style="text-align: left; padding: 0;">No tone analysis yet for this person's messages.</div>
+                    <button class="extract-facts-btn" id="personToneActionBtn" onclick="analyzePersonTone('${personId}')" style="margin-top: 0.5rem;">Analyze tone</button>
+                `;
+                return;
+            }
+
+            const trendLabel = (data.trend || '').replace(/-/g, ' ');
+            const avgLabel = data.average != null ? Math.round(data.average) : '—';
+            content.innerHTML = `
+                ${failedNotice}
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.35rem;">
+                    <span style="font-size: 0.8rem; color: var(--text-primary); text-transform: capitalize;">${escapeHtml(trendLabel)}</span>
+                    <button class="extract-facts-btn" id="personToneActionBtn" onclick="analyzePersonTone('${personId}')" title="Recompute tone analysis" aria-label="Recompute tone analysis" style="padding: 0.2rem 0.4rem;">↻</button>
+                </div>
+                ${buildPersonToneSparkline(tones)}
+                <div style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 0.35rem;">Avg ${avgLabel} · through ${formatToneMonth(data.analyzed_through)}</div>
+            `;
         }
 
         // Handle tone view mode change
