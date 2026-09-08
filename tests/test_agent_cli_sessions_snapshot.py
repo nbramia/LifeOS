@@ -275,3 +275,42 @@ def test_local_transcript_row_without_cli_event_still_gets_local_host(client, st
     assert sessions["cc:no-event-yet"]["host"] == "this-api-host"
     # Unmerged rows keep the transcript's own inferred status.
     assert sessions["cc:no-event-yet"]["status_inferred"] is True
+
+
+@pytest.mark.unit
+def test_removed_hook_row_reverts_to_inferred_status_inside_ttl(client, stores, monkeypatch, tmp_path):
+    """A row's event-driven status from a `cli_sessions` hook post does not
+    survive into a later snapshot inside the cache TTL once that hook row
+    is gone — the transcript scan's own inference takes over instead of a
+    cache-owned dict carrying the stale overlay forward."""
+    session_store, _ = stores
+    from api.services.claude_code import session_ingest as cc
+    from tests.test_claude_code_ingest import _assistant_event, _write_jsonl
+
+    proj_root = tmp_path / "-home-x"
+    _write_jsonl(proj_root / "hooked.jsonl", [_assistant_event()])
+    cc.invalidate_cache()
+    monkeypatch.setattr(
+        agents_route,
+        "_claude_code_snapshot",
+        lambda: cc.build_snapshot(projects_dir=tmp_path, cache_ttl=60, live_counts={}),
+    )
+
+    session_store.record_cli_session_event(
+        engine="claude_code", event="session_end",
+        session_id="hooked", host="this-api-host", cwd="/home/x",
+    )
+
+    r = client.get("/api/agents/snapshot")
+    sessions = {s["session_id"]: s for s in r.json()["sessions"]}
+    row = sessions["cc:hooked"]
+    assert row["status"] == "ended"
+    assert row["status_inferred"] is False
+
+    monkeypatch.setattr(session_store, "list_cli_sessions", lambda limit=500: [])
+    r2 = client.get("/api/agents/snapshot")
+    sessions2 = {s["session_id"]: s for s in r2.json()["sessions"]}
+    row2 = sessions2["cc:hooked"]
+    assert row2["status_inferred"] is True
+    assert row2["status"] == "running"
+    assert row2["host"] == "this-api-host"

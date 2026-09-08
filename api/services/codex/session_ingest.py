@@ -733,12 +733,31 @@ class _CacheEntry:
     edges: list[dict[str, Any]] = field(default_factory=list)
 
 
-_snapshot_cache: dict[tuple[str, int], _CacheEntry] = {}
+_snapshot_cache: dict[tuple[Any, ...], _CacheEntry] = {}
 _snapshot_cache_lock = threading.Lock()
 
 
-def _cache_key(sessions_dir: str | Path | None, lookback_days: int) -> tuple[str, int]:
-    return (str(sessions_dir) if sessions_dir is not None else "", int(lookback_days))
+def _cache_key(
+    sessions_dir: str | Path | None,
+    lookback_days: int,
+    live_counts: dict[str, int] | None,
+) -> tuple[Any, ...]:
+    """Cache key for the snapshot builder.
+
+    Includes the liveness map (`live_counts`) so a caller that scopes the
+    snapshot to a specific liveness signal (the remote transcript mirror's
+    `{}`) never collides with a caller that scans THIS machine's processes
+    (`None`) or passes a different map. `live_counts` is canonicalized to a
+    hashable `frozenset` of `(cwd, count)` pairs.
+    """
+    lc_key: frozenset | None = None
+    if live_counts is not None:
+        lc_key = frozenset(live_counts.items())
+    return (
+        str(sessions_dir) if sessions_dir is not None else "",
+        int(lookback_days),
+        lc_key,
+    )
 
 
 def build_snapshot(
@@ -751,19 +770,23 @@ def build_snapshot(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return `(sessions, edges)` for the /agents snapshot. Cached.
 
+    On both the cache-hit and cache-populate paths, the returned session
+    rows are per-row shallow copies, so a caller may mutate them without
+    touching the cache.
+
     `live_counts`: see the identical parameter on the Claude Code
     adapter's `build_snapshot` — pass `{}` to guarantee no row is promoted
     to `running` by a local process scan (used by the remote transcript
-    mirror). `None` (default) preserves today's behavior: scan local
-    `codex` processes via `live_codex_cwd_counts()`.
+    mirror). `None` (default) scans local `codex` processes via
+    `live_codex_cwd_counts()`.
     """
     now_t = now if now is not None else time.time()
-    key = _cache_key(sessions_dir, lookback_days)
+    key = _cache_key(sessions_dir, lookback_days, live_counts)
     if cache_ttl > 0:
         with _snapshot_cache_lock:
             entry = _snapshot_cache.get(key)
             if entry and entry.expires_at > now_t:
-                return list(entry.sessions), list(entry.edges)
+                return [dict(row) for row in entry.sessions], list(entry.edges)
 
     sessions: list[dict[str, Any]] = []
     cwd_counts = live_counts if live_counts is not None else live_codex_cwd_counts(now=now_t)
@@ -800,10 +823,13 @@ def build_snapshot(
         with _snapshot_cache_lock:
             _snapshot_cache[key] = _CacheEntry(
                 expires_at=now_t + cache_ttl,
-                sessions=list(sessions),
+                sessions=[dict(row) for row in sessions],
                 edges=list(edges),
             )
-    return list(sessions), list(edges)
+    # Per-row copies on the cache-write path too: the returned rows are
+    # distinct objects from the ones the cache entry now owns, so a caller
+    # mutating a returned row can never corrupt a warm cache.
+    return [dict(row) for row in sessions], list(edges)
 
 
 def invalidate_cache() -> None:

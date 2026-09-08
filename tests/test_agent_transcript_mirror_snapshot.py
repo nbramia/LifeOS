@@ -339,26 +339,33 @@ def test_hook_reported_running_survives_even_if_demotion_ran_after_the_merge():
 def test_hook_overlay_does_not_leak_into_ingest_cache_within_ttl(
     client, stores, mirror_root,
 ):
-    """`cc.build_snapshot()`/`cx.build_snapshot()` return
-    `list(entry.sessions)` — a shallow copy of the LIST, so the row DICTS
-    inside are the SAME objects held by `cc`'s own ingest cache
-    (`_snapshot_cache`, 30s default TTL — live in production via
-    `mirrored_snapshot()`'s own `cache_ttl=30.0` default). Without
-    `mirrored_snapshot()` copying each row before mutating it (`host`,
-    `mirrored`, the demotion), `_build_snapshot`'s hook overlay
-    (`_apply_cli_session_to_dict`) would mutate them AGAIN with a genuine
-    `status="running", status_inferred=False` — writing that straight into
-    the cached entry. If the hook row then vanishes (pruned, or a failed
-    `list_cli_sessions()` call) and a rebuild happens INSIDE the cache TTL,
-    `_demote_inferred_running` (guarded on `status_inferred is True`) can't
-    fix the now-`False` cached row, so it replays `running` with zero
-    hook evidence — a straight violation of AC 7 ("a remote session's
-    `running` status comes only from hook events").
+    """A hook overlay applied to a snapshot row must not leak into `cc`'s
+    own ingest cache (`_snapshot_cache`, 30s default TTL — live in
+    production via `mirrored_snapshot()`'s own `cache_ttl=30.0` default)
+    and reappear on a later rebuild inside that TTL.
 
-    Mutation-proved: reverting `mirrored_snapshot()`'s `sessions = [dict(row)
-    for row in sessions]` copy (mutating the cache's own dicts again)
-    makes this fail — the second snapshot stays `running`/`status_inferred:
-    False` instead of demoting back to `inactive`/`True`."""
+    `cc.build_snapshot()` hands back per-row copies (`[dict(row) for row
+    in ...]` on both the cache-hit and cache-populate paths) rather than
+    the dict objects its cache holds, so `mirrored_snapshot()` stamping
+    `host`/`mirrored`/the demotion, then `_build_snapshot`'s hook overlay
+    (`_apply_cli_session_to_dict`) writing a genuine `status="running",
+    status_inferred=False`, can never reach the cached entry. This test
+    builds a snapshot with a `cli_sessions` hook row present, removes the
+    hook row, rebuilds inside the cache TTL, and asserts the second
+    snapshot reports the transcript-inferred status rather than replaying
+    the first snapshot's event-driven `status="running",
+    status_inferred=False` — the failure mode AC 7 rules out ("a remote
+    session's `running` status comes only from hook events").
+
+    This test pins the route-observable behavior at the `/api/agents/snapshot`
+    level rather than mutation-proving `cc.build_snapshot()`'s own copy
+    semantics — `mirrored_snapshot()` makes its own `dict(row)` copy of
+    every row before stamping `host`/`mirrored`/the demotion onto it, so
+    this test still passes even if `cc.build_snapshot()`'s cache-hit-path
+    copy is reverted to alias the cache's own dicts. The per-row-copy
+    guarantee at the ingest layer is mutation-proved directly by
+    `test_snapshot_cache_returns_per_row_copies` in
+    `tests/test_claude_code_ingest.py`."""
     import sqlite3
 
     session_store, _ = stores
