@@ -402,12 +402,50 @@ def _read_cli_transcript_events(session_id: str) -> list[dict[str, Any]]:
     raise ValueError(f"unsupported session_id prefix: {session_id!r}")
 
 
-def _lane_for_session_dict(sd: dict[str, Any]) -> str:
+def _tasks_for_session_dicts(session_dicts: list[dict[str, Any]]) -> dict[str, Any]:
+    """One-shot `TaskManager` lookup for every distinct `task_id` present in
+    `session_dicts`, keyed by task id — feeds both `_lane_for_session_dict`
+    and the card-join fields (`card_id`/`card_title`/`assignee`/`card_tags`)
+    in `_build_snapshot` so a snapshot with many rows linked to the same or
+    different tasks does one lookup per task instead of one per row.
+
+    Never raises: a store error (or an unimportable `TaskManager`) degrades
+    to an empty dict, which callers read the same way a per-row lookup miss
+    already does — the task is treated as unknown.
+    """
+    task_ids = {sd.get("task_id") for sd in session_dicts if sd.get("task_id")}
+    if not task_ids:
+        return {}
+    try:
+        from api.services.task_manager import get_task_manager
+
+        manager = get_task_manager()
+    except Exception as exc:  # noqa: BLE001 — defensive: never break the snapshot on a lane/card lookup
+        logger.debug("task_manager unavailable: %s", exc)
+        return {}
+    tasks: dict[str, Any] = {}
+    for task_id in task_ids:
+        try:
+            task = manager.get(task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("task_manager lookup failed for %s: %s", task_id, exc)
+            continue
+        if task is not None:
+            tasks[task_id] = task
+    return tasks
+
+
+def _lane_for_session_dict(sd: dict[str, Any], tasks_by_id: dict[str, Any] | None = None) -> str:
     """`agent_board.lane_for_session`, wired to a snapshot row's `task_id`.
 
     The task lookup mirrors `_label_for_session`'s (a cheap in-memory dict
     read on the `TaskManager` singleton) — a session dict with no `task_id`,
     or whose task isn't found, derives its lane from its own status alone.
+
+    `tasks_by_id`, when given, is a pre-built `{task_id: task}` map (see
+    `_tasks_for_session_dicts`) read instead of hitting the `TaskManager`
+    again — behaviour is identical either way, just without the repeat
+    lookup. Omitted, this falls back to its own per-row `TaskManager` read.
     """
     from api.services import agent_board
 
@@ -416,9 +454,12 @@ def _lane_for_session_dict(sd: dict[str, Any]) -> str:
     task_tags: list[str] = []
     if task_id:
         try:
-            from api.services.task_manager import get_task_manager
+            if tasks_by_id is not None:
+                task = tasks_by_id.get(task_id)
+            else:
+                from api.services.task_manager import get_task_manager
 
-            task = get_task_manager().get(task_id)
+                task = get_task_manager().get(task_id)
             if task is not None:
                 task_status = task.status
                 task_tags = list(task.tags)
@@ -604,10 +645,10 @@ def _build_snapshot() -> dict[str, Any]:
         sd["custom_label"] = agent_viz_label_override.get_override(cli.session_id)
         session_dicts.append(sd)
 
-    # Board lane + pending-question fields, additive — applied last,
-    # uniformly, to every row regardless of source (local, cc/cx, mirrored,
-    # or synthetic-remote), so a row built by any branch above still ends up
-    # with both fields set.
+    # Board lane + pending-question + card-join fields, additive — applied
+    # last, uniformly, to every row regardless of source (local, cc/cx,
+    # mirrored, or synthetic-remote), so a row built by any branch above
+    # still ends up with all of them set.
     try:
         open_question_by_session = {
             q["session_id"]: q for q in session_store.list_open_questions()
@@ -615,10 +656,29 @@ def _build_snapshot() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — never break the snapshot on a store error
         logger.warning("open questions read failed: %s", exc)
         open_question_by_session = {}
+    from api.services import agent_board
+
+    tasks_by_id = _tasks_for_session_dicts(session_dicts)
     for sd in session_dicts:
-        sd["lane"] = _lane_for_session_dict(sd)
+        # `lane` stays derived from `agent_board.lane_for_session` (session
+        # status, or the linked task's status/tags when there is one) for
+        # EVERY row, linked or not — the graph's node fill colour and lane
+        # legend key off it for every node, so an unlinked session's lane is
+        # never null even though its card-join fields below are.
+        sd["lane"] = _lane_for_session_dict(sd, tasks_by_id)
         pq = open_question_by_session.get(sd.get("session_id"))
         sd["pending_question"] = _pending_question_view(pq) if pq else None
+        task = tasks_by_id.get(sd.get("task_id")) if sd.get("task_id") else None
+        if task is not None:
+            sd["card_id"] = sd["task_id"]
+            sd["card_title"] = task.description
+            sd["assignee"] = agent_board.derive_assignee(task.tags)
+            sd["card_tags"] = list(task.tags)
+        else:
+            sd["card_id"] = None
+            sd["card_title"] = None
+            sd["assignee"] = None
+            sd["card_tags"] = []
 
     return {
         "sessions": session_dicts,

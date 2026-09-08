@@ -220,6 +220,7 @@ def test_label_falls_back_to_task_manager_for_root_sessions(client, stores, monk
     # Stub the task manager so the label lookup hits a known value.
     class StubTask:
         description = "Review the Q4 budget"
+        tags: list[str] = []
 
     class StubManager:
         def get(self, task_id):
@@ -276,6 +277,7 @@ def test_label_cache_does_not_pin_fallback(client, stores, monkeypatch):
     # fallback, so the new label takes effect.
     class _StubTask:
         description = "Real label arrives late"
+        tags: list[str] = []
 
     class _StubManager:
         def get(self, task_id):
@@ -566,6 +568,7 @@ def test_snapshot_reports_lane_from_linked_task(client, stores, monkeypatch):
     class StubTask:
         status = "done"
         tags = ["agent-completed"]
+        description = "Lane-linked task"
 
     class StubManager:
         def get(self, task_id):
