@@ -447,6 +447,23 @@ class TestLastRunAndTrigger:
         expect(page.locator('[data-field="last-run-info"]')).to_contain_text("sent", timeout=5000)
         expect(page.locator('[data-field="last-run-info"]')).to_contain_text("delivered", timeout=5000)
 
+    def test_trigger_now_label_discloses_consumption_for_a_once_schedule(self, page: Page, agents_base_url):
+        """Firing a `once` schedule through this button consumes it (marks
+        it disabled, clears its next fire) -- the label discloses that
+        before the operator clicks, rather than the click being the first
+        the operator learns of it."""
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["schedule_type"] = "once"
+        board_state["lanes"]["scheduled"][0]["schedule_value"] = "2099-01-01T09:00:00"
+        _open_board(page, agents_base_url, board_state=board_state)
+        button = page.locator('[data-action="trigger-now"]')
+        expect(button).to_contain_text("disables")
+
+    def test_trigger_now_label_plain_for_a_cron_schedule(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)  # fixture default schedule_type is "cron"
+        button = page.locator('[data-action="trigger-now"]')
+        expect(button).to_have_text("Trigger now")
+
     def test_trigger_now_failure_shows_toast(self, page: Page, agents_base_url):
         board_state = _board_fixture()
         schedule_puts, trigger_calls = [], []
