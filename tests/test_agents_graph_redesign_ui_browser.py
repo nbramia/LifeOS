@@ -174,7 +174,9 @@ def _open_agents(page: Page, base_url, snapshot=None, focus_calls=None, search_m
     page.wait_for_selector("#filter-route")
     page.select_option("#filter-recency", "all")
     page.locator("#filter-terminal").check()
-    page.wait_for_timeout(500)
+    # Nodes render synchronously once the filters above are applied — wait
+    # for the first one rather than for a fixed delay.
+    page.wait_for_selector(".node")
     return errors
 
 
