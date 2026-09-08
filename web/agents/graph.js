@@ -64,6 +64,13 @@ export function initGraph() {
   let selectedAnchorId = null;
   let lastAnchorsById = new Map();
   let apiHost = '';
+  // Whether the first `/api/agents/snapshot` payload has landed — a tab
+  // activation (or a URL deep link, set before this module has fetched
+  // anything at all) can ask `drainGraphFocus` to resolve a pending focus
+  // intent before `allSessions` is populated; re-queuing it here rather
+  // than resolving against an empty array is what keeps the intent alive
+  // until `applySnapshot`'s own drain (below) actually can (#865).
+  let snapshotLoaded = false;
 
   // Subagent trees — a session with `parent_session_id` set is
   // hidden by default and its parent renders a count badge; clicking the
@@ -1157,6 +1164,7 @@ export function initGraph() {
     allSessions = snap.sessions || [];
     allEdges = snap.edges || [];
     apiHost = snap.api_host || apiHost;
+    snapshotLoaded = true;
     renderGraph(allSessions, allEdges);
     if (selectedSessionId) {
       const s = allSessions.find(x => x.session_id === selectedSessionId);
@@ -1552,6 +1560,14 @@ export function initGraph() {
   function drainGraphFocus() {
     const sessionId = takeGraphFocus();
     if (sessionId == null) return;
+    if (!snapshotLoaded) {
+      // Data hasn't arrived yet (a tab-activation drain can fire before the
+      // first snapshot fetch resolves) — put the intent back so
+      // `applySnapshot`'s own drain resolves it once it actually can,
+      // rather than wrongly reporting a real session as unknown.
+      requestGraphFocus(sessionId);
+      return;
+    }
     focusNode(sessionId);
   }
   onTabActivate((name) => { if (name === 'graph') drainGraphFocus(); });
