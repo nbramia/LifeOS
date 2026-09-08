@@ -283,9 +283,8 @@
     cursor: pointer;
   }
   #graph-zoom-fit:hover, #graph-zoom-reset:hover { border-color: var(--accent); }
-  /* HTML hover card — replaces the native SVG <title> tooltip. Never
-     intercepts pointer events so it can't itself trigger mouseleave on the
-     node underneath it. */
+  /* HTML hover card. Never intercepts pointer events so it can't itself
+     trigger mouseleave on the node underneath it. */
   .hover-card {
     position: fixed;
     z-index: 50;

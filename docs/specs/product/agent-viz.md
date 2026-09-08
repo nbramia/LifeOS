@@ -137,8 +137,7 @@ expands its ancestors automatically so the match is visible.
 
 Hovering a node shows an HTML card near the cursor — name, host,
 branch or cwd, model and effort, cost, duration, and the last event kind —
-with no delay; moving off hides it. This replaces the native browser
-tooltip.
+with no delay; moving off hides it.
 
 - **Drag a node** — pins it where you drop it.
 - **Drag the empty background** — pans the whole graph.
@@ -151,7 +150,7 @@ tooltip.
   white border, everything else dims).
 - **Double-click a non-subagent Claude Code or Codex node** — jumps focus
   to its terminal (see [Operator controls — resume and Go To](#graph-tab--operator-controls--resume-and-go-to)); the side panel opening on the first click of the pair is expected.
-- **Click the same node again, or click empty background** — deselects and closes the panel.
+- **Click the same node again, or click empty background** — deselects and closes the panel. A second click that falls inside the browser's own double-click window is part of a double-click, not a standalone click, and does not close the panel.
 - **Filter change** — releases any drag-pinned positions and resets the pan/zoom transform so the new visible set lays out from scratch at the natural scale.
 
 The simulation restarts whenever the visible-id set OR any visible node's
@@ -206,7 +205,7 @@ transcript existing here doesn't mean the CLI is actually running here.
 
 ## Graph tab — Status semantics
 
-A node's color is its status. The set is slightly different per source — same broad categories, different precise meaning:
+A node's stroke colour is its status. The set is slightly different per source — same broad categories, different precise meaning:
 
 | Status | LifeOS agent worker | CLI (Claude Code or Codex) |
 |---|---|---|
@@ -261,11 +260,11 @@ Clicking any node opens a panel on the right with that session's metadata header
 - **Label** — the same precedence chain the graph node uses (see **Node label** in [Graph tab — what you see](#graph-tab--what-you-see)), so the header never shows a session's raw id when the node or the search dropdown wouldn't. **Click it to rename:** the title becomes a text box. It opens prepopulated with the current custom label or derived label, or empty when neither is a real name (only a raw id) — so blurring without typing never persists a raw id as the custom label. Enter (or clicking away) saves, Escape cancels. A manual name is pinned durably and overrides every other source everywhere the node is named (graph node, panel, search), except that a manual name identical to the row's own raw id is skipped by the graph node and the search dropdown the same way any other raw-id label is. Saving an empty value clears the override and reverts to auto-naming.
 - **cwd** — Claude Code only; the project directory the session was opened in.
 - **Branch** — the git branch of that cwd, when a registration event supplied one. Blank for sessions with no cross-machine registration (e.g. a local Claude Code transcript with no hook installed).
-- **Status badge** — same status the node is colored by, with `(inferred)` if applicable.
+- **Status badge** — the status the node's stroke encodes, with `(inferred)` if applicable.
 - **Source** — `LifeOS agent` or `Claude Code`.
 - **Host badge** — the machine the session is running on.
 - **Routing** — a plain badge, one of `Local`, `Claude Code`, `Codex`, `Remote`, `Hermes`, `Ask` (parked waiting on the operator, no model running), or `Claude` — never a model name, EXCEPT for a Hermes session that has taken at least one turn: its badge shows `model_label` (`Hermes · <model>`, the honest per-session attribution the server records once that session's own turn reports a model) instead of the plain `Hermes` name. A Hermes session with no turn yet, and every non-Hermes session, show exactly the plain routing name.
-- **`.panel-chips` row** — small chips below the header: `model_label`, the engine name (from the same five-engine mapping the node's shape uses), the host, and the effort when present. Display-only metadata, never the header's name.
+- **`.panel-chips` row** — small chips below the header: `model_label` and the engine name (from the same five-engine mapping the node's shape uses), each dropped when its text already equals the Routing badge's text above it, plus the effort when present. The host is not repeated here — the meta row's host badge already shows it. Display-only metadata, never the header's name.
 - **Cost** — `total_dollars` to 4 decimals. For Claude Code, this is cache-aware accounting (separately tracking input, output, cache_creation @ 1.25× and cache_read @ 0.10×).
 - **Tokens** — `input↓ / output↑`.
 - **Depth badge** — if the session is a child, shows spawn depth.

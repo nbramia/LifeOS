@@ -1,19 +1,14 @@
 // web/agents/panel.js
 //
-// Shared session-detail panel (#850): header render, inline label edit,
-// backfill + live SSE transcript tail, LLM summary fetch, and the
-// kill/resume/focus operator actions. Used by BOTH the Graph tab's side
-// panel (web/agents/graph.js) and the Board tab's card drawer
-// (web/agents/board.js), following the web/chat/ module split from #360.
+// Shared session-detail panel: header render, inline label edit, backfill +
+// live SSE transcript tail, LLM summary fetch, and the kill/resume/focus
+// operator actions. Used by both the Graph tab's side panel
+// (web/agents/graph.js) and the Board tab's card drawer
+// (web/agents/board.js).
 //
-// This is the pre-#850 web/agents.html panel code (renderPanelHeader,
-// updatePanelMeta, openPanel/closePanel, loadSessionEvents, appendEvent,
-// startLabelEdit, fetchSessionSummary, focusCcSession, resumeCcSession,
-// openKillModal) with one structural change: every DOM lookup is scoped to
-// a `container` passed in at construction instead of a single global
-// `#panel` element and `document.getElementById`, so a Graph-tab panel and
-// a Board-tab drawer can each hold their own instance without id collisions.
-// Rendering/behavior is otherwise unchanged.
+// `SessionPanel` is constructed with a `container` element rather than a
+// hardcoded `#panel` id, so a Graph-tab panel and a Board-tab drawer can
+// each hold their own instance without DOM id collisions.
 
 import { nodeLabel, isRawIdValue, routingLabel, engineOf, ENGINE_SHAPES } from './graph_encoding.js';
 
@@ -63,16 +58,19 @@ function routingBadgeText(s) {
 // The panel's `.panel-chips` row — model and effort, each as a small chip,
 // never as the header's name text (that's `nodeLabel(s)` above). Shared by
 // the graph panel and the board drawer, since both mount a `SessionPanel`.
-// The engine chip is skipped whenever the model chip already names the
-// engine (e.g. "Hermes · deepseek-v3" already names Hermes; a Claude Code
-// session's model chip equals its engine chip), since the model chip
-// carries the same information more specifically. The host chip is
+// A chip is dropped whenever its text equals `routingBadgeText(s)` — the
+// text the Routing badge already shows above it — so the model and engine
+// chips never just repeat that badge (e.g. a `claude` session whose model
+// chip is "Sonnet" still drops a bare "Claude" engine chip, since the
+// badge itself reads "Claude"; a Hermes session whose badge already reads
+// "Hermes · <model>" drops the now-redundant model chip). The host chip is
 // skipped entirely — the meta row above already shows a host badge.
 function panelChipsHtml(s) {
+  const badgeText = routingBadgeText(s);
   const chips = [];
-  if (s.model_label) chips.push(s.model_label);
+  if (s.model_label && s.model_label !== badgeText) chips.push(s.model_label);
   const engineLabel = ENGINE_SHAPES[engineOf(s)].label;
-  if (!(s.model_label && s.model_label.startsWith(engineLabel))) chips.push(engineLabel);
+  if (engineLabel !== badgeText) chips.push(engineLabel);
   if (s.effort) chips.push(s.effort);
   return chips.map(c => `<span class="badge panel-chip">${escapeHtml(c)}</span>`).join('');
 }

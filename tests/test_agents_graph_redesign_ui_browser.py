@@ -394,6 +394,24 @@ class TestSubagentCollapse:
         ids = {r["session_id"] for r in _nodes(page)}
         assert "cc:redesign-subagent" not in ids
 
+    def test_click_8px_off_badge_center_still_toggles(self, page: Page, agents_base_url):
+        # The clickable hit target (`.node-badge-children-hit`) is a
+        # transparent circle sized well beyond the tiny `+N`/`−` text glyph
+        # itself, so a click near but not exactly on the glyph still toggles
+        # collapse/expand.
+        _open_agents(page, agents_base_url)
+        hit = page.evaluate(
+            "() => { const g = [...document.querySelectorAll('.node')]"
+            ".find(n => n.__data__.session_id === 'cc:redesign-parent');"
+            " const b = g.querySelector('.node-badge-children-hit');"
+            " const box = b.getBoundingClientRect();"
+            " return { x: box.x + box.width / 2, y: box.y + box.height / 2 }; }"
+        )
+        page.mouse.click(hit["x"] + 8, hit["y"])
+        page.wait_for_timeout(300)
+        ids = {r["session_id"] for r in _nodes(page)}
+        assert "cc:redesign-subagent" in ids
+
 
 class TestHoverCard:
     def test_hover_shows_card_quickly_and_hides_on_mouseout(self, page: Page, agents_base_url):
@@ -554,6 +572,34 @@ class TestClickAndDoubleClick:
         assert len(focus_calls) == 1
         k_after = float(page.get_attribute("#graph-svg", "data-zoom-k"))
         assert abs(k_after - k_before) < 0.01
+
+    def test_double_click_on_already_selected_cli_node_reopens_panel(self, page: Page, agents_base_url):
+        """A prior single click already selected and opened the panel for
+        this node (outside any double-click window). A later double-click's
+        own first click (`detail === 1`) then toggles that already-selected
+        node's panel closed before `dblclick` ever fires — the panel must
+        come back open for this session once `dblclick` runs, not stay
+        closed while only focus fires."""
+        focus_calls = []
+        _open_agents(page, agents_base_url, focus_calls=focus_calls)
+        pos = page.evaluate(
+            "() => { const g = [...document.querySelectorAll('.node')]"
+            ".find(n => n.__data__.session_id === 'cc:redesign-parent');"
+            " const box = g.getBoundingClientRect();"
+            " return { x: box.x + box.width / 2, y: box.y + box.height / 2 }; }"
+        )
+        page.mouse.click(pos["x"], pos["y"])
+        page.wait_for_timeout(600)
+        header = page.locator('[data-field="label"]')
+        expect(header).to_be_visible()
+        assert "flaky graph test" in header.inner_text()
+
+        page.mouse.dblclick(pos["x"], pos["y"])
+        page.wait_for_timeout(400)
+        header = page.locator('[data-field="label"]')
+        expect(header).to_be_visible()
+        assert "flaky graph test" in header.inner_text()
+        assert len(focus_calls) == 1
 
     def test_real_doubleclick_non_cli_node_opens_panel_and_does_not_zoom(self, page: Page, agents_base_url):
         focus_calls = []
@@ -717,7 +763,7 @@ class TestPanelRawIdGuardAndHermesBadge:
         routing_text = page.locator('[data-field="routing"]').inner_text()
         assert routing_text == "Hermes · deepseek-v3"
 
-    def test_claude_code_routing_badge_unchanged(self, page: Page, agents_base_url):
+    def test_claude_code_routing_badge_is_plain_engine_name(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)
         page.evaluate(
             """() => {
@@ -731,6 +777,8 @@ class TestPanelRawIdGuardAndHermesBadge:
         assert routing_text == "Claude Code"
 
     def test_claude_code_chips_row_does_not_duplicate_engine_name(self, page: Page, agents_base_url):
+        # The engine name already renders once, in the Routing badge — the
+        # chips row must not repeat it.
         _open_agents(page, agents_base_url)
         page.evaluate(
             """() => {
@@ -741,7 +789,27 @@ class TestPanelRawIdGuardAndHermesBadge:
         )
         page.wait_for_timeout(200)
         chips_text = page.locator('[data-field="panel-chips"]').inner_text()
-        assert chips_text.count("Claude Code") == 1
+        assert "Claude Code" not in chips_text
+
+    def test_claude_chips_row_shows_model_without_separate_engine_chip(self, page: Page, agents_base_url):
+        # routing "claude" with model_label "Sonnet": the Routing badge
+        # reads "Claude" (routingLabel's fallback for the "claude" routing),
+        # so a bare "Claude" engine chip would just repeat it — only the
+        # more specific "Sonnet" model chip should render.
+        _open_agents(page, agents_base_url)
+        page.evaluate(
+            """() => {
+                const g = [...document.querySelectorAll('.node')]
+                  .find(n => n.__data__.session_id === 'sess-claude-api');
+                g.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }"""
+        )
+        page.wait_for_timeout(200)
+        routing_text = page.locator('[data-field="routing"]').inner_text()
+        assert routing_text == "Claude"
+        chips_text = page.locator('[data-field="panel-chips"]').inner_text()
+        assert "Sonnet" in chips_text
+        assert "Claude" not in chips_text
 
 
 class TestSearchUnknownFieldGuard:
