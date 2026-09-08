@@ -262,13 +262,13 @@ The top toolbar has filter controls and five count chips. **Filters are AND-comp
 
 | Filter | Default | Notes |
 |---|---|---|
-| `include finished` checkbox | off | Off → completed / failed / budget_exceeded / ended are hidden. On → everything shows, and the default recency window widens from 30 min to 7 days. Graph-only — no board counterpart. |
-| `recency` dropdown | last 30 min (1 min, 30 min, 1h, 24h, 7d, all) | Filters by `last_activity_at`. Re-defaults to a wider window when `include finished` is enabled, unless the operator (or a restored/shared value) has set it manually. Board recency filters by `updated_at` instead — each tab keeps its own comparison field, only the selected value is shared. |
+| `include finished` checkbox | off | Off → completed / failed / budget_exceeded / ended are hidden. On → those sessions show (subject to every other filter, `lane` excepted — see the `lane` row below), and the recency window auto-defaults wider. Graph-only — no board counterpart. |
+| `recency` dropdown | auto: last 30 min, or 7 days once `include finished` is checked (1 min, 30 min, 1h, 24h, 7d, all also selectable) | Filters by `last_activity_at`. Shared with the board, whose own default is all time — the shared value starts unset so each tab keeps its own default until the operator (on either tab) picks one explicitly, which then applies on both. Board recency filters by `updated_at` instead — each tab keeps its own comparison field, only a chosen value is shared. |
 | `cwd` dropdown | all | Only Claude Code sessions are scoped to a cwd. Dropdown lists every unique cwd present in the current snapshot; auto-hides when empty (no Claude Code sessions visible). Graph-only — no board counterpart. |
 | `host` dropdown | all | Limit to sessions running on a specific machine. Dropdown lists every unique `host` present in the current snapshot; auto-hides on a single-host deployment (nothing to distinguish). |
 | `route` dropdown | all (local / claude / claude_code / codex / hermes / remote / ask) | Filters by where the session ran — operator's local LLM, Managed Agents cloud, Claude Code CLI, Codex CLI, Hermes, the configured remote provider, or a session parked waiting on the operator. Labelled **engine** on the board's own bar. |
 | `status` dropdown | all | Hard-filter by the status column from the table above. Graph-only — no board counterpart. |
-| `lane` dropdown | every lane but Done | A single-select mirror of the board's own lane multi-select — `all` shows every lane, one lane shows just that lane. A session with no lane info (a fixture predating this field) is never excluded by it. |
+| `lane` dropdown | every lane but Done | A single-select mirror of the board's own lane multi-select — `all` shows every lane, one lane shows just that lane. A session with no lane info (a fixture predating this field) is never excluded by it. The Done lane is the one exception: whether a Done-lane session renders is decided by `include finished` alone, never by this selection, so the two controls can't disagree about the same set of sessions — picking `done` here shows only Done-lane sessions and checks `include finished` automatically, since otherwise the selection would show nothing. |
 | `assignee` dropdown | any assignee | Same options as the board's assignee filter — `unassigned` matches a session with no card assignee. |
 | `tag` text input | empty | Substring match against the linked card's tags. |
 
@@ -373,7 +373,7 @@ The board and the graph describe the same work from two angles, kept in one navi
 
 **Card session chip → graph.** A task card whose linked session exists shows a small clickable session chip (↗ session) among its other chips; clicking it switches to the Graph tab, pans to that session's node, and selects it.
 
-**Node → board.** Selecting a node, or a card anchor (see [Card clusters](#card-clusters)), shows a **Show on board** action above the transcript panel whenever it — or, for an anchor, one of its sessions — is linked to a card. Clicking it switches to the Board tab, scrolls to that card, and briefly highlights it, revealing its lane in the lane filter first if that lane was hidden.
+**Node → board.** Selecting a node, or a card anchor (see [Card clusters](#card-clusters)), shows a **Show on board** action above the transcript panel whenever it — or, for an anchor, one of its sessions — is linked to a card. Clicking it — or simply switching to the Board tab while that node or anchor stays selected — scrolls to the card and briefly highlights it, relaxing whichever shared filters (lane, assignee, host, engine, tag, search, recency) currently hide it first.
 
 **Answer from the graph.** A selected node or card anchor with an open pending question shows an **Answer** action next to Show on board; it reveals an inline reply box in place and posts through the same endpoint the board drawer's own Answer button uses.
 

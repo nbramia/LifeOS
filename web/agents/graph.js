@@ -25,9 +25,9 @@ import {
   descendantsOf as sharedDescendantsOf,
 } from './graph_encoding.js';
 import {
-  getFilters, setFilter, resetFilters, subscribe as subscribeFilters,
+  getFilters, setFilter, setFilters, resetFilters, subscribe as subscribeFilters,
   requestGraphFocus, takeGraphFocus, requestBoardFocus,
-  onTabActivate, activateTab,
+  onTabActivate, activateTab, setSelectedGraphCardId,
 } from './linking.js';
 
 // `boardApi` is the object `web/agents/board.js`'s `initBoard()` returns —
@@ -152,6 +152,7 @@ export function initGraph(boardApi) {
     applySelectionStyles();
     applyAnchorSelectionStyles();
     clearPanelActions();
+    setSelectedGraphCardId(null);
   }
 
   function openPanel(sessionId) {
@@ -213,8 +214,9 @@ export function initGraph(boardApi) {
 
   function renderPanelActions(source) {
     if (!panelActionsEl) return;
-    if (!source) { clearPanelActions(); return; }
+    if (!source) { clearPanelActions(); setSelectedGraphCardId(null); return; }
     const cardId = source.card_id || null;
+    setSelectedGraphCardId(cardId);
     const pq = pendingQuestionFor(source);
     let html = '';
     if (cardId) {
@@ -604,6 +606,7 @@ export function initGraph(boardApi) {
     const laneSet = new Set(shared.lanes);
     const assigneeSel = shared.assignee;
     const tagQuery = (shared.tag || '').trim().toLowerCase();
+    const searchQueryLower = (shared.search || '').trim().toLowerCase();
     const nowSec = Date.now() / 1000;
     return sessions.filter(s => {
       if (!showTerm && TERMINAL.has(s.status)) return false;
@@ -618,15 +621,34 @@ export function initGraph(boardApi) {
       // `s.lane` is only ever absent from a fixture synthesized without it
       // (predating card/host anchors) — treat that as "not excludable by
       // lane" rather than hiding it, since a real snapshot row always
-      // carries one.
-      if (s.lane != null && !laneSet.has(s.lane)) return false;
+      // carries one. The `done` lane is the one exception: whether a
+      // done-lane session renders is decided by `showTerm` (include
+      // finished) — not the shared lane selection — so the two controls
+      // never fight over the exact same set of sessions.
+      if (s.lane != null && s.lane !== 'done' && !laneSet.has(s.lane)) return false;
       if (assigneeSel !== 'all') {
         if (assigneeSel === 'unassigned') { if (s.assignee) return false; }
         else if (s.assignee !== assigneeSel) return false;
       }
       if (tagQuery && !(s.card_tags || []).some(t => t.toLowerCase().includes(tagQuery))) return false;
+      if (searchQueryLower && !sessionMatchesSearch(s, searchQueryLower)) return false;
       return true;
     });
+  }
+
+  // The shared `search` text's match against a session — case-insensitive
+  // against the node's own label, its LLM-generated short label, its linked
+  // card's title, and its linked card's tags. Shared with
+  // `relaxSharedFiltersFor` below, so a search-dropdown result chosen for a
+  // session that doesn't actually match this predicate (e.g. it matched only
+  // via the server-side transcript-summary search) has its shared search
+  // cleared rather than becoming permanently unreachable.
+  function sessionMatchesSearch(s, q) {
+    if (!q) return true;
+    const haystack = [nodeLabel(s), s.short_label, s.card_title, ...(s.card_tags || [])]
+      .filter(Boolean)
+      .map(v => String(v).toLowerCase());
+    return haystack.some(h => h.includes(q));
   }
 
   // Subagent trees: a session with `parent_session_id` set is
@@ -1337,6 +1359,16 @@ export function initGraph(boardApi) {
     renderGraph(allSessions, allEdges);
     if (searchQuery.trim()) renderSearchResults();
   }
+  // Re-renders for a shared-filter change (from either tab, a card-chip
+  // jump's relaxation, or a keystroke in the search/tag inputs) WITHOUT
+  // resetting the pan/zoom transform or releasing drag pins — unlike
+  // `onFilterChange` above, which stays the right behaviour for the
+  // graph's own local-only controls (recency/cwd/status/include-finished),
+  // still called directly below.
+  function renderForSharedChange() {
+    renderGraph(allSessions, allEdges);
+    if (searchQuery.trim()) renderSearchResults();
+  }
   filterTerminalEl.addEventListener('change', () => {
     applyRecencyDefault();
     onFilterChange();
@@ -1361,6 +1393,17 @@ export function initGraph(boardApi) {
   if (filterLaneEl) {
     filterLaneEl.addEventListener('change', () => {
       const v = filterLaneEl.value;
+      if (v === 'done') {
+        // The `done` lane is never governed by the shared lane selection
+        // (see `applyFilters`) — only by include-finished. Explicitly
+        // picking it here means "show me only finished sessions", so tick
+        // that checkbox too; otherwise the selection would show nothing at
+        // all, which is worse than confusing.
+        if (!filterTerminalEl.checked) {
+          filterTerminalEl.checked = true;
+          applyRecencyDefault();
+        }
+      }
       setFilter('lanes', v === 'all' ? LANES.map(l => l.id) : [v]);
     });
   }
@@ -1481,15 +1524,18 @@ export function initGraph(boardApi) {
         const fit = [...filterRecencyEl.options]
           .map(o => o.value)
           .find(v => v === 'all' || age <= Number(v));
-        filterRecencyEl.value = fit || 'all';
+        // Routed through the shared store (never the select directly) so
+        // the board and localStorage see the widened window too, and so a
+        // later shared-filter write in the same relaxation (see
+        // `relaxSharedFiltersFor`) can't clobber it back to the old value —
+        // `setFilter` updates the store first, and the sync callback it
+        // triggers just reaffirms the value this already set.
         recencyManuallySet = true;
+        setFilter('recency', fit || 'all');
       }
     }
     if (filterCwdEl && filterCwdEl.value !== 'all' && s.decoded_cwd !== filterCwdEl.value) {
       filterCwdEl.value = 'all';
-    }
-    if (filterRouteEl.value !== 'all' && (s.routing || 'local') !== filterRouteEl.value) {
-      filterRouteEl.value = 'all';
     }
     if (filterStatusEl.value !== 'all' && s.status !== filterStatusEl.value) {
       filterStatusEl.value = 'all';
@@ -1521,22 +1567,14 @@ export function initGraph(boardApi) {
     if (delay) setTimeout(run, delay); else run();
   }
 
+  // Delegates to `focusNode` (below) — the search dropdown is just one more
+  // caller that needs to relax whatever LOCAL or SHARED filter currently
+  // hides the picked session (a shared lane/assignee/host/engine/tag, not
+  // only the graph's own local recency/cwd/status), so the operator doesn't
+  // land on a fully-dimmed graph with nothing actually selected.
   function selectSearchResult(sessionId) {
-    const s = allSessions.find(x => x.session_id === sessionId);
-    if (!s) return;
-    const visibleIds = new Set(applyFilters(allSessions).map(x => x.session_id));
-    const wasFilteredOut = !visibleIds.has(sessionId);
-    const wasCollapsed = !!(s.parent_session_id && !expandedParents.has(s.parent_session_id));
-    const needsRerender = wasFilteredOut || wasCollapsed;
-    if (wasFilteredOut) relaxFiltersFor(s);
-    if (wasCollapsed) expandAncestorsFor(s);
-    if (needsRerender) {
-      releasePins();
-      renderGraph(allSessions, allEdges);
-    }
     hideSearchResults();
-    openPanel(sessionId);
-    panToNode(sessionId, needsRerender ? 400 : 0);
+    focusNode(sessionId);
   }
 
   async function fetchSummaryMatches(q) {
@@ -1635,43 +1673,63 @@ export function initGraph(boardApi) {
       searchInputEl.value = state.search;
       searchQuery = state.search;
     }
-    if (filterRecencyEl && filterRecencyEl.value !== state.recency) filterRecencyEl.value = state.recency;
-    // The shared recency value always wins over the include-finished
-    // toggle's own auto-default from here on — a restored/migrated/reset
-    // shared value counts as "the operator already chose one".
-    recencyManuallySet = true;
-    onFilterChange();
+    if (state.recency != null) {
+      // A concrete shared recency value always wins over the
+      // include-finished toggle's own auto-default from here on — a
+      // restored/migrated/reset concrete value counts as "the operator
+      // already chose one".
+      if (filterRecencyEl && filterRecencyEl.value !== state.recency) filterRecencyEl.value = state.recency;
+      recencyManuallySet = true;
+    } else {
+      // `null` means "the operator has never set it" — the graph keeps
+      // deciding its own default (30 min, or 7 days once include-finished
+      // is ticked) rather than being overwritten by the board's own
+      // default (all time).
+      recencyManuallySet = false;
+      applyRecencyDefault();
+    }
+    renderForSharedChange();
   }
   subscribeFilters(syncSharedFilterControls);
   syncSharedFilterControls(getFilters());
 
   // Loosens whichever SHARED filters would hide session `s` — the shared
   // counterpart to `relaxFiltersFor` above (which only ever touches the
-  // graph's own local-only filters: recency/cwd/route/status). Returns
+  // graph's own local-only filters: cwd/status; recency is routed through
+  // the shared store too, see above). Every key that needs to change is
+  // batched into one `setFilters` call so the FIRST key's own synchronous
+  // sync-callback can't reconcile a control against a shared-store snapshot
+  // that doesn't have the later keys' changes yet, undoing them. Returns
   // whether anything actually changed, so a caller that already knows a
   // shared change re-renders via the `subscribe` callback above doesn't
   // also force a second, redundant render of its own.
   function relaxSharedFiltersFor(s) {
     const state = getFilters();
-    let changed = false;
+    const updates = {};
     if (s.lane != null && !state.lanes.includes(s.lane)) {
-      setFilter('lanes', [...state.lanes, s.lane]);
-      changed = true;
+      updates.lanes = [...state.lanes, s.lane];
     }
     if (state.assignee !== 'all') {
       const matches = state.assignee === 'unassigned' ? !s.assignee : s.assignee === state.assignee;
-      if (!matches) { setFilter('assignee', 'all'); changed = true; }
+      if (!matches) updates.assignee = 'all';
     }
-    if (state.host !== 'all' && s.host !== state.host) { setFilter('host', 'all'); changed = true; }
-    if (state.engine !== 'all' && routingFilterValue(s) !== state.engine) {
-      setFilter('engine', 'all');
-      changed = true;
-    }
+    if (state.host !== 'all' && s.host !== state.host) updates.host = 'all';
+    if (state.engine !== 'all' && routingFilterValue(s) !== state.engine) updates.engine = 'all';
     if (state.tag && !(s.card_tags || []).some(t => t.toLowerCase().includes(state.tag.toLowerCase()))) {
-      setFilter('tag', '');
-      changed = true;
+      updates.tag = '';
     }
-    return changed;
+    // A shared search whose text doesn't actually match `s` (e.g. a
+    // dropdown result found only via the server-side transcript-summary
+    // search, not `sessionMatchesSearch`'s own label/tag fields) would
+    // otherwise stay unreachable — clear it rather than leave the target
+    // permanently filtered out of its own jump target.
+    if (state.search) {
+      const q = state.search.trim().toLowerCase();
+      if (q && !sessionMatchesSearch(s, q)) updates.search = '';
+    }
+    if (Object.keys(updates).length === 0) return false;
+    setFilters(updates);
+    return true;
   }
 
   // Selects a session by id, relaxing whatever filters (local or shared)
@@ -1684,6 +1742,11 @@ export function initGraph(boardApi) {
     const s = allSessions.find(x => x.session_id === sessionId);
     if (!s) {
       showToast(`No such session: ${sessionId}`, true);
+      // Leaves the default view (the Board tab) rather than stranding the
+      // operator on a Graph tab that never resolved to anything — matters
+      // most for a `?session=<id>` deep link that switched to this tab
+      // before the id was known to be unresolvable.
+      activateTab('board');
       return;
     }
     const visibleIds = new Set(applyFilters(allSessions).map(x => x.session_id));

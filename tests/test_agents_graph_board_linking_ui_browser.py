@@ -13,6 +13,7 @@ suite), since clustering and node selection need the real force simulation.
 import http.server
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -328,9 +329,18 @@ class TestUrlDeepLinks:
         _open_agents(page, agents_base_url, path="/agents?session=does-not-exist")
         page.wait_for_timeout(700)
         expect(page.locator(".toast.error")).to_be_visible()
-        # Left at the default (empty) panel — the unknown id was reported,
-        # nothing was selected.
-        expect(page.locator("#panel-empty")).to_be_visible()
+        # Left at the default view — the Board tab, active — not stranded on
+        # the Graph tab the URL param switched to before the id was known to
+        # be unresolvable.
+        assert "active" in (page.get_attribute('[data-tab="board"]', "class") or "")
+        expect(page.locator("#board-view")).to_be_visible()
+
+    def test_unknown_card_deep_link_shows_a_toast_and_stays_on_board(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url, path="/agents?card=does-not-exist")
+        page.wait_for_timeout(700)
+        expect(page.locator(".toast.error")).to_be_visible()
+        assert "active" in (page.get_attribute('[data-tab="board"]', "class") or "")
+        expect(page.locator("#board-view")).to_be_visible()
 
 
 class TestSharedFilters:
@@ -444,3 +454,267 @@ class TestAnchorPendingQuestionBadgeAndAnswer:
         assert len(answer_calls) == 1
         assert answer_calls[0] == {"answer": "Yes, proceed."}
         expect(page.locator(".toast")).to_be_visible()
+
+
+def _svg_center(page: Page):
+    return page.evaluate(
+        "() => { const r = document.getElementById('graph-svg').getBoundingClientRect();"
+        " return {x: r.left + r.width / 2, y: r.top + r.height / 2}; }"
+    )
+
+
+def _node_client_center(page: Page, session_id):
+    return page.evaluate(
+        "(sid) => { const g = [...document.querySelectorAll('.node')]"
+        ".find(n => n.__data__.session_id === sid);"
+        " if (!g) return null; const r = g.getBoundingClientRect();"
+        " return {x: r.left + r.width / 2, y: r.top + r.height / 2}; }",
+        session_id,
+    )
+
+
+class TestIncludeFinishedAndDoneLane:
+    def test_include_finished_reveals_a_done_lane_session(self, page: Page, agents_base_url):
+        """The `done` lane is never governed by the shared lane selection
+        (which defaults to every lane but Done) — only `include finished`
+        decides whether a Done-lane session renders. Widens recency only,
+        deliberately leaving the lane selection at its default, so this
+        actually exercises the bypass rather than masking it the way
+        `_go_to_graph`'s blanket `#filter-lane` -> `all` would."""
+        done_session = _session(
+            session_id="sess-done-terminal", status="completed", lane="done",
+            label="Archived investigation", last_activity_at=2200,
+        )
+        snapshot = dict(SNAPSHOT, sessions=SNAPSHOT["sessions"] + [done_session])
+        _open_agents(page, agents_base_url, snapshot=snapshot)
+        page.click('[data-tab="graph"]')
+        page.wait_for_selector("#filter-route")
+        page.select_option("#filter-recency", "all")
+        page.wait_for_timeout(300)
+        assert "sess-done-terminal" not in _nodes(page)
+        page.locator("#filter-terminal").check()
+        page.wait_for_timeout(400)
+        assert "sess-done-terminal" in _nodes(page)
+
+
+class TestSharedHostFiltersBoard:
+    def test_shared_host_reduces_board_card_count_even_when_absent_from_board_options(
+        self, page: Page, agents_base_url,
+    ):
+        """`host-c` is used by a session with no linked card, so no board
+        card could ever surface it as an option through the board's own
+        card-only host scan — `updateFilterOptions` must inject the shared
+        value as a selectable option in its own right."""
+        host_only_session = _session(
+            session_id="sess-host-only", host="host-c", label="Ad-hoc session on host-c",
+        )
+        snapshot = dict(SNAPSHOT, sessions=SNAPSHOT["sessions"] + [host_only_session])
+        _open_agents(page, agents_base_url, snapshot=snapshot)
+        page.click('[data-tab="graph"]')
+        page.wait_for_selector("#filter-route")
+        page.wait_for_timeout(300)
+        page.select_option("#filter-host", "host-c")
+        page.wait_for_timeout(300)
+        page.click('[data-tab="board"]')
+        page.wait_for_timeout(300)
+        assert page.input_value("#board-filter-host") == "host-c"
+        options = page.evaluate(
+            "() => Array.from(document.querySelectorAll('#board-filter-host option')).map(o => o.value)"
+        )
+        assert "host-c" in options
+        count = page.evaluate("() => document.querySelectorAll('.board-card').length")
+        assert count == 0
+
+
+class TestSharedSearchFiltersGraph:
+    def test_board_search_reduces_rendered_node_count_on_graph(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url)
+        page.fill("#board-search", CLUSTER_TITLE)
+        page.wait_for_timeout(200)
+        _go_to_graph(page)
+        assert page.input_value("#search-input") == CLUSTER_TITLE
+        assert set(_nodes(page)) == {"sess-cluster-1", "sess-cluster-2", "cc:cluster-3"}
+
+
+class TestSearchResultSelectsHiddenNode:
+    def test_search_result_for_an_assignee_hidden_node_selects_and_centres_it(
+        self, page: Page, agents_base_url,
+    ):
+        _open_agents(page, agents_base_url)
+        page.select_option("#board-filter-assignee", "codex")
+        page.wait_for_timeout(200)
+        _go_to_graph(page)
+        assert page.input_value("#filter-assignee") == "codex"
+        # sess-question's assignee is "me" — hidden by the shared "codex"
+        # assignee filter, so it renders no node until the search-result
+        # click relaxes it.
+        assert "sess-question" not in _nodes(page)
+        page.fill("#search-input", "Answer the operator")
+        page.wait_for_timeout(300)
+        page.click(".search-result")
+        page.wait_for_timeout(600)
+        assert page.input_value("#filter-assignee") == "all"
+        selected = page.evaluate(
+            "() => { const g = [...document.querySelectorAll('.node')]"
+            ".find(n => n.__data__.session_id === 'sess-question');"
+            " return g ? g.querySelector('.node-shape').classList.contains('selected') : false; }"
+        )
+        assert selected is True
+        center = _node_client_center(page, "sess-question")
+        svg = _svg_center(page)
+        assert center is not None
+        assert abs(center["x"] - svg["x"]) < 40
+        assert abs(center["y"] - svg["y"]) < 40
+
+
+class TestCardChipJumpWithNarrowRecency:
+    def test_card_chip_jump_with_narrow_recency_lands_on_a_visible_selected_node(
+        self, page: Page, agents_base_url,
+    ):
+        _open_agents(page, agents_base_url)
+        page.select_option("#board-filter-recency", "60")
+        page.wait_for_timeout(200)
+        chip = page.locator('.board-card[data-card-id="t-cluster"] .board-chip-session')
+        chip.click()
+        page.wait_for_timeout(700)
+        assert "active" in (page.get_attribute('[data-tab="graph"]', "class") or "")
+        # The recency window that hid it (1 min, against a fixture session
+        # thousands of seconds old) was widened enough to fit it, through
+        # the shared store — reflected on the graph's own control...
+        assert page.input_value("#filter-recency") == "all"
+        selected = page.evaluate(
+            "() => { const g = [...document.querySelectorAll('.node')]"
+            ".find(n => n.__data__.session_id === 'sess-cluster-1');"
+            " return g ? g.querySelector('.node-shape').classList.contains('selected') : false; }"
+        )
+        assert selected is True
+        center = _node_client_center(page, "sess-cluster-1")
+        svg = _svg_center(page)
+        assert center is not None
+        assert abs(center["x"] - svg["x"]) < 40
+        assert abs(center["y"] - svg["y"]) < 40
+        # ...and, since it went through the shared store rather than the
+        # select directly, the board sees the widened value too.
+        page.click('[data-tab="board"]')
+        page.wait_for_timeout(200)
+        assert page.input_value("#board-filter-recency") == "all"
+
+
+class TestZoomStaysPutWhileTyping:
+    def test_typing_in_search_and_tag_does_not_reset_zoom(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url)
+        _go_to_graph(page)
+        page.click("#graph-zoom-fit")
+        page.wait_for_timeout(400)
+        k_before = float(page.get_attribute("#graph-svg", "data-zoom-k"))
+        assert abs(k_before - 1.0) > 0.01
+
+        page.fill("#search-input", "cluster")
+        page.wait_for_timeout(300)
+        k_after_search = float(page.get_attribute("#graph-svg", "data-zoom-k"))
+        assert abs(k_after_search - k_before) < 0.01
+
+        page.fill("#filter-tag", "codex")
+        page.wait_for_timeout(300)
+        k_after_tag = float(page.get_attribute("#graph-svg", "data-zoom-k"))
+        assert abs(k_after_tag - k_before) < 0.01
+
+
+class TestRevealCardRelaxesRecency:
+    def test_show_on_board_reveals_a_card_hidden_by_recency(self, page: Page, agents_base_url):
+        """The session is recent (`last_activity_at` a couple of minutes
+        ago, real wall-clock time) so the graph shows and selects it; its
+        linked card's `updated_at` is years old, so the SAME shared recency
+        window (1h) hides the card on the board — the two tabs compare
+        different fields (`last_activity_at` vs `updated_at`), so one shared
+        window value can disagree about the same session/card pair."""
+        recent_session = _session(
+            session_id="sess-recent-old-card", task_id="t-recent", card_id="t-recent",
+            card_title="Card last touched long ago", assignee="me", card_tags=["me"],
+            label="Card last touched long ago", last_activity_at=time.time() - 120,
+        )
+        recent_card = {
+            "kind": "task", "id": "t-recent", "title": "Card last touched long ago",
+            "notes": "", "status": "in_progress", "tags": ["me"], "assignee": "me",
+            "fields": {}, "context": "Work", "updated_at": "2020-01-01T00:00:00+00:00",
+            "pending_question": None, "session": recent_session,
+        }
+        snapshot = dict(SNAPSHOT, sessions=SNAPSHOT["sessions"] + [recent_session])
+        board = dict(BOARD, lanes=dict(
+            BOARD["lanes"], in_progress=BOARD["lanes"]["in_progress"] + [recent_card],
+        ))
+        _open_agents(page, agents_base_url, snapshot=snapshot, board=board)
+        page.select_option("#board-filter-recency", "3600")
+        page.wait_for_timeout(200)
+        page.click('[data-tab="graph"]')
+        page.wait_for_selector("#filter-route")
+        page.wait_for_timeout(300)
+        assert "sess-recent-old-card" in _nodes(page)
+        page.evaluate(
+            """() => {
+                const g = [...document.querySelectorAll('.node')]
+                  .find(n => n.__data__.session_id === 'sess-recent-old-card');
+                g.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }"""
+        )
+        page.wait_for_timeout(300)
+        showBtn = page.locator('#graph-panel-actions [data-action="show-on-board"]')
+        expect(showBtn).to_be_visible()
+        showBtn.click()
+        page.wait_for_timeout(500)
+        expect(page.locator("#board-view")).to_be_visible()
+        card_el = page.locator('.board-card[data-card-id="t-recent"]')
+        expect(card_el).to_be_visible()
+        assert "reveal-highlight" in (card_el.get_attribute("class") or "")
+
+
+class TestBoardTabActivationRevealsSelectedCard:
+    def test_activating_board_tab_with_a_node_selected_reveals_its_card(
+        self, page: Page, agents_base_url,
+    ):
+        _open_agents(page, agents_base_url)
+        _go_to_graph(page)
+        page.evaluate(
+            """() => {
+                const g = [...document.querySelectorAll('.node')]
+                  .find(n => n.__data__.session_id === 'sess-cluster-1');
+                g.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }"""
+        )
+        page.wait_for_timeout(300)
+        expect(page.locator('#graph-panel-actions [data-action="show-on-board"]')).to_be_visible()
+        # The board tab itself, not the panel's own "Show on board" button.
+        page.click('[data-tab="board"]')
+        page.wait_for_timeout(400)
+        card = page.locator('.board-card[data-card-id="t-cluster"]')
+        expect(card).to_be_visible()
+        assert "reveal-highlight" in (card.get_attribute("class") or "")
+
+
+class TestCardDeepLinkHighlightObserved:
+    def test_card_deep_link_highlight_is_observed(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url, path="/agents?card=t-cluster")
+        seen = False
+        for _ in range(30):
+            cls = page.get_attribute('.board-card[data-card-id="t-cluster"]', "class") or ""
+            if "reveal-highlight" in cls:
+                seen = True
+                break
+            page.wait_for_timeout(50)
+        assert seen, "the reveal-highlight class was never observed on the deep-linked card"
+
+
+class TestGraphClearResetsSharedState:
+    def test_graph_clear_button_resets_shared_state(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url)
+        _go_to_graph(page)
+        page.select_option("#filter-assignee", "codex")
+        page.fill("#filter-tag", "urgent")
+        page.wait_for_timeout(200)
+        page.click("#graph-filter-clear")
+        page.wait_for_timeout(200)
+        assert page.input_value("#filter-assignee") == "all"
+        assert page.input_value("#filter-tag") == ""
+        page.click('[data-tab="board"]')
+        page.wait_for_timeout(200)
+        assert page.input_value("#board-filter-assignee") == "all"

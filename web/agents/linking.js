@@ -26,6 +26,14 @@ const LEGACY_BOARD_LANE_STORAGE_KEY = 'lifeos.agents.board.lanes';
 // default rather than showing every lane unfiltered.
 const DEFAULT_LANE_IDS = LANES.filter(l => l.id !== 'done').map(l => l.id);
 
+// `recency` defaults to `null` — "the operator has never set it" — rather
+// than a concrete value, because the board and the graph disagree on what
+// the default recency window should be: the board's default is all time,
+// the graph's is its own auto-computed window (30 min, or 7 days once
+// include-finished is ticked — see `applyRecencyDefault` in graph.js). A
+// `null` shared value lets each tab apply its own default; any explicit
+// operator change writes a concrete value through `setFilter`/`setFilters`,
+// which both tabs then honour identically.
 export const DEFAULT_FILTERS = Object.freeze({
   search: '',
   lanes: DEFAULT_LANE_IDS,
@@ -33,7 +41,7 @@ export const DEFAULT_FILTERS = Object.freeze({
   host: 'all',
   engine: 'all',
   tag: '',
-  recency: 'all',
+  recency: null,
 });
 
 // Tolerates a hand-edited or stale array: drops any id that doesn't name a
@@ -110,6 +118,24 @@ export function setFilter(key, value) {
   notifyFilters();
 }
 
+// Applies several keys at once and notifies subscribers ONCE — a caller
+// relaxing multiple shared filters for one target (e.g. `relaxSharedFiltersFor`
+// in graph.js, `revealCard` in board.js) must not call `setFilter` per key:
+// each call's own synchronous notify would let a subscriber's reconciliation
+// of an EARLIER key (which re-reads the filter object as it stood right
+// after that one write) undo work a LATER key in the same relaxation was
+// about to make visible, before the caller's remaining keys ever get applied.
+export function setFilters(partial) {
+  let next = { ...filters };
+  for (const [key, value] of Object.entries(partial || {})) {
+    if (!(key in DEFAULT_FILTERS)) continue;
+    next[key] = key === 'lanes' ? sanitizeLaneIds(value) : value;
+  }
+  filters = next;
+  persist();
+  notifyFilters();
+}
+
 export function resetFilters() {
   filters = { ...DEFAULT_FILTERS, lanes: [...DEFAULT_FILTERS.lanes] };
   persist();
@@ -158,6 +184,25 @@ export function takeBoardFocus() {
   const value = pendingBoardFocus;
   pendingBoardFocus = null;
   return value;
+}
+
+// The `card_id` of whatever the graph currently has selected (a session or
+// a card anchor), or null when nothing selected has one — NOT a one-shot
+// intent like `requestBoardFocus`/`takeBoardFocus` above, since it must
+// still answer correctly however many times the operator switches tabs.
+// `graph.js` updates it on every selection change; `board.js` reads it when
+// the board tab activates with no other pending focus intent, so switching
+// to the board while a card's session is selected on the graph reveals that
+// card too (the panel's own "Show on board" button stays as an explicit,
+// separate way to do the same thing).
+let selectedGraphCardId = null;
+
+export function setSelectedGraphCardId(cardId) {
+  selectedGraphCardId = cardId || null;
+}
+
+export function getSelectedGraphCardId() {
+  return selectedGraphCardId;
 }
 
 const tabSubscribers = [];

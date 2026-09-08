@@ -24,9 +24,9 @@ import { renderAssignmentPickers } from './assignment.js';
 import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
 import {
-  getFilters, setFilter, resetFilters, subscribe as subscribeFilters,
+  getFilters, setFilter, setFilters, resetFilters, subscribe as subscribeFilters,
   requestGraphFocus, requestBoardFocus, takeBoardFocus,
-  onTabActivate, activateTab,
+  onTabActivate, activateTab, getSelectedGraphCardId,
 } from './linking.js';
 
 const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local'];
@@ -172,6 +172,13 @@ export function initBoard() {
     restoreFocusedTextField(captured);
   }
 
+  // `revealCard`'s highlight — kept here (not just poked onto a DOM node
+  // once) so a `render()` that rebuilds every card element in the middle of
+  // the ~2s window (a board-stream SSE tick, common on a cold load) still
+  // stamps it back onto the freshly-built element instead of losing it.
+  let revealedCardId = null;
+  let revealHighlightTimer = null;
+
   // ------------------------------------------------------------------
   // Data load + live updates
   // ------------------------------------------------------------------
@@ -289,20 +296,30 @@ export function initBoard() {
     const hosts = [...new Set(
       allCards().flatMap(c => [c.session && c.session.host, c.fields && c.fields.host]).filter(Boolean)
     )].sort();
-    const hostKey = hosts.join('|');
+    // The shared `host` filter (linking.js) can name a host no board card
+    // currently uses at all — e.g. a session running on it never got linked
+    // to a task, so `_task_card` never surfaces it — in which case the
+    // option list above would never contain it and the select would fall
+    // back to blank. Inject it as a selectable option too, so the control
+    // always shows what's actually filtering rather than rendering blank.
+    const sharedHost = getFilters().host;
+    const optionHosts = (sharedHost && sharedHost !== 'all' && !hosts.includes(sharedHost))
+      ? [...hosts, sharedHost].sort()
+      : hosts;
+    const hostKey = optionHosts.join('|');
     if (hostFilterEl && hostKey !== _lastHostKey) {
       _lastHostKey = hostKey;
       const current = hostFilterEl.value;
       hostFilterEl.innerHTML = '<option value="all">all hosts</option>'
-        + hosts.map(h => `<option value="${escapeHtml(h)}">${escapeHtml(h)}</option>`).join('');
+        + optionHosts.map(h => `<option value="${escapeHtml(h)}">${escapeHtml(h)}</option>`).join('');
       // `host` is shared (linking.js) — the persisted/cross-tab value wins
       // over the select's own pre-repopulation value once it's actually a
       // valid option, so a host filter restored from localStorage before
       // this option list existed yet still lands once it can.
       const preferred = getFilters().host;
-      if (preferred && (preferred === 'all' || hosts.includes(preferred))) {
+      if (preferred && (preferred === 'all' || optionHosts.includes(preferred))) {
         hostFilterEl.value = preferred;
-      } else if (current && (current === 'all' || hosts.includes(current))) {
+      } else if (current && (current === 'all' || optionHosts.includes(current))) {
         hostFilterEl.value = current;
       }
     }
@@ -321,7 +338,14 @@ export function initBoard() {
   }
 
   function cardMatchesFilters(card) {
-    const search = (searchEl?.value || '').trim().toLowerCase();
+    // Read every SHARED key straight from the store rather than trusting a
+    // DOM select's current value — a select can lag the store (its option
+    // list populated asynchronously, e.g. `host` above) or simply not be
+    // the thing the render loop should trust, the same reasoning
+    // `applyFilters` in graph.js already follows.
+    const shared = getFilters();
+
+    const search = (shared.search || '').trim().toLowerCase();
     if (search) {
       const haystack = card.kind === 'schedule'
         ? (card.name || '')
@@ -329,7 +353,7 @@ export function initBoard() {
       if (!haystack.toLowerCase().includes(search)) return false;
     }
 
-    const assigneeSel = assigneeFilterEl?.value || 'all';
+    const assigneeSel = shared.assignee || 'all';
     if (assigneeSel !== 'all') {
       if (card.kind !== 'task') return false;
       if (assigneeSel === 'unassigned') {
@@ -339,7 +363,7 @@ export function initBoard() {
       }
     }
 
-    const hostSel = hostFilterEl?.value || 'all';
+    const hostSel = shared.host || 'all';
     if (hostSel !== 'all') {
       // Matches on either the assignment or the observation — a
       // card matches a selected host when its fields.host names it OR its
@@ -349,7 +373,7 @@ export function initBoard() {
       if (sessionHost !== hostSel && assignedHost !== hostSel) return false;
     }
 
-    const tagQuery = (tagFilterEl?.value || '').trim().toLowerCase().replace(/^#/, '');
+    const tagQuery = (shared.tag || '').trim().toLowerCase().replace(/^#/, '');
     if (tagQuery) {
       if (card.kind !== 'task') return false;
       if (!(card.tags || []).some(t => t.toLowerCase().includes(tagQuery))) return false;
@@ -359,18 +383,22 @@ export function initBoard() {
     // A card matches when its linked session's routing/source (the same
     // notion `routingFilterValue` computes for a graph node) matches; a
     // card with no linked session matches only when the filter is "all".
-    const engineSel = engineFilterEl?.value || 'all';
+    const engineSel = shared.engine || 'all';
     if (engineSel !== 'all') {
       if (!card.session || routingFilterValue(card.session) !== engineSel) return false;
     }
 
+    // Context stays board-local — not one of the seven shared keys.
     const contextSel = contextFilterEl?.value || 'all';
     if (contextSel !== 'all') {
       if (card.kind !== 'task' || card.context !== contextSel) return false;
     }
 
-    const recencyRaw = recencyFilterEl?.value || 'all';
-    if (recencyRaw !== 'all') {
+    // `null` (the shared default) means "the operator has never set a
+    // recency" — the board's own default is all time, so it filters
+    // nothing, same as an explicit 'all'.
+    const recencyRaw = shared.recency;
+    if (recencyRaw != null && recencyRaw !== 'all') {
       const recencySec = Number(recencyRaw);
       const stamp = card.kind === 'schedule' ? card.next_fire_at : card.updated_at;
       if (stamp) {
@@ -439,6 +467,12 @@ export function initBoard() {
     div.className = 'board-card';
     div.dataset.cardId = card.id;
     div.dataset.lane = card.lane;
+    // Re-stamps the reveal highlight on a freshly-built element — a
+    // `render()` in the middle of `revealCard`'s ~2s window (e.g. a
+    // board-stream SSE tick) rebuilds every card node from scratch, so this
+    // is what keeps the highlight surviving that rebuild rather than a
+    // one-time class added to a node that gets discarded.
+    if (card.id === revealedCardId) div.classList.add('reveal-highlight');
     div.innerHTML = `
       <div class="board-card-title">${live ? '<span class="live-dot" title="live"></span>' : ''}${escapeHtml(card.title || '(untitled)')}</div>
       ${card.pending_question ? `<div class="board-card-question">❓ ${escapeHtml(card.pending_question.question)}</div>` : ''}
@@ -465,6 +499,7 @@ export function initBoard() {
     div.className = 'board-card board-card-schedule';
     div.dataset.cardId = card.id;
     div.dataset.lane = card.lane;
+    if (card.id === revealedCardId) div.classList.add('reveal-highlight');
     const nextFire = card.next_fire_at ? new Date(card.next_fire_at).toLocaleString() : '—';
     div.innerHTML = `
       <div class="board-card-title">${escapeHtml(card.name || '(schedule)')}</div>
@@ -526,12 +561,15 @@ export function initBoard() {
   }
 
   // Makes card `cardId` visible and scrolls it into view — the graph tab's
-  // "Show on board" action and a `?card=<id>` deep link both land here.
-  // Only the lane filter is relaxed (adding the card's own lane back to the
-  // shared selection if it's currently hidden); an unknown id is reported
-  // rather than left to fail silently, and any OTHER active filter that
-  // still hides the card (search text, assignee, tag, …) is left as-is —
-  // the operator set those on purpose.
+  // "Show on board" action, a `?card=<id>` deep link, and activating the
+  // board tab with a card selected on the graph (see `drainBoardFocus`
+  // below) all land here. Relaxes EVERY shared filter that currently hides
+  // the card (lanes, assignee, host, engine, tag, search, recency) through
+  // one batched `setFilters` call, then confirms the card actually rendered
+  // before scrolling/highlighting — a board-local filter (context, include
+  // cancelled) is left as-is, the operator set those on purpose and they
+  // have no shared counterpart to relax. An unknown id is reported rather
+  // than left to fail silently.
   function revealCard(cardId, opts) {
     const openDrawerFlag = !!(opts && opts.openDrawer);
     const card = findCard(cardId);
@@ -539,30 +577,79 @@ export function initBoard() {
       showToast(`No such card: ${cardId}`, true);
       return;
     }
-    if (!visibleLanes.has(card.lane)) {
-      setFilter('lanes', [...getFilters().lanes, card.lane]);
+    const shared = getFilters();
+    const updates = {};
+    if (!visibleLanes.has(card.lane)) updates.lanes = [...shared.lanes, card.lane];
+    if (shared.assignee !== 'all') {
+      const matches = shared.assignee === 'unassigned' ? !card.assignee : card.assignee === shared.assignee;
+      if (!matches) updates.assignee = 'all';
     }
+    if (shared.host !== 'all') {
+      const sessionHost = card.session && card.session.host;
+      const assignedHost = card.fields && card.fields.host;
+      if (sessionHost !== shared.host && assignedHost !== shared.host) updates.host = 'all';
+    }
+    if (shared.engine !== 'all' && (!card.session || routingFilterValue(card.session) !== shared.engine)) {
+      updates.engine = 'all';
+    }
+    if (shared.tag) {
+      const tagQuery = shared.tag.trim().toLowerCase().replace(/^#/, '');
+      if (!(card.tags || []).some(t => t.toLowerCase().includes(tagQuery))) updates.tag = '';
+    }
+    if (shared.search) {
+      const search = shared.search.trim().toLowerCase();
+      const haystack = card.kind === 'schedule' ? (card.name || '') : `${card.title || ''} ${card.notes || ''}`;
+      if (!haystack.toLowerCase().includes(search)) updates.search = '';
+    }
+    if (shared.recency != null && shared.recency !== 'all') {
+      const stamp = card.kind === 'schedule' ? card.next_fire_at : card.updated_at;
+      if (stamp && (Date.now() - new Date(stamp).getTime()) / 1000 > Number(shared.recency)) {
+        updates.recency = 'all';
+      }
+    }
+    // `setFilters` notifies synchronously — by the time it returns, this
+    // module's own `syncSharedFilterControls` subscriber has already
+    // re-rendered the board against the widened filters, so the card's
+    // element (if nothing board-local still hides it) already exists below.
+    if (Object.keys(updates).length > 0) setFilters(updates);
+
+    revealedCardId = cardId;
     const el = lanesEl.querySelector(`.board-card[data-card-id="${CSS.escape(cardId)}"]`);
     if (el) {
       el.scrollIntoView({ block: 'nearest' });
       el.classList.add('reveal-highlight');
-      setTimeout(() => el.classList.remove('reveal-highlight'), 2000);
     }
+    clearTimeout(revealHighlightTimer);
+    revealHighlightTimer = setTimeout(() => {
+      revealedCardId = null;
+      const current = lanesEl.querySelector(`.board-card[data-card-id="${CSS.escape(cardId)}"]`);
+      if (current) current.classList.remove('reveal-highlight');
+    }, 2000);
     if (openDrawerFlag) openDrawer(cardId);
   }
 
   function drainBoardFocus() {
     const intent = takeBoardFocus();
-    if (!intent) return;
-    if (!boardLoaded) {
-      // Data hasn't arrived yet (a tab-activation drain can fire before the
-      // first GET /api/agents/board resolves) — put the intent back so
-      // `applyBoard`'s own drain resolves it once it actually can, rather
-      // than wrongly reporting a real card as unknown.
-      requestBoardFocus(intent.cardId, { openDrawer: intent.openDrawer });
+    if (intent) {
+      if (!boardLoaded) {
+        // Data hasn't arrived yet (a tab-activation drain can fire before
+        // the first GET /api/agents/board resolves) — put the intent back
+        // so `applyBoard`'s own drain resolves it once it actually can,
+        // rather than wrongly reporting a real card as unknown.
+        requestBoardFocus(intent.cardId, { openDrawer: intent.openDrawer });
+        return;
+      }
+      revealCard(intent.cardId, { openDrawer: intent.openDrawer });
       return;
     }
-    revealCard(intent.cardId, { openDrawer: intent.openDrawer });
+    // No explicit chip/URL intent pending — if the graph currently has a
+    // card selected (a session or card anchor carrying a `card_id`),
+    // activating the board tab reveals that card too, without requiring the
+    // panel's own "Show on board" button click. That button stays as a
+    // separate, explicit way to do the same thing.
+    if (!boardLoaded) return;
+    const graphCardId = getSelectedGraphCardId();
+    if (graphCardId) revealCard(graphCardId, { openDrawer: false });
   }
   onTabActivate((name) => { if (name === 'board') drainBoardFocus(); });
 
@@ -1741,6 +1828,11 @@ export function initBoard() {
   if (filterClearBtn) filterClearBtn.addEventListener('click', () => resetFilters());
 
   function syncSharedFilterControls(state) {
+    // Rebuild (and, if needed, inject) the host option list against the
+    // now-current shared state BEFORE assigning `hostFilterEl.value` below —
+    // otherwise a host that isn't yet a real `<option>` silently coerces the
+    // assignment to `""`, same as any other absent-value `<select>` write.
+    updateFilterOptions();
     if (searchEl && document.activeElement !== searchEl && searchEl.value !== state.search) {
       searchEl.value = state.search;
     }
@@ -1750,7 +1842,11 @@ export function initBoard() {
     if (tagFilterEl && document.activeElement !== tagFilterEl && tagFilterEl.value !== state.tag) {
       tagFilterEl.value = state.tag;
     }
-    if (recencyFilterEl && recencyFilterEl.value !== state.recency) recencyFilterEl.value = state.recency;
+    // `null` (the shared default — "the operator has never set it") reads
+    // as "all time" here, the board's own longstanding default; only a
+    // concrete value is ever written back to `localStorage`.
+    const recencyDisplay = state.recency == null ? 'all' : state.recency;
+    if (recencyFilterEl && recencyFilterEl.value !== recencyDisplay) recencyFilterEl.value = recencyDisplay;
     syncLaneFilterUI(state.lanes);
     render();
   }
