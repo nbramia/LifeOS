@@ -1246,21 +1246,39 @@ export function initBoard() {
       </div>
     `;
     document.body.appendChild(backdrop);
+    // Guards dismissal (backdrop click / Cancel) while a confirm is in
+    // flight — without it, clicking the backdrop mid-request removes the
+    // modal out from under the confirm handler, which then re-enables a
+    // detached button on failure instead of the modal staying open.
+    let pending = false;
     const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
-    backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
-    backdrop.querySelector('#delete-cancel').onclick = cleanup;
+    backdrop.addEventListener('click', e => { if (!pending && e.target === backdrop) cleanup(); });
+    backdrop.querySelector('#delete-cancel').onclick = () => { if (!pending) cleanup(); };
     backdrop.querySelector('#delete-confirm').onclick = async () => {
       const confirmBtn = backdrop.querySelector('#delete-confirm');
+      pending = true;
       confirmBtn.disabled = true;
       confirmBtn.textContent = 'Deleting…';
       try {
-        if (needsKill) {
-          const kr = await fetch(`/api/agents/sessions/${encodeURIComponent(card.session.session_id)}/kill`, {
+        // Re-resolve the card from the live board rather than trusting the
+        // snapshot captured when the modal opened — `updateOpenDrawer`
+        // skips rebuilding the drawer while it holds focus, so a card the
+        // worker claims after the drawer opened can still show a
+        // session-less snapshot here. Falls back to the captured `card`
+        // if it's vanished from the board entirely.
+        const fresh = findCard(card.id) || card;
+        const freshHasLiveSession = !!(fresh.session && !TERMINAL.has(fresh.session.status));
+        const freshIsCliSession = !!(fresh.session && (fresh.session.source === 'claude_code' || fresh.session.source === 'codex'));
+        const freshNeedsKill = isTask && freshHasLiveSession && !freshIsCliSession;
+        if (freshNeedsKill) {
+          const kr = await fetch(`/api/agents/sessions/${encodeURIComponent(fresh.session.session_id)}/kill`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),
           });
           if (!kr.ok) {
             const text = await kr.text();
-            throw new Error(`Kill failed: HTTP ${kr.status}: ${text}`);
+            let msg = text;
+            try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+            throw new Error(`Kill failed: HTTP ${kr.status}: ${msg}`);
           }
           const killResult = await kr.json();
           const failures = killResult.failures || [];
@@ -1278,12 +1296,14 @@ export function initBoard() {
           try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
           throw new Error(msg || `HTTP ${dr.status}`);
         }
+        pending = false;
         cleanup();
         closeDrawer();
         showToast('Deleted.', false);
         await fetchBoard();
       } catch (err) {
         showToast(`Delete failed: ${err.message}`, true);
+        pending = false;
         confirmBtn.disabled = false;
         confirmBtn.textContent = 'Delete';
       }

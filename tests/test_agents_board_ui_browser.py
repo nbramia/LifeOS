@@ -194,6 +194,7 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                   open_response: "dict | None" = None, task_posts: "list | None" = None,
                   cancel_calls: "list | None" = None, cancel_failures: "list | None" = None,
                   kill_calls: "list | None" = None, kill_status_code: "list | None" = None,
+                  kill_failures: "list | None" = None,
                   task_deletes: "list | None" = None, schedule_deletes: "list | None" = None,
                   call_log: "list | None" = None):
     """Stub d3 (offline CDN) + every /api/ call the page makes.
@@ -208,6 +209,10 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
     /api/agents/sessions/{id}/kill). `kill_status_code`, when given,
     is a one-element list read fresh on every kill call (mirrors
     `lane_status_code`) — a non-200 entry makes the kill stub fail.
+    `kill_failures`, when given, makes a 200 kill response report those
+    entries under `failures` (and an empty `killed` list) instead of a
+    clean kill — the "the endpoint said OK but didn't actually kill
+    anything" shape, distinct from `kill_status_code`'s transport failure.
     `task_deletes`/`schedule_deletes`: appended with each deleted id
     (DELETE /api/tasks/{id} / DELETE /api/scheduler/{id}); a successful
     delete also removes the card from `board_state` so a re-fetch shows
@@ -443,7 +448,13 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             if code != 200:
                 route.fulfill(status=code, content_type="application/json", body=json.dumps({"detail": "boom"}))
             else:
-                route.fulfill(status=200, content_type="application/json", body=json.dumps({"killed": [session_id], "failures": []}))
+                route.fulfill(
+                    status=200, content_type="application/json",
+                    body=json.dumps({
+                        "killed": [] if kill_failures else [session_id],
+                        "failures": kill_failures or [],
+                    }),
+                )
             return
 
         if re.search(r"/api/agents/board$", url) and method == "GET":
@@ -460,7 +471,8 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
 def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_puts=None, lane_status_code=None,
                  schedule_puts=None, board_stream_frames=None, stream_gate=None, lane_response=None,
                  open_calls=None, open_response=None, task_posts=None, cancel_calls=None, cancel_failures=None,
-                 kill_calls=None, kill_status_code=None, task_deletes=None, schedule_deletes=None, call_log=None):
+                 kill_calls=None, kill_status_code=None, kill_failures=None,
+                 task_deletes=None, schedule_deletes=None, call_log=None):
     _stub_routes(
         page,
         board_state if board_state is not None else _board_fixture(),
@@ -478,6 +490,7 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
         cancel_failures,
         kill_calls,
         kill_status_code,
+        kill_failures,
         task_deletes,
         schedule_deletes,
         call_log,
@@ -2590,6 +2603,72 @@ class TestDeleteCard:
         expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
         expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
 
+    def test_delete_kills_the_session_claimed_while_the_drawer_was_focused(self, page: Page, agents_base_url):
+        """The confirm handler must resolve the kill decision from the
+        live board, not the card snapshot the drawer last rendered from —
+        `updateOpenDrawer` skips rebuilding the drawer while it holds
+        focus, so a card the worker claims after the drawer opened (while
+        the operator's caret sits in the Notes field) still shows a
+        session-less snapshot there. Follows the established
+        deferred-frame pattern (see TestLiveUpdates /
+        test_tags_blur_reads_fresh_board_state_after_a_deferred_frame): the
+        frame is withheld behind `stream_gate` until the drawer is open and
+        Notes holds focus, and an unrelated card (t1) carries the
+        proof-of-arrival signal since the drawer itself doesn't rebuild
+        while focused."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append({
+            "kind": "task", "id": "t23", "title": "Unclaimed claude card",
+            "notes": "", "status": "todo", "tags": ["claude"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        board_stream_frames: list[str] = []
+        task_deletes = []
+        kill_calls = []
+        call_log = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+            task_deletes=task_deletes, kill_calls=kill_calls, call_log=call_log,
+        )
+        page.locator('[data-card-id="t23"]').click()
+        notes = page.locator(".drawer-notes")
+        notes.click()  # focus stays in Notes
+
+        # Signal on a DIFFERENT card (t1) proves the frame actually landed;
+        # the real change is the worker claiming t23 mid-edit. t23 stays in
+        # "assigned" (only its session/status/tags change) — the delete
+        # confirm handler's kill decision only cares whether t23 carries a
+        # live, killable session, not which lane it's grouped under.
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t23":
+                card["status"] = "in_progress"
+                card["tags"] = ["claude", "agent-running"]
+                card["session"] = {
+                    "session_id": "s-t23-live", "status": "running",
+                    "host": "test-host", "routing": "claude", "model_label": "Sonnet",
+                    "source": "lifeos_agent",
+                }
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text("urgent", timeout=5000)
+        expect(notes).to_be_focused()  # drawer not rebuilt while focused
+
+        page.get_by_role("button", name="Delete", exact=True).click()
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert kill_calls == ["s-t23-live"]
+        assert task_deletes == ["t23"]
+        # The kill happened before the delete, not merely both happening.
+        assert call_log == [("kill", "s-t23-live"), ("task_delete", "t23")]
+
     def test_claimed_task_card_with_live_session_kills_before_deleting(self, page: Page, agents_base_url):
         board_state = copy.deepcopy(_board_fixture())
         board_state["lanes"]["in_progress"].append({
@@ -2612,6 +2691,9 @@ class TestDeleteCard:
         )
 
         page.locator('[data-card-id="t20"]').click()
+        # The linked-session panel renders into the drawer's session-panel
+        # container while the card is open.
+        expect(page.locator('[data-field="session-panel"] .panel-header')).to_be_visible()
         page.get_by_role("button", name="Delete", exact=True).click()
         expect(page.locator(".modal .descendants")).to_contain_text(
             "kill the running session and its subagents"
@@ -2624,6 +2706,10 @@ class TestDeleteCard:
         # The kill happened before the delete, not merely both happening.
         assert call_log == [("kill", "s-t20"), ("task_delete", "t20")]
         expect(page.locator('[data-card-id="t20"]')).to_have_count(0)
+        # A successful delete tears the session panel down through the
+        # drawer's own close path rather than leaving it for a later
+        # board refresh to clean up.
+        expect(page.locator('[data-field="session-panel"] .panel-header')).to_have_count(0)
 
     def test_scheduled_card_deletes_through_the_scheduler_endpoint(self, page: Page, agents_base_url):
         task_deletes = []
@@ -2670,6 +2756,46 @@ class TestDeleteCard:
         page.locator("#delete-confirm").click()
 
         expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        assert kill_calls == ["s-t20"]
+        assert task_deletes == []
+        expect(page.locator("#delete-title")).to_be_visible()
+        confirm_btn = page.locator("#delete-confirm")
+        expect(confirm_btn).to_be_enabled()
+        expect(confirm_btn).to_have_text("Delete")
+        expect(page.locator('[data-card-id="t20"]')).to_be_visible()
+
+    def test_kill_reported_failure_blocks_the_delete_and_reenables_the_confirm_button(self, page: Page, agents_base_url):
+        """A 2xx kill response can still report the session under
+        `failures` (the kill endpoint said OK but didn't actually tear
+        anything down) — distinct from `kill_status_code`'s transport
+        failure above, and the delete must not proceed on this branch
+        either."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["in_progress"].append({
+            "kind": "task", "id": "t20", "title": "Claimed with a live worker session",
+            "notes": "", "status": "in_progress", "tags": ["claude", "agent-running"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "s-t20", "status": "running",
+                "host": "test-host", "routing": "claude", "model_label": "Sonnet",
+                "source": "lifeos_agent",
+            },
+            "pending_question": None,
+        })
+        task_deletes = []
+        kill_calls = []
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            task_deletes=task_deletes, kill_calls=kill_calls,
+            kill_failures=[{"session_id": "s-t20", "reason": "process wouldn't die"}],
+        )
+
+        page.locator('[data-card-id="t20"]').click()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        page.locator("#delete-confirm").click()
+
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        expect(page.locator(".toast.error")).to_contain_text("process wouldn't die")
         assert kill_calls == ["s-t20"]
         assert task_deletes == []
         expect(page.locator("#delete-title")).to_be_visible()
