@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Scheduler
-> **Last Updated:** 2026-08-18
+> **Last Updated:** 2026-09-08
 > **Audience:** Operators
 
 The Scheduler runs work on a timer. A **schedule** binds a **trigger** (one-off
@@ -70,10 +70,11 @@ so finance, health, or therapy content lands in its own channel instead of the
 general feed. The valid names are `primary` plus whatever is *configured* —
 `config/telegram_bots.json` is the registry, but an entry there counts only once
 the env var named by its `token_env` is set, so a listed bot with no token is not
-an accepted name. Both `POST /api/scheduler` and `PUT /api/scheduler/{id}` reject
-any other name with a 422 that lists the accepted ones. Leaving the field unset
-means the primary bot, which is what an installation with no specialized bots
-configured gets.
+an accepted name. `GET /api/scheduler/bots` lists exactly those accepted names.
+Both `POST /api/scheduler` and `PUT /api/scheduler/{id}` reject any other name
+with a 422 that lists the accepted ones. Leaving the field unset means the
+primary bot, which is what an installation with no specialized bots configured
+gets.
 
 If a stored schedule names a bot the registry no longer has — usually because
 the bot was renamed after the schedule was written — the notification is still
@@ -138,10 +139,25 @@ curl -X POST http://localhost:8000/api/scheduler \
 
 ## Managing Schedules
 
+`PUT /api/scheduler/{id}` validates every field it's given: an unrecognised
+`schedule_type` or `action` rejects the write with a 400 (the same status
+`POST /api/scheduler` uses for those two fields), and an unparsable cron
+expression or ISO datetime, or an unresolvable IANA `timezone`, rejects it
+with a 422. Either way nothing is saved. `POST /api/scheduler` does not run
+the cron / datetime / timezone checks — a schedule created with an unparsable
+value stores fine and then never computes a next fire, which is why the
+update path checks them.
+
+Nothing is saved when a check fails. A request that changes `schedule_type`
+without also sending a matching `schedule_value` is checked against the
+value already stored, so a `cron` entry can't be flipped to `once` (or back)
+and left pointing at a value that doesn't parse under its own type — send
+the type and the new value together to convert a schedule.
+
 - **List:** `GET /api/scheduler`, `lifeos_schedule_list`, or "list my schedules"
 - **Update:** `PUT /api/scheduler/{id}`, or edit the line in Obsidian
 - **Delete:** `DELETE /api/scheduler/{id}`, or "delete the … schedule"
-- **Test-fire:** `POST /api/scheduler/{id}/trigger`
+- **Trigger now:** `POST /api/scheduler/{id}/trigger` — fires immediately; for a `once` schedule this consumes it (disables it and clears its next fire), the same as if it had fired on its own.
 - **Pause all:** set `enabled: false` in `LifeOS/Scheduler/Scheduler.md`
 
 ## Obsidian Dashboard

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-09-04
+> **Last Updated:** 2026-09-08
 
 Codebase organization and module structure for efficient navigation.
 
@@ -63,7 +63,7 @@ api/
 | crm.py | ~5,100 | 57 | Personal CRM API |
 | chat.py | ~1,800 | 1 | Streaming chat with agentic pipeline |
 | tasks.py | ~180 | 6 | Task CRUD API |
-| scheduler.py | ~230 | 7 | Schedule CRUD API (/api/scheduler) |
+| scheduler.py | ~330 | 8 | Schedule CRUD API (/api/scheduler) |
 | reminders.py | ~180 | 6 | Deprecated /api/reminders alias |
 | calendar.py | ~400 | 8 | Google Calendar |
 | gmail.py | ~350 | 6 | Gmail integration |

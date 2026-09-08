@@ -42,7 +42,17 @@ const DRAWER_EDITABLE_FIELDS = [
   'title', 'notes', 'tags', 'context', 'assignee', 'lane',
   // Scheduled-card fields, editable in the drawer since #850 finding 4.
   'name', 'message_content', 'enabled',
+  // Full schedule editing — trigger type, timing, timezone, action,
+  // executor, and delivery bot — all through PUT /api/scheduler/{id}.
+  'schedule_type', 'schedule_value', 'timezone', 'action', 'executor', 'bot',
 ];
+
+// Action a schedule fires when it's due. Mirrors VALID_ACTIONS in
+// api/services/scheduler_store.py.
+const SCHEDULE_ACTIONS = ['notify', 'prompt', 'endpoint', 'agent'];
+// Executor tags a schedule's `agent` action hands off to the agent worker
+// with. Mirrors the executor values accepted by api/routes/scheduler.py.
+const SCHEDULE_EXECUTORS = ['local', 'cloud', 'cloud-haiku', 'cloud-sonnet'];
 
 // Lane filter — multi-select checkbox dropdown. Hidden lanes are
 // removed from the grid entirely (not just emptied), so the remaining
@@ -828,6 +838,36 @@ export function initBoard() {
     return r.json();
   }
 
+  // Bot-registry cache backing the schedule drawer's Bot select — mirrors
+  // assignment.js's loadHostCatalog in NOT caching a failure (so the next
+  // drawer open retries), but without its reachability TTL/cooldown: the
+  // bot registry doesn't drift minute to minute the way host online/offline
+  // status does, so a plain once-per-page-load cache on success is enough.
+  let _botsCatalogPromise = null;
+  function loadBotCatalog(fetchImpl = fetch) {
+    if (_botsCatalogPromise) return _botsCatalogPromise;
+    const promise = fetchImpl('/api/scheduler/bots')
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .catch(() => { _botsCatalogPromise = null; return null; });
+    _botsCatalogPromise = promise;
+    return promise;
+  }
+
+  function formatNextFire(iso) {
+    if (!iso) return 'Not scheduled to fire again.';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return 'Not scheduled to fire again.';
+    return `Next fire: ${d.toLocaleString()}`;
+  }
+
+  function formatLastRun(lastRun) {
+    if (!lastRun) return "Hasn't run yet.";
+    const at = lastRun.at ? new Date(lastRun.at).toLocaleString() : 'unknown time';
+    const outcome = lastRun.outcome || 'unknown';
+    const snippet = lastRun.snippet ? ` — ${lastRun.snippet}` : '';
+    return `Last run: ${at} — ${outcome}${snippet}`;
+  }
+
   // Notes autosize — height tracks content up to 2/3 of the
   // viewport height, after which `.drawer-notes-autosize`'s
   // `overflow-y: auto` (web/agents.html) takes over scrolling. Scoped to
@@ -899,8 +939,50 @@ export function initBoard() {
       <label class="drawer-label">Message</label>
       <textarea class="drawer-notes" data-field="message-content" placeholder="Message…">${escapeHtml(card.message_content || '')}</textarea>
       <label class="drawer-label"><input type="checkbox" data-field="enabled" ${card.enabled ? 'checked' : ''} /> Enabled</label>
-      <div class="drawer-schedule-hint">Name, message, and enabled save here through the scheduler API — for schedule type, timing, or executor, use the existing scheduler UI.</div>
-      <div class="drawer-actions" data-field="actions"></div>
+      <div class="drawer-row">
+        <div>
+          <label class="drawer-label">Schedule type</label>
+          <select class="drawer-select" data-field="schedule-type">
+            <option value="cron" ${card.schedule_type === 'cron' ? 'selected' : ''}>cron</option>
+            <option value="once" ${card.schedule_type === 'once' ? 'selected' : ''}>once</option>
+          </select>
+        </div>
+        <div>
+          <label class="drawer-label" data-field="schedule-value-label">${card.schedule_type === 'once' ? 'When (ISO datetime)' : 'Cron expression'}</label>
+          <input class="drawer-schedule-value" data-field="schedule-value" value="${escapeHtml(card.schedule_value || '')}" placeholder="${card.schedule_type === 'once' ? '2026-06-03T15:05:00' : '0 9 * * *'}" />
+          <div class="drawer-field-error" data-field="schedule-value-error" hidden></div>
+        </div>
+      </div>
+      <label class="drawer-label">Timezone</label>
+      <input class="drawer-timezone" data-field="timezone" value="${escapeHtml(card.timezone || '')}" placeholder="e.g. America/New_York" />
+      <div class="drawer-field-error" data-field="timezone-error" hidden></div>
+      <div class="drawer-row">
+        <div>
+          <label class="drawer-label">Action</label>
+          <select class="drawer-select" data-field="action">
+            ${SCHEDULE_ACTIONS.map(a => `<option value="${a}" ${card.action === a ? 'selected' : ''}>${a}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <div data-row="executor" ${card.action === 'agent' ? '' : 'hidden'}>
+            <label class="drawer-label">Executor</label>
+            <select class="drawer-select" data-field="executor">
+              <option value="" ${!card.executor ? 'selected' : ''}>default route</option>
+              ${SCHEDULE_EXECUTORS.map(e => `<option value="${e}" ${card.executor === e ? 'selected' : ''}>${e}</option>`).join('')}
+            </select>
+          </div>
+          <div data-row="bot" ${card.action === 'agent' ? 'hidden' : ''}>
+            <label class="drawer-label">Bot</label>
+            <select class="drawer-select" data-field="bot" disabled></select>
+            <div class="drawer-field-reason" data-field="bot-reason" hidden></div>
+          </div>
+        </div>
+      </div>
+      <div class="drawer-schedule-info" data-field="next-fire-preview"></div>
+      <div class="drawer-schedule-info" data-field="last-run-info"></div>
+      <div class="drawer-actions" data-field="actions">
+        <button class="drawer-action" data-action="trigger-now">${card.schedule_type === 'once' ? 'Trigger now (disables this one-off)' : 'Trigger now'}</button>
+      </div>
       `}
     `;
     drawerEl.querySelector('[data-action="drawer-close"]').onclick = closeDrawer;
@@ -920,18 +1002,7 @@ export function initBoard() {
     });
 
     if (!isTask) {
-      const msgEl = drawerEl.querySelector('[data-field="message-content"]');
-      msgEl.addEventListener('blur', async () => {
-        const value = msgEl.value;
-        if (value === (card.message_content || '')) return;
-        try { await putSchedule(card.id, { message_content: value }); await fetchBoard(); }
-        catch (err) { showToast(`Couldn't save message: ${err.message}`, true); msgEl.value = card.message_content || ''; }
-      });
-      const enabledEl = drawerEl.querySelector('[data-field="enabled"]');
-      enabledEl.addEventListener('change', async () => {
-        try { await putSchedule(card.id, { enabled: enabledEl.checked }); await fetchBoard(); }
-        catch (err) { showToast(`Couldn't update enabled: ${err.message}`, true); enabledEl.checked = !!card.enabled; }
-      });
+      renderScheduleDrawerFields(card);
       renderDrawerActions(card);
       return;
     }
@@ -1035,6 +1106,248 @@ export function initBoard() {
 
     renderDrawerActions(card);
     renderDrawerSession(card);
+  }
+
+  // Wires the scheduled-card drawer's editable fields (renderDrawer's
+  // `!isTask` branch above). Every field saves through putSchedule — the
+  // scheduler API, never the vault file directly — on blur for text
+  // inputs and on change for selects/the checkbox, refetching the board on
+  // a successful save. A rejected save shows the server's `detail` inline
+  // next to the offending field (schedule value, timezone) or as a toast
+  // (every other field), and snaps the control back to the last value the
+  // server actually accepted. The schedule type select is the one
+  // exception: changing it only updates the value field's label and
+  // placeholder locally — it saves together with the schedule value, on
+  // the value field's own blur, so a type and a value that doesn't parse
+  // under it can never reach the server in the same write (see below).
+  function renderScheduleDrawerFields(card) {
+    const msgEl = drawerEl.querySelector('[data-field="message-content"]');
+    msgEl.addEventListener('blur', async () => {
+      const value = msgEl.value;
+      if (value === (card.message_content || '')) return;
+      try { await putSchedule(card.id, { message_content: value }); await fetchBoard(); }
+      catch (err) { showToast(`Couldn't save message: ${err.message}`, true); msgEl.value = card.message_content || ''; }
+    });
+
+    const enabledEl = drawerEl.querySelector('[data-field="enabled"]');
+    enabledEl.addEventListener('change', async () => {
+      try {
+        const resp = await putSchedule(card.id, { enabled: enabledEl.checked });
+        // The store recomputes next_trigger_at for an enabled change too
+        // (clearing it on disable) — refresh the preview from the
+        // response the same way the type/value/timezone saves do, since
+        // updateOpenDrawer skips its own rebuild while this checkbox
+        // holds focus.
+        previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        await fetchBoard();
+      }
+      catch (err) { showToast(`Couldn't update enabled: ${err.message}`, true); enabledEl.checked = !!card.enabled; }
+    });
+
+    const typeEl = drawerEl.querySelector('[data-field="schedule-type"]');
+    const valueEl = drawerEl.querySelector('[data-field="schedule-value"]');
+    const valueLabelEl = drawerEl.querySelector('[data-field="schedule-value-label"]');
+    const valueErrorEl = drawerEl.querySelector('[data-field="schedule-value-error"]');
+    const tzEl = drawerEl.querySelector('[data-field="timezone"]');
+    const tzErrorEl = drawerEl.querySelector('[data-field="timezone-error"]');
+    const actionEl = drawerEl.querySelector('[data-field="action"]');
+    const executorRow = drawerEl.querySelector('[data-row="executor"]');
+    const executorEl = drawerEl.querySelector('[data-field="executor"]');
+    const botRow = drawerEl.querySelector('[data-row="bot"]');
+    const botEl = drawerEl.querySelector('[data-field="bot"]');
+    const botReasonEl = drawerEl.querySelector('[data-field="bot-reason"]');
+    const previewEl = drawerEl.querySelector('[data-field="next-fire-preview"]');
+    const lastRunEl = drawerEl.querySelector('[data-field="last-run-info"]');
+    const triggerBtnEl = drawerEl.querySelector('[data-action="trigger-now"]');
+
+    previewEl.textContent = formatNextFire(card.next_fire_at);
+    lastRunEl.textContent = formatLastRun(card.last_run);
+
+    // What the server last actually accepted for each field — a rejected
+    // save reverts its control to these, not to whatever was showing when
+    // the drawer opened, the same rule the task drawer's assignee select
+    // follows above.
+    let lastSavedType = card.schedule_type;
+    let lastSavedValue = card.schedule_value;
+    let lastSavedTz = card.timezone || '';
+    let lastSavedAction = card.action;
+    let lastSavedExecutor = card.executor || '';
+    let lastSavedBot = card.bot || '';
+
+    function updateValueLabel(type) {
+      if (type === 'once') {
+        valueLabelEl.textContent = 'When (ISO datetime)';
+        valueEl.placeholder = '2026-06-03T15:05:00';
+      } else {
+        valueLabelEl.textContent = 'Cron expression';
+        valueEl.placeholder = '0 9 * * *';
+      }
+    }
+
+    function setActionVisibility(action) {
+      const isAgent = action === 'agent';
+      executorRow.hidden = !isAgent;
+      botRow.hidden = isAgent;
+    }
+
+    typeEl.addEventListener('change', () => {
+      // Type-only, with no matching value, is unsaveable by construction
+      // (a cron string and an ISO datetime never parse as each other) —
+      // saving it here would either write a type/value pair the server
+      // rejects, or one it accepts but that leaves a live schedule
+      // pointed at the wrong parser. So this only updates the label and
+      // placeholder; the value field's blur handler below carries the
+      // type along with whatever value the operator enters to match it,
+      // so a conversion always reaches the server as one matched pair.
+      updateValueLabel(typeEl.value);
+    });
+
+    valueEl.addEventListener('blur', async () => {
+      const value = valueEl.value;
+      const typeChanged = typeEl.value !== lastSavedType;
+      if (value === (lastSavedValue || '') && !typeChanged) return;
+      const patch = { schedule_value: value };
+      if (typeChanged) patch.schedule_type = typeEl.value;
+      try {
+        const resp = await putSchedule(card.id, patch);
+        lastSavedValue = value;
+        if (typeChanged) lastSavedType = typeEl.value;
+        valueErrorEl.hidden = true;
+        valueErrorEl.textContent = '';
+        previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        if (typeChanged) {
+          triggerBtnEl.textContent = lastSavedType === 'once' ? 'Trigger now (disables this one-off)' : 'Trigger now';
+        }
+        await fetchBoard();
+      } catch (err) {
+        valueErrorEl.textContent = err.message;
+        valueErrorEl.hidden = false;
+        valueEl.value = lastSavedValue || '';
+        if (typeChanged) {
+          typeEl.value = lastSavedType;
+          updateValueLabel(lastSavedType);
+        }
+      }
+    });
+
+    tzEl.addEventListener('blur', async () => {
+      const value = tzEl.value;
+      if (value === lastSavedTz) return;
+      try {
+        const resp = await putSchedule(card.id, { timezone: value });
+        lastSavedTz = value;
+        tzErrorEl.hidden = true;
+        tzErrorEl.textContent = '';
+        previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        await fetchBoard();
+      } catch (err) {
+        tzErrorEl.textContent = err.message;
+        tzErrorEl.hidden = false;
+        tzEl.value = lastSavedTz;
+      }
+    });
+
+    actionEl.addEventListener('change', async () => {
+      // Show/hide the executor and bot controls immediately — no need to
+      // wait for the save (or reopen the drawer) to see the right one.
+      setActionVisibility(actionEl.value);
+      try {
+        await putSchedule(card.id, { action: actionEl.value });
+        lastSavedAction = actionEl.value;
+        await fetchBoard();
+      } catch (err) {
+        showToast(`Couldn't save action: ${err.message}`, true);
+        actionEl.value = lastSavedAction;
+        setActionVisibility(lastSavedAction);
+      }
+    });
+
+    executorEl.addEventListener('change', async () => {
+      try {
+        await putSchedule(card.id, { executor: executorEl.value });
+        lastSavedExecutor = executorEl.value;
+        await fetchBoard();
+      } catch (err) {
+        showToast(`Couldn't save executor: ${err.message}`, true);
+        executorEl.value = lastSavedExecutor;
+      }
+    });
+
+    botEl.addEventListener('change', async () => {
+      try {
+        await putSchedule(card.id, { bot: botEl.value });
+        lastSavedBot = botEl.value;
+        await fetchBoard();
+      } catch (err) {
+        showToast(`Couldn't save bot: ${err.message}`, true);
+        botEl.value = lastSavedBot;
+      }
+    });
+
+    // When the registry loads, the bot select offers only names the API
+    // accepts — the empty "default (primary)" option (distinguishable from
+    // the registry's own "primary" row) plus whatever GET
+    // /api/scheduler/bots returns. A stored name the loaded registry
+    // doesn't include (a bot renamed after the schedule was written) is
+    // appended as a selected, flagged-unknown option instead of leaving
+    // the select with no matching value. When the fetch itself fails, the
+    // stored name isn't known to be invalid — just unconfirmed — so it's
+    // kept visible and selected without that flag, and the select is
+    // disabled with the reason shown as visible text next to it,
+    // mirroring the host dropdown's pattern
+    // (web/agents/assignment.js's seedHostOptions/populateHostOptions).
+    loadBotCatalog().then(catalog => {
+      const stored = card.bot || '';
+      if (!catalog) {
+        const optionsHtml = ['<option value="">default (primary)</option>'];
+        if (stored) {
+          optionsHtml.push(`<option value="${escapeHtml(stored)}" selected>${escapeHtml(stored)}</option>`);
+        }
+        botEl.innerHTML = optionsHtml.join('');
+        botEl.value = stored;
+        botEl.disabled = true;
+        botReasonEl.textContent = 'bot registry unavailable — reopen to retry';
+        botReasonEl.hidden = false;
+        return;
+      }
+      const names = catalog.bots || [];
+      const known = names.includes(stored);
+      const options = ['<option value="">default (primary)</option>'];
+      for (const name of names) {
+        options.push(`<option value="${escapeHtml(name)}" ${stored === name ? 'selected' : ''}>${escapeHtml(name)}</option>`);
+      }
+      if (stored && !known) {
+        options.push(`<option value="${escapeHtml(stored)}" selected data-unknown="true">${escapeHtml(stored)} (unknown)</option>`);
+      }
+      botEl.innerHTML = options.join('');
+      botEl.value = stored;
+      botEl.disabled = false;
+      botReasonEl.hidden = true;
+      botReasonEl.textContent = '';
+    });
+
+    drawerEl.querySelector('[data-action="trigger-now"]').addEventListener('click', async () => {
+      try {
+        const r = await fetch(`/api/scheduler/${encodeURIComponent(card.id)}/trigger`, { method: 'POST' });
+        if (!r.ok) {
+          const text = await r.text();
+          let msg = text;
+          try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+          throw new Error(msg || `HTTP ${r.status}`);
+        }
+        showToast('Triggered.', false);
+        await fetchBoard();
+        // fetchBoard's own drawer refresh (updateOpenDrawer) skips
+        // rebuilding while the drawer holds focus — and the button that
+        // was just clicked still does — so rebuild explicitly here,
+        // exactly like the task drawer's assignee select does above,
+        // rather than leaving a stale last-run/preview showing.
+        const fresh = findCard(card.id);
+        if (fresh) { renderDrawer(fresh); openCardSnapshot = fresh; }
+      } catch (err) {
+        showToast(`Trigger failed: ${err.message}`, true);
+      }
+    });
   }
 
   function renderDrawerActions(card) {

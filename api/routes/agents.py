@@ -982,6 +982,8 @@ def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
 
 
 def _schedule_card(entry) -> dict[str, Any]:
+    from config.settings import settings
+
     last_run = None
     if entry.last_triggered_at:
         last_run = {
@@ -998,6 +1000,12 @@ def _schedule_card(entry) -> dict[str, Any]:
         "next_fire_at": entry.next_trigger_at,
         "recurring": entry.schedule_type == "cron",
         "last_run": last_run,
+        "schedule_type": entry.schedule_type,
+        "schedule_value": entry.schedule_value,
+        "timezone": entry.timezone or settings.timezone,
+        "action": entry.action,
+        "executor": entry.executor,
+        "bot": entry.bot,
     }
 
 

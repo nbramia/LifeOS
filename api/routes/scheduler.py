@@ -7,8 +7,11 @@ Replaces the legacy ``/api/reminders`` surface (kept as a deprecated alias in
 an ``action`` (notify / prompt / endpoint / agent).
 """
 import logging
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
+from croniter import croniter
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -144,6 +147,77 @@ def _require_known_bot(bot: Optional[str]) -> Optional[str]:
         raise HTTPException(status_code=422, detail=str(e))
 
 
+def _validate_schedule_value(schedule_type: str, schedule_value: str) -> None:
+    """Validate a schedule value's shape against a schedule type, 422 on
+    failure. Shared by the two call sites below: a request that supplies
+    ``schedule_value`` validates it against the effective type, and one
+    that changes ``schedule_type`` alone validates the entry's still-stored
+    value against the new type."""
+    if schedule_type == "cron":
+        try:
+            croniter(schedule_value)
+        except Exception as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid cron expression '{schedule_value}': {e}",
+            )
+    elif schedule_type == "once":
+        try:
+            datetime.fromisoformat(schedule_value)
+        except Exception as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid ISO datetime '{schedule_value}': {e}",
+            )
+
+
+def _validate_update_fields(schedule_id: str, request: "UpdateScheduleRequest", store) -> None:
+    """Validate the fields present in a PUT before anything is written.
+
+    Mirrors the status codes ``POST ""`` already uses for ``schedule_type``
+    and ``action`` (400) so the two endpoints agree; ``timezone`` and
+    ``schedule_value`` use 422 like the bot check above, since those are
+    per-field shape errors rather than a missing/misnamed top-level choice.
+    Every detail string names what's wrong well enough to show an operator
+    verbatim.
+
+    A request naming ``schedule_type`` without ``schedule_value`` is
+    validated against the entry's CURRENTLY STORED value under the new
+    type, not skipped — a bare type change from `cron` to `once` (or back)
+    otherwise writes a schedule whose stored value doesn't parse under its
+    own type, and the store's next-trigger computation then silently drops
+    it out of rotation instead of ever firing again. A request that
+    supplies both fields together converts a schedule in one write: the
+    submitted value is validated against the submitted type, regardless of
+    what's currently stored.
+    """
+    if request.schedule_type is not None and request.schedule_type not in ("once", "cron"):
+        raise HTTPException(status_code=400, detail="schedule_type must be 'once' or 'cron'")
+    if request.action is not None and request.action not in VALID_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"action must be one of {VALID_ACTIONS}")
+    if request.timezone is not None:
+        try:
+            ZoneInfo(request.timezone)
+        except Exception:
+            raise HTTPException(status_code=422, detail=f"Unknown timezone '{request.timezone}'")
+
+    if request.schedule_value is not None:
+        effective_type = request.schedule_type
+        if effective_type is None:
+            entry = store.get(schedule_id)
+            if entry is None:
+                raise HTTPException(status_code=404, detail="Schedule not found")
+            effective_type = entry.schedule_type
+        _validate_schedule_value(effective_type, request.schedule_value)
+        return
+
+    if request.schedule_type is not None:
+        entry = store.get(schedule_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        _validate_schedule_value(request.schedule_type, entry.schedule_value)
+
+
 # ---------------------------------------------------------------------------
 # Routes (static paths MUST come before {schedule_id} to avoid capture)
 # ---------------------------------------------------------------------------
@@ -200,6 +274,17 @@ async def send_adhoc_message(request: SendMessageRequest):
     return {"status": "sent"}
 
 
+@router.get("/bots")
+async def list_bots():
+    """Telegram bot names a schedule's `bot` field may name — `primary` plus
+    the registry (`config/telegram_bots.json`), read at call time so a
+    rename is reflected immediately. Backs the board drawer's bot select,
+    which must offer only names the API actually accepts."""
+    from api.services.telegram import valid_bot_names
+
+    return {"bots": valid_bot_names()}
+
+
 @router.get("/{schedule_id}", response_model=ScheduleResponse)
 async def get_schedule(schedule_id: str):
     """Get a specific schedule by ID."""
@@ -215,6 +300,7 @@ async def update_schedule(schedule_id: str, request: UpdateScheduleRequest):
     """Update an existing schedule."""
     request.bot = _require_known_bot(request.bot)
     store = get_scheduler_store()
+    _validate_update_fields(schedule_id, request, store)
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
     entry = store.update(schedule_id, **updates)
     if not entry:
@@ -233,7 +319,10 @@ async def delete_schedule(schedule_id: str):
 
 @router.post("/{schedule_id}/trigger")
 async def trigger_schedule(schedule_id: str):
-    """Manually fire a schedule (for testing)."""
+    """Manually fire a schedule immediately. For a ``once`` schedule this
+    consumes it exactly like an unattended fire would: ``mark_triggered``
+    disables it and clears its next fire, so it stops firing on its own
+    trigger too."""
     store = get_scheduler_store()
     entry = store.get(schedule_id)
     if not entry:

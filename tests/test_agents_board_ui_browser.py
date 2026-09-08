@@ -1480,7 +1480,7 @@ class TestAssignmentPickers:
     def test_scheduled_card_drawer_has_no_assignment_pickers(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
         page.locator('[data-card-id="s1"]').click()
-        expect(page.locator(".drawer-schedule-hint")).to_be_visible()
+        expect(page.locator('[data-field="schedule-type"]')).to_be_visible()
         expect(page.locator(".drawer-assignment")).to_have_count(0)
         expect(page.locator(".assignment-row")).to_have_count(0)
         expect(page.get_by_role("button", name="Open")).to_have_count(0)

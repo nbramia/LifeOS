@@ -583,9 +583,13 @@ List all schedules.
 
 Get a specific schedule.
 
+### GET /api/scheduler/bots
+
+List the Telegram bot names a schedule's `bot` field may use: `primary` plus every configured registry bot (an entry in `config/telegram_bots.json` counts only once its `token_env` is set), as `{"bots": [...]}`. Exactly the names `POST`/`PUT` accept. Backs the board drawer's bot picker.
+
 ### PUT /api/scheduler/{id}
 
-Update a schedule. An unrecognised `bot` returns **422** and leaves the schedule unchanged.
+Update a schedule. Only the fields present in the request body are changed, and nothing is written if any check fails. An unrecognised `bot` returns **422** with the accepted names. `schedule_type` (must be `once` or `cron`) and `action` (must be one of `notify`/`prompt`/`endpoint`/`agent`) return **400**, matching `POST /api/scheduler`. `timezone` (must resolve as an IANA zone) and `schedule_value` (must parse as a cron expression for a `cron` schedule, or an ISO datetime for a `once` schedule — using `schedule_type` from the request if given, otherwise the entry's stored type) return **422** with a detail naming what's wrong. A request that sends `schedule_type` **without** `schedule_value` is validated against the entry's stored value under the new type, and returns the same **422** when that value doesn't parse — converting a schedule means sending both fields in one request.
 
 ### DELETE /api/scheduler/{id}
 
@@ -593,7 +597,7 @@ Delete a schedule.
 
 ### POST /api/scheduler/{id}/trigger
 
-Manually fire a schedule (for testing).
+Manually fire a schedule immediately. For a `once` schedule this consumes it: the fire disables it and clears its next-fire time, exactly as an unattended fire would.
 
 ### POST /api/scheduler/send
 

@@ -1204,7 +1204,8 @@
     color: var(--text-dim);
     margin: 0.6rem 0 0.25rem;
   }
-  .drawer-notes, .drawer-tags, .drawer-context, .drawer-assignee {
+  .drawer-notes, .drawer-tags, .drawer-context, .drawer-assignee,
+  .drawer-schedule-value, .drawer-timezone, .drawer-select {
     width: 100%;
     background: var(--bg-elev);
     color: var(--text-primary);
@@ -1258,7 +1259,12 @@
   .drawer-session { margin-top: 0.75rem; border-top: 1px solid var(--border); padding-top: 0.5rem; }
   .drawer-session .panel-header { padding: 0; border: none; }
   .drawer-session .events { max-height: 40vh; padding: 0.5rem 0; }
-  .drawer-schedule-hint { color: var(--text-dim); font-size: 0.8rem; margin-top: 0.5rem; }
+  /* An inline save-rejection detail next to the offending schedule field
+     (cron/datetime, timezone) — the same alarming color as
+     .assignment-error since, unlike .drawer-field-reason above, this is a
+     failed save, not an ordinary disabled-control explanation. */
+  .drawer-field-error { color: var(--failed); font-size: 0.75rem; margin-top: 0.3rem; }
+  .drawer-schedule-info { color: var(--text-dim); font-size: 0.75rem; margin-top: 0.4rem; }
   .drawer-assignment { margin-top: 0.6rem; }
   .assignment-row { margin: 0.6rem 0; }
   .assignment-label {
