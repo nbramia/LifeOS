@@ -173,7 +173,7 @@ def _open_agents(page: Page, base_url, snapshot=None, focus_calls=None, search_m
     page.click('[data-tab="graph"]')
     page.wait_for_selector("#filter-route")
     page.select_option("#filter-recency", "all")
-    # The shared lane filter (#865) defaults to every lane but Done — several
+    # The shared lane filter defaults to every lane but Done — several
     # fixtures below deliberately carry `lane: "done"`, so widen it the same
     # way the recency filter above is already widened for fixtures with old
     # timestamps.

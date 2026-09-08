@@ -20,9 +20,10 @@ The point is one place to see what needs attention: what's waiting on an assignm
 6. [Graph tab — Side panel](#graph-tab--side-panel)
 7. [Graph tab — Operator controls — kill](#graph-tab--operator-controls--kill)
 8. [Graph tab — Operator controls — resume and Go To](#graph-tab--operator-controls--resume-and-go-to)
-9. [Privacy and exposure](#privacy-and-exposure)
-10. [Configuration knobs](#configuration-knobs)
-11. [Related Documents](#related-documents)
+9. [Linking the board and the graph](#linking-the-board-and-the-graph)
+10. [Privacy and exposure](#privacy-and-exposure)
+11. [Configuration knobs](#configuration-knobs)
+12. [Related Documents](#related-documents)
 
 ---
 
@@ -89,7 +90,7 @@ A human-readable next-fire preview updates from the response of any save that ca
 
 Which lanes show at all is a multi-select: a checkbox per lane in a dropdown, plus **All** and **Clear** controls (Clear resets to the default: every lane except Done). An unchecked lane's column is removed from the board entirely, not just emptied of cards, so the remaining lanes widen to fill the space; re-checking it puts it back in canonical lane order. The selection is remembered via `localStorage` (per browser/device, not synced) and restored on your next visit; if nothing at all is checked, the board shows a one-line hint instead of going blank.
 
-The rest of the filters AND-compose on top of whichever lanes are showing: free-text search (title and notes), assignee (including "me" and "unassigned"), host, tag, context, recency, and whether to include cancelled cards. The host filter's option list names every host that appears either as a card's assigned host or as a linked session's host, and a card matches a selected host when either one names it — so a card assigned to a host that hasn't run a session yet is still reachable through the filter. The board updates live — an edit made directly in the vault (or by the agent worker, or by the scheduler) shows up within a few seconds without a page reload.
+The rest of the filters AND-compose on top of whichever lanes are showing: free-text search (title and notes), assignee (including "me" and "unassigned"), host, engine, tag, context, recency, and whether to include cancelled cards. The host filter's option list names every host that appears either as a card's assigned host or as a linked session's host, and a card matches a selected host when either one names it — so a card assigned to a host that hasn't run a session yet is still reachable through the filter. The engine filter matches a card by its linked session's routing/execution engine; a card with no linked session matches only "all engines". A **Clear** button resets every shared filter (search, lane, assignee, host, engine, tag, recency) to its default in one click. Search, lane, assignee, host, engine, tag, and recency are shared with the Graph tab's own filter bar — see [Linking the board and the graph](#linking-the-board-and-the-graph); context and "include cancelled" stay board-only. The board updates live — an edit made directly in the vault (or by the agent worker, or by the scheduler) shows up within a few seconds without a page reload.
 
 ### Out of scope (for now)
 
@@ -136,6 +137,23 @@ its parent shows the collapsed-subagent badge above. Clicking the badge
 expands the children (and their own spawn edges) into view; clicking again
 collapses them back. Searching for a session inside a collapsed tree
 expands its ancestors automatically so the match is visible.
+
+### Card clusters
+
+Every visible session linked to a board card renders attached to a card
+anchor — a rounded rectangle labelled with the card's title, its stroke
+coloured the same lane colour a session node's own fill uses, positioned
+in the column of the host most of its sessions run on and the lane band
+its own lane occupies. Every session sharing that card attaches to the
+same anchor by a dashed link, distinct from the solid spawn edges above.
+A session with no linked card attaches instead to a host anchor labelled
+with its host name — one per host among the sessions with no card. A
+card anchor whose sessions include an open pending question renders the
+same question-ring badge a session node shows, on the anchor itself.
+
+Clicking an anchor doesn't open the transcript panel — an anchor groups
+several sessions, not one — but shows the same card actions a selected
+session node shows (see [Linking the board and the graph](#linking-the-board-and-the-graph)) for the card it represents.
 
 ### Hover card and canvas controls
 
@@ -238,18 +256,21 @@ A small `(inferred)` hint appears next to the status on CLI sessions whenever th
 
 ## Graph tab — Filters and chips
 
-The top toolbar has six filter controls and five count chips. **Filters are AND-composed**; the chips reflect *what's currently visible* after the filter, not the full snapshot.
+The top toolbar has filter controls and five count chips. **Filters are AND-composed**; the chips reflect *what's currently visible* after the filter, not the full snapshot. `recency`, `route` (engine), `lane`, `assignee`, `tag`, and the free-text search input are shared with the board's own filter bar — see [Linking the board and the graph](#linking-the-board-and-the-graph). `host` is board-shared too, via the same mechanism.
 
 ### Filters
 
 | Filter | Default | Notes |
 |---|---|---|
-| `include finished` checkbox | off | Off → completed / failed / budget_exceeded / ended are hidden. On → everything shows, and the default recency window widens from 30 min to 7 days. |
-| `recency` dropdown | last 30 min (60 min, 6h, 24h, 7d, all) | Filters by `last_activity_at`. Re-defaults to a wider window when `include finished` is enabled, unless the operator has set it manually. |
-| `cwd` dropdown | all | Only Claude Code sessions are scoped to a cwd. Dropdown lists every unique cwd present in the current snapshot; auto-hides when empty (no Claude Code sessions visible). |
+| `include finished` checkbox | off | Off → completed / failed / budget_exceeded / ended are hidden. On → everything shows, and the default recency window widens from 30 min to 7 days. Graph-only — no board counterpart. |
+| `recency` dropdown | last 30 min (1 min, 30 min, 1h, 24h, 7d, all) | Filters by `last_activity_at`. Re-defaults to a wider window when `include finished` is enabled, unless the operator (or a restored/shared value) has set it manually. Board recency filters by `updated_at` instead — each tab keeps its own comparison field, only the selected value is shared. |
+| `cwd` dropdown | all | Only Claude Code sessions are scoped to a cwd. Dropdown lists every unique cwd present in the current snapshot; auto-hides when empty (no Claude Code sessions visible). Graph-only — no board counterpart. |
 | `host` dropdown | all | Limit to sessions running on a specific machine. Dropdown lists every unique `host` present in the current snapshot; auto-hides on a single-host deployment (nothing to distinguish). |
-| `route` dropdown | all (local / claude / claude_code / codex / hermes / remote / ask) | Filters by where the session ran — operator's local LLM, Managed Agents cloud, Claude Code CLI, Codex CLI, Hermes, the configured remote provider, or a session parked waiting on the operator. |
-| `status` dropdown | all | Hard-filter by the status column from the table above. |
+| `route` dropdown | all (local / claude / claude_code / codex / hermes / remote / ask) | Filters by where the session ran — operator's local LLM, Managed Agents cloud, Claude Code CLI, Codex CLI, Hermes, the configured remote provider, or a session parked waiting on the operator. Labelled **engine** on the board's own bar. |
+| `status` dropdown | all | Hard-filter by the status column from the table above. Graph-only — no board counterpart. |
+| `lane` dropdown | every lane but Done | A single-select mirror of the board's own lane multi-select — `all` shows every lane, one lane shows just that lane. A session with no lane info (a fixture predating this field) is never excluded by it. |
+| `assignee` dropdown | any assignee | Same options as the board's assignee filter — `unassigned` matches a session with no card assignee. |
+| `tag` text input | empty | Substring match against the linked card's tags. |
 
 ### Chips
 
@@ -343,6 +364,22 @@ machine it originally ran on:
   copyable text, so the operator can paste it into a terminal on that
   machine themselves. The command is omitted when the session's cwd
   can't be resolved — there's nothing to show.
+
+---
+
+## Linking the board and the graph
+
+The board and the graph describe the same work from two angles, kept in one navigational state.
+
+**Card session chip → graph.** A task card whose linked session exists shows a small clickable session chip (↗ session) among its other chips; clicking it switches to the Graph tab, pans to that session's node, and selects it.
+
+**Node → board.** Selecting a node, or a card anchor (see [Card clusters](#card-clusters)), shows a **Show on board** action above the transcript panel whenever it — or, for an anchor, one of its sessions — is linked to a card. Clicking it switches to the Board tab, scrolls to that card, and briefly highlights it, revealing its lane in the lane filter first if that lane was hidden.
+
+**Answer from the graph.** A selected node or card anchor with an open pending question shows an **Answer** action next to Show on board; it reveals an inline reply box in place and posts through the same endpoint the board drawer's own Answer button uses.
+
+**Deep links.** `/agents?session=<id>` opens the Graph tab with that session selected and centred; `/agents?card=<id>` opens the Board tab with that card's drawer open. An id that doesn't resolve — no such session, no such card — shows a toast and leaves the default view.
+
+**Shared filters.** Search, lane, assignee, host, engine, tag, and recency are one filter state shared by both tabs' filter bars — changing one on either tab updates the other, and the selection persists across reloads (`localStorage`, per browser/device). A **Clear** button on each bar resets every shared filter to its default. The board's own lane multi-select IS this shared state's lane selection; the graph's own lane filter is a single-select (`all`, or one lane) reading and writing the same selection — picking one lane there sets the shared selection to just that lane, and picking `all` sets it to every lane. The board's assignee/host/tag/recency filters and the graph's `route` filter (labelled **engine** on the board's own bar) are the remaining five shared keys — an engine match is by the session's routing/execution engine, so a card with no linked session only matches "all engines". Each tab still keeps one filter of its own with no counterpart to share: the board's context filter and "include cancelled" checkbox, and the graph's include-finished toggle, cwd filter, and status filter.
 
 ---
 

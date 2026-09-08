@@ -213,7 +213,7 @@ def _open_board_with_drawer(
     page.wait_for_selector('.board-card[data-card-id="t1"]')
     # Click the title specifically, not the card's own bounding-box centre —
     # a card whose chip row wraps differently (e.g. `host=""` below, which
-    # omits the "ran on" chip) can shift the session chip (#865) to sit at
+    # omits the "ran on" chip) can shift the session chip to sit at
     # that centre point instead, and its own click handler stops
     # propagation before the card's drawer-opening listener ever sees it.
     page.locator('.board-card[data-card-id="t1"] .board-card-title').click()

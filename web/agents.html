@@ -324,7 +324,7 @@
   .node-badge-question { pointer-events: none; }
   .node-badge-errors { pointer-events: none; }
   .node-badge-children { font-weight: 600; }
-  /* Card/host anchor clusters (#865) — a rounded rect labelled with the
+  /* Card/host anchor clusters — a rounded rect labelled with the
      linked card's title (or the host name, for sessions with no card),
      rendered in a separate SVG group from `.node` so anchor styling can
      never collide with session-node selection/badge classes. */
@@ -349,7 +349,7 @@
     stroke-dasharray: 3 3;
     opacity: 0.4;
   }
-  /* Card actions above the transcript panel (#865) — Show on board / Answer
+  /* Card actions above the transcript panel — Show on board / Answer
      for whatever node or card cluster is currently selected. Empty (and
      therefore invisible — no min-height) when nothing is selected. */
   #graph-panel-actions {
@@ -1259,7 +1259,7 @@
   .board-chip-assignee { color: var(--accent); border-color: var(--accent); }
   .board-chip-host { color: var(--claimed); border-color: var(--claimed); }
   .board-chip-assigned-host { color: var(--yielded); border-color: var(--yielded); border-style: dashed; }
-  /* Session chip → graph tab (#865) — a clickable chip on a card whose
+  /* Session chip → graph tab — a clickable chip on a card whose
      session is live, distinct from the plain (non-interactive) chips
      above it. */
   .board-chip-session {
@@ -1269,7 +1269,7 @@
     border-color: var(--accent);
   }
   .board-chip-session:hover { filter: brightness(1.1); }
-  /* Node selected → board tab reveal (#865) — a temporary highlight on the
+  /* Node selected → board tab reveal — a temporary highlight on the
      card `revealCard` scrolled to, so it's findable at a glance even in a
      lane with many cards. */
   @keyframes board-card-reveal-pulse {

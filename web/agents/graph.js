@@ -67,7 +67,7 @@ export function initGraph(boardApi) {
   let allSessions = [];
   let allEdges = [];
   let selectedSessionId = null;
-  // A selected card/host anchor (#865) — mutually exclusive with
+  // A selected card/host anchor — mutually exclusive with
   // `selectedSessionId`: selecting one clears the other. Anchors render in
   // their own SVG group (`anchorLayer`, below) and never carry a transcript
   // of their own, so selecting one never opens the session panel.
@@ -75,11 +75,11 @@ export function initGraph(boardApi) {
   let lastAnchorsById = new Map();
   let apiHost = '';
   // Whether the first `/api/agents/snapshot` payload has landed — a tab
-  // activation (or a URL deep link, set before this module has fetched
-  // anything at all) can ask `drainGraphFocus` to resolve a pending focus
+  // activation (or a URL deep link, set while this module has not yet
+  // fetched anything at all) can ask `drainGraphFocus` to resolve a pending focus
   // intent before `allSessions` is populated; re-queuing it here rather
   // than resolving against an empty array is what keeps the intent alive
-  // until `applySnapshot`'s own drain (below) actually can (#865).
+  // until `applySnapshot`'s own drain (below) actually can.
   let snapshotLoaded = false;
 
   // Subagent trees — a session with `parent_session_id` set is
@@ -192,7 +192,7 @@ export function initGraph(boardApi) {
     anchorLayer.selectAll('.anchor-shape').classed('selected', d => d.id === selectedAnchorId);
   }
 
-  // --- Card actions above the transcript panel (#865) ---------------------
+  // --- Card actions above the transcript panel ---------------------------
 
   function clearPanelActions() {
     if (panelActionsEl) panelActionsEl.innerHTML = '';
@@ -313,7 +313,7 @@ export function initGraph(boardApi) {
   const viewport = svg.append('g').attr('class', 'viewport');
   const columnLayer = viewport.append('g').attr('class', 'host-columns');
   const linkLayer = viewport.append('g').attr('class', 'links');
-  // Card/host anchor clusters (#865) — its own group, between the links and
+  // Card/host anchor clusters — its own group, between the links and
   // the session nodes, so an anchor's rect never sits on top of a node and
   // an anchor is never mistaken for one by any `.node`-scoped selector
   // (selection styling, badges, drag, hover — all session-node-only).
@@ -588,7 +588,7 @@ export function initGraph(boardApi) {
     const recencySec = (recencyRaw === 'all') ? null : Number(recencyRaw);
     const cwdSel = filterCwdEl ? filterCwdEl.value : 'all';
     const hostSel = filterHostEl ? filterHostEl.value : 'all';
-    // Lane/assignee/tag/engine ("route") are the shared filters (#865) —
+    // Lane/assignee/tag/engine ("route") are the shared filters —
     // read straight from the shared store rather than trusting the DOM
     // mirror (`#filter-lane` etc., kept in sync by `syncSharedControls`
     // below) is always up to date.
@@ -608,7 +608,7 @@ export function initGraph(boardApi) {
       if (hostSel !== 'all' && s.host !== hostSel) return false;
       if (route !== 'all' && routingFilterValue(s) !== route) return false;
       if (status !== 'all' && s.status !== status) return false;
-      // `s.lane` is only ever absent from a row a fixture predating #865
+      // `s.lane` is only ever absent from a row a fixture from before card/host anchors existed
       // synthesized without it — treat that as "not excludable by lane"
       // rather than hiding it, since a real snapshot row always carries one.
       if (s.lane != null && !laneSet.has(s.lane)) return false;
@@ -891,7 +891,7 @@ export function initGraph(boardApi) {
   }
 
   // -------------------------------------------------------------------
-  // Card/host anchors (#865) — one synthetic cluster node per distinct
+  // Card/host anchors — one synthetic cluster node per distinct
   // `card_id` among the visible sessions (labelled with the card's title),
   // plus one per host among sessions with no card at all (labelled with
   // the host name). Every visible session links to exactly one anchor —
@@ -922,7 +922,7 @@ export function initGraph(boardApi) {
 
   // Groups `visible` sessions into one anchor per distinct `card_id`, plus
   // one per host among sessions with none — a session whose `card_id` is
-  // null, undefined, OR whose linked task no longer exists (`card_id`
+  // null, undefined, OR whose linked task doesn't exist (`card_id`
   // stamped null by the server the same way) all land in the host bucket.
   function buildAnchors(visible) {
     const byCard = new Map();
@@ -1315,7 +1315,7 @@ export function initGraph(boardApi) {
     // `requestGraphFocus`, once this snapshot is the first to land after
     // the intent was set — a no-op on every other tick, since
     // `takeGraphFocus` consumes the intent on its first read regardless of
-    // outcome (#865).
+    // outcome.
     drainGraphFocus();
   }
 
@@ -1343,7 +1343,7 @@ export function initGraph(boardApi) {
     el.addEventListener('change', onFilterChange)
   );
 
-  // --- Shared filters (#865): search/lanes/assignee/host/engine/tag/recency,
+  // --- Shared filters: search/lanes/assignee/host/engine/tag/recency,
   // bound bidirectionally with the board's own filter bar via linking.js.
   // `#filter-route` becomes the shared engine control; `#filter-lane` (a
   // single select) sets the shared `lanes` array to just the chosen lane,
@@ -1591,11 +1591,8 @@ export function initGraph(boardApi) {
     });
   }
 
-  // --- Shared filters (#865): search/lanes/assignee/host/engine/tag/recency,
-  // bound bidirectionally with the board's own filter bar via linking.js.
-  // `#filter-route` becomes the shared engine control; `#filter-lane` (a
-  // single select) sets the shared `lanes` array to just the chosen lane,
-  // or every lane id for "all".
+  // --- Shared filters: reconciling every control against the shared store
+  // once it changes, no matter which control or tab caused it.
 
   // A shared `lanes` selection can't always be represented exactly by
   // `#filter-lane`'s single-select — every lane maps to "all", exactly one
@@ -1624,7 +1621,7 @@ export function initGraph(boardApi) {
     if (filterRecencyEl && filterRecencyEl.value !== state.recency) filterRecencyEl.value = state.recency;
     // The shared recency value always wins over the include-finished
     // toggle's own auto-default from here on — a restored/migrated/reset
-    // shared value counts as "the operator already chose one" (#865).
+    // shared value counts as "the operator already chose one".
     recencyManuallySet = true;
     onFilterChange();
   }

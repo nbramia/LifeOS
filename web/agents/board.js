@@ -108,7 +108,7 @@ export function initBoard() {
   let visibleLanes = new Set(getFilters().lanes);
   // Whether the first GET /api/agents/board (or board/stream tick) has
   // landed — see `drainBoardFocus` below, the same "re-queue if not loaded
-  // yet" pattern graph.js's `drainGraphFocus` uses (#865).
+  // yet" pattern graph.js's `drainGraphFocus` uses.
   let boardLoaded = false;
   let openCardId = null;
   let openCardLane = null;
@@ -200,7 +200,7 @@ export function initBoard() {
     }
     // Resolves a pending `?card=<id>` deep link, or a graph node's "Show on
     // board", once this board payload is the first to land after the
-    // intent was set — a no-op on every other tick (#865).
+    // intent was set — a no-op on every other tick.
     drainBoardFocus();
   }
 
@@ -346,7 +346,7 @@ export function initBoard() {
       if (!(card.tags || []).some(t => t.toLowerCase().includes(tagQuery))) return false;
     }
 
-    // Shared engine filter (#865) — mirrored on the graph as `#filter-route`.
+    // Shared engine filter — mirrored on the graph as `#filter-route`.
     // A card matches when its linked session's routing/source (the same
     // notion `routingFilterValue` computes for a graph node) matches; a
     // card with no linked session matches only when the filter is "all".
@@ -410,8 +410,8 @@ export function initBoard() {
     if (card.session && card.session.host && !(assignedChipRendered && card.session.host === assignedHost)) {
       chips.push(`<span class="board-chip board-chip-host" title="ran on">${escapeHtml(card.session.host)}</span>`);
     }
-    // Session chip → graph tab (#865) — clickable only when a session is
-    // actually linked; `renderTaskCard` wires its click after this markup
+    // Session chip → graph tab — clickable only when a session is
+    // actually linked; `renderTaskCard` wires its click once this markup
     // is mounted (a `stopPropagation` handler can't be expressed inline
     // here without re-escaping into an attribute).
     if (card.session) {
@@ -1718,11 +1718,11 @@ export function initBoard() {
     el.addEventListener(evt, () => render());
   });
 
-  // Search/assignee/host/engine/tag/recency (#865) — shared with the graph
+  // Search/assignee/host/engine/tag/recency — shared with the graph
   // tab's own filter bar via linking.js; each control pushes to the store,
   // and `syncSharedFilterControls` (below) reconciles every control
-  // (including these) against whatever the store ends up holding, whatever
-  // the origin of the change.
+  // (including these) against whatever the store ends up holding, no
+  // matter which control or tab caused it.
   if (searchEl) searchEl.addEventListener('input', () => setFilter('search', searchEl.value));
   if (assigneeFilterEl) assigneeFilterEl.addEventListener('change', () => setFilter('assignee', assigneeFilterEl.value));
   if (hostFilterEl) hostFilterEl.addEventListener('change', () => setFilter('host', hostFilterEl.value));
