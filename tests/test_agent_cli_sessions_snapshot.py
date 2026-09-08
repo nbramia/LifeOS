@@ -46,7 +46,12 @@ def client():
 def _fake_cc_transcript_row(session_id="cc:merge-target", **overrides):
     row = {
         "session_id": session_id,
-        "task_id": session_id.split(":", 1)[1],
+        # `to_session_dict` always sets `task_id: None` for a locally
+        # scanned session — a real LifeOS task link only ever arrives via
+        # `_apply_cli_session_to_dict`'s overlay below. This fixture builds
+        # that shape rather than the raw session id leaking into `task_id`,
+        # which no production code emits.
+        "task_id": None,
         "status": "inactive",
         "routing": "claude_code",
         "parent_session_id": None,
@@ -126,6 +131,57 @@ def test_remote_row_with_no_local_transcript(client, stores):
     assert row["status_inferred"] is False
     assert row["status"] == "idle"
     assert row["branch"] == "feat/x"
+
+
+@pytest.mark.unit
+def test_remote_row_label_prefers_prompt_preview(client, stores):
+    """A remote CLI row's `label` must not fall back to the session id when
+    `prompt_preview` is available on the same row — with no local
+    transcript, the session id is the only other candidate and is not a
+    human label."""
+    session_store, _ = stores
+    session_store.record_cli_session_event(
+        engine="codex", event="user_prompt_submit",
+        session_id="labelled-remote", host="a-different-laptop",
+        cwd="/home/laptop/proj", prompt="refactor the synthetic widget",
+    )
+
+    r = client.get("/api/agents/snapshot")
+    sessions = r.json()["sessions"]
+    row = next(s for s in sessions if s["session_id"] == "cx:labelled-remote")
+    assert row["label"] == "refactor the synthetic widget"
+
+
+@pytest.mark.unit
+def test_remote_row_label_falls_back_to_session_id_without_prompt_preview(client, stores):
+    session_store, _ = stores
+    session_store.record_cli_session_event(
+        engine="codex", event="session_start",
+        session_id="unlabelled-remote", host="a-different-laptop",
+        cwd="/home/laptop/proj",
+    )
+
+    r = client.get("/api/agents/snapshot")
+    sessions = r.json()["sessions"]
+    row = next(s for s in sessions if s["session_id"] == "cx:unlabelled-remote")
+    assert row["label"] == "cx:unlabelled-remote"
+
+
+@pytest.mark.unit
+def test_cli_session_to_dict_unknown_engine_uses_engine_name_not_claude_tier():
+    """An unrecognized `engine` on a `cli_sessions` row (defensive only —
+    the route only ever writes claude_code/codex) must not hardcode
+    `model_label = "Claude"`, which would be a misleading Claude-tier
+    guess."""
+    from api.services.agent_worker.session_store import CliSession
+    from api.routes.agents import _cli_session_to_dict
+
+    cli = CliSession(
+        session_id="xy:synthetic", engine="some_new_engine", host="a-laptop",
+        status="idle", started_at=1000, last_event_at=1000,
+    )
+    d = _cli_session_to_dict(cli)
+    assert d["model_label"] == "Some New Engine"
 
 
 @pytest.mark.unit
@@ -219,3 +275,42 @@ def test_local_transcript_row_without_cli_event_still_gets_local_host(client, st
     assert sessions["cc:no-event-yet"]["host"] == "this-api-host"
     # Unmerged rows keep the transcript's own inferred status.
     assert sessions["cc:no-event-yet"]["status_inferred"] is True
+
+
+@pytest.mark.unit
+def test_removed_hook_row_reverts_to_inferred_status_inside_ttl(client, stores, monkeypatch, tmp_path):
+    """A row's event-driven status from a `cli_sessions` hook post does not
+    survive into a later snapshot inside the cache TTL once that hook row
+    is gone — the transcript scan's own inference takes over instead of a
+    cache-owned dict carrying the stale overlay forward."""
+    session_store, _ = stores
+    from api.services.claude_code import session_ingest as cc
+    from tests.test_claude_code_ingest import _assistant_event, _write_jsonl
+
+    proj_root = tmp_path / "-home-x"
+    _write_jsonl(proj_root / "hooked.jsonl", [_assistant_event()])
+    cc.invalidate_cache()
+    monkeypatch.setattr(
+        agents_route,
+        "_claude_code_snapshot",
+        lambda: cc.build_snapshot(projects_dir=tmp_path, cache_ttl=60, live_counts={}),
+    )
+
+    session_store.record_cli_session_event(
+        engine="claude_code", event="session_end",
+        session_id="hooked", host="this-api-host", cwd="/home/x",
+    )
+
+    r = client.get("/api/agents/snapshot")
+    sessions = {s["session_id"]: s for s in r.json()["sessions"]}
+    row = sessions["cc:hooked"]
+    assert row["status"] == "ended"
+    assert row["status_inferred"] is False
+
+    monkeypatch.setattr(session_store, "list_cli_sessions", lambda limit=500: [])
+    r2 = client.get("/api/agents/snapshot")
+    sessions2 = {s["session_id"]: s for s in r2.json()["sessions"]}
+    row2 = sessions2["cc:hooked"]
+    assert row2["status_inferred"] is True
+    assert row2["status"] == "running"
+    assert row2["host"] == "this-api-host"

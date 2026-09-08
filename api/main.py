@@ -211,6 +211,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to start agent_viz prefetch loop: {e}")
 
+    # Startup: background transcript mirror — pulls each registered
+    # host's Claude Code/Codex transcripts onto this box so remote sessions
+    # reach parity with local ones on /agents. No-op when no hosts are
+    # registered.
+    try:
+        from api.services import agent_transcript_mirror
+        agent_transcript_mirror.start()
+    except Exception as e:
+        logger.error(f"Failed to start agent transcript mirror loop: {e}")
+
     # Hint for new users who haven't set their person ID yet
     if not settings.my_person_id and settings.user_name and settings.user_name != "User":
         logger.info(
@@ -265,6 +275,12 @@ async def lifespan(app: FastAPI):
     try:
         from api.services import agent_viz_summary_prefetch
         agent_viz_summary_prefetch.stop()
+    except Exception:
+        pass
+
+    try:
+        from api.services import agent_transcript_mirror
+        agent_transcript_mirror.stop()
     except Exception:
         pass
 

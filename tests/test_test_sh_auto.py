@@ -110,3 +110,41 @@ def test_frontend_fixture_paths_exist(path):
     assert (REPO / path).exists(), (
         f"{path} no longer exists — decide_plan's frontend pattern and this "
         f"test's fixtures are out of sync with the repo layout")
+
+
+# scripts/test.sh holds no PID for the server it starts -- not in a file, not
+# in a variable. scripts/server.sh owns the server's whole lifecycle and
+# identifies the process by port (`get_server_pid` via `lsof -ti :$PORT`), so
+# there is nothing for test.sh to track. These two guards keep that shape out
+# of test.sh: a fixed shared path, or a PID-tracking helper appearing while
+# server.sh's port-based lifecycle management still makes it unnecessary.
+@pytest.mark.unit
+def test_no_fixed_shared_pid_path():
+    text = SCRIPT.read_text()
+    assert "/tmp/lifeos_test_server" not in text, (
+        "scripts/test.sh contains a fixed shared /tmp PID path, which is "
+        "unnecessary: server.sh identifies and owns the test server by port, "
+        "not by PID, so test.sh has nothing to track. (The server itself "
+        "stays one shared resource on one machine -- server.sh's `start` "
+        "kills and replaces whatever is on its port, so two test.sh runs "
+        "that both need a server still contend for it; that is server.sh's "
+        "contract, not something a PID path changes.) If a PID file is "
+        "genuinely needed, key it per-run the way scripts/pre-push keys its "
+        "log path, never a fixed path."
+    )
+    assert "stop_test_server" not in text, (
+        "scripts/test.sh contains a PID-tracking function: confirm it is "
+        "actually called from somewhere (server.sh owns the test server's "
+        "lifecycle and identifies it by port), and if it is unreachable, "
+        "remove it rather than leaving dead code behind."
+    )
+
+
+@pytest.mark.unit
+def test_server_owns_lifecycle_by_port():
+    """server.sh -- not test.sh -- identifies and manages the test server,
+    and it does so by port (lsof), never a PID file. That's why test.sh
+    doesn't need to track a PID of its own at all."""
+    server_sh = (REPO / "scripts" / "server.sh").read_text()
+    assert "get_server_pid()" in server_sh
+    assert "lsof -ti" in server_sh

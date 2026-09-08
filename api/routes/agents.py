@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from api.services.agent_worker.session_store import (
     CLI_ENGINE_PREFIXES,
     CLI_SESSION_EVENTS,
+    CLI_STATUS_ENDED,
     TERMINAL_STATUSES,
     CliSession,
     Session,
@@ -191,9 +192,10 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "session_id": s.session_id,
         "task_id": s.task_id,
         "status": s.status,
-        # Worker sessions only ever run on the machine hosting the API
-        # (#849) — no cross-host worker dispatch exists.
-        "host": api_host_name(),
+        # `Session.host` is the board-assignment field a worker was
+        # dispatched to run on; unset (legacy rows, or no board
+        # assignment) falls back to the machine hosting this API process.
+        "host": s.host or api_host_name(),
         "routing": s.routing,
         "parent_session_id": s.parent_session_id,
         "root_session_id": s.root_session_id,
@@ -210,7 +212,17 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "total_active_seconds": round(s.total_active_seconds, 3),
         "expected_output": s.expected_output,
         "label": _label_for_session(s, events),
-        "model_label": _model_label_for_routing(s.routing),
+        "model_label": _model_label_for_routing(s.routing, s.hermes_model),
+        # Board-assignment + identity fields, passed through so the
+        # panel and filters can surface them without re-deriving. Direct
+        # attribute access, matching `host` above — all five fields exist
+        # on `Session` with defaults, so `getattr(..., None)` would be
+        # inconsistent defensiveness rather than a real guard.
+        "model": s.model,
+        "effort": s.effort,
+        "conversation_id": s.conversation_id,
+        "bot": s.bot,
+        "origin": getattr(s, "origin", None),
         "last_event_kind": summary["last_event_kind"],
         "tool_call_count": summary["tool_call_count"],
         "error_count": summary["error_count"],
@@ -310,7 +322,10 @@ def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
         from api.services.codex import session_ingest as cx
         model_lbl = cx.model_label(cli.model or "")
     else:
-        model_lbl = "Claude"
+        # An unrecognized engine (the route only ever writes claude_code
+        # or codex) surfaces its own name rather than a hardcoded Claude
+        # tier guess.
+        model_lbl = cli.engine.replace("_", " ").title() if cli.engine else "Claude"
     return {
         "session_id": cli.session_id,
         "task_id": cli.task_id,
@@ -330,7 +345,9 @@ def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
         "total_dollars": 0.0,
         "total_active_seconds": 0.0,
         "expected_output": None,
-        "label": cli.session_id,
+        # Prefer the hook-posted prompt preview — the session id is
+        # not a human label.
+        "label": cli.prompt_preview or cli.session_id,
         "model_label": model_lbl,
         "last_event_kind": "",
         "tool_call_count": 0,
@@ -343,6 +360,71 @@ def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
         "branch": cli.branch,
         "prompt_preview": cli.prompt_preview,
     }
+
+
+def _read_cli_transcript_events(session_id: str) -> list[dict[str, Any]]:
+    """Normalized events for a `cc:`/`cx:` session.
+
+    Tries the local transcript root first, then each mirrored remote
+    host's copy in turn — the first non-empty
+    result wins. Used by `/events`, `/stream`, `/summary`, and the viz
+    prefetcher so a mirrored session's transcript reads identically to a
+    local one. Raises `ValueError` (mirrors `read_normalized_events`) for
+    an id that fails validation or carries neither prefix.
+    """
+    from config.settings import settings
+    from api.services import agent_transcript_mirror as mirror
+
+    if session_id.startswith("cc:"):
+        from api.services.claude_code import session_ingest as cc
+
+        events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+        if events:
+            return events
+        for host_dir in mirror.mirrored_transcript_dirs("claude_code"):
+            events = cc.read_normalized_events(session_id, host_dir)
+            if events:
+                return events
+        return []
+
+    if session_id.startswith("cx:"):
+        from api.services.codex import session_ingest as cx
+
+        events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+        if events:
+            return events
+        for host_dir in mirror.mirrored_transcript_dirs("codex"):
+            events = cx.read_normalized_events(session_id, host_dir)
+            if events:
+                return events
+        return []
+
+    raise ValueError(f"unsupported session_id prefix: {session_id!r}")
+
+
+def _lane_for_session_dict(sd: dict[str, Any]) -> str:
+    """`agent_board.lane_for_session`, wired to a snapshot row's `task_id`.
+
+    The task lookup mirrors `_label_for_session`'s (a cheap in-memory dict
+    read on the `TaskManager` singleton) — a session dict with no `task_id`,
+    or whose task isn't found, derives its lane from its own status alone.
+    """
+    from api.services import agent_board
+
+    task_id = sd.get("task_id")
+    task_status: str | None = None
+    task_tags: list[str] = []
+    if task_id:
+        try:
+            from api.services.task_manager import get_task_manager
+
+            task = get_task_manager().get(task_id)
+            if task is not None:
+                task_status = task.status
+                task_tags = list(task.tags)
+        except Exception as exc:  # noqa: BLE001 — defensive: never break the snapshot on a lane lookup
+            logger.debug("task_manager lookup failed for %s: %s", task_id, exc)
+    return agent_board.lane_for_session(sd.get("status"), task_status, task_tags)
 
 
 def _build_snapshot() -> dict[str, Any]:
@@ -420,6 +502,81 @@ def _build_snapshot() -> dict[str, Any]:
     session_dicts.extend(cx_sessions)
     edges.extend(cx_edges)
 
+    # Mirrored remote transcripts: merge alongside the local cc/cx
+    # rows above. A session already present from a LOCAL transcript wins on
+    # id collision — a mirror lags behind by up to one interval, so if this
+    # host somehow has both, the fresher local copy is preferred. Popping a
+    # match from cli_by_id here (like the cc/cx blocks above) means status
+    # comes from hook events and detail from the mirrored transcript; with
+    # no hook row the mirrored row's own `host` (the remote host name) is
+    # left untouched rather than overwritten with this API host's name.
+    try:
+        from api.services import agent_transcript_mirror
+        mirrored_cc, mirrored_cx, mirrored_edges = agent_transcript_mirror.mirrored_snapshot()
+    except Exception as exc:  # noqa: BLE001 — never break the snapshot on a mirror failure
+        logger.warning("mirrored transcript snapshot failed: %s", exc)
+        mirrored_cc, mirrored_cx, mirrored_edges = [], [], []
+
+    local_ids = {sd.get("session_id") for sd in session_dicts}
+    # Ids the mirrored merge loop below actually APPENDED a row for, mapped
+    # to the SOURCE HOST that row came from. A mirrored edge (below) is kept
+    # only when both its endpoints are ids appended here AND both came from
+    # the same host's batch: a local id collision leaves that id pointing at
+    # the local row, not the mirrored one an edge was derived from, and two
+    # different mirrored hosts can carry the same parent session id — so the
+    # host is recorded per id rather than tracked as flat membership alone.
+    appended_mirrored_host_by_id: dict[str, str] = {}
+    for sd in (*mirrored_cc, *mirrored_cx):
+        sid = sd.get("session_id") or ""
+        if not sid or sid in local_ids:
+            continue
+        sd.setdefault(
+            "short_label",
+            _short_label_for_snapshot(
+                sid,
+                sd.get("last_activity_at") or 0.0,
+                sd.get("status") or "",
+            ),
+        )
+        sd["custom_label"] = agent_viz_label_override.get_override(sid)
+        # Capture the mirror's own source host BEFORE the hook overlay below
+        # can rewrite `sd["host"]` to the hook-reported hostname — a
+        # subagent row has no hook row of its own, so it keeps the mirror
+        # directory's host, and comparing that against a parent's
+        # hook-overlaid host would falsely disagree whenever the registry
+        # key differs from the remote machine's actual hostname.
+        source_host = sd.get("host") or ""
+        cli = cli_by_id.pop(sid, None)
+        if cli is not None:
+            _apply_cli_session_to_dict(sd, cli)
+        session_dicts.append(sd)
+        local_ids.add(sid)
+        appended_mirrored_host_by_id[sid] = source_host
+
+    # Extend edges with the mirrored hosts' own parent-subagent spawn
+    # edges — the local cc/cx blocks above already do this
+    # (`edges.extend(cc_edges)` / `edges.extend(cx_edges)`); this does the
+    # same for the mirrored merge. An edge survives only when both endpoints
+    # were appended by the loop above AND both came from the same host's
+    # batch (`appended_mirrored_host_by_id`): a local id collision leaves
+    # that id pointing at the local row rather than the mirrored one the
+    # edge came from, and a session id can be present on two different
+    # mirrored hosts at once, so matching on id alone is not sufficient.
+    # Also dedupe on `(from, to, type)`: a session mirrored from two hosts,
+    # or an id collision, can otherwise emit the identical spawn edge twice.
+    seen_mirrored_edges: set[tuple[Any, Any, Any]] = set()
+    for e in mirrored_edges:
+        frm, to = e.get("from"), e.get("to")
+        frm_host = appended_mirrored_host_by_id.get(frm)
+        to_host = appended_mirrored_host_by_id.get(to)
+        if frm_host is None or to_host is None or frm_host != to_host:
+            continue
+        key = (frm, to, e.get("type"))
+        if key in seen_mirrored_edges:
+            continue
+        seen_mirrored_edges.add(key)
+        edges.append(e)
+
     # Whatever's left in cli_by_id had no local transcript — a remote host,
     # or (rarely) a local hook post that raced ahead of the transcript
     # scan's cache. Bound to the same recency window the transcript scan
@@ -447,27 +604,77 @@ def _build_snapshot() -> dict[str, Any]:
         sd["custom_label"] = agent_viz_label_override.get_override(cli.session_id)
         session_dicts.append(sd)
 
+    # Board lane + pending-question fields, additive — applied last,
+    # uniformly, to every row regardless of source (local, cc/cx, mirrored,
+    # or synthetic-remote), so a row built by any branch above still ends up
+    # with both fields set.
+    try:
+        open_question_by_session = {
+            q["session_id"]: q for q in session_store.list_open_questions()
+        }
+    except Exception as exc:  # noqa: BLE001 — never break the snapshot on a store error
+        logger.warning("open questions read failed: %s", exc)
+        open_question_by_session = {}
+    for sd in session_dicts:
+        sd["lane"] = _lane_for_session_dict(sd)
+        pq = open_question_by_session.get(sd.get("session_id"))
+        sd["pending_question"] = _pending_question_view(pq) if pq else None
+
     return {
         "sessions": session_dicts,
         "edges": edges,
         "generated_at": int(time.time()),
+        # So the drawer's "resume here" host picker can offer THIS
+        # machine even when `GET /api/agents/hosts` isn't reachable —
+        # every page already polls /snapshot, so no extra request is
+        # needed for the frontend's fallback list.
+        "api_host": api_host_name(),
     }
 
 
-def _model_label_for_routing(routing: str | None) -> str:
+def _model_label_for_routing(routing: str | None, hermes_model: str | None = None) -> str:
     if (routing or "local") == "local":
         return "Local"
+    if routing == "ask":
+        # A worker session parked waiting on the operator has no
+        # model running at all — it must never render a Claude tier guess.
+        return "Waiting on you"
     if routing == "remote":
         # (#809) `#cloud` — the configured remote OpenAI-compatible provider,
         # not an Anthropic model, so it must not fall into the Claude-model-
         # name guessing below.
-        return "Remote"
+        try:
+            from config.settings import settings
+            return settings.remote_llm_label or "Remote"
+        except Exception:  # noqa: BLE001
+            return "Remote"
     from api.services.agent_worker.hermes_session import HERMES_ROUTING
     if routing == HERMES_ROUTING:
         # (#850) Hermes sessions used to fall through to the Claude-model-name
         # guess below and get mislabeled "Claude" — Hermes runs its own
         # DeepSeek-backed engine, not an Anthropic model.
-        return "Hermes"
+        # The per-turn model comes from `Session.hermes_model`, written
+        # only by `HermesExecutor.execute` for the session it is running
+        # (via `set_hermes_model`, after the turn's own
+        # `_HermesTurnPersister.reported_model` is known). No other writer
+        # touches it, so it can never be overwritten by an unrelated
+        # session's or surface's turn, and a completed session's value
+        # stays fixed once no more of its own turns run. The badge stays
+        # plain when no model is set rather than appending "· <model>"
+        # from `model_readout._last_observed_hermes_chat_model()`: that's
+        # a single process-wide "last observed" value written by ANY
+        # Hermes turn (an agent-worker session and `/chat`'s Hermes proxy
+        # alike), not a per-session attribution, so a badge built from it
+        # could show a finished session whatever model a *different*,
+        # unrelated Hermes turn most recently reported. The identical
+        # string already flows verbatim into `usage_store.record_usage(
+        # model=...)` and the `/api/health` readout, so it is not
+        # truncated or reformatted here either.
+        return f"Hermes · {hermes_model}" if hermes_model else "Hermes"
+    if routing in ("claude_code", "code"):
+        return "Claude Code"
+    if routing == "codex":
+        return "Codex"
     try:
         from config.settings import settings
         m = (settings.agent_managed_model or "").lower()
@@ -503,10 +710,7 @@ async def get_session_events(
         if not _claude_code_enabled():
             raise HTTPException(status_code=404, detail="claude_code viz disabled")
         try:
-            from config.settings import settings
-            from api.services.claude_code import session_ingest as cc
-
-            events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+            events = _read_cli_transcript_events(session_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         tail = events[-limit:] if len(events) > limit else events
@@ -516,10 +720,7 @@ async def get_session_events(
         if not _codex_enabled():
             raise HTTPException(status_code=404, detail="codex viz disabled")
         try:
-            from config.settings import settings
-            from api.services.codex import session_ingest as cx
-
-            events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+            events = _read_cli_transcript_events(session_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         tail = events[-limit:] if len(events) > limit else events
@@ -554,16 +755,23 @@ async def get_session_summary(session_id: str) -> dict[str, Any]:
         if not _claude_code_enabled():
             raise HTTPException(status_code=404, detail="claude_code viz disabled")
         try:
-            from config.settings import settings
-            from api.services.claude_code import session_ingest as cc
-
-            events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+            events = _read_cli_transcript_events(session_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         # Find this CC session in the cached snapshot to pull label + activity.
         cc_sessions, _ = _claude_code_snapshot()
         match = next((s for s in cc_sessions if s.get("session_id") == session_id), None)
+        if match is None:
+            # Not a local transcript — check every mirrored host too, so a
+            # remote session's summary still gets a real label/status
+            # instead of falling back to the bare session_id below.
+            try:
+                from api.services import agent_transcript_mirror
+                mirrored_cc, _mirrored_cx, _mirrored_edges = agent_transcript_mirror.mirrored_snapshot()
+                match = next((s for s in mirrored_cc if s.get("session_id") == session_id), None)
+            except Exception as exc:  # noqa: BLE001 — summary still works with defaults
+                logger.warning("mirrored snapshot lookup failed for %s: %s", session_id, exc)
         if match:
             label = str(match.get("label") or session_id)
             last_activity = float(match.get("last_activity_at") or 0.0)
@@ -572,15 +780,19 @@ async def get_session_summary(session_id: str) -> dict[str, Any]:
         if not _codex_enabled():
             raise HTTPException(status_code=404, detail="codex viz disabled")
         try:
-            from config.settings import settings
-            from api.services.codex import session_ingest as cx
-
-            events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+            events = _read_cli_transcript_events(session_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         cx_sessions, _ = _codex_snapshot()
         match = next((s for s in cx_sessions if s.get("session_id") == session_id), None)
+        if match is None:
+            try:
+                from api.services import agent_transcript_mirror
+                _mirrored_cc, mirrored_cx, _mirrored_edges = agent_transcript_mirror.mirrored_snapshot()
+                match = next((s for s in mirrored_cx if s.get("session_id") == session_id), None)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("mirrored snapshot lookup failed for %s: %s", session_id, exc)
         if match:
             label = str(match.get("label") or session_id)
             last_activity = float(match.get("last_activity_at") or 0.0)
@@ -619,7 +831,9 @@ async def set_session_label(session_id: str, body: LabelOverrideRequest) -> dict
     """Set or clear an operator-pinned manual label for a session node.
 
     A non-empty label overrides the auto-derived node name (AI short_label /
-    task description) everywhere it's shown. An empty label clears the
+    task description) everywhere it's shown, unless it equals the session's
+    own raw id (session id, prefix-stripped session id, or task id), which
+    the graph node and search dropdown skip. An empty label clears the
     override and reverts the node to auto-naming. Durable across restarts.
     """
     custom = agent_viz_label_override.set_override(session_id, body.label)
@@ -683,8 +897,68 @@ async def stream_snapshots() -> StreamingResponse:
 _BOARD_STREAM_INTERVAL = 0.5
 
 
+def _card_policy(task, session_store: SessionStore) -> dict[str, Any]:
+    """Server-computed policy block for a task card — the ONLY source of
+    truth for which human moves are allowed on this card. The drawer and
+    the board both read this instead of re-implementing
+    `agent_board.evaluate_card_action`'s rules in JS, so they can't drift
+    out of sync with each other or with the write paths that enforce them
+    (the lane endpoint, the cancel endpoint, and the guarded
+    `PUT /api/tasks/{id}`).
+    """
+    from api.services import agent_board
+
+    has_live = session_store.has_live_session(task.id, status=task.status, tags=task.tags)
+
+    def _outcome(action: str, target_lane: str | None = None) -> dict[str, Any]:
+        error = agent_board.evaluate_card_action(
+            task.status, task.tags, action, target_lane, has_live_session=has_live,
+        )
+        return {"allowed": error is None, "reason": error[1] if error else None}
+
+    # `lanes` lists ONLY refused lanes — an absent lane means allowed,
+    # which every client-side reader (`web/agents/board.js`'s
+    # `onCardDropped`/`renderDrawerActions`) already treats it as. Emitting
+    # every lane regardless of outcome would be 555-1261 bytes per card
+    # that GET /board/stream re-serializes to compute its change signature
+    # every 0.5s, purely to say "yes" for the common case. Iterates over
+    # every lane including `scheduled` (not just `TASK_LANES`) so a
+    # consumer following "absent means allowed" never has to special-case
+    # the one lane no task can ever land in directly.
+    lanes_refused = {
+        lane: outcome
+        for lane in agent_board.LANES
+        if not (outcome := _outcome("lane_move", lane))["allowed"]
+    }
+
+    return {
+        "claimed": agent_board.is_claimed(task.status, task.tags, has_live),
+        "agent_owned": agent_board.is_agent_owned(task.tags),
+        "cancel": _outcome("cancel"),
+        "assignee": _outcome("assignee_change"),
+        "fields": _outcome("field_edit"),
+        "lanes": lanes_refused,
+    }
+
+
+def _pending_question_view(pq: dict[str, Any]) -> dict[str, Any]:
+    """The `pending_question` shape rendered on both a board task card
+    (`_task_card`) and a snapshot session row (`_build_snapshot`) — one
+    function so the two can never disagree about what a raw
+    `pending_questions` row (`session_store.list_open_questions()`) means.
+    """
+    return {
+        "id": pq["id"],
+        "session_id": pq["session_id"],
+        "question": pq["question"],
+        "asked_at": pq["sent_at"],
+        "bot": pq.get("bot"),
+    }
+
+
 def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
-                open_question_by_task: dict[str, dict[str, Any]]) -> dict[str, Any]:
+                open_question_by_task: dict[str, dict[str, Any]],
+                session_store: SessionStore) -> dict[str, Any]:
     from api.services import agent_board
 
     candidates = sessions_by_task.get(task.id) or []
@@ -702,20 +976,14 @@ def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
         "context": task.context,
         "updated_at": task.updated_at,
         "session": session,
-        "pending_question": (
-            {
-                "id": pq["id"],
-                "session_id": pq["session_id"],
-                "question": pq["question"],
-                "asked_at": pq["sent_at"],
-                "bot": pq.get("bot"),
-            }
-            if pq else None
-        ),
+        "pending_question": _pending_question_view(pq) if pq else None,
+        "policy": _card_policy(task, session_store),
     }
 
 
 def _schedule_card(entry) -> dict[str, Any]:
+    from config.settings import settings
+
     last_run = None
     if entry.last_triggered_at:
         last_run = {
@@ -732,6 +1000,12 @@ def _schedule_card(entry) -> dict[str, Any]:
         "next_fire_at": entry.next_trigger_at,
         "recurring": entry.schedule_type == "cron",
         "last_run": last_run,
+        "schedule_type": entry.schedule_type,
+        "schedule_value": entry.schedule_value,
+        "timezone": entry.timezone or settings.timezone,
+        "action": entry.action,
+        "executor": entry.executor,
+        "bot": entry.bot,
     }
 
 
@@ -759,13 +1033,13 @@ def _build_board() -> dict[str, Any]:
     lanes: dict[str, list[dict[str, Any]]] = {lane: [] for lane in agent_board.LANES}
     for task in tasks:
         lane = agent_board.derive_lane(task.status, task.tags)
-        lanes[lane].append(_task_card(task, sessions_by_task, open_question_by_task))
+        lanes[lane].append(_task_card(task, sessions_by_task, open_question_by_task, session_store))
 
     for entry in scheduler_store.list_all():
         bucket = "scheduled" if agent_board.is_schedule_active(entry.enabled, entry.next_trigger_at) else "done"
         lanes[bucket].append(_schedule_card(entry))
 
-    return {"lanes": lanes, "generated_at": int(time.time())}
+    return {"lanes": lanes, "generated_at": int(time.time()), "api_host": api_host_name()}
 
 
 # Module-level (built_at, board) cache used ONLY by the stream's own tick —
@@ -863,7 +1137,11 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
     if task is None:
         raise HTTPException(status_code=404, detail="card not found")
 
-    plan = agent_board.plan_lane_move(task.status, task.tags, body.lane, body.assignee)
+    session_store = _get_session_store()
+    has_live = session_store.has_live_session(card_id, status=task.status, tags=task.tags)
+    plan = agent_board.plan_lane_move(
+        task.status, task.tags, body.lane, body.assignee, has_live_session=has_live,
+    )
     if plan.error is not None:
         status_code, detail = plan.error
         raise HTTPException(status_code=status_code, detail=detail)
@@ -921,6 +1199,147 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
 
     lane = agent_board.derive_lane(task.status, task.tags)
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
+
+
+@router.post("/board/cards/{card_id}/cancel")
+async def cancel_board_card(card_id: str) -> dict[str, Any]:
+    """Cancel an agent-assigned card: kill its live session (and every
+    descendant in its subtree) if one exists, then mark the task
+    `cancelled`. Available on any agent-assigned card that isn't in
+    Review and isn't already finished (status `done`, e.g. accepted, is
+    refused; an already-`cancelled` card short-circuits to an idempotent
+    200 below) — unlike a lane drag, Cancel works whether or not the
+    worker has claimed the card yet. Idempotent for the worker-owned
+    session — calling this again on an already-cancelled card touches no
+    session — but a live cc:/cx: CLI session (see below) is reported as a
+    failure on every call, not just the first, since only the
+    worker-owned session was ever really torn down.
+    """
+    from api.services import agent_board
+    from api.services.task_manager import get_task_manager, TaskConflictError
+
+    task_manager = get_task_manager()
+    task = task_manager.get(card_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="card not found")
+
+    # Ownership/review is checked before the idempotence short-circuit
+    # below — a `me` card or a pending-review card that somehow already
+    # carries status="cancelled" (not a state Cancel itself ever produces,
+    # since it refuses both) must still get its real refusal reason, not a
+    # misleading 200 "no-op cancel" success.
+    if agent_board.is_review_pending(task.tags):
+        raise HTTPException(
+            status_code=agent_board.REVIEW_UNRESOLVED_ERROR[0],
+            detail=agent_board.REVIEW_UNRESOLVED_ERROR[1],
+        )
+    if not agent_board.is_agent_owned(task.tags):
+        raise HTTPException(
+            status_code=agent_board.CANCEL_NOT_AGENT_OWNED_ERROR[0],
+            detail=agent_board.CANCEL_NOT_AGENT_OWNED_ERROR[1],
+        )
+
+    session_store = _get_session_store()
+
+    # A live cc:/cx: CLI session (opened via the board's Open button)
+    # lives in the separate `cli_sessions` table, keyed by its own
+    # session_id, not task_id — actually killing a CLI process is a
+    # separate concern, so this is always a reported failure, never a
+    # teardown. Looked up before the idempotent already-cancelled
+    # short-circuit below (and before the worker-session teardown) so a
+    # repeat Cancel call on a card whose CLI session is still open reports
+    # that failure every time, not just the first.
+    try:
+        live_cli_sessions = [
+            cli for cli in session_store.list_cli_sessions_for_task(card_id)
+            if cli.status != CLI_STATUS_ENDED
+        ]
+    except Exception as exc:  # noqa: BLE001 — never block cancel on this lookup
+        logger.warning("cli_sessions lookup for cancel of %s failed: %s", card_id, exc)
+        live_cli_sessions = []
+    cli_failures = [
+        {
+            "session_id": cli.session_id,
+            "reason": (
+                f"a live {cli.engine} CLI session ({cli.session_id}) is still open "
+                "and can't be killed by Cancel yet — close it manually"
+            ),
+        }
+        for cli in live_cli_sessions
+    ]
+
+    if task.status == "cancelled":
+        lane = agent_board.derive_lane(task.status, task.tags)
+        return {
+            "id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags),
+            "killed": [], "failures": cli_failures,
+        }
+
+    has_live = session_store.has_live_session(card_id, status=task.status, tags=task.tags)
+    error = agent_board.evaluate_card_action(task.status, task.tags, "cancel", has_live_session=has_live)
+    if error is not None:
+        status_code, detail = error
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    killed: list[str] = []
+    subtree_failures: list[dict[str, str]] = []
+
+    # Direct primary-key lookup — `task_id` is the `sessions` table's
+    # PRIMARY KEY — instead of `_build_snapshot()`'s 200-row,
+    # most-recently-started window (what the board's own display uses),
+    # which can silently miss a still-running session older than the 200
+    # most recent and let Cancel mark the task cancelled while the worker
+    # keeps running and spending.
+    target = session_store.get(card_id)
+    if target is not None and target.status not in TERMINAL_STATUSES:
+        try:
+            killed, subtree_failures = await _kill_session_subtree(target, "cancelled from the board")
+        except SubtreeTeardownError as exc:
+            # Teardown genuinely failed partway through — the task is NOT
+            # marked cancelled, since claiming a cancellation the teardown
+            # didn't actually finish would strand a still-running session
+            # behind a card that looks done. Report what was already
+            # stopped so the operator isn't left guessing.
+            stopped = ", ".join(exc.killed) or "none"
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"{exc} — sessions already stopped: {stopped}; the task was "
+                    "not marked cancelled, check session status and retry"
+                ),
+            ) from exc
+
+    failures = subtree_failures + cli_failures
+
+    # Strip the tags that would otherwise keep the card out of Done —
+    # `derive_lane` ranks Human queue and In progress above Done, so a
+    # lingering `agent-running`/`agent-blocked`/`human` tag would hide the
+    # cancellation instead of landing the card where the operator expects it.
+    strip = {agent_board.RUNNING_TAG, agent_board.BLOCKED_TAG, agent_board.HUMAN_TAG}
+    new_tags = [t for t in task.tags if t.lstrip("#").lower() not in strip]
+
+    try:
+        task = task_manager.update(card_id, status="cancelled", tags=new_tags)
+    except TaskConflictError as exc:
+        # The session (if any) is already torn down at this point — only
+        # the task write conflicted. Say so and invite a retry, rather
+        # than the generic conflict text, which would read like an
+        # ordinary refusal and hide that the teardown already happened.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"the session was already stopped, but the task update conflicted "
+                f"({exc}) — retry the cancel to finish it"
+            ),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail="card not found")
+    _invalidate_board_cache()
+
+    lane = agent_board.derive_lane(task.status, task.tags)
+    return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags), "killed": killed, "failures": failures}
 
 
 @router.get("/pending-questions")
@@ -1008,6 +1427,11 @@ def _thread_dict(s: Session) -> dict[str, Any]:
         "total_dollars": round(s.total_dollars, 6),
         "expected_output": s.expected_output,
         "label": _label_for_session(s, []),
+        # Called with one argument: the /chat threads panel's
+        # `routeBadgeHtml` renders no badge at all for `hermes` (it doesn't
+        # consume this field for that routing), so this value is never
+        # displayed either way — unlike the `/agents` snapshot row (see
+        # `_session_to_dict` above), which does pass `s.hermes_model` through.
         "model_label": _model_label_for_routing(s.routing),
         "origin": getattr(s, "origin", None),
         "resumable": s.status in TERMINAL_STATUSES,
@@ -1300,25 +1724,35 @@ def _maybe_managed_driver():
         return None
 
 
-@router.post("/sessions/{session_id}/kill")
-async def operator_kill_session(session_id: str, body: KillRequest | None = None) -> dict[str, Any]:
-    """Operator-initiated kill: stop the target session and all descendants
-    in its subtree. Target gets an `operator_killed` transcript event;
-    descendants get `cascade_killed`.
+class SubtreeTeardownError(Exception):
+    """Raised when `_kill_session_subtree` fails partway through a subtree
+    — an actual exception from `teardown_session` itself, distinct from
+    the already-modeled `managed_failure` outcome (a single member's
+    managed-agent teardown failing in an expected way, which still counts
+    as "handled" and doesn't raise). Carries whatever the loop had already
+    accomplished before the failure — `killed`/`failures` — so a caller
+    like Cancel can report exactly what happened rather than losing that
+    information to a bare exception.
+    """
 
-    Local-network only — must NOT be exposed via Tailscale Funnel or the
-    public MCP HTTP transport.
+    def __init__(self, message: str, killed: list[str], failures: list[dict[str, str]]):
+        super().__init__(message)
+        self.killed = killed
+        self.failures = failures
+
+
+async def _kill_session_subtree(target: Session, reason: str) -> tuple[list[str], list[dict[str, str]]]:
+    """Tear down `target` and every descendant in its subtree. Target gets
+    an `operator_killed` transcript event; descendants get `cascade_killed`.
+
+    Shared by the operator kill endpoint and Cancel — both need the exact
+    same subtree teardown, so this is the one place it's written.
+    Caller is responsible for the `TERMINAL_STATUSES` pre-check; this
+    function still no-ops any subtree member that's already terminal by
+    the time it runs.
     """
     session_store = _get_session_store()
     transcript_store = _get_transcript_store()
-    reason = (body.reason if body else "").strip() if body else ""
-
-    target = session_store.get_by_session_id(session_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail=f"session {session_id} not found")
-    if target.status in TERMINAL_STATUSES:
-        return {"killed": [], "failures": [], "reason": f"already {target.status}"}
-
     subtree = _collect_subtree(session_store, target)
     driver = _maybe_managed_driver()
     try:
@@ -1347,13 +1781,18 @@ async def operator_kill_session(session_id: str, body: KillRequest | None = None
                         "reason": reason,
                         "managed_remote": s.managed_agent_session_id,
                     }
-                result = _teardown(
-                    session_store, transcript_store, s,
-                    transcript_kind=kind,
-                    transcript_payload=payload,
-                    managed_driver=driver,
-                    remote_kill_runner=_remote_kill_runner,
-                )
+                try:
+                    result = _teardown(
+                        session_store, transcript_store, s,
+                        transcript_kind=kind,
+                        transcript_payload=payload,
+                        managed_driver=driver,
+                        remote_kill_runner=_remote_kill_runner,
+                    )
+                except Exception as exc:  # noqa: BLE001 — surfaced as SubtreeTeardownError
+                    raise SubtreeTeardownError(
+                        f"teardown failed for session {s.session_id}: {exc}", killed, failures,
+                    ) from exc
                 killed.append(s.session_id)
                 if result.get("managed_failure"):
                     failures.append({
@@ -1362,8 +1801,7 @@ async def operator_kill_session(session_id: str, body: KillRequest | None = None
                     })
             return killed, failures
 
-        killed, failures = await asyncio.to_thread(_run_teardown)
-        return {"killed": killed, "failures": failures}
+        return await asyncio.to_thread(_run_teardown)
     finally:
         if driver is not None:
             try:
@@ -1372,10 +1810,36 @@ async def operator_kill_session(session_id: str, body: KillRequest | None = None
                 pass
 
 
+@router.post("/sessions/{session_id}/kill")
+async def operator_kill_session(session_id: str, body: KillRequest | None = None) -> dict[str, Any]:
+    """Operator-initiated kill: stop the target session and all descendants
+    in its subtree. Target gets an `operator_killed` transcript event;
+    descendants get `cascade_killed`.
+
+    Local-network only — must NOT be exposed via Tailscale Funnel or the
+    public MCP HTTP transport.
+    """
+    session_store = _get_session_store()
+    reason = (body.reason if body else "").strip() if body else ""
+
+    target = session_store.get_by_session_id(session_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"session {session_id} not found")
+    if target.status in TERMINAL_STATUSES:
+        return {"killed": [], "failures": [], "reason": f"already {target.status}"}
+
+    killed, failures = await _kill_session_subtree(target, reason)
+    return {"killed": killed, "failures": failures}
+
+
 class CCResumeRequest(BaseModel):
     """Body for POST /api/agents/sessions/{id}/resume — accepts overrides
     for the spawn env when the systemd-inherited env isn't enough."""
     extra_env: dict[str, str] = {}
+    # "Resume here": an explicit target machine, overriding the
+    # session's recorded host. Blank/unset resumes where the session ran.
+    # See `_resolve_target_host`.
+    target_host: str | None = Field(default=None, max_length=255)
 
 
 class CCPaneBindRequest(BaseModel):
@@ -1863,6 +2327,121 @@ def _check_session_host_or_409(session_id: str) -> str | None:
     return target
 
 
+def _resume_command_text(session_id: str) -> str:
+    """Render the exact resume command for `session_id`, cwd-portable
+    (`cd <cwd> && ...`) so it's paste-able into any terminal.
+
+    Called from THREE sites: `_resolve_target_host`'s 400 `detail.command`
+    field, for a target the operator picked that this API can't launch on
+    itself; and the codex and Claude Code launchers' own 400 branches,
+    when `Popen`'s child `os.chdir` fails because the
+    resolved cwd doesn't exist/isn't a directory/isn't accessible on this
+    host. The launchers still build their own `inner_rendered`
+    independently for their SUCCESS path, and the renderings differ: this
+    function prepends `cd <cwd> && `, theirs doesn't. Do not refactor the
+    launchers' success-path rendering through it without accounting for
+    that difference — only their 400 branches call this function, to
+    render the copyable command text. Resolves cwd via the same
+    local-then-mirrored lookup `/focus` uses, falling back to the
+    `cli_sessions` row's own `cwd` when neither has a transcript for this
+    id — the common case for a remote-hosted session this API has never
+    mirrored. Returns `""` — never raises — when the id can't be
+    resolved at all, or when no cwd resolves for it, so a caller never
+    renders a command missing its `cd`; the drawer suppresses the
+    command box entirely on an empty string.
+    """
+    import shlex
+
+    from config.settings import settings
+
+    if session_id.startswith("cx:"):
+        from api.services.codex import session_ingest as cx
+        try:
+            bare = cx.validate_session_id(session_id)
+        except ValueError:
+            return ""
+        cwd = ""
+        try:
+            cwd = _lookup_cx_session_meta(session_id).decoded_cwd or ""
+        except HTTPException:
+            pass
+        template = (settings.codex_resume_inner_cmd or "").strip()
+    elif session_id.startswith("cc:"):
+        from api.services.claude_code import session_ingest as cc
+        try:
+            bare = cc.validate_session_id(session_id)
+        except ValueError:
+            return ""
+        if ":agent:" in bare:
+            bare = bare.split(":agent:", 1)[0]
+        cwd = ""
+        try:
+            meta, bare = _lookup_cc_session_meta(session_id)
+            cwd = meta.decoded_cwd or ""
+        except HTTPException:
+            pass
+        template = (settings.cc_resume_inner_cmd or "").strip()
+    else:
+        return ""
+
+    if not cwd:
+        try:
+            cli = _get_session_store().get_cli_session(session_id)
+        except Exception:  # noqa: BLE001 — a store error must not break command rendering
+            cli = None
+        if cli is not None and cli.cwd:
+            cwd = cli.cwd
+
+    inner = template.replace("{session_id}", bare).replace("{cwd}", cwd)
+    if not inner:
+        return ""
+    if not cwd:
+        # No cwd resolved at all (local scan missed,
+        # no mirrored transcript, no cli_sessions row) — rendering the
+        # inner command WITHOUT `cd <cwd> &&` would offer a command that
+        # resumes in whatever directory the operator happens to be in,
+        # not the session's actual project. Render nothing rather than a
+        # misleading command; the caller (the drawer) suppresses the
+        # command box entirely when this returns "".
+        return ""
+    return f"cd {shlex.quote(cwd)} && {inner}"
+
+
+def _resolve_target_host(session_id: str, target_host: str | None) -> str | None:
+    """Resolve resume/focus's launch target, honoring an explicit
+    `target_host` override ("resume here").
+
+    - Unset/blank `target_host`: falls through to
+      `_check_session_host_or_409` (including its 409 for an
+      unregistered host).
+    - `target_host` equal to this API host's own name: launch locally
+      (`None`) — OVERRIDES the session's recorded host, which is the
+      whole point of "resume here".
+    - `target_host` a key in `settings.agent_hosts`: launch there over
+      ssh (its target string) — also an override of the recorded host.
+    - Anything else: 400 with a `detail` object carrying `error` and the
+      full resume `command` text, so the caller can offer it for copying
+      rather than trying to launch somewhere this API can't reach.
+    """
+    target_host = (target_host or "").strip()
+    if not target_host:
+        return _check_session_host_or_409(session_id)
+    if target_host == api_host_name():
+        return None
+    from config.settings import settings
+
+    target = settings.agent_hosts.get(target_host)
+    if target:
+        return target
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error": f"host {target_host!r} is not this API host and not in LIFEOS_AGENT_HOSTS",
+            "command": _resume_command_text(session_id),
+        },
+    )
+
+
 async def _resume_codex_session(
     session_id: str,
     body: "CCResumeRequest | None",
@@ -1903,10 +2482,16 @@ async def _resume_codex_session(
         # a remote session's rollout file isn't under this API's local
         # `codex_sessions_dir`; its cwd comes from the `cli_sessions` row.
         cli = _get_session_store().get_cli_session(session_id)
-        if cli is None or not cli.cwd:
-            raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
-        from types import SimpleNamespace
-        target = SimpleNamespace(decoded_cwd=cli.cwd)
+        if cli is not None and cli.cwd:
+            from types import SimpleNamespace
+            target = SimpleNamespace(decoded_cwd=cli.cwd)
+        else:
+            # No cli_sessions row — e.g. a "resume here" targeted at
+            # a session known only from its mirrored transcript. Fall back
+            # to the transcript's own cwd via the same lookup /focus uses.
+            target = _lookup_cx_session_meta(session_id)
+            if not target.decoded_cwd:
+                raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
     else:
         # Widen lookback for resume so older sessions are still resolvable.
         metas = cx.discover_sessions(
@@ -1914,15 +2499,31 @@ async def _resume_codex_session(
             lookback_days=max(int(settings.codex_lookback_days), 365),
         )
         target = next((m for m in metas if m.raw_session_id == bare), None)
-        if target is None:
-            raise HTTPException(status_code=404, detail=f"session {session_id} not found")
         # Codex stores cwd inside session_meta, populated by parse_session. The
         # snapshot prepopulates it but on a fresh resume call we may need to
         # re-parse to recover it (cheap — one jsonl read).
-        if not target.decoded_cwd:
+        if target is not None and not target.decoded_cwd:
             target, _ = cx.parse_session(target)
-        if not target.decoded_cwd:
-            raise HTTPException(status_code=404, detail=f"session {session_id} has no cwd")
+        if target is None or not target.decoded_cwd:
+            # The local scan missed — e.g. "resume here" targeted at this
+            # API host for a session whose transcript lives on another
+            # (mirrored) machine. Fall through to the same mirror-aware
+            # chain `_resume_command_text` performs: the mirrored-
+            # transcript lookup, then the `cli_sessions` row's own cwd,
+            # before giving up.
+            try:
+                target = _lookup_cx_session_meta(session_id)
+            except HTTPException:
+                target = None
+            if target is None or not target.decoded_cwd:
+                cli = _get_session_store().get_cli_session(session_id)
+                if cli is not None and cli.cwd:
+                    from types import SimpleNamespace
+                    target = SimpleNamespace(decoded_cwd=cli.cwd)
+                else:
+                    target = None
+        if target is None or not target.decoded_cwd:
+            raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
 
     inner_template = (settings.codex_resume_inner_cmd or "").strip()
     inner_rendered = (
@@ -1969,9 +2570,37 @@ async def _resume_codex_session(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail=f"resume binary not found: {exc}") from exc
     except OSError as exc:
+        # A mirrored session's cwd is the REMOTE
+        # machine's path — on this (local, non-ssh) branch it's used as-is
+        # for `Popen(cwd=...)`, which may not exist, may not be a
+        # directory, or may not be traversable on THIS host when the
+        # session was mirrored from elsewhere (e.g. "resume here" back
+        # onto the API host for a session whose transcript lives only on
+        # a remote box). Depending on which, `Popen`'s child `os.chdir`
+        # raises `FileNotFoundError` (ENOENT), `NotADirectoryError`
+        # (ENOTDIR — the cwd is a regular file), or `PermissionError`
+        # (EACCES) — all `OSError` subclasses. Checking `exc.filename ==
+        # popen_cwd` FIRST, across all three, is what makes the
+        # discrimination exact: only the child's `os.chdir` failure blames
+        # the cwd itself as `exc.filename`; a missing-executable
+        # `FileNotFoundError` blames argv[0] instead, and no other
+        # `Popen` failure carries the cwd as its filename at all. Without
+        # this, the cwd case renders a 500 that (for the ENOENT case)
+        # misleadingly blames "resume binary not found" when the binary is
+        # fine, and — because a 500's `detail` is a bare string — skips
+        # the copyable-command fallback `panel.js` already knows how to
+        # render for a 400.
+        if not remote_ssh_target and popen_cwd and exc.filename == popen_cwd:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": f"cwd {popen_cwd!r} does not exist on this host",
+                    "command": _resume_command_text(session_id),
+                },
+            ) from exc
+        if isinstance(exc, FileNotFoundError):
+            raise HTTPException(status_code=500, detail=f"resume binary not found: {exc}") from exc
         raise HTTPException(status_code=500, detail=f"resume spawn failed: {exc}") from exc
 
     clipboard_text = ""
@@ -2072,10 +2701,12 @@ async def resume_claude_code_session(
     if not session_id.startswith("cx:") and not session_id.startswith("cc:"):
         raise HTTPException(status_code=400, detail="resume is only available for Claude Code or Codex sessions")
 
-    # (#849/#851) A session registered on a different, but REGISTERED
-    # (settings.agent_hosts), host resumes over ssh; an unregistered host
+    # An explicit `target_host` ("resume here") overrides the session's
+    # recorded host; unset falls through to `_check_session_host_or_409` —
+    # a session registered on a different, but REGISTERED
+    # (settings.agent_hosts), host resumes over ssh, an unregistered host
     # still 409s rather than silently no-op'ing.
-    remote_ssh_target = _check_session_host_or_409(session_id)
+    remote_ssh_target = _resolve_target_host(session_id, body.target_host if body else None)
 
     if session_id.startswith("cx:"):
         return await _resume_codex_session(session_id, body, remote_ssh_target=remote_ssh_target)
@@ -2123,10 +2754,16 @@ async def _resume_claude_code_launcher(
         # from the `cli_sessions` row instead (populated by the remote
         # host's own hook script over HTTP, host-agnostic by design — #849).
         cli = _get_session_store().get_cli_session(session_id)
-        if cli is None or not cli.cwd:
-            raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
-        from types import SimpleNamespace
-        target = SimpleNamespace(decoded_cwd=cli.cwd)
+        if cli is not None and cli.cwd:
+            from types import SimpleNamespace
+            target = SimpleNamespace(decoded_cwd=cli.cwd)
+        else:
+            # No cli_sessions row — e.g. a "resume here" targeted at
+            # a session known only from its mirrored transcript. Fall back
+            # to the transcript's own cwd via the same lookup /focus uses.
+            target, _bare_unused = _lookup_cc_session_meta(session_id)
+            if not target.decoded_cwd:
+                raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
     else:
         # Find the matching jsonl to recover the working directory.
         metas = cc.discover_sessions(
@@ -2134,6 +2771,24 @@ async def _resume_claude_code_launcher(
             lookback_days=max(int(settings.claude_code_lookback_days), 365),  # widen lookback for resume
         )
         target = next((m for m in metas if m.raw_session_id == bare), None)
+        if target is None or not target.decoded_cwd:
+            # The local scan missed — e.g. "resume here" targeted at this
+            # API host for a session whose transcript lives on another
+            # (mirrored) machine. Fall through to the same mirror-aware
+            # chain `_resume_command_text` performs: the mirrored-
+            # transcript lookup, then the `cli_sessions` row's own cwd,
+            # before giving up.
+            try:
+                target, _bare_unused = _lookup_cc_session_meta(session_id)
+            except HTTPException:
+                target = None
+            if target is None or not target.decoded_cwd:
+                cli = _get_session_store().get_cli_session(session_id)
+                if cli is not None and cli.cwd:
+                    from types import SimpleNamespace
+                    target = SimpleNamespace(decoded_cwd=cli.cwd)
+                else:
+                    target = None
         if target is None or not target.decoded_cwd:
             raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
 
@@ -2207,9 +2862,31 @@ async def _resume_claude_code_launcher(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail=f"resume binary not found: {exc}") from exc
     except OSError as exc:
+        # Same cross-machine cwd mismatch as the codex
+        # launcher above: a mirrored session's cwd is the REMOTE machine's
+        # path, so on this local branch it may not exist, may not be a
+        # directory, or may not be traversable on this host at all. The
+        # child's `os.chdir` raises `FileNotFoundError` (ENOENT),
+        # `NotADirectoryError` (ENOTDIR — the cwd is a regular file), or
+        # `PermissionError` (EACCES) — all `OSError` subclasses — with
+        # `exc.filename` set to the cwd; a missing-executable
+        # `FileNotFoundError` blames argv[0] instead, and no other `Popen`
+        # failure carries the cwd as its filename. Checking `exc.filename
+        # == popen_cwd` across all three fails with a 400 carrying the
+        # copyable command instead of letting the ENOENT case fall through
+        # to a 500 that misleadingly blames the resume binary rather than
+        # the cwd.
+        if not remote_ssh_target and popen_cwd and exc.filename == popen_cwd:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": f"cwd {popen_cwd!r} does not exist on this host",
+                    "command": _resume_command_text(session_id),
+                },
+            ) from exc
+        if isinstance(exc, FileNotFoundError):
+            raise HTTPException(status_code=500, detail=f"resume binary not found: {exc}") from exc
         raise HTTPException(status_code=500, detail=f"resume spawn failed: {exc}") from exc
 
     # Push a cwd-portable form of the inner command to the system
@@ -2370,6 +3047,33 @@ def _lookup_cc_session_meta(session_id: str):
                 )
                 return meta, bare
 
+    # Not under the local projects dir — check every mirrored
+    # remote host's copy too, so /focus's FD-probe fallback and the
+    # summary path can resolve a mirrored session the same way a local
+    # one resolves above.
+    from api.services import agent_transcript_mirror as mirror
+
+    for host_dir in mirror.mirrored_transcript_dirs("claude_code"):
+        for proj in host_dir.iterdir():
+            if not proj.is_dir():
+                continue
+            candidate = proj / f"{bare}.jsonl"
+            if candidate.exists():
+                try:
+                    mtime = candidate.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                project_key = proj.name
+                meta = SessionMeta(
+                    session_id=CC_PREFIX + bare,
+                    raw_session_id=bare,
+                    project_key=project_key,
+                    decoded_cwd=decode_project_key(project_key),
+                    jsonl_path=str(candidate),
+                    mtime=mtime,
+                )
+                return meta, bare
+
     raise HTTPException(status_code=404, detail=f"session {session_id} not found")
 
 
@@ -2393,6 +3097,18 @@ def _lookup_cx_session_meta(session_id: str):
         lookback_days=max(int(settings.codex_lookback_days), 365),
     )
     target = next((m for m in metas if m.raw_session_id == bare), None)
+    if target is None:
+        # Not local — check every mirrored remote host's copy too.
+        from api.services import agent_transcript_mirror as mirror
+
+        for host_dir in mirror.mirrored_transcript_dirs("codex"):
+            metas = cx.discover_sessions(
+                sessions_dir=host_dir,
+                lookback_days=max(int(settings.codex_lookback_days), 365),
+            )
+            target = next((m for m in metas if m.raw_session_id == bare), None)
+            if target is not None:
+                break
     if target is None:
         raise HTTPException(status_code=404, detail=f"session {session_id} not found")
     if not target.decoded_cwd:
@@ -2518,7 +3234,10 @@ async def cc_pane_bind(request: Request, body: CCPaneBindRequest) -> dict[str, A
 
 
 @router.post("/sessions/{session_id}/focus")
-async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
+async def focus_claude_code_session(
+    session_id: str,
+    body: CCResumeRequest | None = None,
+) -> dict[str, Any]:
     """Activate the WezTerm pane running this Claude Code session.
 
     Resolution order:
@@ -2546,9 +3265,10 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
     if not session_id.startswith("cc:") and not is_cx:
         raise HTTPException(status_code=400, detail="focus is only available for Claude Code or Codex sessions")
 
-    # (#849/#851) A session registered on a different, but REGISTERED host
-    # resumes over ssh; an unregistered host still 409s.
-    remote_ssh_target = _check_session_host_or_409(session_id)
+    # A session registered on a different, but REGISTERED
+    # host resumes over ssh; an unregistered host still 409s. An explicit
+    # `target_host` ("resume here") overrides the session's recorded host.
+    remote_ssh_target = _resolve_target_host(session_id, body.target_host if body else None)
 
     try:
         from config.settings import settings
@@ -2676,12 +3396,9 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
 
 async def _stream_claude_code_session(session_id: str, backfill: int):
     """Per-session SSE generator for Claude Code (cc:-prefixed) sessions."""
-    from config.settings import settings
-    from api.services.claude_code import session_ingest as cc
-
     yield ": ok\n\n"
     try:
-        events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+        events = _read_cli_transcript_events(session_id)
     except Exception as exc:  # noqa: BLE001
         yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
         return
@@ -2698,7 +3415,7 @@ async def _stream_claude_code_session(session_id: str, backfill: int):
     while True:
         await asyncio.sleep(1.0)
         try:
-            events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+            events = _read_cli_transcript_events(session_id)
         except Exception:
             events = []
         if len(events) > line_count:
@@ -2729,12 +3446,9 @@ async def _stream_codex_session(session_id: str, backfill: int):
     `/sessions/{id}/stream` only dispatched `cc:` here, so opening a Codex
     session's panel fell through to the LifeOS transcript store and 400'd.)
     """
-    from config.settings import settings
-    from api.services.codex import session_ingest as cx
-
     yield ": ok\n\n"
     try:
-        events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+        events = _read_cli_transcript_events(session_id)
     except Exception as exc:  # noqa: BLE001
         yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
         return
@@ -2749,7 +3463,7 @@ async def _stream_codex_session(session_id: str, backfill: int):
     while True:
         await asyncio.sleep(1.0)
         try:
-            events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+            events = _read_cli_transcript_events(session_id)
         except Exception:
             events = []
         if len(events) > line_count:

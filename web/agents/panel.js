@@ -1,19 +1,22 @@
 // web/agents/panel.js
 //
-// Shared session-detail panel (#850): header render, inline label edit,
-// backfill + live SSE transcript tail, LLM summary fetch, and the
-// kill/resume/focus operator actions. Used by BOTH the Graph tab's side
-// panel (web/agents/graph.js) and the Board tab's card drawer
-// (web/agents/board.js), following the web/chat/ module split from #360.
+// Shared session-detail panel: header render, inline label edit, backfill +
+// live SSE transcript tail, LLM summary fetch, and the kill/resume/focus
+// operator actions. Used by both the Graph tab's side panel
+// (web/agents/graph.js) and the Board tab's card drawer
+// (web/agents/board.js).
 //
-// This is the pre-#850 web/agents.html panel code (renderPanelHeader,
-// updatePanelMeta, openPanel/closePanel, loadSessionEvents, appendEvent,
-// startLabelEdit, fetchSessionSummary, focusCcSession, resumeCcSession,
-// openKillModal) with one structural change: every DOM lookup is scoped to
-// a `container` passed in at construction instead of a single global
-// `#panel` element and `document.getElementById`, so a Graph-tab panel and
-// a Board-tab drawer can each hold their own instance without id collisions.
-// Rendering/behavior is otherwise unchanged.
+// `SessionPanel` is constructed with a `container` element rather than a
+// hardcoded `#panel` id, so a Graph-tab panel and a Board-tab drawer can
+// each hold their own instance without DOM id collisions.
+
+import { nodeLabel, isRawIdValue, routingLabel, engineOf, ENGINE_SHAPES } from './graph_encoding.js';
+
+// Re-exported so importers (web/agents/board.js, web/agents/graph.js) can
+// import `routingLabel` from either module — the definition itself lives in
+// graph_encoding.js so that module doesn't import this one back (which would
+// form a cycle, since this module imports `nodeLabel` from it).
+export { routingLabel };
 
 export const STATUS_COLORS = {
   running:   '#34d399',
@@ -32,19 +35,56 @@ export const STATUS_COLORS = {
 // treated as terminal. Only 'ended' (an explicit SessionEnd event) is.
 export const TERMINAL = new Set(['completed', 'failed', 'budget_exceeded', 'ended']);
 
-export function routingLabel(routing) {
-  if (!routing || routing === 'local') return 'Local';
-  if (routing === 'claude_code' || routing === 'code') return 'Claude Code';
-  if (routing === 'codex') return 'Codex';
-  if (routing === 'remote') return 'Remote';  // #809: #cloud tag, not Anthropic
-  if (routing === 'hermes') return 'Hermes';  // #850: was falling through to 'Claude'
-  return 'Claude';
-}
-
 export function sourceLabelFor(d) {
   if (d.source === 'claude_code') return 'Claude Code CLI';
   if (d.source === 'codex') return 'Codex CLI';
   return 'LifeOS agent';
+}
+
+// The panel's Routing badge text. For a Hermes-routed session that has
+// taken at least one turn, `model_label` carries the honest per-session
+// "Hermes · <model>" attribution (`_model_label_for_routing` on the
+// server) — shown in preference to the plain routing name so the operator
+// can see which model actually answered. A Hermes session with no turn
+// yet (`model_label` is still plain "Hermes") and every non-Hermes session
+// render exactly `routingLabel(s.routing)`.
+function routingBadgeText(s) {
+  if (s.routing === 'hermes' && (s.model_label || '').startsWith('Hermes')) {
+    return s.model_label;
+  }
+  return routingLabel(s.routing);
+}
+
+// The panel's `.panel-chips` row — model and effort, each as a small chip,
+// never as the header's name text (that's `nodeLabel(s)` above). Shared by
+// the graph panel and the board drawer, since both mount a `SessionPanel`.
+// A chip is dropped whenever its text equals `routingBadgeText(s)` — the
+// text the Routing badge already shows above it — so the model and engine
+// chips never just repeat that badge (e.g. a `claude` session whose model
+// chip is "Sonnet" still drops a bare "Claude" engine chip, since the
+// badge itself reads "Claude"; a Hermes session whose badge already reads
+// "Hermes · <model>" drops the now-redundant model chip). The host chip is
+// skipped entirely — the meta row above already shows a host badge.
+function panelChipsHtml(s) {
+  const badgeText = routingBadgeText(s);
+  const chips = [];
+  if (s.model_label && s.model_label !== badgeText) chips.push(s.model_label);
+  const engineLabel = ENGINE_SHAPES[engineOf(s)].label;
+  if (engineLabel !== badgeText) chips.push(engineLabel);
+  if (s.effort) chips.push(s.effort);
+  return chips.map(c => `<span class="badge panel-chip">${escapeHtml(c)}</span>`).join('');
+}
+
+// Single source of truth for whether a session should
+// offer Resume + the resume-host select. Both `_renderHeader` (decides
+// whether the elements exist at all) and `updateMeta` (decides whether
+// they're currently visible) call this, so an edit to the expression
+// can't desync creation from visibility.
+export function showResumeFor(s) {
+  const isCli = (s.source === 'claude_code' || s.source === 'codex');
+  const isSubagent = !!s.is_subagent;
+  return isCli && !isSubagent
+    && (TERMINAL.has(s.status) || s.status === 'inactive' || s.status === 'yielded');
 }
 
 export function escapeHtml(s) {
@@ -231,6 +271,57 @@ export function prettyPayload(payload) {
 
 const _EVENTS_RETRY_DELAYS = [800, 1600, 3200];  // ms; ~5.6s before giving up
 
+// "Resume here" host list — same across every panel instance, so
+// fetch it once per page load and cache the promise rather than re-fetching
+// on every panel render. If GET /api/agents/hosts is unavailable (404),
+// takes too long, or the request fails,
+// `_resumeHosts()` returns null and `_populateResumeHosts` builds a
+// fallback list itself.
+//
+// A `null`/empty result re-arms the cache so a later
+// interaction — reopening the panel, or the endpoint becoming reachable
+// mid-session — retries instead of being stuck with a permanently empty
+// select for the page's whole life.
+let _resumeHostsPromise = null;
+
+async function _resumeHosts() {
+  if (!_resumeHostsPromise) {
+    _resumeHostsPromise = fetch('/api/agents/hosts', { signal: AbortSignal.timeout(5000) })
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => (data && Array.isArray(data.hosts) ? data.hosts : null))
+      // A row with no non-empty string `name` would
+      // render `undefined`/`null` as its option value and label — drop it.
+      .then(hosts => {
+        const valid = (hosts || []).filter(h => h && typeof h.name === 'string' && h.name);
+        return valid.length ? valid : null;
+      })
+      .catch(() => null);
+    _resumeHostsPromise.then(hosts => {
+      if (!hosts) _resumeHostsPromise = null;
+    });
+  }
+  return _resumeHostsPromise;
+}
+
+// The API host's own name, for the fallback list when
+// `/api/agents/hosts` isn't available — `GET /api/agents/snapshot` (which
+// every page already polls) carries it. Cached the same way, with the
+// same retry-on-failure re-arming as `_resumeHosts()`.
+let _apiHostPromise = null;
+
+async function _apiHostName() {
+  if (!_apiHostPromise) {
+    _apiHostPromise = fetch('/api/agents/snapshot', { signal: AbortSignal.timeout(5000) })
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => (data && typeof data.api_host === 'string' && data.api_host) ? data.api_host : null)
+      .catch(() => null);
+    _apiHostPromise.then(name => {
+      if (!name) _apiHostPromise = null;
+    });
+  }
+  return _apiHostPromise;
+}
+
 /**
  * A self-contained session-detail panel mounted into `container`.
  *
@@ -297,14 +388,15 @@ export class SessionPanel {
     const inferredHint = s.status_inferred ? ' (inferred)' : '';
     const sourceLabel = sourceLabelFor(s);
     if (!root.querySelector('#label-edit-input')) {
-      setText('label', s.custom_label || s.label || s.session_id);
+      setText('label', nodeLabel(s));
     }
     setText('status', s.status + inferredHint);
     setText('source', sourceLabel);
-    setText('routing', routingLabel(s.routing));
+    setText('routing', routingBadgeText(s));
     setText('cost', '$' + (s.total_dollars || 0).toFixed(4));
     setText('tokens', `${s.total_input_tokens || 0}↓ / ${s.total_output_tokens || 0}↑`);
     setText('cwd-hint', s.decoded_cwd || '');
+    setHtml('panel-chips', panelChipsHtml(s));
 
     const statusBadge = root.querySelector('[data-field="status"]');
     if (statusBadge) statusBadge.className = `badge status-${escapeAttr(s.status)}`;
@@ -315,6 +407,23 @@ export class SessionPanel {
 
     const killBtn = root.querySelector('[data-action="kill"]');
     const isCli = (s.source === 'claude_code' || s.source === 'codex');
+
+    // `_renderHeader` always CREATES the Resume
+    // button and resume-host select whenever `isCli && !isSubagent` (see
+    // below), starting them `hidden` per `showResumeFor`. A poll tick only
+    // calls `updateMeta`, which never re-renders — this toggles the
+    // ALREADY-RENDERED elements' visibility, in BOTH directions: hiding
+    // Resume (spawning a redundant second terminal) on a session that's
+    // actually live, and showing it once a live session reaches a
+    // resumable status. Both `updateMeta` and `_renderHeader` call the
+    // same `showResumeFor` predicate so the two can't drift apart.
+    const showResume = showResumeFor(s);
+    const resumeBtn = root.querySelector('[data-action="resume"]');
+    const resumeHostSelect = root.querySelector('[data-action="resume-host"]');
+    if (resumeBtn) resumeBtn.hidden = !showResume;
+    if (resumeHostSelect) resumeHostSelect.hidden = !showResume;
+    if (!showResume) this._hideResumeCommand();
+
     if (live && !isCli && !killBtn) {
       const header = root.querySelector('.panel-header');
       if (header) {
@@ -339,7 +448,14 @@ export class SessionPanel {
     const isCli = (s.source === 'claude_code' || s.source === 'codex');
     const isSubagent = !!s.is_subagent;
     const showKill = live && !isCli;
-    const showResume = isCli && !isSubagent && (TERMINAL.has(s.status) || s.status === 'inactive' || s.status === 'yielded');
+    // `canResume` gates whether the Resume button, the
+    // resume-host select, and the resume-command box are CREATED — a drawer
+    // opened on a `running` session must still get these elements so a
+    // later `updateMeta` (the only refresh path on the Graph tab) can show
+    // them once the session reaches a resumable status. `showResume` only
+    // gates their INITIAL visibility.
+    const canResume = isCli && !isSubagent;
+    const showResume = showResumeFor(s);
     const showGoTo = isCli && !isSubagent;
     const sourceLabel = sourceLabelFor(s);
     const inferredHint = s.status_inferred ? ' (inferred)' : '';
@@ -347,9 +463,10 @@ export class SessionPanel {
       <div class="panel-header">
         <button class="panel-close" aria-label="Close" data-action="close">×</button>
         ${showKill ? '<button class="panel-kill" data-action="kill">Kill</button>' : ''}
-        ${showResume ? '<button class="panel-resume" data-action="resume" title="Open a new wezterm tab and run claude --resume">Resume</button>' : ''}
+        ${canResume ? `<button class="panel-resume" data-action="resume" title="Open a new wezterm tab and run claude --resume"${showResume ? '' : ' hidden'}>Resume</button>` : ''}
+        ${canResume ? `<select class="panel-resume-host" data-action="resume-host" title="Resume on this machine"${showResume ? '' : ' hidden'}></select>` : ''}
         ${showGoTo ? '<button class="panel-focus" data-action="focus" title="Jump to the existing wezterm pane for this session (or run Resume if there isn\'t one).">Go To</button>' : ''}
-        <div class="label" data-field="label" title="Click to rename this session">${escapeHtml(s.custom_label || s.label || s.session_id)}</div>
+        <div class="label" data-field="label" title="Click to rename this session">${escapeHtml(nodeLabel(s))}</div>
         <div class="cwd-hint" data-field="cwd-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-all">${s.decoded_cwd ? escapeHtml(s.decoded_cwd) : ''}</div>
         ${s.branch ? `<div class="branch-hint" data-field="branch-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.1rem">branch: ${escapeHtml(s.branch)}</div>` : ''}
         <div class="meta" data-field="meta">
@@ -357,12 +474,18 @@ export class SessionPanel {
           <span class="badge status-${safeStatus}" data-field="status">${escapeHtml(s.status + inferredHint)}</span>
           <span class="badge" data-field="source">${escapeHtml(sourceLabel)}</span>
           ${s.host ? `<span class="badge" data-field="host" title="Machine this session is running on">${escapeHtml(s.host)}</span>` : ''}
-          <span class="badge" data-field="routing">${escapeHtml(routingLabel(s.routing))}</span>
+          <span class="badge" data-field="routing">${escapeHtml(routingBadgeText(s))}</span>
           <span class="badge" data-field="cost">$${(s.total_dollars || 0).toFixed(4)}</span>
           <span class="badge" data-field="tokens">${s.total_input_tokens || 0}↓ / ${s.total_output_tokens || 0}↑</span>
           <span data-field="depth">${s.spawn_depth ? `<span class="badge">depth ${s.spawn_depth}</span>` : ''}</span>
         </div>
+        <div class="panel-chips" data-field="panel-chips">${panelChipsHtml(s)}</div>
         ${s.prompt_preview ? `<div class="prompt-preview-hint" data-field="prompt-preview-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-word">“${escapeHtml(s.prompt_preview)}”</div>` : ''}
+        ${canResume ? `
+        <div class="resume-command" data-field="resume-command" hidden>
+          <code data-field="resume-command-text"></code>
+          <button data-action="copy-resume-command">Copy</button>
+        </div>` : ''}
       </div>
       <div class="session-summary loading" data-field="session-summary">
         <div class="ss-label">Summary</div>
@@ -375,21 +498,124 @@ export class SessionPanel {
     const labelEl = root.querySelector('[data-field="label"]');
     if (labelEl) labelEl.onclick = () => this._startLabelEdit(s);
     if (showKill) root.querySelector('[data-action="kill"]').onclick = () => this.openKillModal(s);
-    if (showResume) root.querySelector('[data-action="resume"]').onclick = () => this._resumeSession(s);
+    if (canResume) {
+      root.querySelector('[data-action="resume"]').onclick = () => this._resumeSession(s);
+      this._populateResumeHosts(s);
+      const copyBtn = root.querySelector('[data-action="copy-resume-command"]');
+      if (copyBtn) copyBtn.onclick = () => this._copyResumeCommand();
+    }
     if (showGoTo) root.querySelector('[data-action="focus"]').onclick = () => this._focusSession(s);
+  }
+
+  // "Resume here": populate the host <select> next to Resume with
+  // the API host plus every registry host from GET /api/agents/hosts. When
+  // that isn't available or fails, build a
+  // real fallback instead of only ever offering the
+  // session's own recorded host: the API host (learned from
+  // `/api/agents/snapshot`'s `api_host` field) plus this session's own
+  // host, deduplicated — so "resume here" onto THIS machine is still an
+  // option even without the registry endpoint. Defaults the selection to
+  // the session's recorded host so a plain click behaves like before.
+  async _populateResumeHosts(s) {
+    const select = this.container.querySelector('[data-action="resume-host"]');
+    if (!select) return;
+    let hosts = await _resumeHosts();
+    if (!hosts || !hosts.length) {
+      const apiHost = await _apiHostName();
+      hosts = [];
+      const seen = new Set();
+      if (apiHost) { hosts.push({ name: apiHost, is_api_host: true }); seen.add(apiHost); }
+      if (s.host && !seen.has(s.host)) hosts.push({ name: s.host, is_api_host: false });
+      // No API host is knowable (no `/api/agents/hosts`
+      // AND no `api_host` from `/api/agents/snapshot`) and this session
+      // carries no recorded host either — there is genuinely nothing to
+      // offer. Use an EMPTY value, not the human-readable placeholder
+      // "this host": that string would get sent verbatim as
+      // `target_host`, a machine identifier the backend 400s on. An empty
+      // value falls through `targetHost ? {...} : {}` in `_resumeSession`/
+      // `_focusSession`, omitting `target_host` from the request body.
+      if (!hosts.length) hosts = [{ name: '', label: 'this host', is_api_host: false }];
+    } else {
+      hosts = hosts.slice().sort((a, b) => (b.is_api_host ? 1 : 0) - (a.is_api_host ? 1 : 0));
+      // The registry list alone may not include this
+      // session's own host — e.g. it was registered by the hook on a
+      // machine not listed in LIFEOS_AGENT_HOSTS. Without it, the select
+      // defaults to its first option (the API host) and "Go To"/"Resume"
+      // silently target the wrong machine. Add it so the session's actual
+      // host is always a real, selectable, default-selected option.
+      if (s.host && !hosts.some(h => h.name === s.host)) {
+        hosts.push({ name: s.host, is_api_host: false });
+      }
+    }
+    // Build options as real elements and assign `.value`
+    // / `.textContent` as PROPERTIES — a template-string `value="${escapeAttr(...)}"`
+    // mangled a dotted/hyphenated host (e.g. "mac-mini.local") into an
+    // underscored value the backend doesn't recognize, while displaying
+    // the correct name, and it left `select.value = s.host` unable to
+    // match any option at all.
+    select.innerHTML = '';
+    for (const h of hosts) {
+      const suffix = h.is_api_host ? ' (this machine)' : '';
+      const opt = document.createElement('option');
+      opt.value = h.name;
+      opt.textContent = h.label || (h.name + suffix);
+      select.appendChild(opt);
+    }
+    if (s.host && hosts.some(h => h.name === s.host)) select.value = s.host;
+  }
+
+  _showResumeCommand(command, note) {
+    const box = this.container.querySelector('[data-field="resume-command"]');
+    const codeEl = this.container.querySelector('[data-field="resume-command-text"]');
+    if (box && codeEl && command) {
+      codeEl.textContent = command;
+      box.hidden = false;
+    }
+    showToast(note || 'Copy the command below to run it on that host.', true);
+  }
+
+  _hideResumeCommand() {
+    const box = this.container.querySelector('[data-field="resume-command"]');
+    if (box) box.hidden = true;
+  }
+
+  async _copyResumeCommand() {
+    const codeEl = this.container.querySelector('[data-field="resume-command-text"]');
+    const text = codeEl ? codeEl.textContent : '';
+    if (!text) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try { await navigator.clipboard.writeText(text); showToast('Command copied.', false); return; } catch (_) {}
+    }
+    showToast('Select and copy the command manually.', true);
   }
 
   async _focusSession(s) {
     const btn = this.container.querySelector('[data-action="focus"]');
+    // The resume-host select is created whenever Go
+    // To is (`canResume` and `showGoTo` are both `isCli && !isSubagent`),
+    // but may be `hidden` on a live, non-terminal session — read it
+    // defensively rather than assuming a non-hidden or even present
+    // element.
+    const select = this.container.querySelector('[data-action="resume-host"]');
+    const targetHost = select ? select.value : '';
     if (btn) { btn.disabled = true; btn.textContent = 'Locating…'; }
     try {
       const r = await fetch(`/api/agents/sessions/${encodeURIComponent(s.session_id)}/focus`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(targetHost ? { target_host: targetHost } : {}),
       });
       if (!r.ok) {
         const text = await r.text();
-        let msg = text;
-        try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+        // Reuse _resumeSession's object-detail handling
+        // so a 400 with `{error, command}` renders the message, not
+        // `[object Object]` from a bare String() coercion.
+        let detail = text;
+        try { const j = JSON.parse(text); detail = (j.detail !== undefined) ? j.detail : text; } catch (_) {}
+        if (r.status === 400 && detail && typeof detail === 'object' && detail.command) {
+          this._showResumeCommand(detail.command, detail.error);
+          return;
+        }
+        const msg = (detail && typeof detail === 'object') ? (detail.error || JSON.stringify(detail)) : detail;
         if (r.status === 404) {
           showToast(`Couldn't locate pane — session not running, wezterm unreachable, or SessionStart hook not installed.`, true);
         } else if (r.status === 410) {
@@ -409,15 +635,27 @@ export class SessionPanel {
 
   async _resumeSession(s) {
     const btn = this.container.querySelector('[data-action="resume"]');
+    const select = this.container.querySelector('[data-action="resume-host"]');
+    const targetHost = select ? select.value : '';
     if (btn) { btn.disabled = true; btn.textContent = 'Resuming…'; }
+    this._hideResumeCommand();
     try {
       const r = await fetch(`/api/agents/sessions/${encodeURIComponent(s.session_id)}/resume`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(targetHost ? { target_host: targetHost } : {}),
       });
       if (!r.ok) {
         const text = await r.text();
-        let msg = text;
-        try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+        let detail = text;
+        try { const j = JSON.parse(text); detail = (j.detail !== undefined) ? j.detail : text; } catch (_) {}
+        // A 400 whose detail carries a `command` means this API
+        // can't launch on the chosen host itself — offer the command for
+        // copying instead of treating it as a hard failure.
+        if (r.status === 400 && detail && typeof detail === 'object' && detail.command) {
+          this._showResumeCommand(detail.command, detail.error);
+          return;
+        }
+        const msg = (detail && typeof detail === 'object') ? (detail.error || JSON.stringify(detail)) : detail;
         throw new Error(`HTTP ${r.status}: ${msg}`);
       }
       const result = await r.json();
@@ -448,11 +686,11 @@ export class SessionPanel {
     backdrop.innerHTML = `
       <div class="modal" role="dialog" aria-labelledby="kill-title">
         <h2 id="kill-title">Kill agent session?</h2>
-        <div class="target">${escapeHtml(session.label || session.session_id)}</div>
+        <div class="target">${escapeHtml(nodeLabel(session))}</div>
         ${descendants.length > 0 ? `
           <div class="descendants">
             Will also kill ${descendants.length} descendant${descendants.length === 1 ? '' : 's'}:
-            ${descendants.slice(0, 5).map(d => `<div>• ${escapeHtml(d.label || d.session_id)}</div>`).join('')}
+            ${descendants.slice(0, 5).map(d => `<div>• ${escapeHtml(nodeLabel(d))}</div>`).join('')}
             ${descendants.length > 5 ? `<div>…and ${descendants.length - 5} more</div>` : ''}
           </div>
         ` : ''}
@@ -504,7 +742,16 @@ export class SessionPanel {
     const root = this.container;
     const labelEl = root.querySelector('[data-field="label"]');
     if (!labelEl || labelEl.querySelector('#label-edit-input')) return;
-    const current = s.custom_label || s.label || '';
+    // A raw-id `custom_label` never happens (the operator didn't type it),
+    // but `label` falls back to the raw session/task id whenever there's no
+    // real title — prefilling that here would let a blur-without-
+    // typing save the raw id as a permanent `custom_label`. Guard both the
+    // same way `nodeLabel` does, rather than reusing `nodeLabel` itself:
+    // its further fallbacks (prompt preview, routing name) are display-only
+    // text, not something a save-on-blur should ever persist as the name.
+    const realCustom = isRawIdValue(s, s.custom_label) ? '' : (s.custom_label || '');
+    const realLabel = isRawIdValue(s, s.label) ? '' : (s.label || '');
+    const current = realCustom || realLabel;
     const input = document.createElement('input');
     input.id = 'label-edit-input';
     input.type = 'text';
@@ -524,7 +771,7 @@ export class SessionPanel {
       if (done) return;
       done = true;
       if (save) this._saveLabelEdit(s, input.value);
-      else labelEl.textContent = s.custom_label || s.label || s.session_id;
+      else labelEl.textContent = nodeLabel(s);
     };
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); finish(true); }
@@ -536,7 +783,7 @@ export class SessionPanel {
   async _saveLabelEdit(s, rawValue) {
     const root = this.container;
     const labelEl = root.querySelector('[data-field="label"]');
-    const fallback = () => { if (labelEl) labelEl.textContent = s.custom_label || s.label || s.session_id; };
+    const fallback = () => { if (labelEl) labelEl.textContent = nodeLabel(s); };
     try {
       const r = await fetch(`/api/agents/sessions/${encodeURIComponent(s.session_id)}/label`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -546,7 +793,7 @@ export class SessionPanel {
       const data = await r.json();
       const custom = data.custom_label || null;
       s.custom_label = custom;
-      if (labelEl) labelEl.textContent = custom || s.label || s.session_id;
+      if (labelEl) labelEl.textContent = nodeLabel(s);
       this.onLabelSaved(s.session_id, custom);
     } catch (err) {
       console.warn('label save failed', err);

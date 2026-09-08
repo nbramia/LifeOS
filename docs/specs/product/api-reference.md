@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-04
+**Last Updated:** 2026-09-08
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Four adjacent catalogs split out for size:
 
@@ -387,6 +387,21 @@ Update a task (description, status, context, priority, due_date, tags,
 notes, fields). `fields` merges into the task's operator/unknown fields — a
 string value sets a field, a `null` value removes it.
 
+A patch that includes a `tags` key is checked regardless of whether
+`fields.assigned_by` is `"board"`: adding any of the worker's lifecycle
+tags (`agent-running`, `agent-blocked`, `agent-completed`, `accepted`)
+returns **409** no matter the card's current claim state, and a patch that
+changes the normalized assignee-tag set or the claim-tag set on an
+already-claimed card returns **409** with the same claimed-card reason the
+board's lane endpoint uses. When `fields.assigned_by` is `"board"` (the
+marker the `/agents` board's own pickers stamp on every write) and the
+patch changes `model`, `effort`, or `host` in `fields`, or carries a raw
+`status` key, this endpoint enforces the claimed-card rule on that
+field-edit path too — **409** on a card the worker has claimed, with no
+write. Requests that carry neither a `tags` key nor the board marker are
+unaffected. See [Agent Viz —
+Product](agent-viz.md#human-moves-on-agent-owned-cards).
+
 ### PUT /api/tasks/{id}/complete
 
 Mark a task as done (adds done date automatically).
@@ -447,7 +462,9 @@ and the SSE update cadence.
 
 Full board view model, always built fresh (never cached): `{lanes:
 {unassigned, assigned, in_progress, human_queue, scheduled, review, done},
-generated_at}`. `kind` (`"task"` | `"schedule"`) is the first field of every
+generated_at, api_host}`. `api_host` names the machine running the API, so
+a client can tell a card's assigned host (`fields.host`) apart from "this
+machine". `kind` (`"task"` | `"schedule"`) is the first field of every
 card and the only discriminator between the two shapes below — both kinds
 can land in the `done` lane. Each task card carries `kind: "task"`, `id,
 title, notes, status, tags, assignee, fields, context, updated_at, session
@@ -472,14 +489,21 @@ assignee tag; `lane: "assigned"` requires `assignee` (one of
 tag. `review` and `scheduled` can't be set directly (derived from a tag
 and the scheduler store, respectively) and return **400**.
 
-Three **409** cases, no write in any of them:
-- The card is worker-owned (`agent-running` or `agent-blocked` tag
-  present) and `lane` is `in_progress` or `done` — the worker owns this
+Four **409** cases, no write in any of them:
+- The card is worker-owned — `agent-running`/`agent-blocked` tag present,
+  or the card's status is `in_progress` with a live CLI session actually
+  linked to it (opened via the drawer's **Open** action on an Assigned
+  `#claude`/`#codex` card, before the worker itself ever adds
+  `agent-running`) — **every** `lane` is refused; the worker owns this
   card while it's running or waiting on an answer; answer the question or
   kill the session first.
 - The card's assignee is an agent engine that hasn't been claimed by the
   worker yet and `lane` is `in_progress` — only the agent worker claims
   agent-assigned tasks.
+- The card's assignee is an agent engine that hasn't been claimed by the
+  worker yet (and isn't a pending review) and `lane` is `human_queue` or
+  `done` — agent-owned cards are managed by the agent; reassign, unassign,
+  or cancel (see below) instead of dragging it there.
 - The card is a pending review (`agent-completed` tag without `accepted`)
   and `lane` is `in_progress` or `human_queue` — accept or reject the
   review first. `lane: "done"` on a pending review still succeeds and acts
@@ -491,11 +515,39 @@ the requested lane if a higher-priority signal still applies — e.g. a
 Human-queue card assigned to someone stays in Human queue. The web board
 toasts when this happens.
 
+Every task card in `GET /api/agents/board`'s response also carries a
+server-computed `policy` block (`{claimed, agent_owned, cancel, assignee,
+fields, lanes}`, each of `cancel`/`assignee`/`fields`/`lanes.<lane>` an
+`{allowed, reason}` pair) derived from the exact same rules this endpoint
+enforces — see [Agent Viz — Technical](../technical/agent-viz.md) for the
+shape. The board and drawer read this instead of re-implementing the
+rules, so they can't disagree with what a write actually does.
+
 ### POST /api/agents/board/cards/{id}/accept
 
 Move a Review card to Done by adding the `accepted` tag. Idempotent.
 Returns **409** if the card isn't in the Review lane and isn't already
 accepted.
+
+### POST /api/agents/board/cards/{id}/cancel
+
+Cancel an agent-assigned card — available whether or not the worker has
+claimed it, unlike a lane drag. A card counts as agent-assigned if its
+assignee tag names an agent engine (`#claude`/`#codex`/`#hermes`/`#local`)
+OR it already carries `agent-running`/`agent-blocked` even with no
+assignee tag at all — the shape a claimed bare `#agent` queue card is left
+in. If a live session is linked, kills it and every descendant in its
+subtree (the same teardown `POST /sessions/{id}/kill` performs), then
+marks the task `cancelled`, which derives to the Done lane (behind
+"include cancelled"). Idempotent: calling this on an already-`cancelled`
+card returns the current state and touches no session. Returns **409**
+`"accept or reject the review"` for a pending review, **409** `"cancel is
+only available for agent-assigned cards"` for a card that is neither
+engine-assigned nor claimed (`#me` or unassigned), and **409**
+`"this card is already finished — nothing to cancel"` for a
+card whose status is already `done` (e.g. accepted). Response: `{id, lane,
+status, tags, killed: [session_id, ...], failures: [{session_id, reason},
+...]}`.
 
 ### GET /api/agents/pending-questions
 
@@ -531,9 +583,13 @@ List all schedules.
 
 Get a specific schedule.
 
+### GET /api/scheduler/bots
+
+List the Telegram bot names a schedule's `bot` field may use: `primary` plus every configured registry bot (an entry in `config/telegram_bots.json` counts only once its `token_env` is set), as `{"bots": [...]}`. Exactly the names `POST`/`PUT` accept. Backs the board drawer's bot picker.
+
 ### PUT /api/scheduler/{id}
 
-Update a schedule. An unrecognised `bot` returns **422** and leaves the schedule unchanged.
+Update a schedule. Only the fields present in the request body are changed, and nothing is written if any check fails. An unrecognised `bot` returns **422** with the accepted names. `schedule_type` (must be `once` or `cron`) and `action` (must be one of `notify`/`prompt`/`endpoint`/`agent`) return **400**, matching `POST /api/scheduler`. `timezone` (must resolve as an IANA zone) and `schedule_value` (must parse as a cron expression for a `cron` schedule, or an ISO datetime for a `once` schedule — using `schedule_type` from the request if given, otherwise the entry's stored type) return **422** with a detail naming what's wrong. A request that sends `schedule_type` **without** `schedule_value` is validated against the entry's stored value under the new type, and returns the same **422** when that value doesn't parse — converting a schedule means sending both fields in one request.
 
 ### DELETE /api/scheduler/{id}
 
@@ -541,7 +597,7 @@ Delete a schedule.
 
 ### POST /api/scheduler/{id}/trigger
 
-Manually fire a schedule (for testing).
+Manually fire a schedule immediately. For a `once` schedule this consumes it: the fire disables it and clears its next-fire time, exactly as an unattended fire would.
 
 ### POST /api/scheduler/send
 
@@ -713,9 +769,15 @@ Get usage summary with stats for 24h, 7d, 30d, and all-time. Includes daily cost
 
 Card kill/resume/focus/registration endpoints are documented in [agent-viz.md § Endpoints](../technical/agent-viz.md#endpoints) alongside the rest of the `/agents` operator-control surface, per item 6 of this file's Table of Contents. These two are new to this issue and don't fit that page's visualization framing, so they're listed here instead — full mechanism in [agent-worker.md § Card assignment](../technical/agent-worker.md#card-assignment-851).
 
+`POST /sessions/{id}/resume` and `/focus` also accept an optional `target_host` in the body — "resume here". Full contract in [agent-viz.md § Resume target host](../technical/agent-viz.md#resume-target-host).
+
 ### GET /api/agents/models
 
 Per-engine model catalog for the board's assignment pickers: `{engines: {claude: [...], codex: [...], local: [...], hermes: [...]}, refreshed_at, stale}`, each entry `{id, label, pricing}`. Cached for `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` (default 24h); `stale: true` means the last successful refresh, not this one, is being served.
+
+### GET /api/agents/hosts
+
+Host registry for the board's host picker: `{hosts: [{name, ssh_target, online, is_api_host}], refreshed_at}`. The list is always the API host itself (`is_api_host: true`, `online: true`) plus every entry in `LIFEOS_AGENT_HOSTS`, deduplicated by name. `online` is `true`/`false` when a `tailscale status --json` probe ran successfully and matched the host to a peer, `null` when the signal is inconclusive — `tailscale` isn't installed, the probe failed/timed out, it ran fine but simply found no matching peer (a host can still be reachable over plain LAN ssh), or the catalog build itself failed for any other reason (every registry host still listed, just without a fresh probe). The route enforces a real ~1.8s ceiling on top of the probe's own bound, falling back to that same registry-preserving degraded response — never the bare API host alone, unless the degraded build itself fails — on a timeout or any other failure. Cached server-side for 30 seconds. The board client re-fetches when a drawer is opened more than ~30s after the last fetch, rather than once per page load or on a fixed cadence; a drawer left open never refetches on its own. After two consecutive client-side fetch failures, the client stops retrying for 10 seconds rather than issuing one request per drawer open against a dead endpoint. See [agent-worker.md § Host catalog](../technical/agent-worker.md#host-catalog) for the probe/matching/degrade mechanism.
 
 ### POST /api/agents/board/cards/{id}/open
 

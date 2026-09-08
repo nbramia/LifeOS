@@ -12,18 +12,29 @@ import {
   TERMINAL, routingLabel, sourceLabelFor, escapeHtml, showToast, SessionPanel,
 } from './panel.js';
 import { renderAssignmentPickers } from './assignment.js';
-
-const LANES = [
-  { id: 'unassigned',  label: 'Unassigned' },
-  { id: 'assigned',    label: 'Assigned' },
-  { id: 'in_progress', label: 'In progress' },
-  { id: 'human_queue', label: 'Human queue' },
-  { id: 'scheduled',   label: 'Scheduled' },
-  { id: 'review',      label: 'Review' },
-  { id: 'done',        label: 'Done' },
-];
+import { LANES, laneColor } from './lanes.js';
 
 const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local'];
+// plan_lane_move (api/services/agent_board.py) 409s a lane=in_progress move
+// whose assignee is one of these — "only the worker claims agent-assigned
+// tasks" — so the composer must not let one through.
+const AGENT_ASSIGNEES = ASSIGNEES.filter(a => a !== 'me');
+
+// Tags the worker itself writes as it drives a task through its lifecycle
+// (agent_board.py's RUNNING_TAG/BLOCKED_TAG/COMPLETED_TAG, worker.py's
+// FAILED_TAG/BUDGET_EXCEEDED_TAG, and the accept endpoint's ACCEPTED_TAG)
+// — the drawer's free-text Tags field must never show these as editable
+// tokens, never let them be typed in (mirrors the ASSIGNEES rejection
+// immediately below), and always preserve whatever the card already has
+// on every save, the same way the field never lets a human type an
+// assignee name into it. An explicit set, not a prefix match on `agent-`
+// or the bare `agent` tag — `agent` is the worker's queue marker (an
+// operator-editable label, not a claim), and an operator label that
+// happens to start with `agent-` must stay editable too.
+const LIFECYCLE_TAGS = new Set([
+  'agent-running', 'agent-blocked', 'agent-completed',
+  'agent-failed', 'agent-budget-exceeded', 'accepted',
+]);
 
 // Card fields the drawer renders as editable inputs — used to decide
 // whether an SSE tick needs to rebuild the drawer at all (#850 finding 2).
@@ -31,12 +42,70 @@ const DRAWER_EDITABLE_FIELDS = [
   'title', 'notes', 'tags', 'context', 'assignee', 'lane',
   // Scheduled-card fields, editable in the drawer since #850 finding 4.
   'name', 'message_content', 'enabled',
+  // Full schedule editing — trigger type, timing, timezone, action,
+  // executor, and delivery bot — all through PUT /api/scheduler/{id}.
+  'schedule_type', 'schedule_value', 'timezone', 'action', 'executor', 'bot',
 ];
+
+// Action a schedule fires when it's due. Mirrors VALID_ACTIONS in
+// api/services/scheduler_store.py.
+const SCHEDULE_ACTIONS = ['notify', 'prompt', 'endpoint', 'agent'];
+// Executor tags a schedule's `agent` action hands off to the agent worker
+// with. Mirrors the executor values accepted by api/routes/scheduler.py.
+const SCHEDULE_EXECUTORS = ['local', 'cloud', 'cloud-haiku', 'cloud-sonnet'];
+
+// Lane filter — multi-select checkbox dropdown. Hidden lanes are
+// removed from the grid entirely (not just emptied), so the remaining
+// .board-lane columns (flex: 1 1 260px, see web/agents.html CSS) widen to
+// fill the space.
+const LANE_FILTER_STORAGE_KEY = 'lifeos.agents.board.lanes';
+const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done').map(l => l.id);
+// plan_lane_move (api/services/agent_board.py) rejects `review` and
+// `scheduled` with "cannot be set directly" — no per-lane "+" button for
+// either, and both are excluded from the new-card composer's lane select.
+const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled').map(l => l.id));
+
+function loadLaneSelection() {
+  try {
+    const raw = localStorage.getItem(LANE_FILTER_STORAGE_KEY);
+    if (!raw) return new Set(DEFAULT_VISIBLE_LANE_IDS);
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set(DEFAULT_VISIBLE_LANE_IDS);
+    // A deliberately emptied selection ([]) is a valid, intentional state —
+    // AC 2 says the selection is restored from storage, and the empty-state
+    // hint already covers the UI for it — so it must round-trip as empty,
+    // not be treated as malformed.
+    if (parsed.length === 0) return new Set();
+    const validIds = new Set(LANES.map(l => l.id));
+    // Tolerate an id naming a lane that isn't in the current LANES list — drop it, but
+    // keep whatever's still valid. Only fall back to the default when
+    // nothing valid survives (a malformed store, or a stored selection that
+    // was every lane the operator once had but none exist anymore) — never
+    // render zero lanes from a bad stored value that wasn't actually an
+    // intentional empty selection.
+    const filtered = parsed.filter(id => validIds.has(id));
+    if (filtered.length === 0) return new Set(DEFAULT_VISIBLE_LANE_IDS);
+    return new Set(filtered);
+  } catch (_) {
+    return new Set(DEFAULT_VISIBLE_LANE_IDS);
+  }
+}
+
+function saveLaneSelection(ids) {
+  try {
+    localStorage.setItem(LANE_FILTER_STORAGE_KEY, JSON.stringify([...ids]));
+  } catch (_) {}
+}
 
 export function initBoard() {
   const lanesEl = document.getElementById('board-lanes');
   const searchEl = document.getElementById('board-search');
-  const laneFilterEl = document.getElementById('board-filter-lane');
+  const laneFilterDropdown = document.getElementById('board-lane-filter-dropdown');
+  const laneFilterBtn = document.getElementById('board-lane-filter-btn');
+  const laneFilterOptions = document.getElementById('board-lane-filter-options');
+  const laneFilterLabel = document.getElementById('board-lane-filter-label');
+  const laneFilterAllBtn = document.getElementById('board-lane-filter-all');
+  const laneFilterClearBtn = document.getElementById('board-lane-filter-clear');
   const assigneeFilterEl = document.getElementById('board-filter-assignee');
   const hostFilterEl = document.getElementById('board-filter-host');
   const tagFilterEl = document.getElementById('board-filter-tag');
@@ -49,6 +118,7 @@ export function initBoard() {
   const drawerEl = document.getElementById('board-drawer');
 
   let board = { lanes: Object.fromEntries(LANES.map(l => [l.id, []])) };
+  let visibleLanes = loadLaneSelection();
   let openCardId = null;
   let openCardLane = null;
   let openCardSnapshot = null;  // last card object the drawer was fully rendered from
@@ -149,8 +219,12 @@ export function initBoard() {
   let _lastHostKey = '';
   let _lastContextKey = '';
   function updateFilterOptions() {
+    // Unions the assignment (fields.host — where a card WILL run) with the
+    // observation (session.host — where a session DID run), so a host a
+    // card is assigned to but hasn't run a session on yet still appears in
+    // the option list.
     const hosts = [...new Set(
-      allCards().map(c => c.session && c.session.host).filter(Boolean)
+      allCards().flatMap(c => [c.session && c.session.host, c.fields && c.fields.host]).filter(Boolean)
     )].sort();
     const hostKey = hosts.join('|');
     if (hostFilterEl && hostKey !== _lastHostKey) {
@@ -183,9 +257,6 @@ export function initBoard() {
       if (!haystack.toLowerCase().includes(search)) return false;
     }
 
-    const laneSel = laneFilterEl?.value || 'all';
-    if (laneSel !== 'all' && card.lane !== laneSel) return false;
-
     const assigneeSel = assigneeFilterEl?.value || 'all';
     if (assigneeSel !== 'all') {
       if (card.kind !== 'task') return false;
@@ -198,8 +269,12 @@ export function initBoard() {
 
     const hostSel = hostFilterEl?.value || 'all';
     if (hostSel !== 'all') {
-      const host = card.session && card.session.host;
-      if (host !== hostSel) return false;
+      // Matches on either the assignment or the observation — a
+      // card matches a selected host when its fields.host names it OR its
+      // linked session ran on it.
+      const sessionHost = card.session && card.session.host;
+      const assignedHost = card.fields && card.fields.host;
+      if (sessionHost !== hostSel && assignedHost !== hostSel) return false;
     }
 
     const tagQuery = (tagFilterEl?.value || '').trim().toLowerCase().replace(/^#/, '');
@@ -240,7 +315,29 @@ export function initBoard() {
     if (card.assignee) chips.push(`<span class="board-chip board-chip-assignee">${escapeHtml(card.assignee)}</span>`);
     if (card.fields && card.fields.model) chips.push(`<span class="board-chip">${escapeHtml(card.fields.model)}</span>`);
     if (card.fields && card.fields.effort) chips.push(`<span class="board-chip">${escapeHtml(card.fields.effort)}</span>`);
-    if (card.session && card.session.host) chips.push(`<span class="board-chip board-chip-host">${escapeHtml(card.session.host)}</span>`);
+    // Assignment chip: fields.host is where the card WILL run,
+    // written by the drawer's host dropdown. Rendered only when it names a
+    // machine other than the API host — a card assigned to "this machine"
+    // shows no assignment chip, matching the drawer's own "this machine"
+    // empty-choice semantics. If board.api_host is missing (older/broken
+    // payload), every non-empty fields.host is treated as "other" — fail
+    // visible rather than silently hiding the assignment.
+    const assignedHost = card.fields && card.fields.host;
+    let assignedChipRendered = false;
+    if (assignedHost && assignedHost !== board.api_host) {
+      chips.push(`<span class="board-chip board-chip-assigned-host" title="assigned host">${escapeHtml(assignedHost)}</span>`);
+      assignedChipRendered = true;
+    }
+    // Observation chip: session.host is where a linked session DID run —
+    // distinct from the assignment above (both render, distinguishably,
+    // when they differ). Suppressed when it would repeat the assignment
+    // chip actually rendered above (the steady state once a worker
+    // dispatches to fields.host: the session it creates records that same
+    // host, so showing both would print the identical hostname twice on a
+    // narrow lane).
+    if (card.session && card.session.host && !(assignedChipRendered && card.session.host === assignedHost)) {
+      chips.push(`<span class="board-chip board-chip-host" title="ran on">${escapeHtml(card.session.host)}</span>`);
+    }
     for (const t of (card.tags || [])) {
       if (ASSIGNEES.includes(t.toLowerCase())) continue;  // already shown as the assignee chip
       chips.push(`<span class="board-chip board-chip-tag">#${escapeHtml(t)}</span>`);
@@ -299,7 +396,15 @@ export function initBoard() {
     // that same card id (#850 verify-1 finding 3).
     suppressNextClick = null;
     lanesEl.innerHTML = '';
+    if (visibleLanes.size === 0) {
+      const hint = document.createElement('div');
+      hint.className = 'board-lanes-empty-hint';
+      hint.textContent = 'No lanes selected — use the Lanes filter above to show columns.';
+      lanesEl.appendChild(hint);
+      return;
+    }
     for (const lane of LANES) {
+      if (!visibleLanes.has(lane.id)) continue;
       const column = document.createElement('div');
       column.className = 'board-lane';
       column.dataset.lane = lane.id;
@@ -308,7 +413,12 @@ export function initBoard() {
         .map(c => ({ ...c, lane: lane.id }))
         .filter(cardMatchesFilters);
 
-      column.innerHTML = `<div class="board-lane-header">${escapeHtml(lane.label)} <span class="board-lane-count">${cards.length}</span></div>`;
+      column.innerHTML = `
+        <div class="board-lane-header" style="border-top-color:${laneColor(lane.id)}">${escapeHtml(lane.label)} <span class="board-lane-count">${cards.length}</span></div>
+        ${DIRECT_LANE_IDS.has(lane.id) ? `<button type="button" class="board-lane-add" data-lane="${lane.id}" title="New card in ${escapeHtml(lane.label)}">+</button>` : ''}
+      `;
+      const addBtn = column.querySelector('.board-lane-add');
+      if (addBtn) addBtn.addEventListener('click', () => openNewCardForm(lane.id));
       const cardsEl = document.createElement('div');
       cardsEl.className = 'board-lane-cards';
       for (const card of cards) {
@@ -388,6 +498,32 @@ export function initBoard() {
   function onCardDropped(cardId, targetLane) {
     const card = findCard(cardId);
     if (!card || card.kind !== 'task') return;
+    // Review and Scheduled are never a direct drag target —
+    // plan_lane_move 400s both with "cannot be set directly" for EVERY
+    // card, regardless of state, so refusing them here — matching the
+    // existing DIRECT_LANE_IDS gating on the composer/lane-add button —
+    // means dropping on either never round-trips to the server just to
+    // 400.
+    if (!DIRECT_LANE_IDS.has(targetLane)) {
+      showToast(`Can't move card to ${laneLabel(targetLane)}.`, true);
+      render();
+      return;
+    }
+    // The server is still the authority — this is a fast path that skips
+    // the round trip when the board already knows the move is refused,
+    // matching `card.policy` exactly (see _card_policy in
+    // api/routes/agents.py). A stale board (the policy hasn't caught up
+    // with an out-of-band change) still gets caught by moveCard's own
+    // server-error toast path below.
+    const laneEntry = card.policy && card.policy.lanes && card.policy.lanes[targetLane];
+    if (laneEntry && laneEntry.allowed === false) {
+      showToast(laneEntry.reason || `Can't move card to ${laneLabel(targetLane)}.`, true);
+      // Matches moveCard's own failure path: clears any stray drag-over
+      // class and resets `suppressNextClick` so the operator's next click
+      // on this card still opens the drawer.
+      render();
+      return;
+    }
     let assignee;
     if (targetLane === 'assigned') {
       // No mid-drag assignee picker with plain HTML5 DnD — default to "me"
@@ -432,7 +568,12 @@ export function initBoard() {
         if (data && data.lane && data.lane !== targetLane) {
           showToast(`Card landed in ${laneLabel(data.lane)}, not ${laneLabel(targetLane)}.`, false);
         }
-        return fetchBoard();
+        // Callers that need to know where the card actually ended up (e.g.
+        // the composer revealing the right lane) read
+        // it off the resolved value; fetchBoard()'s own resolution (undefined)
+        // is irrelevant to them, so hand back `data` once the board refresh
+        // settles.
+        return fetchBoard().then(() => data);
       })
       .catch(err => {
         showToast(`Couldn't move card: ${err.message}`, true);
@@ -451,7 +592,11 @@ export function initBoard() {
   // New-card composer
   // ------------------------------------------------------------------
 
-  function openNewCardForm() {
+  // `targetLane` preselects the composer's own Lane select (still
+  // changeable by the operator) — omitted (defaults to unassigned) for the
+  // top-bar "+ New card" button, which never moves the card after creation.
+  function openNewCardForm(targetLane) {
+    const initialLane = DIRECT_LANE_IDS.has(targetLane) ? targetLane : 'unassigned';
     const backdrop = document.createElement('div');
     backdrop.className = 'modal-backdrop';
     backdrop.innerHTML = `
@@ -461,6 +606,10 @@ export function initBoard() {
         <input id="new-card-desc" type="text" style="width:100%;box-sizing:border-box;margin:0.35rem 0;padding:0.4rem;background:var(--bg-elev);color:var(--text-primary);border:1px solid var(--border);border-radius:6px" />
         <label style="font-size:0.75rem;color:var(--text-secondary)">Notes (optional)</label>
         <textarea id="new-card-notes" placeholder="Notes…"></textarea>
+        <label style="font-size:0.75rem;color:var(--text-secondary)">Lane</label>
+        <select id="new-card-lane" style="width:100%;margin:0.35rem 0;padding:0.4rem;background:var(--bg-elev);color:var(--text-primary);border:1px solid var(--border);border-radius:6px">
+          ${LANES.filter(l => DIRECT_LANE_IDS.has(l.id)).map(l => `<option value="${l.id}" ${l.id === initialLane ? 'selected' : ''}>${escapeHtml(l.label)}</option>`).join('')}
+        </select>
         <label style="font-size:0.75rem;color:var(--text-secondary)">Assignee</label>
         <select id="new-card-assignee" style="width:100%;margin:0.35rem 0;padding:0.4rem;background:var(--bg-elev);color:var(--text-primary);border:1px solid var(--border);border-radius:6px">
           <option value="">unassigned</option>
@@ -476,11 +625,51 @@ export function initBoard() {
     const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
     backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
     backdrop.querySelector('#new-card-cancel').onclick = cleanup;
+
+    const laneSelectEl = backdrop.querySelector('#new-card-lane');
+    const assigneeSelectEl = backdrop.querySelector('#new-card-assignee');
+    // Picking an assignee while Lane still reads Unassigned would otherwise
+    // silently file the card in Assigned anyway (derive_lane files any task
+    // carrying an assignee tag there) with the Lane control still
+    // contradicting that outcome — flip it to what will actually happen
+    // instead of leaving it to lie.
+    assigneeSelectEl.addEventListener('change', () => {
+      if (assigneeSelectEl.value && laneSelectEl.value === 'unassigned') {
+        laneSelectEl.value = 'assigned';
+      } else if (!assigneeSelectEl.value && laneSelectEl.value === 'assigned') {
+        // The reverse of the flip above — clearing the assignee back to
+        // blank must not leave Lane stuck on Assigned, or Create then fails
+        // on "Pick an assignee for the Assigned lane." against a select the
+        // operator never touched.
+        laneSelectEl.value = 'unassigned';
+      }
+    });
+
     backdrop.querySelector('#new-card-create').onclick = async () => {
       const desc = backdrop.querySelector('#new-card-desc').value.trim();
       if (!desc) return;
       const notes = backdrop.querySelector('#new-card-notes').value.trim();
-      const assignee = backdrop.querySelector('#new-card-assignee').value;
+      const lane = laneSelectEl.value;
+      const assignee = assigneeSelectEl.value;
+      // The assignee-select's own `change` listener (above) only flips Lane
+      // when the operator picks an assignee — it never re-fires if they then
+      // edit Lane back to Unassigned by hand, leaving it lying about where
+      // the card will actually go: derive_lane (api/services/agent_board.py)
+      // files any task carrying an assignee tag under Assigned regardless of
+      // what Lane says. Recompute here so both the guard checks below and
+      // the lane PUT match reality.
+      const effectiveLane = (lane === 'unassigned' && assignee) ? 'assigned' : lane;
+      if (effectiveLane === 'assigned' && !assignee) {
+        showToast('Pick an assignee for the Assigned lane.', true);
+        return;
+      }
+      // plan_lane_move 409s In progress for any AGENT_ASSIGNEES tag ("only
+      // the worker claims agent-assigned tasks") — reject client-side
+      // before creating anything, mirroring the Assigned guard above.
+      if (effectiveLane === 'in_progress' && assignee && AGENT_ASSIGNEES.includes(assignee)) {
+        showToast('Only "me" can be assigned directly to In progress — the worker claims agent-assigned tasks itself.', true);
+        return;
+      }
       const btn = backdrop.querySelector('#new-card-create');
       btn.disabled = true;
       btn.textContent = 'Creating…';
@@ -498,8 +687,54 @@ export function initBoard() {
           const text = await r.text();
           throw new Error(text);
         }
+        // A 200 with a non-JSON body must not throw here — the task was
+        // already created; falling into the outer catch left the composer
+        // open with Create re-enabled, and a second click created a
+        // duplicate. The `created && created.id` guard
+        // below already handles a null result cleanly.
+        const created = await r.json().catch(() => null);
+        // Where the card is actually filed before any lane PUT runs:
+        // derive_lane keys off the assignee tag the create call sent, never
+        // off the composer's own Lane select — a fresh card with no
+        // assignee tag lands Unassigned, one with an assignee tag lands
+        // Assigned. Updated below with whatever a successful moveCard PUT
+        // reports it actually landed in.
+        let landedLane = assignee ? 'assigned' : 'unassigned';
+        if (effectiveLane !== 'unassigned' && created && created.id) {
+          try {
+            const moved = await moveCard(created.id, effectiveLane, assignee || undefined);
+            // moveCard's own success path already re-fetches the board —
+            // avoid a second GET /api/agents/board round-trip here.
+            if (moved && moved.lane) landedLane = moved.lane;
+          } catch (_) {
+            // moveCard already toasted the failure and never re-fetches on
+            // its own failure path — do it here so the board reflects the
+            // card that DID get created (just not moved). Nothing beyond the
+            // create call landed, so landedLane keeps the pre-move value
+            // above rather than the lane the PUT failed to reach.
+            await fetchBoard();
+          }
+        } else {
+          // A non-Unassigned lane was requested but there's no id to move
+          // with — a 200 whose body didn't parse to an object with one.
+          // Without the toast below, the operator would see nothing at
+          // all: the task IS created, just not where they asked, with
+          // zero indication of that otherwise.
+          if (effectiveLane !== 'unassigned' && !(created && created.id)) {
+            showToast(`Card created, but couldn't confirm its id to move it to ${laneLabel(effectiveLane)} — check ${laneLabel(landedLane)}.`, true);
+          }
+          await fetchBoard();
+        }
+        // A card that landed in a lane the filter is currently hiding would
+        // otherwise have zero on-screen feedback — reveal that lane so it's
+        // actually visible. landedLane is always the lane the card actually
+        // reached, never the one requested: a failed move leaves it at the
+        // tag-derived resting lane set above, and a card whose id we never
+        // learned only ever reached that same tag-derived lane. So
+        // revealing landedLane can never surface a lane the card isn't
+        // actually in — no separate failure gate is needed.
+        ensureLaneVisible(landedLane);
         cleanup();
-        fetchBoard();
       } catch (err) {
         showToast(`Couldn't create card: ${err.message}`, true);
         btn.disabled = false;
@@ -508,7 +743,7 @@ export function initBoard() {
     };
   }
 
-  if (newCardBtn) newCardBtn.addEventListener('click', openNewCardForm);
+  if (newCardBtn) newCardBtn.addEventListener('click', () => openNewCardForm());
 
   // ------------------------------------------------------------------
   // Drawer
@@ -532,6 +767,46 @@ export function initBoard() {
     if (drawerBackdrop) drawerBackdrop.hidden = false;
     renderDrawer(card);
   }
+
+  // Click-outside-close. The drawer sits INSIDE the full-screen
+  // fixed backdrop (`justify-content: flex-end` puts it at the right
+  // edge), so a click anywhere on the board background/lane/card actually
+  // lands on the backdrop element itself — closing when the click's target
+  // IS the backdrop covers all of those in one listener, and a click
+  // inside .board-drawer (whose target is never the backdrop) never
+  // matches. Guarded against a mousedown/mouseup pair that starts on one
+  // side of the backdrop boundary and ends on the other — a scrollbar-drag
+  // (mousedown inside the drawer, mouseup on the backdrop) or a text
+  // selection dragged inward (mousedown on the backdrop, mouseup inside the
+  // drawer) both still fire a `click` on the backdrop (the nearest common
+  // ancestor of the two targets) — so only close when the mousedown, the
+  // mouseup, AND the click all targeted the backdrop itself.
+  let drawerBackdropMouseDownOnSelf = false;
+  let drawerBackdropMouseUpOnSelf = false;
+  if (drawerBackdrop) {
+    drawerBackdrop.addEventListener('mousedown', (e) => {
+      drawerBackdropMouseDownOnSelf = (e.target === drawerBackdrop);
+    });
+    drawerBackdrop.addEventListener('mouseup', (e) => {
+      drawerBackdropMouseUpOnSelf = (e.target === drawerBackdrop);
+    });
+    drawerBackdrop.addEventListener('click', (e) => {
+      if (e.target === drawerBackdrop && drawerBackdropMouseDownOnSelf && drawerBackdropMouseUpOnSelf) closeDrawer();
+      drawerBackdropMouseDownOnSelf = false;
+      drawerBackdropMouseUpOnSelf = false;
+    });
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (!openCardId) return;
+    if (drawerBackdrop && drawerBackdrop.hidden) return;
+    // A modal (new-card composer, answer prompt) renders on top of the
+    // drawer (.modal-backdrop z-index 100 > .board-drawer-backdrop's 90) —
+    // let it own Escape instead of closing the drawer underneath it.
+    if (document.querySelector('.modal-backdrop')) return;
+    closeDrawer();
+  });
 
   async function putTask(taskId, patch) {
     const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
@@ -563,11 +838,75 @@ export function initBoard() {
     return r.json();
   }
 
+  // Bot-registry cache backing the schedule drawer's Bot select — mirrors
+  // assignment.js's loadHostCatalog in NOT caching a failure (so the next
+  // drawer open retries), but without its reachability TTL/cooldown: the
+  // bot registry doesn't drift minute to minute the way host online/offline
+  // status does, so a plain once-per-page-load cache on success is enough.
+  let _botsCatalogPromise = null;
+  function loadBotCatalog(fetchImpl = fetch) {
+    if (_botsCatalogPromise) return _botsCatalogPromise;
+    const promise = fetchImpl('/api/scheduler/bots')
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .catch(() => { _botsCatalogPromise = null; return null; });
+    _botsCatalogPromise = promise;
+    return promise;
+  }
+
+  function formatNextFire(iso) {
+    if (!iso) return 'Not scheduled to fire again.';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return 'Not scheduled to fire again.';
+    return `Next fire: ${d.toLocaleString()}`;
+  }
+
+  function formatLastRun(lastRun) {
+    if (!lastRun) return "Hasn't run yet.";
+    const at = lastRun.at ? new Date(lastRun.at).toLocaleString() : 'unknown time';
+    const outcome = lastRun.outcome || 'unknown';
+    const snippet = lastRun.snippet ? ` — ${lastRun.snippet}` : '';
+    return `Last run: ${at} — ${outcome}${snippet}`;
+  }
+
+  // Notes autosize — height tracks content up to 2/3 of the
+  // viewport height, after which `.drawer-notes-autosize`'s
+  // `overflow-y: auto` (web/agents.html) takes over scrolling. Scoped to
+  // the task notes textarea only — the schedule drawer's message-content
+  // textarea keeps its plain fixed/manual-resize box.
+  function autosizeNotesTextarea(el) {
+    if (!el) return;
+    el.style.height = 'auto';
+    // `* { box-sizing: border-box }` (web/agents.html) means the assigned
+    // `height` is a border-box total, but `scrollHeight` never counts the
+    // border — only content + padding. Without adding the border widths
+    // back, the box is assigned exactly `scrollHeight`, so its actual
+    // content+padding area ends up `scrollHeight` minus the border, 2px
+    // (1px top + 1px bottom) short of the content at every length past the
+    // minimum — clipping and forcing an early internal scroll.
+    const cs = getComputedStyle(el);
+    const borderY = parseFloat(cs.borderTopWidth || '0') + parseFloat(cs.borderBottomWidth || '0');
+    const maxHeight = window.innerHeight * (2 / 3);
+    el.style.height = Math.min(el.scrollHeight + borderY, maxHeight) + 'px';
+  }
+
   function renderDrawer(card) {
     if (!drawerEl) return;
     const isTask = card.kind === 'task';
-    const nonAssigneeTags = (card.tags || []).filter(t => !ASSIGNEES.includes(t.toLowerCase()));
+    // The Tags field never shows an assignee tag OR a worker lifecycle
+    // tag as an editable token — both are managed elsewhere (the
+    // Assignee select above, and the worker/accept endpoint respectively)
+    // and must survive a Tags-field save untouched.
+    const editableTags = (card.tags || []).filter(
+      t => !ASSIGNEES.includes(t.toLowerCase()) && !LIFECYCLE_TAGS.has(t.toLowerCase()),
+    );
     const titleValue = isTask ? (card.title || '') : (card.name || '');
+    // `card.policy` is the server's own decision — the drawer never
+    // re-derives these rules, it just disables-and-explains. A schedule
+    // card carries no `policy` at all: treat that as fully allowed rather
+    // than throwing, matching every other place this file reads
+    // `card.policy`.
+    const assigneePolicy = (card.policy && card.policy.assignee) || { allowed: true, reason: null };
+    const assigneeDisabled = assigneePolicy.allowed === false;
     drawerEl.innerHTML = `
       <div class="drawer-header">
         <button class="panel-close" data-action="drawer-close">×</button>
@@ -575,14 +914,15 @@ export function initBoard() {
       </div>
       ${isTask ? `
       <label class="drawer-label">Notes</label>
-      <textarea class="drawer-notes" data-field="notes" placeholder="Notes…">${escapeHtml(card.notes || '')}</textarea>
+      <textarea class="drawer-notes drawer-notes-autosize" data-field="notes" placeholder="Notes…">${escapeHtml(card.notes || '')}</textarea>
       <div class="drawer-row">
         <div>
           <label class="drawer-label">Assignee</label>
-          <select class="drawer-assignee" data-field="assignee">
+          <select class="drawer-assignee" data-field="assignee" ${assigneeDisabled ? 'disabled' : ''}>
             <option value="">unassigned</option>
             ${ASSIGNEES.map(a => `<option value="${a}" ${card.assignee === a ? 'selected' : ''}>${a}</option>`).join('')}
           </select>
+          ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="assignee-reason">${escapeHtml(assigneePolicy.reason || "This card's assignee can't be changed right now.")}</div>` : ''}
         </div>
         <div>
           <label class="drawer-label">Context</label>
@@ -590,7 +930,8 @@ export function initBoard() {
         </div>
       </div>
       <label class="drawer-label">Tags</label>
-      <input class="drawer-tags" data-field="tags" value="${escapeHtml(nonAssigneeTags.join(' '))}" placeholder="space-separated tags" />
+      <input class="drawer-tags" data-field="tags" value="${escapeHtml(editableTags.join(' '))}" placeholder="space-separated tags" ${assigneeDisabled ? 'disabled' : ''} />
+      ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="tags-reason">${escapeHtml(assigneePolicy.reason || "This card's tags can't be changed right now.")}</div>` : ''}
       <div class="drawer-assignment" data-field="assignment"></div>
       <div class="drawer-actions" data-field="actions"></div>
       <div class="drawer-session" data-field="session-panel"></div>
@@ -598,7 +939,50 @@ export function initBoard() {
       <label class="drawer-label">Message</label>
       <textarea class="drawer-notes" data-field="message-content" placeholder="Message…">${escapeHtml(card.message_content || '')}</textarea>
       <label class="drawer-label"><input type="checkbox" data-field="enabled" ${card.enabled ? 'checked' : ''} /> Enabled</label>
-      <div class="drawer-schedule-hint">Name, message, and enabled save here through the scheduler API — for schedule type, timing, or executor, use the existing scheduler UI.</div>
+      <div class="drawer-row">
+        <div>
+          <label class="drawer-label">Schedule type</label>
+          <select class="drawer-select" data-field="schedule-type">
+            <option value="cron" ${card.schedule_type === 'cron' ? 'selected' : ''}>cron</option>
+            <option value="once" ${card.schedule_type === 'once' ? 'selected' : ''}>once</option>
+          </select>
+        </div>
+        <div>
+          <label class="drawer-label" data-field="schedule-value-label">${card.schedule_type === 'once' ? 'When (ISO datetime)' : 'Cron expression'}</label>
+          <input class="drawer-schedule-value" data-field="schedule-value" value="${escapeHtml(card.schedule_value || '')}" placeholder="${card.schedule_type === 'once' ? '2026-06-03T15:05:00' : '0 9 * * *'}" />
+          <div class="drawer-field-error" data-field="schedule-value-error" hidden></div>
+        </div>
+      </div>
+      <label class="drawer-label">Timezone</label>
+      <input class="drawer-timezone" data-field="timezone" value="${escapeHtml(card.timezone || '')}" placeholder="e.g. America/New_York" />
+      <div class="drawer-field-error" data-field="timezone-error" hidden></div>
+      <div class="drawer-row">
+        <div>
+          <label class="drawer-label">Action</label>
+          <select class="drawer-select" data-field="action">
+            ${SCHEDULE_ACTIONS.map(a => `<option value="${a}" ${card.action === a ? 'selected' : ''}>${a}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <div data-row="executor" ${card.action === 'agent' ? '' : 'hidden'}>
+            <label class="drawer-label">Executor</label>
+            <select class="drawer-select" data-field="executor">
+              <option value="" ${!card.executor ? 'selected' : ''}>default route</option>
+              ${SCHEDULE_EXECUTORS.map(e => `<option value="${e}" ${card.executor === e ? 'selected' : ''}>${e}</option>`).join('')}
+            </select>
+          </div>
+          <div data-row="bot" ${card.action === 'agent' ? 'hidden' : ''}>
+            <label class="drawer-label">Bot</label>
+            <select class="drawer-select" data-field="bot" disabled></select>
+            <div class="drawer-field-reason" data-field="bot-reason" hidden></div>
+          </div>
+        </div>
+      </div>
+      <div class="drawer-schedule-info" data-field="next-fire-preview"></div>
+      <div class="drawer-schedule-info" data-field="last-run-info"></div>
+      <div class="drawer-actions" data-field="actions">
+        <button class="drawer-action" data-action="trigger-now">${card.schedule_type === 'once' ? 'Trigger now (disables this one-off)' : 'Trigger now'}</button>
+      </div>
       `}
     `;
     drawerEl.querySelector('[data-action="drawer-close"]').onclick = closeDrawer;
@@ -618,18 +1002,8 @@ export function initBoard() {
     });
 
     if (!isTask) {
-      const msgEl = drawerEl.querySelector('[data-field="message-content"]');
-      msgEl.addEventListener('blur', async () => {
-        const value = msgEl.value;
-        if (value === (card.message_content || '')) return;
-        try { await putSchedule(card.id, { message_content: value }); await fetchBoard(); }
-        catch (err) { showToast(`Couldn't save message: ${err.message}`, true); msgEl.value = card.message_content || ''; }
-      });
-      const enabledEl = drawerEl.querySelector('[data-field="enabled"]');
-      enabledEl.addEventListener('change', async () => {
-        try { await putSchedule(card.id, { enabled: enabledEl.checked }); await fetchBoard(); }
-        catch (err) { showToast(`Couldn't update enabled: ${err.message}`, true); enabledEl.checked = !!card.enabled; }
-      });
+      renderScheduleDrawerFields(card);
+      renderDrawerActions(card);
       return;
     }
 
@@ -640,6 +1014,8 @@ export function initBoard() {
       try { await putTask(card.id, { notes: value }); await fetchBoard(); }
       catch (err) { showToast(`Couldn't save notes: ${err.message}`, true); notesEl.value = card.notes || ''; }
     });
+    notesEl.addEventListener('input', () => autosizeNotesTextarea(notesEl));
+    autosizeNotesTextarea(notesEl);  // size to existing content on open/re-render
 
     const assigneeEl = drawerEl.querySelector('[data-field="assignee"]');
     assigneeEl.addEventListener('change', async () => {
@@ -679,23 +1055,37 @@ export function initBoard() {
       const tokens = tagsEl.value.split(/\s+/).map(t => t.replace(/^#/, '')).filter(Boolean);
       // Free text here writes straight to the task store — reject anything
       // that isn't a plain word/hyphen token (blocks a vault-comment
-      // injection like `<!--id:...-->` stealing another task's id) and drop
+      // injection like `<!--id:...-->` stealing another task's id), drop
       // any assignee-name token (the assignee comes from the select above,
-      // not this field) rather than letting it silently double up as a tag
-      // (#850 finding 8).
+      // not this field) rather than letting it silently double up as a tag,
+      // and reject a worker lifecycle tag the same way — typing
+      // `agent-running` into a `me` card's Tags field must not be able to
+      // grant it a claim tag the worker never gave it.
       const parsed = [];
       const rejected = [];
       for (const t of tokens) {
-        if (VALID_TAG.test(t) && !ASSIGNEES.includes(t.toLowerCase())) parsed.push(t);
+        const lower = t.toLowerCase();
+        if (VALID_TAG.test(t) && !ASSIGNEES.includes(lower) && !LIFECYCLE_TAGS.has(lower)) parsed.push(t);
         else rejected.push(t);
       }
       if (rejected.length) {
         showToast(`Ignored invalid tag${rejected.length > 1 ? 's' : ''}: ${rejected.join(', ')}`, true);
       }
       tagsEl.value = parsed.join(' ');
-      const assigneeTag = card.assignee ? [card.assignee] : [];
-      try { await putTask(card.id, { tags: [...assigneeTag, ...parsed] }); await fetchBoard(); }
-      catch (err) { showToast(`Couldn't save tags: ${err.message}`, true); tagsEl.value = nonAssigneeTags.join(' '); }
+      // Read the card's CURRENT assignee/lifecycle tags from the live board
+      // state, not the `card` this handler closed over at render time.
+      // `updateOpenDrawer` skips rebuilding the drawer while this field
+      // holds focus (see above), so a claim written by another process
+      // while the operator is mid-edit here never reaches the `card`
+      // variable at all — re-appending from a stale snapshot would save
+      // exactly the claim tag this box never showed and was never asked to
+      // remove. Falls back to the render-time `card` only if the card has
+      // since disappeared from the board entirely.
+      const current = findCard(card.id) || card;
+      const assigneeTag = current.assignee ? [current.assignee] : [];
+      const lifecycleTags = (current.tags || []).filter(t => LIFECYCLE_TAGS.has(t.toLowerCase()));
+      try { await putTask(card.id, { tags: [...assigneeTag, ...lifecycleTags, ...parsed] }); await fetchBoard(); }
+      catch (err) { showToast(`Couldn't save tags: ${err.message}`, true); tagsEl.value = editableTags.join(' '); }
     });
 
     // The drawer's own Assignee select above is the one assignee writer —
@@ -708,7 +1098,7 @@ export function initBoard() {
       renderAssignmentPickers(assignmentEl, card, {
         putTask,
         onSaved: () => fetchBoard(),
-        onError: (message) => showToast(`Couldn't save assignment: ${message}`, true),
+        onError: (message) => { if (message) showToast(`Couldn't save assignment: ${message}`, true); },
       });
       const engineRow = assignmentEl.querySelector('[data-row="engine"]');
       if (engineRow) engineRow.hidden = true;
@@ -716,6 +1106,248 @@ export function initBoard() {
 
     renderDrawerActions(card);
     renderDrawerSession(card);
+  }
+
+  // Wires the scheduled-card drawer's editable fields (renderDrawer's
+  // `!isTask` branch above). Every field saves through putSchedule — the
+  // scheduler API, never the vault file directly — on blur for text
+  // inputs and on change for selects/the checkbox, refetching the board on
+  // a successful save. A rejected save shows the server's `detail` inline
+  // next to the offending field (schedule value, timezone) or as a toast
+  // (every other field), and snaps the control back to the last value the
+  // server actually accepted. The schedule type select is the one
+  // exception: changing it only updates the value field's label and
+  // placeholder locally — it saves together with the schedule value, on
+  // the value field's own blur, so a type and a value that doesn't parse
+  // under it can never reach the server in the same write (see below).
+  function renderScheduleDrawerFields(card) {
+    const msgEl = drawerEl.querySelector('[data-field="message-content"]');
+    msgEl.addEventListener('blur', async () => {
+      const value = msgEl.value;
+      if (value === (card.message_content || '')) return;
+      try { await putSchedule(card.id, { message_content: value }); await fetchBoard(); }
+      catch (err) { showToast(`Couldn't save message: ${err.message}`, true); msgEl.value = card.message_content || ''; }
+    });
+
+    const enabledEl = drawerEl.querySelector('[data-field="enabled"]');
+    enabledEl.addEventListener('change', async () => {
+      try {
+        const resp = await putSchedule(card.id, { enabled: enabledEl.checked });
+        // The store recomputes next_trigger_at for an enabled change too
+        // (clearing it on disable) — refresh the preview from the
+        // response the same way the type/value/timezone saves do, since
+        // updateOpenDrawer skips its own rebuild while this checkbox
+        // holds focus.
+        previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        await fetchBoard();
+      }
+      catch (err) { showToast(`Couldn't update enabled: ${err.message}`, true); enabledEl.checked = !!card.enabled; }
+    });
+
+    const typeEl = drawerEl.querySelector('[data-field="schedule-type"]');
+    const valueEl = drawerEl.querySelector('[data-field="schedule-value"]');
+    const valueLabelEl = drawerEl.querySelector('[data-field="schedule-value-label"]');
+    const valueErrorEl = drawerEl.querySelector('[data-field="schedule-value-error"]');
+    const tzEl = drawerEl.querySelector('[data-field="timezone"]');
+    const tzErrorEl = drawerEl.querySelector('[data-field="timezone-error"]');
+    const actionEl = drawerEl.querySelector('[data-field="action"]');
+    const executorRow = drawerEl.querySelector('[data-row="executor"]');
+    const executorEl = drawerEl.querySelector('[data-field="executor"]');
+    const botRow = drawerEl.querySelector('[data-row="bot"]');
+    const botEl = drawerEl.querySelector('[data-field="bot"]');
+    const botReasonEl = drawerEl.querySelector('[data-field="bot-reason"]');
+    const previewEl = drawerEl.querySelector('[data-field="next-fire-preview"]');
+    const lastRunEl = drawerEl.querySelector('[data-field="last-run-info"]');
+    const triggerBtnEl = drawerEl.querySelector('[data-action="trigger-now"]');
+
+    previewEl.textContent = formatNextFire(card.next_fire_at);
+    lastRunEl.textContent = formatLastRun(card.last_run);
+
+    // What the server last actually accepted for each field — a rejected
+    // save reverts its control to these, not to whatever was showing when
+    // the drawer opened, the same rule the task drawer's assignee select
+    // follows above.
+    let lastSavedType = card.schedule_type;
+    let lastSavedValue = card.schedule_value;
+    let lastSavedTz = card.timezone || '';
+    let lastSavedAction = card.action;
+    let lastSavedExecutor = card.executor || '';
+    let lastSavedBot = card.bot || '';
+
+    function updateValueLabel(type) {
+      if (type === 'once') {
+        valueLabelEl.textContent = 'When (ISO datetime)';
+        valueEl.placeholder = '2026-06-03T15:05:00';
+      } else {
+        valueLabelEl.textContent = 'Cron expression';
+        valueEl.placeholder = '0 9 * * *';
+      }
+    }
+
+    function setActionVisibility(action) {
+      const isAgent = action === 'agent';
+      executorRow.hidden = !isAgent;
+      botRow.hidden = isAgent;
+    }
+
+    typeEl.addEventListener('change', () => {
+      // Type-only, with no matching value, is unsaveable by construction
+      // (a cron string and an ISO datetime never parse as each other) —
+      // saving it here would either write a type/value pair the server
+      // rejects, or one it accepts but that leaves a live schedule
+      // pointed at the wrong parser. So this only updates the label and
+      // placeholder; the value field's blur handler below carries the
+      // type along with whatever value the operator enters to match it,
+      // so a conversion always reaches the server as one matched pair.
+      updateValueLabel(typeEl.value);
+    });
+
+    valueEl.addEventListener('blur', async () => {
+      const value = valueEl.value;
+      const typeChanged = typeEl.value !== lastSavedType;
+      if (value === (lastSavedValue || '') && !typeChanged) return;
+      const patch = { schedule_value: value };
+      if (typeChanged) patch.schedule_type = typeEl.value;
+      try {
+        const resp = await putSchedule(card.id, patch);
+        lastSavedValue = value;
+        if (typeChanged) lastSavedType = typeEl.value;
+        valueErrorEl.hidden = true;
+        valueErrorEl.textContent = '';
+        previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        if (typeChanged) {
+          triggerBtnEl.textContent = lastSavedType === 'once' ? 'Trigger now (disables this one-off)' : 'Trigger now';
+        }
+        await fetchBoard();
+      } catch (err) {
+        valueErrorEl.textContent = err.message;
+        valueErrorEl.hidden = false;
+        valueEl.value = lastSavedValue || '';
+        if (typeChanged) {
+          typeEl.value = lastSavedType;
+          updateValueLabel(lastSavedType);
+        }
+      }
+    });
+
+    tzEl.addEventListener('blur', async () => {
+      const value = tzEl.value;
+      if (value === lastSavedTz) return;
+      try {
+        const resp = await putSchedule(card.id, { timezone: value });
+        lastSavedTz = value;
+        tzErrorEl.hidden = true;
+        tzErrorEl.textContent = '';
+        previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        await fetchBoard();
+      } catch (err) {
+        tzErrorEl.textContent = err.message;
+        tzErrorEl.hidden = false;
+        tzEl.value = lastSavedTz;
+      }
+    });
+
+    actionEl.addEventListener('change', async () => {
+      // Show/hide the executor and bot controls immediately — no need to
+      // wait for the save (or reopen the drawer) to see the right one.
+      setActionVisibility(actionEl.value);
+      try {
+        await putSchedule(card.id, { action: actionEl.value });
+        lastSavedAction = actionEl.value;
+        await fetchBoard();
+      } catch (err) {
+        showToast(`Couldn't save action: ${err.message}`, true);
+        actionEl.value = lastSavedAction;
+        setActionVisibility(lastSavedAction);
+      }
+    });
+
+    executorEl.addEventListener('change', async () => {
+      try {
+        await putSchedule(card.id, { executor: executorEl.value });
+        lastSavedExecutor = executorEl.value;
+        await fetchBoard();
+      } catch (err) {
+        showToast(`Couldn't save executor: ${err.message}`, true);
+        executorEl.value = lastSavedExecutor;
+      }
+    });
+
+    botEl.addEventListener('change', async () => {
+      try {
+        await putSchedule(card.id, { bot: botEl.value });
+        lastSavedBot = botEl.value;
+        await fetchBoard();
+      } catch (err) {
+        showToast(`Couldn't save bot: ${err.message}`, true);
+        botEl.value = lastSavedBot;
+      }
+    });
+
+    // When the registry loads, the bot select offers only names the API
+    // accepts — the empty "default (primary)" option (distinguishable from
+    // the registry's own "primary" row) plus whatever GET
+    // /api/scheduler/bots returns. A stored name the loaded registry
+    // doesn't include (a bot renamed after the schedule was written) is
+    // appended as a selected, flagged-unknown option instead of leaving
+    // the select with no matching value. When the fetch itself fails, the
+    // stored name isn't known to be invalid — just unconfirmed — so it's
+    // kept visible and selected without that flag, and the select is
+    // disabled with the reason shown as visible text next to it,
+    // mirroring the host dropdown's pattern
+    // (web/agents/assignment.js's seedHostOptions/populateHostOptions).
+    loadBotCatalog().then(catalog => {
+      const stored = card.bot || '';
+      if (!catalog) {
+        const optionsHtml = ['<option value="">default (primary)</option>'];
+        if (stored) {
+          optionsHtml.push(`<option value="${escapeHtml(stored)}" selected>${escapeHtml(stored)}</option>`);
+        }
+        botEl.innerHTML = optionsHtml.join('');
+        botEl.value = stored;
+        botEl.disabled = true;
+        botReasonEl.textContent = 'bot registry unavailable — reopen to retry';
+        botReasonEl.hidden = false;
+        return;
+      }
+      const names = catalog.bots || [];
+      const known = names.includes(stored);
+      const options = ['<option value="">default (primary)</option>'];
+      for (const name of names) {
+        options.push(`<option value="${escapeHtml(name)}" ${stored === name ? 'selected' : ''}>${escapeHtml(name)}</option>`);
+      }
+      if (stored && !known) {
+        options.push(`<option value="${escapeHtml(stored)}" selected data-unknown="true">${escapeHtml(stored)} (unknown)</option>`);
+      }
+      botEl.innerHTML = options.join('');
+      botEl.value = stored;
+      botEl.disabled = false;
+      botReasonEl.hidden = true;
+      botReasonEl.textContent = '';
+    });
+
+    drawerEl.querySelector('[data-action="trigger-now"]').addEventListener('click', async () => {
+      try {
+        const r = await fetch(`/api/scheduler/${encodeURIComponent(card.id)}/trigger`, { method: 'POST' });
+        if (!r.ok) {
+          const text = await r.text();
+          let msg = text;
+          try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+          throw new Error(msg || `HTTP ${r.status}`);
+        }
+        showToast('Triggered.', false);
+        await fetchBoard();
+        // fetchBoard's own drawer refresh (updateOpenDrawer) skips
+        // rebuilding while the drawer holds focus — and the button that
+        // was just clicked still does — so rebuild explicitly here,
+        // exactly like the task drawer's assignee select does above,
+        // rather than leaving a stale last-run/preview showing.
+        const fresh = findCard(card.id);
+        if (fresh) { renderDrawer(fresh); openCardSnapshot = fresh; }
+      } catch (err) {
+        showToast(`Trigger failed: ${err.message}`, true);
+      }
+    });
   }
 
   function renderDrawerActions(card) {
@@ -749,16 +1381,27 @@ export function initBoard() {
       }]);
     }
     if (card.session && !TERMINAL.has(card.session.status)) {
-      buttons.push(['Kill', async () => {
-        try {
-          const r = await fetch(`/api/agents/sessions/${encodeURIComponent(card.session.session_id)}/kill`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),
-          });
-          if (!r.ok) throw new Error(await r.text());
-          showToast('Session killed.', false);
-          fetchBoard();
-        } catch (err) { showToast(`Kill failed: ${err.message}`, true); }
-      }]);
+      // A CLI-backed session (opened via the Open button, not started by
+      // the worker) can't actually be torn down by this endpoint — the
+      // same reason Cancel reports one as an unstoppable failure instead
+      // of a teardown. Offer Kill disabled with that explanation rather
+      // than a button that 404s.
+      if (card.session.source === 'claude_code' || card.session.source === 'codex') {
+        buttons.push(['Kill', null, {
+          reason: `killing a live ${sourceLabelFor(card.session)} session isn't supported yet — close it manually`,
+        }]);
+      } else {
+        buttons.push(['Kill', async () => {
+          try {
+            const r = await fetch(`/api/agents/sessions/${encodeURIComponent(card.session.session_id)}/kill`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),
+            });
+            if (!r.ok) throw new Error(await r.text());
+            showToast('Session killed.', false);
+            fetchBoard();
+          } catch (err) { showToast(`Kill failed: ${err.message}`, true); }
+        }]);
+      }
     }
     if (card.pending_question) {
       buttons.push(['Answer', () => openAnswerPrompt(card)]);
@@ -773,20 +1416,219 @@ export function initBoard() {
         } catch (err) { showToast(`Accept failed: ${err.message}`, true); }
       }]);
     }
-    if (card.lane === 'human_queue' && !card.pending_question) {
+    // Resolve is a drop onto Done under the hood — never offer it when
+    // that exact move would be refused (a claimed or agent-owned card can
+    // still land in Human queue without being resolvable by a human).
+    // Absent policy (schedule cards never reach here) defaults to
+    // allowed, matching every other policy read in this file.
+    // `policy.lanes` lists ONLY refused lanes — an absent `.done` entry
+    // means allowed, so this guards the leaf the same way
+    // `onCardDropped`'s own lane read already does, rather than assuming
+    // it's always present.
+    const doneEntry = card.policy && card.policy.lanes && card.policy.lanes.done;
+    const doneAllowed = !doneEntry || doneEntry.allowed !== false;
+    if (card.lane === 'human_queue' && !card.pending_question && doneAllowed) {
       // A manually-filed #human card with no agent question behind it —
       // "Resolve" is the operator saying they've handled it by hand.
       buttons.push(['Resolve', async () => { await moveCard(card.id, 'done').catch(() => {}); }]);
     }
+    // Cancel is offered for every task card that carries a policy block
+    // (schedule cards never do) — disabled-and-explained when refused,
+    // never hidden, matching every other refused control in this drawer.
+    // A hidden Cancel on an agent-owned-with-no-assignee-tag claimed card
+    // (the worker's own bare `#agent` claim) would leave that card with
+    // no recovery action at all — Answer/Kill/Accept aside, Cancel is the
+    // one a human always needs visible, even mid-refusal.
+    if (card.policy && card.policy.cancel && card.policy.cancel.allowed !== true) {
+      buttons.push(['Cancel', null, {
+        reason: card.policy.cancel.reason || "Cancel isn't available for this card.",
+      }]);
+    } else if (card.policy && card.policy.cancel) {
+      buttons.push(['Cancel', async () => {
+        try {
+          const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/cancel`, { method: 'POST' });
+          if (!r.ok) {
+            const text = await r.text();
+            let msg = text;
+            try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+            throw new Error(msg || `HTTP ${r.status}`);
+          }
+          const data = await r.json();
+          // A live cc:/cx: CLI session can't be torn down by Cancel yet —
+          // the endpoint still marks the card cancelled, but reports it
+          // under `failures` instead of silently claiming a teardown it
+          // didn't perform. Surface that as a warning toast rather than a
+          // plain success.
+          const untorn = (data && data.failures) || [];
+          if (untorn.length) {
+            showToast(`Cancelled, but couldn't stop: ${untorn.map(f => f.reason || f.session_id).join('; ')}`, true);
+          } else {
+            showToast('Cancelled.', false);
+          }
+          // Tear the session panel down through its own cleanup path
+          // right here, rather than leaving it to whichever render call
+          // below happens to touch the session-panel container next — a
+          // deferred teardown aborts a summary/stream request that's
+          // still legitimately in flight, which shows up as a failed
+          // request even though nothing actually went wrong.
+          if (panel) { panel.close(); panel = null; }
+          await fetchBoard();
+          // fetchBoard()'s own updateOpenDrawer skips the
+          // rebuild while this button (inside the drawer) still holds
+          // focus after the click — the same staleness the assignee
+          // handler above already works around. Without this, the drawer
+          // keeps showing a stale Open button for a card that just moved
+          // to Done, and clicking it 409s.
+          const fresh = findCard(card.id);
+          if (fresh) { renderDrawer(fresh); openCardSnapshot = fresh; }
+        } catch (err) { showToast(`Cancel failed: ${err.message}`, true); }
+      }]);
+    }
 
-    for (const [label, handler] of buttons) {
+    // Delete is offered for every card the drawer can open — a task card
+    // (any lane, including review) or a scheduled card — and always sits
+    // last, after Cancel. It's the only drawer action styled `danger`.
+    buttons.push(['Delete', () => openDeleteModal(card), { danger: true }]);
+
+    for (const [label, handler, opts] of buttons) {
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = 'drawer-action';
+      btn.className = opts && opts.danger ? 'drawer-action danger' : 'drawer-action';
       btn.textContent = label;
-      btn.onclick = handler;
-      actionsEl.appendChild(btn);
+      if (opts && opts.reason) {
+        // Disable-and-explain rather than hide, matching every other
+        // refused control in this drawer — a `title=` isn't enough, the
+        // reason needs to be visible text next to the button.
+        btn.disabled = true;
+        actionsEl.appendChild(btn);
+        const reasonEl = document.createElement('div');
+        reasonEl.className = 'drawer-field-reason';
+        reasonEl.dataset.field = `${label.toLowerCase()}-reason`;
+        reasonEl.textContent = opts.reason;
+        actionsEl.appendChild(reasonEl);
+      } else {
+        btn.onclick = handler;
+        actionsEl.appendChild(btn);
+      }
     }
+  }
+
+  // Delete confirmation, mirroring panel.js's openKillModal — title,
+  // `.target` naming the card, cancel + danger confirm that disables and
+  // relabels itself while the request is in flight and re-enables on
+  // failure. A task card with a live, killable session (not a CLI-backed
+  // one, which this endpoint can't tear down) kills that session and its
+  // subagents first and only deletes once the kill succeeds; a CLI-backed
+  // live session is deleted without a kill attempt, since the operator has
+  // to close that pane by hand. A scheduled card never carries a session,
+  // so it always deletes straight through.
+  function openDeleteModal(card) {
+    const isTask = card.kind === 'task';
+    const label = isTask ? (card.title || card.id) : (card.name || card.id);
+    // Maps a card to its kill decision and note text — called both here
+    // (against the live card, not the possibly-stale drawer snapshot,
+    // since `updateOpenDrawer` skips rebuilding the drawer while it holds
+    // focus) and again at confirm time.
+    function killDecision(c) {
+      const hasLiveSession = !!(c.session && !TERMINAL.has(c.session.status));
+      const isCliSession = !!(c.session && (c.session.source === 'claude_code' || c.session.source === 'codex'));
+      const needsKill = isTask && hasLiveSession && !isCliSession;
+      let noteHtml;
+      if (needsKill) {
+        noteHtml = `<div class="descendants">Deleting this card will kill the running session and its subagents first, then remove the card. This can't be undone.</div>`;
+      } else if (isTask && hasLiveSession && isCliSession) {
+        noteHtml = `<div class="descendants">This card has a live ${escapeHtml(sourceLabelFor(c.session))} session that can't be killed from here — close its pane manually. Deleting removes the card. This can't be undone.</div>`;
+      } else {
+        noteHtml = `<div class="descendants">This can't be undone.</div>`;
+      }
+      return { needsKill, noteHtml };
+    }
+    let { needsKill, noteHtml } = killDecision(findCard(card.id) || card);
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-labelledby="delete-title">
+        <h2 id="delete-title">Delete card?</h2>
+        <div class="target">${escapeHtml(label)}</div>
+        ${noteHtml}
+        <div class="actions">
+          <button id="delete-cancel">Cancel</button>
+          <button class="danger" id="delete-confirm">Delete</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(backdrop);
+    // Guards dismissal (backdrop click / Cancel) while a confirm is in
+    // flight — without it, clicking the backdrop mid-request removes the
+    // modal out from under the confirm handler, which then re-enables a
+    // detached button on failure instead of the modal staying open.
+    let pending = false;
+    const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
+    backdrop.addEventListener('click', e => { if (!pending && e.target === backdrop) cleanup(); });
+    backdrop.querySelector('#delete-cancel').onclick = () => { if (!pending) cleanup(); };
+    backdrop.querySelector('#delete-confirm').onclick = async () => {
+      const confirmBtn = backdrop.querySelector('#delete-confirm');
+      // Re-resolve the card from the live board rather than trusting the
+      // snapshot captured when the modal opened — `updateOpenDrawer` skips
+      // rebuilding the drawer while it holds focus, so a card the worker
+      // claims after the drawer opened can still show a session-less
+      // snapshot here. Falls back to the captured `card` if it's vanished
+      // from the board entirely.
+      const fresh = findCard(card.id) || card;
+      const { needsKill: freshNeedsKill, noteHtml: freshNoteHtml } = killDecision(fresh);
+      if (freshNeedsKill && !needsKill) {
+        // The disclosed note didn't promise a kill but one is now
+        // required — update the note in place and make the operator
+        // confirm again against accurate text rather than killing a
+        // session they were never told about.
+        needsKill = freshNeedsKill;
+        backdrop.querySelector('.descendants').outerHTML = freshNoteHtml;
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = 'Delete';
+        return;
+      }
+      pending = true;
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = 'Deleting…';
+      try {
+        if (freshNeedsKill) {
+          const kr = await fetch(`/api/agents/sessions/${encodeURIComponent(fresh.session.session_id)}/kill`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),
+          });
+          if (!kr.ok) {
+            const text = await kr.text();
+            let msg = text;
+            try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+            throw new Error(`Kill failed: HTTP ${kr.status}: ${msg}`);
+          }
+          const killResult = await kr.json();
+          const failures = killResult.failures || [];
+          if (failures.length > 0) {
+            throw new Error(`Kill failed: ${failures.map(f => f.reason || f.session_id).join('; ')}`);
+          }
+        }
+        const deleteUrl = isTask
+          ? `/api/tasks/${encodeURIComponent(card.id)}`
+          : `/api/scheduler/${encodeURIComponent(card.id)}`;
+        const dr = await fetch(deleteUrl, { method: 'DELETE' });
+        if (!dr.ok) {
+          const text = await dr.text();
+          let msg = text;
+          try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+          throw new Error(msg || `HTTP ${dr.status}`);
+        }
+        pending = false;
+        cleanup();
+        closeDrawer();
+        showToast('Deleted.', false);
+        await fetchBoard();
+      } catch (err) {
+        showToast(`Delete failed: ${err.message}`, true);
+        pending = false;
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = 'Delete';
+      }
+    };
   }
 
   function openAnswerPrompt(card) {
@@ -864,10 +1706,83 @@ export function initBoard() {
   }
 
   // ------------------------------------------------------------------
+  // Lane filter dropdown — checkboxes + All/Clear toggles + outside-click
+  // close (mirrors web/crm.html's people-filter-* dropdown pattern).
+  // ------------------------------------------------------------------
+
+  function laneFilterCheckboxes() {
+    return laneFilterOptions ? [...laneFilterOptions.querySelectorAll('input[type="checkbox"]')] : [];
+  }
+
+  function updateLaneFilterLabel() {
+    if (!laneFilterLabel) return;
+    if (visibleLanes.size === LANES.length) laneFilterLabel.textContent = 'All lanes';
+    else if (visibleLanes.size === 0) laneFilterLabel.textContent = 'No lanes';
+    else laneFilterLabel.textContent = `${visibleLanes.size} lane${visibleLanes.size === 1 ? '' : 's'}`;
+  }
+
+  function applyLaneSelection(ids) {
+    visibleLanes = new Set(ids);
+    saveLaneSelection(visibleLanes);
+    updateLaneFilterLabel();
+    render();
+  }
+
+  // Reveals `laneId` in the filter (and persists it) if it's currently
+  // hidden — used after creating a card straight into a lane the filter
+  // was hiding, so the new card doesn't vanish with no feedback. A no-op
+  // when the lane is already visible.
+  function ensureLaneVisible(laneId) {
+    if (visibleLanes.has(laneId)) return;
+    const checkbox = laneFilterOptions && laneFilterOptions.querySelector(`input[value="${laneId}"]`);
+    if (checkbox) checkbox.checked = true;
+    applyLaneSelection([...visibleLanes, laneId]);
+  }
+
+  function renderLaneFilterCheckboxes() {
+    if (!laneFilterOptions) return;
+    for (const lane of LANES) {
+      const label = document.createElement('label');
+      label.className = 'board-lane-filter-option';
+      label.innerHTML = `<input type="checkbox" value="${lane.id}" ${visibleLanes.has(lane.id) ? 'checked' : ''} /> ${escapeHtml(lane.label)}`;
+      label.querySelector('input').addEventListener('change', () => {
+        applyLaneSelection(laneFilterCheckboxes().filter(cb => cb.checked).map(cb => cb.value));
+      });
+      laneFilterOptions.appendChild(label);
+    }
+  }
+
+  if (laneFilterBtn) {
+    laneFilterBtn.addEventListener('click', () => {
+      if (laneFilterOptions) laneFilterOptions.classList.toggle('show');
+    });
+  }
+  if (laneFilterAllBtn) {
+    laneFilterAllBtn.addEventListener('click', () => {
+      laneFilterCheckboxes().forEach(cb => { cb.checked = true; });
+      applyLaneSelection(LANES.map(l => l.id));
+    });
+  }
+  if (laneFilterClearBtn) {
+    laneFilterClearBtn.addEventListener('click', () => {
+      laneFilterCheckboxes().forEach(cb => { cb.checked = DEFAULT_VISIBLE_LANE_IDS.includes(cb.value); });
+      applyLaneSelection(DEFAULT_VISIBLE_LANE_IDS);
+    });
+  }
+  document.addEventListener('click', (e) => {
+    if (laneFilterDropdown && !laneFilterDropdown.contains(e.target) && laneFilterOptions) {
+      laneFilterOptions.classList.remove('show');
+    }
+  });
+
+  renderLaneFilterCheckboxes();
+  updateLaneFilterLabel();
+
+  // ------------------------------------------------------------------
   // Wire filters + boot
   // ------------------------------------------------------------------
 
-  [searchEl, laneFilterEl, assigneeFilterEl, hostFilterEl, tagFilterEl,
+  [searchEl, assigneeFilterEl, hostFilterEl, tagFilterEl,
    contextFilterEl, recencyFilterEl, includeDoneEl].filter(Boolean).forEach(el => {
     const evt = (el.tagName === 'SELECT' || el.type === 'checkbox') ? 'change' : 'input';
     el.addEventListener(evt, () => render());

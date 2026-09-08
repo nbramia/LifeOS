@@ -13,6 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 
 # Anchored to the repo root (this file's own location), NOT the caller's
@@ -126,6 +127,19 @@ class Session:
     effort: str | None = None
     conversation_id: str | None = None
     remote_pgid: int | None = None
+    # The model Hermes ITSELF reported for its most recent turn —
+    # observed from the turn's own `usage` event (`_HermesTurnPersister.
+    # reported_model`), not declared. Explicitly distinct from `model`
+    # above: `model` is the board's operator-chosen picker value, which
+    # `HermesExecutor` never reads or writes. Written only by
+    # `HermesExecutor.execute` for the session it is executing (see
+    # `set_hermes_model`), so a completed session's value can never be
+    # rewritten by a later, unrelated turn — unlike the process-wide "last
+    # observed" value `model_readout.py` keeps for `/api/health`, which any
+    # Hermes turn on any surface can overwrite (see `agents.py`'s
+    # `_model_label_for_routing`, which reads this column instead for a
+    # per-session badge).
+    hermes_model: str | None = None
 
 
 # Engine -> storage id prefix for the `cli_sessions` table (#849). Matches
@@ -205,7 +219,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     model                     TEXT,  -- board-assigned model id (#851), passed to the executor's --model flag
     effort                    TEXT,  -- board-assigned effort level (#851): low|medium|high|max
     conversation_id           TEXT,  -- Hermes conversation id (#851, routing='hermes' only)
-    remote_pgid               INTEGER  -- process-group id echoed by a remote-spawned subprocess (#851)
+    remote_pgid               INTEGER,  -- process-group id echoed by a remote-spawned subprocess (#851)
+    hermes_model              TEXT  -- model Hermes itself reported for this session's own turn (#892); NULL = no turn yet
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -505,6 +520,12 @@ class SessionStore:
                 conn.execute("ALTER TABLE sessions ADD COLUMN conversation_id TEXT")
             if "remote_pgid" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN remote_pgid INTEGER")
+            # Idempotent migration for the per-session Hermes-reported model.
+            # Old rows stay NULL — "no turn observed yet" for a session
+            # created without this column, same as a genuinely turn-less
+            # one.
+            if "hermes_model" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN hermes_model TEXT")
 
     # ------------------------------------------------------------------
     # Session CRUD
@@ -764,6 +785,34 @@ class SessionStore:
                 "UPDATE sessions SET conversation_id = ?, last_activity_at = ? "
                 "WHERE task_id = ?",
                 (conversation_id, _now(), task_id),
+            )
+
+    def set_hermes_model(self, task_id: str, model: str) -> None:
+        """Record the model Hermes itself reported for a turn THIS session
+        ran — mirrors `set_conversation_id` exactly. Called only by
+        `HermesExecutor.execute` for the session it just executed, which is
+        what keeps this honest: no other writer can attribute a turn to the
+        wrong session, and a completed session's value can never be
+        rewritten by a later, unrelated turn — unlike the process-wide
+        "last observed" value `model_readout.record_hermes_chat_turn_model`
+        keeps for `/api/health`, which any Hermes turn on any surface can
+        overwrite. Ignores a falsy model rather than clobbering a real
+        prior observation with nothing, same rule
+        `record_hermes_chat_turn_model` follows. `.strip()`s before that
+        guard so a whitespace-only model (e.g. a malformed upstream
+        `usage` event's `model` field) degrades to the same "no turn
+        observed" outcome as an empty one, instead of writing a value that
+        renders as `Hermes ·    ` — no length cap, matching
+        `usage_store`/`/api/health`, which take this same string verbatim."""
+        if isinstance(model, str):
+            model = model.strip()
+        if not model:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET hermes_model = ?, last_activity_at = ? "
+                "WHERE task_id = ?",
+                (model, _now(), task_id),
             )
 
     def set_remote_pgid(self, task_id: str, pgid: int) -> None:
@@ -1706,6 +1755,57 @@ class SessionStore:
             ).fetchall()
         return [self._row_to_cli_session(r) for r in rows]
 
+    def list_cli_sessions_for_task(self, task_id: str) -> list[CliSession]:
+        """Every `cli_sessions` row linked to `task_id`, newest first.
+
+        Unlike the main `sessions` table, `cli_sessions.task_id` isn't a
+        primary key (a card can be opened, closed, and reopened, each a
+        distinct row) — so this is a direct, unbounded query, not a lookup.
+        A live cc:/cx: CLI session can't be found via `get()` (that's the
+        `sessions` table, keyed by task_id) or via the 200-row
+        `list_sessions()` snapshot window (`cli_sessions` isn't in that
+        table at all) — this is how a caller (Cancel, the board's claim
+        check) finds out one exists at all.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cli_sessions WHERE task_id = ? ORDER BY last_event_at DESC",
+                (task_id,),
+            ).fetchall()
+        return [self._row_to_cli_session(r) for r in rows]
+
+    def has_live_session(
+        self,
+        task_id: str,
+        status: str | None = None,
+        tags: Iterable[str] | None = None,
+    ) -> bool:
+        """True if a non-terminal `sessions` row or a non-`ended`
+        `cli_sessions` row actually backs `task_id` — as opposed to a task
+        whose `status` merely reads `in_progress` with nothing behind it (a
+        vault edit or an API status write can set that with no session at
+        all). The board's claim rule keys its status-derived claim on this,
+        not on status alone (`api.services.agent_board.is_claimed`).
+
+        When `status` and `tags` are both given, short-circuits to `False`
+        without querying anything when `agent_board.status_claim_possible`
+        says the answer can't matter for the claim check anyway — the
+        common case, so a policy read over many cards doesn't pay for a
+        lookup per card.
+        """
+        if status is not None or tags is not None:
+            from api.services import agent_board
+
+            if not agent_board.status_claim_possible(status or "", tags or []):
+                return False
+        target = self.get(task_id)
+        if target is not None and target.status not in TERMINAL_STATUSES:
+            return True
+        for cli in self.list_cli_sessions_for_task(task_id):
+            if cli.status != CLI_STATUS_ENDED:
+                return True
+        return False
+
     @staticmethod
     def _row_to_cli_session(row: sqlite3.Row) -> CliSession:
         return CliSession(
@@ -1787,4 +1887,5 @@ class SessionStore:
             effort=(row["effort"] if "effort" in row.keys() else None),
             conversation_id=(row["conversation_id"] if "conversation_id" in row.keys() else None),
             remote_pgid=(row["remote_pgid"] if "remote_pgid" in row.keys() else None),
+            hermes_model=(row["hermes_model"] if "hermes_model" in row.keys() else None),
         )

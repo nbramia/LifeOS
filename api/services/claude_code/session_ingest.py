@@ -751,7 +751,12 @@ def to_session_dict(meta: SessionMeta) -> dict[str, Any]:
     """Render `meta` into a snapshot row matching the agent-worker shape."""
     return {
         "session_id": meta.session_id,
-        "task_id": meta.raw_session_id,
+        # `raw_session_id` is the Claude Code UUID, not a LifeOS task
+        # id — leaking it in would poison `_build_board`'s task join.
+        # `SessionMeta` carries no LifeOS task link of its own; a
+        # hook-registered session gets one overlaid afterwards by
+        # `_apply_cli_session_to_dict`.
+        "task_id": None,
         "status": meta.status,
         "routing": "claude_code",
         "parent_session_id": meta.parent_session_id,
@@ -794,7 +799,9 @@ def subagent_session_dict(parent: SessionMeta, subagent: dict[str, Any]) -> dict
     synthetic_id = f"{parent.session_id}:agent:{tu_id}"
     return {
         "session_id": synthetic_id,
-        "task_id": tu_id,
+        # `tu_id` is a tool_use_id, not a LifeOS task id — same
+        # `sessions_by_task` poisoning risk as `to_session_dict` above.
+        "task_id": None,
         "status": subagent.get("status", "running"),
         "routing": "claude_code",
         "parent_session_id": parent.session_id,
@@ -832,7 +839,7 @@ def subagent_session_dict(parent: SessionMeta, subagent: dict[str, Any]) -> dict
 # Discovery + parse is the expensive op (touches the filesystem and reads
 # every active jsonl). Cache the snapshot dicts for a short window so the
 # 2s SSE tick doesn't hammer disk. The cache is keyed by (projects_dir,
-# lookback_days) so callers with different scopes (e.g. tests) don't
+# lookback_days, live_counts) so callers with different scopes (e.g. tests) don't
 # cross-contaminate, and guarded by a lock so concurrent FastAPI threads
 # can't see a partially-written entry.
 _CACHE_TTL = 30.0
@@ -845,12 +852,33 @@ class _CacheEntry:
     edges: list[dict[str, Any]] = field(default_factory=list)
 
 
-_snapshot_cache: dict[tuple[str, int], _CacheEntry] = {}
+_snapshot_cache: dict[tuple[Any, ...], _CacheEntry] = {}
 _snapshot_cache_lock = threading.Lock()
 
 
-def _cache_key(projects_dir: str | Path | None, lookback_days: int) -> tuple[str, int]:
-    return (str(projects_dir) if projects_dir is not None else "", int(lookback_days))
+def _cache_key(
+    projects_dir: str | Path | None,
+    lookback_days: int,
+    live_counts: dict[str, int] | None,
+) -> tuple[Any, ...]:
+    """Cache key for the snapshot builder.
+
+    Includes the liveness map (`live_counts`) so a caller that scopes the
+    snapshot to a specific liveness signal (the remote transcript mirror's
+    `{}`, which must never promote a row to `running` from a local process
+    scan) never collides with a caller that scans THIS machine's processes
+    (`None`) or passes a different map. `live_counts` is canonicalized into
+    a hashable `frozenset` of `(cwd, count)` pairs so two dicts with the
+    same contents key identically regardless of insertion order.
+    """
+    lc_key: frozenset | None = None
+    if live_counts is not None:
+        lc_key = frozenset(live_counts.items())
+    return (
+        str(projects_dir) if projects_dir is not None else "",
+        int(lookback_days),
+        lc_key,
+    )
 
 
 def build_snapshot(
@@ -859,25 +887,41 @@ def build_snapshot(
     limit: int = 200,
     cache_ttl: float = _CACHE_TTL,
     now: float | None = None,
+    live_counts: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return `(sessions, edges)` for the /agents snapshot. Cached.
 
     Edges include parent→subagent spawn edges. Subagent nodes are synthetic;
     they don't have their own jsonl. The cache is bypassed entirely when
     `cache_ttl <= 0` (no read, no write) so tests get a fresh snapshot.
+    On both the cache-hit and cache-populate paths, the returned session
+    rows are per-row shallow copies, so a caller may mutate them without
+    touching the cache.
+
+    `live_counts`: pass a `{cwd: count}` map to use instead of
+    scanning THIS machine's own processes — `{}` guarantees no row is
+    promoted to `running` by a local process scan, which is what the
+    remote transcript mirror needs (a mirrored session never has a
+    process on this host; its liveness must come only from hook events).
+    `None` (the default) scans local `claude` processes via
+    `live_claude_cwd_counts()`.
     """
     now_t = now if now is not None else time.time()
-    key = _cache_key(projects_dir, lookback_days)
+    key = _cache_key(projects_dir, lookback_days, live_counts)
     if cache_ttl > 0:
         with _snapshot_cache_lock:
             entry = _snapshot_cache.get(key)
             if entry and entry.expires_at > now_t:
-                return list(entry.sessions), list(entry.edges)
+                # Per-row shallow copies so a caller mutating a row
+                # (e.g. the /agents route's label/hook overlay) never
+                # writes back into this cache's own dicts while the entry is
+                # still warm. The list copy alone would alias them.
+                return [dict(row) for row in entry.sessions], list(entry.edges)
 
     sessions: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     # One process-scan per snapshot tick — shared across every session.
-    cwd_counts = live_claude_cwd_counts(now=now_t)
+    cwd_counts = live_counts if live_counts is not None else live_claude_cwd_counts(now=now_t)
     # First pass: parse every discovered session with mtime-only status.
     # Process-detection promotion is layered on per-cwd below so we don't
     # over-attribute `running` to historical sessions sharing a project dir.
@@ -921,10 +965,13 @@ def build_snapshot(
         with _snapshot_cache_lock:
             _snapshot_cache[key] = _CacheEntry(
                 expires_at=now_t + cache_ttl,
-                sessions=list(sessions),
+                sessions=[dict(row) for row in sessions],
                 edges=list(edges),
             )
-    return list(sessions), list(edges)
+    # Per-row copies on the cache-write path too: the returned rows are
+    # distinct objects from the ones the cache entry now owns, so a caller
+    # mutating a returned row can never corrupt a warm cache.
+    return [dict(row) for row in sessions], list(edges)
 
 
 def invalidate_cache() -> None:

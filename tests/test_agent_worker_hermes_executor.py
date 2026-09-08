@@ -8,13 +8,22 @@ at `/chat?conversation=<id>`. Stubs the backend entirely — no network call.
 from __future__ import annotations
 
 import json
+import threading
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
+from api import main as api_main
+from api.routes import agents as agents_route
 from api.routes import hermes_proxy as hp
 from api.services.agent_worker.hermes_executor import HermesExecutor
-from api.services.agent_worker.session_store import STATUS_COMPLETED, STATUS_FAILED, SessionStore
+from api.services.agent_worker.session_store import (
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_RUNNING,
+    SessionStore,
+)
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.conversation_store import ConversationStore
 from api.services.usage_store import UsageStore
@@ -69,6 +78,25 @@ class _FakeClient:
 
     def close(self):
         pass
+
+
+class _DropAfterUsageResponse(_FakeResponse):
+    """Yields its body, then raises mid-stream — simulates the connection
+    dropping right after Hermes's own `usage` event already arrived,
+    exactly like a genuine connection error."""
+
+    def iter_bytes(self):
+        yield self._body
+        raise httpx.ReadError("connection dropped mid-stream")
+
+
+class _DropAfterUsageClient(_FakeClient):
+    def stream(self, method, url, content=None, headers=None):
+        self.captured["method"] = method
+        self.captured["url"] = url
+        self.captured["content"] = content
+        self.captured["headers"] = headers
+        return _FakeStreamCM(_DropAfterUsageResponse(self._body))
 
 
 def _build(tmp_path, monkeypatch, *, body: bytes, status_code: int = 200,
@@ -168,3 +196,360 @@ def test_http_error_fails_gracefully(tmp_path, monkeypatch):
     outcome = executor.execute(session, {"description": "hello"})
     assert outcome.status == STATUS_FAILED
     assert "hermes request failed" in outcome.reason
+
+
+# ---------------------------------------------------------------------------
+# HermesExecutor is the only writer of Session.hermes_model. It records the
+# model Hermes reported for THIS session's OWN turn, on both the
+# normal-completion exit path and the failure exit path (a dropped
+# connection after usage was reported still means the turn ran on that
+# model).
+# ---------------------------------------------------------------------------
+
+
+def test_completed_turn_records_the_reported_model_on_its_own_session(tmp_path, monkeypatch):
+    body = _sse([
+        {"type": "conversation_id", "conversation_id": "conv-model-1"},
+        {"type": "content", "content": "here you go"},
+        {"type": "usage", "model": "gpt-5.5", "input_tokens": 10, "output_tokens": 5, "cost_usd": 0.002},
+        {"type": "done"},
+    ])
+    executor, store, session, captured = _build(tmp_path, monkeypatch, body=body)
+    outcome = executor.execute(session, {"description": "hi"})
+    assert outcome.status == STATUS_COMPLETED
+    assert store.get("t1").hermes_model == "gpt-5.5"
+
+
+def test_no_usage_event_leaves_hermes_model_null(tmp_path, monkeypatch):
+    """A turn whose upstream never sent a well-formed `usage` event (e.g.
+    the malformed-event case `_HermesTurnPersister._handle_usage` already
+    drops) must not write a bogus/empty value onto the session."""
+    body = _sse([
+        {"type": "conversation_id", "conversation_id": "conv-model-2"},
+        {"type": "content", "content": "ack"},
+        {"type": "done"},
+    ])
+    executor, store, session, captured = _build(tmp_path, monkeypatch, body=body)
+    outcome = executor.execute(session, {"description": "hi"})
+    assert outcome.status == STATUS_COMPLETED
+    assert store.get("t1").hermes_model is None
+
+
+def test_failed_turn_after_usage_event_still_records_the_reported_model(tmp_path, monkeypatch):
+    """The upstream connection can drop AFTER Hermes's own `usage`
+    event already arrived (simulated here via `_DropAfterUsageClient`'s
+    `iter_bytes()`, which yields the usage frame, then raises mid-stream,
+    exactly like a genuine connection error). The turn still ran on that
+    model, so it must still be recorded even though the executor's outcome
+    is FAILED — dropping it would be less honest, not more (see
+    `design.md`)."""
+    usage_frame = _sse([
+        {"type": "conversation_id", "conversation_id": "conv-model-3"},
+        {"type": "usage", "model": "drop-after-usage-model", "input_tokens": 3, "output_tokens": 2, "cost_usd": 0.001},
+    ])
+    store, transcripts = _hermes_env(tmp_path, monkeypatch)
+    executor = HermesExecutor(
+        session_store=store, transcript_store=transcripts,
+        http_client_factory=lambda: _DropAfterUsageClient(usage_frame, 200),
+    )
+    session = store.create(task_id="t1", routing="hermes")
+
+    outcome = executor.execute(session, {"description": "hi"})
+    assert outcome.status == STATUS_FAILED
+    assert store.get("t1").hermes_model == "drop-after-usage-model"
+
+
+# ---------------------------------------------------------------------------
+# The tests above (and tests/test_agent_viz_api.py's two-session /
+# completed-session tests) each create exactly ONE Hermes session, so they
+# cannot tell "write only to my own session" apart from "broadcast the
+# model to every Hermes session". These two exercise `HermesExecutor.
+# execute()` — the real write path — with TWO real sessions, so a
+# broadcast mutation (looping over every hermes-routed session and calling
+# `set_hermes_model` on each) fails them. `Turnstile` forces two real
+# `HermesExecutor.execute()` calls to interleave at the chunk level across
+# two real threads, so both turns are genuinely in flight together rather
+# than merely running back-to-back.
+# ---------------------------------------------------------------------------
+
+
+class Turnstile:
+    """Strict ping-pong turn-taking between exactly two parties. Robust to
+    one side finishing first (releases the other unconditionally instead of
+    deadlocking). `parties=1` makes `wait`/`pass_on` a no-op, for a solo
+    turn that still needs `finish()`'s bookkeeping shape."""
+
+    def __init__(self, parties: int = 2):
+        self.ev = [threading.Event(), threading.Event()]
+        self.ev[0].set()
+        self.done = [False, False]
+        self.solo = parties == 1
+
+    def wait(self, me: int) -> None:
+        if self.solo or self.done[1 - me]:
+            return
+        self.ev[me].wait(timeout=20)
+        self.ev[me].clear()
+
+    def pass_on(self, me: int) -> None:
+        self.ev[1 - me].set()
+
+    def finish(self, me: int) -> None:
+        self.done[me] = True
+        self.ev[1 - me].set()
+
+
+class _LockstepResponse:
+    """`iter_bytes()` that yields one SSE frame per chunk and, between every
+    chunk, hands the turn to the other thread via `turnstile` — so two
+    executors' turns genuinely interleave rather than each running to
+    completion before the other starts."""
+
+    def __init__(self, chunks: list[bytes], turnstile: Turnstile, idx: int):
+        self._chunks = chunks
+        self._t = turnstile
+        self._i = idx
+        self.status_code = 200
+
+    def raise_for_status(self):
+        return None
+
+    def iter_bytes(self):
+        try:
+            for c in self._chunks:
+                self._t.wait(self._i)
+                yield c
+                self._t.pass_on(self._i)
+        finally:
+            self._t.finish(self._i)
+
+
+class _LockstepClient:
+    def __init__(self, chunks: list[bytes], turnstile: Turnstile, idx: int = 0):
+        self._chunks = chunks
+        self._t = turnstile
+        self._i = idx
+
+    def stream(self, method, url, content=None, headers=None):
+        return _FakeStreamCM(_LockstepResponse(self._chunks, self._t, self._i))
+
+    def close(self):
+        pass
+
+
+def _turn_chunks(conv: str, model: str, text: str) -> list[bytes]:
+    events = [
+        {"type": "conversation_id", "conversation_id": conv},
+        {"type": "content", "content": text},
+        {"type": "usage", "model": model, "input_tokens": 7, "output_tokens": 3, "cost_usd": 0.001},
+        {"type": "done"},
+    ]
+    return [b"data: " + json.dumps(e).encode() + b"\n\n" for e in events]
+
+
+def _hermes_env(tmp_path, monkeypatch) -> tuple[SessionStore, TranscriptStore]:
+    from config.settings import settings
+    monkeypatch.setattr(settings, "hermes_backend_url", "http://hermes-backend.example", raising=False)
+    monkeypatch.setattr(settings, "hermes_backend_token", "test-token", raising=False)
+    conv_store = ConversationStore(db_path=str(tmp_path / "conversations.db"))
+    usage_store = UsageStore(db_path=str(tmp_path / "usage.db"))
+    monkeypatch.setattr(hp, "get_store", lambda: conv_store)
+    monkeypatch.setattr(hp, "get_usage_store", lambda: usage_store)
+    monkeypatch.setattr(hp, "schedule_retitle", lambda conv_id: None)
+    return (
+        SessionStore(db_path=tmp_path / "sessions.db"),
+        TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+    )
+
+
+def _real_snapshot_rows(monkeypatch, db_path, tmp_path) -> dict[str, dict]:
+    """Build the REAL `/api/agents/snapshot` response through
+    `api/routes/agents.py` — same isolation pattern
+    `tests/test_agent_viz_api.py`'s `stores`/`client` fixtures use, inlined
+    here since this file otherwise has no dependency on the agents route."""
+    reader = SessionStore(db_path=db_path)
+    ts = TranscriptStore(transcripts_dir=tmp_path / "transcripts-read")
+    monkeypatch.setattr(agents_route, "_session_store", reader)
+    monkeypatch.setattr(agents_route, "_transcript_store", ts)
+    monkeypatch.setattr(agents_route, "_claude_code_snapshot", lambda: ([], []))
+    monkeypatch.setattr(agents_route, "_codex_snapshot", lambda: ([], []))
+    agents_route._label_cache.clear()
+    body = TestClient(api_main.app).get("/api/agents/snapshot").json()
+    agents_route._label_cache.clear()
+    return {s["task_id"]: s for s in body["sessions"]}
+
+
+def test_two_real_hermes_turns_interleaved_never_cross_attribute_on_the_real_snapshot(
+    tmp_path, monkeypatch,
+):
+    """Two REAL `HermesExecutor.execute()` turns, different
+    models, chunk-interleaved across two real threads so they're genuinely
+    in flight together — the real snapshot must show each session its own
+    model. Fails under mutation M1 (broadcast every Hermes session's row to
+    the latest observed model): after beta's turn, a broadcasting writer
+    would overwrite alpha's row too, since both are `routing='hermes'` at
+    that point."""
+    store, ts = _hermes_env(tmp_path, monkeypatch)
+    sa = store.create(task_id="t-alpha", status=STATUS_RUNNING, routing="hermes")
+    sb = store.create(task_id="t-beta", status=STATUS_RUNNING, routing="hermes")
+
+    # Each `execute()` call resolves a caller session id via a bare
+    # `SessionStore()` (see `_resolve_caller_session_id` in
+    # `api/routes/hermes_proxy.py`), which constructs against the
+    # DEFAULT-path store (`agent_sessions.db`) — a different file from the
+    # explicitly-pathed store `sa`/`sb` live in. Constructing one here,
+    # before the two threads start, forces its schema/WAL init to happen
+    # once, up front, so both threads find it already created instead of
+    # racing the first-time `PRAGMA journal_mode=WAL`.
+    from api.services.agent_worker.session_store import SessionStore as _SS
+    _SS()
+
+    turn = Turnstile()
+    ea = HermesExecutor(
+        session_store=store, transcript_store=ts,
+        http_client_factory=lambda: _LockstepClient(_turn_chunks("conv-a", "model-ALPHA", "a"), turn, 0),
+    )
+    eb = HermesExecutor(
+        session_store=store, transcript_store=ts,
+        http_client_factory=lambda: _LockstepClient(_turn_chunks("conv-b", "model-BETA", "b"), turn, 1),
+    )
+
+    out: dict = {}
+    ta = threading.Thread(target=lambda: out.update(a=ea.execute(sa, {"description": "qa"})))
+    tb = threading.Thread(target=lambda: out.update(b=eb.execute(sb, {"description": "qb"})))
+    ta.start()
+    tb.start()
+    ta.join(30)
+    tb.join(30)
+
+    assert out["a"].status == STATUS_COMPLETED, out["a"]
+    assert out["b"].status == STATUS_COMPLETED, out["b"]
+
+    rows = _real_snapshot_rows(monkeypatch, store.db_path, tmp_path)
+    assert rows["t-alpha"]["model_label"] == "Hermes · model-ALPHA"
+    assert rows["t-beta"]["model_label"] == "Hermes · model-BETA"
+
+
+def test_completed_sessions_model_is_frozen_against_a_real_later_turn(tmp_path, monkeypatch):
+    """Session alpha completes a REAL Hermes turn, then
+    session beta runs a REAL later turn on a different model — alpha's
+    `model_label` must be byte-identical afterward. The AC4 test in
+    tests/test_agent_viz_api.py writes `hermes_model` by hand via
+    `SessionStore.set_hermes_model()` and never runs a real later turn
+    through `HermesExecutor`; this does. Fails under mutation M1 exactly
+    like the interleaved test above — beta's turn would broadcast to
+    alpha's still-hermes-routed row even though alpha is STATUS_COMPLETED,
+    since the mutation loops over every hermes session with no status
+    check."""
+    store, ts = _hermes_env(tmp_path, monkeypatch)
+    sa = store.create(task_id="t-alpha", status=STATUS_RUNNING, routing="hermes")
+
+    solo = Turnstile(parties=1)
+    ea = HermesExecutor(
+        session_store=store, transcript_store=ts,
+        http_client_factory=lambda: _LockstepClient(_turn_chunks("conv-a", "model-ALPHA", "a"), solo, 0),
+    )
+    assert ea.execute(sa, {"description": "qa"}).status == STATUS_COMPLETED
+    store.update_status("t-alpha", STATUS_COMPLETED)
+
+    rows = _real_snapshot_rows(monkeypatch, store.db_path, tmp_path)
+    assert rows["t-alpha"]["status"] == STATUS_COMPLETED
+    assert rows["t-alpha"]["model_label"] == "Hermes · model-ALPHA"
+
+    sb = store.create(task_id="t-beta", status=STATUS_RUNNING, routing="hermes")
+    solo2 = Turnstile(parties=1)
+    eb = HermesExecutor(
+        session_store=store, transcript_store=ts,
+        http_client_factory=lambda: _LockstepClient(_turn_chunks("conv-b", "model-BETA", "b"), solo2, 0),
+    )
+    assert eb.execute(sb, {"description": "qb"}).status == STATUS_COMPLETED
+
+    rows = _real_snapshot_rows(monkeypatch, store.db_path, tmp_path)
+    assert rows["t-alpha"]["model_label"] == "Hermes · model-ALPHA", "AC4 violated by a real later turn"
+    assert rows["t-beta"]["model_label"] == "Hermes · model-BETA"
+
+
+# ---------------------------------------------------------------------------
+# The tests above give every session in play a real turn of its own. Two gaps
+# that leaves open: a session that never runs a turn at all (completed OR
+# running) must keep its plain `Hermes` label when an UNRELATED session's
+# turn completes, and the failure exit path (only single-session-tested
+# above) must write only to its own session, same as the completion path.
+# ---------------------------------------------------------------------------
+
+
+def test_turnless_hermes_sessions_and_the_chat_anchor_stay_plain_hermes(tmp_path, monkeypatch):
+    """A real turn on session alpha must leave every OTHER session's
+    `hermes_model` alone — including a turn-less completed session, a
+    turn-less running session, and the `/chat` conversation-anchor row
+    `resolve_hermes_caller_session_id` creates (never dispatched, so it
+    never runs a turn of its own). Fails under mutation M3b/M3c (backfill
+    any turn-less hermes row with this turn's model). The anchor is given
+    the SAME conversation id alpha's own turn reports, so a write keyed by
+    conversation_id instead of task_id would also land on it — this also
+    fails under mutation M6."""
+    from api.services.agent_worker.hermes_session import resolve_hermes_caller_session_id
+
+    store, ts = _hermes_env(tmp_path, monkeypatch)
+    sa = store.create(task_id="t-alpha", status=STATUS_RUNNING, routing="hermes")
+    store.create(task_id="t-quiet", status=STATUS_COMPLETED, routing="hermes")
+    store.create(task_id="t-quiet-running", status=STATUS_RUNNING, routing="hermes")
+    anchor_sid = resolve_hermes_caller_session_id(store, "conv-a")
+    anchor_task = "hermes_" + anchor_sid.removeprefix("sess_")
+    store.set_conversation_id(anchor_task, "conv-a")
+
+    ea = HermesExecutor(
+        session_store=store, transcript_store=ts,
+        http_client_factory=lambda: _FakeClient(_sse([
+            {"type": "conversation_id", "conversation_id": "conv-a"},
+            {"type": "content", "content": "hi"},
+            {"type": "usage", "model": "model-ALPHA", "input_tokens": 7, "output_tokens": 3, "cost_usd": 0.001},
+            {"type": "done"},
+        ])),
+    )
+    assert ea.execute(sa, {"description": "qa"}).status == STATUS_COMPLETED
+
+    rows = _real_snapshot_rows(monkeypatch, store.db_path, tmp_path)
+    assert rows["t-alpha"]["model_label"] == "Hermes · model-ALPHA"
+    assert rows["t-quiet"]["model_label"] == "Hermes"
+    assert rows["t-quiet-running"]["model_label"] == "Hermes"
+    assert rows[anchor_task]["model_label"] == "Hermes"
+
+
+def test_failure_exit_path_writes_only_its_own_session(tmp_path, monkeypatch):
+    """AC2 on the FAILURE exit path with TWO real sessions: beta completes
+    a normal turn, then alpha's own turn reports `usage` and drops mid-
+    stream (FAILED). Alpha's own model must still be recorded (the
+    failure path DID record its own model) and beta's must be unchanged.
+    `_record_reported_model` runs on both exit paths, but the
+    completion-path tests above are the only ones with two sessions in
+    play, so a broadcast confined to the failure path alone (mutation M4)
+    is invisible to the rest of the suite."""
+    store, ts = _hermes_env(tmp_path, monkeypatch)
+    sa = store.create(task_id="t-alpha", status=STATUS_RUNNING, routing="hermes")
+    sb = store.create(task_id="t-beta", status=STATUS_RUNNING, routing="hermes")
+
+    eb = HermesExecutor(
+        session_store=store, transcript_store=ts,
+        http_client_factory=lambda: _FakeClient(_sse([
+            {"type": "conversation_id", "conversation_id": "conv-b"},
+            {"type": "content", "content": "hi"},
+            {"type": "usage", "model": "model-BETA", "input_tokens": 7, "output_tokens": 3, "cost_usd": 0.001},
+            {"type": "done"},
+        ])),
+    )
+    assert eb.execute(sb, {"description": "qb"}).status == STATUS_COMPLETED
+
+    dropped = _sse([
+        {"type": "conversation_id", "conversation_id": "conv-a"},
+        {"type": "usage", "model": "model-ALPHA", "input_tokens": 3, "output_tokens": 2, "cost_usd": 0.001},
+    ])
+    ea = HermesExecutor(
+        session_store=store, transcript_store=ts,
+        http_client_factory=lambda: _DropAfterUsageClient(dropped, 200),
+    )
+    assert ea.execute(sa, {"description": "qa"}).status == STATUS_FAILED
+
+    rows = _real_snapshot_rows(monkeypatch, store.db_path, tmp_path)
+    assert rows["t-alpha"]["model_label"] == "Hermes · model-ALPHA"
+    assert rows["t-beta"]["model_label"] == "Hermes · model-BETA", "a failed turn must not rewrite another session"

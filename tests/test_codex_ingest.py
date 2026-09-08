@@ -283,6 +283,23 @@ def test_parse_session_handles_malformed_lines(tmp_path):
     assert any(e["kind"] == "user_message" for e in events)
 
 
+@pytest.mark.unit
+def test_to_session_dict_task_id_is_none_for_locally_scanned_session(tmp_path):
+    """`task_id` must never be a locally scanned Codex session's
+    `raw_session_id` (the rollout UUID) — leaking it in would poison the
+    board's `sessions_by_task` join, making every locally scanned session
+    look like it had a real LifeOS task link. Mirrors
+    `test_to_session_dict_task_id_is_none_for_locally_scanned_session`
+    (tests/test_claude_code_ingest.py) for Claude Code."""
+    root = tmp_path / "sessions"
+    _write_rollout(root, "session-notask", [_session_meta()])
+    metas = cx.discover_sessions(sessions_dir=root)
+    parsed, _ = cx.parse_session(metas[0])
+    d = cx.to_session_dict(parsed)
+    assert d["task_id"] is None
+    assert parsed.raw_session_id  # sanity: the UUID exists, it's just not leaked
+
+
 # ---------------------------------------------------------------------------
 # Status inference
 # ---------------------------------------------------------------------------
@@ -385,3 +402,71 @@ def test_read_normalized_events_unknown_id(tmp_path):
     root = tmp_path / "sessions"
     _write_rollout(root, "session-real", [_session_meta()])
     assert cx.read_normalized_events("cx:session-missing", sessions_dir=root) == []
+
+
+# ---------------------------------------------------------------------------
+# Snapshot cache: liveness-keyed cache + per-row copies
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_build_snapshot_cache_keyed_by_live_counts(tmp_path, monkeypatch):
+    """`live_counts` is part of the cache key so a liveness-scoped caller
+    (`{}` from the remote transcript mirror) never aliases into a caller
+    that scans this machine's processes (`None`)."""
+    root = tmp_path / "sessions"
+    _write_rollout(root, "cx-livekey", [_session_meta(), _turn_context()])
+    cx.invalidate_cache()
+
+    calls = {"n": 0}
+    real_discover = cx.discover_sessions
+
+    def _spy(*args, **kwargs):
+        calls["n"] += 1
+        return real_discover(*args, **kwargs)
+
+    monkeypatch.setattr(cx, "discover_sessions", _spy)
+
+    a1, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts=None)
+    a2, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts=None)
+    assert calls["n"] == 1  # same key -> cache hit
+    assert a1 == a2
+
+    _, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts={})
+    assert calls["n"] == 2  # different key -> rescanned
+
+    _, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts={})
+    assert calls["n"] == 2  # {} entry now warm
+
+
+@pytest.mark.unit
+def test_snapshot_cache_returns_per_row_copies(tmp_path):
+    """Returned rows are shallow copies of the cached dicts, so a caller
+    mutating a returned row can't write into the cache's own entry while
+    it's warm — on both the cache-populate call and a subsequent
+    cache-hit call."""
+    root = tmp_path / "sessions"
+    _write_rollout(root, "cx-rowcopy", [_session_meta(), _turn_context()])
+    cx.invalidate_cache()
+
+    # `live_counts={}` on every call so no local process scan can promote
+    # the row to an authoritative `running`.
+    s1, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts={})
+    wid = s1[0]["session_id"]
+    s1[0]["status"] = "mutated"
+    s1[0]["status_inferred"] = False
+    s1[0]["host"] = "x"
+
+    s2, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts={})
+    row2 = next(r for r in s2 if r["session_id"] == wid)
+    assert row2 is not s1[0]
+    assert row2["status"] != "mutated"
+    assert row2["status_inferred"] is True
+    assert "host" not in row2
+
+    # Mutate the cache-hit result too, covering the cache-hit copy path.
+    row2["status"] = "mutated2"
+    s3, _ = cx.build_snapshot(sessions_dir=root, cache_ttl=60, live_counts={})
+    row3 = next(r for r in s3 if r["session_id"] == wid)
+    assert row3 is not row2
+    assert row3["status"] != "mutated2"
