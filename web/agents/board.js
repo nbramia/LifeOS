@@ -1221,17 +1221,25 @@ export function initBoard() {
   function openDeleteModal(card) {
     const isTask = card.kind === 'task';
     const label = isTask ? (card.title || card.id) : (card.name || card.id);
-    const hasLiveSession = !!(card.session && !TERMINAL.has(card.session.status));
-    const isCliSession = !!(card.session && (card.session.source === 'claude_code' || card.session.source === 'codex'));
-    const needsKill = isTask && hasLiveSession && !isCliSession;
-    let noteHtml;
-    if (needsKill) {
-      noteHtml = `<div class="descendants">Deleting this card will kill the running session and its subagents first, then remove the card. This can't be undone.</div>`;
-    } else if (isTask && hasLiveSession && isCliSession) {
-      noteHtml = `<div class="descendants">This card has a live ${escapeHtml(sourceLabelFor(card.session))} session that can't be killed from here — close its pane manually. Deleting removes the card. This can't be undone.</div>`;
-    } else {
-      noteHtml = `<div class="descendants">This can't be undone.</div>`;
+    // Maps a card to its kill decision and note text — called both here
+    // (against the live card, not the possibly-stale drawer snapshot,
+    // since `updateOpenDrawer` skips rebuilding the drawer while it holds
+    // focus) and again at confirm time.
+    function killDecision(c) {
+      const hasLiveSession = !!(c.session && !TERMINAL.has(c.session.status));
+      const isCliSession = !!(c.session && (c.session.source === 'claude_code' || c.session.source === 'codex'));
+      const needsKill = isTask && hasLiveSession && !isCliSession;
+      let noteHtml;
+      if (needsKill) {
+        noteHtml = `<div class="descendants">Deleting this card will kill the running session and its subagents first, then remove the card. This can't be undone.</div>`;
+      } else if (isTask && hasLiveSession && isCliSession) {
+        noteHtml = `<div class="descendants">This card has a live ${escapeHtml(sourceLabelFor(c.session))} session that can't be killed from here — close its pane manually. Deleting removes the card. This can't be undone.</div>`;
+      } else {
+        noteHtml = `<div class="descendants">This can't be undone.</div>`;
+      }
+      return { needsKill, noteHtml };
     }
+    let { needsKill, noteHtml } = killDecision(findCard(card.id) || card);
     const backdrop = document.createElement('div');
     backdrop.className = 'modal-backdrop';
     backdrop.innerHTML = `
@@ -1256,20 +1264,29 @@ export function initBoard() {
     backdrop.querySelector('#delete-cancel').onclick = () => { if (!pending) cleanup(); };
     backdrop.querySelector('#delete-confirm').onclick = async () => {
       const confirmBtn = backdrop.querySelector('#delete-confirm');
+      // Re-resolve the card from the live board rather than trusting the
+      // snapshot captured when the modal opened — `updateOpenDrawer` skips
+      // rebuilding the drawer while it holds focus, so a card the worker
+      // claims after the drawer opened can still show a session-less
+      // snapshot here. Falls back to the captured `card` if it's vanished
+      // from the board entirely.
+      const fresh = findCard(card.id) || card;
+      const { needsKill: freshNeedsKill, noteHtml: freshNoteHtml } = killDecision(fresh);
+      if (freshNeedsKill && !needsKill) {
+        // The disclosed note didn't promise a kill but one is now
+        // required — update the note in place and make the operator
+        // confirm again against accurate text rather than killing a
+        // session they were never told about.
+        needsKill = freshNeedsKill;
+        backdrop.querySelector('.descendants').outerHTML = freshNoteHtml;
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = 'Delete';
+        return;
+      }
       pending = true;
       confirmBtn.disabled = true;
       confirmBtn.textContent = 'Deleting…';
       try {
-        // Re-resolve the card from the live board rather than trusting the
-        // snapshot captured when the modal opened — `updateOpenDrawer`
-        // skips rebuilding the drawer while it holds focus, so a card the
-        // worker claims after the drawer opened can still show a
-        // session-less snapshot here. Falls back to the captured `card`
-        // if it's vanished from the board entirely.
-        const fresh = findCard(card.id) || card;
-        const freshHasLiveSession = !!(fresh.session && !TERMINAL.has(fresh.session.status));
-        const freshIsCliSession = !!(fresh.session && (fresh.session.source === 'claude_code' || fresh.session.source === 'codex'));
-        const freshNeedsKill = isTask && freshHasLiveSession && !freshIsCliSession;
         if (freshNeedsKill) {
           const kr = await fetch(`/api/agents/sessions/${encodeURIComponent(fresh.session.session_id)}/kill`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),

@@ -2662,12 +2662,82 @@ class TestDeleteCard:
         expect(notes).to_be_focused()  # drawer not rebuilt while focused
 
         page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator(".modal .descendants")).to_contain_text(
+            "kill the running session and its subagents"
+        )
         page.locator("#delete-confirm").click()
         expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
         assert kill_calls == ["s-t23-live"]
         assert task_deletes == ["t23"]
         # The kill happened before the delete, not merely both happening.
         assert call_log == [("kill", "s-t23-live"), ("task_delete", "t23")]
+
+    def test_delete_redisclosed_when_a_session_appears_after_the_modal_opens(self, page: Page, agents_base_url):
+        """The confirmation's note is resolved once, when the modal opens.
+        If the card's live session state changes while the confirmation
+        sits open — no drawer focus required, since a live board tick
+        updates the module-level board state regardless — the first
+        Confirm click must not silently kill a session the note never
+        disclosed. It updates the note to the kill wording and re-enables
+        the button instead, requiring a second Confirm."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append({
+            "kind": "task", "id": "t24", "title": "Unclaimed card that gets claimed mid-confirmation",
+            "notes": "", "status": "todo", "tags": ["claude"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        board_stream_frames: list[str] = []
+        task_deletes = []
+        kill_calls = []
+        call_log = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+            task_deletes=task_deletes, kill_calls=kill_calls, call_log=call_log,
+        )
+        page.locator('[data-card-id="t24"]').click()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator(".modal .descendants")).to_contain_text("This can't be undone.")
+        expect(page.locator(".modal .descendants")).not_to_contain_text(
+            "kill the running session and its subagents"
+        )
+
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t24":
+                card["status"] = "in_progress"
+                card["tags"] = ["claude", "agent-running"]
+                card["session"] = {
+                    "session_id": "s-t24-live", "status": "running",
+                    "host": "test-host", "routing": "claude", "model_label": "Sonnet",
+                    "source": "lifeos_agent",
+                }
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text("urgent", timeout=5000)
+
+        # First confirm click: redisclose rather than silently kill.
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".modal .descendants")).to_contain_text(
+            "kill the running session and its subagents"
+        )
+        expect(page.locator("#delete-confirm")).to_be_enabled()
+        expect(page.locator("#delete-confirm")).to_have_text("Delete")
+        assert kill_calls == []
+        assert task_deletes == []
+        assert call_log == []
+
+        # Second confirm click: the note now promises the kill, so it happens.
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert kill_calls == ["s-t24-live"]
+        assert task_deletes == ["t24"]
+        assert call_log == [("kill", "s-t24-live"), ("task_delete", "t24")]
 
     def test_claimed_task_card_with_live_session_kills_before_deleting(self, page: Page, agents_base_url):
         board_state = copy.deepcopy(_board_fixture())
