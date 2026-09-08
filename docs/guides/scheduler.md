@@ -76,12 +76,6 @@ with a 422 that lists the accepted ones. Leaving the field unset means the
 primary bot, which is what an installation with no specialized bots configured
 gets.
 
-`PUT /api/scheduler/{id}` validates every field it's given the same way: an
-unparsable cron expression or ISO datetime, an unrecognised `schedule_type` or
-`action`, or an unresolvable IANA `timezone` all reject the write with a 400 or
-422 (matching the status `POST /api/scheduler` already uses for that field) and
-save nothing — only the fields actually present in the request are checked.
-
 If a stored schedule names a bot the registry no longer has — usually because
 the bot was renamed after the schedule was written — the notification is still
 delivered from the primary bot rather than dropped, but the message carries a
@@ -144,6 +138,21 @@ curl -X POST http://localhost:8000/api/scheduler \
 `executor` parameters.
 
 ## Managing Schedules
+
+`PUT /api/scheduler/{id}` validates every field it's given: an unrecognised
+`schedule_type` or `action` rejects the write with a 400 (the same status
+`POST /api/scheduler` uses for those two fields), and an unparsable cron
+expression or ISO datetime, or an unresolvable IANA `timezone`, rejects it
+with a 422. Either way nothing is saved. `POST /api/scheduler` does not run
+the cron / datetime / timezone checks — a schedule created with an unparsable
+value stores fine and then never computes a next fire, which is why the
+update path checks them.
+
+Nothing is saved when a check fails. A request that changes `schedule_type`
+without also sending a matching `schedule_value` is checked against the
+value already stored, so a `cron` entry can't be flipped to `once` (or back)
+and left pointing at a value that doesn't parse under its own type — send
+the type and the new value together to convert a schedule.
 
 - **List:** `GET /api/scheduler`, `lifeos_schedule_list`, or "list my schedules"
 - **Update:** `PUT /api/scheduler/{id}`, or edit the line in Obsidian

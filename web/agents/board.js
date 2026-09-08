@@ -1158,6 +1158,7 @@ export function initBoard() {
     const botReasonEl = drawerEl.querySelector('[data-field="bot-reason"]');
     const previewEl = drawerEl.querySelector('[data-field="next-fire-preview"]');
     const lastRunEl = drawerEl.querySelector('[data-field="last-run-info"]');
+    const triggerBtnEl = drawerEl.querySelector('[data-action="trigger-now"]');
 
     previewEl.textContent = formatNextFire(card.next_fire_at);
     lastRunEl.textContent = formatLastRun(card.last_run);
@@ -1214,6 +1215,9 @@ export function initBoard() {
         valueErrorEl.hidden = true;
         valueErrorEl.textContent = '';
         previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        if (typeChanged) {
+          triggerBtnEl.textContent = lastSavedType === 'once' ? 'Trigger now (disables this one-off)' : 'Trigger now';
+        }
         await fetchBoard();
       } catch (err) {
         valueErrorEl.textContent = err.message;
@@ -1280,23 +1284,24 @@ export function initBoard() {
       }
     });
 
-    // The bot select only ever offers names the API accepts — the empty
-    // "default (primary)" option (distinguishable from the registry's own
-    // "primary" row) plus whatever GET /api/scheduler/bots returns — so
-    // picking an unaccepted name is structurally impossible. A stored name
-    // the registry response doesn't include (a bot renamed after the
-    // schedule was written) is appended as a selected, flagged-unknown
-    // option instead of leaving the select with no matching value, and a
-    // failed fetch disables the select and shows the reason as visible
-    // text next to it while still keeping that stored value visible the
-    // same way — mirroring the host dropdown's pattern
+    // When the registry loads, the bot select offers only names the API
+    // accepts — the empty "default (primary)" option (distinguishable from
+    // the registry's own "primary" row) plus whatever GET
+    // /api/scheduler/bots returns. A stored name the loaded registry
+    // doesn't include (a bot renamed after the schedule was written) is
+    // appended as a selected, flagged-unknown option instead of leaving
+    // the select with no matching value. When the fetch itself fails, the
+    // stored name isn't known to be invalid — just unconfirmed — so it's
+    // kept visible and selected without that flag, and the select is
+    // disabled with the reason shown as visible text next to it,
+    // mirroring the host dropdown's pattern
     // (web/agents/assignment.js's seedHostOptions/populateHostOptions).
     loadBotCatalog().then(catalog => {
       const stored = card.bot || '';
       if (!catalog) {
         const optionsHtml = ['<option value="">default (primary)</option>'];
         if (stored) {
-          optionsHtml.push(`<option value="${escapeHtml(stored)}" selected data-unknown="true">${escapeHtml(stored)} (unknown)</option>`);
+          optionsHtml.push(`<option value="${escapeHtml(stored)}" selected>${escapeHtml(stored)}</option>`);
         }
         botEl.innerHTML = optionsHtml.join('');
         botEl.value = stored;

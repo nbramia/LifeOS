@@ -263,6 +263,52 @@ class TestScheduleTypeAndValue:
         expect(value_input).to_have_value("0 9 * * *")
         expect(type_select).to_have_value("cron")
 
+    def test_type_conversion_to_once_updates_the_trigger_button_label(self, page: Page, agents_base_url):
+        """Converting a `cron` entry to `once` in the open drawer must
+        flip the Trigger now button's disclosure the moment the combined
+        type/value save succeeds -- not only on a later reopen -- since
+        the drawer holding focus blocks the board's own periodic
+        redraw."""
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)
+        type_select = page.locator('[data-field="schedule-type"]')
+        value_input = page.locator('[data-field="schedule-value"]')
+        button = page.locator('[data-action="trigger-now"]')
+        expect(button).to_have_text("Trigger now")
+
+        type_select.select_option("once")
+        value_input.fill("2026-06-03T15:05:00")
+        page.locator('[data-field="timezone"]').click()  # blur
+        _wait_for(
+            lambda: {"schedule_type": "once", "schedule_value": "2026-06-03T15:05:00"} in schedule_puts,
+            page=page,
+        )
+        expect(button).to_contain_text("disables")
+
+    def test_type_conversion_to_cron_updates_the_trigger_button_label(self, page: Page, agents_base_url):
+        """The reverse direction: converting a `once` entry to `cron`
+        must drop the one-off disclosure once the save succeeds, rather
+        than continuing to warn about consuming a schedule that is now
+        recurring."""
+        schedule_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["schedule_type"] = "once"
+        board_state["lanes"]["scheduled"][0]["schedule_value"] = "2099-01-01T09:00:00"
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        type_select = page.locator('[data-field="schedule-type"]')
+        value_input = page.locator('[data-field="schedule-value"]')
+        button = page.locator('[data-action="trigger-now"]')
+        expect(button).to_contain_text("disables")
+
+        type_select.select_option("cron")
+        value_input.fill("0 10 * * *")
+        page.locator('[data-field="timezone"]').click()  # blur
+        _wait_for(
+            lambda: {"schedule_type": "cron", "schedule_value": "0 10 * * *"} in schedule_puts,
+            page=page,
+        )
+        expect(button).to_have_text("Trigger now")
+
     def test_schedule_value_edit_saves_on_blur(self, page: Page, agents_base_url):
         schedule_puts = []
         _open_board(page, agents_base_url, schedule_puts=schedule_puts)
@@ -429,6 +475,13 @@ class TestActionExecutorBot:
         expect(bot_select).to_have_value("ledger")
         values = bot_select.locator("option").evaluate_all("els => els.map(e => e.value)")
         assert values == ["", "ledger"]
+        # A registry-fetch failure doesn't mean the stored name is
+        # unresolvable -- only that the registry couldn't be checked -- so
+        # the option must read the plain name, not the orphan label the
+        # "registry loaded and doesn't list it" case uses below.
+        option = bot_select.locator('option[value="ledger"]')
+        assert option.text_content() == "ledger"
+        assert option.get_attribute("data-unknown") is None
         reason = page.locator('[data-field="bot-reason"]')
         expect(reason).to_be_visible()
         expect(reason).to_contain_text("unavailable")
