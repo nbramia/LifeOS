@@ -203,8 +203,12 @@ class TestScheduleTypeAndValue:
         expect(value_input).to_have_attribute("placeholder", "0 9 * * *")
 
         type_select.select_option("once")
+        # Checked immediately with get_attribute() (a one-shot read, unlike
+        # expect()'s polling) so a regression that only updates the label
+        # once the save's own board refetch redraws the drawer -- rather
+        # than synchronously in the change handler -- is still caught.
+        assert value_input.get_attribute("placeholder") == "2026-06-03T15:05:00"
         _wait_for(lambda: {"schedule_type": "once"} in schedule_puts, page=page)
-        expect(value_input).to_have_attribute("placeholder", "2026-06-03T15:05:00")
 
     def test_schedule_value_edit_saves_on_blur(self, page: Page, agents_base_url):
         schedule_puts = []
