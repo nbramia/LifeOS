@@ -236,6 +236,7 @@ class TestClustering:
     def test_three_sessions_on_one_card_all_link_to_its_anchor(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)
         _go_to_graph(page)
+        anchor_ids = {a["id"] for a in _anchors(page)}
         linked = page.evaluate(
             "() => Array.from(document.querySelectorAll('path.link-anchor')).map(el => "
             "({source: (el.__data__.source.session_id || el.__data__.source),"
@@ -244,6 +245,10 @@ class TestClustering:
         cluster_ids = {"sess-cluster-1", "sess-cluster-2", "cc:cluster-3"}
         targets = {edge["target"] for edge in linked if edge["source"] in cluster_ids}
         assert targets == {"card:t-cluster"}, linked
+        # A link's own target string is not enough on its own — it must name
+        # an anchor that's actually rendered, not a dangling id nothing in
+        # the anchor layer answers to.
+        assert targets <= anchor_ids, (targets, anchor_ids)
 
     def test_session_with_no_card_attaches_to_its_host_anchor(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)
