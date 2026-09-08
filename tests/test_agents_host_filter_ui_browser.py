@@ -165,8 +165,7 @@ def _open_agents(page: Page, base_url):
     # applies it, so wait for those options rather than for the select
     # itself, which exists in the markup before any data arrives.
     page.wait_for_function(
-        "document.querySelector('#filter-host').options.length > 1",
-        timeout=8000,
+        "document.querySelector('#filter-host').options.length > 1"
     )
 
 
@@ -443,7 +442,7 @@ def _open_agents2(page: Page, base_url):
     page.locator("#filter-terminal").check()
     # Nodes render synchronously once the filters above are applied — wait
     # for the first one rather than for a fixed delay.
-    page.wait_for_selector(".node", timeout=8000)
+    page.wait_for_selector(".node")
 
 
 class TestRecentChipAndRouteFilterAndNodeLabels:
@@ -682,7 +681,7 @@ def _open_agents3(page: Page, base_url):
     page.locator("#filter-terminal").check()
     # Nodes render synchronously once the filters above are applied — wait
     # for the first one rather than for a fixed delay.
-    page.wait_for_selector(".node", timeout=8000)
+    page.wait_for_selector(".node")
 
 
 class TestSearchDropdownRawIdGuard:
@@ -826,7 +825,7 @@ def _open_agents4(page: Page, base_url, search_matches=None):
     page.locator("#filter-terminal").check()
     # Nodes render synchronously once the filters above are applied — wait
     # for the first one rather than for a fixed delay.
-    page.wait_for_selector(".node", timeout=8000)
+    page.wait_for_selector(".node")
 
 
 class TestSearchDropdownLabelSourcePrecedence:
