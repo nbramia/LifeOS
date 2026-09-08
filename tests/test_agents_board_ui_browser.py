@@ -990,8 +990,8 @@ class TestHostAssignmentChipAndFilter:
         })
         board_state["lanes"]["assigned"].append({
             # No assignment at all, but a linked session ran somewhere —
-            # the ran-on chip still renders exactly as it does without F1's
-            # suppression logic in play.
+            # the ran-on chip renders on its own, with no assignment chip
+            # to suppress it.
             "kind": "task", "id": "t12", "title": "No assignment, but a session ran",
             "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
             "fields": {}, "context": "Inbox",
@@ -1057,7 +1057,7 @@ class TestHostAssignmentChipAndFilter:
         expect(page.locator('[data-card-id="t10"]')).to_be_visible()
         expect(page.locator('[data-card-id="t8"]')).to_have_count(0)
 
-        # Acceptance criterion 4 ("leaves lane layout intact at 1280x800"):
+        # Filtering leaves the lane layout intact at 1280x800:
         # the page never grows a horizontal scrollbar, and every lane
         # column filtering left on screen still has real width rather than
         # collapsing to zero. `body` has `overflow: hidden` and #board-lanes

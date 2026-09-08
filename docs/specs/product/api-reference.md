@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-07
+**Last Updated:** 2026-09-08
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Four adjacent catalogs split out for size:
 
