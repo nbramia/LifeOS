@@ -252,28 +252,78 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   }
   updateVisibility();
 
-  let catalogReady = false;
+  // Model select: the saved model is seeded as a selected option
+  // SYNCHRONOUSLY, before `GET /api/agents/models` has even been
+  // requested, so `modelEl.value` is correct from the very first render
+  // — mirroring the host select immediately below. Once the real catalog
+  // resolves, populateModelOptions() rebuilds the options list against it
+  // and the LIVE select value, classifying that value three ways (see its
+  // own comment below): a model the current engine's catalog lists keeps
+  // its normal label; one only another engine's catalog lists drops to
+  // "engine default"; one no engine's catalog lists stays as the same
+  // flagged-unknown option (`data-unknown="true"`) rather than
+  // disappearing.
+  function seedModelOptions() {
+    const optionsHtml = ['<option value="">engine default</option>'];
+    if (currentModel) {
+      optionsHtml.push(`<option value="${escapeHtml(currentModel)}" selected data-unknown="true">${escapeHtml(currentModel)} (unknown)</option>`);
+    }
+    modelEl.innerHTML = optionsHtml.join('');
+  }
+  seedModelOptions();
+
   function populateModelOptions(catalog) {
+    // Read the LIVE selection, not `currentModel` (the render-time
+    // snapshot) — the operator may have already changed the model, or
+    // switched engines, while this fetch was in flight, and that live
+    // choice wins over the catalog landing. `modelEl.value` still equals
+    // the seeded `currentModel` when nothing has changed, so the
+    // synchronous-seed behavior above is unaffected. This also runs on
+    // every mount — including a full remount driven by board.js's own
+    // Assignee select, which replaces this module's engine picker as the
+    // one way an operator actually changes a card's engine — so the
+    // engine-ownership decision below has to live here rather than in a
+    // change handler on this module's own (board-hidden) engine select.
     const engine = engineEl.value;
-    const models = (catalog.engines && catalog.engines[engine]) || [];
-    modelEl.innerHTML = '<option value="">engine default</option>'
-      + models.map(m => `<option value="${escapeHtml(m.id)}" ${currentModel === m.id ? 'selected' : ''}>${escapeHtml(m.label || m.id)}</option>`).join('');
-    catalogReady = true;
+    const engines = catalog.engines || {};
+    const models = engines[engine] || [];
+    const current = modelEl.value;
+    const known = models.some(m => m.id === current);
+    // A live selection absent from the CURRENT engine's catalog but
+    // listed by some OTHER engine's catalog belongs to that other
+    // engine — a model id is only valid for the catalog it came from,
+    // and carrying it onto this engine's CLI invocation fails there. A
+    // selection absent from EVERY engine's catalog is genuinely unknown
+    // and stays selected, flagged `data-unknown="true"`.
+    const foreign = current && !known && Object.keys(engines)
+      .some(other => other !== engine && (engines[other] || []).some(m => m.id === current));
+    const optionsHtml = ['<option value="">engine default</option>'];
+    for (const m of models) {
+      const selected = !foreign && current === m.id ? 'selected' : '';
+      optionsHtml.push(`<option value="${escapeHtml(m.id)}" ${selected}>${escapeHtml(m.label || m.id)}</option>`);
+    }
+    if (current && !known && !foreign) {
+      optionsHtml.push(`<option value="${escapeHtml(current)}" selected data-unknown="true">${escapeHtml(current)} (unknown)</option>`);
+    }
+    modelEl.innerHTML = optionsHtml.join('');
+    if (foreign) {
+      // Drop the foreign selection back to "engine default", and reset
+      // the failed-save revert target to match — otherwise a later
+      // rejected save could restore the dropped model into the picker.
+      modelEl.value = '';
+      lastSavedModel = '';
+    }
   }
   loadCatalog().then(populateModelOptions);
 
-  // Host select: unlike the model select (which is safe to leave empty
-  // until the catalog resolves — a `model` field is simply omitted from
-  // the PUT until then, see save()'s comment below), a `host` field is
-  // never omitted — an early effort/engine change must still carry the
-  // card's saved host along. So the saved host is seeded as a selected
-  // option SYNCHRONOUSLY, before `GET /api/agents/hosts` has even been
-  // requested, rather than adding a second readiness flag: hostEl.value
-  // is correct from the very first render. Once the real host list
-  // resolves, populateHostOptions() rebuilds the options list against it
-  // — a saved host that IS in the registry gets its real online marker; a
-  // saved host that ISN'T stays as the same flagged-unknown option
-  // (`data-unknown="true"`) rather than disappearing.
+  // Host select: the saved host is seeded as a selected option
+  // SYNCHRONOUSLY, before `GET /api/agents/hosts` has even been
+  // requested, so hostEl.value is correct from the very first render.
+  // Once the real host list resolves, populateHostOptions() rebuilds the
+  // options list against it — a saved host that IS in the registry gets
+  // its real online marker; a saved host that ISN'T stays as the same
+  // flagged-unknown option (`data-unknown="true"`) rather than
+  // disappearing.
   function seedHostOptions() {
     const optionsHtml = ['<option value="">this machine</option>'];
     if (currentHost) {
@@ -360,16 +410,16 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   }
 
   // Every picker writes the SAME shape: the assignee tag (if it's the
-  // engine picker changing) plus the three inline fields, always stamping
-  // `assigned_by: "board"` — that's what keeps preflight's routing
-  // corroboration from ever second-guessing a board assignment (see
-  // api/services/agent_worker/preflight.py's `_apply_route_corroboration`
-  // and assignment.py's module docstring). The `model` field is the one
-  // exception: it's omitted (not nulled) until the model catalog has
-  // populated the select. Before that, `modelEl.value` is always '' —
-  // regardless of what the card has saved — so sending `model: null` would
-  // wipe the card's already-saved model on the very first effort/host
-  // change of a page load, before `GET /api/agents/models` has resolved.
+  // engine picker changing) plus the three inline fields — model, effort,
+  // host — always stamping `assigned_by: "board"` — that's what keeps
+  // preflight's routing corroboration from ever second-guessing a board
+  // assignment (see api/services/agent_worker/preflight.py's
+  // `_apply_route_corroboration` and assignment.py's module docstring).
+  // The model select's synchronous seed (see seedModelOptions above)
+  // means `modelEl.value` already equals the card's saved model before
+  // the catalog resolves, so sending it on the very first effort/host
+  // change of a page load carries the saved value forward instead of
+  // clearing it.
   //
   // Saves are serialized through a single in-flight chain (`saveChain`
   // below) rather than fired independently: without it, whichever of two
@@ -394,12 +444,12 @@ export function renderAssignmentPickers(container, card, opts = {}) {
     const sentHost = hostEl.value.trim();
     const sentModel = modelEl.value;
     const fields = {
+      model: sentModel || null,
       effort: sentEffort || null,
       host: sentHost || null,
       assigned_by: 'board',
       ...extraFields,
     };
-    if (catalogReady) fields.model = sentModel || null;
     const patch = { fields };
     if (tags) patch.tags = tags;
     try {
@@ -408,7 +458,7 @@ export function renderAssignmentPickers(container, card, opts = {}) {
       // failed save has something correct to revert to.
       lastSavedEffort = sentEffort;
       lastSavedHost = sentHost;
-      if (catalogReady) lastSavedModel = sentModel;
+      lastSavedModel = sentModel;
       clearError();
       onSaved();
     } catch (err) {
@@ -423,7 +473,7 @@ export function renderAssignmentPickers(container, card, opts = {}) {
       // no user-reachable path that leaves it stale.
       restoreSelect(effortEl, lastSavedEffort);
       restoreSelect(hostEl, lastSavedHost);
-      if (catalogReady) restoreSelect(modelEl, lastSavedModel);
+      restoreSelect(modelEl, lastSavedModel);
       showError(err && err.message ? err.message : String(err));
     }
   }
@@ -445,11 +495,19 @@ export function renderAssignmentPickers(container, card, opts = {}) {
 
   engineEl.addEventListener('change', () => {
     updateVisibility();
-    loadCatalog().then(populateModelOptions);
     const engine = engineEl.value;
     const nonAssigneeTags = (card.tags || []).filter(t => !ENGINES.includes((t || '').toLowerCase()));
     const tags = engine ? [engine, ...nonAssigneeTags] : nonAssigneeTags;
-    save({ tags });
+    // `populateModelOptions` decides whether the live model selection
+    // belongs to this engine, another engine, or no engine's catalog at
+    // all (see its own comment above) — chained onto the same catalog
+    // fetch as `save`, one after the other, so the PUT this engine
+    // switch fires always carries the value that decision just settled
+    // on rather than racing it.
+    loadCatalog().then(catalog => {
+      populateModelOptions(catalog);
+      save({ tags });
+    });
   });
   modelEl.addEventListener('change', () => save());
   effortEl.addEventListener('change', () => save());

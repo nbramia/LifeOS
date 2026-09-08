@@ -1374,6 +1374,71 @@ class TestAssignmentPickers:
         expect(reopened_model.locator("option")).to_have_count(3)
         expect(reopened_model).to_have_value("claude-sonnet-5")
 
+    def test_board_assignee_change_to_another_engine_drops_a_model_that_engine_lists(self, page: Page, agents_base_url):
+        """The drawer's own Assignee select (`.drawer-assignee`) is the one
+        reachable way an operator changes a card's engine — it hides
+        assignment.js's own engine row and moves the card by calling
+        moveCard() then renderDrawer(fresh), a full remount of
+        renderAssignmentPickers. A model claude's own catalog lists must
+        not survive that remount onto codex: populateModelOptions() drops
+        it to "engine default" on the mount for the new engine, and a
+        following effort save's PUT carries model: null."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-sonnet-5", "effort": "medium"}
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t7"]').click()
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        expect(model_select.locator("option")).to_have_count(3)
+        expect(model_select).to_have_value("claude-sonnet-5")
+
+        page.locator(".drawer-assignee").select_option("codex")
+        expect(model_select).to_have_value("")
+        expect(model_select.locator("option[data-unknown='true']")).to_have_count(0)
+        expect(model_select.locator("option:checked")).to_have_text("engine default")
+
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        expect(effort_select).to_be_visible()
+        effort_select.select_option("high")
+        _wait_for(lambda: any("fields" in p for p in task_puts), page=page)
+        page.wait_for_timeout(100)  # let any second, unwanted PUT land before counting
+        fields_puts = [p for p in task_puts if "fields" in p]
+        assert len(fields_puts) == 1, task_puts
+        assert fields_puts[0]["fields"]["model"] is None
+
+    def test_board_assignee_change_keeps_a_model_no_engine_lists(self, page: Page, agents_base_url):
+        """The positive companion to
+        test_board_assignee_change_to_another_engine_drops_a_model_that_engine_lists:
+        a model absent from EVERY engine's catalog survives the same
+        board-driven remount, still selected and flagged
+        `data-unknown="true"`, and a following effort save's PUT still
+        carries it."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-legacy-9", "effort": "medium"}
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t7"]').click()
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        expect(model_select.locator("option[data-unknown='true']")).to_have_count(1)
+        expect(model_select).to_have_value("claude-legacy-9")
+
+        page.locator(".drawer-assignee").select_option("codex")
+        expect(model_select.locator("option[data-unknown='true']")).to_have_count(1)
+        expect(model_select).to_have_value("claude-legacy-9")
+
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        expect(effort_select).to_be_visible()
+        effort_select.select_option("high")
+        _wait_for(lambda: any("fields" in p for p in task_puts), page=page)
+        page.wait_for_timeout(100)  # let any second, unwanted PUT land before counting
+        fields_puts = [p for p in task_puts if "fields" in p]
+        assert len(fields_puts) == 1, task_puts
+        assert fields_puts[0]["fields"]["model"] == "claude-legacy-9"
+
     def test_open_button_posts_and_shows_success_toast(self, page: Page, agents_base_url):
         open_calls = []
         _open_board(page, agents_base_url, open_calls=open_calls)
