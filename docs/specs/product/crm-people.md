@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-09-04
+**Last Updated:** 2026-09-05
 
 People management: the list and detail views at `/crm`, the contact-source model behind entity splitting/merging, the relationship-strength score that drives ranking and Dunbar circles, and the multi-stage fact-extraction pipeline that surfaces memorable personal details.
 
@@ -219,6 +219,17 @@ Detail panel that slides in when a person is selected. Shows contact info (email
 ```
 
 Timeline, Connections, and Graph tabs are covered in their respective specs ([crm-interactions.md](crm-interactions.md), [crm-graph.md](crm-graph.md)).
+
+### Tone card
+
+The Overview tab shows a compact Tone card for any person who isn't the owner and has ever had iMessage history (`person.sources` includes `imessage`); it's hidden otherwise. The gate is iMessage-specific because the tone pipeline only ever reads `source_type="imessage"` -- a WhatsApp/Slack/phone-only person can never have anything for it to analyze. It loads with the cheap, LLM-free `compute=false` read of `POST /api/crm/relationship/tone-analysis` (see [api-crm.md](api-crm.md#tone-analysis) and [crm-analytics.md](crm-analytics.md#tone-analysis-apis)) and renders one of five states, driven by the response's top-level `status`:
+- **No iMessage in the window** (`status: "no-messages"`) — the person has iMessage history somewhere, but none inside the analysis window; explainer text only, no button.
+- **Not analyzed** (`status: "ok"`, no scored months) — a short explainer and an "Analyze tone" button.
+- **Analyzed** (`status: "ok"`, at least one scored month) — a trend label, average, a small sparkline of monthly combined scores positioned by calendar-month distance (a stale month dimmed and dashed on the line, an error month a separate small marker off the line), and "through \<month\>", with a refresh control.
+- **In progress** (`status: "in-progress"`) — another request already holds this person's per-person lock; progress text, and the card re-reads with `compute=false` every 5 seconds (up to ~5 minutes) until real months appear, never showing a failure for this.
+- **Failed** (`status: "failed"`) — a `compute=true` attempt that couldn't produce or find any real score; the one-line notice, plus the explainer/button.
+
+Switching to a different person cancels a still-in-flight tone request (and any pending "in progress" poll) for the one left behind. This card is independent of the Relationship page's own Tone Evolution chart ([crm-analytics.md](crm-analytics.md#communication-visualizations)), which always shows separate user/partner scores for the configured partner.
 
 ---
 
