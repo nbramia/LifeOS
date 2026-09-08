@@ -390,8 +390,14 @@ class TestSharedFilters:
         _open_agents(page, agents_base_url, snapshot=two_host_snapshot, board=two_host_board)
         assert page.input_value("#board-filter-host") == "host-a"
         # And the graph's own host options, freshly populated on this new
-        # page load, must prefer the same persisted value too.
-        _go_to_graph(page)
+        # page load, must prefer the same persisted value too — checked
+        # without `_go_to_graph`'s own recency/lane selects, which would
+        # themselves re-trigger a sync that could mask a broken
+        # `updateHostOptions` (its own preferred-value fix, isolated from
+        # `syncSharedFilterControls`'s).
+        page.click('[data-tab="graph"]')
+        page.wait_for_selector("#filter-route")
+        page.wait_for_timeout(500)
         assert page.input_value("#filter-host") == "host-a"
 
     def test_clear_resets_every_shared_filter(self, page: Page, agents_base_url):
