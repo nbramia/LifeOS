@@ -205,8 +205,9 @@ class TestScheduleTypeAndValue:
         type_select.select_option("once")
         # Checked immediately with get_attribute() (a one-shot read, unlike
         # expect()'s polling) so a regression that only updates the label
-        # once the save's own board refetch redraws the drawer -- rather
-        # than synchronously in the change handler -- is still caught.
+        # via the save's own board refetch redraw -- rather than
+        # synchronously in the select's own event listener -- is still
+        # caught.
         assert value_input.get_attribute("placeholder") == "2026-06-03T15:05:00"
         _wait_for(lambda: {"schedule_type": "once"} in schedule_puts, page=page)
 
@@ -273,9 +274,9 @@ class TestActionExecutorBot:
         expect(bot_row).to_be_visible()
 
         action_select.select_option("agent")
-        # The swap happens synchronously in the change handler, before the
-        # save's network round trip resolves -- checked with a
-        # non-auto-waiting is_visible()/is_hidden() query rather than
+        # The swap happens synchronously in the select's own event
+        # listener, ahead of the save's network round trip -- checked with
+        # a non-auto-waiting is_visible()/is_hidden() query rather than
         # expect()'s polling, which would also pass if the swap only
         # happened later, via the save's own board refetch.
         assert executor_row.is_visible()
