@@ -177,11 +177,25 @@ def _move_card_in_state(board_state: dict, card_id: str, target_lane: str) -> No
                 return
 
 
+def _remove_card_from_state(board_state: dict, card_id: str) -> None:
+    """Mutate the stub's in-memory board the way a real DELETE would, so a
+    follow-up GET /api/agents/board reflects the card's removal instead of
+    a re-fetch snapping it back into place against a static fixture."""
+    for cards in board_state["lanes"].values():
+        for card in list(cards):
+            if card["id"] == card_id:
+                cards.remove(card)
+                return
+
+
 def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: list, lane_status_code: list,
                   schedule_puts: list, board_stream_frames: list, stream_gate: "threading.Event | None" = None,
                   lane_response: "list | None" = None, open_calls: "list | None" = None,
                   open_response: "dict | None" = None, task_posts: "list | None" = None,
-                  cancel_calls: "list | None" = None, cancel_failures: "list | None" = None):
+                  cancel_calls: "list | None" = None, cancel_failures: "list | None" = None,
+                  kill_calls: "list | None" = None, kill_status_code: "list | None" = None,
+                  task_deletes: "list | None" = None, schedule_deletes: "list | None" = None,
+                  call_log: "list | None" = None):
     """Stub d3 (offline CDN) + every /api/ call the page makes.
 
     `open_calls`: appended with each opened card id (POST
@@ -189,6 +203,18 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
     `{"status": <code>, "detail": <str>}` — the 409 failure path;
     omitted defaults to a 200 success. `GET /api/agents/models` is served
     from `_MODEL_CATALOG`; `GET /api/agents/hosts` from `_HOST_CATALOG`.
+
+    `kill_calls`: appended with each killed session id (POST
+    /api/agents/sessions/{id}/kill). `kill_status_code`, when given,
+    is a one-element list read fresh on every kill call (mirrors
+    `lane_status_code`) — a non-200 entry makes the kill stub fail.
+    `task_deletes`/`schedule_deletes`: appended with each deleted id
+    (DELETE /api/tasks/{id} / DELETE /api/scheduler/{id}); a successful
+    delete also removes the card from `board_state` so a re-fetch shows
+    it gone. `call_log`: when given, every kill and delete call above
+    also appends an `("kill"|"task_delete"|"schedule_delete", id)` tuple
+    here, in the order the requests actually arrived — for asserting a
+    kill happened before its delete.
 
     `board_stream_frames`: SSE frame strings (each a full
     "event: board\\ndata: {...}\\n\\n" block), delivered one per *reconnect*
@@ -376,6 +402,16 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": task_id}))
             return
 
+        if task_match and method == "DELETE":
+            task_id = task_match.group(1)
+            if task_deletes is not None:
+                task_deletes.append(task_id)
+            if call_log is not None:
+                call_log.append(("task_delete", task_id))
+            _remove_card_from_state(board_state, task_id)
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"status": "deleted", "id": task_id}))
+            return
+
         schedule_match = re.search(r"/api/scheduler/([^/]+)$", url)
         if schedule_match and method == "PUT":
             try:
@@ -386,12 +422,36 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": schedule_match.group(1)}))
             return
 
+        if schedule_match and method == "DELETE":
+            schedule_id = schedule_match.group(1)
+            if schedule_deletes is not None:
+                schedule_deletes.append(schedule_id)
+            if call_log is not None:
+                call_log.append(("schedule_delete", schedule_id))
+            _remove_card_from_state(board_state, schedule_id)
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"status": "deleted", "id": schedule_id}))
+            return
+
+        kill_match = re.search(r"/api/agents/sessions/([^/]+)/kill$", url)
+        if kill_match and method == "POST":
+            session_id = kill_match.group(1)
+            if kill_calls is not None:
+                kill_calls.append(session_id)
+            if call_log is not None:
+                call_log.append(("kill", session_id))
+            code = kill_status_code[0] if kill_status_code else 200
+            if code != 200:
+                route.fulfill(status=code, content_type="application/json", body=json.dumps({"detail": "boom"}))
+            else:
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({"killed": [session_id], "failures": []}))
+            return
+
         if re.search(r"/api/agents/board$", url) and method == "GET":
             route.fulfill(status=200, content_type="application/json", body=json.dumps(board_state))
             return
 
         # Everything else the page might touch (pending-questions answer,
-        # session focus/kill) — a harmless empty JSON body.
+        # session focus) — a harmless empty JSON body.
         route.fulfill(status=200, content_type="application/json", body="{}")
 
     page.route("**/api/**", api_handler)
@@ -399,7 +459,8 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
 
 def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_puts=None, lane_status_code=None,
                  schedule_puts=None, board_stream_frames=None, stream_gate=None, lane_response=None,
-                 open_calls=None, open_response=None, task_posts=None, cancel_calls=None, cancel_failures=None):
+                 open_calls=None, open_response=None, task_posts=None, cancel_calls=None, cancel_failures=None,
+                 kill_calls=None, kill_status_code=None, task_deletes=None, schedule_deletes=None, call_log=None):
     _stub_routes(
         page,
         board_state if board_state is not None else _board_fixture(),
@@ -415,6 +476,11 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
         task_posts,
         cancel_calls,
         cancel_failures,
+        kill_calls,
+        kill_status_code,
+        task_deletes,
+        schedule_deletes,
+        call_log,
     )
     page.goto(f"{base_url}/agents")
     page.wait_for_selector('[data-card-id="t1"]')
@@ -2499,3 +2565,186 @@ class TestAgentCardMoveRulesAndCancel:
 
         page.locator(".drawer-title").click()  # blur the tags field
         assert any("agent-running" in (p.get("tags") or []) for p in task_puts), task_puts
+
+
+class TestDeleteCard:
+    """Delete on the drawer, behind a confirmation — a task card, a
+    scheduled card, and (the sequencing case) a task card whose linked
+    session is still live, which the confirmation kills before the
+    delete goes through."""
+
+    def test_unclaimed_task_card_deletes_after_confirmation(self, page: Page, agents_base_url):
+        task_deletes = []
+        kill_calls = []
+        _open_board(page, agents_base_url, task_deletes=task_deletes, kill_calls=kill_calls)
+
+        page.locator('[data-card-id="t1"]').click()  # t1: unassigned, no session
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator("#delete-title")).to_be_visible()
+        expect(page.locator(".modal .target")).to_contain_text("Investigate outage")
+
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert task_deletes == ["t1"]
+        assert kill_calls == []
+        expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+
+    def test_claimed_task_card_with_live_session_kills_before_deleting(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["in_progress"].append({
+            "kind": "task", "id": "t20", "title": "Claimed with a live worker session",
+            "notes": "", "status": "in_progress", "tags": ["claude", "agent-running"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "s-t20", "status": "running",
+                "host": "test-host", "routing": "claude", "model_label": "Sonnet",
+                "source": "lifeos_agent",
+            },
+            "pending_question": None,
+        })
+        task_deletes = []
+        kill_calls = []
+        call_log = []
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            task_deletes=task_deletes, kill_calls=kill_calls, call_log=call_log,
+        )
+
+        page.locator('[data-card-id="t20"]').click()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator(".modal .descendants")).to_contain_text(
+            "kill the running session and its subagents"
+        )
+
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert kill_calls == ["s-t20"]
+        assert task_deletes == ["t20"]
+        # The kill happened before the delete, not merely both happening.
+        assert call_log == [("kill", "s-t20"), ("task_delete", "t20")]
+        expect(page.locator('[data-card-id="t20"]')).to_have_count(0)
+
+    def test_scheduled_card_deletes_through_the_scheduler_endpoint(self, page: Page, agents_base_url):
+        task_deletes = []
+        schedule_deletes = []
+        kill_calls = []
+        _open_board(
+            page, agents_base_url, task_deletes=task_deletes,
+            schedule_deletes=schedule_deletes, kill_calls=kill_calls,
+        )
+
+        page.locator('[data-card-id="s1"]').click()  # s1: scheduled, "Morning briefing"
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator(".modal .target")).to_contain_text("Morning briefing")
+
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert schedule_deletes == ["s1"]
+        assert task_deletes == []
+        assert kill_calls == []
+        expect(page.locator('[data-card-id="s1"]')).to_have_count(0)
+
+    def test_kill_failure_blocks_the_delete_and_reenables_the_confirm_button(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["in_progress"].append({
+            "kind": "task", "id": "t20", "title": "Claimed with a live worker session",
+            "notes": "", "status": "in_progress", "tags": ["claude", "agent-running"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "s-t20", "status": "running",
+                "host": "test-host", "routing": "claude", "model_label": "Sonnet",
+                "source": "lifeos_agent",
+            },
+            "pending_question": None,
+        })
+        task_deletes = []
+        kill_calls = []
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            task_deletes=task_deletes, kill_calls=kill_calls, kill_status_code=[500],
+        )
+
+        page.locator('[data-card-id="t20"]').click()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        page.locator("#delete-confirm").click()
+
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        assert kill_calls == ["s-t20"]
+        assert task_deletes == []
+        expect(page.locator("#delete-title")).to_be_visible()
+        confirm_btn = page.locator("#delete-confirm")
+        expect(confirm_btn).to_be_enabled()
+        expect(confirm_btn).to_have_text("Delete")
+        expect(page.locator('[data-card-id="t20"]')).to_be_visible()
+
+    def test_cancelling_the_confirmation_changes_nothing(self, page: Page, agents_base_url):
+        task_deletes = []
+        kill_calls = []
+        _open_board(page, agents_base_url, task_deletes=task_deletes, kill_calls=kill_calls)
+
+        page.locator('[data-card-id="t1"]').click()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator("#delete-title")).to_be_visible()
+
+        page.locator("#delete-cancel").click()
+        expect(page.locator("#delete-title")).to_have_count(0)
+        assert task_deletes == []
+        assert kill_calls == []
+        expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+
+    def test_review_lane_card_offers_delete_with_the_same_confirmation(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["review"].append({
+            "kind": "task", "id": "t22", "title": "Awaiting review",
+            "notes": "", "status": "done", "tags": ["agent-completed"], "assignee": "codex",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        task_deletes = []
+        _open_board(page, agents_base_url, board_state=board_state, task_deletes=task_deletes)
+
+        page.locator('[data-card-id="t22"]').click()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator("#delete-title")).to_be_visible()
+        expect(page.locator(".modal .target")).to_contain_text("Awaiting review")
+
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert task_deletes == ["t22"]
+
+    def test_cli_backed_live_session_deletes_without_a_kill_call(self, page: Page, agents_base_url):
+        """A live Claude Code/Codex CLI pane can't be torn down by the kill
+        endpoint (the same limitation Kill and Cancel already report for
+        this session shape) — the confirmation doesn't promise a kill and
+        deleting removes the card without attempting one."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["in_progress"].append({
+            "kind": "task", "id": "t21", "title": "CLI-backed claimed card",
+            "notes": "", "status": "in_progress", "tags": ["claude", "agent-running"], "assignee": "claude",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "cc:cli-live-1", "status": "running",
+                "host": "test-host", "routing": "claude_code", "model_label": "Sonnet", "source": "claude_code",
+            },
+            "pending_question": None,
+        })
+        task_deletes = []
+        kill_calls = []
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            task_deletes=task_deletes, kill_calls=kill_calls,
+        )
+
+        page.locator('[data-card-id="t21"]').click()
+        page.get_by_role("button", name="Delete", exact=True).click()
+        expect(page.locator(".modal .descendants")).not_to_contain_text(
+            "kill the running session and its subagents"
+        )
+        expect(page.locator(".modal .descendants")).to_contain_text("close its pane manually")
+
+        page.locator("#delete-confirm").click()
+        expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
+        assert kill_calls == []
+        assert task_deletes == ["t21"]
