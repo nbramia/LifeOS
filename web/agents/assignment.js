@@ -163,6 +163,14 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   const currentHost = fieldValue(card, 'host');
   const ran = card.session || null;
 
+  // `card.policy` is the server's own decision (see _card_policy in
+  // api/routes/agents.py) — this module never re-derives the rule, it just
+  // disables-and-explains. A card with no `policy` at all (a schedule card
+  // never reaches this module) defaults to allowed, matching every other
+  // policy read in the board UI.
+  const fieldsPolicy = (card.policy && card.policy.fields) || { allowed: true, reason: null };
+  const fieldsDisabled = fieldsPolicy.allowed === false;
+
   // (#901 round 2, finding A3) Last-known-good values for the three
   // fields every save() sends, seeded from the card and updated on each
   // SUCCESSFUL save. A rejected save reverts the controls to these —
@@ -186,29 +194,30 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   container.innerHTML = `
     <div class="assignment-row" data-row="engine">
       <label class="assignment-label">Engine</label>
-      <select class="assignment-engine" data-field="assignee">
+      <select class="assignment-engine" data-field="assignee" ${fieldsDisabled ? 'disabled' : ''}>
         <option value="">unassigned</option>
         ${ENGINES.map(e => `<option value="${e}" ${currentEngine === e ? 'selected' : ''}>${e}</option>`).join('')}
       </select>
     </div>
     <div class="assignment-row" data-row="model" hidden>
       <label class="assignment-label">Model</label>
-      <select class="assignment-model" data-field="model">
+      <select class="assignment-model" data-field="model" ${fieldsDisabled ? 'disabled' : ''}>
         <option value="">engine default</option>
       </select>
     </div>
     <div class="assignment-row" data-row="effort" hidden>
       <label class="assignment-label">Effort</label>
-      <select class="assignment-effort" data-field="effort">
+      <select class="assignment-effort" data-field="effort" ${fieldsDisabled ? 'disabled' : ''}>
         <option value="">default</option>
         ${EFFORTS.map(e => `<option value="${e}" ${currentEffort === e ? 'selected' : ''}>${e}</option>`).join('')}
       </select>
     </div>
     <div class="assignment-row" data-row="host" hidden>
       <label class="assignment-label">Host</label>
-      <select class="assignment-host" data-field="host"></select>
+      <select class="assignment-host" data-field="host" ${fieldsDisabled ? 'disabled' : ''}></select>
     </div>
     <div class="assignment-ran" data-field="ran"></div>
+    <div class="drawer-field-reason" data-field="fields-reason" ${fieldsDisabled ? '' : 'hidden'}>${fieldsDisabled ? escapeHtml(fieldsPolicy.reason || "This card's fields can't be changed right now.") : ''}</div>
     <div class="assignment-error" data-field="error" hidden></div>
   `;
 

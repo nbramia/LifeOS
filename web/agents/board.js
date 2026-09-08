@@ -29,6 +29,22 @@ const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local'];
 // tasks" — so the composer must not let one through.
 const AGENT_ASSIGNEES = ASSIGNEES.filter(a => a !== 'me');
 
+// Tags the worker itself writes as it drives a task through its lifecycle
+// (agent_board.py's RUNNING_TAG/BLOCKED_TAG/COMPLETED_TAG, worker.py's
+// FAILED_TAG/BUDGET_EXCEEDED_TAG, and the accept endpoint's ACCEPTED_TAG)
+// — the drawer's free-text Tags field must never show these as editable
+// tokens, never let them be typed in (mirrors the ASSIGNEES rejection
+// immediately below), and always preserve whatever the card already has
+// on every save, the same way the field never lets a human type an
+// assignee name into it. An explicit set, not a prefix match on `agent-`
+// or the bare `agent` tag — `agent` is the worker's queue marker (an
+// operator-editable label, not a claim), and an operator label that
+// happens to start with `agent-` must stay editable too.
+const LIFECYCLE_TAGS = new Set([
+  'agent-running', 'agent-blocked', 'agent-completed',
+  'agent-failed', 'agent-budget-exceeded', 'accepted',
+]);
+
 // Card fields the drawer renders as editable inputs — used to decide
 // whether an SSE tick needs to rebuild the drawer at all (#850 finding 2).
 const DRAWER_EDITABLE_FIELDS = [
@@ -451,6 +467,32 @@ export function initBoard() {
   function onCardDropped(cardId, targetLane) {
     const card = findCard(cardId);
     if (!card || card.kind !== 'task') return;
+    // Review and Scheduled are never a direct drag target —
+    // plan_lane_move 400s both with "cannot be set directly" for EVERY
+    // card, regardless of state, so refusing them here — matching the
+    // existing DIRECT_LANE_IDS gating on the composer/lane-add button —
+    // means dropping on either never round-trips to the server just to
+    // 400.
+    if (!DIRECT_LANE_IDS.has(targetLane)) {
+      showToast(`Can't move card to ${laneLabel(targetLane)}.`, true);
+      render();
+      return;
+    }
+    // The server is still the authority — this is a fast path that skips
+    // the round trip when the board already knows the move is refused,
+    // matching `card.policy` exactly (see _card_policy in
+    // api/routes/agents.py). A stale board (the policy hasn't caught up
+    // with an out-of-band change) still gets caught by moveCard's own
+    // server-error toast path below.
+    const laneEntry = card.policy && card.policy.lanes && card.policy.lanes[targetLane];
+    if (laneEntry && laneEntry.allowed === false) {
+      showToast(laneEntry.reason || `Can't move card to ${laneLabel(targetLane)}.`, true);
+      // Matches moveCard's own failure path: clears any stray drag-over
+      // class and resets `suppressNextClick` so the operator's next click
+      // on this card still opens the drawer.
+      render();
+      return;
+    }
     let assignee;
     if (targetLane === 'assigned') {
       // No mid-drag assignee picker with plain HTML5 DnD — default to "me"
@@ -789,8 +831,21 @@ export function initBoard() {
   function renderDrawer(card) {
     if (!drawerEl) return;
     const isTask = card.kind === 'task';
-    const nonAssigneeTags = (card.tags || []).filter(t => !ASSIGNEES.includes(t.toLowerCase()));
+    // The Tags field never shows an assignee tag OR a worker lifecycle
+    // tag as an editable token — both are managed elsewhere (the
+    // Assignee select above, and the worker/accept endpoint respectively)
+    // and must survive a Tags-field save untouched.
+    const editableTags = (card.tags || []).filter(
+      t => !ASSIGNEES.includes(t.toLowerCase()) && !LIFECYCLE_TAGS.has(t.toLowerCase()),
+    );
     const titleValue = isTask ? (card.title || '') : (card.name || '');
+    // `card.policy` is the server's own decision — the drawer never
+    // re-derives these rules, it just disables-and-explains. A schedule
+    // card carries no `policy` at all: treat that as fully allowed rather
+    // than throwing, matching every other place this file reads
+    // `card.policy`.
+    const assigneePolicy = (card.policy && card.policy.assignee) || { allowed: true, reason: null };
+    const assigneeDisabled = assigneePolicy.allowed === false;
     drawerEl.innerHTML = `
       <div class="drawer-header">
         <button class="panel-close" data-action="drawer-close">×</button>
@@ -802,10 +857,11 @@ export function initBoard() {
       <div class="drawer-row">
         <div>
           <label class="drawer-label">Assignee</label>
-          <select class="drawer-assignee" data-field="assignee">
+          <select class="drawer-assignee" data-field="assignee" ${assigneeDisabled ? 'disabled' : ''}>
             <option value="">unassigned</option>
             ${ASSIGNEES.map(a => `<option value="${a}" ${card.assignee === a ? 'selected' : ''}>${a}</option>`).join('')}
           </select>
+          ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="assignee-reason">${escapeHtml(assigneePolicy.reason || "This card's assignee can't be changed right now.")}</div>` : ''}
         </div>
         <div>
           <label class="drawer-label">Context</label>
@@ -813,7 +869,8 @@ export function initBoard() {
         </div>
       </div>
       <label class="drawer-label">Tags</label>
-      <input class="drawer-tags" data-field="tags" value="${escapeHtml(nonAssigneeTags.join(' '))}" placeholder="space-separated tags" />
+      <input class="drawer-tags" data-field="tags" value="${escapeHtml(editableTags.join(' '))}" placeholder="space-separated tags" ${assigneeDisabled ? 'disabled' : ''} />
+      ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="tags-reason">${escapeHtml(assigneePolicy.reason || "This card's tags can't be changed right now.")}</div>` : ''}
       <div class="drawer-assignment" data-field="assignment"></div>
       <div class="drawer-actions" data-field="actions"></div>
       <div class="drawer-session" data-field="session-panel"></div>
@@ -904,23 +961,37 @@ export function initBoard() {
       const tokens = tagsEl.value.split(/\s+/).map(t => t.replace(/^#/, '')).filter(Boolean);
       // Free text here writes straight to the task store — reject anything
       // that isn't a plain word/hyphen token (blocks a vault-comment
-      // injection like `<!--id:...-->` stealing another task's id) and drop
+      // injection like `<!--id:...-->` stealing another task's id), drop
       // any assignee-name token (the assignee comes from the select above,
-      // not this field) rather than letting it silently double up as a tag
-      // (#850 finding 8).
+      // not this field) rather than letting it silently double up as a tag,
+      // and reject a worker lifecycle tag the same way — typing
+      // `agent-running` into a `me` card's Tags field must not be able to
+      // grant it a claim tag the worker never gave it.
       const parsed = [];
       const rejected = [];
       for (const t of tokens) {
-        if (VALID_TAG.test(t) && !ASSIGNEES.includes(t.toLowerCase())) parsed.push(t);
+        const lower = t.toLowerCase();
+        if (VALID_TAG.test(t) && !ASSIGNEES.includes(lower) && !LIFECYCLE_TAGS.has(lower)) parsed.push(t);
         else rejected.push(t);
       }
       if (rejected.length) {
         showToast(`Ignored invalid tag${rejected.length > 1 ? 's' : ''}: ${rejected.join(', ')}`, true);
       }
       tagsEl.value = parsed.join(' ');
-      const assigneeTag = card.assignee ? [card.assignee] : [];
-      try { await putTask(card.id, { tags: [...assigneeTag, ...parsed] }); await fetchBoard(); }
-      catch (err) { showToast(`Couldn't save tags: ${err.message}`, true); tagsEl.value = nonAssigneeTags.join(' '); }
+      // Read the card's CURRENT assignee/lifecycle tags from the live board
+      // state, not the `card` this handler closed over at render time.
+      // `updateOpenDrawer` skips rebuilding the drawer while this field
+      // holds focus (see above), so a claim written by another process
+      // while the operator is mid-edit here never reaches the `card`
+      // variable at all — re-appending from a stale snapshot would save
+      // exactly the claim tag this box never showed and was never asked to
+      // remove. Falls back to the render-time `card` only if the card has
+      // since disappeared from the board entirely.
+      const current = findCard(card.id) || card;
+      const assigneeTag = current.assignee ? [current.assignee] : [];
+      const lifecycleTags = (current.tags || []).filter(t => LIFECYCLE_TAGS.has(t.toLowerCase()));
+      try { await putTask(card.id, { tags: [...assigneeTag, ...lifecycleTags, ...parsed] }); await fetchBoard(); }
+      catch (err) { showToast(`Couldn't save tags: ${err.message}`, true); tagsEl.value = editableTags.join(' '); }
     });
 
     // The drawer's own Assignee select above is the one assignee writer —
@@ -974,16 +1045,27 @@ export function initBoard() {
       }]);
     }
     if (card.session && !TERMINAL.has(card.session.status)) {
-      buttons.push(['Kill', async () => {
-        try {
-          const r = await fetch(`/api/agents/sessions/${encodeURIComponent(card.session.session_id)}/kill`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),
-          });
-          if (!r.ok) throw new Error(await r.text());
-          showToast('Session killed.', false);
-          fetchBoard();
-        } catch (err) { showToast(`Kill failed: ${err.message}`, true); }
-      }]);
+      // A CLI-backed session (opened via the Open button, not started by
+      // the worker) can't actually be torn down by this endpoint — the
+      // same reason Cancel reports one as an unstoppable failure instead
+      // of a teardown. Offer Kill disabled with that explanation rather
+      // than a button that 404s.
+      if (card.session.source === 'claude_code' || card.session.source === 'codex') {
+        buttons.push(['Kill', null, {
+          reason: `killing a live ${sourceLabelFor(card.session)} session isn't supported yet — close it manually`,
+        }]);
+      } else {
+        buttons.push(['Kill', async () => {
+          try {
+            const r = await fetch(`/api/agents/sessions/${encodeURIComponent(card.session.session_id)}/kill`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),
+            });
+            if (!r.ok) throw new Error(await r.text());
+            showToast('Session killed.', false);
+            fetchBoard();
+          } catch (err) { showToast(`Kill failed: ${err.message}`, true); }
+        }]);
+      }
     }
     if (card.pending_question) {
       buttons.push(['Answer', () => openAnswerPrompt(card)]);
@@ -998,19 +1080,95 @@ export function initBoard() {
         } catch (err) { showToast(`Accept failed: ${err.message}`, true); }
       }]);
     }
-    if (card.lane === 'human_queue' && !card.pending_question) {
+    // Resolve is a drop onto Done under the hood — never offer it when
+    // that exact move would be refused (a claimed or agent-owned card can
+    // still land in Human queue without being resolvable by a human).
+    // Absent policy (schedule cards never reach here) defaults to
+    // allowed, matching every other policy read in this file.
+    // `policy.lanes` lists ONLY refused lanes — an absent `.done` entry
+    // means allowed, so this guards the leaf the same way
+    // `onCardDropped`'s own lane read already does, rather than assuming
+    // it's always present.
+    const doneEntry = card.policy && card.policy.lanes && card.policy.lanes.done;
+    const doneAllowed = !doneEntry || doneEntry.allowed !== false;
+    if (card.lane === 'human_queue' && !card.pending_question && doneAllowed) {
       // A manually-filed #human card with no agent question behind it —
       // "Resolve" is the operator saying they've handled it by hand.
       buttons.push(['Resolve', async () => { await moveCard(card.id, 'done').catch(() => {}); }]);
     }
+    // Cancel is offered for every task card that carries a policy block
+    // (schedule cards never do) — disabled-and-explained when refused,
+    // never hidden, matching every other refused control in this drawer.
+    // A hidden Cancel on an agent-owned-with-no-assignee-tag claimed card
+    // (the worker's own bare `#agent` claim) would leave that card with
+    // no recovery action at all — Answer/Kill/Accept aside, Cancel is the
+    // one a human always needs visible, even mid-refusal.
+    if (card.policy && card.policy.cancel && card.policy.cancel.allowed !== true) {
+      buttons.push(['Cancel', null, {
+        reason: card.policy.cancel.reason || "Cancel isn't available for this card.",
+      }]);
+    } else if (card.policy && card.policy.cancel) {
+      buttons.push(['Cancel', async () => {
+        try {
+          const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/cancel`, { method: 'POST' });
+          if (!r.ok) {
+            const text = await r.text();
+            let msg = text;
+            try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+            throw new Error(msg || `HTTP ${r.status}`);
+          }
+          const data = await r.json();
+          // A live cc:/cx: CLI session can't be torn down by Cancel yet —
+          // the endpoint still marks the card cancelled, but reports it
+          // under `failures` instead of silently claiming a teardown it
+          // didn't perform. Surface that as a warning toast rather than a
+          // plain success.
+          const untorn = (data && data.failures) || [];
+          if (untorn.length) {
+            showToast(`Cancelled, but couldn't stop: ${untorn.map(f => f.reason || f.session_id).join('; ')}`, true);
+          } else {
+            showToast('Cancelled.', false);
+          }
+          // Tear the session panel down through its own cleanup path
+          // right here, rather than leaving it to whichever render call
+          // below happens to touch the session-panel container next — a
+          // deferred teardown aborts a summary/stream request that's
+          // still legitimately in flight, which shows up as a failed
+          // request even though nothing actually went wrong.
+          if (panel) { panel.close(); panel = null; }
+          await fetchBoard();
+          // fetchBoard()'s own updateOpenDrawer skips the
+          // rebuild while this button (inside the drawer) still holds
+          // focus after the click — the same staleness the assignee
+          // handler above already works around. Without this, the drawer
+          // keeps showing a stale Open button for a card that just moved
+          // to Done, and clicking it 409s.
+          const fresh = findCard(card.id);
+          if (fresh) { renderDrawer(fresh); openCardSnapshot = fresh; }
+        } catch (err) { showToast(`Cancel failed: ${err.message}`, true); }
+      }]);
+    }
 
-    for (const [label, handler] of buttons) {
+    for (const [label, handler, opts] of buttons) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'drawer-action';
       btn.textContent = label;
-      btn.onclick = handler;
-      actionsEl.appendChild(btn);
+      if (opts && opts.reason) {
+        // Disable-and-explain rather than hide, matching every other
+        // refused control in this drawer — a `title=` isn't enough, the
+        // reason needs to be visible text next to the button.
+        btn.disabled = true;
+        actionsEl.appendChild(btn);
+        const reasonEl = document.createElement('div');
+        reasonEl.className = 'drawer-field-reason';
+        reasonEl.dataset.field = `${label.toLowerCase()}-reason`;
+        reasonEl.textContent = opts.reason;
+        actionsEl.appendChild(reasonEl);
+      } else {
+        btn.onclick = handler;
+        actionsEl.appendChild(btn);
+      }
     }
   }
 

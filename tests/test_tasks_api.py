@@ -18,6 +18,20 @@ class TestTasksAPI:
         from api.main import app
         return TestClient(app)
 
+    @pytest.fixture(autouse=True)
+    def _isolated_session_store(self, tmp_path, monkeypatch):
+        """The claimed-card tags guard queries `SessionStore.has_live_session`
+        (see `api/routes/tasks.py`'s tags-patch check) whenever a tags
+        patch touches the assignee-tag or claim-tag set — point that at a
+        temp-dir-backed store instead of the real one for every test in
+        this class, so a test never opens (or, worse, matches against) the
+        real `data/agent_sessions.db`. Empty by default, which makes
+        `has_live_session` return False for any task id — exactly what
+        every existing test in this file already assumes."""
+        from api.routes import tasks as tasks_route
+        from api.services.agent_worker.session_store import SessionStore
+        monkeypatch.setattr(tasks_route, "_session_store", SessionStore(db_path=tmp_path / "sessions.db"))
+
     @pytest.fixture
     def mock_task_manager(self):
         with patch("api.routes.tasks.get_task_manager") as mock:
@@ -380,6 +394,294 @@ class TestTasksAPI:
         response = client.put("/api/tasks/abc12345", json={"fields": {"x": "bad]value"}})
         assert response.status_code == 422
         assert "must not contain" in response.json()["detail"]
+
+    # --- claimed-card tags guard: keyed on the card's own claim state,
+    # not on the `assigned_by: board` marker (that marker only gates the
+    # model/effort/host check below, since the drawer's Tags field sends a
+    # bare `{"tags": [...]}` patch with no `fields` key at all) ---
+
+    def _set_current(self, mock_task_manager, *, status="todo", tags=None):
+        from api.services.task_manager import Task
+        current = Task(
+            id="abc12345", description="Pull 1099 from Schwab", status=status,
+            tags=list(tags or []), source_file="LifeOS/Tasks/Finance.md", line_number=7,
+        )
+        mock_task_manager.get.return_value = current
+        return current
+
+    def test_board_marker_field_edit_on_claimed_card_is_409_and_nothing_written(self, client, mock_task_manager):
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
+            "fields": {"effort": "high", "host": None, "assigned_by": "board"},
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        mock_task_manager.update.assert_not_called()
+
+    def test_board_marker_assignee_change_on_claimed_card_is_409_and_nothing_written(self, client, mock_task_manager):
+        self._set_current(mock_task_manager, tags=["codex", "agent-blocked"])
+        response = client.put("/api/tasks/abc12345", json={
+            "tags": ["hermes"],
+            "fields": {"effort": None, "host": None, "assigned_by": "board"},
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        mock_task_manager.update.assert_not_called()
+
+    def test_board_marker_status_change_on_claimed_card_is_409_and_nothing_written(
+        self, client, mock_task_manager,
+    ):
+        """A board-marked patch carrying a raw `status` field reaches the
+        same claimed-card guard as model/effort/host — the board itself
+        only ever moves lanes through the lane endpoint, but nothing else
+        stops a `status` write from carrying the marker too, and a claimed
+        card's status is exactly what the worker owns while running."""
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
+            "status": "done", "fields": {"assigned_by": "board"},
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        mock_task_manager.update.assert_not_called()
+
+    def test_board_marker_status_change_on_unclaimed_agent_card_succeeds(self, client, mock_task_manager):
+        """Positive case: the identical board-marked status patch on an
+        UNCLAIMED agent card is unaffected."""
+        self._set_current(mock_task_manager, tags=["codex"])
+        response = client.put("/api/tasks/abc12345", json={
+            "status": "done", "fields": {"assigned_by": "board"},
+        })
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_unmarked_status_change_on_claimed_card_skips_the_guard(self, client, mock_task_manager):
+        """A `status` patch with no `assigned_by: board` marker and no
+        `tags` key never reaches the field_edit guard at all — matching
+        every agent-side/vault-side status write today (only a
+        board-marked write, or a `tags` patch, pays for the extra read)."""
+        response = client.put("/api/tasks/abc12345", json={"status": "done"})
+        assert response.status_code == 200
+        mock_task_manager.get.assert_not_called()
+        mock_task_manager.update.assert_called_once()
+
+    @pytest.mark.parametrize("lifecycle_tag", ["agent-completed", "accepted"])
+    def test_unmarked_tags_patch_adding_agent_completed_or_accepted_is_409(
+        self, client, mock_task_manager, lifecycle_tag,
+    ):
+        """`agent-completed` and `accepted` are just as unreachable through
+        a bare tags PUT as the two claim tags — the worker writes the
+        former, the accept endpoint writes the latter, and no other HTTP
+        caller in this codebase adds either. Manufacturing one this way
+        would fake a Review state (or a fake accept out of one)."""
+        self._set_current(mock_task_manager, tags=["codex"])
+        response = client.put("/api/tasks/abc12345", json={"tags": ["codex", lifecycle_tag]})
+        assert response.status_code == 409
+        mock_task_manager.update.assert_not_called()
+
+    def test_unmarked_tags_patch_without_agent_completed_or_accepted_succeeds(self, client, mock_task_manager):
+        """Positive case: an ordinary tags edit that adds neither
+        lifecycle tag is unaffected."""
+        self._set_current(mock_task_manager, tags=["codex"])
+        response = client.put("/api/tasks/abc12345", json={"tags": ["codex", "needs-design"]})
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_board_marker_case_insensitive_and_stripped(self, client, mock_task_manager):
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
+            "fields": {"model": "claude-opus-5", "assigned_by": "  Board  "},
+        })
+        assert response.status_code == 409
+        mock_task_manager.update.assert_not_called()
+
+    def test_fields_only_patch_without_board_marker_succeeds_on_claimed_card(self, client, mock_task_manager):
+        """A model/effort/host patch with no `assigned_by: board` marker
+        and no `tags` key -> neither guard runs, matching agent-side/
+        vault-side field writes exactly. (The tags guard below is
+        marker-independent; this test has no `tags` key at all, so it
+        never reaches that check either.)"""
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
+            "fields": {"effort": "high", "host": None},
+        })
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_board_marker_field_edit_on_unclaimed_agent_card_succeeds(self, client, mock_task_manager):
+        self._set_current(mock_task_manager, tags=["codex"])
+        response = client.put("/api/tasks/abc12345", json={
+            "fields": {"effort": "high", "host": None, "assigned_by": "board"},
+        })
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_board_marker_assignee_change_on_unclaimed_agent_card_succeeds(self, client, mock_task_manager):
+        self._set_current(mock_task_manager, tags=["codex"])
+        response = client.put("/api/tasks/abc12345", json={
+            "tags": ["hermes"],
+            "fields": {"effort": None, "host": None, "assigned_by": "board"},
+        })
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_board_marker_without_model_effort_host_or_assignee_change_skips_guard(self, client, mock_task_manager):
+        """The marker alone doesn't trigger a refusal — only an actual
+        model/effort/host change or an assignee-changing tag patch does."""
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
+            "fields": {"assigned_by": "board"},
+        })
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_board_marker_tags_and_claim_state_unchanged_skips_assignee_check(self, client, mock_task_manager):
+        """The same assignee tag AND the same claim tag re-sent (no actual
+        assignee or claim-state change, just an unrelated extra label) must
+        not trip the assignee_change guard even on a claimed card."""
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
+            "tags": ["codex", "agent-running", "extra-label"],
+            "fields": {"assigned_by": "board"},
+        })
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_unmarked_tags_patch_dropping_claim_tag_on_claimed_card_is_409(self, client, mock_task_manager):
+        """A bare `{"tags": [...]}` PUT — no `fields` key at all, exactly
+        the shape the drawer's Tags field blur handler sends — that leaves
+        the derived assignee unchanged but silently drops `agent-running`
+        must be refused just like an explicit assignee change: the derived
+        assignee ("codex") doesn't change, only the claim tag disappears.
+        The guard runs on the card's own claim state regardless of any
+        marker, so this request shape — the one the product actually
+        sends — is caught."""
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={"tags": ["codex", "extra-label"]})
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        mock_task_manager.update.assert_not_called()
+
+    def test_unmarked_second_assignee_tag_on_claimed_card_is_409(self, client, mock_task_manager):
+        """Adding a second assignee tag alongside the existing one, via a
+        bare tags-only PUT, must be refused on a claimed card even though
+        `derive_assignee` (first-match-wins) still resolves to the same
+        tag — comparing the normalized assignee-tag *set*, not the derived
+        value, is what catches this."""
+        self._set_current(mock_task_manager, tags=["claude", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={"tags": ["claude", "agent-running", "codex"]})
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        mock_task_manager.update.assert_not_called()
+
+    def test_unmarked_second_assignee_tag_on_unclaimed_card_succeeds(self, client, mock_task_manager):
+        """Positive case: the same second-assignee-tag patch on an
+        UNCLAIMED agent card is still allowed — the set comparison only
+        feeds into the existing claimed-only refusal, it doesn't add a new
+        refusal of its own."""
+        self._set_current(mock_task_manager, tags=["claude"])
+        response = client.put("/api/tasks/abc12345", json={"tags": ["claude", "codex"]})
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_unmarked_tags_patch_preserving_claim_and_assignee_on_claimed_card_succeeds(
+        self, client, mock_task_manager,
+    ):
+        """Positive case: a tags-only PUT on a claimed card that keeps both
+        the assignee tag and the claim tag exactly as they were — only
+        adding an unrelated label — is not what this guard exists to
+        catch, and must still succeed. The guard fires on a specific
+        diff (a dropped claim tag, a changed assignee-tag set, or an
+        added claim tag), not on the mere fact that the card is claimed."""
+        self._set_current(mock_task_manager, tags=["codex", "agent-running"])
+        response = client.put("/api/tasks/abc12345", json={
+            "tags": ["codex", "agent-running", "needs-design"],
+        })
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_unmarked_tags_patch_adding_a_claim_tag_to_an_unclaimed_card_is_409(
+        self, client, mock_task_manager,
+    ):
+        """The other half of the vector a bare tags PUT could otherwise
+        reach: ADDING a claim tag (`agent-running`/`agent-blocked`) to a
+        card that doesn't have one. No HTTP caller in this codebase adds a
+        claim tag this way — the worker uses `/swap-tag` — so this is
+        refused unconditionally, not only when the card was already
+        claimed. Reproduces the exact "freeze a `me` card" vector: without
+        this guard, an unmarked `{"tags": ["me", "agent-running"]}` PUT
+        would succeed and every human move on that card would then read as
+        refused on the very next policy read."""
+        self._set_current(mock_task_manager, tags=["me"])
+        response = client.put("/api/tasks/abc12345", json={"tags": ["me", "agent-running"]})
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        mock_task_manager.update.assert_not_called()
+
+    def test_unmarked_tags_patch_without_a_claim_tag_on_an_unclaimed_me_card_succeeds(
+        self, client, mock_task_manager,
+    ):
+        """Positive case for the added-claim-tag guard: an ordinary,
+        non-claim-tag tags edit on a `me` card is completely unaffected."""
+        self._set_current(mock_task_manager, tags=["me"])
+        response = client.put("/api/tasks/abc12345", json={"tags": ["me", "urgent"]})
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_board_marker_missing_task_is_404(self, client, mock_task_manager):
+        mock_task_manager.get.return_value = None
+        response = client.put("/api/tasks/abc12345", json={
+            "fields": {"effort": "high", "assigned_by": "board"},
+        })
+        assert response.status_code == 404
+        mock_task_manager.update.assert_not_called()
+
+    def test_unmarked_tags_patch_on_missing_task_is_404(self, client, mock_task_manager):
+        """The tags guard's own task read 404s independently of the
+        marker-gated fields read above."""
+        mock_task_manager.get.return_value = None
+        response = client.put("/api/tasks/abc12345", json={"tags": ["codex"]})
+        assert response.status_code == 404
+        mock_task_manager.update.assert_not_called()
+
+    # --- the claim rule is keyed on a live session actually existing, not
+    # on status alone (see api/services/agent_board.py's
+    # `status_claim_possible` / `SessionStore.has_live_session`) ---
+
+    def test_status_in_progress_agent_card_with_a_live_session_refuses_assignee_change(
+        self, client, mock_task_manager,
+    ):
+        """An agent-owned card whose status merely reads "in_progress"
+        (no `agent-running`/`agent-blocked` tag) is claimed only when a
+        live session actually backs it — reproduced here with a real row
+        in the (temp-dir, isolated) session store."""
+        from api.routes import tasks as tasks_route
+        current = self._set_current(mock_task_manager, status="in_progress", tags=["codex"])
+        tasks_route._session_store.create(task_id=current.id, routing="claude_code")
+        response = client.put("/api/tasks/abc12345", json={"tags": ["hermes"]})
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        mock_task_manager.update.assert_not_called()
+
+    def test_status_in_progress_agent_card_with_no_live_session_allows_assignee_change(
+        self, client, mock_task_manager,
+    ):
+        """Positive case: the identical status/tags shape with NO session
+        row behind it — the transition a board reassignment or a vault
+        edit can produce — stays movable. (`_isolated_session_store`
+        leaves the store empty by default, so this is really just proving
+        the negative case still works with the new code path in place.)"""
+        self._set_current(mock_task_manager, status="in_progress", tags=["codex"])
+        response = client.put("/api/tasks/abc12345", json={"tags": ["hermes"]})
+        assert response.status_code == 200
+        mock_task_manager.update.assert_called_once()
+
+    def test_no_fields_patch_never_reads_current_task(self, client, mock_task_manager):
+        """No `fields` in the request at all -> the guard short-circuits
+        before ever calling `manager.get` (no extra read on the hot path)."""
+        response = client.put("/api/tasks/abc12345", json={"priority": "high"})
+        assert response.status_code == 200
+        mock_task_manager.get.assert_not_called()
+        mock_task_manager.update.assert_called_once()
 
     # --- COMPLETE ---
 
