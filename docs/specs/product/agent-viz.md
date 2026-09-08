@@ -150,7 +150,7 @@ with no delay; moving off hides it.
   white border, everything else dims).
 - **Double-click a non-subagent Claude Code or Codex node** — jumps focus
   to its terminal (see [Operator controls — resume and Go To](#graph-tab--operator-controls--resume-and-go-to)); the side panel opening on the first click of the pair is expected.
-- **Click the same node again, or click empty background** — deselects and closes the panel. A second click that falls inside the browser's own double-click window is part of a double-click, not a standalone click, and does not close the panel.
+- **Click the same node again, or click empty background** — deselects and closes the panel. Double-clicking a non-subagent Claude Code or Codex node is the exception: the pair's first click closes the panel and the double-click reopens it on that same session as focus jumps to its terminal.
 - **Filter change** — releases any drag-pinned positions and resets the pan/zoom transform so the new visible set lays out from scratch at the natural scale.
 
 The simulation restarts whenever the visible-id set OR any visible node's
