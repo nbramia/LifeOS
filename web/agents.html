@@ -324,6 +324,67 @@
   .node-badge-question { pointer-events: none; }
   .node-badge-errors { pointer-events: none; }
   .node-badge-children { font-weight: 600; }
+  /* Card/host anchor clusters (#865) — a rounded rect labelled with the
+     linked card's title (or the host name, for sessions with no card),
+     rendered in a separate SVG group from `.node` so anchor styling can
+     never collide with session-node selection/badge classes. */
+  .anchor { cursor: pointer; }
+  .anchor-shape {
+    transition: stroke-width 0.2s ease, filter 0.2s ease;
+  }
+  .anchor:hover .anchor-shape { filter: brightness(1.2); }
+  .anchor-shape.selected {
+    stroke-width: 3 !important;
+    filter: brightness(1.3);
+  }
+  .anchor-label {
+    font: 600 12px system-ui, -apple-system, sans-serif;
+    fill: var(--text-primary);
+    text-anchor: middle;
+    pointer-events: none;
+    user-select: none;
+  }
+  .anchor-badge-question { pointer-events: none; }
+  #graph-svg .link-anchor {
+    stroke-dasharray: 3 3;
+    opacity: 0.4;
+  }
+  /* Card actions above the transcript panel (#865) — Show on board / Answer
+     for whatever node or card cluster is currently selected. Empty (and
+     therefore invisible — no min-height) when nothing is selected. */
+  #graph-panel-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    padding: 0 0 0.5rem 5px;
+  }
+  #graph-panel-actions:empty { display: none; }
+  .graph-panel-action {
+    align-self: flex-start;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.78rem;
+    cursor: pointer;
+  }
+  .graph-panel-action:hover { border-color: var(--accent); }
+  .graph-panel-answer-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .graph-panel-answer-form textarea {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.4rem;
+    font: inherit;
+    min-height: 4.5em;
+    resize: vertical;
+  }
   /* Drag handle on the left edge of the side panel — col-resize cursor,
      pure CSS visual feedback on hover/active. Drag logic in JS persists
      the width to localStorage so it survives reload. */
@@ -1167,6 +1228,27 @@
   .board-chip-assignee { color: var(--accent); border-color: var(--accent); }
   .board-chip-host { color: var(--claimed); border-color: var(--claimed); }
   .board-chip-assigned-host { color: var(--yielded); border-color: var(--yielded); border-style: dashed; }
+  /* Session chip → graph tab (#865) — a clickable chip on a card whose
+     session is live, distinct from the plain (non-interactive) chips
+     above it. */
+  .board-chip-session {
+    cursor: pointer;
+    background: var(--accent);
+    color: var(--bg-primary);
+    border-color: var(--accent);
+  }
+  .board-chip-session:hover { filter: brightness(1.1); }
+  /* Node selected → board tab reveal (#865) — a temporary highlight on the
+     card `revealCard` scrolled to, so it's findable at a glance even in a
+     lane with many cards. */
+  @keyframes board-card-reveal-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); }
+    50%      { box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.55); }
+  }
+  .board-card.reveal-highlight {
+    border-color: var(--accent);
+    animation: board-card-reveal-pulse 0.6s ease-in-out 2;
+  }
   #board-connection-state { margin-left: 0.5rem; color: var(--text-dim); font-size: 0.75rem; }
 
   .board-drawer-backdrop {
@@ -1331,15 +1413,28 @@
       <option value="local">local</option>
     </select>
     <select id="board-filter-host" title="Host"><option value="all">all hosts</option></select>
+    <select id="board-filter-engine" title="Engine">
+      <option value="all">all engines</option>
+      <option value="local">local</option>
+      <option value="remote">remote</option>
+      <option value="claude">claude</option>
+      <option value="claude_code">claude code</option>
+      <option value="codex">codex</option>
+      <option value="hermes">hermes</option>
+      <option value="ask">ask</option>
+    </select>
     <input type="text" id="board-filter-tag" placeholder="tag" />
     <select id="board-filter-context" title="Context"><option value="all">all contexts</option></select>
     <select id="board-filter-recency" title="Recency">
-      <option value="all" selected>all time</option>
+      <option value="60">1 min</option>
+      <option value="1800">30 min</option>
       <option value="3600">1 h</option>
       <option value="86400">24 h</option>
       <option value="604800">1 wk</option>
+      <option value="all" selected>all time</option>
     </select>
     <label><input type="checkbox" id="board-filter-done" /> include cancelled</label>
+    <button type="button" id="board-filter-clear" title="Reset every shared filter to its default">Clear</button>
     <button id="board-new-card" type="button">+ New card</button>
     <span id="board-connection-state">connecting…</span>
   </div>
@@ -1362,6 +1457,7 @@
       <select id="filter-recency">
         <option value="60">1 min</option>
         <option value="1800" selected>30 min</option>
+        <option value="3600">1 h</option>
         <option value="86400">24 h</option>
         <option value="604800">1 wk</option>
         <option value="all">all time</option>
@@ -1389,6 +1485,33 @@
         <option value="ask">ask</option>
       </select>
     </label>
+    <label title="Limit to sessions whose board lane matches — shared with the board's own lane filter.">lane
+      <select id="filter-lane">
+        <option value="all">all</option>
+        <option value="unassigned">Unassigned</option>
+        <option value="assigned">Assigned</option>
+        <option value="in_progress">In progress</option>
+        <option value="human_queue">Human queue</option>
+        <option value="scheduled">Scheduled</option>
+        <option value="review">Review</option>
+        <option value="done">Done</option>
+      </select>
+    </label>
+    <label title="Limit to sessions whose linked card is assigned to this — shared with the board's own assignee filter.">assignee
+      <select id="filter-assignee">
+        <option value="all">any assignee</option>
+        <option value="unassigned">unassigned</option>
+        <option value="me">me</option>
+        <option value="claude">claude</option>
+        <option value="codex">codex</option>
+        <option value="hermes">hermes</option>
+        <option value="local">local</option>
+      </select>
+    </label>
+    <label title="Limit to sessions whose linked card carries this tag — shared with the board's own tag filter.">tag
+      <input type="text" id="filter-tag" placeholder="tag" />
+    </label>
+    <button type="button" id="graph-filter-clear" title="Reset every shared filter to its default">Clear</button>
     <label>status
       <select id="filter-status">
         <option value="all">all</option>
@@ -1423,6 +1546,7 @@
     </section>
     <aside class="panel" id="panel-outer">
       <div class="panel-resizer" id="panel-resizer" title="Drag to resize"></div>
+      <div id="graph-panel-actions"></div>
       <div class="panel-content" id="panel">
         <div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>
       </div>
@@ -1433,6 +1557,9 @@
 <script type="module">
   import { initBoard } from '/static/agents/board.js';
   import { initGraph } from '/static/agents/graph.js';
+  import {
+    activateTab, onTabActivate, requestGraphFocus, requestBoardFocus,
+  } from '/static/agents/linking.js';
 
   const boardView = document.getElementById('board-view');
   const graphView = document.getElementById('graph-view');
@@ -1440,7 +1567,11 @@
   const tabButtons = document.querySelectorAll('.tab-btn');
   let graphInitialized = false;
 
-  function activateTab(name) {
+  // The DOM-visibility half of tab activation — registered as a
+  // subscriber (see linking.js's `onTabActivate`) rather than called
+  // directly, so `activateTab` stays the one thing both this page's own
+  // tab buttons and a URL deep link (below) go through.
+  onTabActivate((name) => {
     tabButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.tab === name));
     boardView.hidden = name !== 'board';
     graphView.hidden = name !== 'graph';
@@ -1449,13 +1580,31 @@
       graphInitialized = true;
       initGraph();
     }
-  }
+  });
 
   tabButtons.forEach(btn => btn.addEventListener('click', () => activateTab(btn.dataset.tab)));
 
   // Board is the primary view — boots immediately. The Graph tab's snapshot
   // fetch + SSE stream only start once the operator opens it.
   initBoard();
+
+  // URL deep links — `?session=<id>` opens the graph tab with that node
+  // selected; `?card=<id>` opens the board with that card's drawer open.
+  // The intent is stored via `requestGraphFocus`/`requestBoardFocus` BEFORE
+  // `activateTab` runs, so it's already there for board.js/graph.js's own
+  // `onTabActivate` drain (see their `initBoard`/`initGraph`) whether or not
+  // their data has loaded yet — an unknown id is reported by whichever
+  // module actually resolves the intent once its data lands, not here.
+  const deepLinkParams = new URLSearchParams(location.search);
+  const sessionParam = deepLinkParams.get('session');
+  const cardParam = deepLinkParams.get('card');
+  if (sessionParam) {
+    requestGraphFocus(sessionParam);
+    activateTab('graph');
+  } else if (cardParam) {
+    requestBoardFocus(cardParam, { openDrawer: true });
+    activateTab('board');
+  }
 </script>
 </body>
 </html>

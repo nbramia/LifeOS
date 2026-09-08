@@ -211,7 +211,12 @@ def _open_board_with_drawer(
     page.set_viewport_size({"width": 1280, "height": 800})
     page.goto(f"{base_url}/agents")
     page.wait_for_selector('.board-card[data-card-id="t1"]')
-    page.locator('.board-card[data-card-id="t1"]').click()
+    # Click the title specifically, not the card's own bounding-box centre —
+    # a card whose chip row wraps differently (e.g. `host=""` below, which
+    # omits the "ran on" chip) can shift the session chip (#865) to sit at
+    # that centre point instead, and its own click handler stops
+    # propagation before the card's drawer-opening listener ever sees it.
+    page.locator('.board-card[data-card-id="t1"] .board-card-title').click()
     page.wait_for_selector('[data-action="resume"]')
     if capture_focus:
         return resume_calls, focus_calls

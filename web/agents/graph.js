@@ -20,9 +20,14 @@ import {
 import { LANES } from './lanes.js';
 import {
   nodeLabel, isRawIdValue, engineOf, ENGINE_SHAPES, shapeTagFor,
-  radiusForActiveSeconds, ringWidthForToolCalls, laneColor,
+  radiusForActiveSeconds, ringWidthForToolCalls, laneColor, routingFilterValue,
   isKnownSearchField, SEARCH_TIER, SEARCH_BADGE, hoverCardRows,
 } from './graph_encoding.js';
+import {
+  getFilters, setFilter, resetFilters, subscribe as subscribeFilters,
+  requestGraphFocus, takeGraphFocus, requestBoardFocus,
+  onTabActivate, activateTab,
+} from './linking.js';
 
 export function initGraph() {
   const filterTerminalEl = document.getElementById('filter-terminal');
@@ -41,12 +46,23 @@ export function initGraph() {
   const zoomResetBtn = document.getElementById('graph-zoom-reset');
   const laneLegendEl = document.getElementById('graph-lane-legend');
   const engineLegendEl = document.getElementById('graph-engine-legend');
+  const filterLaneEl = document.getElementById('filter-lane');
+  const filterAssigneeEl = document.getElementById('filter-assignee');
+  const filterTagEl = document.getElementById('filter-tag');
+  const filterClearBtn = document.getElementById('graph-filter-clear');
+  const panelActionsEl = document.getElementById('graph-panel-actions');
   // Operator chooses recency manually → don't auto-flip on include-finished toggle.
   let recencyManuallySet = false;
 
   let allSessions = [];
   let allEdges = [];
   let selectedSessionId = null;
+  // A selected card/host anchor (#865) — mutually exclusive with
+  // `selectedSessionId`: selecting one clears the other. Anchors render in
+  // their own SVG group (`anchorLayer`, below) and never carry a transcript
+  // of their own, so selecting one never opens the session panel.
+  let selectedAnchorId = null;
+  let lastAnchorsById = new Map();
   let apiHost = '';
 
   // Subagent trees — a session with `parent_session_id` set is
@@ -116,17 +132,125 @@ export function initGraph() {
 
   function closePanel() {
     selectedSessionId = null;
+    selectedAnchorId = null;
     panel.close();
     panelEl.innerHTML = '<div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>';
     applySelectionStyles();
+    applyAnchorSelectionStyles();
+    clearPanelActions();
   }
 
   function openPanel(sessionId) {
     const s = allSessions.find(x => x.session_id === sessionId);
     if (!s) return;
+    selectedAnchorId = null;
     selectedSessionId = sessionId;
     applySelectionStyles();
+    applyAnchorSelectionStyles();
     panel.open(s);
+    renderPanelActions(s);
+  }
+
+  // A card/host anchor's own selection — no transcript to show (an anchor
+  // groups several sessions, not one), so the transcript panel goes back to
+  // its empty state while `#graph-panel-actions` (below) still renders for
+  // the anchor's own card id / pending question.
+  function selectAnchor(anchorId) {
+    const a = lastAnchorsById.get(anchorId);
+    if (!a) return;
+    selectedSessionId = null;
+    selectedAnchorId = anchorId;
+    panel.close();
+    panelEl.innerHTML = '<div class="panel-empty" id="panel-empty">This is a card cluster — click one of its session nodes to inspect a transcript.</div>';
+    applySelectionStyles();
+    applyAnchorSelectionStyles();
+    renderPanelActions(a);
+  }
+
+  function applyAnchorSelectionStyles() {
+    anchorLayer.selectAll('.anchor-shape').classed('selected', d => d.id === selectedAnchorId);
+  }
+
+  // --- Card actions above the transcript panel (#865) ---------------------
+
+  function clearPanelActions() {
+    if (panelActionsEl) panelActionsEl.innerHTML = '';
+  }
+
+  // A source is either a session row (`pending_question` lives directly on
+  // it) or a card anchor (`_hasPendingQuestion`/`_sessions` — the first of
+  // its sessions carrying one, since the anchor itself never owns a
+  // question, only the sessions it groups do).
+  function pendingQuestionFor(source) {
+    if (!source) return null;
+    if (source.anchor) {
+      const withQuestion = (source._sessions || []).find(s => s.pending_question);
+      return withQuestion ? withQuestion.pending_question : null;
+    }
+    return source.pending_question || null;
+  }
+
+  function renderPanelActions(source) {
+    if (!panelActionsEl) return;
+    if (!source) { clearPanelActions(); return; }
+    const cardId = source.card_id || null;
+    const pq = pendingQuestionFor(source);
+    let html = '';
+    if (cardId) {
+      html += `<button type="button" class="graph-panel-action" data-action="show-on-board">Show on board</button>`;
+    }
+    if (pq) {
+      html += `<button type="button" class="graph-panel-action" data-action="answer">Answer</button>`;
+    }
+    panelActionsEl.innerHTML = html;
+    const showBtn = panelActionsEl.querySelector('[data-action="show-on-board"]');
+    if (showBtn) {
+      showBtn.addEventListener('click', () => {
+        requestBoardFocus(cardId, { openDrawer: false });
+        activateTab('board');
+      });
+    }
+    const answerBtn = panelActionsEl.querySelector('[data-action="answer"]');
+    if (answerBtn) answerBtn.addEventListener('click', () => openInlineAnswerForm(pq));
+  }
+
+  // Reveals an inline textarea + Send inside `#graph-panel-actions` — the
+  // same `/api/agents/pending-questions/{id}/answer` endpoint
+  // `openAnswerPrompt` in board.js posts to, so an answer sent from either
+  // tab is indistinguishable to the worker on the other end.
+  function openInlineAnswerForm(pq) {
+    if (!panelActionsEl || !pq) return;
+    const answerBtn = panelActionsEl.querySelector('[data-action="answer"]');
+    if (answerBtn) answerBtn.remove();
+    const form = document.createElement('div');
+    form.className = 'graph-panel-answer-form';
+    form.innerHTML = `
+      <textarea placeholder="Your answer…"></textarea>
+      <button type="button" class="graph-panel-action">Send</button>
+    `;
+    panelActionsEl.appendChild(form);
+    const textEl = form.querySelector('textarea');
+    const sendBtn = form.querySelector('button');
+    sendBtn.addEventListener('click', async () => {
+      const answer = textEl.value.trim();
+      if (!answer) return;
+      sendBtn.disabled = true;
+      sendBtn.textContent = 'Sending…';
+      try {
+        const r = await fetch(`/api/agents/pending-questions/${encodeURIComponent(pq.id)}/answer`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ answer }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        showToast('Answer sent.', false);
+        fetchSnapshotOnce();
+      } catch (err) {
+        showToast(`Couldn't send answer: ${err.message}`, true);
+        sendBtn.disabled = false;
+        sendBtn.textContent = 'Send';
+      }
+    });
   }
 
   // Standalone Go To for the node dblclick handler — fires regardless of
@@ -168,6 +292,11 @@ export function initGraph() {
   const viewport = svg.append('g').attr('class', 'viewport');
   const columnLayer = viewport.append('g').attr('class', 'host-columns');
   const linkLayer = viewport.append('g').attr('class', 'links');
+  // Card/host anchor clusters (#865) — its own group, between the links and
+  // the session nodes, so an anchor's rect never sits on top of a node and
+  // an anchor is never mistaken for one by any `.node`-scoped selector
+  // (selection styling, badges, drag, hover — all session-node-only).
+  const anchorLayer = viewport.append('g').attr('class', 'anchors');
   const nodeLayer = viewport.append('g').attr('class', 'nodes');
 
   const zoom = d3.zoom()
@@ -186,7 +315,7 @@ export function initGraph() {
   svg.on('mouseup.cursor',   () => svg.style('cursor', 'grab'));
 
   svg.on('click', (event) => {
-    if (event.target === svg.node() && selectedSessionId) closePanel();
+    if (event.target === svg.node() && (selectedSessionId || selectedAnchorId)) closePanel();
   });
 
   function transitionMs() {
@@ -262,13 +391,17 @@ export function initGraph() {
     .force('charge', d3.forceManyBody().strength(-220).distanceMax(600))
     .force('col-x', d3.forceX(columnTargetX).strength(0.22))
     .force('lane-y', d3.forceY(laneTargetY).strength(0.16))
-    .force('collide', d3.forceCollide().radius(d => collideRadius(d)).strength(0.9))
+    // Anchors get their own (larger) collide radius, computed from their
+    // rendered box — never `collideRadius` itself, which is sized for a
+    // session node's own radius + wrapped label.
+    .force('collide', d3.forceCollide().radius(d => d.anchor ? anchorCollideRadius(d) : collideRadius(d)).strength(0.9))
     .alphaDecay(0.025)
     .alphaMin(0.001)
     .velocityDecay(0.45);
 
   simulation.on('tick', () => {
     nodeLayer.selectAll('.node').attr('transform', d => `translate(${d.x},${d.y})`);
+    anchorLayer.selectAll('.anchor').attr('transform', d => `translate(${d.x},${d.y})`);
     linkLayer.selectAll('.link').attr('d', d => {
       const sx = d.source.x, sy = d.source.y;
       const tx = d.target.x, ty = d.target.y;
@@ -325,12 +458,20 @@ export function initGraph() {
 
   function applyFilters(sessions) {
     const showTerm = filterTerminalEl.checked;
-    const route = filterRouteEl.value;
     const status = filterStatusEl.value;
     const recencyRaw = filterRecencyEl ? filterRecencyEl.value : 'all';
     const recencySec = (recencyRaw === 'all') ? null : Number(recencyRaw);
     const cwdSel = filterCwdEl ? filterCwdEl.value : 'all';
     const hostSel = filterHostEl ? filterHostEl.value : 'all';
+    // Lane/assignee/tag/engine ("route") are the shared filters (#865) —
+    // read straight from the shared store rather than trusting the DOM
+    // mirror (`#filter-lane` etc., kept in sync by `syncSharedControls`
+    // below) is always up to date.
+    const shared = getFilters();
+    const route = shared.engine;
+    const laneSet = new Set(shared.lanes);
+    const assigneeSel = shared.assignee;
+    const tagQuery = (shared.tag || '').trim().toLowerCase();
     const nowSec = Date.now() / 1000;
     return sessions.filter(s => {
       if (!showTerm && TERMINAL.has(s.status)) return false;
@@ -340,11 +481,17 @@ export function initGraph() {
       }
       if (cwdSel !== 'all' && s.decoded_cwd !== cwdSel) return false;
       if (hostSel !== 'all' && s.host !== hostSel) return false;
-      if (route !== 'all') {
-        const r = s.routing || 'local';
-        if (r !== route) return false;
-      }
+      if (route !== 'all' && routingFilterValue(s) !== route) return false;
       if (status !== 'all' && s.status !== status) return false;
+      // `s.lane` is only ever absent from a row a fixture predating #865
+      // synthesized without it — treat that as "not excludable by lane"
+      // rather than hiding it, since a real snapshot row always carries one.
+      if (s.lane != null && !laneSet.has(s.lane)) return false;
+      if (assigneeSel !== 'all') {
+        if (assigneeSel === 'unassigned') { if (s.assignee) return false; }
+        else if (s.assignee !== assigneeSel) return false;
+      }
+      if (tagQuery && !(s.card_tags || []).some(t => t.toLowerCase().includes(tagQuery))) return false;
       return true;
     });
   }
@@ -611,6 +758,128 @@ export function initGraph() {
     renderGraph(allSessions, allEdges);
   }
 
+  // -------------------------------------------------------------------
+  // Card/host anchors (#865) — one synthetic cluster node per distinct
+  // `card_id` among the visible sessions (labelled with the card's title),
+  // plus one per host among sessions with no card at all (labelled with
+  // the host name). Every visible session links to exactly one anchor —
+  // its card anchor if it has one, else its host anchor.
+  // -------------------------------------------------------------------
+
+  const ANCHOR_PAD_X = 14;
+  const ANCHOR_CHAR_W = 6.5;
+  const ANCHOR_MAX_CHARS = 26;
+  const ANCHOR_H = 30;
+
+  function anchorLabelText(d) {
+    const raw = String(d.label || d.card_id || d.host || '?');
+    if (raw.length <= ANCHOR_MAX_CHARS) return raw;
+    return raw.slice(0, ANCHOR_MAX_CHARS - 1) + '…';
+  }
+
+  function anchorBoxFor(d) {
+    const text = anchorLabelText(d);
+    const w = Math.max(64, text.length * ANCHOR_CHAR_W + ANCHOR_PAD_X * 2);
+    return { w, h: ANCHOR_H };
+  }
+
+  function anchorCollideRadius(d) {
+    const { w, h } = anchorBoxFor(d);
+    return Math.hypot(w, h) / 2 + 12;
+  }
+
+  // Groups `visible` sessions into one anchor per distinct `card_id`, plus
+  // one per host among sessions with none — a session whose `card_id` is
+  // null, undefined, OR whose linked task no longer exists (`card_id`
+  // stamped null by the server the same way) all land in the host bucket.
+  function buildAnchors(visible) {
+    const byCard = new Map();
+    const byHost = new Map();
+    for (const s of visible) {
+      if (s.card_id != null) {
+        if (!byCard.has(s.card_id)) byCard.set(s.card_id, []);
+        byCard.get(s.card_id).push(s);
+      } else {
+        const h = hostOf(s);
+        if (!byHost.has(h)) byHost.set(h, []);
+        byHost.get(h).push(s);
+      }
+    }
+    const anchors = [];
+    for (const [cardId, sessions] of byCard) {
+      // The anchor's own host is the host most of its sessions run on —
+      // ties break on the alphabetically first host, so the choice is
+      // deterministic across renders (no dependence on Map insertion order).
+      const hostCounts = new Map();
+      for (const s of sessions) hostCounts.set(hostOf(s), (hostCounts.get(hostOf(s)) || 0) + 1);
+      let bestHost = hostOf(sessions[0]);
+      let bestCount = -1;
+      for (const h of [...hostCounts.keys()].sort()) {
+        const c = hostCounts.get(h);
+        if (c > bestCount) { bestCount = c; bestHost = h; }
+      }
+      const withTitle = sessions.find(s => s.card_title);
+      anchors.push({
+        anchor: true, anchor_kind: 'card',
+        id: 'card:' + cardId, session_id: 'card:' + cardId,
+        card_id: cardId, label: (withTitle && withTitle.card_title) || cardId,
+        lane: sessions[0].lane, host: bestHost,
+        _sessions: sessions,
+      });
+    }
+    for (const [host, sessions] of byHost) {
+      anchors.push({
+        anchor: true, anchor_kind: 'host',
+        id: 'host:' + host, session_id: 'host:' + host,
+        card_id: null, label: host,
+        lane: null, host,
+        _sessions: sessions,
+      });
+    }
+    return anchors;
+  }
+
+  function anchorTargetIdFor(s) {
+    return s.card_id != null ? ('card:' + s.card_id) : ('host:' + hostOf(s));
+  }
+
+  function applyAnchorAttrs(sel) {
+    sel.each(function(d) {
+      const el = d3.select(this);
+      const { w, h } = anchorBoxFor(d);
+      const strokeColor = d.anchor_kind === 'card' ? laneColor(d.lane) : 'rgba(232,232,237,0.35)';
+      el.select('rect.anchor-shape')
+        .attr('x', -w / 2).attr('y', -h / 2)
+        .attr('width', w).attr('height', h)
+        .attr('rx', 8).attr('ry', 8)
+        .attr('fill', 'rgba(255,255,255,0.04)')
+        .attr('stroke', strokeColor)
+        .attr('stroke-width', 2)
+        .attr('stroke-dasharray', d.anchor_kind === 'host' ? '4 3' : null);
+      el.select('text.anchor-label')
+        .attr('y', 4)
+        .text(anchorLabelText(d));
+    });
+  }
+
+  // Renders the question badge on the anchor itself — a card anchor whose
+  // sessions include any row with a non-null `pending_question` — never via
+  // `applyBadges`, which only ever touches a session `.node`.
+  function applyAnchorBadge(sel) {
+    sel.each(function(d) {
+      const g = d3.select(this);
+      const { w, h } = anchorBoxFor(d);
+      const hasQuestion = d.anchor_kind === 'card' && (d._sessions || []).some(s => !!s.pending_question);
+      g.select('.anchor-badge-question-ring')
+        .style('display', hasQuestion ? '' : 'none')
+        .attr('cx', w / 2 - 2).attr('cy', -h / 2 + 2).attr('r', 8);
+      g.select('text.anchor-badge-question')
+        .style('display', hasQuestion ? '' : 'none')
+        .attr('x', w / 2 - 2).attr('y', -h / 2 + 2)
+        .text('?');
+    });
+  }
+
   function renderGraph(sessions, snapshotEdges) {
     const filtered = applyFilters(sessions);
     const visible = applyCollapse(filtered);
@@ -638,13 +907,31 @@ export function initGraph() {
 
     const visibleLinks = (snapshotEdges || [])
       .filter(e => visibleIds.has(e.from) && visibleIds.has(e.to))
-      .map(e => ({ id: `${e.from}->${e.to}`, source: e.from, target: e.to }));
+      .map(e => ({ id: `${e.from}->${e.to}`, source: e.from, target: e.to, _anchorLink: false }));
 
+    // One anchor link per visible session, in addition to the spawn edges
+    // above — a distinct `link-anchor` class keeps their styling (and the
+    // existing `relatedTo`/selection highlighting, which matches on any
+    // `path.link`) coherent with the spawn edges rather than colliding.
+    const anchors = buildAnchors(visible);
+    lastAnchorsById = new Map(anchors.map(a => [a.id, a]));
+    const anchorLinks = visible.map(s => ({
+      id: `anchor:${s.session_id}`, source: s.session_id, target: anchorTargetIdFor(s), _anchorLink: true,
+    }));
+
+    // The SAME array (and the SAME link objects) feed both this DOM data
+    // join and `simulation.force('link').links(...)` below — `d3.forceLink`
+    // mutates each link's `source`/`target` in place (string id -> resolved
+    // node object) once the simulation ticks, and the tick handler's own
+    // path-drawing code reads `d.source.x`/`d.target.x` off exactly these
+    // bound objects; a copy here would leave the DOM-bound data permanently
+    // holding the un-resolved string ids instead.
+    const allLinkData = [...visibleLinks, ...anchorLinks];
     linkLayer.selectAll('path.link')
-      .data(visibleLinks, d => d.id)
+      .data(allLinkData, d => d.id)
       .join(
-        enter => enter.append('path').attr('class', 'link'),
-        update => update,
+        enter => enter.append('path').attr('class', d => d._anchorLink ? 'link link-anchor' : 'link'),
+        update => update.attr('class', d => d._anchorLink ? 'link link-anchor' : 'link'),
         exit => exit.remove()
       );
 
@@ -751,15 +1038,49 @@ export function initGraph() {
 
     sel.exit().remove();
 
+    // Anchor rendering mirrors the session-node join above (preserve x/y
+    // across re-renders via `oldAnchorsById`) but never runs through
+    // `applyShapeAttrs`/`applyBadges`/`renderNodeLabel` — those are the
+    // session node's own rendering, off limits here by design.
+    const oldAnchorsById = new Map();
+    anchorLayer.selectAll('.anchor').each(function(d) { oldAnchorsById.set(d.id, d); });
+    const anchorMerged = anchors.map(a => {
+      const prev = oldAnchorsById.get(a.id);
+      return prev ? Object.assign(prev, a) : Object.assign(
+        { x: columnTargetX(a), y: laneTargetY(a) }, a,
+      );
+    });
+
+    const anchorSel = anchorLayer.selectAll('.anchor')
+      .data(anchorMerged, d => d.id);
+    const anchorEntered = anchorSel.enter().append('g')
+      .attr('class', 'anchor')
+      .on('click', (event, d) => {
+        if (event.detail > 1) return;
+        if (d.id === selectedAnchorId) closePanel();
+        else selectAnchor(d.id);
+      });
+    anchorEntered.append('rect').attr('class', 'anchor-shape');
+    anchorEntered.append('text').attr('class', 'anchor-label');
+    anchorEntered.append('circle').attr('class', 'anchor-badge-question-ring')
+      .attr('fill', 'none').attr('stroke', 'var(--accent, #6366f1)').attr('stroke-width', 2);
+    anchorEntered.append('text').attr('class', 'anchor-badge-question')
+      .attr('text-anchor', 'middle').attr('font-size', 11).attr('fill', 'var(--accent, #6366f1)');
+    const anchorAll = anchorEntered.merge(anchorSel);
+    applyAnchorAttrs(anchorAll);
+    applyAnchorBadge(anchorAll);
+    anchorSel.exit().remove();
+
     visibleCount = merged.length;
-    simulation.nodes(merged);
-    simulation.force('link').links(visibleLinks);
-    // Restart when either the visible-id set OR any node's size changed —
-    // a snapshot tick that only updates `total_active_seconds` must still
-    // reheat the layout so a grown node's collide radius is honored.
+    simulation.nodes([...merged, ...anchorMerged]);
+    simulation.force('link').links(allLinkData);
+    // Restart when either the visible-id set, any node's size, OR the
+    // anchor set changed — a card just linked to (or dropped by) a session
+    // reshapes the clusters even when no session itself entered or left.
     const idsKey = visible.map(s => s.session_id).sort().join('|');
     const sizeKey = visible.map(s => `${s.session_id}:${Math.round(nodeRadius(s))}`).sort().join('|');
-    const simKey = idsKey + '::' + sizeKey;
+    const anchorKey = anchors.map(a => a.id).sort().join('|');
+    const simKey = idsKey + '::' + sizeKey + '::' + anchorKey;
     if (simKey !== _lastSimKey) {
       _lastSimKey = simKey;
       simulation.alpha(0.3).restart();
@@ -772,6 +1093,7 @@ export function initGraph() {
     updateCwdOptions(allSessions);
     updateHostOptions(allSessions);
     applySelectionStyles();
+    applyAnchorSelectionStyles();
   }
 
   function linkEndpoints(e) {
@@ -838,8 +1160,18 @@ export function initGraph() {
     renderGraph(allSessions, allEdges);
     if (selectedSessionId) {
       const s = allSessions.find(x => x.session_id === selectedSessionId);
-      if (s) panel.updateMeta(s);
+      if (s) { panel.updateMeta(s); renderPanelActions(s); }
     }
+    if (selectedAnchorId) {
+      const a = lastAnchorsById.get(selectedAnchorId);
+      if (a) renderPanelActions(a);
+    }
+    // Resolves a pending `?session=<id>` deep link, or a session chip's
+    // `requestGraphFocus`, once this snapshot is the first to land after
+    // the intent was set — a no-op on every other tick, since
+    // `takeGraphFocus` consumes the intent on its first read regardless of
+    // outcome (#865).
+    drainGraphFocus();
   }
 
   // --- Filters ---
@@ -859,12 +1191,28 @@ export function initGraph() {
   if (filterRecencyEl) {
     filterRecencyEl.addEventListener('change', () => {
       recencyManuallySet = true;
-      onFilterChange();
+      setFilter('recency', filterRecencyEl.value);
     });
   }
-  [filterRouteEl, filterStatusEl, filterCwdEl, filterHostEl].filter(Boolean).forEach(el =>
+  [filterStatusEl, filterCwdEl, filterHostEl].filter(Boolean).forEach(el =>
     el.addEventListener('change', onFilterChange)
   );
+
+  // --- Shared filters (#865): search/lanes/assignee/host/engine/tag/recency,
+  // bound bidirectionally with the board's own filter bar via linking.js.
+  // `#filter-route` becomes the shared engine control; `#filter-lane` (a
+  // single select) sets the shared `lanes` array to just the chosen lane,
+  // or every lane id for "all".
+  if (filterRouteEl) filterRouteEl.addEventListener('change', () => setFilter('engine', filterRouteEl.value));
+  if (filterLaneEl) {
+    filterLaneEl.addEventListener('change', () => {
+      const v = filterLaneEl.value;
+      setFilter('lanes', v === 'all' ? LANES.map(l => l.id) : [v]);
+    });
+  }
+  if (filterAssigneeEl) filterAssigneeEl.addEventListener('change', () => setFilter('assignee', filterAssigneeEl.value));
+  if (filterTagEl) filterTagEl.addEventListener('input', () => setFilter('tag', filterTagEl.value));
+  if (filterClearBtn) filterClearBtn.addEventListener('click', () => resetFilters());
 
   // --- Search (issue #252) ---
   const searchInputEl = document.getElementById('search-input');
@@ -1051,6 +1399,7 @@ export function initGraph() {
 
   function onSearchInput() {
     searchQuery = searchInputEl.value;
+    setFilter('search', searchQuery);
     const q = searchQuery.trim();
     clearTimeout(searchDebounceTimer);
     summaryMatches = new Map();
@@ -1097,6 +1446,116 @@ export function initGraph() {
     });
   }
 
+  // --- Shared filters (#865): search/lanes/assignee/host/engine/tag/recency,
+  // bound bidirectionally with the board's own filter bar via linking.js.
+  // `#filter-route` becomes the shared engine control; `#filter-lane` (a
+  // single select) sets the shared `lanes` array to just the chosen lane,
+  // or every lane id for "all".
+
+  // A shared `lanes` selection can't always be represented exactly by
+  // `#filter-lane`'s single-select — every lane maps to "all", exactly one
+  // maps to that lane's own option, and anything else (e.g. the board's own
+  // "every lane but Done" default) has no exact single-value display, so it
+  // falls back to showing "all" rather than an arbitrary pick.
+  function laneSelectValueFor(state) {
+    if (state.lanes.length === 1) return state.lanes[0];
+    return 'all';
+  }
+
+  function syncSharedFilterControls(state) {
+    if (filterRouteEl && filterRouteEl.value !== state.engine) filterRouteEl.value = state.engine;
+    if (filterLaneEl) {
+      const want = laneSelectValueFor(state);
+      if (filterLaneEl.value !== want) filterLaneEl.value = want;
+    }
+    if (filterAssigneeEl && filterAssigneeEl.value !== state.assignee) filterAssigneeEl.value = state.assignee;
+    if (filterTagEl && document.activeElement !== filterTagEl && filterTagEl.value !== state.tag) {
+      filterTagEl.value = state.tag;
+    }
+    if (searchInputEl && document.activeElement !== searchInputEl && searchInputEl.value !== state.search) {
+      searchInputEl.value = state.search;
+      searchQuery = state.search;
+    }
+    if (filterRecencyEl && filterRecencyEl.value !== state.recency) filterRecencyEl.value = state.recency;
+    // The shared recency value always wins over the include-finished
+    // toggle's own auto-default from here on — a restored/migrated/reset
+    // shared value counts as "the operator already chose one" (#865).
+    recencyManuallySet = true;
+    onFilterChange();
+  }
+  subscribeFilters(syncSharedFilterControls);
+  syncSharedFilterControls(getFilters());
+
+  // Loosens whichever SHARED filters would hide session `s` — the shared
+  // counterpart to `relaxFiltersFor` above (which only ever touches the
+  // graph's own local-only filters: recency/cwd/route/status). Returns
+  // whether anything actually changed, so a caller that already knows a
+  // shared change re-renders via the `subscribe` callback above doesn't
+  // also force a second, redundant render of its own.
+  function relaxSharedFiltersFor(s) {
+    const state = getFilters();
+    let changed = false;
+    if (s.lane != null && !state.lanes.includes(s.lane)) {
+      setFilter('lanes', [...state.lanes, s.lane]);
+      changed = true;
+    }
+    if (state.assignee !== 'all') {
+      const matches = state.assignee === 'unassigned' ? !s.assignee : s.assignee === state.assignee;
+      if (!matches) { setFilter('assignee', 'all'); changed = true; }
+    }
+    if (state.host !== 'all' && s.host !== state.host) { setFilter('host', 'all'); changed = true; }
+    if (state.engine !== 'all' && routingFilterValue(s) !== state.engine) {
+      setFilter('engine', 'all');
+      changed = true;
+    }
+    if (state.tag && !(s.card_tags || []).some(t => t.toLowerCase().includes(state.tag.toLowerCase()))) {
+      setFilter('tag', '');
+      changed = true;
+    }
+    return changed;
+  }
+
+  // Selects a session by id, relaxing whatever filters (local or shared)
+  // currently hide it and expanding any collapsed ancestor first — the
+  // model `selectSearchResult` above already follows, generalized for a
+  // caller with no search UI of its own (a card's session chip, a URL
+  // `?session=` deep link). Unknown ids are reported here rather than left
+  // to fail silently.
+  function focusNode(sessionId) {
+    const s = allSessions.find(x => x.session_id === sessionId);
+    if (!s) {
+      showToast(`No such session: ${sessionId}`, true);
+      return;
+    }
+    const visibleIds = new Set(applyFilters(allSessions).map(x => x.session_id));
+    const wasFilteredOut = !visibleIds.has(sessionId);
+    const wasCollapsed = !!(s.parent_session_id && !expandedParents.has(s.parent_session_id));
+    let sharedChanged = false;
+    if (wasFilteredOut) {
+      relaxFiltersFor(s);
+      sharedChanged = relaxSharedFiltersFor(s);
+    }
+    if (wasCollapsed) expandAncestorsFor(s);
+    const needsRerender = wasFilteredOut || wasCollapsed;
+    // A shared-filter change above already triggers its own re-render (via
+    // `syncSharedFilterControls`, subscribed to the shared store) — only
+    // force one here for the local-only relax/expand paths, which don't go
+    // through it.
+    if (needsRerender && !sharedChanged) {
+      releasePins();
+      renderGraph(allSessions, allEdges);
+    }
+    openPanel(sessionId);
+    panToNode(sessionId, needsRerender ? 400 : 0);
+  }
+
+  function drainGraphFocus() {
+    const sessionId = takeGraphFocus();
+    if (sessionId == null) return;
+    focusNode(sessionId);
+  }
+  onTabActivate((name) => { if (name === 'graph') drainGraphFocus(); });
+
   // --- Side panel resize ---
   (function setupPanelResizer() {
     if (!panelResizerEl || !panelOuterEl) return;
@@ -1142,10 +1601,13 @@ export function initGraph() {
   })();
 
   // --- Initial load + stream ---
-  fetch('/api/agents/snapshot')
-    .then(r => r.json())
-    .then(applySnapshot)
-    .catch(err => { connStateEl.textContent = 'failed: ' + err; });
+  function fetchSnapshotOnce() {
+    return fetch('/api/agents/snapshot')
+      .then(r => r.json())
+      .then(applySnapshot)
+      .catch(err => { connStateEl.textContent = 'failed: ' + err; });
+  }
+  fetchSnapshotOnce();
 
   const snapshotES = new EventSource('/api/agents/stream');
   snapshotES.onopen = () => { connStateEl.textContent = 'live'; };
