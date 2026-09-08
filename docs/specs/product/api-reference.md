@@ -583,9 +583,13 @@ List all schedules.
 
 Get a specific schedule.
 
+### GET /api/scheduler/bots
+
+List the Telegram bot names a schedule's `bot` field may use: `primary` plus whatever's registered in `config/telegram_bots.json`, as `{"bots": [...]}`. Backs the board drawer's bot picker.
+
 ### PUT /api/scheduler/{id}
 
-Update a schedule. An unrecognised `bot` returns **422** and leaves the schedule unchanged.
+Update a schedule. Only the fields present in the request body are validated and changed; nothing is written if any check fails. An unrecognised `bot` returns **422** with the accepted names. `schedule_type` (must be `once` or `cron`) and `action` (must be one of `notify`/`prompt`/`endpoint`/`agent`) return **400**, matching `POST /api/scheduler`. `timezone` (must resolve as an IANA zone) and `schedule_value` (must parse as a cron expression for a `cron` schedule, or an ISO datetime for a `once` schedule — using `schedule_type` from the request if given, otherwise the entry's stored type) return **422** with a detail naming what's wrong.
 
 ### DELETE /api/scheduler/{id}
 

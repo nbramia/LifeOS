@@ -127,6 +127,127 @@ class TestSchedulerAPI:
         assert client.delete("/api/scheduler/nope").status_code == 404
 
 
+class TestUpdateScheduleValidation:
+    """PUT /api/scheduler/{id} validates schedule_type, action, timezone,
+    and schedule_value before writing anything, mirroring the checks
+    POST "" already applies at creation time."""
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    @pytest.fixture
+    def mock_store(self):
+        with patch("api.routes.scheduler.get_scheduler_store") as mock:
+            store = mock.return_value
+            entry = _sample_entry()
+            store.get.return_value = entry
+            store.update.return_value = entry
+            yield store
+
+    def test_rejects_invalid_schedule_type(self, client, mock_store):
+        resp = client.put("/api/scheduler/sch-1", json={"schedule_type": "weekly"})
+        assert resp.status_code == 400
+        assert "schedule_type" in resp.text
+        mock_store.update.assert_not_called()
+
+    def test_rejects_invalid_action(self, client, mock_store):
+        resp = client.put("/api/scheduler/sch-1", json={"action": "explode"})
+        assert resp.status_code == 400
+        assert "action" in resp.text
+        mock_store.update.assert_not_called()
+
+    def test_rejects_unknown_timezone(self, client, mock_store):
+        resp = client.put("/api/scheduler/sch-1", json={"timezone": "Nowhere/Fake"})
+        assert resp.status_code == 422
+        assert "Nowhere/Fake" in resp.text
+        mock_store.update.assert_not_called()
+
+    def test_accepts_known_timezone(self, client, mock_store):
+        resp = client.put("/api/scheduler/sch-1", json={"timezone": "America/Chicago"})
+        assert resp.status_code == 200
+        assert mock_store.update.call_args.kwargs["timezone"] == "America/Chicago"
+
+    def test_rejects_invalid_cron_expression_against_explicit_type(self, client, mock_store):
+        resp = client.put("/api/scheduler/sch-1", json={
+            "schedule_type": "cron", "schedule_value": "not a cron string",
+        })
+        assert resp.status_code == 422
+        assert "cron" in resp.text.lower()
+        assert "not a cron string" in resp.text
+        mock_store.update.assert_not_called()
+
+    def test_accepts_valid_cron_expression(self, client, mock_store):
+        resp = client.put("/api/scheduler/sch-1", json={
+            "schedule_type": "cron", "schedule_value": "0 8 * * 1-5",
+        })
+        assert resp.status_code == 200
+        assert mock_store.update.call_args.kwargs["schedule_value"] == "0 8 * * 1-5"
+
+    def test_rejects_invalid_once_datetime(self, client, mock_store):
+        resp = client.put("/api/scheduler/sch-1", json={
+            "schedule_type": "once", "schedule_value": "not-a-datetime",
+        })
+        assert resp.status_code == 422
+        assert "not-a-datetime" in resp.text
+        mock_store.update.assert_not_called()
+
+    def test_accepts_valid_once_datetime(self, client, mock_store):
+        resp = client.put("/api/scheduler/sch-1", json={
+            "schedule_type": "once", "schedule_value": "2026-06-03T15:05:00",
+        })
+        assert resp.status_code == 200
+
+    def test_schedule_value_alone_is_validated_against_the_stored_type(self, client, mock_store):
+        """A PUT that changes only schedule_value (no schedule_type in the
+        same request) must be validated against the ENTRY's stored type,
+        not assumed to be cron."""
+        mock_store.get.return_value = _sample_entry(schedule_type="once")
+        resp = client.put("/api/scheduler/sch-1", json={"schedule_value": "not-a-datetime"})
+        assert resp.status_code == 422
+        assert "not-a-datetime" in resp.text
+        mock_store.update.assert_not_called()
+
+    def test_schedule_value_alone_accepted_against_the_stored_cron_type(self, client, mock_store):
+        mock_store.get.return_value = _sample_entry(schedule_type="cron")
+        resp = client.put("/api/scheduler/sch-1", json={"schedule_value": "0 7 * * *"})
+        assert resp.status_code == 200
+        assert mock_store.update.call_args.kwargs["schedule_value"] == "0 7 * * *"
+
+    def test_no_fields_present_skips_all_validation(self, client, mock_store):
+        resp = client.put("/api/scheduler/sch-1", json={"name": "Renamed"})
+        assert resp.status_code == 200
+        mock_store.update.assert_called_once()
+
+
+class TestListBots:
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    def test_returns_registry_names(self, client):
+        with patch("api.services.telegram.valid_bot_names", return_value=["primary", "alerts", "ledger"]):
+            resp = client.get("/api/scheduler/bots")
+        assert resp.status_code == 200
+        assert resp.json() == {"bots": ["primary", "alerts", "ledger"]}
+
+    def test_not_captured_by_the_schedule_id_route(self, client):
+        """GET /bots is declared before GET /{schedule_id} — a store whose
+        `get` would happily resolve "bots" as a schedule id must never be
+        reached for this path."""
+        with patch("api.routes.scheduler.get_scheduler_store") as mock:
+            mock.return_value.get.return_value = _sample_entry()
+            with patch("api.services.telegram.valid_bot_names", return_value=["primary"]):
+                resp = client.get("/api/scheduler/bots")
+        assert resp.status_code == 200
+        assert resp.json() == {"bots": ["primary"]}
+        mock.return_value.get.assert_not_called()
+
+
 class TestReminderAliasStillWorks:
     """The legacy /api/reminders surface must keep functioning."""
 

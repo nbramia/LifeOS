@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Scheduler
-> **Last Updated:** 2026-08-18
+> **Last Updated:** 2026-09-08
 > **Audience:** Operators
 
 The Scheduler runs work on a timer. A **schedule** binds a **trigger** (one-off
@@ -70,10 +70,17 @@ so finance, health, or therapy content lands in its own channel instead of the
 general feed. The valid names are `primary` plus whatever is *configured* —
 `config/telegram_bots.json` is the registry, but an entry there counts only once
 the env var named by its `token_env` is set, so a listed bot with no token is not
-an accepted name. Both `POST /api/scheduler` and `PUT /api/scheduler/{id}` reject
-any other name with a 422 that lists the accepted ones. Leaving the field unset
-means the primary bot, which is what an installation with no specialized bots
-configured gets.
+an accepted name. `GET /api/scheduler/bots` lists exactly those accepted names.
+Both `POST /api/scheduler` and `PUT /api/scheduler/{id}` reject any other name
+with a 422 that lists the accepted ones. Leaving the field unset means the
+primary bot, which is what an installation with no specialized bots configured
+gets.
+
+`PUT /api/scheduler/{id}` validates every field it's given the same way: an
+unparsable cron expression or ISO datetime, an unrecognised `schedule_type` or
+`action`, or an unresolvable IANA `timezone` all reject the write with a 400 or
+422 (matching the status `POST /api/scheduler` already uses for that field) and
+save nothing — only the fields actually present in the request are checked.
 
 If a stored schedule names a bot the registry no longer has — usually because
 the bot was renamed after the schedule was written — the notification is still
