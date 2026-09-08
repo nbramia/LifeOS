@@ -380,8 +380,15 @@ class TestSharedFilters:
         page.wait_for_timeout(200)
         _go_to_graph(page)
         assert page.input_value("#filter-host") == "host-b"
+        # Reverse direction — a host chosen on the graph tab must reach the
+        # board tab too.
+        page.select_option("#filter-host", "host-a")
+        page.wait_for_timeout(200)
+        page.click('[data-tab="board"]')
+        page.wait_for_timeout(200)
+        assert page.input_value("#board-filter-host") == "host-a"
         _open_agents(page, agents_base_url, snapshot=two_host_snapshot, board=two_host_board)
-        assert page.input_value("#board-filter-host") == "host-b"
+        assert page.input_value("#board-filter-host") == "host-a"
 
     def test_clear_resets_every_shared_filter(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)
