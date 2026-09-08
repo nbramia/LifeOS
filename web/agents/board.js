@@ -106,6 +106,10 @@ export function initBoard() {
 
   let board = { lanes: Object.fromEntries(LANES.map(l => [l.id, []])) };
   let visibleLanes = new Set(getFilters().lanes);
+  // Whether the first GET /api/agents/board (or board/stream tick) has
+  // landed — see `drainBoardFocus` below, the same "re-queue if not loaded
+  // yet" pattern graph.js's `drainGraphFocus` uses (#865).
+  let boardLoaded = false;
   let openCardId = null;
   let openCardLane = null;
   let openCardSnapshot = null;  // last card object the drawer was fully rendered from
@@ -186,6 +190,7 @@ export function initBoard() {
 
   function applyBoard(next) {
     board = next;
+    boardLoaded = true;
     updateFilterOptions();
     render();
     if (openCardId) {
@@ -540,6 +545,14 @@ export function initBoard() {
   function drainBoardFocus() {
     const intent = takeBoardFocus();
     if (!intent) return;
+    if (!boardLoaded) {
+      // Data hasn't arrived yet (a tab-activation drain can fire before the
+      // first GET /api/agents/board resolves) — put the intent back so
+      // `applyBoard`'s own drain resolves it once it actually can, rather
+      // than wrongly reporting a real card as unknown.
+      requestBoardFocus(intent.cardId, { openDrawer: intent.openDrawer });
+      return;
+    }
     revealCard(intent.cardId, { openDrawer: intent.openDrawer });
   }
   onTabActivate((name) => { if (name === 'board') drainBoardFocus(); });
