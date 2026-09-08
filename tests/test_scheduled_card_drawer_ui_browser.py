@@ -234,11 +234,21 @@ class TestScheduleTypeAndValue:
     def test_next_fire_preview_updates_from_put_response(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
         preview = page.locator('[data-field="next-fire-preview"]')
-        expect(preview).to_contain_text("2099")  # the fixture's original next_fire_at
+        initial_text = preview.text_content()
+        assert "2099" in initial_text  # the fixture's original next_fire_at
+
         page.locator('[data-field="schedule-value"]').fill("0 10 * * *")
-        page.locator('[data-field="timezone"]').click()  # blur
-        # The stub advances next_fire_at to 2099-02-02 on a schedule_value save.
-        expect(preview).to_contain_text("2099", timeout=5000)
+        # Blur onto the timezone field, which stays inside the drawer -- so
+        # a subsequent board refetch's own redraw is skipped (the drawer
+        # still holds focus) and can't stand in for the direct
+        # preview-from-response update this waits on.
+        page.locator('[data-field="timezone"]').click()
+        # The stub advances next_fire_at to 2099-02-02 on a schedule_value
+        # save -- checked by inequality against the captured initial text,
+        # not by substring, since both the original and the new date
+        # contain "2099" and so wouldn't otherwise distinguish "updated"
+        # from "never touched".
+        _wait_for(lambda: preview.text_content() != initial_text, page=page)
 
 
 class TestTimezone:
