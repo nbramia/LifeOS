@@ -1991,7 +1991,7 @@ class TestLaneAddButton:
         page.locator("#board-lane-filter-options input[value='human_queue']").uncheck()
         expect(page.locator('.board-lane[data-lane="assigned"]')).to_have_count(0)
         expect(page.locator('.board-lane[data-lane="human_queue"]')).to_have_count(0)
-        # The lane selection persists under the shared filters key (#865),
+        # The lane selection persists under the shared filters key,
         # not the board-only key those two lanes' `_seed_lane_storage` peers
         # elsewhere in this file target.
         stored_before = page.evaluate("localStorage.getItem('lifeos.agents.filters.v1')")

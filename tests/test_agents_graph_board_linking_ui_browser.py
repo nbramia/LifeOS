@@ -1,4 +1,4 @@
-"""Browser test for linking the /agents Board and Graph tabs (#865): card
+"""Browser test for linking the /agents Board and Graph tabs: card
 clusters on the graph, cross-tab jumps in both directions, URL deep links,
 shared persistent filters, and the card-anchor pending-question badge with
 its inline Answer form.

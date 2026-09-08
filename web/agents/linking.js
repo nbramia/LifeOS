@@ -1,10 +1,10 @@
 // web/agents/linking.js
 //
-// The Board and Graph tabs (#850) describe the same work from two angles —
-// this module is the one shared surface between them: a persisted filter
-// state both tabs' filter bars read and write, and a tiny cross-tab
-// navigation bus. It owns no DOM and no rendering — `web/agents/board.js`
-// and `web/agents/graph.js` each bind their own filter controls to
+// The Board and Graph tabs describe the same work from two angles — this
+// module is the one shared surface between them: a persisted filter state
+// both tabs' filter bars read and write, and a tiny cross-tab navigation
+// bus. It owns no DOM and no rendering — `web/agents/board.js` and
+// `web/agents/graph.js` each bind their own filter controls to
 // `getFilters()`/`setFilter()`/`subscribe()`, and drain their own pending
 // focus intent via `takeGraphFocus()`/`takeBoardFocus()`, applying it to
 // their own view (scrolling, panning, opening a drawer or panel).
@@ -17,13 +17,13 @@ const FILTERS_STORAGE_KEY = 'lifeos.agents.filters.v1';
 // Mirrors LANE_FILTER_STORAGE_KEY in web/agents/board.js — duplicated as a
 // literal (not imported) so this module and board.js never form an import
 // cycle: board.js imports FROM here, not the other way around. Read only
-// once, for the one-time migration below; board.js no longer writes to it.
+// once, for the one-time migration below; board.js writes only to this key.
 const LEGACY_BOARD_LANE_STORAGE_KEY = 'lifeos.agents.board.lanes';
 
-// The board's own pre-#865 default (every lane but Done) — the shared
-// `lanes` filter's default too, so an operator who never touched the lane
-// filter sees the same board they always did, and the graph now honours
-// that same default rather than showing every lane unfiltered.
+// The board's own default (every lane but Done) — the shared `lanes`
+// filter's default too, so an operator who never touched the lane filter
+// sees the same board they always did, and the graph honours that same
+// default rather than showing every lane unfiltered.
 const DEFAULT_LANE_IDS = LANES.filter(l => l.id !== 'done').map(l => l.id);
 
 export const DEFAULT_FILTERS = Object.freeze({
@@ -73,8 +73,8 @@ function loadFilters() {
       }
     }
   } catch (_) { /* corrupt value — fall through to the legacy/default read */ }
-  // No v1 key yet — seed `lanes` from the board's own pre-#865 selection if
-  // the operator had ever changed it, so that choice survives the upgrade.
+  // No v1 key yet — seed `lanes` from the board's own legacy selection if
+  // the operator had ever changed it, so that choice survives.
   const legacyLaneIds = readLegacyLaneIds();
   return {
     ...DEFAULT_FILTERS,
