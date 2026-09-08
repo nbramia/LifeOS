@@ -259,14 +259,18 @@ class TestActionExecutorBot:
         expect(bot_row).to_be_visible()
 
         action_select.select_option("agent")
-        # The swap is immediate -- it doesn't wait on the save round trip.
-        expect(executor_row).to_be_visible()
-        expect(bot_row).to_be_hidden()
+        # The swap happens synchronously in the change handler, before the
+        # save's network round trip resolves -- checked with a
+        # non-auto-waiting is_visible()/is_hidden() query rather than
+        # expect()'s polling, which would also pass if the swap only
+        # happened later, via the save's own board refetch.
+        assert executor_row.is_visible()
+        assert bot_row.is_hidden()
         _wait_for(lambda: {"action": "agent"} in schedule_puts, page=page)
 
         action_select.select_option("notify")
-        expect(executor_row).to_be_hidden()
-        expect(bot_row).to_be_visible()
+        assert executor_row.is_hidden()
+        assert bot_row.is_visible()
 
     def test_executor_select_saves(self, page: Page, agents_base_url):
         schedule_puts = []
