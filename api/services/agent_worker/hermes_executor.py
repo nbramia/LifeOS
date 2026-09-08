@@ -116,10 +116,12 @@ class HermesExecutor:
                     close()
         except Exception as exc:  # noqa: BLE001 — network/HTTP errors of every shape
             persister.finalize()
+            self._record_reported_model(session, persister)
             self.transcript_store.append(sid, "hermes_request_failed", {"error": str(exc)})
             return ExecutorOutcome(status=STATUS_FAILED, reason=f"hermes request failed: {exc}")
 
         persister.finalize()
+        self._record_reported_model(session, persister)
 
         conversation_id = persister.conversation_id
         final_text = persister.content_text.strip()
@@ -141,6 +143,26 @@ class HermesExecutor:
             )
 
         return ExecutorOutcome(status=STATUS_COMPLETED, final_text=final_text)
+
+    def _record_reported_model(self, session, persister: _HermesTurnPersister) -> None:
+        """Record the model Hermes reported for THIS turn onto THIS
+        session's own row — run on both the success and failure exit
+        paths, right after `persister.finalize()`, so a turn whose
+        connection dropped after Hermes reported usage still gets credited:
+        it ran on that model regardless of how the request ended. Wrapped
+        so a persistence failure here can never turn an otherwise-completed
+        turn into a failed one, matching this class's existing tolerance
+        for store errors elsewhere (`_HermesTurnPersister.finalize` itself
+        swallows its own store failures for the same reason)."""
+        if not persister.reported_model:
+            return
+        try:
+            self.session_store.set_hermes_model(session.task_id, persister.reported_model)
+        except Exception:  # noqa: BLE001 — never let a store failure fail the turn
+            logger.warning(
+                "hermes turn persistence: failed to record reported model for %s",
+                session.task_id, exc_info=True,
+            )
 
     @staticmethod
     def _build_prompt(task: dict) -> str:
