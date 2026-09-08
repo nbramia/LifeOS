@@ -696,10 +696,11 @@ export function initGraph() {
         if (!isCli || d.is_subagent || d.parent_session_id) return;
         event.preventDefault();
         event.stopPropagation();
-        // The double-click's own first click (`detail === 1`) toggled an
-        // already-selected node's panel closed before this handler ever
-        // sees the pair — reopen it so a double-click on a selected CLI
-        // node still shows its panel, not just fires focus.
+        // The double-click's own first click (`detail === 1`) toggles an
+        // already-selected node's panel closed, which the `click` handler's
+        // own listener runs ahead of this `dblclick` handler — reopen the
+        // panel here so a double-click on a selected CLI node still shows
+        // it, not just fires focus.
         if (selectedSessionId !== d.session_id) openPanel(d.session_id);
         focusSessionQuick(d);
       })
