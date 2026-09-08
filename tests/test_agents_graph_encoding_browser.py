@@ -154,6 +154,28 @@ class TestEngineOf:
 
 
 # ---------------------------------------------------------------------------
+# routingFilterValue — the shared engine filter's match value: source wins
+# for CC/Codex rows, otherwise the raw routing value, never collapsed into
+# engineOf's five shape buckets (`remote`/`hermes`/`ask` stay distinct).
+# ---------------------------------------------------------------------------
+
+class TestRoutingFilterValue:
+    @pytest.mark.parametrize("row,expected", [
+        ({"source": "claude_code", "routing": "hermes"}, "claude_code"),
+        ({"source": "codex", "routing": "local"}, "codex"),
+        ({"routing": "hermes"}, "hermes"),
+        ({"routing": "remote"}, "remote"),
+        ({"routing": "ask"}, "ask"),
+        ({"routing": "local"}, "local"),
+        ({"routing": None}, "local"),
+        ({"routing": "claude"}, "claude"),
+    ])
+    def test_routing_filter_value(self, page: Page, web_base_url, row, expected):
+        _load_module(page, web_base_url)
+        assert _call(page, "routingFilterValue", row) == expected
+
+
+# ---------------------------------------------------------------------------
 # shapeTagFor / ENGINE_SHAPES — five distinct glyphs
 # ---------------------------------------------------------------------------
 
