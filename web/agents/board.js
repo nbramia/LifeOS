@@ -22,6 +22,12 @@ import { descendantsOf } from './graph_encoding.js';
 import { cardActionHandlers, cancelCard, openDeleteCardModal } from './card_actions.js';
 import { renderAssignmentPickers } from './assignment.js';
 import { LANES, laneColor } from './lanes.js';
+import { routingFilterValue } from './graph_encoding.js';
+import {
+  getFilters, setFilter, resetFilters, subscribe as subscribeFilters,
+  requestGraphFocus, requestBoardFocus, takeBoardFocus,
+  onTabActivate, activateTab,
+} from './linking.js';
 
 const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local'];
 // plan_lane_move (api/services/agent_board.py) 409s a lane=in_progress move
@@ -66,45 +72,15 @@ const SCHEDULE_EXECUTORS = ['local', 'cloud', 'cloud-haiku', 'cloud-sonnet'];
 // Lane filter — multi-select checkbox dropdown. Hidden lanes are
 // removed from the grid entirely (not just emptied), so the remaining
 // .board-lane columns (flex: 1 1 260px, see web/agents.html CSS) widen to
-// fill the space.
-const LANE_FILTER_STORAGE_KEY = 'lifeos.agents.board.lanes';
+// fill the space. The selection itself is the shared `lanes` filter
+// (web/agents/linking.js) — persistence, migration, and validation of a
+// stored id list all live there now; `visibleLanes` below is a local mirror
+// kept in sync via `subscribeFilters`.
 const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done').map(l => l.id);
 // plan_lane_move (api/services/agent_board.py) rejects `review` and
 // `scheduled` with "cannot be set directly" — no per-lane "+" button for
 // either, and both are excluded from the new-card composer's lane select.
 const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled').map(l => l.id));
-
-function loadLaneSelection() {
-  try {
-    const raw = localStorage.getItem(LANE_FILTER_STORAGE_KEY);
-    if (!raw) return new Set(DEFAULT_VISIBLE_LANE_IDS);
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return new Set(DEFAULT_VISIBLE_LANE_IDS);
-    // A deliberately emptied selection ([]) is a valid, intentional state —
-    // AC 2 says the selection is restored from storage, and the empty-state
-    // hint already covers the UI for it — so it must round-trip as empty,
-    // not be treated as malformed.
-    if (parsed.length === 0) return new Set();
-    const validIds = new Set(LANES.map(l => l.id));
-    // Tolerate an id naming a lane that isn't in the current LANES list — drop it, but
-    // keep whatever's still valid. Only fall back to the default when
-    // nothing valid survives (a malformed store, or a stored selection that
-    // was every lane the operator once had but none exist anymore) — never
-    // render zero lanes from a bad stored value that wasn't actually an
-    // intentional empty selection.
-    const filtered = parsed.filter(id => validIds.has(id));
-    if (filtered.length === 0) return new Set(DEFAULT_VISIBLE_LANE_IDS);
-    return new Set(filtered);
-  } catch (_) {
-    return new Set(DEFAULT_VISIBLE_LANE_IDS);
-  }
-}
-
-function saveLaneSelection(ids) {
-  try {
-    localStorage.setItem(LANE_FILTER_STORAGE_KEY, JSON.stringify([...ids]));
-  } catch (_) {}
-}
 
 export function initBoard() {
   const lanesEl = document.getElementById('board-lanes');
@@ -117,17 +93,19 @@ export function initBoard() {
   const laneFilterClearBtn = document.getElementById('board-lane-filter-clear');
   const assigneeFilterEl = document.getElementById('board-filter-assignee');
   const hostFilterEl = document.getElementById('board-filter-host');
+  const engineFilterEl = document.getElementById('board-filter-engine');
   const tagFilterEl = document.getElementById('board-filter-tag');
   const contextFilterEl = document.getElementById('board-filter-context');
   const recencyFilterEl = document.getElementById('board-filter-recency');
   const includeDoneEl = document.getElementById('board-filter-done');
+  const filterClearBtn = document.getElementById('board-filter-clear');
   const newCardBtn = document.getElementById('board-new-card');
   const connStateEl = document.getElementById('board-connection-state');
   const drawerBackdrop = document.getElementById('board-drawer-backdrop');
   const drawerEl = document.getElementById('board-drawer');
 
   let board = { lanes: Object.fromEntries(LANES.map(l => [l.id, []])) };
-  let visibleLanes = loadLaneSelection();
+  let visibleLanes = new Set(getFilters().lanes);
   let openCardId = null;
   let openCardLane = null;
   let openCardSnapshot = null;  // last card object the drawer was fully rendered from
@@ -215,6 +193,10 @@ export function initBoard() {
       if (!fresh) { closeDrawer(); return; }
       updateOpenDrawer(fresh);
     }
+    // Resolves a pending `?card=<id>` deep link, or a graph node's "Show on
+    // board", once this board payload is the first to land after the
+    // intent was set — a no-op on every other tick (#865).
+    drainBoardFocus();
   }
 
   // A board tick (SSE, ~every 0.75s) reaches here even when nothing about
@@ -359,6 +341,15 @@ export function initBoard() {
       if (!(card.tags || []).some(t => t.toLowerCase().includes(tagQuery))) return false;
     }
 
+    // Shared engine filter (#865) — mirrored on the graph as `#filter-route`.
+    // A card matches when its linked session's routing/source (the same
+    // notion `routingFilterValue` computes for a graph node) matches; a
+    // card with no linked session matches only when the filter is "all".
+    const engineSel = engineFilterEl?.value || 'all';
+    if (engineSel !== 'all') {
+      if (!card.session || routingFilterValue(card.session) !== engineSel) return false;
+    }
+
     const contextSel = contextFilterEl?.value || 'all';
     if (contextSel !== 'all') {
       if (card.kind !== 'task' || card.context !== contextSel) return false;
@@ -414,6 +405,13 @@ export function initBoard() {
     if (card.session && card.session.host && !(assignedChipRendered && card.session.host === assignedHost)) {
       chips.push(`<span class="board-chip board-chip-host" title="ran on">${escapeHtml(card.session.host)}</span>`);
     }
+    // Session chip → graph tab (#865) — clickable only when a session is
+    // actually linked; `renderTaskCard` wires its click after this markup
+    // is mounted (a `stopPropagation` handler can't be expressed inline
+    // here without re-escaping into an attribute).
+    if (card.session) {
+      chips.push(`<span class="board-chip board-chip-session" data-session-id="${escapeHtml(card.session.session_id)}" title="Open in graph">↗ session</span>`);
+    }
     for (const t of (card.tags || [])) {
       if (ASSIGNEES.includes(t.toLowerCase())) continue;  // already shown as the assignee chip
       chips.push(`<span class="board-chip board-chip-tag">#${escapeHtml(t)}</span>`);
@@ -436,6 +434,14 @@ export function initBoard() {
       if (suppressNextClick === card.id) { suppressNextClick = null; return; }
       openDrawer(card.id);
     });
+    const sessionChip = div.querySelector('.board-chip-session');
+    if (sessionChip) {
+      sessionChip.addEventListener('click', (e) => {
+        e.stopPropagation();
+        requestGraphFocus(sessionChip.dataset.sessionId);
+        activateTab('graph');
+      });
+    }
     div.addEventListener('mousedown', (e) => onCardMouseDown(e, card));
     return div;
   }
@@ -504,6 +510,39 @@ export function initBoard() {
       lanesEl.appendChild(column);
     }
   }
+
+  // Makes card `cardId` visible and scrolls it into view — the graph tab's
+  // "Show on board" action and a `?card=<id>` deep link both land here.
+  // Only the lane filter is relaxed (adding the card's own lane back to the
+  // shared selection if it's currently hidden); an unknown id is reported
+  // rather than left to fail silently, and any OTHER active filter that
+  // still hides the card (search text, assignee, tag, …) is left as-is —
+  // the operator set those on purpose.
+  function revealCard(cardId, opts) {
+    const openDrawerFlag = !!(opts && opts.openDrawer);
+    const card = findCard(cardId);
+    if (!card) {
+      showToast(`No such card: ${cardId}`, true);
+      return;
+    }
+    if (!visibleLanes.has(card.lane)) {
+      setFilter('lanes', [...getFilters().lanes, card.lane]);
+    }
+    const el = lanesEl.querySelector(`.board-card[data-card-id="${CSS.escape(cardId)}"]`);
+    if (el) {
+      el.scrollIntoView({ block: 'nearest' });
+      el.classList.add('reveal-highlight');
+      setTimeout(() => el.classList.remove('reveal-highlight'), 2000);
+    }
+    if (openDrawerFlag) openDrawer(cardId);
+  }
+
+  function drainBoardFocus() {
+    const intent = takeBoardFocus();
+    if (!intent) return;
+    revealCard(intent.cardId, { openDrawer: intent.openDrawer });
+  }
+  onTabActivate((name) => { if (name === 'board') drainBoardFocus(); });
 
   // ------------------------------------------------------------------
   // Drag and drop — pointer-based (mousedown/mousemove/mouseup), not the
@@ -1587,21 +1626,32 @@ export function initBoard() {
     else laneFilterLabel.textContent = `${visibleLanes.size} lane${visibleLanes.size === 1 ? '' : 's'}`;
   }
 
-  function applyLaneSelection(ids) {
-    visibleLanes = new Set(ids);
-    saveLaneSelection(visibleLanes);
+  // Reconciles `visibleLanes`, the checkbox dropdown, and the label against
+  // the shared `lanes` filter — called both by the checkbox listeners'
+  // round trip through `setFilter` and by any OTHER origin of a `lanes`
+  // change (the graph tab's own lane select, a storage restore, Clear).
+  function syncLaneFilterUI(laneIds) {
+    visibleLanes = new Set(laneIds);
+    laneFilterCheckboxes().forEach(cb => { cb.checked = visibleLanes.has(cb.value); });
     updateLaneFilterLabel();
-    render();
   }
 
-  // Reveals `laneId` in the filter (and persists it) if it's currently
-  // hidden — used after creating a card straight into a lane the filter
-  // was hiding, so the new card doesn't vanish with no feedback. A no-op
-  // when the lane is already visible.
+  // The lane selection is the shared `lanes` filter (linking.js) — this
+  // just forwards to it; `syncSharedFilterControls` (below, in "Wire
+  // filters + boot") is what actually updates `visibleLanes`, the
+  // checkboxes, and the label once the store notifies, so a lane change
+  // made from the graph tab (or restored from storage) reaches this UI the
+  // same way a change made here does.
+  function applyLaneSelection(ids) {
+    setFilter('lanes', ids);
+  }
+
+  // Reveals `laneId` in the filter if it's currently hidden — used after
+  // creating a card straight into a lane the filter was hiding, so the new
+  // card doesn't vanish with no feedback. A no-op when the lane is already
+  // visible.
   function ensureLaneVisible(laneId) {
     if (visibleLanes.has(laneId)) return;
-    const checkbox = laneFilterOptions && laneFilterOptions.querySelector(`input[value="${laneId}"]`);
-    if (checkbox) checkbox.checked = true;
     applyLaneSelection([...visibleLanes, laneId]);
   }
 
@@ -1648,11 +1698,42 @@ export function initBoard() {
   // Wire filters + boot
   // ------------------------------------------------------------------
 
-  [searchEl, assigneeFilterEl, hostFilterEl, tagFilterEl,
-   contextFilterEl, recencyFilterEl, includeDoneEl].filter(Boolean).forEach(el => {
+  // Context and "include cancelled" stay board-local — not part of the
+  // seven shared keys (linking.js).
+  [contextFilterEl, includeDoneEl].filter(Boolean).forEach(el => {
     const evt = (el.tagName === 'SELECT' || el.type === 'checkbox') ? 'change' : 'input';
     el.addEventListener(evt, () => render());
   });
+
+  // Search/assignee/host/engine/tag/recency (#865) — shared with the graph
+  // tab's own filter bar via linking.js; each control pushes to the store,
+  // and `syncSharedFilterControls` (below) reconciles every control
+  // (including these) against whatever the store ends up holding, whatever
+  // the origin of the change.
+  if (searchEl) searchEl.addEventListener('input', () => setFilter('search', searchEl.value));
+  if (assigneeFilterEl) assigneeFilterEl.addEventListener('change', () => setFilter('assignee', assigneeFilterEl.value));
+  if (hostFilterEl) hostFilterEl.addEventListener('change', () => setFilter('host', hostFilterEl.value));
+  if (engineFilterEl) engineFilterEl.addEventListener('change', () => setFilter('engine', engineFilterEl.value));
+  if (tagFilterEl) tagFilterEl.addEventListener('input', () => setFilter('tag', tagFilterEl.value));
+  if (recencyFilterEl) recencyFilterEl.addEventListener('change', () => setFilter('recency', recencyFilterEl.value));
+  if (filterClearBtn) filterClearBtn.addEventListener('click', () => resetFilters());
+
+  function syncSharedFilterControls(state) {
+    if (searchEl && document.activeElement !== searchEl && searchEl.value !== state.search) {
+      searchEl.value = state.search;
+    }
+    if (assigneeFilterEl && assigneeFilterEl.value !== state.assignee) assigneeFilterEl.value = state.assignee;
+    if (hostFilterEl && hostFilterEl.value !== state.host) hostFilterEl.value = state.host;
+    if (engineFilterEl && engineFilterEl.value !== state.engine) engineFilterEl.value = state.engine;
+    if (tagFilterEl && document.activeElement !== tagFilterEl && tagFilterEl.value !== state.tag) {
+      tagFilterEl.value = state.tag;
+    }
+    if (recencyFilterEl && recencyFilterEl.value !== state.recency) recencyFilterEl.value = state.recency;
+    syncLaneFilterUI(state.lanes);
+    render();
+  }
+  subscribeFilters(syncSharedFilterControls);
+  syncSharedFilterControls(getFilters());
 
   fetchBoard();
   connectStream();

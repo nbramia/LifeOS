@@ -2658,7 +2658,10 @@ class TestLaneAddButton:
         page.locator("#board-lane-filter-options input[value='human_queue']").uncheck()
         expect(page.locator('.board-lane[data-lane="assigned"]')).to_have_count(0)
         expect(page.locator('.board-lane[data-lane="human_queue"]')).to_have_count(0)
-        stored_before = page.evaluate("localStorage.getItem('lifeos.agents.board.lanes')")
+        # The lane selection persists under the shared filters key (#865),
+        # not the board-only key those two lanes' `_seed_lane_storage` peers
+        # elsewhere in this file target.
+        stored_before = page.evaluate("localStorage.getItem('lifeos.agents.filters.v1')")
 
         page.locator("#board-new-card").click()
         page.locator("#new-card-desc").fill("Should reveal Assigned, not Human queue")
@@ -2673,8 +2676,11 @@ class TestLaneAddButton:
             "Should reveal Assigned, not Human queue"
         )
         expect(page.locator('.board-lane[data-lane="human_queue"]')).to_have_count(0)
-        stored_after = page.evaluate("localStorage.getItem('lifeos.agents.board.lanes')")
+        stored_after = page.evaluate("localStorage.getItem('lifeos.agents.filters.v1')")
         assert stored_after != stored_before, (stored_before, stored_after)
+        after_lanes = json.loads(stored_after)["lanes"]
+        assert "assigned" in after_lanes
+        assert "human_queue" not in after_lanes
         page.locator("#board-lane-filter-btn").click()
         expect(page.locator("#board-lane-filter-options input[value='assigned']")).to_be_checked()
         expect(page.locator("#board-lane-filter-options input[value='human_queue']")).not_to_be_checked()
