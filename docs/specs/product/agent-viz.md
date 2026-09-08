@@ -350,4 +350,3 @@ All in `.env`. None are required — the defaults work for the standard LifeOS i
 - [Task Management](task-management.md) — The vault task store the board's cards are backed by
 - [Human Queue](../../guides/human-queue.md) — How `#human` cards are filed and auto-resolved by agents and the nightly sync
 - [Scheduler Guide](../../guides/scheduler.md) — How the Scheduled column's entries are created and edited
-- [API Reference](api-reference.md) — Board, pending-question, and lane-move endpoint shapes
