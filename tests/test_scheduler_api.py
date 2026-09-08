@@ -187,11 +187,14 @@ class TestUpdateScheduleValidation:
         assert mock_store.update.call_args.kwargs["schedule_value"] == "0 8 * * 1-5"
 
     def test_rejects_invalid_once_datetime(self, client, mock_store):
+        # A valid CRON expression, so a validator that ignores the
+        # requested "once" type and always parses as cron would let this
+        # through instead of rejecting it as a bad ISO datetime.
         resp = client.put("/api/scheduler/sch-1", json={
-            "schedule_type": "once", "schedule_value": "not-a-datetime",
+            "schedule_type": "once", "schedule_value": "0 9 * * *",
         })
         assert resp.status_code == 422
-        assert "not-a-datetime" in resp.text
+        assert "0 9 * * *" in resp.text
         mock_store.update.assert_not_called()
 
     def test_accepts_valid_once_datetime(self, client, mock_store):
@@ -205,9 +208,13 @@ class TestUpdateScheduleValidation:
         same request) must be validated against the ENTRY's stored type,
         not assumed to be cron."""
         mock_store.get.return_value = _sample_entry(schedule_type="once")
-        resp = client.put("/api/scheduler/sch-1", json={"schedule_value": "not-a-datetime"})
+        # A valid CRON expression but not a valid ISO datetime -- a
+        # validator that defaults to (or ignores the fetch and assumes)
+        # cron would accept this instead of rejecting it against the
+        # entry's actual stored "once" type.
+        resp = client.put("/api/scheduler/sch-1", json={"schedule_value": "0 9 * * *"})
         assert resp.status_code == 422
-        assert "not-a-datetime" in resp.text
+        assert "0 9 * * *" in resp.text
         mock_store.update.assert_not_called()
 
     def test_schedule_value_alone_accepted_against_the_stored_cron_type(self, client, mock_store):
