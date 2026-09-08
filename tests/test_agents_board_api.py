@@ -339,6 +339,25 @@ class TestGetBoard:
         assert card["last_run"] is None
         assert lanes["done"] == []
 
+    def test_scheduled_card_carries_the_full_schedule_for_the_drawer(self, client, stores):
+        """The board drawer edits schedule type, timing, timezone, action,
+        executor, and bot without a second round trip — the card has to
+        carry all of them."""
+        _tm, scheduler_store, *_ = stores
+        scheduler_store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", executor="cloud", message_content="Draft my weekly review",
+            timezone="America/Chicago",
+        )
+        r = client.get("/api/agents/board")
+        card = r.json()["lanes"]["scheduled"][0]
+        assert card["schedule_type"] == "cron"
+        assert card["schedule_value"] == "0 9 * * 6"
+        assert card["timezone"] == "America/Chicago"
+        assert card["action"] == "agent"
+        assert card["executor"] == "cloud"
+        assert card["bot"] == ""
+
     def test_scheduled_cron_entry_carries_last_run_after_it_fires(self, client, stores):
         """Round-1 finding 16: a recurring entry that has already fired once
         but is still enabled with a future next trigger stays in Scheduled —
