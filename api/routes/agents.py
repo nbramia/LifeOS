@@ -984,7 +984,7 @@ def _build_board() -> dict[str, Any]:
         bucket = "scheduled" if agent_board.is_schedule_active(entry.enabled, entry.next_trigger_at) else "done"
         lanes[bucket].append(_schedule_card(entry))
 
-    return {"lanes": lanes, "generated_at": int(time.time())}
+    return {"lanes": lanes, "generated_at": int(time.time()), "api_host": api_host_name()}
 
 
 # Module-level (built_at, board) cache used ONLY by the stream's own tick —

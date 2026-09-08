@@ -158,6 +158,9 @@ def _board_fixture():
             ],
         },
         "generated_at": 0,
+        # Synthetic API host — distinguishes a card's assigned host
+        # (fields.host) from "this machine".
+        "api_host": "primary-host",
     }
 
 
@@ -928,6 +931,94 @@ class TestFilters:
         page.locator("#board-filter-context").select_option("Work")
         expect(page.locator('[data-card-id="t2"]')).to_be_visible()
         expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
+
+
+class TestHostAssignmentChipAndFilter:
+    """fields.host (the assignment — where a card WILL run, written by the
+    drawer's host dropdown) is surfaced as its own chip on the card face,
+    distinct from the session.host "ran on" chip, and the host filter's
+    option list and matching union both fields instead of reading
+    session.host alone."""
+
+    def _board_with_host_cards(self):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append({
+            # Assigned to a non-API host, no session yet — assignment chip
+            # only; also the sole card whose only host is an
+            # assignment-only host ("build-box-2" never appears as any
+            # card's session.host), so it proves the filter's union.
+            "kind": "task", "id": "t8", "title": "Assigned but not yet run",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"host": "build-box-2"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        board_state["lanes"]["assigned"].append({
+            # Assigned to the API host itself — "this machine", not
+            # "another" host, so no assignment chip; no session either.
+            "kind": "task", "id": "t9", "title": "Assigned to the API host itself",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"host": board_state["api_host"]}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        board_state["lanes"]["assigned"].append({
+            # Assigned to one host, ran on another — both chips render.
+            "kind": "task", "id": "t10", "title": "Assigned elsewhere, ran somewhere else",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"host": "build-box-3"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "s-t10", "status": "completed",
+                "host": "build-box-4", "routing": "claude_code",
+            },
+            "pending_question": None,
+        })
+        return board_state
+
+    def test_assigned_host_chip_renders_distinctly_from_ran_on_chip(self, page: Page, agents_base_url):
+        board_state = self._board_with_host_cards()
+        _open_board(page, agents_base_url, board_state=board_state)
+
+        assigned = page.locator('[data-card-id="t8"] .board-chip-assigned-host')
+        expect(assigned).to_have_text("build-box-2")
+        expect(page.locator('[data-card-id="t8"] .board-chip-host')).to_have_count(0)
+
+        expect(page.locator('[data-card-id="t9"] .board-chip-assigned-host')).to_have_count(0)
+        expect(page.locator('[data-card-id="t9"] .board-chip-host')).to_have_count(0)
+
+        # Baseline fixture card: no host field at all -> no host chip.
+        expect(page.locator('[data-card-id="t1"] .board-chip-assigned-host')).to_have_count(0)
+        expect(page.locator('[data-card-id="t1"] .board-chip-host')).to_have_count(0)
+
+        expect(page.locator('[data-card-id="t10"] .board-chip-assigned-host')).to_have_text("build-box-3")
+        expect(page.locator('[data-card-id="t10"] .board-chip-host')).to_have_text("build-box-4")
+
+    def test_host_filter_options_include_an_assignment_only_host(self, page: Page, agents_base_url):
+        board_state = self._board_with_host_cards()
+        _open_board(page, agents_base_url, board_state=board_state)
+        values = page.locator("#board-filter-host option").evaluate_all("els => els.map(e => e.value)")
+        assert "build-box-2" in values, values
+
+    def test_host_filter_matches_assignment_or_session_and_leaves_lanes_intact(self, page: Page, agents_base_url):
+        page.set_viewport_size({"width": 1280, "height": 800})
+        board_state = self._board_with_host_cards()
+        _open_board(page, agents_base_url, board_state=board_state)
+        lane_count_before = page.locator(".board-lane").count()
+
+        page.locator("#board-filter-host").select_option("build-box-2")
+        expect(page.locator('[data-card-id="t8"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t10"]')).to_have_count(0)
+        expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
+        expect(page.locator('[data-card-id="t2"]')).to_have_count(0)
+
+        # "build-box-4" only ever appears as t10's session host — selecting
+        # it exercises the observation half of the match.
+        page.locator("#board-filter-host").select_option("build-box-4")
+        expect(page.locator('[data-card-id="t10"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t8"]')).to_have_count(0)
+
+        assert page.locator(".board-lane").count() == lane_count_before
 
 
 class TestTabSwitching:

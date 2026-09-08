@@ -83,6 +83,14 @@ class TestGetBoard:
         }
         assert "generated_at" in body
 
+    def test_board_carries_api_host(self, client, stores, monkeypatch):
+        """The board's own payload names the API host, so the client
+        can tell a card's assigned host (`fields.host`) apart from "this
+        machine" without a separate round trip."""
+        monkeypatch.setattr(agents_route, "api_host_name", lambda: "board-api-host")
+        body = client.get("/api/agents/board").json()
+        assert body["api_host"] == "board-api-host"
+
     def test_get_board_never_served_from_stream_cache(self, client, stores):
         """Round-2 finding 6(a): GET /board must always build fresh — it
         must never read the TTL'd cache the stream's own tick uses.
