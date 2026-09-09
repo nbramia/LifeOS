@@ -468,6 +468,14 @@ def test_task_execution_tags_require_positive_valid_delegation(transcript, tag, 
             "I was told to assign code repair to Codex.",
             "assign code repair to Codex",
         ),
+        (
+            "Per Sam, assign code repair to Codex.",
+            "Per Sam, assign code repair to Codex.",
+        ),
+        (
+            "At lunch Sam instructed me: assign code repair to Codex.",
+            "At lunch Sam instructed me: assign code repair to Codex.",
+        ),
     ],
 )
 def test_contextual_reported_speech_cannot_delegate_a_task(
@@ -481,8 +489,14 @@ def test_contextual_reported_speech_cannot_delegate_a_task(
     assert action.tags == ()
 
 
-def test_contextual_prefix_does_not_block_a_direct_task_delegation():
-    transcript = "At lunch, assign code repair to Codex."
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "At lunch, assign code repair to Codex.",
+        "Remember, assign code repair to Codex.",
+    ],
+)
+def test_contextual_prefix_does_not_block_a_direct_task_delegation(transcript):
     [action] = validate_plan([{
         "kind": "task", "index": 0, "title": "Code repair", "tags": ["codex"],
         "delegation_evidence": transcript, "action_evidence": "code repair",
@@ -757,6 +771,14 @@ def test_blank_or_generic_executor_never_authorizes_agent_schedule():
             "According to Sam, schedule Codex to run the synthetic report tomorrow at 09:00.",
             "schedule Codex to run the synthetic report tomorrow at 09:00",
         ),
+        (
+            "Per Sam, schedule Codex to run the synthetic report tomorrow at 09:00.",
+            "Per Sam, schedule Codex to run the synthetic report tomorrow at 09:00.",
+        ),
+        (
+            "Sam instructed me: schedule Codex to run the synthetic report tomorrow at 09:00.",
+            "Sam instructed me: schedule Codex to run the synthetic report tomorrow at 09:00.",
+        ),
     ],
 )
 def test_contextual_reported_speech_cannot_delegate_a_schedule(
@@ -772,8 +794,14 @@ def test_contextual_reported_speech_cannot_delegate_a_schedule(
         }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
 
 
-def test_contextual_prefix_does_not_block_a_direct_scheduled_delegation():
-    transcript = "At lunch, schedule Codex to run the synthetic report tomorrow at 09:00."
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "At lunch, schedule Codex to run the synthetic report tomorrow at 09:00.",
+        "Remember, schedule Codex to run the synthetic report tomorrow at 09:00.",
+    ],
+)
+def test_contextual_prefix_does_not_block_a_direct_scheduled_delegation(transcript):
     [action] = validate_plan([{
         "kind": "schedule", "index": 0, "title": "Synthetic report",
         "schedule_type": "once", "schedule_value": "2030-01-02T09:00:00Z",
@@ -1001,6 +1029,44 @@ async def test_classifier_repairs_malformed_conditional_to_an_inert_plan(
     monkeypatch.setattr("api.services.pebble_capture.LocalLLMClient", FakeLocalClient)
     ledger, tasks, schedules = stores
     payload = {**_payload(), "capture_id": "conditional-malformed", "final_text": transcript}
+    assert await PebbleCaptureConsumer(
+        ledger, tasks, schedules, LocalOnlyJournalClassifier(), apply=True
+    ).process(payload) == "complete"
+    assert tasks.list_tasks() == [] and schedules.list_all() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "At lunch I heard Sam assign this task to Codex: review the synthetic auth logs.",
+        "Per Sam, assign the synthetic auth logs to Codex.",
+        "At lunch Sam instructed me: assign the synthetic auth logs to Codex.",
+    ],
+)
+async def test_classifier_repairs_reported_delegation_to_an_inert_plan(
+    stores, monkeypatch, transcript
+):
+    proposed = {
+        "kind": "task", "index": 0, "title": "Review synthetic auth logs",
+        "tags": ["codex"], "delegation_evidence": transcript,
+        "action_evidence": "the synthetic auth logs",
+    }
+    responses = iter((
+        SimpleNamespace(text=json.dumps({"actions": [proposed]})),
+        SimpleNamespace(text=json.dumps({"actions": []})),
+    ))
+
+    class FakeLocalClient:
+        def __init__(self, *, base_url, timeout, trust_env):
+            assert base_url and timeout == 30 and trust_env is False
+
+        async def acreate(self, **kwargs):
+            return next(responses)
+
+    monkeypatch.setattr("api.services.pebble_capture.LocalLLMClient", FakeLocalClient)
+    ledger, tasks, schedules = stores
+    payload = {**_payload(), "capture_id": "reported-repair", "final_text": transcript}
     assert await PebbleCaptureConsumer(
         ledger, tasks, schedules, LocalOnlyJournalClassifier(), apply=True
     ).process(payload) == "complete"

@@ -500,10 +500,10 @@ def _positive_clauses(text: str) -> list[str]:
         ):
             continue
         if re.search(
-            r"\b(?:according\s+to|i\s+(?:heard|remember|recall|wrote)|"
+            r"\b(?:according\s+to|per\s+[\w-]+|i\s+(?:heard|remember|recall|wrote)|"
             r"(?:i\s+was|we\s+were)\s+told|"
             r"(?:my\s+)?(?:notes?|reminder)\s+(?:say|says|said|reads?|read)|"
-            r"[\w-]+\s+(?:said|says|reported|told\s+me|asked\s+me)|"
+            r"[\w-]+\s+(?:said|says|reported|told\s+me|asked\s+me|instructed\s+me)|"
             r"(?:write|wrote)\s+down)\b",
             clause,
             re.I,
@@ -872,7 +872,22 @@ def _validated_classifier_actions(
     actions = parsed.get("actions")
     if not isinstance(actions, list):
         raise PebbleCaptureError("local classifier returned no action list")
-    validate_plan(actions, transcript=final_text, recorded_at=recorded_at)
+    validated = validate_plan(actions, transcript=final_text, recorded_at=recorded_at)
+    for raw_action, action in zip(actions, validated):
+        if not isinstance(raw_action, dict) or action.kind != "task":
+            continue
+        claimed_assignees = {
+            value.lstrip("#").lower()
+            for value in raw_action.get("tags", [])
+            if isinstance(value, str)
+            and value.lstrip("#").lower() in _VALID_TASK_ASSIGNEES
+        }
+        if claimed_assignees.difference(action.tags):
+            # ``validate_plan`` deliberately strips an unsupported routing tag
+            # for direct callers. The classifier must instead correct or omit
+            # the entire proposed effect: reported speech is log-only, not an
+            # unassigned task derived from somebody else's instruction.
+            raise PebbleCaptureError("classifier proposed unauthorized task delegation")
     return actions
 
 

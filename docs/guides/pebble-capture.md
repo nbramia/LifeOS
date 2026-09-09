@@ -49,7 +49,9 @@ raw revision creates no receipt, so a later ready reconciliation can proceed.
 - A structurally incomplete local classification gets one bounded local repair
   attempt. The replacement must supply exact source evidence and pass the same
   deterministic authority checks; application code never fills missing
-  delegation fields, and a second invalid response leaves the capture pending.
+  delegation fields. A proposed task whose execution tag fails those checks is
+  corrected or omitted rather than filed as an unassigned task, and a second
+  invalid response leaves the capture pending.
 - Classifier-proposed titles and messages cannot inject task/schedule Markdown
   fields, routing tags, comments, or line separators. The captured text stays
   quoted producer evidence and never becomes parser metadata.
