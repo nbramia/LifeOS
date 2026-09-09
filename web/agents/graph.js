@@ -15,16 +15,26 @@
 // also open a second live connection nobody is looking at.
 
 import {
-  STATUS_COLORS, TERMINAL, escapeHtml, showToast, SessionPanel,
+  STATUS_COLORS, TERMINAL, isSubagentSession, escapeHtml, showToast, SessionPanel,
 } from './panel.js';
 import { LANES } from './lanes.js';
 import {
   nodeLabel, isRawIdValue, engineOf, ENGINE_SHAPES, shapeTagFor,
   radiusForActiveSeconds, ringWidthForToolCalls, laneColor,
   isKnownSearchField, SEARCH_TIER, SEARCH_BADGE, hoverCardRows,
+  descendantsOf as sharedDescendantsOf,
 } from './graph_encoding.js';
 
-export function initGraph() {
+// `boardApi` is the object `web/agents/board.js`'s `initBoard()` returns —
+// board.js boots immediately on page load (the Graph tab only lazily,
+// on first visit), so by the time an operator can even click a node here
+// the board's own live state (kept current by its own SSE stream) already
+// exists. Reusing it — rather than a second `/api/agents/board` fetch —
+// is how the side panel finds the card linked to a session, the same way
+// the Board drawer already does, so both surfaces decide the same action
+// row for the same session (see ./session_actions.js's `decideActions`).
+export function initGraph(boardApi) {
+  const getCardForSession = (boardApi && boardApi.getCardForSession) || (() => null);
   const filterTerminalEl = document.getElementById('filter-terminal');
   const filterRouteEl = document.getElementById('filter-route');
   const filterStatusEl = document.getElementById('filter-status');
@@ -68,32 +78,23 @@ export function initGraph() {
   }
   renderLegend();
 
-  // 1-hop descendants (via parent_session_id) for the kill-modal preview.
+  // Descendants (via parent_session_id) for the kill-modal preview — every
+  // known session already lives in `allSessions`, so this is synchronous,
+  // unlike the Board drawer's own on-demand fetch (web/agents/board.js).
   function descendantsOf(session) {
-    const childrenOf = new Map();
-    for (const x of allSessions) {
-      if (!x.parent_session_id) continue;
-      if (!childrenOf.has(x.parent_session_id)) childrenOf.set(x.parent_session_id, []);
-      childrenOf.get(x.parent_session_id).push(x);
-    }
-    const out = [];
-    const queue = [session.session_id];
-    const seen = new Set([session.session_id]);
-    while (queue.length) {
-      const sid = queue.shift();
-      for (const child of (childrenOf.get(sid) || [])) {
-        if (seen.has(child.session_id)) continue;
-        seen.add(child.session_id);
-        out.push(child);
-        queue.push(child.session_id);
-      }
-    }
-    return out;
+    return sharedDescendantsOf(allSessions, session);
   }
 
   const panel = new SessionPanel({
     container: panelEl,
     getDescendants: descendantsOf,
+    // `boardApi.findCard` resolves a card by id from the board's own live
+    // state — the same lookup the Board drawer's Delete confirmation uses
+    // to re-resolve the freshest copy of the card at confirm time, so
+    // Delete on the Graph tab makes its kill-first decision from a live
+    // card rather than the one captured when the panel was opened.
+    findCard: (boardApi && boardApi.findCard) || null,
+    onCardChanged: () => { if (boardApi && boardApi.refresh) boardApi.refresh(); },
     onLabelSaved: (sessionId, customLabel) => {
       const canonical = allSessions.find(x => x.session_id === sessionId);
       if (canonical) canonical.custom_label = customLabel;
@@ -102,6 +103,11 @@ export function initGraph() {
         .each(function(d) { d.custom_label = customLabel; })
         .select('text.node-label')
         .each(renderNodeLabel);
+      // A relabel resets that one node's tspans to the unboosted 12px
+      // layout (`renderNodeLabel`'s own doing) — reapply whatever boost
+      // is currently in effect so it doesn't fall out of step with every
+      // other label.
+      updateLabelLegibility(currentZoomK());
     },
     onSummaryFetched: (sessionId, shortLabel) => {
       const s = allSessions.find(x => x.session_id === sessionId);
@@ -111,6 +117,7 @@ export function initGraph() {
         .each(function(d) { d.short_label = shortLabel; })
         .select('text.node-label')
         .each(renderNodeLabel);
+      updateLabelLegibility(currentZoomK());
     },
   });
 
@@ -126,7 +133,14 @@ export function initGraph() {
     if (!s) return;
     selectedSessionId = sessionId;
     applySelectionStyles();
-    panel.open(s);
+    // `getCardForSession` returns null both for a genuinely bare session
+    // and for one whose linked card the board hasn't fetched yet (the
+    // Graph tab can be opened before `initBoard()`'s first
+    // `GET /api/agents/board` resolves) — `decideActions` already treats
+    // an absent card as "no card-only actions", so this never throws or
+    // renders a half-decided action set; the next snapshot tick's
+    // `updateMeta` call below picks the card up once it's available.
+    panel.open(s, getCardForSession(sessionId));
   }
 
   // Standalone Go To for the node dblclick handler — fires regardless of
@@ -170,13 +184,117 @@ export function initGraph() {
   const linkLayer = viewport.append('g').attr('class', 'links');
   const nodeLayer = viewport.append('g').attr('class', 'nodes');
 
+  // A `.node-label`'s on-screen CSS pixel size is its font-size in SVG
+  // user-space units (12px, set in web/agents.html) times BOTH the zoom
+  // transform's own scale (`k`) AND the ratio between the SVG element's
+  // actual rendered width and its `viewBox` width — `#graph-svg` sits next
+  // to `#panel-outer` (the side panel), so that ratio is well under 1 at
+  // any realistic viewport, not the ~1 a `k`-only threshold implicitly
+  // assumes. At `k = 1` (the resting zoom, what Reset restores) on a
+  // 1280×800 viewport that works out to well under half the ~11px a label
+  // needs to stay legible.
+  //
+  // So: measure the real on-screen size and counter-scale the label's own
+  // font-size (in user-space units) just enough to hold it at the legible
+  // floor whenever the natural size would fall under it — zoomed in far
+  // enough that labels are already comfortably sized, nothing changes.
+  // Below a point, though, no reasonable font-size compensates without the
+  // labels themselves overlapping and cluttering a dense, zoomed-far-out
+  // graph — past `LABEL_MAX_BOOST_PX`, hide them instead and rely on the
+  // hover card (`showHoverCard`, below) to name a node, exactly as before.
+  const LABEL_BASE_FONT_PX = 12;   // matches `.node-label`'s CSS font-size
+  const LABEL_MIN_SCREEN_PX = 11;  // never render a shown label under this
+  const LABEL_MAX_BOOST_PX = 36;   // beyond this, hide rather than enlarge further
+
+  // The label layout metrics below (`LABEL_CHAR_W`/`LABEL_LINE_H`/
+  // `LABEL_GAP`, defined further down alongside `renderNodeLabel`) are all
+  // tuned for the 12px base font. Counter-scaling `font-size` without
+  // scaling these by the same factor is what makes a boosted multi-line
+  // label's lines draw on top of each other (the per-tspan `dy` stays a
+  // fixed 12px-era user-space value) and neighbouring nodes' labels
+  // collide (the collision force's radius estimate stays sized for the
+  // unboosted label). `_labelBoost` is the single current boost factor
+  // (1 = unboosted), read by `collideRadius` on every force tick and
+  // applied to every label's line spacing by `applyLabelBoost`, keeping
+  // the two in lockstep.
+  let _labelBoost = 1;
+
+  // `#graph-svg` carries `preserveAspectRatio="xMidYMid meet"`
+  // (web/agents.html) — the SVG is letterboxed to fit inside its rendered
+  // box, so the real user-space→screen scale is the SMALLER of the width
+  // and height ratios, never the width ratio alone. Using the width ratio
+  // alone overestimates the scale (and so undercounts the needed boost)
+  // whenever the graph area is height-bound — a short browser window, or
+  // the side panel dragged wide.
+  function svgScreenScale() {
+    const rect = svg.node().getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return 1;
+    return Math.min(rect.width / VIEW_W, rect.height / VIEW_H);
+  }
+
+  function currentZoomK() {
+    return parseFloat(svg.attr('data-zoom-k')) || 1;
+  }
+
+  // Re-derives every label's own line spacing (the gap from its node and
+  // each tspan's `dy`) for the given boost factor, so a boosted font's
+  // lines stay the same distance apart, proportionally, as the unboosted
+  // 12px layout — never overlapping regardless of how large the
+  // counter-scaled font gets.
+  function applyLabelBoost(boost) {
+    nodeLayer.selectAll('.node').each(function(d) {
+      const label = d3.select(this).select('text.node-label');
+      if (label.empty()) return;
+      label.attr('y', nodeRadius(d) + LABEL_GAP * boost);
+      label.selectAll('tspan').each(function(_, i) {
+        if (i > 0) d3.select(this).attr('dy', LABEL_LINE_H * boost);
+      });
+    });
+  }
+
+  function updateLabelLegibility(k) {
+    const screenScale = svgScreenScale();
+    const naturalPx = LABEL_BASE_FONT_PX * k * screenScale;
+    let boost = 1;
+    let hide = false;
+    if (naturalPx < LABEL_MIN_SCREEN_PX) {
+      const neededUserPx = LABEL_MIN_SCREEN_PX / (k * screenScale);
+      if (neededUserPx <= LABEL_MAX_BOOST_PX) {
+        boost = neededUserPx / LABEL_BASE_FONT_PX;
+      } else {
+        hide = true;
+      }
+    }
+    nodeLayer.classed('labels-below-legible', hide);
+    nodeLayer.selectAll('.node-label')
+      .style('font-size', (!hide && boost !== 1) ? `${LABEL_BASE_FONT_PX * boost}px` : null);
+    // A hidden label has no on-screen footprint to defend against — treat
+    // it as unboosted for layout/collision purposes.
+    const effectiveBoost = hide ? 1 : boost;
+    applyLabelBoost(effectiveBoost);
+    // `collideRadius` (below) reads `_labelBoost` on every force tick —
+    // reheat the simulation whenever it changes enough to matter, so
+    // nodes whose labels just grew (or shrank) actually move apart (or
+    // back together) instead of the new radius sitting unused on an
+    // already-settled layout.
+    _labelBoost = effectiveBoost;
+  }
+
   const zoom = d3.zoom()
     .scaleExtent([0.2, 5])
     .on('zoom', (event) => {
       viewport.attr('transform', event.transform);
       svg.attr('data-zoom-k', event.transform.k);
+      updateLabelLegibility(event.transform.k);
     });
   svg.call(zoom);
+  // The screen-scale factor above depends on the SVG's own rendered
+  // width, which changes independent of any zoom event — the side panel
+  // resizer (below) or the browser window itself. Re-measure whenever it
+  // does, at whatever zoom is currently in effect.
+  if (typeof ResizeObserver !== 'undefined') {
+    new ResizeObserver(() => updateLabelLegibility(currentZoomK())).observe(svg.node());
+  }
   // d3.zoom's own double-click-to-zoom would otherwise fire alongside the
   // node dblclick handler below on every double-click anywhere on the
   // canvas, including non-CLI nodes that have no focus action of their own.
@@ -464,7 +582,14 @@ export function initGraph() {
   function collideRadius(d) {
     const r = nodeRadius(d);
     const lines = d._labelLines || 1;
-    const halfW = Math.max(r, (d._labelW || 0) / 2) + 6;
+    // A boosted label renders wider and taller (in user-space units) than
+    // its `_labelW`/`LABEL_LINE_H`/`LABEL_GAP` estimate assumes — those
+    // are fixed at the 12px base font — so scale the whole footprint by
+    // the current boost factor (`_labelBoost`, kept current by
+    // `updateLabelLegibility`) rather than the collision radius silently
+    // under-defending a font it doesn't know grew.
+    const boost = _labelBoost;
+    const halfW = Math.max(r, ((d._labelW || 0) * boost) / 2) + 6;
     const labelBottom = r + LABEL_GAP + (lines - 1) * LABEL_LINE_H + LABEL_LINE_H * 0.5;
     const enclose = Math.hypot(halfW, labelBottom) * 0.85;
     return Math.max(r + 14, enclose);
@@ -693,7 +818,7 @@ export function initGraph() {
       .on('dblclick', (event, d) => {
         const engine = engineOf(d);
         const isCli = engine === 'claude_code' || engine === 'codex';
-        if (!isCli || d.is_subagent || d.parent_session_id) return;
+        if (!isCli || isSubagentSession(d)) return;
         event.preventDefault();
         event.stopPropagation();
         // The double-click's own first click (`detail === 1`) toggles an
@@ -748,6 +873,11 @@ export function initGraph() {
     applyToolRing(all.select('.node-ring-tools'));
     all.select('text.node-label').each(renderNodeLabel);
     applyBadges(all);
+    // Newly-entered labels start at the CSS default font-size — size them
+    // to the currently-in-effect zoom immediately, not just on the next
+    // zoom/resize event (covers the very first render, at the identity
+    // transform, before any zoom event has ever fired).
+    updateLabelLegibility(currentZoomK());
 
     sel.exit().remove();
 
@@ -838,7 +968,11 @@ export function initGraph() {
     renderGraph(allSessions, allEdges);
     if (selectedSessionId) {
       const s = allSessions.find(x => x.session_id === selectedSessionId);
-      if (s) panel.updateMeta(s);
+      // Passing the card on every tick (not just at `open`) is what lets
+      // an already-open panel pick up a card the board hadn't loaded yet
+      // when the panel first opened, or a card whose lane/policy changed
+      // after a board action fired from this same panel.
+      if (s) panel.updateMeta(s, getCardForSession(selectedSessionId));
     }
   }
 

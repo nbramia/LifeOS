@@ -3,14 +3,23 @@
 // The Kanban board (#850) — the primary /agents view. Backed by the vault
 // task store via GET/PUT /api/agents/board*, with a card drawer that reuses
 // the shared SessionPanel (./panel.js) for the linked session's transcript,
-// exactly like the Graph tab's side panel does.
+// exactly like the Graph tab's side panel does. The drawer's own action
+// row (Open, Go To, Resume, Kill, Answer, Accept, Resolve, Cancel, Delete)
+// is rendered by session_actions.js's `renderActionRow` — the same
+// function the Graph tab's side panel uses for its own header — so the
+// embedded SessionPanel here is constructed with `showActions: false`
+// (see `renderDrawerSession`) to avoid rendering the same session's
+// Kill/Resume/Go To twice.
 //
 // No card reordering within a lane (file order is lane order, per the
 // issue) — drag only ever changes which lane a card is in.
 
 import {
-  TERMINAL, routingLabel, sourceLabelFor, escapeHtml, showToast, SessionPanel,
+  TERMINAL, routingLabel, escapeHtml, showToast, SessionPanel,
 } from './panel.js';
+import { renderActionRow } from './session_actions.js';
+import { descendantsOf } from './graph_encoding.js';
+import { cardActionHandlers, cancelCard, openDeleteCardModal } from './card_actions.js';
 import { renderAssignmentPickers } from './assignment.js';
 import { LANES, laneColor } from './lanes.js';
 
@@ -165,8 +174,18 @@ export function initBoard() {
     const freshSessionId = (fresh.session && fresh.session.session_id) || null;
     const sessionUnchanged = prevSessionId === freshSessionId;
 
-    if (sessionUnchanged && panel && freshSessionId) {
-      panel.updateMeta(fresh.session);
+    if (sessionUnchanged) {
+      if (panel && freshSessionId) panel.updateMeta(fresh.session);
+      // Refresh the action row in place on every tick, independent of the
+      // full-drawer-rebuild's own `!focused` guard below — that guard
+      // exists to protect the notes/title/tags inputs from a mid-keystroke
+      // reset, and this container holds none of them.
+      // `renderActionRow`'s own signature check (session_actions.js) makes
+      // this a no-op unless the decided action set actually changed, so a
+      // session reaching a terminal state or an Answer being sent updates
+      // the row even while the drawer has focus, rather than leaving a
+      // stale button behind until focus leaves.
+      renderDrawerActions(fresh);
     }
 
     // Beyond the editable fields, also watch pending_question and the
@@ -980,9 +999,10 @@ export function initBoard() {
       </div>
       <div class="drawer-schedule-info" data-field="next-fire-preview"></div>
       <div class="drawer-schedule-info" data-field="last-run-info"></div>
-      <div class="drawer-actions" data-field="actions">
+      <div class="drawer-actions" data-field="schedule-actions">
         <button class="drawer-action" data-action="trigger-now">${card.schedule_type === 'once' ? 'Trigger now (disables this one-off)' : 'Trigger now'}</button>
       </div>
+      <div class="drawer-actions" data-field="actions"></div>
       `}
     `;
     drawerEl.querySelector('[data-action="drawer-close"]').onclick = closeDrawer;
@@ -1350,327 +1370,77 @@ export function initBoard() {
     });
   }
 
+  // Every non-terminal descendant (via `parent_session_id`) of a card's
+  // linked session, for Kill's cascade-preview modal — the same
+  // `descendantsOf` the Graph tab's side panel uses, over the same
+  // `/api/agents/snapshot` every session (not just card-linked ones,
+  // including subagents that never get their own card) lives in. Fetched
+  // on demand rather than polled continuously: the drawer only ever needs
+  // this the moment Kill is clicked. Rejects (rather than resolving with
+  // an empty list) on a failed fetch — `openKillModal`
+  // (web/agents/session_actions.js) tells that apart from a genuine "no
+  // descendants" and discloses it instead of confirming a possible
+  // cascade the operator was never shown.
+  async function fetchDescendantsForKill(session) {
+    if (!session) return [];
+    const r = await fetch('/api/agents/snapshot');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const snap = await r.json();
+    return descendantsOf(snap.sessions || [], session);
+  }
+
+  // The drawer's action row — Open, Go To, Resume, Kill, Answer, Accept,
+  // Resolve, Cancel, Delete. Which of these apply and whether each is
+  // enabled or disabled-with-a-reason is decided once, by
+  // session_actions.js's `decideActions`, and rendered by its
+  // `renderActionRow` — the exact same function the Graph tab's side panel
+  // uses for its own header, so the two surfaces can't disagree about a
+  // shared session. Go To/Resume/Kill/Answer are built into
+  // `renderActionRow` itself (it owns Kill's cascade-preview modal,
+  // Resume's host select, and Go To's "Locating…" state); Open, Accept,
+  // Resolve, Cancel, and Delete come from ./card_actions.js, shared with a
+  // card-linked Graph tab side panel — Cancel and Delete are overridden
+  // below with the extra drawer-specific bookkeeping (closing/rebuilding
+  // this drawer) that a bare handoff to `fetchBoard` doesn't cover.
   function renderDrawerActions(card) {
     const actionsEl = drawerEl.querySelector('[data-field="actions"]');
     if (!actionsEl) return;
-    const buttons = [];
-
-    if (card.lane === 'assigned' && (card.assignee === 'claude' || card.assignee === 'codex')) {
-      buttons.push(['Open', async () => {
-        try {
-          const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/open`, { method: 'POST' });
-          if (!r.ok) {
-            const text = await r.text();
-            let msg = text;
-            try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
-            throw new Error(msg || `HTTP ${r.status}`);
-          }
-          showToast('Opened.', false);
-          fetchBoard();
-        } catch (err) { showToast(`Open failed: ${err.message}`, true); }
-      }]);
-    }
-
-    if (card.session && (card.session.source === 'claude_code' || card.session.source === 'codex')) {
-      buttons.push(['Focus', async () => {
-        try {
-          const r = await fetch(`/api/agents/sessions/${encodeURIComponent(card.session.session_id)}/focus`, { method: 'POST' });
-          if (!r.ok) throw new Error(await r.text());
-          showToast('Pane selected in wezterm.', false);
-        } catch (err) { showToast(`Focus failed: ${err.message}`, true); }
-      }]);
-    }
-    if (card.session && !TERMINAL.has(card.session.status)) {
-      // A CLI-backed session (opened via the Open button, not started by
-      // the worker) can't actually be torn down by this endpoint — the
-      // same reason Cancel reports one as an unstoppable failure instead
-      // of a teardown. Offer Kill disabled with that explanation rather
-      // than a button that 404s.
-      if (card.session.source === 'claude_code' || card.session.source === 'codex') {
-        buttons.push(['Kill', null, {
-          reason: `killing a live ${sourceLabelFor(card.session)} session isn't supported yet — close it manually`,
-        }]);
-      } else {
-        buttons.push(['Kill', async () => {
-          try {
-            const r = await fetch(`/api/agents/sessions/${encodeURIComponent(card.session.session_id)}/kill`, {
-              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),
-            });
-            if (!r.ok) throw new Error(await r.text());
-            showToast('Session killed.', false);
-            fetchBoard();
-          } catch (err) { showToast(`Kill failed: ${err.message}`, true); }
-        }]);
-      }
-    }
-    if (card.pending_question) {
-      buttons.push(['Answer', () => openAnswerPrompt(card)]);
-    }
-    if (card.lane === 'review') {
-      buttons.push(['Accept', async () => {
-        try {
-          const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/accept`, { method: 'POST' });
-          if (!r.ok) throw new Error(await r.text());
-          showToast('Accepted.', false);
-          fetchBoard();
-        } catch (err) { showToast(`Accept failed: ${err.message}`, true); }
-      }]);
-    }
-    // Resolve is a drop onto Done under the hood — never offer it when
-    // that exact move would be refused (a claimed or agent-owned card can
-    // still land in Human queue without being resolvable by a human).
-    // Absent policy (schedule cards never reach here) defaults to
-    // allowed, matching every other policy read in this file.
-    // `policy.lanes` lists ONLY refused lanes — an absent `.done` entry
-    // means allowed, so this guards the leaf the same way
-    // `onCardDropped`'s own lane read already does, rather than assuming
-    // it's always present.
-    const doneEntry = card.policy && card.policy.lanes && card.policy.lanes.done;
-    const doneAllowed = !doneEntry || doneEntry.allowed !== false;
-    if (card.lane === 'human_queue' && !card.pending_question && doneAllowed) {
-      // A manually-filed #human card with no agent question behind it —
-      // "Resolve" is the operator saying they've handled it by hand.
-      buttons.push(['Resolve', async () => { await moveCard(card.id, 'done').catch(() => {}); }]);
-    }
-    // Cancel is offered for every task card that carries a policy block
-    // (schedule cards never do) — disabled-and-explained when refused,
-    // never hidden, matching every other refused control in this drawer.
-    // A hidden Cancel on an agent-owned-with-no-assignee-tag claimed card
-    // (the worker's own bare `#agent` claim) would leave that card with
-    // no recovery action at all — Answer/Kill/Accept aside, Cancel is the
-    // one a human always needs visible, even mid-refusal.
-    if (card.policy && card.policy.cancel && card.policy.cancel.allowed !== true) {
-      buttons.push(['Cancel', null, {
-        reason: card.policy.cancel.reason || "Cancel isn't available for this card.",
-      }]);
-    } else if (card.policy && card.policy.cancel) {
-      buttons.push(['Cancel', async () => {
-        try {
-          const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/cancel`, { method: 'POST' });
-          if (!r.ok) {
-            const text = await r.text();
-            let msg = text;
-            try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
-            throw new Error(msg || `HTTP ${r.status}`);
-          }
-          const data = await r.json();
-          // A live cc:/cx: CLI session can't be torn down by Cancel yet —
-          // the endpoint still marks the card cancelled, but reports it
-          // under `failures` instead of silently claiming a teardown it
-          // didn't perform. Surface that as a warning toast rather than a
-          // plain success.
-          const untorn = (data && data.failures) || [];
-          if (untorn.length) {
-            showToast(`Cancelled, but couldn't stop: ${untorn.map(f => f.reason || f.session_id).join('; ')}`, true);
-          } else {
-            showToast('Cancelled.', false);
-          }
-          // Tear the session panel down through its own cleanup path
-          // right here, rather than leaving it to whichever render call
-          // below happens to touch the session-panel container next — a
-          // deferred teardown aborts a summary/stream request that's
-          // still legitimately in flight, which shows up as a failed
-          // request even though nothing actually went wrong.
+    renderActionRow(actionsEl, {
+      session: card.session || null,
+      card,
+      getDescendants: fetchDescendantsForKill,
+      onChange: fetchBoard,
+      handlers: {
+        // The embedded session panel (`renderDrawerSession`, below) owns
+        // the actual label-edit UI — its own `.label` click already
+        // starts the same edit; this just gives the drawer's own action
+        // row a working button for it too.
+        rename: () => { if (panel) panel.startRename(); },
+        ...cardActionHandlers(card, { onChanged: fetchBoard }),
+        cancel: () => cancelCard(card, async () => {
+          // Tear the session panel down through its own cleanup path right
+          // here, rather than leaving it to whichever render call below
+          // happens to touch the session-panel container next — a
+          // deferred teardown aborts a summary/stream request that's still
+          // legitimately in flight, which shows up as a failed request
+          // even though nothing actually went wrong.
           if (panel) { panel.close(); panel = null; }
           await fetchBoard();
-          // fetchBoard()'s own updateOpenDrawer skips the
-          // rebuild while this button (inside the drawer) still holds
-          // focus after the click — the same staleness the assignee
-          // handler above already works around. Without this, the drawer
-          // keeps showing a stale Open button for a card that just moved
-          // to Done, and clicking it 409s.
+          // fetchBoard()'s own updateOpenDrawer skips the rebuild while
+          // this button (inside the drawer) still holds focus after the
+          // click — the same staleness the assignee handler above already
+          // works around. Without this, the drawer keeps showing a stale
+          // Open button for a card that just moved to Done, and clicking
+          // it 409s.
           const fresh = findCard(card.id);
           if (fresh) { renderDrawer(fresh); openCardSnapshot = fresh; }
-        } catch (err) { showToast(`Cancel failed: ${err.message}`, true); }
-      }]);
-    }
-
-    // Delete is offered for every card the drawer can open — a task card
-    // (any lane, including review) or a scheduled card — and always sits
-    // last, after Cancel. It's the only drawer action styled `danger`.
-    buttons.push(['Delete', () => openDeleteModal(card), { danger: true }]);
-
-    for (const [label, handler, opts] of buttons) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = opts && opts.danger ? 'drawer-action danger' : 'drawer-action';
-      btn.textContent = label;
-      if (opts && opts.reason) {
-        // Disable-and-explain rather than hide, matching every other
-        // refused control in this drawer — a `title=` isn't enough, the
-        // reason needs to be visible text next to the button.
-        btn.disabled = true;
-        actionsEl.appendChild(btn);
-        const reasonEl = document.createElement('div');
-        reasonEl.className = 'drawer-field-reason';
-        reasonEl.dataset.field = `${label.toLowerCase()}-reason`;
-        reasonEl.textContent = opts.reason;
-        actionsEl.appendChild(reasonEl);
-      } else {
-        btn.onclick = handler;
-        actionsEl.appendChild(btn);
-      }
-    }
-  }
-
-  // Delete confirmation, mirroring panel.js's openKillModal — title,
-  // `.target` naming the card, cancel + danger confirm that disables and
-  // relabels itself while the request is in flight and re-enables on
-  // failure. A task card with a live, killable session (not a CLI-backed
-  // one, which this endpoint can't tear down) kills that session and its
-  // subagents first and only deletes once the kill succeeds; a CLI-backed
-  // live session is deleted without a kill attempt, since the operator has
-  // to close that pane by hand. A scheduled card never carries a session,
-  // so it always deletes straight through.
-  function openDeleteModal(card) {
-    const isTask = card.kind === 'task';
-    const label = isTask ? (card.title || card.id) : (card.name || card.id);
-    // Maps a card to its kill decision and note text — called both here
-    // (against the live card, not the possibly-stale drawer snapshot,
-    // since `updateOpenDrawer` skips rebuilding the drawer while it holds
-    // focus) and again at confirm time.
-    function killDecision(c) {
-      const hasLiveSession = !!(c.session && !TERMINAL.has(c.session.status));
-      const isCliSession = !!(c.session && (c.session.source === 'claude_code' || c.session.source === 'codex'));
-      const needsKill = isTask && hasLiveSession && !isCliSession;
-      let noteHtml;
-      if (needsKill) {
-        noteHtml = `<div class="descendants">Deleting this card will kill the running session and its subagents first, then remove the card. This can't be undone.</div>`;
-      } else if (isTask && hasLiveSession && isCliSession) {
-        noteHtml = `<div class="descendants">This card has a live ${escapeHtml(sourceLabelFor(c.session))} session that can't be killed from here — close its pane manually. Deleting removes the card. This can't be undone.</div>`;
-      } else {
-        noteHtml = `<div class="descendants">This can't be undone.</div>`;
-      }
-      return { needsKill, noteHtml };
-    }
-    let { needsKill, noteHtml } = killDecision(findCard(card.id) || card);
-    const backdrop = document.createElement('div');
-    backdrop.className = 'modal-backdrop';
-    backdrop.innerHTML = `
-      <div class="modal" role="dialog" aria-labelledby="delete-title">
-        <h2 id="delete-title">Delete card?</h2>
-        <div class="target">${escapeHtml(label)}</div>
-        ${noteHtml}
-        <div class="actions">
-          <button id="delete-cancel">Cancel</button>
-          <button class="danger" id="delete-confirm">Delete</button>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(backdrop);
-    // Guards dismissal (backdrop click / Cancel) while a confirm is in
-    // flight — without it, clicking the backdrop mid-request removes the
-    // modal out from under the confirm handler, which then re-enables a
-    // detached button on failure instead of the modal staying open.
-    let pending = false;
-    const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
-    backdrop.addEventListener('click', e => { if (!pending && e.target === backdrop) cleanup(); });
-    backdrop.querySelector('#delete-cancel').onclick = () => { if (!pending) cleanup(); };
-    backdrop.querySelector('#delete-confirm').onclick = async () => {
-      const confirmBtn = backdrop.querySelector('#delete-confirm');
-      // Re-resolve the card from the live board rather than trusting the
-      // snapshot captured when the modal opened — `updateOpenDrawer` skips
-      // rebuilding the drawer while it holds focus, so a card the worker
-      // claims after the drawer opened can still show a session-less
-      // snapshot here. Falls back to the captured `card` if it's vanished
-      // from the board entirely.
-      const fresh = findCard(card.id) || card;
-      const { needsKill: freshNeedsKill, noteHtml: freshNoteHtml } = killDecision(fresh);
-      if (freshNeedsKill && !needsKill) {
-        // The disclosed note didn't promise a kill but one is now
-        // required — update the note in place and make the operator
-        // confirm again against accurate text rather than killing a
-        // session they were never told about.
-        needsKill = freshNeedsKill;
-        backdrop.querySelector('.descendants').outerHTML = freshNoteHtml;
-        confirmBtn.disabled = false;
-        confirmBtn.textContent = 'Delete';
-        return;
-      }
-      pending = true;
-      confirmBtn.disabled = true;
-      confirmBtn.textContent = 'Deleting…';
-      try {
-        if (freshNeedsKill) {
-          const kr = await fetch(`/api/agents/sessions/${encodeURIComponent(fresh.session.session_id)}/kill`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),
-          });
-          if (!kr.ok) {
-            const text = await kr.text();
-            let msg = text;
-            try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
-            throw new Error(`Kill failed: HTTP ${kr.status}: ${msg}`);
-          }
-          const killResult = await kr.json();
-          const failures = killResult.failures || [];
-          if (failures.length > 0) {
-            throw new Error(`Kill failed: ${failures.map(f => f.reason || f.session_id).join('; ')}`);
-          }
-        }
-        const deleteUrl = isTask
-          ? `/api/tasks/${encodeURIComponent(card.id)}`
-          : `/api/scheduler/${encodeURIComponent(card.id)}`;
-        const dr = await fetch(deleteUrl, { method: 'DELETE' });
-        if (!dr.ok) {
-          const text = await dr.text();
-          let msg = text;
-          try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
-          throw new Error(msg || `HTTP ${dr.status}`);
-        }
-        pending = false;
-        cleanup();
-        closeDrawer();
-        showToast('Deleted.', false);
-        await fetchBoard();
-      } catch (err) {
-        showToast(`Delete failed: ${err.message}`, true);
-        pending = false;
-        confirmBtn.disabled = false;
-        confirmBtn.textContent = 'Delete';
-      }
-    };
-  }
-
-  function openAnswerPrompt(card) {
-    const backdrop = document.createElement('div');
-    backdrop.className = 'modal-backdrop';
-    backdrop.innerHTML = `
-      <div class="modal" role="dialog" aria-labelledby="answer-title">
-        <h2 id="answer-title">Answer</h2>
-        <div class="target">${escapeHtml(card.pending_question.question)}</div>
-        <textarea id="answer-text" placeholder="Your answer…"></textarea>
-        <div class="actions">
-          <button id="answer-cancel">Cancel</button>
-          <button class="danger" id="answer-send">Send</button>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(backdrop);
-    const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
-    backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
-    backdrop.querySelector('#answer-cancel').onclick = cleanup;
-    backdrop.querySelector('#answer-send').onclick = async () => {
-      const answer = backdrop.querySelector('#answer-text').value.trim();
-      if (!answer) return;
-      const btn = backdrop.querySelector('#answer-send');
-      btn.disabled = true;
-      btn.textContent = 'Sending…';
-      try {
-        const r = await fetch(`/api/agents/pending-questions/${encodeURIComponent(card.pending_question.id)}/answer`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ answer }),
-        });
-        if (!r.ok) throw new Error(await r.text());
-        showToast('Answer sent.', false);
-        cleanup();
-        fetchBoard();
-      } catch (err) {
-        showToast(`Couldn't send answer: ${err.message}`, true);
-        btn.disabled = false;
-        btn.textContent = 'Send';
-      }
-    };
+        }),
+        delete: () => openDeleteCardModal(card, {
+          findCard,
+          onDeleted: async () => { closeDrawer(); await fetchBoard(); },
+        }),
+      },
+    });
   }
 
   function renderDrawerSession(card) {
@@ -1681,7 +1451,11 @@ export function initBoard() {
       sessionWrap.innerHTML = '<div class="panel-empty">No linked session yet.</div>';
       return;
     }
-    panel = new SessionPanel({ container: sessionWrap });
+    // `showActions: false` — the drawer's own action row (built by
+    // `renderDrawerActions`, above) already covers Go To/Resume/Kill for
+    // this same session; this embedded panel renders only the session
+    // header, transcript, and summary.
+    panel = new SessionPanel({ container: sessionWrap, showActions: false });
     panel.open(card.session);
   }
 
@@ -1790,4 +1564,22 @@ export function initBoard() {
 
   fetchBoard();
   connectStream();
+
+  // The Graph tab's side panel (web/agents/graph.js) reuses this live
+  // state, rather than issuing its own `/api/agents/board` fetch, to find
+  // the card linked to a session — the same lookup the drawer itself uses
+  // (`findCard`, `allCards()`), so the two surfaces can never derive
+  // different `card.lane`/`card.policy` for the same session. `findCard`
+  // is exposed the same way, by card id, so a card-linked Graph tab panel
+  // can re-resolve the freshest copy of its card at Delete-confirm time
+  // exactly the way the Board drawer's own `findCard` wiring
+  // (`renderDrawerActions`, above) does.
+  return {
+    getCardForSession(sessionId) {
+      if (!sessionId) return null;
+      return allCards().find(c => c.session && c.session.session_id === sessionId) || null;
+    },
+    findCard,
+    refresh: fetchBoard,
+  };
 }
