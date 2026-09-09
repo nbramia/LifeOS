@@ -37,6 +37,13 @@ def stores(tmp_path: Path, monkeypatch):
     # from ~/.claude/projects/ and Codex sessions from the test machine.
     monkeypatch.setattr(agents_route, "_claude_code_snapshot", lambda: ([], []))
     monkeypatch.setattr(agents_route, "_codex_snapshot", lambda: ([], []))
+    # Mirrored remote transcripts (Syncthing copies of other hosts' sessions)
+    # are a third union branch in `_build_snapshot` — stub them too so a
+    # developer machine with live mirrors doesn't pollute empty/snapshot tests.
+    from api.services import agent_transcript_mirror
+    monkeypatch.setattr(
+        agent_transcript_mirror, "mirrored_snapshot", lambda: ([], [], []),
+    )
     yield session_store, transcript_store
     agents_route._label_cache.clear()
 
@@ -1327,6 +1334,12 @@ def test_prefetch_with_engine_disabled_still_caches_fallback_and_drops_out(
     monkeypatch.setattr(agents_route, "_session_store", session_store)
     monkeypatch.setattr(agents_route, "_transcript_store", transcript_store)
     agents_route._label_cache.clear()
+    monkeypatch.setattr(agents_route, "_claude_code_snapshot", lambda: ([], []))
+    monkeypatch.setattr(agents_route, "_codex_snapshot", lambda: ([], []))
+    from api.services import agent_transcript_mirror
+    monkeypatch.setattr(
+        agent_transcript_mirror, "mirrored_snapshot", lambda: ([], [], []),
+    )
 
     # A hook-registered Codex session on a different host — no local rollout
     # to read, which is exactly the row shape that leaked through the flag

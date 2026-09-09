@@ -9,7 +9,7 @@ The Telegram surface is a first-class client for LifeOS. It gives you:
 - **Conversational access** to LifeOS from your phone — every message runs through the same orchestrator and tool catalog as the web `/chat` SPA (search, calendar, email, tasks, people, finances, and the rest).
 - **Proactive notifications and briefings** — scheduled reminders and nightly summaries are delivered to your chat.
 - **Alerting** — operational alerts (sync failures, auto-deploy failures) can land in Telegram as a backup to email.
-- **Delegating autonomous work** — spawn `#agent` tasks and Claude Code / Codex sessions from the chat and get progress and completion notices back in the same thread.
+- **Delegating autonomous work** — spawn engine-assigned tasks and Claude Code / Codex sessions from the chat and get progress and completion notices back in the same thread.
 
 This guide sets up the primary bot, explains its commands and reply threading, and points to the specialized persona bots.
 
@@ -134,7 +134,7 @@ The listener only answers the chat whose ID equals the configured `*_CHAT_ID` �
 - [Operations](operations.md) — Alerting severities and operational procedures.
 
 ### Specifications
-- [Agent Worker](../specs/product/agent-worker.md) — What `#agent` tasks do and how they run.
+- [Agent Worker](../specs/product/agent-worker.md) — What engine-assigned tasks do and how they run.
 - [Client Surfaces](../specs/technical/client-surfaces.md) — Which backend (Hermes or native) answers each persona bot's turn, and the fallback contract.
 
 ### Code References

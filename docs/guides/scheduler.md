@@ -56,7 +56,7 @@ internally, so "daily at 6pm" means 6pm local.
 | `notify` | Sends the static `message_content` via Telegram |
 | `prompt` | Runs `message_content` through the full chat pipeline (with retry) and sends the result |
 | `endpoint` | Calls a LifeOS API endpoint and sends the formatted result |
-| `agent` | Writes an `#agent` task into `LifeOS/Tasks/Inbox.md` so the agent worker runs it autonomously |
+| `agent` | Writes an engine-assigned task into `LifeOS/Tasks/Inbox.md` so the agent worker runs it autonomously |
 
 For `notify` and `prompt`, the Telegram message is **suppressed** when the
 result is empty or a sentinel (`NO_MEETING`, `NOTHING_TO_REPORT`, …) — so
@@ -85,8 +85,10 @@ channel it lands in.
 ### Agent hand-off
 
 An `action:: agent` schedule spawns autonomous work without any new executor:
-when it fires it writes an `#agent` task carrying the prompt as the description
-and the executor tag (`#local` / `#cloud` / `#cloud-haiku` / `#cloud-sonnet`).
+when it fires it writes a task carrying the prompt as the description and the
+executor tag (`#local` / `#cloud` / `#cloud-haiku` / `#cloud-sonnet` / …).
+When no executor is set, the schedule retains the legacy `#agent` handoff and
+uses the worker's configured default route.
 The existing [agent worker](../specs/product/agent-worker.md) discovers the
 task and routes it via preflight. Progress is reported through the worker's own
 channel, not the scheduler.
@@ -104,7 +106,7 @@ on the task. The worker reads it on completion and appends every fire's output
 to **one shared Agent Output note per schedule** (`LifeOS/Tasks/Agent Output/<schedule-slug>-<id>.md`),
 newest run on top under a dated heading — rather than a new note per fire. A
 one-time (`once`) agent schedule gets no such tag and produces its own one-off
-note like any other `#agent` task.
+note like any other engine-assigned task.
 
 ```markdown
 - [ ] Weekly Review [cron:: 0 9 * * 6] [action:: agent] #cloud <!-- id:d4e5f6 -->
@@ -210,7 +212,7 @@ See [API Reference § Scheduler & Telegram Endpoints](../specs/product/api-refer
 ## Related Documents
 
 - [Scheduler — Technical](../specs/technical/scheduler.md) — Engineering view: store, cache, watcher, firing internals
-- [Task Management](../specs/product/task-management.md) — Tasks system (the `agent` action writes `#agent` tasks)
+- [Task Management](../specs/product/task-management.md) — Tasks system (the `agent` action writes engine-assigned tasks)
 - [Agent Worker](../specs/product/agent-worker.md) — Runs `action:: agent` schedules
 - [API Reference](../specs/product/api-reference.md) — Scheduler API endpoint contracts
 - [MCP Tools](../specs/product/mcp-tools.md) — `lifeos_schedule_*` tool contracts

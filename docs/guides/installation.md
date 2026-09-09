@@ -36,7 +36,7 @@ indexing.
 - **Apple Data Agent** (macOS) — iMessage, phone calls, contacts
 - **Local llama-server** — fully local LLM instead of the Anthropic backend (needs a high-VRAM GPU)
 - **whisper-relay** — voice input
-- **Agent worker** — autonomous execution of `#agent`-tagged tasks
+- **Agent worker** — autonomous execution of engine-assigned tasks
 
 The minimal path is Steps 1–8 below. The full-setup integrations are covered in
 [Configuration](configuration.md), [Google OAuth](google-oauth.md),
