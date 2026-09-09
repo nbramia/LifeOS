@@ -20,7 +20,7 @@ class TestDeriveAssignee:
     def test_me(self):
         assert agent_board.derive_assignee(["me"]) == "me"
 
-    @pytest.mark.parametrize("engine", ["claude", "codex", "hermes", "local"])
+    @pytest.mark.parametrize("engine", ["claude", "codex", "hermes", "local", "cloud"])
     def test_agent_engines(self, engine):
         assert agent_board.derive_assignee([engine]) == engine
 
@@ -417,7 +417,7 @@ class TestPlanLaneMoveLandsInTargetLane:
 # ---------------------------------------------------------------------------
 
 class TestIsAgentOwned:
-    @pytest.mark.parametrize("engine", ["claude", "codex", "hermes", "local"])
+    @pytest.mark.parametrize("engine", ["claude", "codex", "hermes", "local", "cloud"])
     def test_engine_assignee_tag_is_agent_owned(self, engine):
         assert agent_board.is_agent_owned([engine]) is True
 
@@ -428,12 +428,9 @@ class TestIsAgentOwned:
 
     @pytest.mark.parametrize("claim_tag", ["agent-running", "agent-blocked"])
     def test_claim_tag_with_no_assignee_tag_is_agent_owned(self, claim_tag):
-        # The worker's own claim swap (`agent` -> `agent-running`/
-        # `agent-blocked`) never adds an engine-specific assignee tag — a
-        # card claimed this way must still count as agent-owned, or Cancel
-        # (agent-owned-only) would refuse the one recovery action left on
-        # it, with no assignee tag to edit it back to a workable state.
-        assert agent_board.is_agent_owned(["agent", claim_tag]) is True
+        # A card the worker already claimed with no engine assignee must
+        # still count as agent-owned.
+        assert agent_board.is_agent_owned([claim_tag]) is True
 
     def test_completed_or_accepted_tag_alone_is_not_agent_owned(self):
         # Only the two WORKER-CLAIM tags (agent-running/agent-blocked)
@@ -550,7 +547,7 @@ class TestIsScheduleActive:
 ALL_LANES = (
     "unassigned", "assigned", "in_progress", "human_queue", "scheduled", "review", "done",
 )
-ALL_ASSIGNEES = (None, "me", "claude", "codex", "hermes", "local")
+ALL_ASSIGNEES = (None, "me", "claude", "codex", "hermes", "local", "cloud")
 ALL_CONDITIONS = (
     "unclaimed", "agent_running", "agent_blocked", "review", "accepted", "done", "cancelled",
     "cli_opened", "in_progress_no_session",
@@ -595,7 +592,7 @@ def _state_to_status_tags(assignee, condition):
     elif condition in ("cli_opened", "in_progress_no_session"):
         # cli_session_event sets status="in_progress" the first time a
         # card's Open button spawns a session, but never adds
-        # agent-running (only the worker's own #agent claim flow does) —
+        # agent-running (only the worker's own claim flow does) —
         # no extra tag beyond the plain assignee either way. The two
         # conditions share this exact (status, tags) shape; what tells
         # them apart is whether a live session actually backs it (see
@@ -620,14 +617,8 @@ def _expected_outcome(assignee, condition, action, target_lane=None):
     `(status_code, detail)` for refused."""
     # A card is agent-owned once EITHER its assignee tag names an agent
     # engine, OR it already carries a worker claim tag — regardless of
-    # whether an assignee tag is also present. The claim-tag branch covers
-    # both the bare-`#agent`-queue-card shape with no engine-specific
-    # assignee at all (the worker's own claim swap only ever touches
-    # `agent`/claim tags, never assignee tags) and a card the worker
-    # claimed while it still carries `#me`. Without that branch, either
-    # shape would refuse Cancel too (agent-owned-only) with no assignee tag
-    # left to edit it back to a workable state.
-    agent_owned = assignee in ("claude", "codex", "hermes", "local") or condition in (
+    # whether an assignee tag is also present.
+    agent_owned = assignee in ("claude", "codex", "hermes", "local", "cloud") or condition in (
         "agent_running", "agent_blocked",
     )
     # A CLI-opened, agent-owned card backed by a live session is claimed
@@ -751,15 +742,9 @@ class TestEvaluateCardActionDecisionTable:
             # it's how a human gets rid of it without dragging it anywhere.
             assert agent_board.evaluate_card_action(status, tags, "cancel") is None
 
-    def test_claimed_bare_agent_card_with_no_assignee_tag_still_allows_cancel(self):
-        """The worker selects candidates by the bare `#agent` queue tag
-        alone and its claim swap (`agent` -> `agent-running`/`agent-blocked`)
-        never adds an engine-specific assignee tag — so a card can be
-        claimed with `derive_assignee` still returning `None`. That shape
-        must be treated as agent-owned the same as an engine-assigned one:
-        every lane refuses (claimed, same as the engine case), but Cancel,
-        the one recovery action left, still works — there's no assignee
-        tag to edit it back to a workable state otherwise."""
+    def test_claimed_card_with_no_assignee_tag_still_allows_cancel(self):
+        """A claimed card with no engine assignee is still agent-owned:
+        every lane refuses, but Cancel still works."""
         for condition in ("agent_running", "agent_blocked"):
             status, tags = _state_to_status_tags(None, condition)
             assert agent_board.derive_assignee(tags) is None  # no assignee tag at all
