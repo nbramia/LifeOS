@@ -4,7 +4,7 @@
 > **Owner:** Agent Worker
 > **Last Updated:** 2026-09-05
 
-Engineering view of the agent worker — the stand-alone process that consumes `#agent`-tagged tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
+Engineering view of the agent worker — the stand-alone process that consumes engine-assigned tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
 ---
 
@@ -36,7 +36,7 @@ Engineering view of the agent worker — the stand-alone process that consumes `
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         Operator's task list                             │
-│                    (Obsidian markdown, #agent tag)                       │
+│                    (Obsidian markdown, engine assignee)                       │
 └──────────────────────────────┬──────────────────────────────────────────┘
                                │ HTTP poll (60s)
                                ▼
@@ -100,7 +100,7 @@ One row per agent session (1:1 with a claimed task, or a root-spawned operator s
 
 | Column | Meaning |
 |---|---|
-| `task_id` (PK) | The `#agent` task this session was claimed from (or a synthetic id for operator sessions). |
+| `task_id` (PK) | The engine-assigned task this session was claimed from (or a synthetic id for operator sessions). |
 | `session_id` (UNIQUE) | Internal session identifier used for inter-agent addressing, transcripts, etc. |
 | `status` | One of `claimed`, `running`, `yielded`, `completed`, `failed`, `budget_exceeded`, `blocked`. |
 | `routing` | `local`, `claude`, `claude_code`, `codex`, `hermes`, or `ask` — which executor runs the session. |
@@ -115,7 +115,7 @@ One row per agent session (1:1 with a claimed task, or a root-spawned operator s
 | `yield_waiting_for` | JSON array of `session_id`s this session is yielded waiting on. |
 | `managed_agent_session_id` | Anthropic Managed Agents session id, for `routing="claude"` sessions. |
 | `preset_class` | Tool-filtering preset applied to a Managed Agents session at start. |
-| `origin` | NULL or `"agent"` = claimed from an `#agent` task; `"operator"` = root-spawned on demand with no backing task (#235). |
+| `origin` | NULL or `"agent"` = claimed from an engine-assigned vault task; `"operator"` = root-spawned on demand with no backing task. |
 | `claude_code_session_id` | Claude Code (or Codex) CLI session/thread id, for `routing="claude_code"`/`"codex"` — the column is reused for both; `routing` disambiguates which CLI it belongs to. |
 | `claude_code_model` | Claude tier for `routing="claude_code"` (`haiku`/`sonnet`/`opus`); NULL falls back to the CLI's own default (`opus`). |
 | `bot` | Telegram bot that owns this session's notices; NULL = primary bot (#348). |
@@ -220,10 +220,17 @@ poll → resolve Human-queue cards whose done_when now passes (throttled by
      → dispatch spawned sessions (drain pending_messages)
      → process clarification answers (Telegram replies)
      → timeout stale clarifications (default 72h)
-     → list /api/tasks across AGENT_PICKUP_STATUSES (`todo` + `urgent`), tag=agent, dedupe by id
+     → list /api/tasks across AGENT_PICKUP_STATUSES (`todo` + `urgent`) ×
+       AGENT_PICKUP_TAGS (`#agent` + every engine assignee + Managed Agents
+       consent tags), dedupe by id,
+       keep candidates with `#agent` OR an engine assignee OR a consent tag,
+       drop any task that already carries a lifecycle claim/terminal tag
      → for each candidate:
-         atomic swap #agent → #agent-running   (race-free via swap-tag API)
+         atomically re-check status, pickup tag, and lifecycle exclusions;
+         replace legacy `#agent` or append `#agent-running`, and set in-progress
          create session row + transcript "claim" event
+         (session-create failure rolls the tag back: swap to `#agent` when
+         that was the original handoff, otherwise remove `#agent-running`)
          run preflight (Haiku) → PreflightResult
              routing in {local, claude, claude_code, codex, ask}
              expected_output in {text, file, external_action, structured}
@@ -273,13 +280,13 @@ Each session also tracks `routing`, `budget`, `expected_output`, `total_input_to
 
 The preflight classifies a task before executor dispatch, cheap (~$0.001) and fast (~1s). Which LLM client runs the classifier call is controlled by `LIFEOS_AGENT_PREFLIGHT_ENGINE` (#808), default `auto`:
 
-- **`auto`** (default) — the pre-existing priority order: Anthropic (`claude-haiku-4-5` by default) when `ANTHROPIC_API_KEY` is set, with no reachability probe on this branch; else the local llama-server if reachable; else the remote provider described under "Local executor" below, if configured and enabled (`LIFEOS_AGENT_REMOTE_EXECUTOR` + `remote_llm_configured`); else the call raises, which `run_preflight()` degrades to `sane=False`/`routing=ask` like any other preflight failure. This keeps an install with no Anthropic key from failing every `#agent` task at the classification step, before the local-executor fallback below ever gets a chance to run. Every existing install is byte-identical to pre-#808 behavior under this default.
+- **`auto`** (default) — Anthropic (`claude-haiku-4-5` by default) when `ANTHROPIC_API_KEY` is set, without a reachability probe; else the local llama-server if reachable; else the remote provider described under "Local executor" below, if configured and enabled (`LIFEOS_AGENT_REMOTE_EXECUTOR` + `remote_llm_configured`); else the call raises, which `run_preflight()` degrades to `sane=False`/`routing=ask` like any other preflight failure. This keeps an install with no Anthropic key from failing every engine-assigned task at the classification step, before the local-executor fallback below ever gets a chance to run.
 - **`remote`** — build the remote OpenAI-compatible provider (e.g. Fireworks running DeepSeek) first, when `remote_llm_configured`. Built the same way the `auto` chain's own remote fallback is, and used **unprobed** by design (the same #706 convention the `auto` chain already follows for that branch — the remote client is trusted, not health-checked) — so this never adds a reachability check that wasn't already implicit in the request itself. A failure of the completion call is not caught specially; it propagates to `run_preflight()`'s existing except-clause exactly like a failure on any other engine. If the provider *isn't* configured, the call raises — a forced engine never silently falls back to another one, and in particular never to the Anthropic API, which is the spend `remote` exists to avoid; `run_preflight()` degrades the raise to `routing=ask`, so the operator sees a confirmation question rather than a surprise API bill. Operator motivation (#808): all five observed field instruction-deviations were Haiku's, while the remote provider has executed real tasks cleanly — classifier engine choice is a quality lever, not a safety dependency (routing/ambiguity/sanity opinions already can't cancel, bypass the default route, or block under one — see #747/#751/#757/#803 below).
 - **`anthropic`** — force the Anthropic branch. Falls through to `auto` (with a logged warning) if no API key is configured.
 - **`local`** — force the local llama-server client. Still probed via `is_available()`, same as the `auto` chain's own local branch — but since there's no further engine to fall back to for a forced value, an unreachable server raises (degrading via the same except-clause) rather than silently trying something else.
 - Any other value is treated as `auto`, with a logged warning — never a crash over a typo'd env var, mirroring `LIFEOS_AGENT_DEFAULT_ROUTE`'s own invalid-value handling below.
 
-None of this changes which engine an `#agent` task itself dispatches to — only which client classifies it. Spend attribution: preflight calls do not write to the usage store (`usage_store.record_usage`) on **any** engine today, including the pre-#808 Anthropic/local/remote branches — usage recording is caller-side and lives only in the chat and Hermes-proxy routes, not in `llm_client.py` or the agent worker. `#808` preserves that: a preflight call on the remote engine is exactly as unattributed as one on Anthropic or local was before it, so `remote_llm_*_price_per_mtok` never sees a preflight-driven row. Returns:
+This only chooses which client classifies a task — not which engine the task itself dispatches to. Spend attribution: preflight calls do not write to the usage store (`usage_store.record_usage`) on **any** engine today — usage recording is caller-side and lives only in the chat and Hermes-proxy routes, not in `llm_client.py` or the agent worker. A preflight call on the remote engine is exactly as unattributed as one on Anthropic or local, so `remote_llm_*_price_per_mtok` never sees a preflight-driven row. Returns:
 
 ```python
 @dataclass
@@ -321,7 +328,7 @@ Hardening: response is parsed defensively (handles `` ```json `` fences, partial
 
 `LocalExecutor.execute(session, task) -> ExecutorOutcome`. Wraps an agent loop against an OpenAI-compatible local LLM server (llama-server with `unsloth/gemma-4-26B-A4B-it-GGUF` by default).
 
-**Remote fallback (`LIFEOS_AGENT_REMOTE_EXECUTOR`, off by default).** When enabled and an OpenAI-compatible remote provider is fully configured (`LIFEOS_REMOTE_LLM_URL`/`_MODEL`/`_API_KEY`, see [configuration.md](../../guides/configuration.md#openai-compatible-remote-provider)), a session-start reachability check that finds the local llama-server unreachable runs the session against the remote provider instead of failing — one cheap `is_available()` probe at session start, not a background prober. This exists for an install with no other `#agent` executor at all (no Claude Code, no Codex, no Managed Agents, no reachable llama-server); flag off, or the remote provider unconfigured, is byte-identical to the local-only path. It is a fallback, not a new route: an explicit `#local` tag on a host with a live llama-server is unaffected. The escalation ladder can never reach this path — its `local` rung goes through `agent_loop.py`'s `_select_client(force_local=True)`, a separate code path that never consults this flag.
+**Remote fallback (`LIFEOS_AGENT_REMOTE_EXECUTOR`, off by default).** When enabled and an OpenAI-compatible remote provider is fully configured (`LIFEOS_REMOTE_LLM_URL`/`_MODEL`/`_API_KEY`, see [configuration.md](../../guides/configuration.md#openai-compatible-remote-provider)), a session-start reachability check that finds the local llama-server unreachable runs the session against the remote provider instead of failing — one cheap `is_available()` probe at session start, not a background prober. This exists for an install with no other agent executor at all (no Claude Code, no Codex, no Managed Agents, no reachable llama-server); flag off, or the remote provider unconfigured, is byte-identical to the local-only path. It is a fallback, not a new route: an explicit `#local` tag on a host with a live llama-server is unaffected. The escalation ladder can never reach this path — its `local` rung goes through `agent_loop.py`'s `_select_client(force_local=True)`, a separate code path that never consults this flag.
 
 **Remote route (`ROUTE_REMOTE`, the `#cloud` tag, #809) — distinct from the fallback above.** `_remote_only_llm_client` builds the same kind of `LocalLLMClient` pointed at the remote provider, but unconditionally: no `agent_remote_executor` flag check, no local-reachability probe. Tagging a task `#cloud` is itself the opt-in. `Worker._get_remote_executor` constructs a `LocalExecutor` from it (cached separately from the local one, so a mixed local + `#cloud` install never has one route silently swap the other's target client), and `_dispatch`'s `ROUTE_REMOTE` branch requires `settings.remote_llm_configured` first — unconfigured parks the task at `#agent-blocked` rather than falling back to local or Anthropic. Attribution and pricing reuse the fallback's own machinery unchanged: `is_remote=True` drives `_record_spend` (priced from `remote_llm_{input,output}_price_per_mtok` when set, else real unpriced spend) and `_served_by()` (the remote model id, surfaced via `_model_label_for_routing`/`_worker_label` as "Remote").
 
@@ -398,7 +405,7 @@ The Managed Agents API emits `session.error` events at session-start for any MCP
 
 ## Card assignment (#851)
 
-A Kanban card assigns a task to an engine (an assignee tag — `#claude`, `#codex`, `#local`, `#hermes`), a model, an effort level, and a host, written as `[key:: value]` inline fields (`model`, `effort`, `host`, `assigned_by` — round-tripped verbatim by `Task.fields`, see [task-management.md](task-management.md)). `assignment.py`'s `extract_assignment()` reads those four fields; `worker.py`'s `_dispatch()` calls it right after preflight and records `host`/`model`/`effort` onto the session row before any executor runs (`SessionStore.set_assignment`) — the same place `claude_code_model` has always been set. `assigned_by` is recorded for bookkeeping only — it plays no role in routing. The preflight bypass that lets a card's assignee tag skip route corroboration comes from the tag itself: `_apply_tag_overrides` returns as soon as it matches a routing tag, before `_apply_route_corroboration` ever runs (`worker.py`'s comment at the assignment-persist call site notes the same thing).
+A Kanban card assigns a task to an engine (an assignee tag — `#claude`, `#codex`, `#local`, `#hermes`, `#cloud`), a model, an effort level, and a host, written as `[key:: value]` inline fields (`model`, `effort`, `host`, `assigned_by` — round-tripped verbatim by `Task.fields`, see [task-management.md](task-management.md)). An engine assignee on a todo/urgent card is itself the claim handoff — the worker's pickup list fans out by those tags (plus `#cloud-haiku` / `#cloud-sonnet`). `assignment.py`'s `extract_assignment()` reads those four fields; `worker.py`'s `_dispatch()` calls it right after preflight and records `host`/`model`/`effort` onto the session row before any executor runs (`SessionStore.set_assignment`) — the same place `claude_code_model` has always been set. `assigned_by` is recorded for bookkeeping only — it plays no role in routing. The preflight bypass that lets a card's assignee tag skip route corroboration comes from the tag itself: `_apply_tag_overrides` returns as soon as it matches a routing tag, before `_apply_route_corroboration` ever runs (`worker.py`'s comment at the assignment-persist call site notes the same thing).
 
 ### Effort mapping
 
@@ -506,12 +513,12 @@ Lineage budgets: every session tracks `root_session_id` + `spawn_depth`. Budget 
 
 - **Routing** follows override-then-preflight: an explicit `local`/`claude` keyword wins; otherwise `run_preflight()` decides. On `ROUTE_ASK` the session parks at `blocked` with `routing='ask'` and the caller sends the engine clarification (the worker resolves it on reply).
 - **The API needs consent (#584).** `routing=claude` is the only per-token-billed-to-Anthropic route, so preflight may reach it only when the operator asked: a `#cloud-haiku` / `#cloud-sonnet` tag, or a title naming an engine or model (the classifier's `routing_explicit`, corroborated against the title so a hallucinated flag can't dispatch). A cloud route the classifier *inferred* — rule 4's capability cues — is downgraded to `ROUTE_ASK` and confirmed. (#809: bare `#cloud` is a separate, similarly-gated consent — it dispatches straight to `ROUTE_REMOTE`, the configured remote provider, never Anthropic; a title merely containing "cloud" no longer corroborates an inferred `claude` route either, since #809 dropped it from `_TITLE_NAMES_A_CLOUD_ENGINE`.) The confirmation offers `claude code` / `codex` / `local` / `cloud` (remote provider) / `anthropic` or a Claude model name, and a bare "claude" in the reply resolves to the **CLI**, not the API: with both in play, the subscription reading is the one where a misparse costs nothing.
-- **Provenance** is marked with the additive `sessions.origin = 'operator'` column. The worker's `_dispatch_spawned_sessions` skip is relaxed to claim parentless sessions when `origin='operator'`, so they dispatch alongside spawned children without colliding with the top-level `#agent` claim path (which uses NULL origin). The prompt is enqueued as a pending message and drained as the task description on dispatch.
+- **Provenance** is marked with the additive `sessions.origin = 'operator'` column. The worker's `_dispatch_spawned_sessions` skip is relaxed to claim parentless sessions when `origin='operator'`, so they dispatch alongside spawned children without colliding with the top-level engine-assignee claim path (which uses NULL origin). The prompt is enqueued as a pending message and drained as the task description on dispatch.
 - Operator sessions are root sessions (`parent_session_id=None`), so their terminal notifications surface to the operator and register a replyable follow-up (Phase 1 / #234). Because they have no backing vault task, `_handle_outcome` and `_resume_as_followup` skip the vault mutations (`_complete_task` / `_swap_tag` / `_set_task_status`) for `origin='operator'` — gated on `has_vault_task` — while still sending the notification + follow-up. The prompt is enqueued *before* the session row is created so the worker can never observe a CLAIMED operator session whose prompt hasn't landed. Default budget comes from the `agent_default_*` settings; local concurrency cap of 1 means operator local spawns queue behind running ones.
 
 ### Off-tick CLI dispatch (#299, #753)
 
-`claude_code` / `codex` sessions are long-running subprocesses — up to the session's budget wall (14,400s by default) — so their dispatch always runs on a bounded `ThreadPoolExecutor` (`_cli_pool`, sized `2 × agent_max_concurrent_managed`) via `_submit_cli_dispatch`, never inline on the tick thread. This applies to both callers: `_dispatch_spawned_sessions` (spawned children and operator root-spawns) and `_dispatch`'s `ROUTE_CLAUDE_CODE`/`ROUTE_CODEX` branch (top-level `#agent` tasks, #753) — a single delegated child or top-level CLI task can no longer park the poll loop and starve new `#agent` claims, sleeping-session wakes, managed polling, or clarification processing/timeouts. Preflight and the fast blocked/failed/sanity short-circuits still run inline on the tick thread; only the `execute()`/`resume()` subprocess call and everything downstream of its outcome (vault tag swap, Telegram notify) move to the pool, since `_dispatch_claude_code_session`/`_dispatch_codex_session` own outcome handling themselves rather than going through `_handle_outcome`. An `_cli_inflight` set (lock-guarded) prevents a re-scan from re-submitting the same session in the window before its executor flips the row `CLAIMED→RUNNING`; for CLI routes the guard is checked *before* draining pending messages so a skipped re-scan can't discard them. Per-routing concurrency stays bounded at `lifeos_agent_spawn` time (`count_active_by_routing`), independent of dispatch timing. The `local` route stays inline (in-process, GPU-bound, cap 1). `stop()` calls `shutdown(wait=False, cancel_futures=True)`; sessions still running are reconciled by `resume_pending()` on restart. Tests inject a `_SynchronousPool` for deterministic dispatch.
+`claude_code` / `codex` sessions are long-running subprocesses — up to the session's budget wall (14,400s by default) — so their dispatch always runs on a bounded `ThreadPoolExecutor` (`_cli_pool`, sized `2 × agent_max_concurrent_managed`) via `_submit_cli_dispatch`, never inline on the tick thread. This applies to both callers: `_dispatch_spawned_sessions` (spawned children and operator root-spawns) and `_dispatch`'s `ROUTE_CLAUDE_CODE`/`ROUTE_CODEX` branch (top-level engine-assigned tasks) — a single delegated child or top-level CLI task must not park the poll loop and starve new engine-assignee claims, sleeping-session wakes, managed polling, or clarification processing/timeouts. Preflight and the fast blocked/failed/sanity short-circuits still run inline on the tick thread; only the `execute()`/`resume()` subprocess call and everything downstream of its outcome (vault tag swap, Telegram notify) move to the pool, since `_dispatch_claude_code_session`/`_dispatch_codex_session` own outcome handling themselves rather than going through `_handle_outcome`. An `_cli_inflight` set (lock-guarded) prevents a re-scan from re-submitting the same session in the window before its executor flips the row `CLAIMED→RUNNING`; for CLI routes the guard is checked *before* draining pending messages so a skipped re-scan can't discard them. Per-routing concurrency stays bounded at `lifeos_agent_spawn` time (`count_active_by_routing`), independent of dispatch timing. The `local` route stays inline (in-process, GPU-bound, cap 1). `stop()` calls `shutdown(wait=False, cancel_futures=True)`; sessions still running are reconciled by `resume_pending()` on restart. Tests inject a `_SynchronousPool` for deterministic dispatch.
 
 ### Earned completion / interrupted CLI sessions (#760)
 
@@ -562,7 +569,7 @@ The worker is signal-safe and crash-resumable. `resume_pending()` runs on startu
 
 - `YIELDED` with a `sleeps` row → leave alone (sleeps loop wakes it on schedule).
 - `BLOCKED` → leave alone (waiting on Telegram reply or operator unblock).
-- Anything else (`CLAIMED` / `RUNNING` mid-execution) → roll tag back from `#agent-running` to `#agent`, mark session `FAILED` in the DB, notify operator.
+- Anything else (`CLAIMED` / `RUNNING` mid-execution) → undo the claim tag (swap `#agent-running` → `#agent` when the card had no engine assignee; otherwise remove `#agent-running` alone so an engine-only card is not injected with `#agent`), mark session `FAILED` in the DB, notify operator.
 
 A managed session's `managed_agent_session_id` is durable across worker restarts — on resume the worker reattaches via `GET /v1/sessions/{id}` and continues polling from `managed_cursor.last_event_id`.
 
@@ -620,7 +627,7 @@ On every successful completion (root sessions only — not spawned children or o
 Two layouts:
 
 - **One-off task** → a new note `<YYYY-MM-DD>-<slug>-<sid>.md` (the trailing 6-char session id prevents same-day/same-slug clobbering), with `task` / `session_id` / `routing` / `created` / `source: agent-worker` frontmatter.
-- **Recurring (cron) schedule** → one shared note per schedule. The scheduler stamps the handed-off `#agent` task with a `sched-<id>` tag (see [scheduler.md](scheduler.md)); `_schedule_id_from_task` reads it on completion, resolves the schedule's name via `GET /api/scheduler/{id}` for a readable filename `<schedule-slug>-<id>.md` (falling back to `recurring-<id>.md`), and `_recurring_content` prepends this fire above prior runs under a `## YYYY-MM-DD HH:MM` heading — newest first, frontmatter `created` preserved and `updated` bumped.
+- **Recurring (cron) schedule** → one shared note per schedule. The scheduler stamps the handed-off engine-assigned task with a `sched-<id>` tag (see [scheduler.md](scheduler.md)); `_schedule_id_from_task` reads it on completion, resolves the schedule's name via `GET /api/scheduler/{id}` for a readable filename `<schedule-slug>-<id>.md` (falling back to `recurring-<id>.md`), and `_recurring_content` prepends this fire above prior runs under a `## YYYY-MM-DD HH:MM` heading — newest first, frontmatter `created` preserved and `updated` bumped.
 
 The Telegram summary links the note; over-length replies show a preview + link instead of the full body. When the vault path is unset or the write fails the worker keeps the inline summary so the operator never loses content.
 
@@ -652,7 +659,7 @@ Full reference in [`agent-worker-setup.md`](../../guides/agent-worker-setup.md).
 - [Agent Worker — Setup § Working directory](../../guides/agent-worker-setup.md#working-directory-run-a-local-or-cloud-card-in-an-isolated-checkout-925) — Operator-facing walkthrough for the guard described here
 - [Agent Viz — Technical](agent-viz.md) — `/agents` page that reads SessionStore + TranscriptStore here
 - [Agent Viz — Product](../product/agent-viz.md) — Board drawer pickers and Open action that write the card-assignment fields read here
-- [Task Management](../product/task-management.md) — How `#agent` tasks sit alongside regular tasks
+- [Task Management](../product/task-management.md) — How engine-assigned tasks sit alongside regular tasks
 - [Human Queue](../../guides/human-queue.md) — Cards the worker's poll tick auto-resolves via `done_when`
 - [MCP Tools](../product/mcp-tools.md) — Standard MCP catalog including `lifeos_agent_*` family
 - [API Reference](../product/api-reference.md) — Task endpoints the worker uses (`/api/tasks/{id}/swap-tag`, `/api/tasks/{id}/complete`)

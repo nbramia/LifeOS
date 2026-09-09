@@ -956,8 +956,8 @@ class SchedulerScheduler:
         - ``prompt``   — run ``message_content`` through the chat pipeline (with
           retry) and send the result via Telegram
         - ``endpoint`` — call a LifeOS API endpoint and send the formatted result
-        - ``agent``    — write an ``#agent`` task (carrying the executor tag) into
-          ``LifeOS/Tasks/Inbox.md`` so the existing agent worker runs it
+        - ``agent``    — write an engine-assigned task (carrying the executor
+          tag) into ``LifeOS/Tasks/Inbox.md`` so the agent worker runs it
 
         For ``notify``/``prompt`` the Telegram message is suppressed when the
         result is empty or a suppression sentinel (e.g. ``NO_MEETING``). Every
@@ -1031,11 +1031,13 @@ class SchedulerScheduler:
     _fire_reminder = _fire_entry
 
     def _hand_off_to_agent(self, entry: ScheduleEntry) -> str:
-        """Write an ``#agent`` task so the existing agent worker runs the prompt.
+        """Write an engine-assigned task so the agent worker runs the prompt.
 
         The schedule's executor tag (``local`` / ``cloud`` / ``cloud-haiku`` /
-        ``cloud-sonnet``) is passed straight through as a task tag — the agent
-        worker's preflight routes on it, so no new execution path is needed.
+        ``cloud-sonnet`` / ``hermes`` / …) is the claim handoff — the worker
+        picks up todo tasks carrying an engine assignee and preflight routes
+        on that tag. Schedules without an executor retain the legacy
+        ``agent`` handoff and use the worker's configured default route.
 
         For ``cron`` (recurring) schedules we also stamp a ``sched-<id>`` tag.
         The worker reads it on completion to recognise the task as a recurring
@@ -1044,9 +1046,8 @@ class SchedulerScheduler:
         is a stand-alone task that produces its own note.
         """
         from api.services.task_manager import get_task_manager
-        tags = ["agent"]
-        if entry.executor:
-            tags.append(entry.executor.lstrip("#"))
+        executor = (entry.executor or "").lstrip("#").strip()
+        tags: list[str] = [executor] if executor else ["agent"]
         if entry.schedule_type == "cron":
             tags.append(f"sched-{entry.id}")
         task = get_task_manager().create(

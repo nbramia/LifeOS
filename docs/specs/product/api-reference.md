@@ -535,8 +535,7 @@ Cancel an agent-assigned card — available whether or not the worker has
 claimed it, unlike a lane drag. A card counts as agent-assigned if its
 assignee tag names an agent engine (`#claude`/`#codex`/`#hermes`/`#local`)
 OR it already carries `agent-running`/`agent-blocked` even with no
-assignee tag at all — the shape a claimed bare `#agent` queue card is left
-in. If a live session is linked, kills it and every descendant in its
+assignee tag. If a live session is linked, kills it and every descendant in its
 subtree (the same teardown `POST /sessions/{id}/kill` performs), then
 marks the task `cancelled`, which derives to the Done lane (behind
 "include cancelled"). Idempotent: calling this on an already-`cancelled`
@@ -571,7 +570,7 @@ Schedules can also be created, edited, listed, and deleted via natural language 
 
 ### POST /api/scheduler
 
-Create a schedule. Supports `schedule_type` of `once` (ISO datetime) or `cron`, and `action` of `notify` (static text), `prompt` (runs through the chat pipeline), `endpoint` (calls a LifeOS API endpoint), or `agent` (hands off to the agent worker via an `#agent` task, with `executor` = `local`/`cloud`/`cloud-haiku`/`cloud-sonnet`).
+Create a schedule. Supports `schedule_type` of `once` (ISO datetime) or `cron`, and `action` of `notify` (static text), `prompt` (runs through the chat pipeline), `endpoint` (calls a LifeOS API endpoint), or `agent` (hands off to the agent worker via an engine-assigned task, with `executor` = `local`/`cloud`/`cloud-haiku`/`cloud-sonnet`).
 
 `bot` (optional) selects which Telegram bot delivers the notification. Valid values are `primary` and the names registered in `config/telegram_bots.json`; anything else returns **422** with the accepted names. Omit it, or send an empty string, for the primary bot.
 

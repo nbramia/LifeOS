@@ -108,7 +108,13 @@ def pytest_configure(config):
         "allow_anthropic_api: Test is explicitly allowed to hit api.anthropic.com "
         "(used for the canary test that verifies the ban itself works).",
     )
+    config.addinivalue_line(
+        "markers",
+        "allow_cli_spawn: Test is explicitly allowed to spawn the real "
+        "`claude`/`codex` CLI (normally banned — see the CLI spawn guard).",
+    )
     _install_anthropic_request_guard()
+    _install_cli_spawn_guard()
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +200,61 @@ def _install_anthropic_request_guard() -> None:
     httpx.Client.send = patched_send
     httpx.AsyncClient.send = patched_async_send
     _anthropic_guard_active = True
+
+
+
+# ---------------------------------------------------------------------------
+# Agent CLI spawn guard + default-route isolation
+# ---------------------------------------------------------------------------
+
+_BANNED_CLI_BINARIES = frozenset({"claude", "codex"})
+_cli_spawn_guard_active = False
+
+
+def _banned_cli_name(args):
+    if isinstance(args, (str, bytes, os.PathLike)):
+        argv0 = args
+    else:
+        try:
+            argv0 = next(iter(args))
+        except (TypeError, StopIteration):
+            return None
+    if isinstance(argv0, bytes):
+        argv0 = argv0.decode("utf-8", "replace")
+    elif not isinstance(argv0, str):
+        argv0 = str(argv0)
+    name = os.path.basename(argv0.split()[0] if " " in argv0 else argv0)
+    return name if name in _BANNED_CLI_BINARIES else None
+
+
+def _install_cli_spawn_guard() -> None:
+    global _cli_spawn_guard_active
+    if _cli_spawn_guard_active:
+        return
+    import subprocess
+    original_init = subprocess.Popen.__init__
+
+    def patched_init(self, args, *rest, **kwargs):
+        banned = _banned_cli_name(args)
+        if banned is not None:
+            node = getattr(_install_anthropic_request_guard, "_current_node", None)
+            allowed = node is not None and node.get_closest_marker("allow_cli_spawn")
+            if not allowed:
+                raise RuntimeError(
+                    f"Test attempted to spawn the real `{banned}` CLI: {args!r}. "
+                    "Inject a fake spawn_fn / stub executor, or mark "
+                    "@pytest.mark.allow_cli_spawn."
+                )
+        return original_init(self, args, *rest, **kwargs)
+
+    subprocess.Popen.__init__ = patched_init
+    _cli_spawn_guard_active = True
+
+
+@pytest.fixture(autouse=True)
+def _isolate_agent_default_route(monkeypatch):
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "agent_default_route", "", raising=False)
 
 
 def pytest_runtest_setup(item):

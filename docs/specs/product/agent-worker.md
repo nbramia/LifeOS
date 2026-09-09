@@ -4,7 +4,7 @@
 > **Owner:** Agent Worker
 > **Last Updated:** 2026-09-03
 
-LifeOS includes an external **agent worker** that picks up tasks you've tagged `#agent` and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
+LifeOS includes an external **agent worker** that picks up engine-assigned tasks and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
 The point is hands-free task completion for the long tail of small chores that aren't worth a conversation but are worth doing: "draft a follow-up to last week's intro thread," "summarize my unread emails from the partnership channel," "find every meeting where we discussed the Q3 launch."
 
@@ -30,13 +30,13 @@ The point is hands-free task completion for the long tail of small chores that a
 You add this line anywhere in your Obsidian Tasks file:
 
 ```
-- [ ] TODO Summarize my unread emails from the partnership channel and reply with the top 3 by importance #agent
+- [ ] TODO Summarize my unread emails from the partnership channel and reply with the top 3 by importance #local
 ```
 
 Within a poll cycle (default 60s), the worker:
 
 1. Runs a Haiku preflight to parse the task — budget, routing, expected output, sanity check
-2. Atomically swaps the tag to `#agent-running` (so two workers can't claim the same task)
+2. Atomically adds `#agent-running` (so two workers can't claim the same task)
 3. Routes the task — to your local Gemma model, a CLI engine, your configured remote provider, or Claude on Managed Agents — from your tags or an explicit request; when it can only *infer* that a cloud connector is needed, it asks you first
 4. Lets the agent execute: tool calls, MCP servers, web search, file I/O, the full kit
 5. On completion: marks the task done in your vault, swaps the tag to `#agent-completed`, writes the full result to an Agent Output note (`LifeOS/Tasks/Agent Output/`), and sends you a one-paragraph Telegram summary with the actual result (linking the note)
@@ -47,15 +47,14 @@ Cost for that task: usually under $0.10 on Claude Sonnet 4.6, free on local Gemm
 
 ## Task conventions
 
-The agent worker triggers on tasks that have the `#agent` tag and a pickup-eligible status — `todo` (`[ ]`) or `urgent` (`[!]`). Marking a `#agent` task as urgent in Obsidian doesn't skip the worker; it just signals high priority within your queue. Other statuses (`in_progress`, `done`, `cancelled`, `deferred`, `blocked`) are left alone.
+The agent worker claims todo (`[ ]`) or urgent (`[!]`) tasks that carry an engine assignee (`#claude` / `#codex` / `#hermes` / `#local` / `#cloud`), a Managed Agents consent tag (`#cloud-haiku` / `#cloud-sonnet`), or the legacy bare `#agent` queue marker (no engine tag required). An engine assignee alone is the handoff — a separate `#agent` tag is not required. Marking a task as urgent in Obsidian doesn't skip the worker; it just signals high priority within your queue. Other statuses (`in_progress`, `done`, `cancelled`, `deferred`, `blocked`) are left alone.
 
-Optional sub-tags steer routing:
+Routing / handoff tags:
 
 | Tag | Effect |
 |-----|--------|
-| `#agent` | Required. Marks the task as eligible for autonomous execution. |
-| `#local` | Forces routing to your local LLM (Gemma by default). No API spend. Subject to local model capability. |
-| `#cloud` | Forces routing to your configured remote OpenAI-compatible provider (e.g. DeepSeek via Fireworks) — never the Anthropic API. Real per-token billing at that provider's rates. Requires the provider configured ([configuration.md](../../guides/configuration.md#openai-compatible-remote-provider)); an unconfigured install parks the task at `#agent-blocked` rather than falling back to Anthropic. |
+| `#local` | Forces routing to your local LLM (Gemma by default). No API spend. Subject to local model capability. Board assignee for local. |
+| `#cloud` | Forces routing to your configured remote OpenAI-compatible provider (e.g. DeepSeek via Fireworks) — never the Anthropic API. Real per-token billing at that provider's rates. Requires the provider configured ([configuration.md](../../guides/configuration.md#openai-compatible-remote-provider)); an unconfigured install parks the task at `#agent-blocked` rather than falling back to Anthropic. Board assignee for the remote provider. |
 | `#cloud-haiku` | Forces routing to Claude Haiku on Anthropic Managed Agents. Required for tasks that need Anthropic's cloud connectors. Per-token API billing. |
 | `#cloud-sonnet` | Forces routing to Claude Sonnet on Anthropic Managed Agents. Same connector access and billing as `#cloud-haiku`. |
 | `#claude` | Forces routing to Claude Code CLI (the same surface as `/claude`). Billed against your Claude Pro subscription rather than per-token. Good for code/filesystem/browser work where the cloud connectors aren't needed. |
@@ -103,12 +102,12 @@ There's also a global daily $-cap (`LIFEOS_AGENT_DAILY_CAP_DOLLARS`, default `$1
 
 ## Tag lifecycle
 
-A `#agent` task transitions through these states:
+An engine-assigned task transitions through these states:
 
 ```
-#agent                    (your starting tag)
+#local / #claude / …      (engine assignee — the claim handoff)
    ↓ claimed
-#agent-running            (worker has picked it up)
+#agent-running            (worker has picked it up; assignee tag remains)
    ↓ terminal
 #agent-completed          (success — task is also marked `done`)
    or
@@ -119,7 +118,7 @@ A `#agent` task transitions through these states:
 #agent-blocked            (waiting on you via Telegram, or required setup is missing)
 ```
 
-To re-run a terminal task, swap the tag back to `#agent` (Obsidian: edit the line; API: `POST /api/tasks/{id}/swap-tag?from=agent-failed&to=agent`). The full prior transcript stays in `data/agent_transcripts/`.
+To re-run a terminal task, clear the terminal lifecycle tag and keep (or restore) an engine assignee so the worker can claim it again. The full prior transcript stays in `data/agent_transcripts/`.
 
 ---
 
@@ -170,7 +169,7 @@ The agent runs with the operator's full filesystem and shell access — no sandb
 3. **Per-task budgets** — enforced from outside the agent loop, so the model can't override them.
 4. **Telegram notification on every terminal state** — you find out quickly if something runs that shouldn't have.
 
-Operators should still audit `#agent`-tagged tasks before they reach the worker (your task list is the queue), keep budgets set, and treat agent-touchable secrets the same as operator-touchable secrets.
+Operators should still audit handed-off tasks before they reach the worker (your task list is the queue), keep budgets set, and treat agent-touchable secrets the same as operator-touchable secrets.
 
 ---
 
