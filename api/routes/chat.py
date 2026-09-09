@@ -625,6 +625,15 @@ def journal_capture_gate(persona_id: Optional[str], text: str) -> Optional[Captu
         )
 
 
+def _with_journal_filing_policy(persona_id: Optional[str], preamble: str) -> str:
+    """Attach the shared filing boundary to every native Journal turn."""
+    if persona_id != JOURNAL_PERSONA_ID:
+        return preamble
+    from api.services.journal_filing_policy import filing_rules
+
+    return f"{preamble}\n\n{filing_rules(allow_agent_schedule=False, allow_clarification=True)}"
+
+
 @router.post("/ask/stream")
 async def ask_stream(request: AskStreamRequest):
     """
@@ -678,6 +687,9 @@ async def ask_stream(request: AskStreamRequest):
     # reused rather than re-inlined so the Hermes proxy's journal-capture gate
     # (#685) shares the exact same derivation instead of approximating it.
     _effective_pid = resolve_effective_persona_id(request.persona_id, request.persona)
+    # Shared with Pebble's bounded classifier. Native Journal remains a
+    # notify-only surface even when Pebble permits attested delegation.
+    persona_preamble = _with_journal_filing_policy(_effective_pid, persona_preamble)
     personal_context = settings.personal_context(_effective_pid or "")
 
     # #674 (shared with the Hermes proxy via `journal_capture_gate`, #685):

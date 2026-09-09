@@ -298,6 +298,7 @@ class LocalLLMClient:
         timeout: float | None = None,
         model: str = "local",
         api_key: str | None = None,
+        trust_env: bool = True,
     ):
         self.base_url = (base_url or getattr(settings, "local_llm_url", None) or "http://localhost:8080").rstrip("/")
         # Every OpenAI-compatible provider documents its base URL *with* the
@@ -313,6 +314,7 @@ class LocalLLMClient:
         self.timeout = timeout or getattr(settings, "local_llm_timeout", 90)
         self._model = model
         self._api_key = api_key
+        self._trust_env = trust_env
         self._async_client: httpx.AsyncClient | None = None
         self._sync_client: httpx.Client | None = None
 
@@ -345,6 +347,7 @@ class LocalLLMClient:
                 base_url=self.base_url,
                 timeout=httpx.Timeout(self.timeout, connect=10.0),
                 headers=self._auth_headers(),
+                trust_env=self._trust_env,
             )
         return self._async_client
 
@@ -355,6 +358,7 @@ class LocalLLMClient:
                 base_url=self.base_url,
                 timeout=httpx.Timeout(self.timeout, connect=10.0),
                 headers=self._auth_headers(),
+                trust_env=self._trust_env,
             )
         return self._sync_client
 

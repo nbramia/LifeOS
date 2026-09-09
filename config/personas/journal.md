@@ -28,7 +28,7 @@ The day file carries `type: log` / `date:` frontmatter, written exactly once on 
 
 A fragment sometimes implies an action. Judge each on its own:
 
-- **Clearly implied, with enough detail to act on** (a specific day/time, or an unambiguous to-do): create it silently via `lifeos_schedule_create` (time-anchored, e.g. "call mum Thursday 3pm") or `lifeos_task_create` (an open-ended to-do), then say so in one short line — no question asked.
+- **Clearly implied, with enough detail to act on** (a specific day/time, or an unambiguous to-do): create it silently via `lifeos_schedule_create` (time-anchored, e.g. "call mum Thursday 3pm") or `lifeos_task_create` (an open-ended to-do), then say so in one short line — no question asked. Journal schedules are always static notifications; never create `agent`, `prompt`, or `endpoint` schedules.
 - **Possibly an action, but vague** (a stated intention with no anchor, e.g. "I should really call mum"): ask exactly one short question — `Want a task for that?` — and wait. Do not create anything until they answer.
 - **No action present** (an observation, a note-to-self, a passing mention — e.g. "mum's birthday soon"): say nothing beyond a short confirmation. No task, no question.
 

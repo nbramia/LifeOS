@@ -5,6 +5,7 @@ Covers CRUD, cron computation, auto-disable, due detection, suppression,
 prompt execution, the markdown round-trip, markdown-as-source-of-truth, and
 the auto-generated dashboard.
 """
+import multiprocessing
 import threading
 
 import pytest
@@ -25,6 +26,19 @@ from api.services.scheduler_store import (
 pytestmark = pytest.mark.unit
 
 
+def _create_schedule_operation_process(vault, index, start, results, name):
+    try:
+        candidate = SchedulerStore(vault_path=vault, index_path=index)
+        start.wait()
+        entry, created = candidate.create_or_find_by_operation(
+            "pebble:process-schedule", name=name,
+            schedule_type="cron", schedule_value="0 9 * * *",
+        )
+        results.put((entry.id, created, ""))
+    except Exception as exc:  # pragma: no cover - surfaced in parent
+        results.put(("", False, repr(exc)))
+
+
 @pytest.fixture
 def store(tmp_path):
     return SchedulerStore(
@@ -34,6 +48,120 @@ def store(tmp_path):
 
 
 class TestSchedulerStoreCRUD:
+    def test_create_or_find_by_operation_survives_index_rebuild(self, store, tmp_path):
+        first, created = store.create_or_find_by_operation(
+            "pebble:synthetic-source:capture-a:1",
+            name="Synthetic reminder",
+            schedule_type="cron",
+            schedule_value="0 9 * * *",
+            message_content="Synthetic reminder",
+        )
+        assert created is True
+
+        rebuilt = SchedulerStore(
+            vault_path=tmp_path / "vault", index_path=tmp_path / "scheduler_index.json"
+        )
+        second, created = rebuilt.create_or_find_by_operation(
+            "pebble:synthetic-source:capture-a:1",
+            name="Should not be used",
+            schedule_type="cron",
+            schedule_value="0 10 * * *",
+        )
+        assert created is False
+        assert second.id == first.id
+
+    def test_operation_retry_reconciles_markdown_after_pre_cache_crash(
+        self, store, monkeypatch
+    ):
+        original = store._insert_block_at_top
+
+        def commit_then_crash(*args, **kwargs):
+            original(*args, **kwargs)
+            raise RuntimeError("synthetic post-markdown pre-cache crash")
+
+        monkeypatch.setattr(store, "_insert_block_at_top", commit_then_crash)
+        with pytest.raises(RuntimeError, match="post-markdown"):
+            store.create_or_find_by_operation(
+                "pebble:synthetic:crash:schedule",
+                name="Synthetic reminder",
+                schedule_type="cron",
+                schedule_value="0 9 * * *",
+            )
+        monkeypatch.setattr(store, "_insert_block_at_top", original)
+
+        entry, created = store.create_or_find_by_operation(
+            "pebble:synthetic:crash:schedule",
+            name="Duplicate",
+            schedule_type="cron",
+            schedule_value="0 10 * * *",
+        )
+        assert created is False
+        assert entry.name == "Synthetic reminder"
+
+    def test_operation_create_is_atomic_across_independent_stores(self, tmp_path):
+        vault = tmp_path / "vault"
+        index = tmp_path / "scheduler.json"
+        stores = [
+            SchedulerStore(vault_path=vault, index_path=index),
+            SchedulerStore(vault_path=vault, index_path=index),
+        ]
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def create(candidate, name):
+            try:
+                barrier.wait()
+                results.append(candidate.create_or_find_by_operation(
+                    "pebble:atomic-schedule",
+                    name=name,
+                    schedule_type="cron",
+                    schedule_value="0 9 * * *",
+                ))
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=create, args=(stores[0], "Synthetic A")),
+            threading.Thread(target=create, args=(stores[1], "Synthetic B")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert sum(created for _entry, created in results) == 1
+        assert len({entry.id for entry, _created in results}) == 1
+        rebuilt = SchedulerStore(vault_path=vault, index_path=index)
+        assert len(rebuilt.list_all()) == 1
+
+    def test_operation_create_is_atomic_across_processes(self, tmp_path):
+        context = multiprocessing.get_context("spawn")
+        vault = tmp_path / "vault"
+        index = tmp_path / "scheduler.json"
+        start = context.Event()
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_create_schedule_operation_process,
+                args=(str(vault), str(index), start, results, f"Synthetic {number}"),
+            )
+            for number in range(2)
+        ]
+        for process in processes:
+            process.start()
+        start.set()
+        observed = [results.get(timeout=10) for _ in processes]
+        for process in processes:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+        assert [error for _id, _created, error in observed if error] == []
+        assert sum(created for _id, created, _error in observed) == 1
+        assert len({entry_id for entry_id, _created, _error in observed}) == 1
+        rebuilt = SchedulerStore(vault_path=vault, index_path=index)
+        assert len(rebuilt.list_all()) == 1
+
     def test_create_schedule(self, store):
         entry = store.create(
             name="Test Schedule",
@@ -565,6 +693,34 @@ class TestActionDispatch:
         mock_send.assert_called_once()
         assert "hydrate the ferns" in mock_send.call_args[0][0]
         assert scheduler.store.get(entry.id).last_status == "sent"
+
+    @pytest.mark.asyncio
+    async def test_external_operation_firing_logs_and_history_omit_content(
+        self, scheduler, caplog
+    ):
+        secret_name = "Synthetic private schedule title"
+        secret_body = "Synthetic private transcript body"
+        entry, created = scheduler.store.create_or_find_by_operation(
+            "pebble:opaque-schedule",
+            name=secret_name,
+            schedule_type="cron",
+            schedule_value="0 18 * * *",
+            action="notify",
+            message_type="static",
+            message_content=secret_body,
+        )
+        assert created
+        caplog.clear()
+        with caplog.at_level("INFO"):
+            with patch(
+                "api.services.telegram.send_message_async",
+                new_callable=AsyncMock,
+                return_value=True,
+            ):
+                await scheduler._fire_entry(entry)
+        assert secret_name not in caplog.text
+        assert secret_body not in caplog.text
+        assert scheduler.store.get(entry.id).last_result == ""
 
     @pytest.mark.asyncio
     async def test_notify_suppressed_when_empty(self, scheduler):

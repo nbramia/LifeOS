@@ -32,6 +32,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from api.routes import vault as vault_route
+from api.routes.chat import _with_journal_filing_policy
+from api.services.journal_filing_policy import (
+    JOURNAL_BEHAVIOR_CASES,
+    classifier_prompt,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -134,12 +139,12 @@ class TestPersonaContent:
         text = _PERSONA_PATH.read_text()
         assert "lifeos_task_create" in text
         assert "lifeos_schedule_create" in text
-        # The three worked examples from the issue, verbatim enough to prove
-        # each behavior (silent schedule / one question / log-only) is spelled out.
+        # The three native interactive cases remain explicit.
         assert "call mum Thursday 3pm" in text
         assert "I should really call mum" in text
         assert "mum's birthday soon" in text
         assert "Want a task for that?" in text
+        assert "never create `agent`, `prompt`, or `endpoint` schedules" in text
 
     def test_no_real_personal_data(self):
         # Open-source rule: examples must be obviously synthetic, no real
@@ -147,6 +152,22 @@ class TestPersonaContent:
         text = _PERSONA_PATH.read_text()
         for leaked in ("nathanramia", "/home/", "TELEGRAM_JOURNAL_BOT_TOKEN="):
             assert leaked not in text
+
+    def test_native_and_pebble_prompts_consume_the_same_behavior_cases(self):
+        native = _with_journal_filing_policy("journal", "Synthetic native prompt")
+        pebble = classifier_prompt(
+            transcript="Synthetic capture",
+            recorded_at="2030-01-01T15:00:00Z",
+            local_timezone="America/New_York",
+            allow_agent_schedule=True,
+        )
+        for example, disposition in JOURNAL_BEHAVIOR_CASES:
+            expected = f'{json.dumps(example)} means {disposition}.'
+            assert expected in native
+            assert expected in pebble
+        assert "task-clarification question" in native
+        assert "Vague possible actions and ambiguous actions remain log-only" in pebble
+        assert "Want a task for that?" in _PERSONA_PATH.read_text()
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-09-05
+**Last Updated:** 2026-09-09
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -355,6 +355,10 @@ A capture device (e.g. the Pebble Index ring) posts transcriptions here. See [jo
 | Variable | Type | Default | Sets |
 |---|---|---|---|
 | `LIFEOS_JOURNAL_INGEST_TOKEN` | str | — | Bearer token for `POST /api/journal/ingest` (a capture device's transcription webhook). Empty disables the endpoint (503). Generate with `openssl rand -hex 32`. |
+| `LIFEOS_PEBBLE_CAPTURE_ENABLED` | bool | `false` | Start the local-only consumer for validated Pebble v1 archive frames. |
+| `LIFEOS_PEBBLE_CAPTURE_APPLY` | bool | `false` | Permit Pebble filing effects after classification-only validation; false records plans without creating tasks or schedules. |
+| `LIFEOS_PEBBLE_CAPTURE_DIR` | str | `LifeOS/Log/Pebble` | Producer-owned Pebble archive directory under the vault. |
+| `LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS` | int | `60` | Startup/periodic recovery scan interval, seconds (minimum `10`). |
 
 ## Notifications
 
@@ -496,6 +500,7 @@ LIFEOS_ALERT_EMAIL=you@example.com
 - [Agent Worker Setup](agent-worker-setup.md) — Operator setup for the agent worker; references many of the `LIFEOS_AGENT_*` vars above in operator-flow context.
 - [Claude Code Orchestration](claude-code-orchestration.md) — `/claude` setup; references the `LIFEOS_CLAUDE_*` vars in operator-flow context.
 - [Journal Ring Ingest](journal-ring-ingest.md) — `LIFEOS_JOURNAL_INGEST_TOKEN` in operator-flow context.
+- [Pebble Capture Filing](pebble-capture.md) — Framed archive recovery and safe activation procedure.
 - [Doctor Bot](doctor-bot.md) — The self-repair orchestration bot; setup of its `TELEGRAM_DOCTOR_*` vars and the repair flow.
 - [ADR-009: LIFEOS_LLM_BACKEND toggle](../adr/009-llm-backend-toggle.md) — Why the synthesis backend is operator-configurable.
 - [ADR-024: Remote provider as a third backend value](../adr/024-remote-llm-backend.md) — Why `remote` can be the standing default, not just a per-turn pick.
