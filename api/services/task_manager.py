@@ -125,6 +125,10 @@ class _TagAbsentError(Exception):
     CAS retry re-read the task (e.g. someone else already swapped it)."""
 
 
+class _TaskNotClaimableError(Exception):
+    """Internal signal that a claim precondition failed after a CAS re-read."""
+
+
 @dataclass
 class Task:
     """A task stored in the vault."""
@@ -493,6 +497,126 @@ class TaskManager:
             self._save_index()
             self._write_dashboard()
             logger.info(f"swap_tag {task_id}: {from_norm} → {to_norm}")
+            return True
+
+    def claim_for_agent(
+        self,
+        task_id: str,
+        *,
+        pickup_tags: set[str],
+        exclusion_tags: set[str],
+        eligible_statuses: set[str],
+        queue_tag: str = "agent",
+        running_tag: str = "agent-running",
+    ) -> tuple[bool, bool]:
+        """Atomically claim an eligible task and return `(claimed, consumed_queue_tag)`.
+
+        Eligibility is checked again on every compare-and-swap retry so a stale
+        worker listing cannot claim a task whose status or assignment changed.
+        """
+        pickup = {tag.lstrip("#").lower() for tag in pickup_tags}
+        excluded = {tag.lstrip("#").lower() for tag in exclusion_tags}
+        statuses = {status.lower() for status in eligible_statuses}
+        queue = queue_tag.lstrip("#").lower()
+        running = running_tag.lstrip("#")
+        consumed_queue_tag = False
+
+        def is_claimable(task: Task) -> bool:
+            tags = {tag.lstrip("#").lower() for tag in task.tags}
+            return task.status.lower() in statuses and bool(tags & pickup) and not bool(tags & excluded)
+
+        with self._lock:
+            current = self._tasks.get(task_id)
+            if not current or not is_claimable(current):
+                return False, False
+
+            path = Path(current.source_file)
+
+            def compute() -> Task:
+                nonlocal consumed_queue_tag
+                t = self._tasks[task_id]
+                if not is_claimable(t):
+                    raise _TaskNotClaimableError()
+                new_task = copy.copy(t)
+                new_tags = list(t.tags)
+                queue_index = next(
+                    (i for i, tag in enumerate(new_tags) if tag.lstrip("#").lower() == queue),
+                    None,
+                )
+                consumed_queue_tag = queue_index is not None
+                if queue_index is None:
+                    new_tags.append(running)
+                else:
+                    new_tags[queue_index] = running
+                new_task.tags = new_tags
+                new_task.status = "in_progress"
+                new_task.updated_at = _now_iso()
+                return new_task
+
+            try:
+                found, task = self._cas_rewrite(path, task_id, compute)
+            except _TaskNotClaimableError:
+                return False, False
+            if not found:
+                self._tasks.pop(task_id, None)
+                self._last_written_line.pop(task_id, None)
+                self._save_index()
+                self._write_dashboard()
+                return False, False
+
+            self._reposition_file(path)
+            self._save_index()
+            self._write_dashboard()
+            logger.info("claim_for_agent %s: consumed_queue_tag=%s", task_id, consumed_queue_tag)
+            return True, consumed_queue_tag
+
+    def remove_tag_if_present(self, task_id: str, tag: str) -> bool:
+        """Atomically remove `tag` when present.
+
+        Returns True when the tag is absent after the call, False if the task is gone or
+        the tag is already absent.
+        """
+        tag_cmp = tag.lstrip("#").lower()
+        with self._lock:
+            current = self._tasks.get(task_id)
+            if not current:
+                return False
+            if not any(t.lstrip("#").lower() == tag_cmp for t in current.tags):
+                return False
+
+            path = Path(current.source_file)
+
+            def compute() -> Task:
+                t = self._tasks[task_id]
+                try:
+                    idx = next(
+                        i for i, existing in enumerate(t.tags)
+                        if existing.lstrip("#").lower() == tag_cmp
+                    )
+                except StopIteration:
+                    raise _TagAbsentError()
+                new_task = copy.copy(t)
+                new_tags = list(t.tags)
+                del new_tags[idx]
+                new_task.tags = new_tags
+                new_task.updated_at = _now_iso()
+                return new_task
+
+            try:
+                found, task = self._cas_rewrite(path, task_id, compute)
+            except _TagAbsentError:
+                return False
+            if not found:
+                self._tasks.pop(task_id, None)
+                self._last_written_line.pop(task_id, None)
+                self._save_index()
+                self._write_dashboard()
+                return False
+
+            self._reposition_file(path)
+            self._save_index()
+            self._write_dashboard()
+            logger.info(f"remove_tag_if_present {task_id}: -{tag_cmp}")
             return True
 
     def delete(self, task_id: str) -> bool:
