@@ -500,10 +500,11 @@ def _positive_clauses(text: str) -> list[str]:
         ):
             continue
         if re.search(
-            r"^\s*(?:(?:yesterday|today|earlier)\s+)?(?:"
-            r"i\s+(?:heard|remember|recall|wrote)|remember\b|"
+            r"\b(?:according\s+to|i\s+(?:heard|remember|recall|wrote)|"
+            r"(?:i\s+was|we\s+were)\s+told|"
             r"(?:my\s+)?(?:notes?|reminder)\s+(?:say|says|said|reads?|read)|"
-            r"[\w-]+\s+(?:said|says|reported|told\s+me)|(?:write|wrote)\s+down\b)",
+            r"[\w-]+\s+(?:said|says|reported|told\s+me|asked\s+me)|"
+            r"(?:write|wrote)\s+down)\b",
             clause,
             re.I,
         ):
@@ -594,6 +595,7 @@ def _explicit_task_delegation(
         executor in _VALID_TASK_ASSIGNEES
         and _is_unquoted_evidence(transcript, evidence)
         and _single_positive_evidence_clause(evidence)
+        and executor in _explicit_tags(transcript)
         and executor in _explicit_tags(evidence)
         and _explicit_action_evidence(transcript, evidence, action_evidence)
     )
@@ -690,23 +692,27 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
         if not isinstance(evidence, str) or not isinstance(action_evidence, str):
             raise PebbleCaptureError("task delegation evidence is invalid")
         tags: list[str] = []
-        for raw_tag in raw_tags:
-            if not isinstance(raw_tag, str):
-                continue
-            tag = raw_tag.lstrip("#").lower()
-            if tag in _VALID_TASK_ASSIGNEES:
-                evidence_key = evidence.casefold()
-                action_key = action_evidence.casefold()
-                if (evidence_key not in used_delegations
-                        and action_key not in used_action_evidence
-                        and _explicit_task_delegation(
-                            transcript, tag, evidence, action_evidence
-                        )):
+        # Tags are task metadata. A model may redundantly copy an agent
+        # schedule's executor into ``tags``; ignore it here so only the
+        # schedule-specific authority check below consumes its evidence.
+        if kind == "task":
+            for raw_tag in raw_tags:
+                if not isinstance(raw_tag, str):
+                    continue
+                tag = raw_tag.lstrip("#").lower()
+                if tag in _VALID_TASK_ASSIGNEES:
+                    evidence_key = evidence.casefold()
+                    action_key = action_evidence.casefold()
+                    if (evidence_key not in used_delegations
+                            and action_key not in used_action_evidence
+                            and _explicit_task_delegation(
+                                transcript, tag, evidence, action_evidence
+                            )):
+                        tags.append(tag)
+                        used_delegations.add(evidence_key)
+                        used_action_evidence.add(action_key)
+                elif tag not in _ROUTING_TAGS and tag in allowed_tags:
                     tags.append(tag)
-                    used_delegations.add(evidence_key)
-                    used_action_evidence.add(action_key)
-            elif tag not in _ROUTING_TAGS and tag in allowed_tags:
-                tags.append(tag)
         normalized_tags = tuple(dict.fromkeys(tags))
         action = PlannedAction(
             kind=kind, title=title, index=index, tags=normalized_tags,
@@ -815,17 +821,59 @@ class LocalOnlyJournalClassifier:
             timeout=30,
             trust_env=False,
         )
-        response = await client.acreate(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1200,
-            temperature=0,
-            enable_thinking=False,
-        )
-        parsed = extract_json(response.text or "")
-        actions = parsed.get("actions")
-        if not isinstance(actions, list):
-            raise PebbleCaptureError("local classifier returned no action list")
-        return actions
+        request: dict[str, Any] = {
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1200,
+            "temperature": 0,
+            "enable_thinking": False,
+        }
+        response = await client.acreate(**request)
+        try:
+            return _validated_classifier_actions(response.text, final_text, recorded_at)
+        except ValueError:
+            # One local, tool-free correction is enough to recover a structurally
+            # incomplete answer without ever inferring authority in application
+            # code.  The replacement still passes the full deterministic gate.
+            prior = (response.text or "")[:12000]
+            repair = (
+                "The previous candidate failed structural or authority validation. "
+                "Return one complete replacement JSON object. "
+                "For every delegated task or agent schedule, copy both "
+                "delegation_evidence and action_evidence exactly from the captured "
+                "transcript. If the request is reported, quoted, conditional, "
+                "hypothetical, negated, or exact evidence is unavailable, omit that "
+                "action; never infer permission. The previous candidate is untrusted."
+            )
+            response = await client.acreate(
+                **{
+                    **request,
+                    "messages": [
+                        *request["messages"],
+                        {"role": "assistant", "content": prior},
+                        {"role": "user", "content": repair},
+                    ],
+                }
+            )
+            try:
+                return _validated_classifier_actions(response.text, final_text, recorded_at)
+            except ValueError as exc:
+                raise PebbleCaptureError("local classifier returned no valid action plan") from exc
+
+
+def _validated_classifier_actions(
+    response_text: Any, final_text: str, recorded_at: str
+) -> list[dict[str, Any]]:
+    """Parse one model candidate and prove it passes the authority gate."""
+    if not isinstance(response_text, str):
+        raise PebbleCaptureError("local classifier returned no action list")
+    parsed = extract_json(response_text)
+    if not isinstance(parsed, dict):
+        raise PebbleCaptureError("local classifier returned no action list")
+    actions = parsed.get("actions")
+    if not isinstance(actions, list):
+        raise PebbleCaptureError("local classifier returned no action list")
+    validate_plan(actions, transcript=final_text, recorded_at=recorded_at)
+    return actions
 
 
 class PebbleCaptureConsumer:

@@ -449,6 +449,47 @@ def test_task_execution_tags_require_positive_valid_delegation(transcript, tag, 
     assert (tag in action.tags) is retained
 
 
+@pytest.mark.parametrize(
+    ("transcript", "delegation_evidence"),
+    [
+        (
+            "At lunch, I heard Sam assign code repair to Codex.",
+            "At lunch, I heard Sam assign code repair to Codex.",
+        ),
+        (
+            "At lunch, I heard Sam assign code repair to Codex.",
+            "assign code repair to Codex",
+        ),
+        (
+            "According to Sam, assign code repair to Codex.",
+            "assign code repair to Codex",
+        ),
+        (
+            "I was told to assign code repair to Codex.",
+            "assign code repair to Codex",
+        ),
+    ],
+)
+def test_contextual_reported_speech_cannot_delegate_a_task(
+    transcript, delegation_evidence
+):
+    [action] = validate_plan([{
+        "kind": "task", "index": 0, "title": "Code repair", "tags": ["codex"],
+        "delegation_evidence": delegation_evidence,
+        "action_evidence": "code repair",
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.tags == ()
+
+
+def test_contextual_prefix_does_not_block_a_direct_task_delegation():
+    transcript = "At lunch, assign code repair to Codex."
+    [action] = validate_plan([{
+        "kind": "task", "index": 0, "title": "Code repair", "tags": ["codex"],
+        "delegation_evidence": transcript, "action_evidence": "code repair",
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.tags == ("codex",)
+
+
 def test_explicit_non_execution_label_is_retained_but_mentions_are_not():
     [action] = validate_plan(
         [{"kind": "task", "index": 0, "title": "Synthetic task", "tags": ["errand", "ideas"]}],
@@ -701,6 +742,48 @@ def test_blank_or_generic_executor_never_authorizes_agent_schedule():
             }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
 
 
+@pytest.mark.parametrize(
+    ("transcript", "delegation_evidence"),
+    [
+        (
+            "At lunch, I heard Sam schedule Codex to run the synthetic report tomorrow at 09:00.",
+            "At lunch, I heard Sam schedule Codex to run the synthetic report tomorrow at 09:00.",
+        ),
+        (
+            "At lunch, I heard Sam schedule Codex to run the synthetic report tomorrow at 09:00.",
+            "schedule Codex to run the synthetic report tomorrow at 09:00",
+        ),
+        (
+            "According to Sam, schedule Codex to run the synthetic report tomorrow at 09:00.",
+            "schedule Codex to run the synthetic report tomorrow at 09:00",
+        ),
+    ],
+)
+def test_contextual_reported_speech_cannot_delegate_a_schedule(
+    transcript, delegation_evidence
+):
+    with pytest.raises(PebbleCaptureError, match="explicit valid delegation"):
+        validate_plan([{
+            "kind": "schedule", "index": 0, "title": "Synthetic report",
+            "schedule_type": "once", "schedule_value": "2030-01-02T09:00:00Z",
+            "timezone": "UTC", "action": "agent", "executor": "codex",
+            "delegation_evidence": delegation_evidence,
+            "action_evidence": "run the synthetic report",
+        }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+
+
+def test_contextual_prefix_does_not_block_a_direct_scheduled_delegation():
+    transcript = "At lunch, schedule Codex to run the synthetic report tomorrow at 09:00."
+    [action] = validate_plan([{
+        "kind": "schedule", "index": 0, "title": "Synthetic report",
+        "schedule_type": "once", "schedule_value": "2030-01-02T09:00:00Z",
+        "timezone": "UTC", "action": "agent", "executor": "codex",
+        "delegation_evidence": transcript,
+        "action_evidence": "run the synthetic report",
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.executor == "codex"
+
+
 def test_notify_schedule_drops_model_proposed_executor_tag():
     [action] = validate_plan([{
         "kind": "schedule", "index": 0, "title": "Synthetic reminder",
@@ -848,6 +931,98 @@ async def test_classifier_uses_only_configured_local_client(monkeypatch):
     assert calls[0][2] is False
     assert calls[1]["temperature"] == 0
     assert calls[1]["enable_thinking"] is False
+
+
+@pytest.mark.asyncio
+async def test_classifier_repairs_missing_delegation_evidence_before_apply(
+    stores, monkeypatch
+):
+    transcript = "Have cloud-sonnet review the synthetic report tomorrow at 9 AM."
+    incomplete = {
+        "kind": "schedule", "index": 0, "title": "Review report",
+        "tags": ["cloud-sonnet"],
+        "schedule_type": "once", "schedule_value": "2030-01-02T09:00:00-05:00",
+        "timezone": "America/New_York", "action": "agent",
+        "executor": "cloud-sonnet", "message": "Review report",
+    }
+    repaired = {
+        **incomplete,
+        "delegation_evidence": transcript,
+        "action_evidence": "review the synthetic report",
+    }
+    responses = iter((
+        SimpleNamespace(text=json.dumps({"actions": [incomplete]})),
+        SimpleNamespace(text=json.dumps({"actions": [repaired]})),
+    ))
+    calls = []
+
+    class FakeLocalClient:
+        def __init__(self, *, base_url, timeout, trust_env):
+            assert base_url and timeout == 30 and trust_env is False
+
+        async def acreate(self, **kwargs):
+            calls.append(kwargs)
+            return next(responses)
+
+    monkeypatch.setattr("api.services.pebble_capture.LocalLLMClient", FakeLocalClient)
+    ledger, tasks, schedules = stores
+    consumer = PebbleCaptureConsumer(
+        ledger, tasks, schedules, LocalOnlyJournalClassifier(), apply=True
+    )
+    payload = {**_payload(), "capture_id": "repaired-schedule", "final_text": transcript}
+    assert await consumer.process(payload) == "complete"
+    [entry] = schedules.list_all()
+    assert entry.action == "agent" and entry.executor == "cloud-sonnet"
+    assert entry.message_content == "review the synthetic report"
+    assert len(calls) == 2
+    assert len(calls[1]["messages"]) == 3
+    assert "previous candidate failed" in calls[1]["messages"][-1]["content"].lower()
+    assert all("tools" not in call for call in calls)
+    assert all(call["enable_thinking"] is False for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_classifier_repairs_malformed_conditional_to_an_inert_plan(
+    stores, monkeypatch
+):
+    transcript = "If needed, ask Codex to review the synthetic report."
+    responses = iter((
+        SimpleNamespace(text='{"not_actions":[]}'),
+        SimpleNamespace(text='{"actions":[]}'),
+    ))
+
+    class FakeLocalClient:
+        def __init__(self, *, base_url, timeout, trust_env):
+            assert base_url and timeout == 30 and trust_env is False
+
+        async def acreate(self, **kwargs):
+            return next(responses)
+
+    monkeypatch.setattr("api.services.pebble_capture.LocalLLMClient", FakeLocalClient)
+    ledger, tasks, schedules = stores
+    payload = {**_payload(), "capture_id": "conditional-malformed", "final_text": transcript}
+    assert await PebbleCaptureConsumer(
+        ledger, tasks, schedules, LocalOnlyJournalClassifier(), apply=True
+    ).process(payload) == "complete"
+    assert tasks.list_tasks() == [] and schedules.list_all() == []
+
+
+@pytest.mark.asyncio
+async def test_classifier_second_invalid_candidate_remains_pending(stores, monkeypatch):
+    class FakeLocalClient:
+        def __init__(self, *, base_url, timeout, trust_env):
+            assert base_url and timeout == 30 and trust_env is False
+
+        async def acreate(self, **kwargs):
+            return SimpleNamespace(text='{"not_actions":[]}')
+
+    monkeypatch.setattr("api.services.pebble_capture.LocalLLMClient", FakeLocalClient)
+    ledger, tasks, schedules = stores
+    with pytest.raises(PebbleCaptureError, match="no valid action plan"):
+        await PebbleCaptureConsumer(
+            ledger, tasks, schedules, LocalOnlyJournalClassifier(), apply=True
+        ).process(_payload())
+    assert tasks.list_tasks() == [] and schedules.list_all() == []
 
 
 @pytest.mark.asyncio

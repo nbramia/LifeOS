@@ -83,6 +83,9 @@ An untimed direct request such as "Ask Codex to review the synthetic login bug" 
 tags:["codex"], delegation_evidence, and action_evidence; it is never a schedule. Select schedule
 only when the source states a definite future time or recurrence, and include schedule_type,
 schedule_value, timezone, action, and message for every schedule.
+For "Have cloud-sonnet review the synthetic report tomorrow at 9 AM", an agent schedule must
+copy the full sentence into delegation_evidence and "review the synthetic report" into
+action_evidence. Never omit either evidence field from a delegated task or agent schedule.
 Conditional, hypothetical, or negated statements are
 not delegation. Never select email, calendar, shell, endpoint, prompt, or immediate execution.
 If an affected action is ambiguous, omit it; do not guess.
