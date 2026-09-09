@@ -1,8 +1,8 @@
 """Browser test for the /agents Graph tab — label
 precedence against a linked card's title, the lane colour legend, the
-five-engine shape legend, question/error/subagent badges, host columns,
+five-engine shape legend, question/error/subagent badges, timeline guides,
 the HTML hover card, synchronous click and double-click focus, zoom
-controls, and the simulation reheating on a size-only change.
+controls, and deterministic layout updates.
 
 Serves `web/` itself on an ephemeral port and stubs every `/api/` call —
 the same server-free pattern as `tests/test_agents_host_filter_ui_browser.py`
@@ -10,7 +10,7 @@ the same server-free pattern as `tests/test_agents_host_filter_ui_browser.py`
 (`browser and not requires_server`). `/agents` loads d3 from
 `https://d3js.org/d3.v7.min.js`, which is left unstubbed (real network),
 same as every other test in this family — hover, click, and collapse all
-need the real force simulation.
+need real D3 SVG rendering.
 """
 import http.server
 import json
@@ -95,7 +95,7 @@ CC_SUBAGENT = _row(
     session_id="cc:redesign-subagent", task_id="t-cc", routing="claude_code",
     source="claude_code", host="studio-host", label="cc:redesign-subagent",
     parent_session_id="cc:redesign-parent", is_subagent=True,
-    model_label="Claude Code", total_active_seconds=30, lane="in_progress",
+    model_label="Claude Code", total_active_seconds=30, status="ended", lane="done",
 )
 # Unlinked (no card) — `label` falls back to the raw session id, same as a
 # real ingest with no title; the node's actual name comes from
@@ -344,18 +344,18 @@ class TestBadges:
         assert text == "2"
 
 
-class TestHostColumns:
-    def test_host_column_headers_show_name_and_count(self, page: Page, agents_base_url):
+class TestDelegationTimeline:
+    def test_axes_have_explicit_semantics_and_no_host_columns(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)
-        texts = page.eval_on_selector_all(
-            "text.host-column-label", "els => els.map(e => e.textContent)"
-        )
-        assert "studio-host · 2" in texts
-        assert "build-host · 4" in texts
+        assert page.locator("text.host-column-label").count() == 0
+        guide_text = page.locator(".timeline-guides").text_content()
+        assert "EARLIER" in guide_text
+        assert "LATER" in guide_text
+        assert "ROOT" in guide_text
 
 
 class TestSubagentCollapse:
-    def test_subagent_hidden_by_default(self, page: Page, agents_base_url):
+    def test_completed_subagent_hidden_by_default(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)
         rows = _nodes(page)
         ids = {r["session_id"] for r in rows}
@@ -370,6 +370,18 @@ class TestSubagentCollapse:
             " return g.querySelector('.node-badge-children').textContent; }"
         )
         assert text == "+1"
+
+    def test_active_subagent_is_visible_at_the_next_depth(self, page: Page, agents_base_url):
+        active = dict(CC_SUBAGENT, status="running", lane="in_progress")
+        snapshot = {**SNAPSHOT, "sessions": [
+            active if row["session_id"] == active["session_id"] else row
+            for row in SNAPSHOT["sessions"]
+        ]}
+        _open_agents(page, agents_base_url, snapshot=snapshot)
+        depth = page.get_attribute(
+            '.node[data-depth="1"][data-timeline-order]', "data-depth"
+        )
+        assert depth == "1"
 
     def _badge_center(self, page: Page):
         return page.evaluate(
@@ -390,9 +402,8 @@ class TestSubagentCollapse:
         # Clicking the badge must not also open the side panel.
         expect(page.locator("#panel-empty")).to_be_visible()
 
-        # The simulation reheats on expand (the visible-id set changed) and
-        # may have moved the badge — recompute its position rather than
-        # reusing stale coordinates for the second click.
+        # Expansion re-renders the timeline, so recompute the badge position
+        # rather than reusing screen coordinates from the prior render.
         badge = self._badge_center(page)
         page.mouse.click(badge["x"], badge["y"])
         page.wait_for_timeout(300)
@@ -562,6 +573,8 @@ class TestClickAndDoubleClick:
         zoom, which is disabled."""
         focus_calls = []
         _open_agents(page, agents_base_url, focus_calls=focus_calls)
+        page.click("#graph-zoom-fit")
+        page.wait_for_timeout(400)
         k_before = float(page.get_attribute("#graph-svg", "data-zoom-k"))
         pos = page.evaluate(
             "() => { const g = [...document.querySelectorAll('.node')]"
@@ -609,11 +622,13 @@ class TestClickAndDoubleClick:
     def test_real_doubleclick_non_cli_node_opens_panel_and_does_not_zoom(self, page: Page, agents_base_url):
         focus_calls = []
         _open_agents(page, agents_base_url, focus_calls=focus_calls)
+        page.click("#graph-zoom-fit")
+        page.wait_for_timeout(400)
         k_before = float(page.get_attribute("#graph-svg", "data-zoom-k"))
         pos = page.evaluate(
             "() => { const g = [...document.querySelectorAll('.node')]"
             ".find(n => n.__data__.session_id === 'sess-local');"
-            " const box = g.getBoundingClientRect();"
+            " const box = g.querySelector('.node-shape').getBoundingClientRect();"
             " return { x: box.x + box.width / 2, y: box.y + box.height / 2 }; }"
         )
         page.mouse.dblclick(pos["x"], pos["y"])

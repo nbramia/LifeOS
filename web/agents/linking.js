@@ -186,8 +186,8 @@ export function takeBoardFocus() {
   return value;
 }
 
-// The `card_id` of whatever the graph currently has selected (a session or
-// a card anchor), or null when nothing selected has one — NOT a one-shot
+// The `card_id` of whatever graph session is currently selected, or null
+// when nothing selected has one — NOT a one-shot
 // intent like `requestBoardFocus`/`takeBoardFocus` above, since it must
 // still answer correctly however many times the operator switches tabs.
 // `graph.js` updates it on every selection change; `board.js` reads it when

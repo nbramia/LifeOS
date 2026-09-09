@@ -694,7 +694,7 @@ export function initBoard() {
       return;
     }
     // No explicit chip/URL intent pending — if the graph currently has a
-    // card selected (a session or card anchor carrying a `card_id`),
+    // card-linked session selected,
     // activating the board tab reveals that card too, without requiring the
     // panel's own "Show on board" button click. That button stays as a
     // separate, explicit way to do the same thing.

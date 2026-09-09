@@ -1,14 +1,13 @@
-"""Browser test for linking the /agents Board and Graph tabs: card
-clusters on the graph, cross-tab jumps in both directions, URL deep links,
-shared persistent filters, and the card-anchor pending-question badge with
-its inline Answer form.
+"""Browser test for linking the /agents Board and Graph tabs: session card
+metadata, cross-tab jumps in both directions, URL deep links, shared
+persistent filters, and session-level pending-question actions.
 
 Serves `web/` itself on an ephemeral port and stubs every `/api/` call — the
 same server-free pattern as `tests/test_agents_graph_redesign_ui_browser.py`
 — so this carries no `requires_server` marker and runs at pre-push
 (`browser and not requires_server`). d3 loads from the real
 `https://d3js.org/d3.v7.min.js` (left unstubbed, same as the redesign
-suite), since clustering and node selection need the real force simulation.
+suite), since node selection and timeline rendering need real D3.
 """
 import http.server
 import json
@@ -50,9 +49,8 @@ def agents_base_url():
 
 # ---------------------------------------------------------------------------
 # Fixtures — three sessions sharing one card ("t-cluster"), one session with
-# no card (attaches to its host anchor), and one card whose one session
-# carries an open pending question ("t-question", its own single-session
-# card anchor). The board fixture's two task cards are the `_task_card`-
+# no card, and one card whose session carries an open pending question. The
+# board fixture's two task cards are the `_task_card`-
 # shaped view of the same two cards, each embedding its own most-recently-
 # active session — the snapshot and board fixtures describe the same world
 # from the graph's and the board's own angle, as the real API does.
@@ -216,53 +214,32 @@ def _nodes(page: Page):
     )
 
 
-def _anchors(page: Page):
-    return page.evaluate(
-        "() => Array.from(document.querySelectorAll('.anchor')).map(el => ({"
-        "id: el.__data__.id, kind: el.__data__.anchor_kind, card_id: el.__data__.card_id,"
-        "label: el.querySelector('.anchor-label').textContent,"
-        "}))"
-    )
-
-
-class TestClustering:
-    def test_three_sessions_on_one_card_render_one_anchor_with_the_card_title(self, page: Page, agents_base_url):
+class TestTopology:
+    def test_cards_and_hosts_are_metadata_not_nodes(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)
         _go_to_graph(page)
-        anchors = _anchors(page)
-        card_anchors = [a for a in anchors if a["kind"] == "card" and a["card_id"] == "t-cluster"]
-        assert len(card_anchors) == 1, anchors
-        assert card_anchors[0]["label"] == CLUSTER_TITLE
+        assert page.locator(".anchor").count() == 0
+        assert page.locator("path.link-anchor").count() == 0
+        assert page.locator("text.host-column-label").count() == 0
 
-    def test_three_sessions_on_one_card_all_link_to_its_anchor(self, page: Page, agents_base_url):
+    def test_card_link_remains_on_session_data(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)
         _go_to_graph(page)
-        anchor_ids = {a["id"] for a in _anchors(page)}
-        linked = page.evaluate(
-            "() => Array.from(document.querySelectorAll('path.link-anchor')).map(el => "
-            "({source: (el.__data__.source.session_id || el.__data__.source),"
-            "  target: (el.__data__.target.session_id || el.__data__.target)}))"
+        card = page.evaluate(
+            "() => [...document.querySelectorAll('.node')]"
+            ".find(el => el.__data__.session_id === 'sess-cluster-1').__data__.card_id"
         )
-        cluster_ids = {"sess-cluster-1", "sess-cluster-2", "cc:cluster-3"}
-        targets = {edge["target"] for edge in linked if edge["source"] in cluster_ids}
-        assert targets == {"card:t-cluster"}, linked
-        # A link's own target string is not enough on its own — it must name
-        # an anchor that's actually rendered, not a dangling id nothing in
-        # the anchor layer answers to.
-        assert targets <= anchor_ids, (targets, anchor_ids)
+        assert card == "t-cluster"
 
-    def test_session_with_no_card_attaches_to_its_host_anchor(self, page: Page, agents_base_url):
-        _open_agents(page, agents_base_url)
+    def test_host_remains_filterable(self, page: Page, agents_base_url):
+        sessions = [dict(row) for row in SNAPSHOT["sessions"]]
+        sessions[2]["host"] = "studio-host"
+        _open_agents(page, agents_base_url, snapshot={**SNAPSHOT, "sessions": sessions})
         _go_to_graph(page)
-        anchors = _anchors(page)
-        host_anchors = [a for a in anchors if a["kind"] == "host"]
-        assert any(a["label"] == "build-host" for a in host_anchors), anchors
-        linked_to_host = page.evaluate(
-            "() => { const l = Array.from(document.querySelectorAll('path.link-anchor'))"
-            ".find(el => (el.__data__.source.session_id || el.__data__.source) === 'sess-unlinked');"
-            " return l ? (l.__data__.target.session_id || l.__data__.target) : null; }"
-        )
-        assert linked_to_host == "host:build-host"
+        page.select_option("#filter-host", "build-host")
+        assert set(_nodes(page)) == {
+            "sess-cluster-1", "sess-cluster-2", "sess-unlinked", "sess-question"
+        }
 
 
 class TestCardChipToGraph:
@@ -421,14 +398,14 @@ class TestSharedFilters:
         assert page.input_value("#board-filter-tag") == ""
 
 
-class TestAnchorPendingQuestionBadgeAndAnswer:
-    def test_card_anchor_with_pending_question_renders_the_badge(self, page: Page, agents_base_url):
+class TestPendingQuestionBadgeAndAnswer:
+    def test_session_with_pending_question_renders_the_badge(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)
         _go_to_graph(page)
         display = page.evaluate(
-            "() => { const a = [...document.querySelectorAll('.anchor')]"
-            ".find(n => n.__data__.card_id === 't-question');"
-            " const b = a.querySelector('.anchor-badge-question');"
+            "() => { const a = [...document.querySelectorAll('.node')]"
+            ".find(n => n.__data__.session_id === 'sess-question');"
+            " const b = a.querySelector('.node-badge-question');"
             " return b ? getComputedStyle(b).display : null; }"
         )
         assert display != "none"
@@ -439,17 +416,17 @@ class TestAnchorPendingQuestionBadgeAndAnswer:
         _go_to_graph(page)
         page.evaluate(
             """() => {
-                const a = [...document.querySelectorAll('.anchor')]
-                  .find(n => n.__data__.card_id === 't-question');
+                const a = [...document.querySelectorAll('.node')]
+                  .find(n => n.__data__.session_id === 'sess-question');
                 a.dispatchEvent(new MouseEvent('click', { bubbles: true }));
             }"""
         )
         page.wait_for_timeout(300)
-        answerBtn = page.locator('#graph-panel-actions [data-action="answer"]')
+        answerBtn = page.locator('#panel [data-action="answer"]')
         expect(answerBtn).to_be_visible()
         answerBtn.click()
-        page.fill("#graph-panel-actions textarea", "Yes, proceed.")
-        page.click("#graph-panel-actions .graph-panel-answer-form button")
+        page.fill("#answer-text", "Yes, proceed.")
+        page.click("#answer-send")
         page.wait_for_timeout(400)
         assert len(answer_calls) == 1
         assert answer_calls[0] == {"answer": "Yes, proceed."}
