@@ -36,7 +36,11 @@ if TYPE_CHECKING:
 
 from api.services.agent_worker.completion_signal import has_positive_completion_signal
 from api.services.agent_worker.assignment import extract_assignment
-from api.services.agent_board import AGENT_ASSIGNEES as _BOARD_AGENT_ASSIGNEES
+from api.services.agent_board import (
+    AGENT_ASSIGNEES as _BOARD_AGENT_ASSIGNEES,
+    AGENT_PICKUP_TAGS,
+    MANAGED_AGENT_ASSIGNEES,
+)
 from api.services.agent_worker.preflight import (
     ROUTE_ASK,
     ROUTE_CLAUDE,
@@ -407,10 +411,7 @@ AGENT_PICKUP_STATUSES = ("todo", "urgent")
 # (not board assignees, but valid executors on scheduled / tagged work).
 # Board assignees are imported so the board vocabulary and pickup set cannot
 # drift. Bare `#agent` remains pickupable alongside engine/consent tags.
-_MANAGED_AGENTS_CONSENT_TAGS = ("cloud-haiku", "cloud-sonnet")
-AGENT_PICKUP_TAGS: tuple[str, ...] = (
-    (AGENT_TAG,) + tuple(_BOARD_AGENT_ASSIGNEES) + _MANAGED_AGENTS_CONSENT_TAGS
-)
+_MANAGED_AGENTS_CONSENT_TAGS = MANAGED_AGENT_ASSIGNEES
 _AGENT_ASSIGNEE_SET = frozenset(_BOARD_AGENT_ASSIGNEES)
 _CONSENT_TAG_SET = frozenset(_MANAGED_AGENTS_CONSENT_TAGS)
 _PICKUP_TAG_SET = frozenset(AGENT_PICKUP_TAGS)

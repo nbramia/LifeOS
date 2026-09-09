@@ -32,6 +32,7 @@ from typing import Callable, Optional
 
 from config.settings import settings
 from api.services.atomic_write import atomic_write_text, atomic_write_lines
+from api.services.operation_lock import exclusive_operation_lock
 
 logger = logging.getLogger(__name__)
 
@@ -302,6 +303,7 @@ class TaskManager:
         reminder_id: Optional[str] = None,
         notes: Optional[str] = None,
         fields: Optional[dict[str, str]] = None,
+        _log_content: bool = True,
     ) -> Task:
         """Create a new task at the top of its context file, update index.
 
@@ -347,8 +349,74 @@ class TaskManager:
             self._reposition_file(file_path)
             self._save_index()
             self._write_dashboard()
-            logger.info(f"Created task {task.id}: {description}")
+            if _log_content:
+                logger.info(f"Created task {task.id}: {description}")
+            else:
+                logger.info("Created task %s for an external operation", task.id)
             return task
+
+    def create_or_find_by_operation(
+        self,
+        operation_key: str,
+        *,
+        description: str,
+        context: str = "Inbox",
+        status: str = "todo",
+        priority: str = "",
+        due_date: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        notes: Optional[str] = None,
+        fields: Optional[dict[str, str]] = None,
+    ) -> tuple[Task, bool]:
+        """Atomically find or create a task for a durable source operation.
+
+        The key is stored in Markdown, rather than only in the rebuildable
+        index.  A caller which crashes after the Markdown commit but before
+        acknowledging its own ledger can therefore retry without creating a
+        second task.  This deliberately does not recreate a task once the
+        caller has acknowledged a later user deletion; that policy belongs to
+        the caller's ledger, not this primitive.
+        """
+        if not operation_key:
+            raise ValueError("operation_key must not be empty")
+        with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
+            # Markdown is authoritative.  A previous writer can have
+            # committed it and died before refreshing this instance's cache,
+            # so never let an in-memory miss create a duplicate operation.
+            self.rebuild_index()
+            for task in self._tasks.values():
+                if task.fields.get("operation_key") == operation_key:
+                    return task, False
+            merged_fields = dict(fields or {})
+            if "operation_key" in merged_fields and merged_fields["operation_key"] != operation_key:
+                raise ValueError("fields.operation_key must match operation_key")
+            merged_fields["operation_key"] = operation_key
+            # ``create`` shares this reentrant write guard, including its
+            # Markdown CAS and index refresh, so lookup and creation cannot
+            # race another local source-operation writer.
+            return self.create(
+                description=description,
+                context=context,
+                status=status,
+                priority=priority,
+                due_date=due_date,
+                tags=tags,
+                notes=notes,
+                fields=merged_fields,
+                _log_content=False,
+            ), True
+
+    def find_by_operation(self, operation_key: str) -> Optional[Task]:
+        """Find an operation in authoritative Markdown without creating it."""
+        if not operation_key:
+            raise ValueError("operation_key must not be empty")
+        with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
+            self.rebuild_index()
+            return next(
+                (task for task in self._tasks.values()
+                 if task.fields.get("operation_key") == operation_key),
+                None,
+            )
 
     def get(self, task_id: str) -> Optional[Task]:
         return self._tasks.get(task_id)

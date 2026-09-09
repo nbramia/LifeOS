@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from api.services import human_queue
-from api.services.agent_board import AGENT_ASSIGNEES
+from api.services.agent_board import AGENT_PICKUP_TAGS
 from api.services.agent_worker.session_store import SessionStore
 from api.services.task_manager import get_task_manager, Task, TaskConflictError, VALID_STATUSES
 
@@ -21,7 +21,7 @@ router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 # Same claim vocabulary the worker fans out on (engine assignees + Managed
 # Agents consent tags). dry_run previews only when the create would be
 # worker-claimable.
-_AGENT_PICKUP_TAGS = frozenset(("agent", *AGENT_ASSIGNEES, "cloud-haiku", "cloud-sonnet"))
+_AGENT_PICKUP_TAGS = frozenset(AGENT_PICKUP_TAGS)
 _AGENT_CLAIM_EXCLUSION_TAGS = frozenset({
     "agent-running", "agent-blocked", "agent-completed",
     "agent-failed", "agent-budget-exceeded",

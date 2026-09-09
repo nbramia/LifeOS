@@ -622,6 +622,20 @@ class TestRemoteProviderConfig:
         assert client.sync_client.headers["authorization"] == "Bearer fw_test_key"
         assert client.async_client.headers["authorization"] == "Bearer fw_test_key"
 
+    def test_explicit_trust_env_false_reaches_both_http_clients(self):
+        from unittest.mock import patch
+        from api.services.llm_client import LocalLLMClient
+
+        with patch("api.services.llm_client.httpx.Client") as sync_cls, \
+                patch("api.services.llm_client.httpx.AsyncClient") as async_cls:
+            sync_cls.return_value.is_closed = False
+            async_cls.return_value.is_closed = False
+            client = LocalLLMClient(base_url="http://127.0.0.1:8080", trust_env=False)
+            _ = client.sync_client
+            _ = client.async_client
+        assert sync_cls.call_args.kwargs["trust_env"] is False
+        assert async_cls.call_args.kwargs["trust_env"] is False
+
     def test_create_sends_configured_model(self):
         from api.services.llm_client import LocalLLMClient
         client = LocalLLMClient(base_url="http://fake:8080", model="accounts/fireworks/models/x")

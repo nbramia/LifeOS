@@ -45,6 +45,7 @@ if os.environ.get("LIFEOS_TEST_INSTANCE") != "1":
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
+import asyncio
 import hashlib
 import logging
 import socket
@@ -90,6 +91,7 @@ _reminder_scheduler = None
 _scheduler_watcher = None
 _job_queue = None
 _task_watcher = None
+_pebble_capture_watcher = None
 
 # Health monitoring (previously _health_check_loop) is now an out-of-band
 # watcher in nbramia/local-processing that polls /health/raw-state. Moving it
@@ -133,7 +135,7 @@ def check_server_host_guard() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown."""
-    global _calendar_indexer, _telegram_listeners, _reminder_scheduler, _scheduler_watcher, _job_queue, _task_watcher
+    global _calendar_indexer, _telegram_listeners, _reminder_scheduler, _scheduler_watcher, _job_queue, _task_watcher, _pebble_capture_watcher
 
     # Startup: refuse to run a second server on a non-designated machine (#506).
     # Deliberately not wrapped in try/except — unlike the best-effort blocks
@@ -219,6 +221,33 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Failed to start task file watcher: {e}")
 
+        # Pebble archive consumer is deliberately separate from native Journal
+        # capture.  The producer retains ownership of LifeOS/Log/Pebble and this
+        # watcher only reads validated frames; effect writes stay disabled by
+        # default until dry-run validation is complete.
+        if settings.pebble_capture_enabled:
+            try:
+                from api.services.pebble_capture import CaptureLedger, PebbleCaptureConsumer
+                from api.services.pebble_capture_watcher import PebbleCaptureWatcher
+                from api.services.scheduler_store import get_scheduler_store
+                from api.services.task_manager import get_task_manager
+                capture_dir = (settings.vault_path / settings.pebble_capture_dir).resolve()
+                if capture_dir.parent != (settings.vault_path / "LifeOS" / "Log").resolve():
+                    raise ValueError("Pebble capture directory must be LifeOS/Log/Pebble")
+                ledger = CaptureLedger(Path("data") / "pebble_capture.db")
+                consumer = PebbleCaptureConsumer(
+                    ledger, get_task_manager(), get_scheduler_store(), apply=settings.pebble_capture_apply,
+                )
+                _pebble_capture_watcher = PebbleCaptureWatcher(
+                    capture_dir, consumer, scan_seconds=settings.pebble_capture_scan_seconds,
+                )
+                # Observer setup may touch a network-backed vault. Keep even that
+                # bounded filesystem work off FastAPI's event loop; startup
+                # recovery itself is queued onto the watcher's consumer thread.
+                await asyncio.to_thread(_pebble_capture_watcher.start)
+            except Exception as e:
+                logger.error(f"Failed to start Pebble capture watcher: {e}")
+
         # Startup: Background prefetch for /agents session summaries — so the
         # graph already shows real short labels by the time the operator looks.
         try:
@@ -285,6 +314,10 @@ async def lifespan(app: FastAPI):
     if _task_watcher:
         _task_watcher.stop()
         logger.info("Task file watcher stopped")
+    if _pebble_capture_watcher:
+        # stop() waits for the sole active consumer and cancels queued paths.
+        await asyncio.to_thread(_pebble_capture_watcher.stop)
+        logger.info("Pebble capture watcher stopped")
 
     if _job_queue:
         _job_queue.stop_worker()
@@ -480,6 +513,9 @@ async def health_check():
         # unconditionally, and previously had no liveness signal of its own
         # (#766).
         "scheduler_watcher": _scheduler_watcher.is_alive() if _scheduler_watcher else False,
+        "pebble_capture_watcher": (
+            _pebble_capture_watcher.is_alive() if _pebble_capture_watcher else not settings.pebble_capture_enabled
+        ),
     }
 
     all_healthy = all(checks.values())

@@ -36,6 +36,13 @@ ACCEPTED_TAG = "accepted"
 # it claimable by the worker — see agent-worker claim pickup.
 ASSIGNEE_TAGS: tuple[str, ...] = ("me", "claude", "codex", "hermes", "local", "cloud")
 AGENT_ASSIGNEES: tuple[str, ...] = ("claude", "codex", "hermes", "local", "cloud")
+# Execution-capable sub-tags are not board lanes, but they are valid explicit
+# task/schedule handoffs. Keep this shared with the worker, task API, and
+# bounded capture consumers so a renamed route cannot leave a stale local
+# allowlist that silently grants or drops execution authority.
+MANAGED_AGENT_ASSIGNEES: tuple[str, ...] = ("cloud-haiku", "cloud-sonnet")
+AGENT_EXECUTOR_TAGS: tuple[str, ...] = (*AGENT_ASSIGNEES, *MANAGED_AGENT_ASSIGNEES)
+AGENT_PICKUP_TAGS: tuple[str, ...] = ("agent", *AGENT_EXECUTOR_TAGS)
 
 LANES: tuple[str, ...] = (
     "unassigned",

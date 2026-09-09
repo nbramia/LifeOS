@@ -13,6 +13,7 @@ This directory contains operational guides — how to set up, configure, and run
 - `personas.md` — Personas: what they are, the built-ins, and creating your own
 - `launchd-setup.md` — macOS launchd service configuration
 - `scheduler.md` — Scheduler (triggers + actions): cron/one-off, notify/prompt/endpoint/agent
+- `pebble-capture.md` — Pebble framed-capture recovery and filing controls
 - `scripts.md` — Available scripts and their usage
 - `apple-health.md` — Apple Health/Fitness ingestion (HealthBridge app + iOS Shortcut fallback)
 - `operations.md` — Operational reference: Apple Data Agent, Monarch re-auth, perf-trace commands, alerting

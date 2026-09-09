@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "kind": "result",
+  "capture_id": "example-capture-pending-001",
+  "revision": 2,
+  "recorded_at_utc": "2026-09-09T14:15:00+00:00",
+  "received_at_utc": "2026-09-09T14:16:00+00:00",
+  "source": {"id": "synthetic-ring", "client": "ring", "trigger": "button"},
+  "status": "ready",
+  "availability": {"audio": true, "pebble_text": true},
+  "pebble_text": "Buy synthetic printer paper.",
+  "audio": {
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "reference": "/private/synthetic-pending.m4a",
+    "content_type": "audio/mp4"
+  },
+  "provenance": {"receipt": "durable", "raw_stt": "durable", "interpretation": "complete"},
+  "whisper_raw": "Buy synthetic printer paper.",
+  "whisper_polished": null,
+  "final_text": "Buy synthetic printer paper.",
+  "comparison": "equivalent",
+  "reconciliation": {
+    "status": "ready",
+    "selected_source": "pebble",
+    "disputed_spans": [],
+    "action_eligible": true
+  },
+  "models": {
+    "engine": {"backend": "synthetic", "model": "synthetic"},
+    "reconciliation": {"provider": "local-openai-compatible", "model": "synthetic"}
+  }
+}
