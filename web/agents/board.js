@@ -132,6 +132,63 @@ export function initBoard() {
   let openCardLane = null;
   let openCardSnapshot = null;  // last card object the drawer was fully rendered from
   let panel = null;  // SessionPanel for the drawer's linked-session transcript
+  let assignmentHandle = null;  // renderAssignmentPickers()'s return value for the open drawer, or null
+
+  // A card snapshot older than an in-flight picker save re-seeds the
+  // model/effort/host pickers with the pre-save value on remount -- a
+  // drawer rebuild must not run while one of the open card's own picker
+  // saves hasn't settled yet.
+  function assignmentSaveInFlight() {
+    return !!(assignmentHandle && assignmentHandle.isSaving && assignmentHandle.isSaving());
+  }
+
+  // A focused TEXTAREA or text INPUT inside the drawer holds uncommitted
+  // keystrokes a `renderDrawer` innerHTML replacement would destroy.
+  // `captureFocusedTextField` snapshots its identity (`data-field`), value,
+  // and selection range immediately before such a repaint, and
+  // `restoreFocusedTextField` puts them back into the rebuilt drawer's
+  // matching control afterward. The old control's own `blur` still fires
+  // during the replacement, so its normal save handler runs with the typed
+  // value -- this only restores the on-screen state, it never suppresses a
+  // save. If the rebuilt drawer carries no control for the same field (the
+  // card's shape changed), restoring is skipped.
+  function captureFocusedTextField() {
+    const active = document.activeElement;
+    if (!active || !drawerEl || !drawerEl.contains(active)) return null;
+    if (active.tagName !== 'TEXTAREA' && active.tagName !== 'INPUT') return null;
+    const field = active.dataset.field;
+    if (!field) return null;
+    return {
+      field, value: active.value,
+      selectionStart: active.selectionStart, selectionEnd: active.selectionEnd,
+    };
+  }
+
+  function restoreFocusedTextField(captured) {
+    if (!captured || !drawerEl) return;
+    const el = drawerEl.querySelector(`[data-field="${captured.field}"]`);
+    if (!el || (el.tagName !== 'TEXTAREA' && el.tagName !== 'INPUT')) return;
+    el.value = captured.value;
+    if (typeof el.setSelectionRange === 'function') {
+      el.setSelectionRange(captured.selectionStart, captured.selectionEnd);
+    }
+    el.focus();
+  }
+
+  // Repaints the drawer's editable fields (including the model/effort/host
+  // pickers) for `cardId` from the board state already applied to `board`,
+  // preserving a focused text control's in-progress edit across the
+  // repaint. A card id that doesn't match the open drawer -- closed, or
+  // switched to another card -- is dropped.
+  function attemptDrawerRebuild(cardId) {
+    if (openCardId !== cardId) return;
+    const captured = captureFocusedTextField();
+    const f = findCard(cardId);
+    if (!f) return;
+    renderDrawer(f);
+    openCardSnapshot = f;
+    restoreFocusedTextField(captured);
+  }
 
   // ------------------------------------------------------------------
   // Data load + live updates
@@ -203,7 +260,7 @@ export function initBoard() {
       f => JSON.stringify(prev[f]) !== JSON.stringify(fresh[f])
     ) || prevPendingId !== freshPendingId || prevSessionStatus !== freshSessionStatus;
     const focused = !!(drawerEl && drawerEl.contains(document.activeElement));
-    if ((fieldsChanged || !sessionUnchanged) && !focused) {
+    if ((fieldsChanged || !sessionUnchanged) && !focused && !assignmentSaveInFlight()) {
       renderDrawer(fresh);
       // Only advance the snapshot on the branch that actually rendered —
       // otherwise a frame skipped because the drawer had focus is treated
@@ -910,6 +967,7 @@ export function initBoard() {
 
   function renderDrawer(card) {
     if (!drawerEl) return;
+    assignmentHandle = null;
     const isTask = card.kind === 'task';
     // The Tags field never shows an assignee tag OR a worker lifecycle
     // tag as an editable token — both are managed elsewhere (the
@@ -1040,6 +1098,11 @@ export function initBoard() {
     const assigneeEl = drawerEl.querySelector('[data-field="assignee"]');
     assigneeEl.addEventListener('change', async () => {
       const value = assigneeEl.value;
+      // Captured immediately, ahead of `moveCard`'s own `fetchBoard()`
+      // possibly running `updateOpenDrawer` -> `renderDrawer`, which
+      // would otherwise reset `assignmentHandle` to null ahead of the
+      // wait below on the save this handler actually started with.
+      const handle = assignmentHandle;
       try {
         await moveCard(card.id, value ? 'assigned' : 'unassigned', value || undefined);
         // moveCard already awaited fetchBoard(), so the board's own state is
@@ -1048,16 +1111,45 @@ export function initBoard() {
         // which a native <select> keeps after a change event. Re-render
         // explicitly so the model/effort/host pickers and the Open button
         // reflect the new assignee immediately, not only once focus leaves
-        // the drawer (#859 review round 1 finding 1).
-        const fresh = findCard(card.id);
-        if (fresh) { renderDrawer(fresh); openCardSnapshot = fresh; }
+        // the drawer.
+        //
+        // A picker save still in flight when the assignee change resolves
+        // must not have its snapshot re-seeded by this rebuild — and
+        // neither must a picker save the operator starts while this
+        // rebuild is still waiting. `whenIdle()` reads `handle`'s current
+        // save chain each time it's called, so re-checking `isSaving()`
+        // after every fetch and calling `whenIdle()` again keeps the wait
+        // going until no save is outstanding, however many queue up in the
+        // meantime.
+        //
+        // The rebuild paints exactly once, as soon as the wait above
+        // settles, whether or not a text control inside the drawer holds
+        // focus — `attemptDrawerRebuild` preserves that control's
+        // in-progress edit across the repaint rather than blocking on it,
+        // so the model/effort/host pickers and the Open button never sit
+        // stuck on the old assignee's chrome waiting for the operator to
+        // leave a text field first. `attemptDrawerRebuild` also drops the
+        // paint outright if the drawer isn't currently showing this card:
+        // it can sit closed, or open on a different card, by the time this
+        // settles.
+        const rebuild = () => attemptDrawerRebuild(card.id);
+        const settleThenRebuild = () => handle.whenIdle().then(() => fetchBoard()).then(() => {
+          if (handle.isSaving && handle.isSaving()) return settleThenRebuild();
+          rebuild();
+        }).catch(() => {});
+        if (handle && handle.isSaving && handle.isSaving()) {
+          settleThenRebuild();
+        } else {
+          rebuild();
+        }
       } catch (err) {
         // moveCard already toasted the failure and nothing was persisted —
-        // re-render the drawer from the still-current card so the select
-        // snaps back to the actual assignee instead of showing the
-        // rejected choice (#850 finding 9).
+        // only the Assignee select is wrong, so snap it back directly to
+        // the card's actual assignee instead of rebuilding the whole
+        // drawer (which would re-seed the pickers from a stale snapshot
+        // while a picker save is still in flight).
         const fresh = findCard(card.id);
-        if (fresh) renderDrawer(fresh);
+        assigneeEl.value = (fresh || card).assignee || '';
       }
     });
 
@@ -1115,7 +1207,7 @@ export function initBoard() {
     // module's engine row to avoid a second, conflicting assignee control.
     const assignmentEl = drawerEl.querySelector('[data-field="assignment"]');
     if (assignmentEl) {
-      renderAssignmentPickers(assignmentEl, card, {
+      assignmentHandle = renderAssignmentPickers(assignmentEl, card, {
         putTask,
         onSaved: () => fetchBoard(),
         onError: (message) => { if (message) showToast(`Couldn't save assignment: ${message}`, true); },
@@ -1470,8 +1562,8 @@ export function initBoard() {
       // action button before its mouseup) still sees `activeElement` as
       // <body> for an instant. relatedTarget is the element receiving
       // focus — populated for an intra-drawer move, null when blur() sends
-      // focus to <body> — so only flush once focus has actually left the
-      // drawer (#850 round-3 finding 1).
+      // focus to <body> — so only flush the full drawer update once focus
+      // has actually left the drawer.
       if (e.relatedTarget && drawerEl.contains(e.relatedTarget)) return;
       if (!openCardId) return;
       const fresh = findCard(openCardId);

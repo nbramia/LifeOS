@@ -1177,6 +1177,72 @@ def test_successful_host_change_sticks_and_rides_along_on_next_save(page: Page, 
     assert host_select.input_value() == "laptop"
 
 
+def test_newer_choice_on_same_control_survives_a_rejected_earlier_save(page: Page, web_base_url):
+    """AC1: a save in flight that ends up rejected must not clobber a
+    newer choice the operator made on the SAME control while it was in
+    flight. The newer choice survives the revert and is sent on its own
+    through the serialized chain -- it must not be silently discarded, and
+    the rejection must not surface more than the one error it actually
+    caused."""
+
+    def api_handler(route):
+        if "/api/agents/hosts" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+        elif "/api/agents/models" in route.request.url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
+        else:
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+    _load_module(page, web_base_url, api_handler=api_handler)
+    page.evaluate(
+        """(card) => {
+            const container = document.createElement('div');
+            container.id = 'test-assignment-container';
+            document.body.appendChild(container);
+            window.__lastCalls = [];
+            window.__errorCalls = [];
+            window.__renderAssignmentPickers(container, card, {
+                putTask: (id, patch) => {
+                    window.__lastCalls.push({ id, patch });
+                    return new Promise((resolve, reject) => {
+                        const host = patch.fields.host;
+                        // The first send (studio-box) is held 200ms and
+                        // then rejected -- long enough for the operator's
+                        // second choice to land well inside its flight
+                        // time. The second send (whatever it is) resolves
+                        // quickly.
+                        setTimeout(() => {
+                            if (host === 'studio-box') reject(new Error('studio-box is unreachable'));
+                            else resolve({ id, ...patch });
+                        }, host === 'studio-box' ? 200 : 20);
+                    });
+                },
+                onError: (message) => { window.__errorCalls.push(message); },
+            });
+        }""",
+        {"id": "t53", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {"host": "laptop", "effort": "medium"}},
+    )
+    host_select = page.locator("#test-assignment-container [data-field='host']")
+    error_el = page.locator("#test-assignment-container [data-field='error']")
+    expect(host_select.locator("option")).to_have_count(1 + len(_HOST_CATALOG["hosts"]))  # wait for the catalog
+
+    host_select.select_option("studio-box")  # save 1: sent, held 200ms, then rejected
+    host_select.select_option("mystery-box")  # made while save 1 is still in flight, queued behind it
+    page.wait_for_function("() => window.__lastCalls.length === 2")  # both saves have settled
+
+    # The newer choice made while save 1 was in flight survives the
+    # revert -- not overwritten back to "laptop" (the value save 1 would
+    # have reverted to had nothing changed since) -- and save 2 (queued
+    # behind save 1, running once it settles) lands and succeeds, which
+    # is also what clears the error save 1's rejection raised.
+    expect(host_select).to_have_value("mystery-box")
+    expect(error_el).to_be_hidden()
+    calls = page.evaluate("() => window.__lastCalls")
+    assert [c["patch"]["fields"]["host"] for c in calls] == ["studio-box", "mystery-box"]
+    error_calls = page.evaluate("() => window.__errorCalls")
+    assert error_calls == ["studio-box is unreachable"]  # exactly one error, for the rejection -- not two
+
+
 def test_failed_host_fetch_shows_unavailable_option_never_selectable(page: Page, web_base_url):
     """R7: a failed (or R6-cooldown-skipped) `/api/agents/hosts` fetch
     must tell the operator the registry itself failed to load -- not look
