@@ -57,17 +57,23 @@ class TestCrmMappings:
         assert mappings is not None
         assert isinstance(mappings, dict)
 
-    def test_has_domain_mappings(self):
-        """CRM mappings should have domain_mappings section when configured."""
-        from pathlib import Path
+    def test_has_domain_mappings(self, tmp_path, monkeypatch):
+        """CRM mappings should have a domain_mappings section."""
+        import config.crm_config as crm_config
 
-        from config.crm_config import get_mappings
-
-        if not (Path("config") / "crm_mappings.yaml").exists():
-            pytest.skip("crm_mappings.yaml not configured (expected for open-source)")
-
-        mappings = get_mappings()
-        assert "domain_mappings" in mappings
+        synthetic = tmp_path / "crm_mappings.yaml"
+        synthetic.write_text("domain_mappings:\n  example.com:\n    context: Work\n", encoding="utf-8")
+        monkeypatch.setattr(crm_config, "MAPPINGS_FILE", synthetic)
+        crm_config.reload_config()
+        try:
+            mappings = crm_config.get_mappings()
+            # Assert the exact synthetic mapping was loaded, not merely
+            # that a domain_mappings key exists -- a broken loader could
+            # otherwise satisfy a bare key-presence check via some
+            # unrelated fallback value.
+            assert mappings["domain_mappings"] == {"example.com": {"context": "Work"}}
+        finally:
+            crm_config.reload_config()
 
 
 @pytest.mark.unit
@@ -102,19 +108,27 @@ class TestSettingsStructure:
 class TestPeopleDictionary:
     """Tests for People Dictionary structure (if loaded)."""
 
-    def test_structure_if_exists(self):
-        """If people dictionary exists, verify its structure."""
+    def test_structure_if_exists(self, tmp_path, monkeypatch):
+        """Verify people dictionary structure through the real loader."""
         import json
-        from pathlib import Path
 
-        dict_path = Path("config/people_dictionary.json")
-        if not dict_path.exists():
-            pytest.skip("People dictionary not configured (expected for open-source)")
+        import api.services.people as people_module
 
-        with open(dict_path) as f:
-            data = json.load(f)
+        dict_path = tmp_path / "people_dictionary.json"
+        synthetic = {
+            "Alex Chen": {"aliases": ["Al Chen"], "category": "work"},
+            "Sam Rivera": {"category": "family"},
+        }
+        dict_path.write_text(json.dumps(synthetic), encoding="utf-8")
+        monkeypatch.setattr(people_module, "PEOPLE_DICTIONARY_PATH", dict_path)
 
-        assert isinstance(data, dict)
+        data = people_module._load_people_dictionary()
+
+        # A broken or silently-empty loader must fail this, not just a
+        # malformed-content check -- assert the real loader actually
+        # produced our exact synthetic entry, not an empty fallback.
+        assert data == synthetic
+        assert "Alex Chen" in data
         # Each entry should have expected structure
         for name, info in data.items():
             assert isinstance(name, str)

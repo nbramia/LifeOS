@@ -432,7 +432,19 @@ def test_mcp_tool_surface_refuses_draft_then_send_same_turn(
 
         def post(self, url: str, json: dict | None = None, headers: dict | None = None):
             path = url.removeprefix(mcp_server.API_BASE)
-            return self.test_client.post(path, json=json, headers=headers)
+            response = self.test_client.post(path, json=json, headers=headers)
+            # mcp_server._call_api's error handling matches on httpx's own
+            # HTTPStatusError, which raise_for_status() only raises off an
+            # httpx.Response bound to an httpx.Request -- rebuild both here
+            # so this adapter round-trips through the exact response shape
+            # production's real httpx.Client(...) hands back, regardless of
+            # which HTTP library the test client itself is built on.
+            return httpx.Response(
+                response.status_code,
+                headers=list(response.headers.items()),
+                content=response.content,
+                request=httpx.Request("POST", url),
+            )
 
     with patch("api.routes.gmail.get_gmail_service", return_value=mock_gmail_service):
         api_client = TestClient(app)

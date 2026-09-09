@@ -62,6 +62,43 @@ def _call(page: Page, fn: str, *args):
     return page.evaluate(f"(args) => window.__enc.{fn}(...args)", list(args))
 
 
+class TestDelegationTimelineLayout:
+    def test_orders_sessions_earlier_to_later(self, page: Page, web_base_url):
+        _load_module(page, web_base_url)
+        rows = _call(page, "delegationTimelineLayout", [
+            {"session_id": "new", "started_at": 30},
+            {"session_id": "old", "started_at": 10},
+            {"session_id": "middle", "started_at": 20},
+        ])
+        assert [row["session_id"] for row in rows] == ["old", "middle", "new"]
+        assert [row["x"] for row in rows] == sorted(row["x"] for row in rows)
+
+    def test_places_children_by_delegation_depth(self, page: Page, web_base_url):
+        _load_module(page, web_base_url)
+        rows = _call(page, "delegationTimelineLayout", [
+            {"session_id": "root", "started_at": 10},
+            {"session_id": "child", "parent_session_id": "root", "started_at": 20},
+            {"session_id": "grandchild", "parent_session_id": "child", "started_at": 30},
+        ])
+        by_id = {row["session_id"]: row for row in rows}
+        assert by_id["root"]["_delegationDepth"] == 0
+        assert by_id["child"]["_delegationDepth"] == 1
+        assert by_id["grandchild"]["_delegationDepth"] == 2
+        assert by_id["root"]["y"] < by_id["child"]["y"] < by_id["grandchild"]["y"]
+
+    def test_is_stable_for_equal_timestamps_and_missing_parents(self, page: Page, web_base_url):
+        _load_module(page, web_base_url)
+        sessions = [
+            {"session_id": "z", "parent_session_id": "filtered", "started_at": 10},
+            {"session_id": "a", "started_at": 10},
+        ]
+        first = _call(page, "delegationTimelineLayout", sessions)
+        second = _call(page, "delegationTimelineLayout", list(reversed(sessions)))
+        assert first == second
+        assert [row["session_id"] for row in first] == ["a", "z"]
+        assert all(row["_delegationDepth"] == 0 for row in first)
+
+
 # ---------------------------------------------------------------------------
 # nodeLabel — precedence + raw-id guard + "model badge never the label"
 # ---------------------------------------------------------------------------

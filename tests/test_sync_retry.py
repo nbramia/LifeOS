@@ -17,6 +17,7 @@ existed.
 """
 import sqlite3
 import subprocess
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -31,6 +32,46 @@ from scripts.run_all_syncs import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def isolated_sync_file_logging(tmp_path, monkeypatch):
+    """Isolate sync logging and restore the process logging state afterward."""
+    from scripts import run_all_syncs
+
+    root = logging.getLogger()
+    httpx_logger = logging.getLogger("httpx")
+    root_level_before = root.level
+    httpx_level_before = httpx_logger.level
+    root_filters_before = list(root.filters)
+    handlers_before = list(root.handlers)
+    handler_filters_before = {id(handler): list(handler.filters) for handler in handlers_before}
+
+    old_handler = run_all_syncs._sync_log_handler
+    old_log_file = run_all_syncs.log_file
+    if old_handler is not None:
+        root.removeHandler(old_handler)
+    run_all_syncs._sync_log_handler = None
+    run_all_syncs.log_file = None
+    monkeypatch.setattr(run_all_syncs, "LOG_DIR", tmp_path / "logs")
+    yield
+    handler = run_all_syncs._sync_log_handler
+    if handler is not None and handler is not old_handler:
+        root.removeHandler(handler)
+        handler.close()
+
+    for h in list(root.handlers):
+        root.removeHandler(h)
+        if h not in handlers_before:
+            h.close()
+    for h in handlers_before:
+        h.filters = handler_filters_before[id(h)]
+        root.addHandler(h)
+    root.setLevel(root_level_before)
+    httpx_logger.setLevel(httpx_level_before)
+    root.filters = root_filters_before
+    run_all_syncs._sync_log_handler = old_handler
+    run_all_syncs.log_file = old_log_file
 
 
 def _completed(returncode: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:

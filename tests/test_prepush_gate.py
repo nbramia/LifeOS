@@ -26,14 +26,55 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-HOOK = REPO / "scripts" / "pre-push"
+SOURCE_REPO = Path(__file__).resolve().parent.parent
+SOURCE_HOOK = SOURCE_REPO / "scripts" / "pre-push"
+# These names are rebound by ``isolated_hook_repo`` for every test. The
+# immutable source paths above are used only to copy the production snapshot;
+# no test invokes the hook from the ambient checkout.
+REPO = SOURCE_REPO
+HOOK = SOURCE_HOOK
 
-# A dummy 40-hex SHA. It's never resolved as a real commit — every `git diff`/
-# `git merge-base` call downstream of the stdin loop tolerates a bogus SHA via
-# `|| true` fallbacks — it just needs to look like a SHA so the loop treats
-# the line as "carries commits" rather than a deletion (all-zeros) push.
+# A dummy 40-hex SHA for existing-ref test inputs. It is intentionally used
+# only with a nonzero remote SHA; new-branch tests use real commits in the
+# per-test synthetic repository and assert merge-base provenance directly.
 _FAKE_SHA = "1234567890abcdef1234567890abcdef12345678"
+
+
+@pytest.fixture(autouse=True)
+def isolated_hook_repo(tmp_path, monkeypatch):
+    """Run every hook invocation from a copied, minimal Git repository.
+
+    The copied source snapshot contains the actual hook and the smallest
+    runner support it sources, but no ``.git`` directory. A separate synthetic
+    repository is initialized around that snapshot so ``git rev-parse`` and
+    ``origin/main`` are deterministic and cannot resolve through the operator's
+    checkout or its ambient parent repository.
+    """
+    snapshot = tmp_path / "hook-snapshot"
+    scripts = snapshot / "scripts"
+    scripts.mkdir(parents=True)
+    for relative in (
+        "pre-push", "test-lanes.sh", "test_lane_registry.py", "test_lane_plugin.py",
+        "verify_candidate.py", "test.sh",
+    ):
+        shutil.copy2(SOURCE_REPO / "scripts" / relative, scripts / relative)
+    (scripts / "pre-push").chmod(0o755)
+    (scripts / "test-lanes.sh").chmod(0o755)
+    (scripts / "test.sh").chmod(0o755)
+
+    subprocess.run(["git", "init", "-q", str(snapshot)], check=True)
+    subprocess.run(["git", "-C", str(snapshot), "config", "user.name", "Hook Fixture"], check=True)
+    subprocess.run(["git", "-C", str(snapshot), "config", "user.email", "hook-fixture@example.com"], check=True)
+    (snapshot / "fixture-seed.txt").write_text("synthetic hook fixture\n")
+    subprocess.run(["git", "-C", str(snapshot), "add", "fixture-seed.txt"], check=True)
+    subprocess.run(["git", "-C", str(snapshot), "commit", "-q", "-m", "fixture seed"], check=True)
+    subprocess.run(
+        ["git", "-C", str(snapshot), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True,
+    )
+
+    monkeypatch.setitem(globals(), "REPO", snapshot)
+    monkeypatch.setitem(globals(), "HOOK", scripts / "pre-push")
+    return snapshot
 
 
 def _decision(tmp_path, changed_files: str, have_content: str = "1") -> str:
@@ -137,14 +178,51 @@ def stub_python(tmp_path):
     stub = bin_dir / "python"
     stub.write_text(
         "#!/bin/bash\n"
+        "# The hook's sourced lane helper asks its registry for a marker before\n"
+        "# invoking pytest. Answer that tiny CLI directly so this remains a\n"
+        "# controlled hook test rather than accidentally running real Python.\n"
+        "if [[ \"$1\" == *test_lane_registry.py && \"$2\" == lanes ]]; then\n"
+        "    printf '%s\\n' fast-unit slow browser-free browser-server server integration\n"
+        "    exit 0\n"
+        "fi\n"
+        "if [[ \"$1\" == *test_lane_registry.py && \"$2\" == marker ]]; then\n"
+        "    case \"$3\" in\n"
+        "        fast-unit) echo 'unit and not browser and not requires_server and not integration and not slow' ;;\n"
+        "        browser-free) echo 'browser and not requires_server' ;;\n"
+        "    esac\n"
+        "    exit 0\n"
+        "fi\n"
         "# Detection probe: `python -c \"import playwright\"`.\n"
         "if [ \"$1\" = \"-c\" ]; then\n"
         "    exit \"${STUB_DETECT_EXIT:-0}\"\n"
         "fi\n"
+        "# The integrated hook invokes one verifier for both lanes. It writes\n"
+        "# the same external per-lane receipt protocol as the real plugin.\n"
+        "if [[ \"$1\" == *verify_candidate.py && \"$2\" == pushed-ref ]]; then\n"
+        "    args=(\"$@\")\n"
+        "    for ((i=0; i<${#args[@]}; i++)); do\n"
+        "        if [ \"${args[$i]}\" = \"--lane-log-dir\" ]; then lane_dir=\"${args[$((i+1))]}\"; fi\n"
+        "        if [ \"${args[$i]}\" = \"--base\" ] && [ -n \"${STUB_CAPTURE_BASE:-}\" ]; then printf '%s' \"${args[$((i+1))]}\" > \"$STUB_CAPTURE_BASE\"; fi\n"
+        "    done\n"
+        "    mkdir -p \"$lane_dir\"\n"
+        "    unit_rc=\"${STUB_UNIT_EXIT:-0}\"; browser_rc=\"${STUB_BROWSER_EXIT:-0}\"\n"
+        "    unit_status=success; browser_status=success\n"
+        "    [ \"$unit_rc\" = 0 ] || unit_status=failure\n"
+        "    [ \"$browser_rc\" = 0 ] || browser_status=failure\n"
+        "    printf '{\\\"status\\\":\\\"%s\\\",\\\"reports\\\":{}}\\n' \"$unit_status\" > \"$lane_dir/fast-unit.json\"\n"
+        "    if [ \"${STUB_UNIT_NO_OUTPUT:-0}\" != 1 ]; then echo \"${STUB_UNIT_SUMMARY:-1 passed in 0.01s}\" > \"$lane_dir/fast-unit.log\"; fi\n"
+        "    if [ \"${STUB_UNIT_DELETE_LOG:-0}\" = 1 ]; then find \"${TMPDIR:-/tmp}/lifeos-prepush\" -maxdepth 1 -name '*-unit.log' -delete 2>/dev/null; rm -f \"$lane_dir/fast-unit.log\"; exit \"${STUB_UNIT_EXIT:-1}\"; fi\n"
+        "    if [ \"$unit_rc\" != 0 ]; then exit \"$unit_rc\"; fi\n"
+        "    printf '{\\\"status\\\":\\\"%s\\\",\\\"reports\\\":{}}\\n' \"$browser_status\" > \"$lane_dir/browser-free.json\"\n"
+        "    echo \"${STUB_BROWSER_SUMMARY:-1 passed in 0.01s}\" > \"$lane_dir/browser-free.log\"\n"
+        "    if [ \"$browser_rc\" != 0 ]; then exit \"$browser_rc\"; fi\n"
+        "    exit 0\n"
+        "    exit 0\n"
+        "fi\n"
         "# Otherwise this is one of the two `python -m pytest -m \"...\"` calls;\n"
         "# tell them apart by the marker expression, which always names its stage.\n"
         "args=\"$*\"\n"
-        "if [[ \"$args\" == *browser* ]]; then\n"
+        "if [[ \"$args\" == *'--lanes browser-free'* ]] || [[ \"$args\" == *'-m browser and not requires_server'* ]]; then\n"
         "    echo \"${STUB_BROWSER_SUMMARY:-1 passed in 0.01s}\"\n"
         "    exit \"${STUB_BROWSER_EXIT:-0}\"\n"
         "fi\n"
@@ -162,9 +240,10 @@ def stub_python(tmp_path):
 
 
 def _run_real_hook(stub_python, tmp_path, local_ref="refs/heads/feat/real-run",
-                    changed_files="api/main.py", extra_env=None, tmpdir=None):
+                    changed_files="api/main.py", extra_env=None, tmpdir=None,
+                    local_sha=_FAKE_SHA, remote_sha=_FAKE_SHA):
     """Run the REAL, unmodified hook (not plan-only) to completion."""
-    stdin = f"{local_ref} {_FAKE_SHA} refs/heads/unused {_FAKE_SHA}\n"
+    stdin = f"{local_ref} {local_sha} refs/heads/unused {remote_sha}\n"
     env = {
         **os.environ,
         "PATH": f"{stub_python['bin_dir']}:{os.environ['PATH']}",
@@ -180,6 +259,28 @@ def _run_real_hook(stub_python, tmp_path, local_ref="refs/heads/feat/real-run",
         capture_output=True, text=True, env=env, cwd=str(REPO),
         input=stdin,
     )
+
+
+@pytest.mark.unit
+def test_new_branch_verification_uses_resolved_merge_base(stub_python, tmp_path):
+    """A new branch's verifier base is the actual merge-base, never git's
+    all-zero remote SHA (or a guessed ``HEAD~10`` fallback)."""
+    source_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=REPO, text=True,
+    ).strip()
+    expected_base = subprocess.check_output(
+        ["git", "merge-base", source_sha, "origin/main"], cwd=REPO, text=True,
+    ).strip()
+    captured = tmp_path / "resolved-base"
+    result = _run_real_hook(
+        stub_python, tmp_path, local_ref="refs/heads/feat/new-branch-base",
+        local_sha=source_sha,
+        remote_sha="0" * 40,
+        extra_env={"STUB_CAPTURE_BASE": str(captured)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert captured.read_text() == expected_base
+    assert captured.read_text() != "0" * 40
 
 
 _CASES = [
@@ -264,7 +365,10 @@ def test_gate_is_not_narrowed_by_lastfailed():
         if not line.lstrip().startswith("#")
     )
     assert "--lf" not in code, "pre-push must not deselect tests via --lf"
-    assert "--ff" in code, "pre-push should still order previously-failed tests first"
+    # The isolated verifier executes exact pushed-ref node IDs. Keep the
+    # no-deselection safety property without requiring a hook-local `--ff`
+    # argument.
+    assert "verify_candidate.py" in code, "pre-push must delegate execution to the isolated verifier"
 
 
 # --- Per-run log paths -----------------------------------------------------
@@ -474,6 +578,41 @@ def test_ui_suite_failure_does_not_clobber_unit_log(stub_python, tmp_path):
     assert len(browser_logs) == 1
     assert "FAILED (1 failed in 0.02s)" in result.stdout
     assert f"Full output: {browser_logs[0]}" in result.stdout
+
+
+@pytest.mark.unit
+def test_missing_playwright_fails_required_ui_lane(stub_python, tmp_path):
+    """The required hook cannot turn missing Playwright into a green push."""
+    result = _run_real_hook(
+        stub_python, tmp_path, local_ref="refs/heads/feat/playwright-required",
+        extra_env={"STUB_DETECT_EXIT": "1"},
+    )
+    assert result.returncode == 1
+    assert "requires Playwright" in result.stdout
+
+
+@pytest.mark.unit
+def test_hook_verifies_each_nondeleted_ref_once_with_both_required_lanes(stub_python, tmp_path):
+    """Two push lines dispatch two outer candidates, never four lane snapshots."""
+    second_sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+    stdin = (
+        f"refs/heads/feat/one {_FAKE_SHA} refs/heads/one {_FAKE_SHA}\n"
+        f"refs/heads/feat/two {second_sha} refs/heads/two {second_sha}\n"
+    )
+    result = subprocess.run(
+        ["bash", str(HOOK)], cwd=REPO, input=stdin, text=True, capture_output=True,
+        env={
+            **os.environ, "PATH": f"{stub_python['bin_dir']}:{os.environ['PATH']}",
+            "HOME": str(stub_python["home_dir"]), "TMPDIR": str(tmp_path),
+            "LIFEOS_PREPUSH_CHANGED_FILES": "api/main.py",
+            "LIFEOS_PREPUSH_HAVE_CONTENT": "1",
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    lane_root = tmp_path / "lifeos-prepush"
+    candidate_roots = list(lane_root.glob("*-unit-lanes/*"))
+    assert {path.name for path in candidate_roots} == {_FAKE_SHA, second_sha}
+    assert all((path / "fast-unit.json").is_file() and (path / "browser-free.json").is_file() for path in candidate_roots)
 
 
 @pytest.mark.unit

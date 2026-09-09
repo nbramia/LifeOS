@@ -1,8 +1,8 @@
 # Testing Standards
 
-> **Status:** Complete
-> **Last Updated:** 2026-09-04
-> **Audience:** All developers and AI agents
+**Status:** Complete
+**Last Updated:** 2026-09-09
+**Audience:** All developers and AI agents
 
 Testing patterns and conventions for the LifeOS codebase.
 
@@ -25,12 +25,91 @@ All tests live in the `tests/` directory. Files follow the `test_<module>.py` na
 
 | Level | Command | What it runs |
 |-------|---------|-------------|
-| Unit | `./scripts/test.sh` | Fast tests, no external deps (~30s) |
+| Unit | `./scripts/test.sh` | Fast lane: tests without browser, server, integration, or slow markers |
 | Smoke | `./scripts/test.sh smoke` | Unit + critical browser test (used by deploy) |
-| All | `./scripts/test.sh all` | Unit + integration + browser |
+| All | `./scripts/test.sh all` | Every non-archived test, once, after verifying the lane inventory is complete and disjoint |
 | Health | `./scripts/test.sh health` | Quick server health check |
 
-Unit tests are the default and exclude markers: `browser`, `requires_server`, `integration`, `slow`.
+`scripts/test_lane_registry.py` is the single test-lane registry;
+`scripts/test-lanes.sh` is its shell runner and inventory command. It assigns
+each test to exactly one execution lane using marker precedence, so `all`,
+pre-push, and future CI collect the same IDs:
+
+| Lane | Marker selection | Prerequisite |
+|------|------------------|--------------|
+| `fast-unit` | `unit`, excluding `browser`, `requires_server`, `integration`, and `slow` | none |
+| `slow` | `slow`, excluding browser/server/integration | isolated heavy dependencies as needed |
+| `browser-free` | `browser` without `requires_server` | Playwright |
+| `browser-server` | `browser` with `requires_server` | Playwright and a running API server |
+| `server` | `requires_server`, excluding browser | running API server |
+| `integration` | `integration`, excluding browser and `requires_server` | none |
+
+Browser, server, and integration lanes each run in separate processes. This
+prevents pytest-playwright's sync event loop from being co-scheduled with
+unrelated async tests. `./scripts/test.sh all` collects the full non-archived
+inventory and every lane first; it fails before execution if any test is
+omitted or appears in more than one lane.
+
+`./scripts/test-lanes.sh inventory [test-path ...]` runs one collection and
+prints a JSON receipt with every lane's IDs/count, marker expression,
+prerequisites, and intentional exclusions. `prepush-parity` uses the same
+single collection to compare the current fast-unit plus server-free-browser
+gate against the former `unit and not slow` selection.
+
+`./scripts/test.sh auto` is an iteration planner, not a shortcut around
+markers. A changed test file is collected against every lane and each lane
+that has selected IDs runs. A present test file that selects zero IDs fails;
+deleted test paths and unknown test infrastructure conservatively fall back to
+the fast-unit lane. Docs-only diffs are the intentional no-test case.
+
+## Lifecycle Verification Contract
+
+The lifecycle contract in
+[development-lifecycle.md](development-lifecycle.md) is authoritative for
+which evidence is current and which lanes a change requires. Before commit,
+obtain current evidence for every selected lane; a focused iteration command
+does not replace a required broad gate. Broad gates remain blocking until the
+repository records an approved evidence-reuse policy, and a valid reusable
+receipt may be consumed only for its exact source candidate and lane.
+
+Lifecycle implementers, reviewers, documentation checks, and pull-request
+standards checks run focused checks only. One verification phase owns the
+authoritative broad command or ordered command plan and records its result once
+for the exact source candidate; merge readiness consumes that record rather
+than rerunning the broad plan. Infrastructure retries require an explicit
+reason and preserve the original result.
+
+Production restarts belong to deployment. Tests that use an isolated source,
+temporary data, or a server-free fixture never restart or stop a production
+server; server-dependent tests must use the runner's owned instance contract.
+
+### Development metrics
+
+[`scripts/development_metrics.py`](../../../scripts/development_metrics.py) is
+the one shared local recorder for lifecycle phase timing and evidence-reuse
+observations; a caller records a phase through its `record` subcommand
+(candidate-verification CLIs and canonical lifecycle plugin adapters alike)
+rather than hand-rolling a second JSONL format or timing implementation, and
+reads `summary` for aggregate durations, percentile, and per-phase status
+(`unknown` for a phase never observed — never imputed from commit or
+wall-clock timestamps). Records are private and contain no timestamps, paths,
+or environment values; only an opaque run/candidate/task id and the
+caller-supplied evidence reference identify a phase. `scripts/remote-test.sh`
+records the transfer/execution phases of a remote run this way, gated on
+`METRICS_CANDIDATE` and writing to `LIFEOS_DEV_METRICS_PATH` (default
+`~/.cache/lifeos/remote-test-metrics/metrics.jsonl`); it is best-effort only
+and never changes the script's real exit status.
+
+`scripts/remote-test.sh` never rsyncs `.git` itself — a linked worktree's
+`.git` is a file pointing at the source host's administrative directory,
+which does not exist on the execution host, and even an ordinary checkout's
+`.git` carries credentials/hooks/config the transfer must not export.
+`scripts/_remote_git_bundle.py` resolves HEAD and (if present) `origin/main`
+locally via plain git commands and bundles just that history; the execution
+host materializes a fresh, self-contained repository from the bundle (a
+throwaway `LifeOS Remote Test` identity, no source credentials) before the
+working-tree content — including uncommitted/untracked state — is rsynced
+on top, so `git status`/`auto`'s diff match the source exactly.
 
 ## Remote Testing Workflow
 
@@ -73,7 +152,7 @@ Custom markers are registered in `conftest.py`:
 |--------|---------|
 | `@pytest.mark.unit` | Fast unit tests |
 | `@pytest.mark.slow` | Tests needing ChromaDB, embeddings, or file watchers |
-| `@pytest.mark.integration` | Tests requiring a running server |
+| `@pytest.mark.integration` | Cross-service tests; add `requires_server` only when they need the API server |
 | `@pytest.mark.browser` | Playwright browser tests |
 | `@pytest.mark.requires_server` | Tests requiring the API server |
 | `@pytest.mark.requires_db` | Tests needing direct database access |
@@ -84,7 +163,13 @@ Apply `pytestmark = pytest.mark.unit` at the module level for unit test files.
 
 `browser` and `requires_server` are independent. A browser test that points at a running `lifeos-api` carries both; one that serves `web/` itself on an ephemeral port and intercepts every `/api/` call carries only `browser`.
 
-That distinction is load-bearing: `browser and not requires_server` is the set the pre-push hook runs, so it is the only gate that catches a `web/` JS regression before it reaches `main`. Pushes must not depend on a shared server that other agents restart, so a browser test that needs one is excluded there and runs under `./scripts/test.sh browser` instead.
+That distinction is load-bearing: the `browser-free` lane is the set the
+pre-push hook runs, so it is the only gate that catches a `web/` JS regression
+before it reaches `main`. Pushes must not depend on a shared server that other
+agents restart, so a browser test that needs one is excluded there and runs
+under `./scripts/test.sh browser` instead. Playwright is a required
+pre-push prerequisite: when it is absent, the hook fails with its install
+command rather than reporting a green check without browser coverage.
 
 Prefer the self-contained pattern for new frontend tests — it also means the test exercises the checkout under test rather than whatever a running server has deployed.
 
@@ -235,3 +320,4 @@ There is no enforced coverage threshold. The project relies on targeted tests fo
 - [Client Surfaces](../technical/client-surfaces.md) -- HTTP consumers and breaking-change policy
 - [AGENTS.md](../../../AGENTS.md) -- development workflow and agent instructions
 - [Python Conventions](python-conventions.md) -- coding style and module patterns
+- [Development Lifecycle](development-lifecycle.md) -- risk-based implementation, review, and verification contract

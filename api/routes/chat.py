@@ -1195,6 +1195,8 @@ async def ask_stream(request: AskStreamRequest):
                 await turn.emit(f"data: {json.dumps(_usage_event)}\n\n")
 
             # Build source list from tool calls
+            _error_message = getattr(agent_result, "error_message", None)
+            _turn_failed = isinstance(_error_message, str) and bool(_error_message)
             sources = []
             _source_type_map = {
                 "search_vault": "vault",
@@ -1224,25 +1226,39 @@ async def ask_stream(request: AskStreamRequest):
                 "reasoning": f"agentic ({orchestrator_model})",
                 "tool_rounds": len(agent_result.tool_calls_log),
             }
+            # On an agent-loop failure, ``full_text`` may not contain the
+            # current round because its normal accumulator advances only at a
+            # round boundary.  ``partial_text`` is the exact sanitized stream
+            # delivered to the client and is therefore the honest persisted
+            # fallback for this terminal failure.
+            _assistant_text = (
+                partial_text if _turn_failed and partial_text
+                else agent_result.full_text
+            )
             store.add_message(
                 conversation_id,
                 "assistant",
-                agent_result.full_text,
+                _assistant_text,
                 sources=sources,
                 routing=routing_metadata,
             )
-            # Persisted in full above (the authoritative agent_result.full_text,
-            # not the streamed partial_text) -- clear the accumulator so a
+            # Clear the streamed accumulator after persistence so a
             # cancellation on the way out below can't re-persist it as a
             # truncated duplicate of the message just written (#611).
             partial_text = ""
-            print(f"Saved assistant response ({len(agent_result.full_text)} chars, {len(agent_result.tool_calls_log)} tool calls)")
+            print(f"Saved assistant response ({len(_assistant_text)} chars, {len(agent_result.tool_calls_log)} tool calls)")
 
             # Finish performance trace and emit it
             perf_trace = finish_trace()
             if perf_trace:
                 await turn.emit(f"data: {json.dumps({'type': 'perf_trace', 'trace_id': perf_trace.trace_id, 'total_ms': round(perf_trace.total_ms, 1), 'spans': [{'name': s.name, 'duration_ms': s.duration_ms, 'parent': s.parent} for s in perf_trace.spans]})}\n\n")
 
+            # Agent loop provider failures are represented in the terminal
+            # result after their sanitized fallback text has been persisted.
+            # Emit the contract-level fatal event before the terminal marker so
+            # non-browser clients can distinguish a failed turn from success.
+            if _turn_failed:
+                await turn.emit(f"data: {json.dumps({'type': 'error', 'message': _error_message})}\n\n")
             await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
 
         except asyncio.CancelledError:
@@ -1316,7 +1332,7 @@ async def ask_stream(request: AskStreamRequest):
                     usage_recorded = True
             finish_trace()
             raise
-        except Exception as e:
+        except Exception:
             finish_trace()  # Clean up trace on error
             if conversation_id and partial_text:
                 # #611: a genuine mid-stream error (e.g. the agent loop
@@ -1328,7 +1344,9 @@ async def ask_stream(request: AskStreamRequest):
                     conversation_id, "assistant", partial_text + TRUNCATION_MARKER,
                     routing=truncation_routing("stream_error"),
                 )
-            await turn.emit(f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n")
+            # Never expose provider or filesystem exception text over the
+            # client surface; the full exception remains server-side logs.
+            await turn.emit(f"data: {json.dumps({'type': 'error', 'message': 'The request could not be completed.'})}\n\n")
         finally:
             # Post-turn intelligent titling (one shared seam — see
             # conversation_titler.py's module docstring). Idempotent and

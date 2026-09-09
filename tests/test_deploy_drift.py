@@ -1,25 +1,18 @@
 """Deploy-drift coverage (#631).
 
-Three services (lifeos-api, lifeos-mcp-http, lifeos-agent-worker) were found
-running three-day-old code while autodeploy fired cleanly every 10 minutes the
-whole time. Three independent mechanisms each declined to act for individually
-defensible reasons:
+`scripts/auto-deploy.sh` is the sole production-restart mechanism: it
+detects a stale-but-active service by comparing tracked source/`.env` mtimes
+against each unit's own recorded start time, and defers instead of
+restarting a service mid-`#agent`-session. `scripts/post-commit` normalizes
+commit timestamps only and never restarts anything — production restart is
+a deployment concern exclusively (`scripts/deploy.sh` for a direct commit,
+`auto-deploy.sh` for drift after a merge lands) — so a local commit or merge
+never has a restart side effect of its own to test here.
 
-1. `scripts/post-commit`'s change detection used `git diff-tree -r HEAD`,
-   which is blind to merge commits (no output without `-m`/`--first-parent`),
-   so a local merge restarted nothing.
-2. `scripts/auto-deploy.sh` inferred "services are current" from "nothing to
-   pull" (`LOCAL == REMOTE`) — false the instant a merge is pushed from the
-   canonical checkout itself.
-3. The agent worker had no restart path at all in that workflow, and no
-   explicit busy/idle policy.
-
-This file covers (1) via subprocess (bash isn't pytest-covered except by
-driving the real script, per the established pattern in
-test_agent_worker_self_restart.py), and the decision helpers behind (2)/(3) —
-`newest_code_mtime`, `service_active_since_epoch`, `worker_busy` — by
-`source`-ing scripts/auto-deploy.sh (its operational body is wrapped in
-`main()` and guarded so sourcing only defines functions, never fetches,
+This file covers auto-deploy.sh's decision helpers — `newest_code_mtime`,
+`service_active_since_epoch`, `worker_busy`, and the sync-lock/env-mtime
+helpers below — by `source`-ing the script (its operational body is wrapped
+in `main()` and guarded so sourcing only defines functions, never fetches,
 pulls, or restarts anything for real).
 """
 from __future__ import annotations
@@ -42,7 +35,6 @@ from api.services.agent_worker.session_store import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-POST_COMMIT = REPO_ROOT / "scripts" / "post-commit"
 AUTO_DEPLOY = REPO_ROOT / "scripts" / "auto-deploy.sh"
 
 
@@ -54,173 +46,6 @@ def _stub_bin(dir_: Path, name: str, body: str) -> None:
     p = dir_ / name
     p.write_text("#!/bin/bash\n" + body, encoding="utf-8")
     p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IRWXU)
-
-
-# ---------------------------------------------------------------------------
-# Gap 1 — post-commit's merge blindness
-# ---------------------------------------------------------------------------
-def _make_repo_with_post_commit(tmp_path: Path) -> Path:
-    """A synthetic repo with the real post-commit script + a stubbed
-    server.sh, systemctl, and sudo so nothing real is ever restarted."""
-    repo = tmp_path / "repo"
-    (repo / "api").mkdir(parents=True)
-    (repo / "config").mkdir(parents=True)
-    (repo / "docs").mkdir(parents=True)
-    scripts = repo / "scripts"
-    scripts.mkdir()
-    (scripts / "post-commit").write_text(POST_COMMIT.read_text(), encoding="utf-8")
-    (scripts / "post-commit").chmod(0o755)
-    # No-op server.sh — the hook only checks `-x` and backgrounds a call to it.
-    _stub_bin(scripts, "server.sh", "exit 0\n")
-
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@t.t")
-    _git(repo, "config", "user.name", "t")
-    (repo / "README.md").write_text("base\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    return repo
-
-
-def _run_post_commit(repo: Path) -> subprocess.CompletedProcess:
-    bindir = repo / "stubbin"
-    bindir.mkdir(exist_ok=True)
-    _stub_bin(bindir, "systemctl", "exit 1\n")  # lifeos-mcp-http.service "not found"
-    _stub_bin(bindir, "sudo", 'exec "$@"\n')
-    env = dict(os.environ)
-    env["PATH"] = f"{bindir}:{env['PATH']}"
-    return subprocess.run(
-        ["bash", "scripts/post-commit"], cwd=repo, env=env,
-        capture_output=True, text=True, timeout=30,
-    )
-
-
-@pytest.mark.unit
-def test_post_commit_detects_merge_touching_api(tmp_path: Path):
-    """A merge commit touching api/ must still trigger the API restart —
-    this is the exact scenario that silently restarted nothing (#631)."""
-    if not POST_COMMIT.exists():
-        pytest.skip("scripts/post-commit not present")
-    repo = _make_repo_with_post_commit(tmp_path)
-
-    _git(repo, "checkout", "-qb", "feature")
-    (repo / "api" / "handler.py").write_text("# feature change\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "feature: touch api/")
-
-    _git(repo, "checkout", "-q", "main")
-    (repo / "README.md").write_text("main moved on\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "unrelated main commit")
-
-    _git(repo, "merge", "--no-ff", "-q", "-m", "merge feature", "feature")
-    # Sanity: this is genuinely a merge commit non-git-diff-tree-visible case.
-    parents = subprocess.run(
-        ["git", "rev-list", "--parents", "-n", "1", "HEAD"],
-        cwd=repo, capture_output=True, text=True, check=True,
-    ).stdout.split()
-    assert len(parents) == 3, "expected a real 2-parent merge commit"
-
-    result = _run_post_commit(repo)
-    assert result.returncode == 0, result.stderr
-    assert "Server restart triggered" in result.stdout, result.stdout
-    assert "No server restart needed" not in result.stdout
-
-
-@pytest.mark.unit
-def test_post_commit_merge_touching_docs_only_restarts_nothing(tmp_path: Path):
-    """A merge whose only changes are under docs/ must still restart nothing
-    (today's non-merge behavior, preserved for merges too)."""
-    if not POST_COMMIT.exists():
-        pytest.skip("scripts/post-commit not present")
-    repo = _make_repo_with_post_commit(tmp_path)
-
-    _git(repo, "checkout", "-qb", "feature")
-    (repo / "docs" / "notes.md").write_text("feature docs\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "feature: docs only")
-
-    _git(repo, "checkout", "-q", "main")
-    (repo / "README.md").write_text("main moved on\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "unrelated main commit")
-
-    _git(repo, "merge", "--no-ff", "-q", "-m", "merge feature", "feature")
-
-    result = _run_post_commit(repo)
-    assert result.returncode == 0, result.stderr
-    assert "No server restart needed" in result.stdout, result.stdout
-    assert "Server restart triggered" not in result.stdout
-    assert "MCP HTTP service restart triggered" not in result.stdout
-
-
-@pytest.mark.unit
-def test_post_commit_merge_touching_mcp_server_triggers_mcp_restart(tmp_path: Path):
-    """A merge touching mcp_server.py must restart lifeos-mcp-http."""
-    if not POST_COMMIT.exists():
-        pytest.skip("scripts/post-commit not present")
-    repo = _make_repo_with_post_commit(tmp_path)
-    (repo / "mcp_server.py").write_text("# base\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "add mcp_server.py")
-
-    _git(repo, "checkout", "-qb", "feature")
-    (repo / "mcp_server.py").write_text("# feature change\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "feature: touch mcp_server.py")
-
-    _git(repo, "checkout", "-q", "main")
-    (repo / "README.md").write_text("main moved on\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "unrelated main commit")
-
-    _git(repo, "merge", "--no-ff", "-q", "-m", "merge feature", "feature")
-
-    bindir = repo / "stubbin"
-    bindir.mkdir(exist_ok=True)
-    # This time report the mcp-http unit as installed so the hook takes the branch.
-    _stub_bin(bindir, "systemctl", 'exit 0\n')
-    _stub_bin(bindir, "sudo", 'exec "$@"\n')
-    env = dict(os.environ)
-    env["PATH"] = f"{bindir}:{env['PATH']}"
-    result = subprocess.run(
-        ["bash", "scripts/post-commit"], cwd=repo, env=env,
-        capture_output=True, text=True, timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "MCP HTTP service restart triggered" in result.stdout, result.stdout
-
-
-@pytest.mark.unit
-def test_post_commit_normal_commit_docs_only_restarts_nothing(tmp_path: Path):
-    """Regression guard: an ordinary (non-merge) docs-only commit must keep
-    restarting nothing, unaffected by the `-m --first-parent` change."""
-    if not POST_COMMIT.exists():
-        pytest.skip("scripts/post-commit not present")
-    repo = _make_repo_with_post_commit(tmp_path)
-    (repo / "docs" / "notes.md").write_text("more docs\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "docs only")
-
-    result = _run_post_commit(repo)
-    assert result.returncode == 0, result.stderr
-    assert "No server restart needed" in result.stdout, result.stdout
-
-
-@pytest.mark.unit
-def test_post_commit_normal_commit_api_change_still_restarts(tmp_path: Path):
-    """Regression guard: an ordinary (non-merge) api/ commit must still
-    restart, unaffected by the `-m --first-parent` change."""
-    if not POST_COMMIT.exists():
-        pytest.skip("scripts/post-commit not present")
-    repo = _make_repo_with_post_commit(tmp_path)
-    (repo / "api" / "handler.py").write_text("# change\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "touch api/")
-
-    result = _run_post_commit(repo)
-    assert result.returncode == 0, result.stderr
-    assert "Server restart triggered" in result.stdout, result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -400,9 +225,25 @@ def test_service_active_since_epoch_parses_systemd_timestamp(tmp_path: Path):
 
 
 def _venv_with_python(tmp_path: Path) -> Path:
+    """A bare `bin/python` symlink alone is not a valid venv: with no
+    `pyvenv.cfg` alongside it, sys.prefix resolves to the interpreter's own
+    base install rather than this directory, and the base install's
+    site-packages lacks whatever this project's real venv has pip-installed
+    -- masked on a machine where the same packages also happen to be
+    present in the user's own `~/.local` site-packages, which a synthetic
+    HOME (e.g. under the isolated verifier's hermetic sandbox) never has.
+    Copying the real venv's own pyvenv.cfg and linking its `lib` directory
+    makes this a real, self-sufficient venv regardless of HOME."""
+    real_venv = Path(sys.executable).parent.parent
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
     (venv / "bin" / "python").symlink_to(sys.executable)
+    pyvenv_cfg = real_venv / "pyvenv.cfg"
+    if pyvenv_cfg.is_file():
+        (venv / "pyvenv.cfg").write_text(pyvenv_cfg.read_text(encoding="utf-8"), encoding="utf-8")
+    real_lib = real_venv / "lib"
+    if real_lib.is_dir():
+        (venv / "lib").symlink_to(real_lib)
     return venv
 
 

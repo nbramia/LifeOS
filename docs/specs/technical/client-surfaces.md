@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-09-04
+> **Last Updated:** 2026-09-09
 
 LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that submit text and consume SSE without importing LifeOS Python modules. Endpoint and event **shapes** are defined in [api-reference.md](../product/api-reference.md); this doc covers **who consumes them**, **whisper-relay integration**, and **breaking-change policy**.
 
@@ -19,6 +19,18 @@ LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that subm
 | MCP / Managed Agents | stdio or HTTP MCP | Tool catalog only — `mcp_server.py` |
 
 **Response compression.** `api/main.py` applies `GZipMiddleware` scoped to `/api/crm/*`, `/api/people/*`, and the CRM page routes (`minimum_size=1024`, `compresslevel=6`), not app-wide. This is a deliberate scoping choice, not a required safety measure: the installed Starlette (0.52.x) already refuses to compress `text/event-stream` responses on its own, so applying `GZipMiddleware` app-wide would not in fact risk buffering any of the SSE streams documented above. Scoping to an allow-list instead simply keeps the gzip CPU cost confined to the handful of routes large enough to be worth it, independent of a dependency default that could change.
+
+**Native chat stream terminal contract.** `POST /api/ask/stream` has two
+failure paths. When the agent loop handles a provider failure, every content
+frame emitted before the failure (including content from completed earlier
+rounds) remains in the assistant message; the stream then emits sanitized
+`error` followed by `done`. When the outer stream handler catches a genuine
+failure, it emits sanitized `error` without `done`; any emitted content is
+persisted with `TRUNCATION_MARKER` and `routing.truncated: true` plus
+`routing.truncation_reason: "stream_error"`. The web client preserves the
+already-rendered content, displays the error status, and re-enables the
+composer in either case, so a follow-up turn can be submitted. Provider and
+filesystem exception details remain server-side.
 
 ---
 

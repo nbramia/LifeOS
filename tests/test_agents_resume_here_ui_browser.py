@@ -228,6 +228,9 @@ class TestResumeHostSelect:
         _open_board_with_drawer(page, agents_base_url)
         select = page.locator('[data-action="resume-host"]')
         expect(select).to_be_visible()
+        expect(select.locator("option", has_text="studio")).to_have_count(1)
+        expect(select.locator("option", has_text="this machine")).to_have_count(1)
+        expect(select.locator("option", has_text="laptop")).to_have_count(1)
         options = select.locator("option").all_inner_texts()
         assert any("studio" in o for o in options), options
         assert any("this machine" in o for o in options), options
@@ -288,6 +291,8 @@ class TestResumeHostSelectFallback:
         _open_board_with_drawer(page, agents_base_url, hosts_status=404, snapshot_api_host="fallback-api-host")
         select = page.locator('[data-action="resume-host"]')
         expect(select.locator("option")).to_have_count(2)
+        expect(select.locator("option", has_text="fallback-api-host")).to_have_count(1)
+        expect(select.locator("option", has_text="laptop")).to_have_count(1)
         options = select.locator("option").all_inner_texts()
         assert any("fallback-api-host" in o and "this machine" in o for o in options), options
         assert any(o.strip() == "laptop" for o in options), options
@@ -302,6 +307,8 @@ class TestResumeHostSelectFallback:
         _open_board_with_drawer(page, agents_base_url, hang_hosts=True, snapshot_api_host="hang-fallback-host")
         select = page.locator('[data-action="resume-host"]')
         expect(select.locator("option")).to_have_count(2, timeout=8000)
+        expect(select.locator("option", has_text="hang-fallback-host")).to_have_count(1)
+        expect(select.locator("option", has_text="laptop")).to_have_count(1)
         options = select.locator("option").all_inner_texts()
         assert any("hang-fallback-host" in o and "this machine" in o for o in options), options
         assert any(o.strip() == "laptop" for o in options), options
@@ -347,10 +354,11 @@ class TestResumeHostsValidation:
         }
         _open_board_with_drawer(page, agents_base_url, hosts_fixture=bad_hosts)
         select = page.locator('[data-action="resume-host"]')
+        expect(select.locator("option")).to_have_count(2)
+        expect(select.locator("option", has_text="laptop")).to_have_count(1)
         options = select.locator("option").all_inner_texts()
         assert not any(("null" in o or "undefined" in o) for o in options), options
         assert any(o.strip() == "laptop" for o in options), options
-        expect(select.locator("option")).to_have_count(2)
 
 
 class TestFocusSendsTargetHost:
@@ -397,6 +405,7 @@ class TestResumeHostSelectIncludesSessionsOwnHost:
         card = _session_card(host="orchard")  # not in _HOSTS_FIXTURE
         _open_board_with_drawer(page, agents_base_url, card=card)
         select = page.locator('[data-action="resume-host"]')
+        expect(select.locator("option", has_text="orchard")).to_have_count(1)
         options = select.locator("option").all_inner_texts()
         assert any(o.strip() == "orchard" for o in options), options
         assert select.input_value() == "orchard"
@@ -633,6 +642,8 @@ class TestGraphTabRendersResumeControlsOnLiveSessionForLaterReveal:
         # `_populateResumeHosts` is called at initial `_renderHeader` time
         # (bound to `canResume`, not `showResume`), so the options should
         # already be there by the time visibility flips.
+        expect(select.locator("option", has_text="studio")).to_have_count(1)
+        expect(select.locator("option", has_text="laptop")).to_have_count(1)
         options = select.locator("option").all_inner_texts()
         assert any("studio" in o for o in options), options
         assert any(o.strip() == "laptop" for o in options), options

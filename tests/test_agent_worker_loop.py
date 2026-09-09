@@ -143,15 +143,6 @@ class FakeApi:
         return httpx.Response(404)
 
 
-@pytest.fixture(autouse=True)
-def _clear_agent_default_route(monkeypatch):
-    """Host `.env` can set LIFEOS_AGENT_DEFAULT_ROUTE; that demotes
-    ambiguity/non-fatal sanity and would make "must block" tests flaky.
-    Tests that need a default route monkeypatch it back on explicitly."""
-    from config.settings import settings as _settings
-    monkeypatch.setattr(_settings, "agent_default_route", "")
-
-
 def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_executor,
                   claude_code_executor=None, codex_executor=None, cli_pool=None,
                   remote_executor=None):

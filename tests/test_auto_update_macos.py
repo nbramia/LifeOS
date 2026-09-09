@@ -160,24 +160,47 @@ def test_sourcing_does_not_run_main(tmp_path: Path):
     assert "did-not-exit" in result.stdout
 
 
+def _git_ls_files_mode(path: Path, tmp_path: Path) -> str:
+    """`git ls-files -s` reports the INDEX mode, distinct from the file's
+    own filesystem stat() bit -- the check this exists for. Run against
+    REPO_ROOT when it's a real git checkout: this proves the actual
+    committed index entry, catching a bad index entry even when a local
+    `chmod +x` masks it on the working-tree copy. When REPO_ROOT has no
+    `.git` (an isolated verifier snapshot, which never includes one -- see
+    scripts/candidate_snapshot.py), there is no original index entry
+    available to check at all; stage this file's own snapshotted content
+    and executable mode into an owned disposable repo instead, so the
+    check exercises real `git add`/`ls-files` mechanics on that
+    snapshotted state rather than erroring out -- this proves the
+    snapshotted content's mode round-trips through git correctly, not the
+    original repository's committed index entry."""
+    if (REPO_ROOT / ".git").exists():
+        return subprocess.run(
+            ["git", "ls-files", "-s", "--", str(path)],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+        ).stdout
+    fixture = tmp_path / "git-index-mode-fixture"
+    fixture.mkdir()
+    staged = fixture / path.name
+    staged.write_bytes(path.read_bytes())
+    staged.chmod(path.stat().st_mode)
+    subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+    subprocess.run(["git", "add", "--", path.name], cwd=fixture, check=True)
+    return subprocess.run(
+        ["git", "ls-files", "-s", "--", path.name],
+        cwd=fixture, capture_output=True, text=True, check=True,
+    ).stdout
+
+
 @pytest.mark.unit
-def test_auto_update_macos_is_executable():
+def test_auto_update_macos_is_executable(tmp_path: Path):
     """Found on review: committed as mode 100644 — the script's own header
     tells an operator to add it to their crontab by path, which fails with
     'Permission denied' on a non-executable file. Same check as
-    test_launchd_env_wrapper.py's test_wrapper_is_executable.
-
-    Checks the git INDEX mode, not the working-tree file's stat() bit
-    (found on re-review) — the original bug was a bad index entry
-    (100644), and a local `chmod +x` on the working-tree copy alone would
-    make this test pass while a fresh `git clone` on another machine still
-    got a non-executable file."""
+    test_launchd_env_wrapper.py's test_wrapper_is_executable."""
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
-    ls_files = subprocess.run(
-        ["git", "ls-files", "-s", "--", str(AUTO_UPDATE_MACOS)],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
-    ).stdout
+    ls_files = _git_ls_files_mode(AUTO_UPDATE_MACOS, tmp_path)
     assert ls_files.startswith("100755"), f"git index mode is not 100755: {ls_files!r}"
 
 

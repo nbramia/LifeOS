@@ -1,7 +1,7 @@
 # Scripts Reference
 
 > **Status:** Complete
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-09
 > **Audience:** Operators
 
 Reference for the operator-facing scripts under `scripts/`, with usage examples. One-off CRM entity-repair scripts (`merge_people.py`, `split_person.py`, `fix_*`, etc.), git hooks, and Claude Code worktree/session-diagnostic helpers aren't covered here — they're self-documenting via `--help` or their own docstring.
@@ -17,7 +17,7 @@ Manage the LifeOS API server.
 ```bash
 ./scripts/server.sh start      # Start server (background)
 ./scripts/server.sh stop       # Stop server
-./scripts/server.sh restart    # Restart (after code changes)
+./scripts/server.sh restart    # Restart after deploying (never for isolated test runs)
 ./scripts/server.sh status     # Check if running
 ./scripts/server.sh wait       # Wait for server to become healthy
 ./scripts/server.sh preflight  # Check prerequisites before first start
@@ -84,6 +84,61 @@ LIFEOS_REMOTE_HOST=<ssh-target> ./scripts/remote-test.sh
 ```
 
 Set `LIFEOS_REMOTE_HOST` once in your shell profile — there is no default.
+
+### Candidate CI policy audit
+
+`scripts/candidate_ci_setup.py` audits whether GitHub can bind a required
+candidate check to the trusted workflow rather than merely its display name.
+It never enables the spoofable classic status-check path.
+
+See [Candidate Verification CI](candidate-verification-ci.md) for the hosted
+runner boundary and the operator rollout procedure.
+
+### Dedicated test-runner capacity
+
+Development test runners share one canonical per-account capacity state at
+`~/.cache/lifeos/development-capacity`; neither a worktree nor a synthetic
+`HOME` creates another production budget. Normal callers read its configured
+total and conservative normal per-run maximum (initially total `4`, per-run
+`2`). Configure it only during a host-wide quiescent maintenance window:
+
+```bash
+python scripts/test_capacity.py configure --total-workers 8 --max-run-workers 2
+```
+
+The command takes the canonical construction/acquisition lock, tries every
+current slot without waiting, and refuses if any lease is active. It writes the
+replacement configuration atomically only after that proof; restoring `4` is
+the same operation:
+
+```bash
+python scripts/test_capacity.py configure --total-workers 4 --max-run-workers 2
+```
+
+For a reviewed dedicated invocation, the runner's explicit per-run override
+may be larger than the normal cap but never larger than the configured total:
+
+```bash
+python scripts/verify_candidate.py local --source . --evidence-root /safe/evidence \
+  --lanes fast-unit,browser-free --workers 8 --capacity-max-run-workers 8 \
+  --parallel-browser-free
+```
+
+This is a reservation control, not proof that eight workers are safe. Retain
+the CPU-only environment safeguards, source/evidence identity, detached owner,
+and whole-process cleanup; do not run a large capacity benchmark until its
+resource evidence and review are approved. Two genuinely concurrent jobs with
+eight workers each require a separately configured total of `16`; a total of
+`8` serializes them and must not be reported as concurrent throughput.
+
+Every runner process must use the current capacity implementation: a process
+that does not fence acquisition with `initialize.lock` can retain slot paths
+that are unsafe for a shrink. Finish or stop every runner, update every active
+worktree to this implementation, and restart those runner processes before
+changing a shared host; do not shrink while any process with obsolete slot
+paths could acquire. If that transition cannot be proved, leave the existing
+total in place. The restoration command above requires the same quiescence and
+upgrade preconditions.
 
 ---
 

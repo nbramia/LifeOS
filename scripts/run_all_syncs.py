@@ -902,26 +902,37 @@ This file tracks errors from the nightly sync process. Most recent errors appear
     except Exception as e:
         logger.warning(f"Failed to write to markdown error log: {e}")
 
-# Configure logging
-LOG_DIR = Path(__file__).parent.parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-
-log_file = LOG_DIR / f"sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(log_file),
-    ]
-)
-# This sync sends a Telegram notification with a run summary. httpx's request
-# logger defaults to INFO and logs the full request URL — and the Telegram
-# Bot API embeds the bot token in that URL — so without this, every sync run
-# writes a live credential into logs/sync_*.log (#519).
-configure_telegram_log_redaction()
 logger = logging.getLogger(__name__)
+LOG_DIR = Path(__file__).parent.parent / "logs"
+log_file: Path | None = None
+_sync_log_handler: logging.FileHandler | None = None
+
+
+def configure_sync_logging() -> Path:
+    """Attach the timestamped, redacted file log when a sync actually runs.
+
+    Importing this module is part of test collection and must be read-only.
+    The handler is process-scoped so repeated callable invocations keep the
+    existing single-run log rather than adding duplicate file handlers.
+    """
+    global log_file, _sync_log_handler
+    if _sync_log_handler is not None and log_file is not None:
+        return log_file
+
+    LOG_DIR.mkdir(exist_ok=True)
+    log_file = LOG_DIR / f"sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    root = logging.getLogger()
+    root.setLevel(min(root.level, logging.INFO))
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    if not root.handlers:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        root.addHandler(stream_handler)
+    _sync_log_handler = logging.FileHandler(log_file)
+    _sync_log_handler.setFormatter(formatter)
+    root.addHandler(_sync_log_handler)
+    configure_telegram_log_redaction()
+    return log_file
 
 # =============================================================================
 # UNIFIED SYNC ORDER - Organized by Phase
@@ -2091,6 +2102,7 @@ def run_all_syncs(
     Returns:
         Summary dict with results
     """
+    configured_log_file = configure_sync_logging()
     sources = sources or SYNC_ORDER
     results = {}
     failed = []
@@ -2111,7 +2123,7 @@ def run_all_syncs(
 
     logger.info(f"Sync triggered: {trigger}")
     logger.info(f"Starting sync run for {len(sources)} sources...")
-    logger.info(f"Log file: {log_file}")
+    logger.info(f"Log file: {configured_log_file}")
 
     # Clean up sync_runs rows left in status='running' by killed/crashed
     # processes. Otherwise they pin the dashboard's "last completed" timestamp
@@ -2514,6 +2526,7 @@ def main():
         print(f"  All healthy: {summary['all_healthy']}")
         return 0 if summary['all_healthy'] else 1
 
+    configure_sync_logging()
     sources = [args.source] if args.source else None
 
     # Require --execute for actual syncs (safety measure)

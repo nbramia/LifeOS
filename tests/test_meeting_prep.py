@@ -201,13 +201,7 @@ class TestGetMeetingPrep:
 
     @pytest.mark.integration
     def test_returns_meeting_prep_response(self, mock_calendar_events, mock_search_results):
-        """Should return MeetingPrepResponse with meetings.
-
-        #682: only get_calendar_service/get_hybrid_search are patched — which
-        accounts get iterated comes from get_configured_accounts(), which
-        reads real OAuth token config. On a clean checkout with no configured
-        Google accounts this returns 0 meetings, not 2.
-        """
+        """Should return MeetingPrepResponse with meetings."""
         from api.services.google_auth import GoogleAccount
 
         def mock_get_service(account):
@@ -222,9 +216,10 @@ class TestGetMeetingPrep:
         mock_search = MagicMock()
         mock_search.search.return_value = mock_search_results
 
-        with patch('api.services.meeting_prep.get_calendar_service', side_effect=mock_get_service):
-            with patch('api.services.meeting_prep.get_hybrid_search', return_value=mock_search):
-                result = get_meeting_prep("2026-01-28")
+        with patch('api.services.meeting_prep.get_configured_accounts', return_value=[GoogleAccount.PERSONAL, GoogleAccount.WORK]):
+            with patch('api.services.meeting_prep.get_calendar_service', side_effect=mock_get_service):
+                with patch('api.services.meeting_prep.get_hybrid_search', return_value=mock_search):
+                    result = get_meeting_prep("2026-01-28")
 
         assert result.date == "2026-01-28"
         assert result.count == 2
@@ -232,11 +227,7 @@ class TestGetMeetingPrep:
 
     @pytest.mark.integration
     def test_meeting_has_required_fields(self, mock_calendar_events, mock_search_results):
-        """Should include all required fields in meeting prep.
-
-        #682: relies on result.meetings[0], which requires at least one
-        configured Google account (get_configured_accounts()) to be non-empty.
-        """
+        """Should include all required fields in meeting prep."""
         from api.services.google_auth import GoogleAccount
 
         def mock_get_service(account):
@@ -250,9 +241,10 @@ class TestGetMeetingPrep:
         mock_search = MagicMock()
         mock_search.search.return_value = mock_search_results
 
-        with patch('api.services.meeting_prep.get_calendar_service', side_effect=mock_get_service):
-            with patch('api.services.meeting_prep.get_hybrid_search', return_value=mock_search):
-                result = get_meeting_prep("2026-01-28")
+        with patch('api.services.meeting_prep.get_configured_accounts', return_value=[GoogleAccount.PERSONAL, GoogleAccount.WORK]):
+            with patch('api.services.meeting_prep.get_calendar_service', side_effect=mock_get_service):
+                with patch('api.services.meeting_prep.get_hybrid_search', return_value=mock_search):
+                    result = get_meeting_prep("2026-01-28")
 
         meeting = result.meetings[0]
         assert meeting.event_id == "1"
@@ -338,11 +330,8 @@ class TestGetMeetingPrep:
 
     @pytest.mark.integration
     def test_fetches_from_both_calendars(self, mock_search_results):
-        """Should fetch from both work and personal calendars.
-
-        #682: asserts get_calendar_service was called twice, which requires
-        both accounts to be present in get_configured_accounts().
-        """
+        """Should fetch from both work and personal calendars."""
+        from api.services.google_auth import GoogleAccount
         def mock_get_service(account):
             mock = MagicMock()
             mock.get_events_in_range.return_value = []
@@ -351,9 +340,10 @@ class TestGetMeetingPrep:
         mock_search = MagicMock()
         mock_search.search.return_value = []
 
-        with patch('api.services.meeting_prep.get_calendar_service', side_effect=mock_get_service) as mock_get_cal:
-            with patch('api.services.meeting_prep.get_hybrid_search', return_value=mock_search):
-                get_meeting_prep("2026-01-28")
+        with patch('api.services.meeting_prep.get_configured_accounts', return_value=[GoogleAccount.PERSONAL, GoogleAccount.WORK]):
+            with patch('api.services.meeting_prep.get_calendar_service', side_effect=mock_get_service) as mock_get_cal:
+                with patch('api.services.meeting_prep.get_hybrid_search', return_value=mock_search):
+                    get_meeting_prep("2026-01-28")
 
         # Should be called twice (work and personal)
         assert mock_get_cal.call_count == 2

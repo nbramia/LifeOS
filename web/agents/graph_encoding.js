@@ -2,8 +2,8 @@
 //
 // Pure session-encoding functions for the Graph tab — no DOM, no d3, no
 // fetch, so every function here is directly unit-testable (see
-// tests/test_agents_graph_encoding_browser.py) without spinning up the
-// force simulation or a stubbed page. `web/agents/graph.js` imports these
+// tests/test_agents_graph_encoding_browser.py) without spinning up a
+// stubbed page. `web/agents/graph.js` imports these
 // for node rendering; `web/agents/panel.js` imports `nodeLabel`,
 // `isRawIdValue`, and `routingLabel` for the side panel's header, tooltip,
 // and rename prefill and re-exports `routingLabel` so existing
@@ -81,6 +81,65 @@ export function descendantsOf(sessions, session) {
     }
   }
   return out;
+}
+
+// Deterministic coordinates for the delegation timeline. Horizontal order is
+// chronological (with the id as a stable tie-breaker); vertical position is
+// delegation depth. Missing or filtered parents make a session a visible root.
+export function delegationTimelineLayout(sessions, {
+  left = 130,
+  top = 120,
+  columnGap = 190,
+  depthGap = 190,
+} = {}) {
+  const byId = new Map(sessions.map(s => [s.session_id, s]));
+  const timestamp = s => {
+    const raw = s.started_at ?? s.created_at ?? s.last_activity_at ?? 0;
+    const value = typeof raw === 'number' ? raw : Date.parse(raw);
+    return Number.isFinite(value) ? value : 0;
+  };
+  const compareTime = (a, b) =>
+    timestamp(a) - timestamp(b) || String(a.session_id).localeCompare(String(b.session_id));
+  const remaining = new Map(sessions.map(s => [s.session_id, s]));
+  const ordered = [];
+  while (remaining.size) {
+    let available = [...remaining.values()]
+      .filter(s => !s.parent_session_id || !remaining.has(s.parent_session_id))
+      .sort(compareTime);
+    // A malformed cycle has no topological head. Break it deterministically;
+    // depth calculation below independently guards against the same cycle.
+    if (!available.length) available = [[...remaining.values()].sort(compareTime)[0]];
+    const next = available[0];
+    ordered.push(next);
+    remaining.delete(next.session_id);
+  }
+  const depthMemo = new Map();
+
+  function depthOf(session, visiting = new Set()) {
+    if (depthMemo.has(session.session_id)) return depthMemo.get(session.session_id);
+    const parent = byId.get(session.parent_session_id);
+    if (!parent || visiting.has(session.session_id)) {
+      depthMemo.set(session.session_id, 0);
+      return 0;
+    }
+    const next = new Set(visiting);
+    next.add(session.session_id);
+    const depth = depthOf(parent, next) + 1;
+    depthMemo.set(session.session_id, depth);
+    return depth;
+  }
+
+  return ordered.map((session, index) => {
+    const depth = depthOf(session);
+    return {
+      ...session,
+      x: left + index * columnGap,
+      y: top + depth * depthGap,
+      _timelineOrder: index,
+      _delegationDepth: depth,
+      _timelineTimestamp: timestamp(session),
+    };
+  });
 }
 
 export function nodeLabel(d) {

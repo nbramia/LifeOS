@@ -2,7 +2,7 @@
 # LifeOS Server Management Script
 # Designed for reliable server management from Claude or command line
 #
-# Usage: ./scripts/server.sh [start|stop|restart|status|wait|preflight|classify-change|verify-deployed|restart-worker-detached]
+# Usage: ./scripts/server.sh [start|stop|restart|status|wait|preflight|classify-change|verify-deployed|restart-worker-detached|test-instance]
 #
 # Commands:
 #   start                    - Kill any existing processes, start server, wait for health check
@@ -14,6 +14,13 @@
 #   classify-change          - Print whether a diff needs a worker or api-only restart (#401)
 #   verify-deployed          - Exit 0 only if the checkout is a real work tree on the expected SHA (#419)
 #   restart-worker-detached  - Detached restart of lifeos-agent-worker for the doctor (#401)
+#   test-instance ACTION     - Private, isolated candidate instance for tests:
+#                              run|verify|stop — see scripts/test_instance.py --help. `run` is
+#                              the one supported way to exercise a candidate: it starts an
+#                              instance, runs a command against it, and always stops it — no
+#                              detached "start now, stop later" mode. Never touches the shared
+#                              lifeos-api service; this is the ONLY server.sh path that never
+#                              calls kill_server/pkill/systemctl.
 #
 # Expected startup time: 30-60 seconds (loading sentence-transformers model)
 
@@ -34,7 +41,7 @@ LOG_FILE="$PROJECT_DIR/logs/server.log"
 # doctor self-repair persona drives a headless session *inside* this unit, so
 # bouncing it kills the doctor's own session — see restart-worker-detached.
 WORKER_UNIT="lifeos-agent-worker"
-VENV_PYTHON="$HOME/.venvs/lifeos/bin/python"
+VENV_PYTHON="${LIFEOS_VENV_PYTHON:-$HOME/.venvs/lifeos/bin/python}"
 # Files whose change requires the agent worker (not just lifeos-api) to
 # restart for the change to take effect — see classify-change.
 WORKER_CODE_PATH="api/services/agent_worker/"
@@ -522,10 +529,20 @@ case "${1:-status}" in
         shift
         restart_worker_detached "$@"
         ;;
+    test-instance)
+        # Isolated candidate instance for tests. Delegates entirely to
+        # scripts/test_instance.py: an owned source snapshot, its own port,
+        # a sanitized environment, and manifest-verified process identity.
+        # Deliberately does NOT go through kill_server/start_server/systemd —
+        # this path must never touch the shared lifeos-api service or any
+        # process it didn't itself spawn.
+        shift
+        exec "$VENV_PYTHON" "$SCRIPT_DIR/test_instance.py" "$@"
+        ;;
     *)
         echo "LifeOS Server Management"
         echo ""
-        echo "Usage: $0 {start|stop|restart|status|wait [timeout]|foreground|preflight|classify-change [range]|verify-deployed [sha]|restart-worker-detached [opts]}"
+        echo "Usage: $0 {start|stop|restart|status|wait [timeout]|foreground|preflight|classify-change [range]|verify-deployed [sha]|restart-worker-detached [opts]|test-instance <run|verify|stop> [opts]}"
         echo ""
         echo "Commands:"
         echo "  start                    - Start server (kills existing, waits for healthy)"
@@ -541,6 +558,9 @@ case "${1:-status}" in
         echo "                             <sha> (default origin/main); else exit 1 (#419)"
         echo "  restart-worker-detached  - Detached restart of $WORKER_UNIT for the doctor"
         echo "                             [--session ID] [--notify TEXT] [--bot NAME]"
+        echo "  test-instance ACTION     - Isolated candidate instance for tests:"
+        echo "                             run|verify|stop (see test_instance.py --help); run"
+        echo "                             is the supported way to exercise a candidate"
         echo ""
         echo "Expected startup time: 30-60 seconds (ML model loading)"
         exit 1

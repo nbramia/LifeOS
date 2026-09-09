@@ -1,0 +1,195 @@
+name: Candidate verification
+
+# This file is evaluated from the protected base branch for both events below
+# (pull_request_target always resolves workflow YAML from the base ref, and
+# workflow_dispatch resolves it from whatever --ref it is invoked against —
+# the publisher always dispatches against main). Candidate code is checked
+# out only in the unprivileged job below; the status publisher never checks
+# out or runs it.
+#
+# There are two independent purposes here, never conflated:
+#   - pull_request_target publishes `candidate-verification-shadow` for fast,
+#     visible PR feedback. It is diagnostic only and must never be required.
+#   - workflow_dispatch (input: candidate_sha) verifies the EXACT normalized
+#     two-parent candidate the publisher (scripts/candidate_publisher.py)
+#     constructed, and publishes the actual required check,
+#     `candidate-verification`, bound to a dedicated GitHub App id so a
+#     candidate-controlled workflow cannot forge a matching check under the
+#     generic Actions app. GitHub merge queue (`merge_group`) and Enterprise
+#     "required workflow" rules are both organization/Enterprise-only
+#     features and are structurally unavailable on this User-owned
+#     repository, so neither is used here.
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: "Exact candidate commit SHA to verify (constructed by scripts/candidate_publisher.py)"
+        required: true
+        type: string
+      pr_number:
+        description: "The PR this candidate was built for, so a superseded candidate for the same PR is cancelled rather than racing"
+        required: true
+        type: string
+      trusted_runner_sha:
+        description: "Exact protected-base commit containing the verifier and lane registry"
+        required: true
+        type: string
+
+concurrency:
+  # Keyed on stable PR identity, not the ephemeral candidate SHA: a second
+  # candidate built for the same PR (e.g. after a rebuild) must cancel the
+  # still-running verification of the one it supersedes, which a SHA-keyed
+  # group could never do since each candidate has a distinct SHA.
+  group: candidate-verification-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  execute-candidate:
+    name: candidate-execution
+    runs-on: ubuntu-latest
+    # The retained lanes have measured at roughly 38m (fast-unit) + 11m
+    # (browser-free), before dependency and Chromium setup. Keep a bounded
+    # ceiling with enough setup headroom rather than timing out a healthy run.
+    timeout-minutes: 65
+    permissions:
+      contents: read
+    env:
+      CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.event.inputs.candidate_sha }}
+      TRUSTED_RUNNER_SHA: ${{ github.event.pull_request.base.sha || github.event.inputs.trusted_runner_sha }}
+      TORCH_CPU_VERSION: "2.14.0+cpu"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_INPUT: "1"
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+      CUDA_VISIBLE_DEVICES: ""
+      LIFEOS_TEST_PARALLEL_WORKERS: "2"
+    steps:
+      - name: Checkout the protected runner definition
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TRUSTED_RUNNER_SHA }}
+          path: trusted-runner
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Checkout the untrusted candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: candidate
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Bind dispatched runner to protected workflow provenance
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            test "$TRUSTED_RUNNER_SHA" = "$WORKFLOW_SHA"
+            FIRST_PARENT="$(git -C candidate cat-file commit "$CANDIDATE_SHA" | awk '$1 == "parent" { print $2; exit }')"
+            test "$FIRST_PARENT" = "$TRUSTED_RUNNER_SHA"
+          fi
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: candidate/requirements.txt
+      - name: Install the declared CPU test environment
+        run: |
+          python -m pip install --upgrade pip
+          printf 'torch==%s\n' "$TORCH_CPU_VERSION" > "$RUNNER_TEMP/cpu-torch-constraints.txt"
+          python -m pip install --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu -c "$RUNNER_TEMP/cpu-torch-constraints.txt" "torch==$TORCH_CPU_VERSION"
+          python -m pip install --only-binary=:all: --extra-index-url https://download.pytorch.org/whl/cpu -c "$RUNNER_TEMP/cpu-torch-constraints.txt" -r candidate/requirements.txt
+          python -m playwright install --with-deps chromium
+          python -m pip freeze --all | LC_ALL=C sort | sha256sum | tee "$RUNNER_TEMP/lifeos-installed-dependencies.sha256"
+          python - <<'PY'
+          import os
+          import torch
+          assert torch.__version__ == os.environ["TORCH_CPU_VERSION"], torch.__version__
+          assert torch.version.cuda is None and torch.version.hip is None, torch.__version__
+          PY
+      - name: Prove checkout identity
+        run: |
+          test "$(git -C trusted-runner rev-parse HEAD)" = "$TRUSTED_RUNNER_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+      - name: Verify the retained fast unit and server-free browser lanes
+        run: |
+          python trusted-runner/scripts/verify_candidate.py pushed-ref \
+            --repository "$GITHUB_WORKSPACE/candidate" \
+            --sha "$CANDIDATE_SHA" \
+            --base "$TRUSTED_RUNNER_SHA" \
+            --evidence-root "$RUNNER_TEMP/lifeos-verification-evidence" \
+            --lanes fast-unit,browser-free \
+            --workers 2
+
+  publish-aggregate:
+    # This job never checks out, runs, or consumes an artifact from the
+    # candidate; it only reports the result of the job above for the
+    # event's exact candidate SHA. It authenticates as a dedicated GitHub
+    # App (installation token, minted fresh in this job and never
+    # persisted) whose credentials are never given to any
+    # candidate-influenceable workflow.
+    #
+    # The App's private key is stored as an ENVIRONMENT secret, not a
+    # repository secret: a repository secret is available to any same-repo
+    # (non-fork) workflow run regardless of which workflow file defines it,
+    # so a candidate-authored `pull_request`-triggered workflow could
+    # otherwise reference it directly and mint a valid App token itself,
+    # completely defeating the point of a dedicated issuer. An environment
+    # secret is exposed only to a job that declares `environment:` AND only
+    # when that environment's deployment branch policy matches the run's
+    # actual ref — configure the `candidate-verification-publish`
+    # environment's deployment branch policy to exactly `main` (no tags, no
+    # `refs/pull/*`, no "protected branches" fallback if none are actually
+    # protected), so a `pull_request`-triggered run (whose ref is the PR
+    # head/merge ref, never `main`) is denied the secret even if it tries
+    # to declare the same environment name itself. `execute-candidate`
+    # above never declares this environment and never sees this credential.
+    # Until LIFEOS_CANDIDATE_APP_ID / LIFEOS_CANDIDATE_APP_PRIVATE_KEY exist
+    # in that environment, this job falls back to the default token, and
+    # the resulting check must NOT be treated as the required gate — it is
+    # advisory only until the App-issued token path is active.
+    name: candidate-verification-publisher
+    needs: [execute-candidate]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    environment: candidate-verification-publish
+    permissions:
+      checks: write
+    env:
+      CHECK_NAME: ${{ github.event_name == 'workflow_dispatch' && 'candidate-verification' || 'candidate-verification-shadow' }}
+      TRUSTED_RUNNER_SHA: ${{ github.event.pull_request.base.sha || github.event.inputs.trusted_runner_sha }}
+    steps:
+      - name: Mint a dedicated-App installation token, if configured
+        id: app-token
+        if: ${{ vars.LIFEOS_CANDIDATE_APP_ID != '' }}
+        uses: actions/create-github-app-token@5d869da34e18e7287c1daad50e0b8ea0f506ce69 # v1.11.0
+        with:
+          app-id: ${{ vars.LIFEOS_CANDIDATE_APP_ID }}
+          private-key: ${{ secrets.LIFEOS_CANDIDATE_APP_PRIVATE_KEY }}
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          RESULT: ${{ needs.execute-candidate.result }}
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.event.inputs.candidate_sha }}
+          TRUSTED_RUNNER_SHA: ${{ github.event.pull_request.base.sha || github.event.inputs.trusted_runner_sha }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
+          script: |
+            const conclusion = process.env.RESULT === 'success' ? 'success' : 'failure';
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: process.env.CHECK_NAME,
+              head_sha: process.env.CANDIDATE_SHA,
+              status: 'completed',
+              conclusion,
+              output: {
+                title: 'Candidate verification',
+                summary: `Candidate ${process.env.CANDIDATE_SHA} verified by runner ${process.env.TRUSTED_RUNNER_SHA}: ${process.env.RESULT}`,
+              },
+            });

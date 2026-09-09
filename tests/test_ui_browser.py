@@ -2,7 +2,7 @@
 Browser-based UI tests using Playwright.
 
 Tests the LifeOS chat interface on both desktop and mobile viewports.
-Requires the server to be running on localhost:8000.
+Requires the owned candidate instance provided by ``candidate_base_url``.
 """
 import pytest
 from playwright.sync_api import Page, expect
@@ -19,10 +19,10 @@ class TestDesktopUI:
     """Test UI on desktop viewport."""
 
     @pytest.fixture(autouse=True)
-    def setup(self, page: Page):
+    def setup(self, page: Page, candidate_base_url):
         """Set desktop viewport and navigate to app."""
         page.set_viewport_size(DESKTOP_VIEWPORT)
-        page.goto("http://localhost:8000")
+        page.goto(f"{candidate_base_url}/chat")
         # Wait for app to load
         page.wait_for_selector(".welcome")
 
@@ -92,10 +92,10 @@ class TestMobileUI:
     """Test UI on mobile viewport."""
 
     @pytest.fixture(autouse=True)
-    def setup(self, page: Page):
+    def setup(self, page: Page, candidate_base_url):
         """Set mobile viewport and navigate to app."""
         page.set_viewport_size(MOBILE_VIEWPORT)
-        page.goto("http://localhost:8000")
+        page.goto(f"{candidate_base_url}/chat")
         page.wait_for_selector(".welcome")
 
     def test_welcome_screen_visible(self, page: Page):
@@ -156,9 +156,11 @@ class TestMobileUI:
         font_size = input_field.evaluate("el => window.getComputedStyle(el).fontSize")
         assert font_size == "16px", f"Input font size should be 16px, got {font_size}"
 
-    def test_cost_display_hidden_on_mobile(self, page: Page):
-        """Cost display should be hidden on mobile."""
-        expect(page.locator(".cost-display")).not_to_be_visible()
+    def test_cost_display_uses_compact_mobile_affordance(self, page: Page):
+        """Mobile keeps the usage affordance while hiding verbose labels."""
+        expect(page.locator(".cost-display")).to_be_visible()
+        expect(page.locator(".cost-display .label")).to_be_hidden()
+        expect(page.locator(".cost-display .amount")).to_be_hidden()
 
     def test_messages_fill_screen(self, page: Page):
         """Messages area should fill available screen."""
@@ -172,10 +174,10 @@ class TestInteractions:
     """Test interactive elements work correctly."""
 
     @pytest.fixture(autouse=True)
-    def setup(self, page: Page):
+    def setup(self, page: Page, candidate_base_url):
         """Navigate to app."""
         page.set_viewport_size(DESKTOP_VIEWPORT)
-        page.goto("http://localhost:8000")
+        page.goto(f"{candidate_base_url}/chat")
         page.wait_for_selector(".welcome")
 
     def test_enter_sends_message(self, page: Page):
@@ -219,10 +221,10 @@ class TestAccessibility:
     """Test accessibility features."""
 
     @pytest.fixture(autouse=True)
-    def setup(self, page: Page):
+    def setup(self, page: Page, candidate_base_url):
         """Navigate to app."""
         page.set_viewport_size(DESKTOP_VIEWPORT)
-        page.goto("http://localhost:8000")
+        page.goto(f"{candidate_base_url}/chat")
         page.wait_for_selector(".welcome")
 
     def test_buttons_have_titles(self, page: Page):
@@ -259,10 +261,10 @@ class TestAttachmentUI:
     """Test attachment UI functionality."""
 
     @pytest.fixture(autouse=True)
-    def setup(self, page: Page):
+    def setup(self, page: Page, candidate_base_url):
         """Navigate to app."""
         page.set_viewport_size(DESKTOP_VIEWPORT)
-        page.goto("http://localhost:8000")
+        page.goto(f"{candidate_base_url}/chat")
         page.wait_for_selector(".welcome")
 
     def test_attach_button_visible(self, page: Page):
@@ -328,10 +330,10 @@ class TestAttachmentMobileUI:
     """Test attachment UI on mobile viewport."""
 
     @pytest.fixture(autouse=True)
-    def setup(self, page: Page):
+    def setup(self, page: Page, candidate_base_url):
         """Set mobile viewport and navigate to app."""
         page.set_viewport_size(MOBILE_VIEWPORT)
-        page.goto("http://localhost:8000")
+        page.goto(f"{candidate_base_url}/chat")
         page.wait_for_selector(".welcome")
 
     def test_attach_button_visible_on_mobile(self, page: Page):

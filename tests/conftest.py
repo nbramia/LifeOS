@@ -62,6 +62,47 @@ def wait_for_condition(predicate, timeout: float, interval: float = 0.2):
     return result
 
 
+@pytest.fixture(scope="session")
+def candidate_base_url():
+    """Return the URL of the owned candidate, failing closed otherwise.
+
+    Server-dependent tests opt into this fixture explicitly.  The runner
+    supplies all three values below from the same sanitized candidate
+    environment; checking the instance-only identity route prevents a stale
+    production/other-worktree listener from satisfying a health check.  The
+    token is compared in memory and never included in an assertion message.
+    """
+    import httpx
+
+    raw_url = os.environ.get("LIFEOS_TEST_BASE_URL", "").strip()
+    expected_candidate = os.environ.get("LIFEOS_TEST_CANDIDATE_ID", "").strip()
+    expected_token = os.environ.get("LIFEOS_TEST_TOKEN", "").strip()
+    assert raw_url and expected_candidate and expected_token, (
+        "owned candidate environment is required: run through the candidate "
+        "server.sh test-instance"
+    )
+    base_url = raw_url.rstrip("/")
+    try:
+        response = httpx.get(f"{base_url}/_test_instance/identity", timeout=5.0)
+    except httpx.HTTPError as exc:
+        pytest.fail(f"owned candidate identity is unreachable: {exc}")
+    assert response.status_code == 200, (
+        "owned candidate identity endpoint missing or wrong instance "
+        f"(status {response.status_code})"
+    )
+    try:
+        identity = response.json()
+    except ValueError as exc:
+        pytest.fail(f"owned candidate identity was not JSON: {exc}")
+    assert identity.get("candidate_id") == expected_candidate, (
+        "candidate identity does not match the runner's owned candidate"
+    )
+    assert identity.get("token") == expected_token, (
+        "candidate ownership token does not match the runner's owned instance"
+    )
+    return base_url
+
+
 # ---------------------------------------------------------------------------
 # Force CPU-only embeddings under pytest (#521).
 #
@@ -263,17 +304,14 @@ def pytest_runtest_setup(item):
 
 
 @pytest.fixture(scope="session")
-def server_available():
-    """Check if API server is available for tests."""
-    try:
-        import httpx
-        response = httpx.get("http://localhost:8000/health", timeout=2.0)
-        return response.status_code == 200
-    except Exception:
-        return False
+def server_available(candidate_base_url):
+    """Require the active test to use the owned candidate instance."""
+    # ``candidate_base_url`` performs the identity check and fails closed for
+    # a missing, stale, or wrong listener; never silently probe production.
+    return bool(candidate_base_url)
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def db_available():
     """
     Check if the interactions database is available for direct access.
@@ -281,6 +319,17 @@ def db_available():
     When the server is running, it may hold a lock on the SQLite database,
     preventing tests from accessing it directly. This fixture detects that
     situation and allows tests to skip gracefully.
+
+    Must be function-scoped, not session-scoped: `get_interaction_db_path()`
+    resolves through `settings.chroma_path`, which
+    `_isolate_integration_persistent_stores` (autouse, function-scoped)
+    redirects to a fresh per-test path for every `integration`-marked test.
+    A session-scoped probe would run once, against whichever path was live
+    for the first test that ever requested it, and then be reused as a
+    stale answer for every other test's own (differently redirected) path —
+    autouse fixtures of the same scope are set up before an explicitly
+    requested one, so a function-scoped probe here observes the same
+    redirected path the test body itself will use.
     """
     import sqlite3
     try:
@@ -401,6 +450,72 @@ def _isolate_vault_indexer_stores(tmp_path, monkeypatch):
             created[0]._client.delete_collection(collection)
         except Exception:
             pass
+
+
+@pytest.fixture(autouse=True)
+def _isolate_slow_crm_schema(request, tmp_path, monkeypatch):
+    """Give real slow indexer cases a complete per-test CRM schema."""
+    if request.node.get_closest_marker("slow") is None:
+        yield
+        return
+
+    from api.services.person_entity import PersonEntityStore
+    from api.services.interaction_store import InteractionStore, get_interaction_db_path
+    from api.services.source_entity import SourceEntityStore
+    import api.services.task_manager as task_manager_mod
+    from api.utils import db_paths
+
+    crm_path = tmp_path / "crm.db"
+    # SourceEntityStore resolves its default path through settings rather
+    # than PersonEntityStore.CRM_DB_PATH. Keep both existing schemas in the
+    # same owned database if a slow path constructs either default store.
+    monkeypatch.setattr(db_paths.settings, "chroma_path", tmp_path / "chromadb")
+    monkeypatch.setattr(PersonEntityStore, "CRM_DB_PATH", crm_path)
+    monkeypatch.setattr(task_manager_mod, "DEFAULT_INDEX_PATH", tmp_path / "task_index.json")
+    monkeypatch.setattr(task_manager_mod, "_task_manager", None)
+    SourceEntityStore(db_path=str(crm_path))
+    InteractionStore(db_path=get_interaction_db_path(), strict=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_integration_persistent_stores(request, tmp_path, monkeypatch):
+    """Keep integration defaults out of the candidate source snapshot."""
+    if request.node.get_closest_marker("integration") is None:
+        yield
+        return
+    if "require_db" in request.fixturenames:
+        # These tests are explicitly designed to read the real,
+        # developer-supplied interactions/CRM database -- require_db's own
+        # skip-if-unavailable mechanism already gates them, so redirecting
+        # the default store path here as well would make them permanently
+        # unable to see real data in any context, defeating their
+        # documented purpose of verifying it.
+        yield
+        return
+
+    import api.services.person_entity as person_entity_mod
+    import api.services.link_override as link_override_mod
+    import api.services.sync_health as sync_health_mod
+    from api.utils import db_paths
+
+    # CRM routes use PersonEntityStore's static default, while source-entity
+    # paths resolve from chroma_path.  Sync health has its own static SQLite
+    # path.  Redirect only those demonstrated write defaults to this test's
+    # pytest-owned directory; explicit test paths and skip conditions remain
+    # unchanged.
+    runtime_data = tmp_path / "runtime"
+    runtime_data.mkdir()
+    monkeypatch.setattr(db_paths.settings, "chroma_path", runtime_data / "chromadb")
+    monkeypatch.setattr(person_entity_mod.PersonEntityStore, "CRM_DB_PATH", runtime_data / "crm.db")
+    monkeypatch.setattr(person_entity_mod, "_entity_store", None)
+    monkeypatch.setattr(
+        link_override_mod,
+        "_link_override_store",
+        link_override_mod.LinkOverrideStore(runtime_data / "crm.db"),
+    )
+    monkeypatch.setattr(sync_health_mod, "SYNC_HEALTH_DB_PATH", runtime_data / "sync_health.db")
+    yield
 
 
 # Collection names `VectorStore` actually writes to on a real install:
@@ -914,7 +1029,7 @@ def pytest_collection_modifyitems(config, items):
         "applies to the whole file:\n"
         "  @pytest.mark.unit            - fast, fully isolated (no real data or live services)\n"
         "  @pytest.mark.integration     - needs real production data or a live external service\n"
-        "  @pytest.mark.requires_server - needs the LifeOS API server running on localhost:8000\n"
+        "  @pytest.mark.requires_server - needs an identity-checked owned candidate\n"
         "  @pytest.mark.slow            - loads real ML models / ChromaDB / other heavy processing\n"
         "  @pytest.mark.browser         - Playwright browser test\n\n"
         f"Unmarked test(s):\n{preview}"
