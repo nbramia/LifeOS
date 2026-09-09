@@ -3,9 +3,10 @@
 Per-tick flow:
   - wake any sessions whose sleep timer has expired
   - check the daily spend cap
-  - list todo+#agent tasks from the API
-  - for each unclaimed candidate: atomic tag swap, preflight, route
-    (local → run on Gemma; claude → defer to Issue D; ask/ambiguous → block)
+  - list todo/urgent tasks carrying an engine assignee (or Managed Agents
+    consent tag) from the API
+  - for each unclaimed candidate: claim with `#agent-running`, preflight, route
+    (local → run on Gemma; claude → Managed Agents; ask/ambiguous → block)
   - on terminal outcomes, swap to the matching #agent-* status tag and
     notify via Telegram
 
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
 
 from api.services.agent_worker.completion_signal import has_positive_completion_signal
 from api.services.agent_worker.assignment import extract_assignment
+from api.services.agent_board import AGENT_ASSIGNEES as _BOARD_AGENT_ASSIGNEES
 from api.services.agent_worker.preflight import (
     ROUTE_ASK,
     ROUTE_CLAUDE,
@@ -387,12 +389,31 @@ BLOCKED_TAG = "agent-blocked"
 FAILED_TAG = "agent-failed"
 BUDGET_EXCEEDED_TAG = "agent-budget-exceeded"
 
+# Lifecycle claim / terminal tags — a task carrying any of these is already
+# mid-flight or finished and must not be re-claimed from the pickup list.
+_CLAIM_EXCLUSION_TAGS = frozenset({
+    RUNNING_TAG, BLOCKED_TAG, COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG,
+})
+
 # Task statuses that the worker will pick up for execution. `todo` is the
 # everyday-task default; `urgent` (Obsidian Tasks `[!]`) is for high-priority
 # items the operator wants run ahead of the queue — both should trigger the
-# agent if tagged `#agent`. The list API only accepts a single status per
-# request, so we fan out and dedupe.
+# agent if tagged `#agent` or an engine assignee. The list API only accepts a single
+# status (and a single tag) per request, so we fan out and dedupe.
 AGENT_PICKUP_STATUSES = ("todo", "urgent")
+
+# Tags that make a todo/urgent task eligible for claim: the legacy `#agent`
+# queue marker, every board engine assignee, plus Managed Agents consent tags
+# (not board assignees, but valid executors on scheduled / tagged work).
+# Board assignees are imported so the board vocabulary and pickup set cannot
+# drift. Bare `#agent` remains pickupable alongside engine/consent tags.
+_MANAGED_AGENTS_CONSENT_TAGS = ("cloud-haiku", "cloud-sonnet")
+AGENT_PICKUP_TAGS: tuple[str, ...] = (
+    (AGENT_TAG,) + tuple(_BOARD_AGENT_ASSIGNEES) + _MANAGED_AGENTS_CONSENT_TAGS
+)
+_AGENT_ASSIGNEE_SET = frozenset(_BOARD_AGENT_ASSIGNEES)
+_CONSENT_TAG_SET = frozenset(_MANAGED_AGENTS_CONSENT_TAGS)
+_PICKUP_TAG_SET = frozenset(AGENT_PICKUP_TAGS)
 
 # #760: best-effort WIP-branch discovery for an interrupted CLI session — a
 # regex over past tool_use transcript events, never a live `git` call.
@@ -662,15 +683,23 @@ class Worker:
             if session.parent_session_id:
                 recovered += 1
                 continue
-            self._swap_tag(session.task_id, RUNNING_TAG, AGENT_TAG)
-            # Rolling back to #agent — return the vault checkbox to "todo"
+            task_snapshot = self._fetch_task(session.task_id) or {}
+            tags_now = self._norm_task_tags(task_snapshot)
+            # Restore `#agent` only when that was the handoff (or no engine/consent
+            # tag remains). Engine-only and consent-only cards just drop running.
+            handoff = tags_now & (_AGENT_ASSIGNEE_SET | _CONSENT_TAG_SET)
+            if AGENT_TAG in tags_now or not handoff:
+                self._swap_tag(session.task_id, RUNNING_TAG, AGENT_TAG)
+            else:
+                self._remove_tag_if_present(session.task_id, RUNNING_TAG)
+            # Rolling back claim — return the vault checkbox to "todo"
             # so the operator sees the task as un-started rather than stuck
             # in "in_progress".
             self._set_task_status(session.task_id, "todo")
             self._notify(
                 f"⚠️ {_worker_label(session.routing)}: task left in {session.status!r} from a prior "
-                f"run could not be safely resumed — tag rolled back to "
-                f"#{AGENT_TAG} for retry. Transcript: "
+                f"run could not be safely resumed — removed #{RUNNING_TAG} for "
+                f"retry. Transcript: "
                 f"`data/agent_transcripts/{sid}.jsonl`"
             )
             recovered += 1
@@ -1314,7 +1343,7 @@ class Worker:
     def _timeout_stale_clarifications(self) -> None:
         """Send a one-time nudge for clarifications older than the configured
         timeout. The task stays at #agent-blocked permanently after that — the
-        operator can manually re-tag with #agent to retry.
+        operator can manually re-tag with an engine assignee to retry.
         """
         timeout_seconds = settings.agent_clarification_timeout_hours * 3600
         cutoff = int(time.time()) - timeout_seconds
@@ -1323,8 +1352,9 @@ class Worker:
             # Close every stale row, but only nudge for actual clarifications
             # (agent BLOCKED awaiting input). Completion follow-ups
             # (kind='followup', #234) are just replyable notifications; a
-            # "re-tag with #agent to retry" nudge is wrong for them. Marking
-            # them timed out also keeps stale follow-up rows from accumulating.
+            # "re-tag with an engine assignee to retry" nudge is wrong for
+            # them. Marking them timed out also keeps stale follow-up rows
+            # from accumulating.
             self.session_store.mark_question_timed_out(q["id"])
             if (q.get("kind") or "clarification") != "clarification":
                 continue
@@ -1337,7 +1367,8 @@ class Worker:
                 f"⏰ {label}: task is still waiting on your reply.\n\n"
                 f"Question: {q['question'][:300]}\n\n"
                 f"(Task remains at #{BLOCKED_TAG}. Reply to the original "
-                f"question to unblock, or re-tag with #{AGENT_TAG} to retry.)"
+                f"question to unblock, or re-tag with an engine assignee "
+                f"to retry.)"
             )
 
     def _process_human_queue(self) -> None:
@@ -1481,30 +1512,49 @@ class Worker:
     # ------------------------------------------------------------------
 
     def _list_agent_tasks(self) -> list[dict[str, Any]]:
-        """Fetch open `#agent` tasks from the API.
+        """Fetch open claimable tasks from the API.
 
-        The list endpoint only filters on a single status string, so we fan
-        out across `AGENT_PICKUP_STATUSES` (`todo` + `urgent` by default) and
-        dedupe by task id. A task that appears under both statuses in quick
-        succession is still claimed once.
+        Fans out across `AGENT_PICKUP_STATUSES` × `AGENT_PICKUP_TAGS`
+        (`todo`/`urgent` × every engine assignee / Managed Agents consent
+        tag) and dedupes by task id. A candidate must still carry a pickup
+        tag, and must not already have a lifecycle claim/terminal tag
+        (`agent-running`, `agent-blocked`, `agent-completed`,
+        `agent-failed`, `agent-budget-exceeded`) — engine-only tasks keep
+        their assignee tag after claim, so the tag fan-out alone would
+        otherwise re-list in-flight work.
         """
         seen: set[str] = set()
         all_tasks: list[dict[str, Any]] = []
         for status in AGENT_PICKUP_STATUSES:
-            try:
-                resp = self._http.get(
-                    f"{self.api_base}/api/tasks",
-                    params={"status": status, "tag": AGENT_TAG},
-                )
-                resp.raise_for_status()
-                for task in resp.json().get("tasks", []):
-                    tid = task.get("id")
-                    if tid and tid not in seen:
-                        seen.add(tid)
-                        all_tasks.append(task)
-            except Exception as exc:
-                logger.warning("failed to list agent tasks (status=%s): %s", status, exc)
-        return all_tasks
+            for tag in AGENT_PICKUP_TAGS:
+                try:
+                    resp = self._http.get(
+                        f"{self.api_base}/api/tasks",
+                        params={"status": status, "tag": tag},
+                    )
+                    resp.raise_for_status()
+                    for task in resp.json().get("tasks", []):
+                        tid = task.get("id")
+                        if tid and tid not in seen:
+                            seen.add(tid)
+                            all_tasks.append(task)
+                except Exception as exc:
+                    logger.warning(
+                        "failed to list agent tasks (status=%s, tag=%s): %s",
+                        status, tag, exc,
+                    )
+        candidates: list[dict[str, Any]] = []
+        for task in all_tasks:
+            tags = {str(t).lstrip("#").lower() for t in (task.get("tags") or [])}
+            if tags & _CLAIM_EXCLUSION_TAGS:
+                continue
+            if (
+                AGENT_TAG in tags
+                or tags & _AGENT_ASSIGNEE_SET
+                or tags & _CONSENT_TAG_SET
+            ):
+                candidates.append(task)
+        return candidates
 
     def _swap_tag(self, task_id: str, from_tag: str, to_tag: str) -> bool:
         try:
@@ -1517,6 +1567,37 @@ class Worker:
         except Exception as exc:
             logger.warning("swap_tag failed for %s: %s", task_id, exc)
             return False
+
+    def _claim_task(self, task_id: str) -> bool | None:
+        """Return whether the claim consumed `#agent`, or None if it lost."""
+        try:
+            resp = self._http.post(
+                f"{self.api_base}/api/tasks/{task_id}/claim-agent",
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            if not payload.get("claimed"):
+                return None
+            return bool(payload.get("consumed_queue_tag"))
+        except Exception as exc:
+            logger.warning("claim_agent failed for %s: %s", task_id, exc)
+            return None
+
+    def _remove_tag_if_present(self, task_id: str, tag: str) -> bool:
+        try:
+            resp = self._http.post(
+                f"{self.api_base}/api/tasks/{task_id}/remove-tag",
+                params={"tag": tag},
+            )
+            resp.raise_for_status()
+            return bool(resp.json().get("ok"))
+        except Exception as exc:
+            logger.warning("remove_tag_if_present failed for %s: %s", task_id, exc)
+            return False
+
+    @staticmethod
+    def _norm_task_tags(task: dict[str, Any] | None) -> set[str]:
+        return {str(t).lstrip("#").lower() for t in ((task or {}).get("tags") or [])}
 
     def _complete_task(self, task_id: str) -> bool:
         try:
@@ -1710,16 +1791,16 @@ class Worker:
     # ------------------------------------------------------------------
 
     def _claim(self, task_id: str) -> bool:
-        """Atomically swap `#agent` → `#agent-running` and record the session.
+        """Atomically claim a pickup candidate and record the session.
+
+        Legacy `#agent` tasks: swap `#agent` → `#agent-running`.
+        Engine-only tasks (no `#agent`): atomically ADD `#agent-running`.
 
         Returns True iff this worker won the race.
         """
-        if not self._swap_tag(task_id, AGENT_TAG, RUNNING_TAG):
+        consumed_queue_tag = self._claim_task(task_id)
+        if consumed_queue_tag is None:
             return False
-        # Sync vault status to in_progress so the operator can see at a
-        # glance which tasks are actively being worked on, not just by
-        # tag color.
-        self._set_task_status(task_id, "in_progress")
         try:
             session = self.session_store.create(
                 task_id=task_id,
@@ -1732,12 +1813,12 @@ class Worker:
             )
             return True
         except Exception as exc:
-            # Already-claimed by a sibling worker, or DB hiccup. Try to un-do
-            # the tag swap so the task remains pickable.
             logger.error("session create failed for %s: %s", task_id, exc)
-            if not self._swap_tag(task_id, RUNNING_TAG, AGENT_TAG):
-                # Rollback failed — task is stuck at #agent-running. Notify so
-                # the operator can intervene before this silently strands work.
+            if consumed_queue_tag:
+                rolled_back = self._swap_tag(task_id, RUNNING_TAG, AGENT_TAG)
+            else:
+                rolled_back = self._remove_tag_if_present(task_id, RUNNING_TAG)
+            if not rolled_back:
                 self._notify(
                     f"⚠️ Agent worker: failed to claim task {task_id} and could "
                     f"not roll back tag. Task stuck at #{RUNNING_TAG} — please "
@@ -2694,7 +2775,7 @@ class Worker:
                     f"⏸ {_worker_label(ROUTE_REMOTE)}: task '{title}' routed to #cloud but the "
                     f"remote provider not configured — set LIFEOS_REMOTE_LLM_* "
                     f"(LIFEOS_REMOTE_LLM_URL, LIFEOS_REMOTE_LLM_MODEL, "
-                    f"LIFEOS_REMOTE_LLM_API_KEY) in .env, then retag with #{AGENT_TAG}."
+                    f"LIFEOS_REMOTE_LLM_API_KEY) in .env, then re-tag with an engine assignee to retry."
                 )
                 return
             executor = self._get_remote_executor(caller_session_id=session.session_id)
@@ -2721,7 +2802,7 @@ class Worker:
                     f"Managed Agents isn't configured. Set ANTHROPIC_API_KEY, "
                     f"LIFEOS_AGENT_PRESET_ID, and LIFEOS_AGENT_ENVIRONMENT_ID "
                     f"in .env (see docs/guides/agent-worker-setup.md for the "
-                    f"console flow), then retag with #{AGENT_TAG}."
+                    f"console flow), then re-tag with an engine assignee to retry."
                 )
                 return
             try:

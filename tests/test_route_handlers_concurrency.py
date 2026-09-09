@@ -69,7 +69,12 @@ def _assert_fast_request_not_blocked(client, *, slow_request):
         elapsed = time.time() - start
 
         for future in slow_futures:
-            slow_response = future.result(timeout=SLEEP_SECONDS + 5)
+            # Under a saturated host (full xdist suite + other agents), the
+            # TestClient threadpool can take longer than the sleep itself to
+            # schedule all four slow handlers — wait generously for them to
+            # finish so this assertion stays about the *fast* request bound
+            # below, not about scheduler latency for the slow ones.
+            slow_response = future.result(timeout=SLEEP_SECONDS + 60)
             assert slow_response.status_code == 200
 
     assert fast_response.status_code == 200
