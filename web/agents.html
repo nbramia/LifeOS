@@ -1230,7 +1230,15 @@
   }
   .board-card:hover { border-color: var(--accent); }
   .board-card.dragging-source { opacity: 0.4; }
+  body.board-dragging, body.board-dragging * { user-select: none !important; }
   .board-card-ghost { opacity: 0.9; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+  .board-card-accept {
+    margin-top: 0.4rem;
+    width: 100%;
+    font-size: 0.72rem;
+    padding: 0.25rem 0.5rem;
+    cursor: pointer;
+  }
   .board-card-title { font-weight: 600; word-break: break-word; }
   .board-card-question {
     margin-top: 0.3rem;
@@ -1454,6 +1462,7 @@
       <option value="codex">codex</option>
       <option value="hermes">hermes</option>
       <option value="local">local</option>
+      <option value="cloud">cloud</option>
     </select>
     <select id="board-filter-host" title="Host"><option value="all">all hosts</option></select>
     <select id="board-filter-engine" title="Engine">
@@ -1467,7 +1476,14 @@
       <option value="ask">ask</option>
     </select>
     <input type="text" id="board-filter-tag" placeholder="tag" />
-    <select id="board-filter-context" title="Context"><option value="all">all contexts</option></select>
+    <select id="board-filter-sort" title="Sort cards within each lane">
+      <option value="file" selected>file order</option>
+      <option value="created_asc">created oldest</option>
+      <option value="created_desc">created newest</option>
+      <option value="modified_asc">modified oldest</option>
+      <option value="modified_desc">modified newest</option>
+      <option value="assignee_asc">assignee A-Z</option>
+    </select>
     <select id="board-filter-recency" title="Recency">
       <option value="60">1 min</option>
       <option value="1800">30 min</option>
@@ -1477,7 +1493,7 @@
       <option value="all" selected>all time</option>
     </select>
     <label><input type="checkbox" id="board-filter-done" /> include cancelled</label>
-    <button type="button" id="board-filter-clear" title="Reset every shared filter to its default">Clear</button>
+    <button type="button" id="board-filter-clear" title="Reset all board filters to defaults">Clear filters</button>
     <button id="board-new-card" type="button">+ New card</button>
     <span id="board-connection-state">connecting…</span>
   </div>

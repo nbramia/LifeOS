@@ -19,7 +19,7 @@ import {
 } from './panel.js';
 import { renderActionRow } from './session_actions.js';
 import { descendantsOf } from './graph_encoding.js';
-import { cardActionHandlers, cancelCard, openDeleteCardModal } from './card_actions.js';
+import { acceptCard, cardActionHandlers, cancelCard, openDeleteCardModal } from './card_actions.js';
 import { renderAssignmentPickers } from './assignment.js';
 import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
@@ -29,11 +29,17 @@ import {
   onTabActivate, activateTab, getSelectedGraphCardId,
 } from './linking.js';
 
-const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local'];
+const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud'];
 // plan_lane_move (api/services/agent_board.py) 409s a lane=in_progress move
 // whose assignee is one of these — "only the worker claims agent-assigned
 // tasks" — so the composer must not let one through.
 const AGENT_ASSIGNEES = ASSIGNEES.filter(a => a !== 'me');
+
+const SORT_STORAGE_KEY = 'lifeos.agents.board.sort';
+const DEFAULT_SORT = 'file';
+const SORT_OPTIONS = new Set([
+  'file', 'created_asc', 'created_desc', 'modified_asc', 'modified_desc', 'assignee_asc',
+]);
 
 // Tags the worker itself writes as it drives a task through its lifecycle
 // (agent_board.py's RUNNING_TAG/BLOCKED_TAG/COMPLETED_TAG, worker.py's
@@ -82,6 +88,53 @@ const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done').map(l => l.i
 // either, and both are excluded from the new-card composer's lane select.
 const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled').map(l => l.id));
 
+function loadSortSelection() {
+  try {
+    const value = localStorage.getItem(SORT_STORAGE_KEY);
+    if (value && SORT_OPTIONS.has(value)) return value;
+  } catch (_) {}
+  return DEFAULT_SORT;
+}
+
+function saveSortSelection(value) {
+  try { localStorage.setItem(SORT_STORAGE_KEY, value); } catch (_) {}
+}
+
+function cardSortKey(card, mode) {
+  if (mode.startsWith('created')) {
+    const raw = card.created_at || card.created_date || card.next_fire_at || '';
+    const timestamp = raw ? Date.parse(raw) : NaN;
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+  if (mode.startsWith('modified')) {
+    const raw = card.updated_at || card.next_fire_at || '';
+    const timestamp = raw ? Date.parse(raw) : NaN;
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+  if (mode === 'assignee_asc') {
+    if (card.kind === 'schedule') return '\uffff';
+    return (card.assignee || '\ufffe').toLowerCase();
+  }
+  return null;
+}
+
+function sortCards(cards, mode) {
+  if (!mode || mode === DEFAULT_SORT) return cards;
+  const descending = mode.endsWith('_desc');
+  return cards
+    .map((card, index) => ({ card, index, key: cardSortKey(card, mode) }))
+    .sort((a, b) => {
+      if (a.key == null && b.key == null) return a.index - b.index;
+      if (a.key == null) return 1;
+      if (b.key == null) return -1;
+      const comparison = typeof a.key === 'string'
+        ? a.key.localeCompare(b.key)
+        : a.key - b.key;
+      return comparison === 0 ? a.index - b.index : (descending ? -comparison : comparison);
+    })
+    .map(({ card }) => card);
+}
+
 export function initBoard() {
   const lanesEl = document.getElementById('board-lanes');
   const searchEl = document.getElementById('board-search');
@@ -95,8 +148,8 @@ export function initBoard() {
   const hostFilterEl = document.getElementById('board-filter-host');
   const engineFilterEl = document.getElementById('board-filter-engine');
   const tagFilterEl = document.getElementById('board-filter-tag');
-  const contextFilterEl = document.getElementById('board-filter-context');
   const recencyFilterEl = document.getElementById('board-filter-recency');
+  const sortFilterEl = document.getElementById('board-filter-sort');
   const includeDoneEl = document.getElementById('board-filter-done');
   const filterClearBtn = document.getElementById('board-filter-clear');
   const newCardBtn = document.getElementById('board-new-card');
@@ -106,6 +159,8 @@ export function initBoard() {
 
   let board = { lanes: Object.fromEntries(LANES.map(l => [l.id, []])) };
   let visibleLanes = new Set(getFilters().lanes);
+  let sortMode = loadSortSelection();
+  if (sortFilterEl) sortFilterEl.value = sortMode;
   // Whether the first GET /api/agents/board (or board/stream tick) has
   // landed — see `drainBoardFocus` below, the same "re-queue if not loaded
   // yet" pattern graph.js's `drainGraphFocus` uses.
@@ -287,7 +342,6 @@ export function initBoard() {
   // ------------------------------------------------------------------
 
   let _lastHostKey = '';
-  let _lastContextKey = '';
   function updateFilterOptions() {
     // Unions the assignment (fields.host — where a card WILL run) with the
     // observation (session.host — where a session DID run), so a host a
@@ -324,17 +378,6 @@ export function initBoard() {
       }
     }
 
-    const contexts = [...new Set(
-      allCards().filter(c => c.kind === 'task').map(c => c.context).filter(Boolean)
-    )].sort();
-    const contextKey = contexts.join('|');
-    if (contextFilterEl && contextKey !== _lastContextKey) {
-      _lastContextKey = contextKey;
-      const current = contextFilterEl.value;
-      contextFilterEl.innerHTML = '<option value="all">all contexts</option>'
-        + contexts.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
-      if (current && (current === 'all' || contexts.includes(current))) contextFilterEl.value = current;
-    }
   }
 
   function cardMatchesFilters(card) {
@@ -386,12 +429,6 @@ export function initBoard() {
     const engineSel = shared.engine || 'all';
     if (engineSel !== 'all') {
       if (!card.session || routingFilterValue(card.session) !== engineSel) return false;
-    }
-
-    // Context stays board-local — not one of the seven shared keys.
-    const contextSel = contextFilterEl?.value || 'all';
-    if (contextSel !== 'all') {
-      if (card.kind !== 'task' || card.context !== contextSel) return false;
     }
 
     // `null` (the shared default) means "the operator has never set a
@@ -473,10 +510,12 @@ export function initBoard() {
     // is what keeps the highlight surviving that rebuild rather than a
     // one-time class added to a node that gets discarded.
     if (card.id === revealedCardId) div.classList.add('reveal-highlight');
+    const showAccept = card.lane === 'review';
     div.innerHTML = `
       <div class="board-card-title">${live ? '<span class="live-dot" title="live"></span>' : ''}${escapeHtml(card.title || '(untitled)')}</div>
       ${card.pending_question ? `<div class="board-card-question">❓ ${escapeHtml(card.pending_question.question)}</div>` : ''}
       <div class="board-card-chips">${cardChips(card)}</div>
+      ${showAccept ? '<button type="button" class="board-card-accept">Accept</button>' : ''}
     `;
     div.addEventListener('click', () => {
       if (suppressNextClick === card.id) { suppressNextClick = null; return; }
@@ -491,6 +530,15 @@ export function initBoard() {
       });
     }
     div.addEventListener('mousedown', (e) => onCardMouseDown(e, card));
+    if (showAccept) {
+      const acceptBtn = div.querySelector('.board-card-accept');
+      acceptBtn.addEventListener('mousedown', (e) => e.stopPropagation());
+      acceptBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        acceptCard(card, fetchBoard);
+      });
+    }
     return div;
   }
 
@@ -540,9 +588,12 @@ export function initBoard() {
       column.className = 'board-lane';
       column.dataset.lane = lane.id;
 
-      const cards = (board.lanes[lane.id] || [])
-        .map(c => ({ ...c, lane: lane.id }))
-        .filter(cardMatchesFilters);
+      const cards = sortCards(
+        (board.lanes[lane.id] || [])
+          .map(c => ({ ...c, lane: lane.id }))
+          .filter(cardMatchesFilters),
+        sortMode,
+      );
 
       column.innerHTML = `
         <div class="board-lane-header" style="border-top-color:${laneColor(lane.id)}">${escapeHtml(lane.label)} <span class="board-lane-count">${cards.length}</span></div>
@@ -675,6 +726,11 @@ export function initBoard() {
     document.addEventListener('mouseup', onDragUp);
   }
 
+  function clearDragSelection() {
+    const selection = window.getSelection && window.getSelection();
+    if (selection && selection.removeAllRanges) selection.removeAllRanges();
+  }
+
   function onDragMove(e) {
     if (!dragState) return;
     const dx = e.clientX - dragState.startX;
@@ -682,6 +738,8 @@ export function initBoard() {
     if (!dragState.moved && Math.hypot(dx, dy) < 4) return;
     if (!dragState.moved) {
       dragState.moved = true;
+      document.body.classList.add('board-dragging');
+      clearDragSelection();
       dragState.cardEl.classList.add('dragging-source');
       const rect = dragState.cardEl.getBoundingClientRect();
       const ghost = dragState.cardEl.cloneNode(true);
@@ -708,7 +766,9 @@ export function initBoard() {
     document.querySelectorAll('.board-lane.drag-over').forEach(el => el.classList.remove('drag-over'));
     if (ghost && ghost.parentNode) ghost.parentNode.removeChild(ghost);
     if (cardEl) cardEl.classList.remove('dragging-source');
+    document.body.classList.remove('board-dragging');
     if (moved) {
+      clearDragSelection();
       const laneEl = document.elementFromPoint(e.clientX, e.clientY)?.closest('.board-lane');
       const targetLane = laneEl && laneEl.dataset.lane;
       if (targetLane && targetLane !== sourceLane) {
@@ -1807,9 +1867,8 @@ export function initBoard() {
   // Wire filters + boot
   // ------------------------------------------------------------------
 
-  // Context and "include cancelled" stay board-local — not part of the
-  // seven shared keys (linking.js).
-  [contextFilterEl, includeDoneEl].filter(Boolean).forEach(el => {
+  // "Include cancelled" and sorting stay board-local.
+  [includeDoneEl].filter(Boolean).forEach(el => {
     const evt = (el.tagName === 'SELECT' || el.type === 'checkbox') ? 'change' : 'input';
     el.addEventListener(evt, () => render());
   });
@@ -1825,7 +1884,21 @@ export function initBoard() {
   if (engineFilterEl) engineFilterEl.addEventListener('change', () => setFilter('engine', engineFilterEl.value));
   if (tagFilterEl) tagFilterEl.addEventListener('input', () => setFilter('tag', tagFilterEl.value));
   if (recencyFilterEl) recencyFilterEl.addEventListener('change', () => setFilter('recency', recencyFilterEl.value));
-  if (filterClearBtn) filterClearBtn.addEventListener('click', () => resetFilters());
+  if (sortFilterEl) {
+    sortFilterEl.addEventListener('change', () => {
+      sortMode = SORT_OPTIONS.has(sortFilterEl.value) ? sortFilterEl.value : DEFAULT_SORT;
+      saveSortSelection(sortMode);
+      render();
+    });
+  }
+  if (filterClearBtn) filterClearBtn.addEventListener('click', () => {
+    resetFilters();
+    if (includeDoneEl) includeDoneEl.checked = false;
+    sortMode = DEFAULT_SORT;
+    if (sortFilterEl) sortFilterEl.value = DEFAULT_SORT;
+    saveSortSelection(DEFAULT_SORT);
+    render();
+  });
 
   function syncSharedFilterControls(state) {
     // Rebuild (and, if needed, inject) the host option list against the
