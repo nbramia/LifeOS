@@ -160,7 +160,13 @@ def _open_agents(page: Page, base_url):
     # #850: the board is the default tab; the graph (and its filters) live
     # behind the Graph tab and only initialize once it's opened.
     page.click('[data-tab="graph"]')
-    page.wait_for_selector("#filter-host")
+    # The host select ships with only its `all` option; the per-host options
+    # are appended once `GET /api/agents/snapshot` resolves and the graph
+    # applies it, so wait for those options rather than for the select
+    # itself, which exists in the markup before any data arrives.
+    page.wait_for_function(
+        "document.querySelector('#filter-host').options.length > 1"
+    )
 
 
 class TestHostFilter:
@@ -180,7 +186,6 @@ class TestHostFilter:
         # widen recency to "all time" first.
         page.select_option("#filter-recency", "all")
         page.select_option("#filter-host", "laptop-a")
-        page.wait_for_timeout(400)  # let the filtered re-render settle
         nodes = page.locator(".node")
         expect(nodes).to_have_count(1)
 
@@ -194,14 +199,12 @@ class TestEndedStatus:
     def test_ended_session_hidden_by_default(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)
         page.select_option("#filter-recency", "all")
-        page.wait_for_timeout(400)
         expect(page.locator(".node")).to_have_count(2)
 
     def test_ended_session_shown_when_include_finished_is_checked(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)
         page.select_option("#filter-recency", "all")
         page.locator("#filter-terminal").check()
-        page.wait_for_timeout(400)
         expect(page.locator(".node")).to_have_count(3)
 
 
@@ -437,7 +440,9 @@ def _open_agents2(page: Page, base_url):
     page.wait_for_selector("#filter-route")
     page.select_option("#filter-recency", "all")
     page.locator("#filter-terminal").check()
-    page.wait_for_timeout(400)
+    # Nodes render synchronously once the filters above are applied — wait
+    # for the first one rather than for a fixed delay.
+    page.wait_for_selector(".node")
 
 
 class TestRecentChipAndRouteFilterAndNodeLabels:
@@ -455,13 +460,11 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
     def test_route_filter_selecting_hermes_shows_only_hermes_node(self, page: Page, agents_base_url):
         _open_agents2(page, agents_base_url)
         page.select_option("#filter-route", "hermes")
-        page.wait_for_timeout(400)
         expect(page.locator(".node")).to_have_count(1)
 
     def test_route_filter_selecting_ask_shows_only_ask_node(self, page: Page, agents_base_url):
         _open_agents2(page, agents_base_url)
         page.select_option("#filter-route", "ask")
-        page.wait_for_timeout(400)
         expect(page.locator(".node")).to_have_count(1)
 
     def test_no_node_label_is_a_literal_question_mark(self, page: Page, agents_base_url):
@@ -477,8 +480,6 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
 
         _open_agents2(page, agents_base_url)
         expect(page.locator(".node")).to_have_count(7)
-        # Let the force-layout / label-render tick settle before reading text.
-        page.wait_for_timeout(300)
         labels = page.eval_on_selector_all(
             "text.node-label", "els => els.map(e => e.textContent)"
         )
@@ -498,7 +499,7 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
         It returns "" instead, so the node falls through to `label` exactly
         as it already does for a raw-id `short_label`."""
         _open_agents2(page, agents_base_url)
-        page.wait_for_timeout(300)
+        expect(page.locator(".node")).to_have_count(7)
         rows = page.evaluate(
             "() => Array.from(document.querySelectorAll('.node')).map(el => ({"
             "session_id: el.__data__.session_id,"
@@ -517,7 +518,7 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
         which would let the raw id `label` the ingest falls back to shadow
         the far more useful `prompt_preview`."""
         _open_agents2(page, agents_base_url)
-        page.wait_for_timeout(300)
+        expect(page.locator(".node")).to_have_count(7)
         rows = page.evaluate(
             "() => Array.from(document.querySelectorAll('.node')).map(el => ({"
             "session_id: el.__data__.session_id,"
@@ -537,7 +538,7 @@ class TestRecentChipAndRouteFilterAndNodeLabels:
         that raw id and must fall through to the next real candidate
         (`model_label` here, since there's no `prompt_preview`)."""
         _open_agents2(page, agents_base_url)
-        page.wait_for_timeout(300)
+        expect(page.locator(".node")).to_have_count(7)
         rows = page.evaluate(
             "() => Array.from(document.querySelectorAll('.node')).map(el => ({"
             "session_id: el.__data__.session_id,"
@@ -678,7 +679,9 @@ def _open_agents3(page: Page, base_url):
     page.wait_for_selector("#filter-route")
     page.select_option("#filter-recency", "all")
     page.locator("#filter-terminal").check()
-    page.wait_for_timeout(400)
+    # Nodes render synchronously once the filters above are applied — wait
+    # for the first one rather than for a fixed delay.
+    page.wait_for_selector(".node")
 
 
 class TestSearchDropdownRawIdGuard:
@@ -820,7 +823,9 @@ def _open_agents4(page: Page, base_url, search_matches=None):
     page.wait_for_selector("#filter-route")
     page.select_option("#filter-recency", "all")
     page.locator("#filter-terminal").check()
-    page.wait_for_timeout(400)
+    # Nodes render synchronously once the filters above are applied — wait
+    # for the first one rather than for a fixed delay.
+    page.wait_for_selector(".node")
 
 
 class TestSearchDropdownLabelSourcePrecedence:
@@ -865,7 +870,6 @@ class TestSearchDropdownLabelSourcePrecedence:
         ]
         _open_agents4(page, agents_base_url, search_matches=matches)
         page.locator("#search-input").fill("zz")
-        page.wait_for_timeout(400)
         results = page.locator(".search-result")
         expect(results).to_have_count(2)
         titles = results.locator(".sr-name").all_inner_texts()
@@ -880,7 +884,6 @@ class TestSearchDropdownLabelSourcePrecedence:
         ]
         _open_agents4(page, agents_base_url, search_matches=matches)
         page.locator("#search-input").fill("llm-short")
-        page.wait_for_timeout(400)
         result = page.locator(".search-result", has_text="dropdowntest-llm-short")
         expect(result).to_be_visible()
         name_el = result.locator(".sr-name")

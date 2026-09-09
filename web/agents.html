@@ -384,6 +384,15 @@
     pointer-events: none;
     user-select: none;
   }
+  /* `updateLabelLegibility` (web/agents/graph.js) counter-scales each
+     label's own font-size to hold it at a legible on-screen size across
+     most zoom levels; past a point no reasonable font-size compensates
+     without the labels themselves overlapping and cluttering a dense,
+     zoomed-far-out graph, so it hides them entirely instead — the hover
+     card still names a node in this state. */
+  #graph-svg .nodes.labels-below-legible .node-label {
+    display: none;
+  }
   /* Pulse animation for actively-writing nodes (last 60s of activity).
      White border that alternates thick / thin via CSS keyframe — no JS
      polling required. */
@@ -720,6 +729,23 @@
     color: var(--text-secondary);
   }
   .pp-empty { color: var(--text-dim); font-style: italic; }
+  /* The shared action row (web/agents/session_actions.js's
+     `renderActionRow`) mounts here — `float:right` positions this whole
+     container next to the close button instead of escaping into the rest
+     of the header (a floated box can still use `display:flex`
+     internally). `flex-wrap` is what actually lays the row out: the
+     Board drawer's own action-row container (`.drawer-actions`) is flex
+     too, so the two surfaces wrap and place a disabled action's reason
+     text (`.drawer-field-reason`) the same way — the row can hold every
+     card-only action a card-linked panel offers, not just the three
+     CLI-only buttons (`.panel-kill`/`.panel-resume`/`.panel-focus`). */
+  .panel-header-actions {
+    float: right;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+  }
   .panel-close {
     background: none;
     border: none;
@@ -784,6 +810,11 @@
     display: flex;
     align-items: center;
     gap: 0.4rem;
+    /* This is a flex item of the action row it's a sibling of
+       (`.panel-header-actions` / `.drawer-actions`, both flex-wrap) —
+       `flex-basis: 100%` forces it onto its own line below the buttons
+       regardless of exactly where in the row Resume's button lands. */
+    flex-basis: 100%;
   }
   .resume-command[hidden] { display: none; }
   .resume-command code {
@@ -1235,7 +1266,13 @@
      save failure. --text-secondary (5.39:1 on this drawer's background)
      rather than --text-dim (2.77:1) — this text is the only explanation
      the operator gets for a refused action, so it needs to clear WCAG AA. */
-  .drawer-field-reason { color: var(--text-secondary); font-size: 0.75rem; margin-top: 0.3rem; }
+  /* This is a flex item of the action row it's a sibling of
+     (`.panel-header-actions` / `.drawer-actions`, both flex-wrap — see
+     .panel-header-actions below) — `flex-basis: 100%` forces it onto its
+     own line below the buttons rather than sharing a line with them,
+     where a disabled button's reason text would otherwise collide with
+     whatever follows the row. */
+  .drawer-field-reason { color: var(--text-secondary); font-size: 0.75rem; margin-top: 0.3rem; flex-basis: 100%; }
   .drawer-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.75rem; }
   .drawer-action {
     background: var(--bg-card);
@@ -1453,15 +1490,17 @@
     graphChips.hidden = name !== 'graph';
     if (name === 'graph' && !graphInitialized) {
       graphInitialized = true;
-      initGraph();
+      initGraph(boardApi);
     }
   }
 
   tabButtons.forEach(btn => btn.addEventListener('click', () => activateTab(btn.dataset.tab)));
 
   // Board is the primary view — boots immediately. The Graph tab's snapshot
-  // fetch + SSE stream only start once the operator opens it.
-  initBoard();
+  // fetch + SSE stream only start once the operator opens it; `boardApi`
+  // lets its side panel find a session's linked card without a second
+  // `/api/agents/board` fetch.
+  const boardApi = initBoard();
 </script>
 </body>
 </html>

@@ -1242,6 +1242,61 @@ class TestDragThenClick:
         expect(page.locator(".drawer-title")).to_have_value("Investigate outage")
 
 
+def _hold_task_field_puts(page: Page, task_puts: list, board_state: dict):
+    """Intercept `PUT /api/tasks/{id}` ahead of `_stub_routes`'s generic
+    handler and hold each one un-fulfilled until the test releases it —
+    lets a test keep a picker save "in flight" for as long as it needs
+    before deciding whether it lands or is rejected, rather than
+    resolving synchronously the way the generic stub does. Registered
+    after `_open_board`, so Playwright tries it first (the most recently
+    registered matching handler runs first); every request the handler
+    itself doesn't hold falls through to the generic stub via
+    `route.fallback()`.
+
+    Returns `(held, release)`: `held` is a list of `(route, task_id,
+    body)` tuples, one per PUT that arrived, in arrival order — a test
+    reads its length to prove a save actually reached the network before
+    driving the race it wants. `release(index, status=200, detail=None)`
+    fulfills that held PUT — a 200 also merges `body["fields"]` into
+    `board_state` the same way the generic stub does, so a later
+    `GET /api/agents/board` (a save's own `onSaved` callback triggers a
+    `fetchBoard()`) reflects it; any other status returns `{"detail":
+    ...}` without mutating the board, mirroring a rejected save."""
+    held: list = []
+
+    def handler(route):
+        req = route.request
+        match = re.search(r"/api/tasks/([^/]+)$", req.url)
+        if not (match and req.method == "PUT"):
+            route.fallback()
+            return
+        body = json.loads(req.post_data or "{}")
+        task_puts.append(body)
+        held.append((route, match.group(1), body))
+
+    page.route("**/api/tasks/**", handler)
+
+    def release(index=0, *, status=200, detail=None):
+        route, task_id, body = held[index]
+        if status == 200:
+            if "fields" in body and isinstance(body["fields"], dict):
+                for cards in board_state["lanes"].values():
+                    for card in cards:
+                        if card["id"] != task_id:
+                            continue
+                        fields = card.setdefault("fields", {})
+                        for key, value in body["fields"].items():
+                            if value is None:
+                                fields.pop(key, None)
+                            else:
+                                fields[key] = value
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": task_id}))
+        else:
+            route.fulfill(status=status, content_type="application/json", body=json.dumps({"detail": detail or "boom"}))
+
+    return held, release
+
+
 class TestAssignmentPickers:
     """#859: web/agents/assignment.js's model/effort/host pickers mounted
     into the task drawer. t7 (assignee claude, lane Assigned) is the fixture
@@ -1484,6 +1539,618 @@ class TestAssignmentPickers:
         expect(page.locator(".drawer-assignment")).to_have_count(0)
         expect(page.locator(".assignment-row")).to_have_count(0)
         expect(page.get_by_role("button", name="Open")).to_have_count(0)
+
+    def test_drawer_rebuild_skipped_while_picker_save_in_flight_then_converges_once_it_settles(self, page: Page, agents_base_url):
+        """A board frame that would otherwise rebuild the open drawer
+        (updateOpenDrawer's own SSE-poll path) skips the remount while a
+        picker save is still in flight — remounting the model/effort/host
+        pickers from a card snapshot that predates the save would show the
+        pre-save value and let the next picker change resend it, silently
+        discarding the committed one. The skip never advances
+        `openCardSnapshot`, so it is self-healing: the next board refresh
+        re-diffs against the original, unadvanced snapshot and rebuilds for
+        real once the save settles. Holds the effort PUT open with
+        `_hold_task_field_puts` so the save is provably still outstanding
+        when the frame lands, then releases it to prove convergence rather
+        than asserting only the suppression."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_stream_frames: list[str] = []
+        task_puts: list = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state, task_puts=task_puts,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        notes = page.locator(".drawer-notes")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+
+        effort_select.select_option("high")  # select_option blurs afterward, so !focused holds
+        expect(effort_select).to_have_value("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+        assert held[0][2]["fields"]["effort"] == "high"
+
+        # A frame lands while that save is still in flight, changing the
+        # OPEN card's notes — a DRAWER_EDITABLE_FIELDS field, so it would
+        # otherwise make updateOpenDrawer rebuild the whole drawer and
+        # remount the pickers from `fields.effort` exactly as the server
+        # still has it: unset, the value the operator moved away from. A
+        # tag flip on t1 (a different, closed card) is the drawer-
+        # independent proof the frame was actually delivered.
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["notes"] = "updated while the effort save was in flight"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text("urgent", timeout=5000)
+
+        # The in-flight save's own choice still shows — not reverted to
+        # the stale pre-save value by the skipped frame — and the
+        # notes field, part of the same skipped rebuild, still shows its
+        # pre-frame value rather than a half-applied one.
+        expect(effort_select).to_have_value("high")
+        expect(notes).to_have_value("")
+        assert len(task_puts) == 1  # no resend of a reverted value
+
+        # Releasing the held save settles it. `onSaved`'s own
+        # `fetchBoard()` re-diffs against the ORIGINAL (never-advanced)
+        # snapshot, sees the notes change the skip left unapplied, and
+        # rebuilds for real — the drawer converges on the server's actual
+        # state instead of staying stuck at its pre-save contents.
+        release(0)
+        expect(notes).to_have_value("updated while the effort save was in flight", timeout=5000)
+        expect(effort_select).to_have_value("high")
+        assert len(task_puts) == 1  # convergence rebuilds the drawer, it does not resend a PUT
+
+    def test_drawer_rebuild_applies_normally_from_sse_frame_with_no_save_in_flight(self, page: Page, agents_base_url):
+        """Positive counterpart to the deferred-rebuild test above,
+        guarding against over-correction: with no picker save in flight, a
+        board frame that changes a watched field on the open card still
+        rebuilds the drawer normally, including remounting the pickers
+        with a genuinely fresh field value."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_stream_frames: list[str] = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        notes = page.locator(".drawer-notes")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+        expect(effort_select).to_have_value("")
+
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["notes"] = "changed elsewhere, no save in flight"
+                card["fields"] = {"effort": "max"}
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        expect(notes).to_have_value("changed elsewhere, no save in flight", timeout=5000)
+        expect(page.locator(".drawer-assignment [data-field='effort']")).to_have_value("max")
+
+    def test_assignee_change_does_not_clobber_an_in_flight_picker_save(self, page: Page, agents_base_url):
+        """AC3's other rebuild path: the drawer's own Assignee select
+        calls renderDrawer(fresh) once its own moveCard PUT succeeds — a
+        remount that must not re-seed the model/effort/host pickers from a
+        card snapshot that predates a picker save still in flight.
+        moveCard PUTs the lane endpoint, not /api/tasks/{id}, so it isn't
+        held by `_hold_task_field_puts` and completes normally; the
+        rebuild instead defers until the held picker save settles, then
+        re-fetches the board before rebuilding — at settlement `findCard`
+        would still return the pre-save card. Drives the Assignee select
+        via `focus()` + a dispatched `change` (not `select_option`, which
+        blurs) so it keeps focus exactly as a real mouse pick does — the
+        same condition that blocks `updateOpenDrawer`'s own poll path and
+        is why the explicit rebuild is needed at all."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-sonnet-5"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        expect(model_select.locator("option")).to_have_count(3)
+        expect(model_select).to_have_value("claude-sonnet-5")
+
+        effort_select.select_option("high")
+        expect(effort_select).to_have_value("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'local'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        assert lane_calls == [{"lane": "assigned", "assignee": "local"}]
+
+        # The Assignee select reflects the operator's direct choice
+        # regardless of any drawer remount.
+        expect(page.locator(".drawer-assignee")).to_have_value("local")
+        # The still-in-flight effort save's own choice survives — the
+        # remount this assignee change would otherwise trigger did not
+        # re-seed the effort picker from the stale, pre-save snapshot.
+        expect(effort_select).to_have_value("high")
+        assert len(task_puts) == 1  # no resend of a reverted value
+
+        # Releasing the held save settles it: the deferred rebuild fires,
+        # re-fetches the board, and remounts the pickers for the card's
+        # ACTUAL current engine ("local") — no model or host picker and no
+        # Open action, unlike the "claude" controls still on screen a
+        # moment ago. "claude-sonnet-5" belongs only to claude's catalog,
+        # so the remount drops it rather than carrying it onto "local".
+        release(0)
+        expect(page.locator(".drawer-assignment [data-row='model']")).to_be_hidden(timeout=5000)
+        expect(page.locator(".drawer-assignment [data-row='host']")).to_be_hidden()
+        expect(page.locator(".drawer-assignment [data-row='effort']")).to_be_visible()
+        expect(page.get_by_role("button", name="Open")).to_have_count(0)
+        expect(page.locator(".drawer-assignment [data-field='model']")).to_have_value("")
+
+        # The next picker save carries the dropped model as null, not the
+        # stale claude value — the direct proof that the old engine's
+        # model never rides onto the new engine's next save.
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        effort_select.select_option("max")
+        _wait_for(lambda: len(task_puts) == 2, page=page)
+        assert task_puts[1] == {
+            "fields": {"model": None, "effort": "max", "host": None, "assigned_by": "board"}
+        }
+
+    def test_rejected_assignee_change_during_in_flight_picker_save_snaps_select_back(self, page: Page, agents_base_url):
+        """D1: a rejected Assignee change during an in-flight picker save
+        must not leave the rejected choice on screen for the life of the
+        drawer. Nothing was persisted, so the failure branch snaps the
+        select back to the card's actual assignee directly rather than
+        rebuilding the whole drawer — a rebuild while the picker save is
+        still outstanding would re-seed the model/effort/host pickers from
+        the pre-save snapshot, which is exactly the hazard the in-flight
+        guard exists to avoid."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(
+            page, agents_base_url, board_state=board_state, task_puts=task_puts,
+            lane_calls=lane_calls, lane_status_code=[409],
+        )
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        assignee_select = page.locator(".drawer-assignee")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+        expect(assignee_select).to_have_value("claude")
+
+        effort_select.select_option("high")
+        expect(effort_select).to_have_value("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        assignee_select.select_option("codex")
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        assert lane_calls == [{"lane": "assigned", "assignee": "codex"}]
+
+        # The lane move was rejected and nothing was persisted — the
+        # select reads the card's actual, unchanged assignee, not the
+        # rejected pick, and exactly one toast reports the failure.
+        expect(assignee_select).to_have_value("claude")
+        expect(page.locator(".toast.error")).to_have_count(1)
+        # The still-in-flight effort save's own choice survives — no
+        # rebuild happened on the failure path to disturb it.
+        expect(effort_select).to_have_value("high")
+
+        release(0)
+        expect(assignee_select).to_have_value("claude")
+        expect(effort_select).to_have_value("high")
+        fields_puts = [p for p in task_puts if "fields" in p]
+        assert len(fields_puts) == 1  # no resend triggered by the failed assignee change
+
+    def test_assignee_change_waits_for_a_picker_save_queued_after_it_before_rebuilding(self, page: Page, agents_base_url):
+        """A picker save that starts AFTER the assignee change's deferral is
+        armed must still be waited for, not just the one already in flight
+        when the deferral armed. Hold the effort save, change the assignee
+        (arming the deferral against that outstanding save), then change
+        host while effort is still held — host's own save queues behind
+        it and its PUT reaches the network only once effort settles.
+        Releasing effort alone must not let the deferred rebuild paint the
+        pre-host snapshot over the committed host value; it must keep
+        waiting until host's save settles too, then reflect it — and a
+        following save must carry the committed host forward rather than
+        resending the stale one."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"host": "desktop-box"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        host_select = page.locator(".drawer-assignment [data-field='host']")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+        expect(host_select).to_have_value("desktop-box")
+
+        effort_select.select_option("max")
+        _wait_for(lambda: len(held) == 1, page=page)
+        assert held[0][2]["fields"]["effort"] == "max"
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        # Queued behind the still-held effort save — its own PUT hasn't
+        # reached the network yet.
+        host_select.select_option("build-box-2")
+        expect(host_select).to_have_value("build-box-2")
+        page.wait_for_timeout(150)
+        assert len(held) == 1, held  # host's save is still queued, not sent
+
+        release(0)  # effort settles
+        _wait_for(lambda: len(held) == 2, page=page)
+        assert held[1][2]["fields"]["host"] == "build-box-2"
+        release(1)  # host settles
+
+        # The committed host survives — the deferred rebuild waited for
+        # both saves, not just the first, before re-seeding the pickers.
+        expect(host_select).to_have_value("build-box-2", timeout=5000)
+        expect(effort_select).to_have_value("max")
+
+        # A following save carries the committed host forward, not the
+        # pre-save snapshot's value.
+        effort_select.select_option("high")
+        _wait_for(lambda: len(task_puts) == 3, page=page)
+        assert task_puts[2]["fields"]["host"] == "build-box-2"
+
+    def test_deferred_rebuild_fires_with_the_assignee_select_still_focused(self, page: Page, agents_base_url):
+        """Positive companion to the focus-guard tests below: a native
+        <select> keeps focus after firing its own change event, exactly
+        like the assignee select does once this handler's own moveCard
+        call resolves. The focus guard must not treat a focused select as an
+        active edit blocking the rebuild — a select holds no uncommitted
+        content a rebuild can destroy, and blocking on it would leave the
+        model/effort/host rows this deferral exists to update stuck on
+        the old assignee's chrome."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+
+        effort_select.select_option("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'local'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        expect(page.locator(".drawer-assignee")).to_be_focused()
+
+        release(0)
+
+        # The rebuild fires despite the select still holding focus — model
+        # and host rows hide and Open disappears for "local", the round-1
+        # convergence this deferral exists to preserve.
+        expect(page.locator(".drawer-assignment [data-row='model']")).to_be_hidden(timeout=5000)
+        expect(page.locator(".drawer-assignment [data-row='host']")).to_be_hidden()
+        expect(page.get_by_role("button", name="Open")).to_have_count(0)
+
+    def test_deferred_rebuild_fires_with_the_assignee_select_still_focused_for_a_rows_keeping_engine(
+        self, page: Page, agents_base_url,
+    ):
+        """Companion to the test above for an engine whose picker rows stay
+        visible on assignment — codex keeps model/effort/host visible
+        (unlike local, which hides model and host), so this proves the
+        paint remounts the picker CONTENTS (a fresh catalog, a dropped
+        foreign model), not just row visibility, while the assignee select
+        still holds focus."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-opus-5", "effort": "medium"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        expect(model_select.locator("option")).to_have_count(3)
+
+        effort_select.select_option("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        expect(page.locator(".drawer-assignee")).to_be_focused()
+
+        release(0)
+
+        # Rows stay visible for codex, but the catalog remounts under the
+        # focused select — claude-opus-5 belongs only to claude's catalog.
+        expect(page.locator(".drawer-assignment [data-row='model']")).to_be_visible(timeout=5000)
+        expect(page.locator(".drawer-assignment [data-row='host']")).to_be_visible()
+        expect(model_select.locator("option")).to_have_count(2)
+        expect(model_select).to_have_value("")
+        expect(page.get_by_role("button", name="Open")).to_have_count(1)
+
+    def test_deferred_rebuild_preserves_a_focused_text_edits_value_focus_and_caret_across_its_single_paint(
+        self, page: Page, agents_base_url,
+    ):
+        """The deferred rebuild paints exactly once, as soon as the
+        in-flight picker save settles — it never waits for a text control
+        to lose focus first. A focused textarea holds uncommitted
+        keystrokes an innerHTML replacement would otherwise destroy, so
+        board.js captures the control's value and selection range
+        immediately before the repaint and restores them into the rebuilt
+        drawer's matching control afterward. The captured control's own
+        blur still fires during the replacement, so its normal save
+        handler runs and the typed text reaches the vault."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-opus-5", "effort": "medium", "host": "desktop-box"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        notes = page.locator(".drawer-notes")
+        expect(model_select.locator("option")).to_have_count(3)
+
+        effort_select.select_option("max")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        notes.click()
+        notes.type("ssh key rotated, retry after 18:00")
+        notes.evaluate("el => el.setSelectionRange(4, 7)")  # caret over "key"
+
+        release(0)  # the effort save settles -- the deferred rebuild paints now
+
+        # The rebuild's own repaint blurs the pre-existing notes control,
+        # which fires its own save with the typed text -- proof the text
+        # reaches the vault, not just that it survives on screen.
+        _wait_for(lambda: len(held) == 2, page=page)
+        notes_index = next(i for i, (_, _, body) in enumerate(held) if "notes" in body)
+        assert held[notes_index][2]["notes"] == "ssh key rotated, retry after 18:00"
+        for cards in board_state["lanes"].values():
+            for card in cards:
+                if card["id"] == "t7":
+                    card["notes"] = held[notes_index][2]["notes"]
+        release(notes_index)
+
+        # The rebuilt drawer's notes control carries the same text,
+        # selection range, and focus forward across the repaint.
+        expect(notes).to_have_value("ssh key rotated, retry after 18:00")
+        expect(notes).to_be_focused()
+        assert notes.evaluate("el => [el.selectionStart, el.selectionEnd]") == [4, 7]
+
+        # The picker rebuild converges in the SAME paint — claude-opus-5
+        # is foreign to codex's catalog.
+        expect(model_select.locator("option")).to_have_count(2)
+        expect(model_select).to_have_value("")
+
+    def test_deferred_rebuild_does_not_paint_the_previous_card_after_switching_cards(self, page: Page, agents_base_url):
+        """The deferred rebuild closes over the card it was armed for — it
+        must not paint that card into the drawer once the operator has
+        switched to another one while it was waiting."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+
+        effort_select.select_option("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        # Switch to a different card while the deferral is still pending.
+        # The drawer's own backdrop covers the board while it's open, so
+        # switching cards is close-then-open, exactly like an operator
+        # closing one card's drawer and opening another's.
+        page.locator("#board-drawer-backdrop").click(position={"x": 10, "y": 10})
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-title")).to_have_value("Ship the release")
+
+        release(0)
+        page.wait_for_timeout(300)  # the deferred rebuild settles and would land here if unguarded
+
+        # Still t2 — the deferred rebuild armed for t7 never painted over it.
+        expect(page.locator(".drawer-title")).to_have_value("Ship the release")
+        expect(page.locator(".drawer-assignee")).to_have_value("me")
+
+    def test_deferred_rebuild_does_not_repopulate_a_closed_drawer(self, page: Page, agents_base_url):
+        """The deferred rebuild must not reopen a drawer the operator has
+        since closed — it repopulates hidden markup for no one and
+        advances `openCardSnapshot` while nothing is open."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        expect(page.locator(".drawer-assignment [data-field='model'] option")).to_have_count(3)
+
+        effort_select.select_option("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        page.locator('[data-action="drawer-close"]').click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+
+        release(0)
+        page.wait_for_timeout(300)  # the deferred rebuild settles and would land here if unguarded
+
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+        expect(page.locator(".drawer-title")).to_have_count(0)
+
+    def test_keyboard_pick_right_after_tags_blur_reads_the_converged_engines_catalog(
+        self, page: Page, agents_base_url,
+    ):
+        """The deferred rebuild is not gated on focus leaving a text
+        control — it starts the instant the in-flight picker save settles,
+        so a keyboard pick that lands in the same turn as the focus move
+        still reads the converged engine. Hold the effort save, change the
+        assignee to codex, click into Tags with no typing, release the
+        held save, and once its own round trip clears, Tab from Tags to
+        the Model select and press the down arrow with no pause between
+        the two key presses. The resulting PUT must carry a model from
+        codex's own catalog, never claude's, and the select's option list
+        itself must be codex's, not a stale holdover."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-opus-5", "effort": "medium", "host": "desktop-box"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        model_select = page.locator(".drawer-assignment [data-field='model']")
+        tags = page.locator(".drawer-tags")
+        expect(model_select).to_have_value("claude-opus-5")
+
+        effort_select.select_option("max")
+        _wait_for(lambda: len(held) == 1, page=page)
+        assert held[0][2]["fields"]["effort"] == "max"
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        tags.click()  # no typing -- Tags is the last text field before the pickers in tab order
+        expect(tags).to_be_focused()
+
+        release(0)  # the effort save settles; the deferred rebuild fires now
+        # A held route's fulfillment is delivered to the page over a
+        # separate CDP round trip from the next call below -- this gives
+        # that delivery, and the settle chain it triggers, the same
+        # ordinary breathing room a real network response would have
+        # before the operator's own, independent next key press. The
+        # actual race under test -- Tab then the arrow key -- stays
+        # back-to-back with nothing in between.
+        page.wait_for_timeout(50)
+        page.keyboard.press("Tab")  # Tags -> Model
+        page.keyboard.press("ArrowDown")  # picks codex's one real model off whatever list is live -- no pause
+
+        # Tab's own blur also fires the Tags field's unconditional
+        # re-save, alongside whatever the arrow key produced -- pull out
+        # whichever held entry actually carries fields (Tags' body
+        # carries none) rather than assuming a fixed position. The
+        # deferred rebuild's own repaint cannot finish converging the
+        # option list while a picker save it doesn't yet know the outcome
+        # of sits held, so wait for either that repaint or a picker save
+        # to show up before inspecting either.
+        _wait_for(
+            lambda: page.locator(".drawer-assignment [data-field='model'] option").count() == 2
+            or any(i > 0 and "fields" in body for i, (_, _, body) in enumerate(held)),
+            page=page,
+        )
+        fields_entries = [(i, body) for i, (_, _, body) in enumerate(held) if i > 0 and "fields" in body]
+        for i, body in fields_entries:
+            assert body["fields"]["model"] == "gpt-5.5", held  # codex's model, never claude's
+            release(i)
+
+        # The option list itself is codex's — a test asserting only the
+        # PUT body could still pass against a stale claude list that
+        # happened to share an option value.
+        expect(model_select.locator("option")).to_have_count(2, timeout=5000)
+        expect(model_select.locator("option").nth(1)).to_have_text("GPT-5.5")
+        if fields_entries:
+            expect(model_select).to_have_value("gpt-5.5")
+
+    def test_open_button_and_pickers_converge_immediately_once_the_deferral_settles(
+        self, page: Page, agents_base_url,
+    ):
+        """`renderDrawerActions` (the Open button) repaints in the same
+        drawer rebuild the picker rows come from, and that rebuild no
+        longer waits for the operator to move focus onto a picker first —
+        it paints the instant the held save settles, with a text control
+        (notes) still focused throughout."""
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-opus-5", "effort": "medium", "host": "desktop-box"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        notes = page.locator(".drawer-notes")
+        expect(page.get_by_role("button", name="Open")).to_have_count(1)
+
+        effort_select.select_option("max")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'local'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        notes.click()  # a focused text control does not block the paint
+        release(0)  # the effort save settles -- the rebuild paints now
+
+        # "local" never shows Open -- converges without any further
+        # operator action on a picker.
+        expect(page.get_by_role("button", name="Open")).to_have_count(0, timeout=5000)
 
 
 class TestLaneFilterMultiSelect:
