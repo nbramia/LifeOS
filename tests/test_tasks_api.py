@@ -172,9 +172,9 @@ class TestTasksAPI:
 
     # --- DRY RUN (#138) ---
 
-    def test_dry_run_with_agent_tag_returns_preflight_preview(self, client, mock_task_manager):
-        """dry_run=true on an #agent task runs preflight and returns the
-        routing decision + cost estimate WITHOUT creating the task."""
+    def test_dry_run_with_engine_tag_returns_preflight_preview(self, client, mock_task_manager):
+        """dry_run=true on an engine-assigned task runs preflight and returns
+        the routing decision + cost estimate WITHOUT creating the task."""
         from api.services.agent_worker.preflight import (
             PreflightBudget,
             PreflightResult,
@@ -192,7 +192,7 @@ class TestTasksAPI:
         with patch("api.services.agent_worker.preflight.run_preflight", return_value=fake_result):
             response = client.post("/api/tasks", json={
                 "description": "draft my Q4 review",
-                "tags": ["agent"],
+                "tags": ["local"],
                 "dry_run": True,
             })
         assert response.status_code == 200
@@ -228,7 +228,7 @@ class TestTasksAPI:
         with patch("api.services.agent_worker.preflight.run_preflight", return_value=fake_result):
             response = client.post("/api/tasks", json={
                 "description": "draft my Q4 review",
-                "tags": ["agent", "cloud"],
+                "tags": ["cloud"],
                 "dry_run": True,
             })
         assert response.status_code == 200
@@ -261,14 +261,14 @@ class TestTasksAPI:
         with patch("api.services.agent_worker.preflight.run_preflight", return_value=fake_result):
             response = client.post("/api/tasks", json={
                 "description": "draft my Q4 review",
-                "tags": ["agent", "cloud"],
+                "tags": ["cloud"],
                 "dry_run": True,
             })
         assert response.status_code == 200
         assert response.json()["estimated_dollars"] == 0.0
 
-    def test_dry_run_without_agent_tag_falls_through_to_create(self, client, mock_task_manager):
-        """dry_run is a no-op for non-#agent tasks — the task is still created."""
+    def test_dry_run_without_engine_tag_falls_through_to_create(self, client, mock_task_manager):
+        """dry_run is a no-op without an engine/consent tag — the task is still created."""
         response = client.post("/api/tasks", json={
             "description": "shopping list",
             "dry_run": True,
@@ -277,12 +277,35 @@ class TestTasksAPI:
         # Falls through to real task creation.
         mock_task_manager.create.assert_called_once()
 
+    def test_dry_run_bare_agent_tag_preserves_legacy_preview(self, client, mock_task_manager):
+        """Legacy queue-only tasks remain both claimable and previewable."""
+        from api.services.agent_worker.preflight import PreflightBudget, PreflightResult, ROUTE_LOCAL
+
+        fake_result = PreflightResult(
+            budget=PreflightBudget(wall_seconds=60, max_tokens=1_000, max_dollars=0.1),
+            routing=ROUTE_LOCAL,
+            routing_reason="default route",
+            expected_output="text",
+            ambiguity=None,
+            sane=True,
+            sane_reason="",
+        )
+        with patch("api.services.agent_worker.preflight.run_preflight", return_value=fake_result):
+            response = client.post("/api/tasks", json={
+                "description": "legacy handoff",
+                "tags": ["agent"],
+                "dry_run": True,
+            })
+        assert response.status_code == 200
+        assert response.json()["dry_run"] is True
+        mock_task_manager.create.assert_not_called()
+
     def test_dry_run_false_creates_task_normally(self, client, mock_task_manager):
-        """dry_run=false on an #agent task still creates it (the worker
-        picks it up later and does its own preflight)."""
+        """dry_run=false on an engine-assigned task still creates it (the
+        worker picks it up later and does its own preflight)."""
         response = client.post("/api/tasks", json={
             "description": "dispatch this",
-            "tags": ["agent"],
+            "tags": ["local"],
             "dry_run": False,
         })
         assert response.status_code == 200
@@ -791,6 +814,30 @@ class TestTasksAPI:
         mock_task_manager.swap_tag.side_effect = TaskConflictError("too many conflicting writes")
         response = client.post("/api/tasks/abc12345/swap-tag?from=agent&to=agent-running")
         assert response.status_code == 409
+
+    def test_claim_agent_uses_atomic_eligibility_checked_write(self, client, mock_task_manager):
+        mock_task_manager.claim_for_agent.return_value = (True, False)
+        response = client.post("/api/tasks/abc12345/claim-agent")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "claimed": True,
+            "consumed_queue_tag": False,
+            "reason": None,
+        }
+        kwargs = mock_task_manager.claim_for_agent.call_args.kwargs
+        assert "agent" in kwargs["pickup_tags"]
+        assert "cloud" in kwargs["pickup_tags"]
+        assert "agent-running" in kwargs["exclusion_tags"]
+        assert kwargs["eligible_statuses"] == {"todo", "urgent"}
+
+    def test_claim_agent_reports_stale_candidate_without_mutating(self, client, mock_task_manager):
+        mock_task_manager.claim_for_agent.return_value = (False, False)
+        response = client.post("/api/tasks/abc12345/claim-agent")
+
+        assert response.status_code == 200
+        assert response.json()["claimed"] is False
+        assert response.json()["reason"] == "task is no longer eligible"
 
 
 class TestListTasksParameterDocs:

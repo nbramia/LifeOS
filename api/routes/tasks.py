@@ -10,12 +10,23 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from api.services import human_queue
+from api.services.agent_board import AGENT_ASSIGNEES
 from api.services.agent_worker.session_store import SessionStore
 from api.services.task_manager import get_task_manager, Task, TaskConflictError, VALID_STATUSES
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+
+# Same claim vocabulary the worker fans out on (engine assignees + Managed
+# Agents consent tags). dry_run previews only when the create would be
+# worker-claimable.
+_AGENT_PICKUP_TAGS = frozenset(("agent", *AGENT_ASSIGNEES, "cloud-haiku", "cloud-sonnet"))
+_AGENT_CLAIM_EXCLUSION_TAGS = frozenset({
+    "agent-running", "agent-blocked", "agent-completed",
+    "agent-failed", "agent-budget-exceeded",
+})
+_AGENT_PICKUP_STATUSES = frozenset({"todo", "urgent"})
 
 # Lazy module-level singleton, mirroring api/routes/agents.py's own
 # `_get_session_store()` — needed here to answer "is there actually a live
@@ -67,12 +78,12 @@ class CreateTaskRequest(BaseModel):
     tags: Optional[list[str]] = Field(
         default=None,
         description="List of tags (e.g., ['work', 'urgent']). Add exactly the "
-                    "tags the operator named. A routing tag (agent/local/claude/"
-                    "codex/cloud/cloud-haiku/cloud-sonnet) only if the operator "
-                    "explicitly named that engine — these tags are operator-"
-                    "authority and outrank every routing safeguard, so inventing "
-                    "one injects your own engine preference at the highest-"
-                    "precedence slot.",
+                    "tags the operator named. A routing tag (local/claude/"
+                    "codex/hermes/cloud/cloud-haiku/cloud-sonnet) only if the "
+                    "operator explicitly named that engine — these tags are "
+                    "operator-authority and outrank every routing safeguard, "
+                    "so inventing one injects your own engine preference at "
+                    "the highest-precedence slot.",
     )
     reminder_id: Optional[str] = Field(default=None, description="Associated reminder ID")
     notes: Optional[str] = Field(
@@ -87,11 +98,12 @@ class CreateTaskRequest(BaseModel):
     )
     dry_run: Optional[bool] = Field(
         default=False,
-        description="When true and the task carries the #agent tag, run the "
-                    "Haiku preflight and return the routing + cost estimate "
-                    "without creating the task. Used by prompt-engineering "
-                    "iteration to inspect routing decisions without dispatching "
-                    "a managed session. Costs ~$0.001 for the preflight call.",
+        description="When true and the task carries an engine assignee or "
+                    "Managed Agents consent tag, run the Haiku preflight and "
+                    "return the routing + cost estimate without creating the "
+                    "task. Used by prompt-engineering iteration to inspect "
+                    "routing decisions without dispatching a managed session. "
+                    "Costs ~$0.001 for the preflight call.",
     )
 
 
@@ -125,8 +137,8 @@ class UpdateTaskRequest(BaseModel):
     tags: Optional[list[str]] = Field(
         default=None,
         description="Replaces the task's tag list. Add exactly the tags the "
-                    "operator named. A routing tag (agent/local/claude/codex/"
-                    "cloud/cloud-haiku/cloud-sonnet) only if the operator "
+                    "operator named. A routing tag (local/claude/codex/"
+                    "hermes/cloud/cloud-haiku/cloud-sonnet) only if the operator "
                     "explicitly named that engine — these tags are operator-"
                     "authority and outrank every routing safeguard.",
     )
@@ -204,15 +216,17 @@ class ConflictListResponse(BaseModel):
 async def create_task(request: CreateTaskRequest):
     """Create a new task, or preview its agent routing without creating it.
 
-    When `dry_run=true` and the request carries the #agent tag, the route runs
-    the Haiku preflight classifier and returns the routing decision + cost
-    estimate without persisting a task or dispatching a session. Used by
-    prompt-engineering iteration to inspect routing decisions cheaply
-    (only the preflight call costs anything, ~$0.001).
+    When `dry_run=true` and the request carries an engine assignee or Managed
+    Agents consent tag, the route runs the Haiku preflight classifier and
+    returns the routing decision + cost estimate without persisting a task or
+    dispatching a session. Used by prompt-engineering iteration to inspect
+    routing decisions cheaply (only the preflight call costs anything,
+    ~$0.001).
 
-    For non-#agent tasks (or `dry_run=false`), the task is created normally.
+    Otherwise (no engine/consent tag, or `dry_run=false`), the task is created
+    normally.
     """
-    if request.dry_run and _has_agent_tag(request.tags):
+    if request.dry_run and _has_agent_pickup_tag(request.tags):
         return _build_preflight_preview(request)
     _require_valid_status(request.status)
     manager = get_task_manager()
@@ -236,10 +250,10 @@ async def create_task(request: CreateTaskRequest):
     return TaskResponse.from_task(task)
 
 
-def _has_agent_tag(tags: Optional[list[str]]) -> bool:
+def _has_agent_pickup_tag(tags: Optional[list[str]]) -> bool:
     if not tags:
         return False
-    return any(t.lstrip("#").lower() == "agent" for t in tags)
+    return any(t.lstrip("#").lower() in _AGENT_PICKUP_TAGS for t in tags)
 
 
 def _build_preflight_preview(request: CreateTaskRequest) -> PreflightPreviewResponse:
@@ -504,10 +518,11 @@ async def swap_tag(
 ):
     """Atomically replace one tag with another on a task.
 
-    Used by the external agent worker to claim `#agent` tasks. Returns
-    `{swapped: false}` (with a `reason`) when the task does not exist or
-    `from` is not currently among the task's tags — both indicate the worker
-    should move on to the next candidate rather than retry.
+    Used by the external agent worker for lifecycle tag transitions (e.g.
+    `#agent-running` → `#agent-completed`). Returns `{swapped: false}` (with
+    a `reason`) when the task does not exist or `from` is not currently among
+    the task's tags — both indicate the worker should move on to the next
+    candidate rather than retry.
     """
     manager = get_task_manager()
     if manager.get(task_id) is None:
@@ -517,6 +532,58 @@ async def swap_tag(
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
     return SwapTagResponse(swapped=ok, reason=None if ok else f"tag '{from_tag}' not present")
+
+
+class MutateTagResponse(BaseModel):
+    ok: bool
+    reason: Optional[str] = None
+
+
+class ClaimAgentResponse(BaseModel):
+    claimed: bool
+    consumed_queue_tag: bool = False
+    reason: Optional[str] = None
+
+
+@router.post("/{task_id}/claim-agent", response_model=ClaimAgentResponse)
+async def claim_agent_task(task_id: str):
+    """Atomically claim a currently eligible task for the agent worker."""
+    manager = get_task_manager()
+    if manager.get(task_id) is None:
+        return ClaimAgentResponse(claimed=False, reason="task not found")
+    try:
+        claimed, consumed_queue_tag = manager.claim_for_agent(
+            task_id,
+            pickup_tags=set(_AGENT_PICKUP_TAGS),
+            exclusion_tags=set(_AGENT_CLAIM_EXCLUSION_TAGS),
+            eligible_statuses=set(_AGENT_PICKUP_STATUSES),
+        )
+    except TaskConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return ClaimAgentResponse(
+        claimed=claimed,
+        consumed_queue_tag=consumed_queue_tag,
+        reason=None if claimed else "task is no longer eligible",
+    )
+
+
+@router.post("/{task_id}/remove-tag", response_model=MutateTagResponse)
+async def remove_tag(
+    task_id: str,
+    tag: str = Query(..., description="Tag to remove if present (with or without '#')"),
+):
+    """Atomically remove a tag when present.
+
+    Used by the agent worker to roll back a claim by dropping `#agent-running`.
+    """
+    manager = get_task_manager()
+    if manager.get(task_id) is None:
+        return MutateTagResponse(ok=False, reason="task not found")
+    try:
+        ok = manager.remove_tag_if_present(task_id, tag)
+    except TaskConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return MutateTagResponse(ok=ok, reason=None if ok else f"tag '{tag}' not present")
 
 
 @router.get("/{task_id}", response_model=TaskResponse)
