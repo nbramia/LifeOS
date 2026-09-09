@@ -272,6 +272,22 @@ def _extract_actions(page: Page, container_selector: str):
     return page.eval_on_selector(container_selector, _EXTRACT_JS)
 
 
+def _click_graph_node(page: Page, session_id: str) -> None:
+    page.wait_for_function(
+        """sid => [...document.querySelectorAll('#graph-svg .node')]
+            .some(node => node.__data__ && node.__data__.session_id === sid)""",
+        arg=session_id,
+    )
+    page.evaluate(
+        """sid => {
+            const node = [...document.querySelectorAll('#graph-svg .node')]
+                .find(candidate => candidate.__data__ && candidate.__data__.session_id === sid);
+            node.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }));
+        }""",
+        session_id,
+    )
+
+
 # A rich session+card pair exercising Open, Focus, Resume, Kill (disabled),
 # Answer, Cancel (disabled), and Delete together — Accept/Resolve need
 # different lanes, covered separately below and by TestDecideActions above.
@@ -487,24 +503,7 @@ class TestGraphTabParity:
         page.wait_for_selector("#filter-route")
         page.select_option("#filter-recency", "all")
         page.locator("#filter-terminal").check()
-        page.wait_for_timeout(800)
-
-        clicked = page.evaluate(
-            """
-            (sid) => {
-              const nodes = document.querySelectorAll('#graph-svg .node');
-              for (const n of nodes) {
-                if (n.__data__ && n.__data__.session_id === sid) {
-                  n.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }));
-                  return true;
-                }
-              }
-              return false;
-            }
-            """,
-            session["session_id"],
-        )
-        assert clicked, "graph node for the linked session was never rendered"
+        _click_graph_node(page, session["session_id"])
         page.wait_for_selector('#panel [data-field="actions"] [data-action]')
         graph_actions = _extract_actions(page, '#panel [data-field="actions"]')
 
@@ -570,24 +569,7 @@ class TestGraphPanelCardOnlyHandlersWired:
         page.wait_for_selector("#filter-route")
         page.select_option("#filter-recency", "all")
         page.locator("#filter-terminal").check()
-        page.wait_for_timeout(800)
-
-        clicked = page.evaluate(
-            """
-            (sid) => {
-              const nodes = document.querySelectorAll('#graph-svg .node');
-              for (const n of nodes) {
-                if (n.__data__ && n.__data__.session_id === sid) {
-                  n.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }));
-                  return true;
-                }
-              }
-              return false;
-            }
-            """,
-            session["session_id"],
-        )
-        assert clicked, "graph node for the linked session was never rendered"
+        _click_graph_node(page, session["session_id"])
         page.wait_for_selector('#panel [data-field="actions"] [data-action="open"]')
         page.click('#panel [data-field="actions"] [data-action="open"]')
         page.wait_for_timeout(300)
@@ -689,24 +671,7 @@ class TestGraphTabDeleteUsesFreshCard:
         page.wait_for_selector("#filter-route")
         page.select_option("#filter-recency", "all")
         page.locator("#filter-terminal").check()
-        page.wait_for_timeout(500)
-
-        clicked = page.evaluate(
-            """
-            (sid) => {
-              const nodes = document.querySelectorAll('#graph-svg .node');
-              for (const n of nodes) {
-                if (n.__data__ && n.__data__.session_id === sid) {
-                  n.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }));
-                  return true;
-                }
-              }
-              return false;
-            }
-            """,
-            stale_card["session"]["session_id"],
-        )
-        assert clicked, "graph node for the linked session was never rendered"
+        _click_graph_node(page, stale_card["session"]["session_id"])
         page.wait_for_selector('#panel [data-field="actions"] [data-action="delete"]')
 
         # Deliver the board's live update NOW — after the panel has already
