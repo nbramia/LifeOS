@@ -6,7 +6,7 @@ End-to-end:
   2. User replies (reply-threaded). The listener's deposit hook updates
      pending_questions.answer.
   3. Worker tick scans answered+unprocessed, injects the answer as a user
-     turn, swaps tag back to #agent-running, resumes the local executor.
+     turn, adds `#agent-running` if needed, resumes the local executor.
 
 Also covers `lifeos_agent_user_ask` (agent-initiated clarification) and the
 3-day timeout path.
@@ -24,6 +24,7 @@ from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_BUDGET_EXCEEDED,
+    STATUS_CLAIMED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_RUNNING,
@@ -63,12 +64,45 @@ class FakeApi:
             tags[tags.index(f)] = to
             t["tags"] = tags
             return httpx.Response(200, json={"swapped": True})
+        if request.method == "POST" and path.endswith("/claim-agent"):
+            tid = path.split("/")[-2]
+            t = self.tasks.get(tid)
+            if not t:
+                return httpx.Response(200, json={"claimed": False})
+            tags = list(t.get("tags", []))
+            consumed = "agent" in tags
+            if consumed:
+                tags[tags.index("agent")] = "agent-running"
+            else:
+                tags.append("agent-running")
+            t["tags"] = tags
+            t["status"] = "in_progress"
+            return httpx.Response(200, json={"claimed": True, "consumed_queue_tag": consumed})
+        if request.method == "POST" and path.endswith("/remove-tag"):
+            tid = path.split("/")[-2]
+            tag = request.url.params.get("tag")
+            t = self.tasks.get(tid)
+            if not t or tag not in t.get("tags", []):
+                return httpx.Response(200, json={"ok": False})
+            tags = list(t["tags"])
+            tags.remove(tag)
+            t["tags"] = tags
+            return httpx.Response(200, json={"ok": True})
         if request.method == "PUT" and path.endswith("/complete"):
             tid = path.split("/")[-2]
             t = self.tasks.get(tid)
             if not t:
                 return httpx.Response(404)
             t["status"] = "done"
+            return httpx.Response(200, json=t)
+        if request.method == "PUT" and path.startswith("/api/tasks/"):
+            tid = path.split("/")[-1]
+            t = self.tasks.get(tid)
+            if not t:
+                return httpx.Response(404)
+            body = json.loads(request.content or b"{}")
+            for k, v in body.items():
+                t[k] = v
             return httpx.Response(200, json=t)
         if request.method == "GET" and "/api/tasks/" in path:
             tid = path.split("/")[-1]
@@ -158,7 +192,7 @@ def _local_ok_preflight():
 
 @pytest.mark.unit
 def test_ambiguous_task_sends_clarification_with_tracked_id(tmp_path: Path):
-    api = FakeApi([{"id": "t1", "description": "reply to John", "status": "todo", "tags": ["agent"]}])
+    api = FakeApi([{"id": "t1", "description": "reply to John", "status": "todo", "tags": ["local"]}])
     executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
     w = _make_worker(tmp_path, api, preflight_caller=_ambiguity_preflight(), local_executor=executor)
     w.tick()
@@ -182,7 +216,7 @@ def test_ambiguous_task_sends_clarification_with_tracked_id(tmp_path: Path):
 @pytest.mark.unit
 def test_reply_threaded_answer_resumes_blocked_session(tmp_path: Path):
     """End-to-end: ambiguous → answered → resumed → completed."""
-    api = FakeApi([{"id": "t1", "description": "reply to John", "status": "todo", "tags": ["agent"]}])
+    api = FakeApi([{"id": "t1", "description": "reply to John", "status": "todo", "tags": ["local"]}])
     # First call: returns "ambiguous". After resume, preflight isn't called
     # again — the executor handles the rest.
     executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="emailed Doe"))
@@ -233,7 +267,12 @@ def test_stale_answered_question_doesnt_redeposit(tmp_path: Path):
 
 @pytest.mark.unit
 def test_routing_ask_local_reply_routes_to_local_executor(tmp_path: Path):
-    """Routing-ask resume: user reply 'local' must run the local executor."""
+    """Routing-ask resume: user reply 'local' must run the local executor.
+
+    Ask-routing is only reachable without an engine assignee tag (those
+    force a route in preflight). Drive `_dispatch` on an already-claimed
+    card that carries only `#agent-running`.
+    """
 
     def routing_ask_preflight():
         import json
@@ -246,10 +285,12 @@ def test_routing_ask_local_reply_routes_to_local_executor(tmp_path: Path):
             })
         return _caller
 
-    api = FakeApi([{"id": "t1", "description": "research dolphins", "status": "todo", "tags": ["agent"]}])
+    api = FakeApi([{"id": "t1", "description": "research dolphins",
+                    "status": "in_progress", "tags": [RUNNING_TAG]}])
     executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="ok"))
     w = _make_worker(tmp_path, api, preflight_caller=routing_ask_preflight(), local_executor=executor)
-    w.tick()
+    w.session_store.create(task_id="t1", status=STATUS_CLAIMED)
+    w._dispatch(api.tasks["t1"])
 
     # Task is blocked, routing=ask.
     blocked = w.session_store.list_sessions(status=STATUS_BLOCKED)[0]
@@ -280,10 +321,12 @@ def test_routing_ask_unparseable_reply_reasks(tmp_path: Path):
             })
         return _caller
 
-    api = FakeApi([{"id": "t1", "description": "x", "status": "todo", "tags": ["agent"]}])
+    api = FakeApi([{"id": "t1", "description": "x", "status": "in_progress",
+                    "tags": [RUNNING_TAG]}])
     executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
     w = _make_worker(tmp_path, api, preflight_caller=routing_ask_preflight(), local_executor=executor)
-    w.tick()
+    w.session_store.create(task_id="t1", status=STATUS_CLAIMED)
+    w._dispatch(api.tasks["t1"])
 
     msg_id, _ = w._sent_with_ids[0]
     w.session_store.deposit_answer(msg_id, "yeah whatever you like")
@@ -492,7 +535,7 @@ def test_lifeos_agent_user_ask_fails_when_telegram_unavailable(tmp_path: Path):
 def test_failed_task_registers_followup_and_reply_resumes(tmp_path: Path):
     """A FAILED task's notification is replyable: replying resumes the session,
     swapping the failed tag back to running, and a clean completion follows."""
-    api = FakeApi([{"id": "t1", "description": "do the thing", "status": "todo", "tags": ["agent"]}])
+    api = FakeApi([{"id": "t1", "description": "do the thing", "status": "todo", "tags": ["local"]}])
     executor = _SequenceExecutor([
         ExecutorOutcome(status=STATUS_FAILED, reason="boom"),
         ExecutorOutcome(status=STATUS_COMPLETED, final_text="fixed it"),
@@ -520,7 +563,7 @@ def test_failed_task_registers_followup_and_reply_resumes(tmp_path: Path):
 @pytest.mark.unit
 def test_budget_exceeded_task_registers_followup(tmp_path: Path):
     """BUDGET_EXCEEDED notifications are replyable too."""
-    api = FakeApi([{"id": "t1", "description": "big job", "status": "todo", "tags": ["agent"]}])
+    api = FakeApi([{"id": "t1", "description": "big job", "status": "todo", "tags": ["local"]}])
     executor = _StubExecutor(ExecutorOutcome(status=STATUS_BUDGET_EXCEEDED, reason="out of budget"))
     w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
     w.tick()
@@ -538,7 +581,7 @@ def test_reply_to_non_first_chunk_matches_and_resumes(tmp_path: Path):
 
     Uses a long FAILED reason (the failure body isn't vault-spilled, so it
     actually exceeds one 4096-char chunk)."""
-    api = FakeApi([{"id": "t1", "description": "task", "status": "todo", "tags": ["agent"]}])
+    api = FakeApi([{"id": "t1", "description": "task", "status": "todo", "tags": ["local"]}])
     long_reason = "y" * 9000  # forces the notification body across 3 chunks
     executor = _SequenceExecutor([
         ExecutorOutcome(status=STATUS_FAILED, reason=long_reason),
@@ -668,7 +711,7 @@ def test_operator_session_dispatches_and_registers_followup(tmp_path: Path):
     completion registers a replyable follow-up (Phase 1)."""
     from api.services.agent_worker.operator_spawn import create_operator_session
 
-    api = FakeApi([])  # no #agent vault tasks
+    api = FakeApi([])  # no engine-assigned vault tasks
     executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
     w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
 
@@ -715,11 +758,11 @@ def test_operator_ask_resolution_dispatches_after_reply(tmp_path: Path):
 
 @pytest.mark.unit
 def test_operator_session_coexists_with_agent_task(tmp_path: Path):
-    """An operator spawn and a normal #agent task both run in the same tick
-    without interfering."""
+    """An operator spawn and a normal engine-assigned task both run in the
+    same tick without interfering."""
     from api.services.agent_worker.operator_spawn import create_operator_session
 
-    api = FakeApi([{"id": "t1", "description": "agent task", "status": "todo", "tags": ["agent"]}])
+    api = FakeApi([{"id": "t1", "description": "agent task", "status": "todo", "tags": ["local"]}])
     executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
     w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
 

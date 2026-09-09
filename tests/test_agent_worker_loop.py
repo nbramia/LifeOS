@@ -83,6 +83,36 @@ class FakeApi:
             task["tags"] = tags
             return httpx.Response(200, json={"swapped": True})
 
+        if request.method == "POST" and request.url.path.endswith("/claim-agent"):
+            task_id = request.url.path.split("/")[-2]
+            task = self.tasks.get(task_id)
+            if not task:
+                return httpx.Response(200, json={"claimed": False, "reason": "task not found"})
+            tags = list(task.get("tags", []))
+            pickup = {"agent", "claude", "codex", "hermes", "local", "cloud", "cloud-haiku", "cloud-sonnet"}
+            excluded = {"agent-running", "agent-blocked", "agent-completed", "agent-failed", "agent-budget-exceeded"}
+            if task.get("status") not in {"todo", "urgent"} or not pickup.intersection(tags) or excluded.intersection(tags):
+                return httpx.Response(200, json={"claimed": False, "reason": "task is no longer eligible"})
+            consumed = "agent" in tags
+            if consumed:
+                tags[tags.index("agent")] = "agent-running"
+            else:
+                tags.append("agent-running")
+            task["tags"] = tags
+            task["status"] = "in_progress"
+            return httpx.Response(200, json={"claimed": True, "consumed_queue_tag": consumed})
+
+        if request.method == "POST" and request.url.path.endswith("/remove-tag"):
+            task_id = request.url.path.split("/")[-2]
+            tag = request.url.params.get("tag")
+            task = self.tasks.get(task_id)
+            if not task or tag not in task.get("tags", []):
+                return httpx.Response(200, json={"ok": False, "reason": "tag not present"})
+            tags = list(task["tags"])
+            tags.remove(tag)
+            task["tags"] = tags
+            return httpx.Response(200, json={"ok": True})
+
         if request.method == "PUT" and request.url.path.endswith("/complete"):
             task_id = request.url.path.split("/")[-2]
             task = self.tasks.get(task_id)
@@ -111,6 +141,15 @@ class FakeApi:
             return httpx.Response(200, json=task)
 
         return httpx.Response(404)
+
+
+@pytest.fixture(autouse=True)
+def _clear_agent_default_route(monkeypatch):
+    """Host `.env` can set LIFEOS_AGENT_DEFAULT_ROUTE; that demotes
+    ambiguity/non-fatal sanity and would make "must block" tests flaky.
+    Tests that need a default route monkeypatch it back on explicitly."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "agent_default_route", "")
 
 
 def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_executor,
@@ -188,8 +227,8 @@ def test_worker_picks_up_urgent_status_tasks_too(tmp_path: Path):
     the urgent status signals high-priority work the operator wants run
     sooner, not 'skip the agent.'"""
     api = FakeApi(tasks=[
-        {"id": "t-todo",   "description": "ordinary task",  "status": "todo",   "tags": ["agent", "local"]},
-        {"id": "t-urgent", "description": "urgent task",    "status": "urgent", "tags": ["agent", "local"]},
+        {"id": "t-todo",   "description": "ordinary task",  "status": "todo",   "tags": ["local"]},
+        {"id": "t-urgent", "description": "urgent task",    "status": "urgent", "tags": ["local"]},
         {"id": "t-other",  "description": "irrelevant",     "status": "todo",   "tags": ["other"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
@@ -228,7 +267,7 @@ def test_worker_dedups_when_task_appears_under_both_statuses(tmp_path: Path):
             return super().handler(request)
 
     api = _DupeApi(tasks=[
-        {"id": "t1", "description": "dup", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "dup", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="ok"))
     w = _make_worker(tmp_path, api,
@@ -241,7 +280,7 @@ def test_worker_dedups_when_task_appears_under_both_statuses(tmp_path: Path):
 @pytest.mark.unit
 def test_dispatch_local_completes_and_marks_task_done(tmp_path: Path):
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "hello there", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "hello there", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="hi back"))
     w = _make_worker(tmp_path, api,
@@ -262,7 +301,7 @@ def test_dispatch_local_completes_and_marks_task_done(tmp_path: Path):
 @pytest.mark.unit
 def test_ambiguous_title_lands_in_blocked(tmp_path: Path):
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "reply to John", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "reply to John", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="should not run"))
     preflight = _golden_preflight(
@@ -286,13 +325,18 @@ def test_ambiguous_title_lands_in_blocked(tmp_path: Path):
 
 @pytest.mark.unit
 def test_routing_ask_lands_in_blocked_with_model_question(tmp_path: Path):
+    """Ask-routing is only reachable without an engine assignee tag (those
+    force a route in preflight). Drive `_dispatch` on an already-claimed
+    card that carries only `#agent-running`."""
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "research dolphins", "status": "todo", "tags": ["agent"]},
+        {"id": "t1", "description": "research dolphins", "status": "in_progress",
+         "tags": [RUNNING_TAG]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
     preflight = _golden_preflight(routing="ask")
     w = _make_worker(tmp_path, api, preflight_caller=preflight, local_executor=executor)
-    w.tick()
+    w.session_store.create(task_id="t1", status=STATUS_CLAIMED)
+    w._dispatch(api.tasks["t1"])
 
     assert executor.calls == []
     assert BLOCKED_TAG in api.tasks["t1"]["tags"]
@@ -332,7 +376,7 @@ def test_insane_task_lands_in_failed(tmp_path: Path):
     """A deterministically destructive title (matched by the code, not the
     model's prose) still fails closed — #747 must not weaken this guard."""
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "rm -rf /", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "rm -rf /", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
     preflight = _golden_preflight(routing="local", sane=False, sane_reason="destructive")
@@ -352,7 +396,7 @@ def test_mundane_sane_false_task_lands_in_blocked_not_cancelled(tmp_path: Path):
     api = FakeApi(tasks=[
         {"id": "t1",
          "description": "Display the transcribed message immediately after sending",
-         "status": "todo", "tags": ["agent", "local"]},
+         "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="should not run"))
     preflight = _golden_preflight(
@@ -378,7 +422,7 @@ def test_sane_false_and_ambiguous_blocked_messages_are_distinguishable(tmp_path:
     ambiguity must produce distinguishable operator-facing text, not one
     generic 'blocked' string."""
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "reply to John", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "reply to John", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="should not run"))
     preflight = _golden_preflight(
@@ -403,7 +447,7 @@ def test_routing_flavored_ambiguity_does_not_block(tmp_path: Path):
     not block the task — routing decides."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "Turn the record button white when idle",
-         "status": "todo", "tags": ["agent", "local"]},
+         "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="ran"))
     preflight = _golden_preflight(
@@ -433,7 +477,7 @@ def test_default_route_demotes_ambiguity_and_runs(tmp_path: Path, monkeypatch):
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "agent_default_route", "local")
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "reply to John", "status": "todo", "tags": ["agent"]},
+        {"id": "t1", "description": "reply to John", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="replied"))
     preflight = _golden_preflight(
@@ -459,7 +503,7 @@ def test_default_route_does_not_rescue_fatal_sanity(tmp_path: Path, monkeypatch)
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "agent_default_route", "local")
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "rm -rf /", "status": "todo", "tags": ["agent"]},
+        {"id": "t1", "description": "rm -rf /", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
     preflight = _golden_preflight(routing="local", sane=False, sane_reason="destructive")
@@ -488,7 +532,7 @@ def test_default_route_demotes_nonfatal_sanity_and_runs(tmp_path: Path, monkeypa
     monkeypatch.setattr(_settings, "agent_default_route", "local")
     api = FakeApi(tasks=[
         {"id": "t1", "description": "Display the transcribed message immediately after sending",
-         "status": "todo", "tags": ["agent"]},
+         "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="ran"))
     sane_reason = "This is a product specification or feature request, not a task an agent can execute."
@@ -527,7 +571,7 @@ def test_default_route_demotes_second_field_verdict_sanity_and_runs(tmp_path: Pa
         {"id": "t1",
          "description": "Bring the macOS setup script's service catalog up to parity "
                          "with Linux for the agent worker and MCP-HTTP bridge",
-         "status": "todo", "tags": ["agent"]},
+         "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="ran"))
     sane_reason = "This is a product specification or feature request, not a task an agent can execute."
@@ -552,7 +596,7 @@ def test_no_default_route_nonfatal_sanity_still_parks(tmp_path: Path, monkeypatc
     monkeypatch.setattr(_settings, "agent_default_route", "")
     api = FakeApi(tasks=[
         {"id": "t1", "description": "Display the transcribed message immediately after sending",
-         "status": "todo", "tags": ["agent", "local"]},
+         "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="should not run"))
     sane_reason = "This is a product specification or feature request, not a task an agent can execute."
@@ -572,7 +616,7 @@ def test_no_default_route_nonfatal_sanity_still_parks(tmp_path: Path, monkeypatc
 @pytest.mark.unit
 def test_executor_budget_exceeded_sets_budget_exceeded_tag(tmp_path: Path):
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "long task", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "long task", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_BUDGET_EXCEEDED, reason="budget exceeded (max_tokens)",
@@ -600,7 +644,7 @@ def test_claude_routing_without_managed_credentials_blocks(tmp_path: Path, monke
         # `#cloud-sonnet` is the operator asking for the API route explicitly;
         # without it an inferred cloud route would park at `ask` instead (#584).
         {"id": "t1", "description": "summarize", "status": "todo",
-         "tags": ["agent", "cloud-sonnet"]},
+         "tags": ["cloud-sonnet"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
     preflight = _golden_preflight(routing="claude")
@@ -625,7 +669,7 @@ def test_cloud_tag_routes_to_remote_provider_when_configured(tmp_path: Path, mon
     monkeypatch.setattr(_settings, "remote_llm_api_key", "test-fireworks-key", raising=False)
     api = FakeApi(tasks=[
         {"id": "t1", "description": "summarize", "status": "todo",
-         "tags": ["agent", "cloud"]},
+         "tags": ["cloud"]},
     ])
     remote_executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="done", served_by="accounts/fireworks/models/deepseek-v3",
@@ -655,7 +699,7 @@ def test_cloud_tag_parks_when_remote_provider_unconfigured(tmp_path: Path, monke
     monkeypatch.setattr(_settings, "remote_llm_api_key", "", raising=False)
     api = FakeApi(tasks=[
         {"id": "t1", "description": "summarize", "status": "todo",
-         "tags": ["agent", "cloud"]},
+         "tags": ["cloud"]},
     ])
     local_executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
     remote_executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
@@ -679,7 +723,7 @@ def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
     subsequent ticks until terminal."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "summarize my inbox", "status": "todo",
-         "tags": ["agent", "cloud-sonnet"]},
+         "tags": ["cloud-sonnet"]},
     ])
 
     class _StubManagedExecutor:
@@ -753,7 +797,7 @@ def test_completion_summary_uses_transcript_pointer_when_final_text_empty(tmp_pa
     transcript pointer instead of an empty body so the operator can inspect
     what actually happened."""
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["local"]},
     ])
     # final_text="" simulates the empty-text path.
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
@@ -801,7 +845,7 @@ def test_completion_summary_renders_four_bucket_breakdown(tmp_path: Path):
     that #137 actually landed."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "draft email", "status": "todo",
-         "tags": ["agent", "cloud-sonnet"]},
+         "tags": ["cloud-sonnet"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="Drafted.",
@@ -875,7 +919,7 @@ def test_completion_summary_includes_init_failed_mcps_footer(tmp_path: Path):
     the completion summary appends a "Note: N MCP server(s) unavailable"
     footer so the operator can fix or remove the broken connectors."""
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "summarize my calendar", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "summarize my calendar", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED,
@@ -902,7 +946,7 @@ def test_completion_summary_includes_init_failed_mcps_footer(tmp_path: Path):
 def test_completion_summary_omits_footer_when_no_init_failures(tmp_path: Path):
     """No footer noise when all MCPs initialized cleanly."""
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "answer the question", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "answer the question", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="42.", init_failed_mcps=[],
@@ -1143,7 +1187,7 @@ def test_recovery_skips_json_tool_results_and_summarizes_tool_calls(tmp_path: Pa
 
     api = FakeApi(tasks=[
         {"id": "t1", "description": "compare gmail vs slack",
-         "status": "todo", "tags": ["agent", "local"]},
+         "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="",
@@ -1184,7 +1228,7 @@ def test_recovery_inlines_short_text_tool_result(tmp_path: Path):
     from api.services.agent_worker.transcript_store import TranscriptStore as _TS
     api = FakeApi(tasks=[
         {"id": "t1", "description": "draft", "status": "todo",
-         "tags": ["agent", "local"]},
+         "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="",
@@ -1406,7 +1450,7 @@ def test_followup_reply_reopens_completed_session_and_reruns_with_new_turn(tmp_p
     still refers to the prior assistant turn), and re-runs the executor."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "summarize X", "status": "todo",
-         "tags": ["agent", "local"]},
+         "tags": ["local"]},
     ])
     # Two executor invocations — first completes, second handles the followup.
     class _TwoStepExecutor:
@@ -1472,7 +1516,7 @@ def test_empty_final_text_surfaces_last_tool_result_from_transcript(tmp_path: Pa
 
     api = FakeApi(tasks=[
         {"id": "t1", "description": "draft email", "status": "todo",
-         "tags": ["agent", "local"]},
+         "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="",
@@ -1525,7 +1569,7 @@ def test_empty_final_text_without_side_effect_marks_failed(tmp_path: Path):
     #agent-failed."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "research thing", "status": "todo",
-         "tags": ["agent", "local"]},
+         "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="",
@@ -1552,7 +1596,7 @@ def test_empty_final_text_with_high_spend_skips_failure_guard(tmp_path: Path):
     this gap; this guard handles the residual lag."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "expensive research", "status": "todo",
-         "tags": ["agent", "running"]},
+         "tags": ["running"]},
     ])
     api.tasks["t1"]["tags"] = ["agent-running"]
 
@@ -1593,7 +1637,7 @@ def test_empty_final_text_with_side_effect_tool_still_marks_completed(tmp_path: 
     """
     api = FakeApi(tasks=[
         {"id": "t1", "description": "draft an email", "status": "todo",
-         "tags": ["agent", "running"]},  # already #agent-running for the swap
+         "tags": ["running"]},  # already #agent-running for the swap
     ])
     # Manually flip the running tag — handle_outcome's success path swaps
     # RUNNING_TAG → COMPLETED_TAG, so the running tag must be present.
@@ -1623,13 +1667,14 @@ def test_empty_final_text_with_side_effect_tool_still_marks_completed(tmp_path: 
 
 
 @pytest.mark.unit
+
 def test_claim_sets_vault_status_to_in_progress(tmp_path: Path):
-    """When the worker claims a task (swap #agent → #agent-running), the
+    """When the worker claims a task (adds #agent-running), the
     vault checkbox status must also flip to "in_progress" so the operator
     can see at a glance which tasks are actively being worked on."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "do thing", "status": "todo",
-         "tags": ["agent", "local"]},
+         "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="done",
@@ -1646,12 +1691,98 @@ def test_claim_sets_vault_status_to_in_progress(tmp_path: Path):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("engine", ["hermes", "cloud", "local", "claude", "codex"])
+def test_list_and_claim_engine_only_without_agent_tag(tmp_path: Path, engine: str):
+    """Engine assignee alone is the handoff — list + claim without `#agent`."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "engine only", "status": "todo",
+         "tags": [engine]},
+        {"id": "t-me", "description": "human only", "status": "todo",
+         "tags": ["me"]},
+        {"id": "t-done", "description": "already claimed", "status": "todo",
+         "tags": [engine, RUNNING_TAG]},
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(
+                         status=STATUS_COMPLETED, final_text="done",
+                     )))
+    listed = w._list_agent_tasks()
+    ids = {t["id"] for t in listed}
+    assert ids == {"t1"}
+    assert w._claim("t1") is True
+    assert RUNNING_TAG in api.tasks["t1"]["tags"]
+    assert engine in api.tasks["t1"]["tags"]
+    assert AGENT_TAG not in api.tasks["t1"]["tags"]
+    assert api.tasks["t1"]["status"] == "in_progress"
+    # Second claim loses the race (running already present)
+    assert w._claim("t1") is False
+
+
+
+@pytest.mark.unit
+def test_list_and_claim_bare_agent_still_works(tmp_path: Path):
+    """Legacy dual claim: bare `#agent` remains pickupable."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "legacy queue", "status": "todo",
+         "tags": ["agent"]},
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(
+                         status=STATUS_COMPLETED, final_text="done",
+                     )))
+    listed = w._list_agent_tasks()
+    assert [t["id"] for t in listed] == ["t1"]
+    assert w._claim("t1") is True
+    assert RUNNING_TAG in api.tasks["t1"]["tags"]
+    assert AGENT_TAG not in api.tasks["t1"]["tags"]
+
+
+
+@pytest.mark.unit
+def test_me_alone_is_not_listed_for_claim(tmp_path: Path):
+    api = FakeApi(tasks=[
+        {"id": "t-me", "description": "human only", "status": "todo",
+         "tags": ["me"]},
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(
+                         status=STATUS_COMPLETED, final_text="done",
+                     )))
+    assert w._list_agent_tasks() == []
+
+
+@pytest.mark.unit
+def test_resume_pending_engine_only_does_not_inject_agent(tmp_path: Path):
+    """Crash recovery on an engine-only claim drops `#agent-running` without
+    leaving the engine assignee."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "hermes only", "status": "in_progress",
+         "tags": ["hermes", RUNNING_TAG]},
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="hermes"),
+                     local_executor=None)
+    w.session_store.create(task_id="t1", routing="hermes", status=STATUS_RUNNING)
+
+    n = w.resume_pending()
+
+    assert n == 1
+    assert AGENT_TAG not in api.tasks["t1"]["tags"]
+    assert RUNNING_TAG not in api.tasks["t1"]["tags"]
+    assert "hermes" in api.tasks["t1"]["tags"]
+    assert api.tasks["t1"]["status"] == "todo"
+
+
+@pytest.mark.unit
 def test_budget_exceeded_sets_vault_status_to_cancelled(tmp_path: Path):
     """Terminal non-success states (budget_exceeded, failed) flip the vault
     checkbox to "cancelled" rather than leaving it stranded at "in_progress"."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "expensive task", "status": "todo",
-         "tags": ["agent", "local"]},
+         "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_BUDGET_EXCEEDED, reason="max_tokens",
@@ -1714,7 +1845,7 @@ def test_completion_label_says_local_for_local_routing(tmp_path: Path):
     """Operator wants to know at a glance whether a result came from local
     Gemma or cloud Claude — the worker label is route-aware."""
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "task", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "task", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="done",
@@ -1736,7 +1867,7 @@ def test_completion_label_reports_remote_fallback_model_when_served_by_set(tmp_p
     served the session, not just the static "local" route label — #658's
     report-observed-not-configured principle applied to this new path."""
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "task", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "task", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="done",
@@ -1758,7 +1889,7 @@ def test_completion_inline_summary_kept_when_under_cap(tmp_path: Path):
     every completion now also lands a note in the vault — so the message carries
     the full body plus a 'Saved to vault' pointer + obsidian:// link."""
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "summarize", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "summarize", "status": "todo", "tags": ["local"]},
     ])
     # Just under the 2000-char inline cap
     short_text = "Here is the answer. " * 50  # 1000 chars
@@ -1786,7 +1917,7 @@ def test_failed_task_writes_no_agent_output(tmp_path: Path):
     from config.settings import settings as _settings
 
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom"))
     w = _make_worker(tmp_path, api,
@@ -1814,7 +1945,7 @@ def test_completion_spills_to_vault_when_over_cap(tmp_path: Path, monkeypatch):
     # the over-cap spillover via _StubExecutor on the local path.
     api = FakeApi(tasks=[
         {"id": "t1", "description": "Big report on Julia",
-         "status": "todo", "tags": ["agent", "local"]},
+         "status": "todo", "tags": ["local"]},
     ])
     long_text = (
         "Julia Barnes is the CEO of The Movement Cooperative.\n\n"
@@ -1860,7 +1991,7 @@ def test_completion_falls_back_to_truncation_when_vault_unset(tmp_path: Path, mo
 
     api = FakeApi(tasks=[
         {"id": "t1", "description": "report", "status": "todo",
-         "tags": ["agent", "local"]},
+         "tags": ["local"]},
     ])
     long_text = "X" * 3000
     executor = _StubExecutor(outcome=ExecutorOutcome(
@@ -1954,7 +2085,7 @@ def test_managed_executor_omits_vault_ids_when_vault_unset(tmp_path: Path, monke
 @pytest.mark.unit
 def test_sleep_yield_does_not_mark_terminal(tmp_path: Path):
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "wait for it", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "wait for it", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_YIELDED, wake_at=99999999999,  # far future
@@ -1977,7 +2108,7 @@ def test_sleep_yield_does_not_mark_terminal(tmp_path: Path):
 @pytest.mark.unit
 def test_worker_skips_already_claimed_tasks(tmp_path: Path):
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "hi", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "hi", "status": "todo", "tags": ["local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
     w = _make_worker(tmp_path, api,
@@ -1985,7 +2116,7 @@ def test_worker_skips_already_claimed_tasks(tmp_path: Path):
                      local_executor=executor)
     w.tick()
     # Re-tag back to #agent and verify the worker doesn't claim it again.
-    api.tasks["t1"]["tags"] = ["agent", "local"]
+    api.tasks["t1"]["tags"] = ["local"]
     api.tasks["t1"]["status"] = "todo"
     assert w.tick() == 0
     # Executor was called exactly once across both ticks.
@@ -1995,7 +2126,7 @@ def test_worker_skips_already_claimed_tasks(tmp_path: Path):
 @pytest.mark.unit
 def test_worker_pauses_at_daily_cap(tmp_path: Path):
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "x", "status": "todo", "tags": ["agent", "local"]},
+        {"id": "t1", "description": "x", "status": "todo", "tags": ["local"]},
     ])
     transport = httpx.MockTransport(api.handler)
     client = httpx.Client(transport=transport, base_url="http://api")
@@ -2067,7 +2198,7 @@ def test_top_level_cli_task_dispatched_off_tick_not_inline(tmp_path: Path):
             return ExecutorOutcome(status=STATUS_COMPLETED, final_text="all done", notifications_sent=1)
 
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["agent"]},
+        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["claude"]},
     ])
     pool = _CapturingPool()
     w = _make_worker(tmp_path, api,
@@ -2119,8 +2250,8 @@ def test_second_cli_task_claimed_and_runs_while_first_blocks(tmp_path: Path):
                 status=STATUS_COMPLETED, final_text="fast done", notifications_sent=1)
 
     api = FakeApi(tasks=[
-        {"id": "t-slow", "description": "slow task", "status": "todo", "tags": ["agent"]},
-        {"id": "t-fast", "description": "fast task", "status": "todo", "tags": ["agent"]},
+        {"id": "t-slow", "description": "slow task", "status": "todo", "tags": ["claude"]},
+        {"id": "t-fast", "description": "fast task", "status": "todo", "tags": ["claude"]},
     ])
     w = _make_worker(tmp_path, api,
                      preflight_caller=_golden_preflight(routing="claude_code"),
@@ -2166,7 +2297,7 @@ def test_clarification_processing_continues_while_cli_task_blocks(tmp_path: Path
             return ExecutorOutcome(status=STATUS_COMPLETED, final_text="slow done")
 
     api = FakeApi(tasks=[
-        {"id": "t-slow", "description": "slow task", "status": "todo", "tags": ["agent"]},
+        {"id": "t-slow", "description": "slow task", "status": "todo", "tags": ["claude"]},
         {"id": "t-other", "description": "other task", "status": "blocked",
          "tags": [BLOCKED_TAG, "local"]},
     ])
@@ -2218,7 +2349,7 @@ def test_cli_inflight_guard_covers_top_level_dispatch(tmp_path: Path):
             return ExecutorOutcome(status=STATUS_COMPLETED, final_text="done")
 
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["agent"]},
+        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["claude"]},
     ])
     pool = _CapturingPool()  # never runs -> the session stays "in flight"
     w = _make_worker(tmp_path, api,
@@ -2238,10 +2369,7 @@ def test_cli_inflight_guard_covers_top_level_dispatch(tmp_path: Path):
 
 @pytest.mark.unit
 def test_resume_pending_rolls_back_top_level_cli_session_same_as_before(tmp_path: Path):
-    """(#753) resume_pending()'s startup-recovery semantics for a top-level
-    claude_code/codex #agent session are unchanged by routing dispatch
-    through the pool — a crash-time CLAIMED/RUNNING session still rolls back
-    to #agent for retry, exactly as before this fix."""
+    """Crash-time CLAIMED/RUNNING with no engine assignee restores `#agent`."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "do the thing", "status": "in_progress",
          "tags": [RUNNING_TAG]},
