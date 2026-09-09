@@ -135,7 +135,7 @@ SNAPSHOT = {
 CLUSTER_CARD = {
     "kind": "task", "id": "t-cluster", "title": CLUSTER_TITLE,
     "notes": "", "status": "in_progress", "tags": ["codex"], "assignee": "codex",
-    "fields": {}, "context": "Work", "updated_at": "2026-01-01T00:00:00+00:00",
+    "fields": {}, "context": "Work", "updated_at": "2999-01-01T00:00:00+00:00",
     "pending_question": None,
     "session": CLUSTER_1,  # most recently active of the three
 }

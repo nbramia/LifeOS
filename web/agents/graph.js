@@ -222,7 +222,10 @@ export function initGraph(boardApi) {
     if (cardId) {
       html += `<button type="button" class="graph-panel-action" data-action="show-on-board">Show on board</button>`;
     }
-    if (pq) {
+    // A session's Answer action belongs to SessionPanel's shared action
+    // row. Anchors have no SessionPanel header, so their Answer affordance
+    // lives in this auxiliary strip instead.
+    if (source.anchor && pq) {
       html += `<button type="button" class="graph-panel-action" data-action="answer">Answer</button>`;
     }
     panelActionsEl.innerHTML = html;
