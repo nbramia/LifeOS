@@ -16,11 +16,10 @@ from dataclasses import dataclass
 from typing import Iterable, Optional
 
 # Tags the agent worker itself writes as it drives a task through its
-# lifecycle — see AGENT_TAG / RUNNING_TAG / COMPLETED_TAG / BLOCKED_TAG in
+# lifecycle — see RUNNING_TAG / COMPLETED_TAG / BLOCKED_TAG in
 # api/services/agent_worker/worker.py. Mirrored here (not imported) so this
 # module stays import-light — the board treats them as opaque strings, not
 # worker internals.
-AGENT_TAG = "agent"
 RUNNING_TAG = "agent-running"
 COMPLETED_TAG = "agent-completed"
 BLOCKED_TAG = "agent-blocked"
@@ -33,11 +32,10 @@ HUMAN_TAG = "human"
 ACCEPTED_TAG = "accepted"
 
 # Assignee is exactly one tag from this set. "me" is the operator; the rest
-# are agent engines. This is a labeling convention only at this stage —
-# actually dispatching to an engine from an assignee tag is issue #851
-# (assignment and execution), out of scope here.
-ASSIGNEE_TAGS: tuple[str, ...] = ("me", "claude", "codex", "hermes", "local")
-AGENT_ASSIGNEES: tuple[str, ...] = ("claude", "codex", "hermes", "local")
+# are agent engines. An engine assignee on a todo/urgent task is what makes
+# it claimable by the worker — see agent-worker claim pickup.
+ASSIGNEE_TAGS: tuple[str, ...] = ("me", "claude", "codex", "hermes", "local", "cloud")
+AGENT_ASSIGNEES: tuple[str, ...] = ("claude", "codex", "hermes", "local", "cloud")
 
 LANES: tuple[str, ...] = (
     "unassigned",
@@ -209,13 +207,9 @@ def is_agent_owned(tags: Iterable[str]) -> bool:
     """True when the card is managed by an agent rather than a human —
     either its assignee tag names an agent engine, or the worker has
     already claimed it (`agent-running`/`agent-blocked`) even with no
-    engine-specific assignee tag at all. The worker selects candidates by
-    the bare `agent` queue tag alone and its claim swap
-    (`agent` -> `agent-running`) never touches assignee tags, so a card
-    can be claimed while `derive_assignee` still returns `None` — that
-    shape must still count as agent-owned, or Cancel (and every other
-    agent-owned-only action) would refuse the one card that most needs
-    it, with no assignee tag left to edit it back to a workable state."""
+    engine-specific assignee tag. Claimed cards without an assignee must
+    still count as agent-owned so Cancel (and every other agent-owned-only
+    action) remains available."""
     tset = _norm_tags(tags)
     return derive_assignee(tset) in AGENT_ASSIGNEES or bool(tset & {RUNNING_TAG, BLOCKED_TAG})
 
@@ -282,8 +276,8 @@ def evaluate_card_action(
             return None
         if agent_owned:
             if target_lane == "in_progress":
-                # Only the worker claims agent-assigned tasks (swaps #agent
-                # -> #agent-running itself); a human dragging such a card to
+                # Only the worker claims agent-assigned tasks (adds
+                # #agent-running itself); a human dragging such a card to
                 # In progress would desync the tag from the actual claim
                 # state.
                 return AGENT_ONLY_CLAIM_ERROR
