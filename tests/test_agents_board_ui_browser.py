@@ -58,7 +58,7 @@ _HOST_CATALOG = {
 # change (web/agents/board.js ASSIGNEES) — used by the lane stub below to
 # mirror plan_lane_move's tag bookkeeping on a drawer-driven assign (#859
 # review round 2 finding 1).
-_ASSIGNEE_TAGS = {"me", "claude", "codex", "hermes", "local"}
+_ASSIGNEE_TAGS = {"me", "claude", "codex", "hermes", "local", "cloud"}
 
 
 class _AgentsHandler(http.server.SimpleHTTPRequestHandler):
@@ -304,6 +304,21 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                 )
             else:
                 route.fulfill(status=200, content_type="application/json", body=json.dumps({"ok": True}))
+            return
+
+        accept_match = re.search(r"/api/agents/board/cards/([^/]+)/accept$", url)
+        if accept_match and method == "POST":
+            card_id = accept_match.group(1)
+            _move_card_in_state(board_state, card_id, "done")
+            for cards in board_state["lanes"].values():
+                for card in cards:
+                    if card["id"] == card_id:
+                        card["status"] = "done"
+                        tags = [t for t in card.get("tags", []) if t != "agent-completed"]
+                        if "accepted" not in tags:
+                            tags.append("accepted")
+                        card["tags"] = tags
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": card_id, "lane": "done"}))
             return
 
         if re.search(r"/api/agents/models$", url) and method == "GET":
@@ -1032,11 +1047,83 @@ class TestFilters:
         expect(page.locator('[data-card-id="t2"]')).to_have_count(0)
         expect(page.locator('[data-card-id="t4"]')).to_have_count(0)
 
-    def test_context_filter(self, page: Page, agents_base_url):
+    def test_context_filter_control_removed(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
-        page.locator("#board-filter-context").select_option("Work")
-        expect(page.locator('[data-card-id="t2"]')).to_be_visible()
-        expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
+        expect(page.locator("#board-filter-context")).to_have_count(0)
+
+    def test_clear_filters_resets_row(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator("#board-search").fill("outage")
+        page.locator("#board-filter-assignee").select_option("me")
+        page.locator("#board-filter-tag").fill("codex")
+        page.locator("#board-filter-sort").select_option("created_desc")
+        page.locator("#board-filter-clear").click()
+        expect(page.locator("#board-search")).to_have_value("")
+        expect(page.locator("#board-filter-assignee")).to_have_value("all")
+        expect(page.locator("#board-filter-tag")).to_have_value("")
+        expect(page.locator("#board-filter-sort")).to_have_value("file")
+        expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+
+    def test_sort_by_assignee_orders_lane(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"] = [
+            {
+                "kind": "task", "id": "ta", "title": "A card",
+                "notes": "", "status": "todo", "tags": ["codex"], "assignee": "codex",
+                "fields": {}, "context": "Inbox", "created_date": "2026-01-02",
+                "updated_at": "2026-01-02T00:00:00+00:00",
+                "session": None, "pending_question": None,
+            },
+            {
+                "kind": "task", "id": "tb", "title": "B card",
+                "notes": "", "status": "todo", "tags": ["claude"], "assignee": "claude",
+                "fields": {}, "context": "Inbox", "created_date": "2026-01-01",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "session": None, "pending_question": None,
+            },
+        ]
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator("#board-filter-sort").select_option("assignee_asc")
+        ids = page.locator('.board-lane[data-lane="assigned"] .board-card').evaluate_all(
+            "els => els.map(e => e.dataset.cardId)"
+        )
+        assert ids == ["tb", "ta"]
+
+    def test_review_card_accept_without_drawer(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["review"] = [{
+            "kind": "task", "id": "tr", "title": "Ready for review",
+            "notes": "", "status": "done", "tags": ["agent-completed", "hermes"],
+            "assignee": "hermes", "fields": {}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        }]
+        _open_board(page, agents_base_url, board_state=board_state)
+        # Review is visible by default
+        card = page.locator('[data-card-id="tr"]')
+        expect(card.locator(".board-card-accept")).to_be_visible()
+        card.locator(".board-card-accept").click()
+        expect(page.locator('.board-lane[data-lane="review"] [data-card-id="tr"]')).to_have_count(0)
+        assert any(card["id"] == "tr" for card in board_state["lanes"]["done"])
+
+    def test_assignee_filter_lists_cloud(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        options = page.locator("#board-filter-assignee option").evaluate_all(
+            "els => els.map(e => e.value)"
+        )
+        assert "cloud" in options
+
+    def test_drag_sets_board_dragging_class(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        card = page.locator('[data-card-id="t1"]')
+        box = card.bounding_box()
+        assert box
+        page.mouse.move(box["x"] + 5, box["y"] + 5)
+        page.mouse.down()
+        page.mouse.move(box["x"] + 40, box["y"] + 40, steps=5)
+        assert page.evaluate("() => document.body.classList.contains('board-dragging')")
+        page.mouse.up()
+        assert not page.evaluate("() => document.body.classList.contains('board-dragging')")
 
 
 class TestHostAssignmentChipAndFilter:
@@ -2958,16 +3045,11 @@ def _claimed_agent_owned_card(card_id="t9", lane="in_progress", title="Migrate t
     }
 
 
-def _claimed_bare_agent_card(card_id="t12", title="Triage the queue"):
-    """A claimed card with NO engine-specific assignee tag at all — the
-    shape left behind when the worker claims a bare `#agent` queue card
-    (its claim swap only ever touches `agent`/claim tags, never adds an
-    assignee). Every picker is refused the same as an engine-assigned
-    claimed card, but Cancel — the one recovery action left, since there's
-    no assignee tag to edit it back to a workable state — still works."""
+def _claimed_no_assignee_card(card_id="t12", title="Triage the queue"):
+    """A claimed card with no engine-specific assignee."""
     return {
         "kind": "task", "id": card_id, "title": title,
-        "notes": "", "status": "in_progress", "tags": ["agent", "agent-running"], "assignee": None,
+        "notes": "", "status": "in_progress", "tags": ["agent-running"], "assignee": None,
         "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
         "session": None, "pending_question": None,
         "policy": {
@@ -3032,14 +3114,13 @@ class TestAgentCardMoveRulesAndCancel:
         # left available on a claimed card.
         expect(page.get_by_role("button", name="Cancel", exact=True)).to_be_visible()
 
-    def test_claimed_bare_agent_card_disables_pickers_but_cancel_still_works(self, page: Page, agents_base_url):
-        """The no-assignee claimed card (a bare `#agent` queue card the
-        worker claimed without ever writing an engine-specific assignee):
-        every picker is disabled with a reason, exactly like an
+    def test_claimed_no_assignee_card_disables_pickers_but_cancel_still_works(self, page: Page, agents_base_url):
+        """A claimed card with no engine assignee (lifecycle claim tags
+        only): every picker is disabled with a reason, exactly like an
         engine-assigned claimed card, but Cancel is enabled and posts —
         the one recovery action left with no assignee tag to edit."""
         board_state = copy.deepcopy(_board_fixture())
-        board_state["lanes"]["in_progress"].append(_claimed_bare_agent_card())
+        board_state["lanes"]["in_progress"].append(_claimed_no_assignee_card())
         cancel_calls = []
         _open_board(page, agents_base_url, board_state=board_state, cancel_calls=cancel_calls)
 
@@ -3242,12 +3323,7 @@ class TestAgentCardMoveRulesAndCancel:
         expect(page.get_by_role("button", name="Cancel", exact=True)).to_have_count(0)
 
     def test_removing_agent_marker_tag_leaves_other_editable_tags_via_tags_box(self, page: Page, agents_base_url):
-        """AR2's positive case, missing until now: `agent` is the worker's
-        queue marker, not a claim tag (LIFECYCLE_TAGS is an explicit set,
-        not a prefix match on `agent-`/`agent`), so an unclaimed `me` card
-        must still show it — and any operator label that merely starts
-        with `agent-` — as an editable Tags-box token, and clearing just
-        `agent` must save with everything else intact."""
+        """`agent` is an ordinary operator label, not a lifecycle tag."""
         board_state = copy.deepcopy(_board_fixture())
         board_state["lanes"]["assigned"].append({
             "kind": "task", "id": "t13", "title": "Operator queue card",

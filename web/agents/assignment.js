@@ -26,20 +26,20 @@
 // No build step, no framework — plain DOM, matching every other file in
 // this directory.
 
-const ENGINES = ['claude', 'codex', 'local', 'hermes'];
+const ENGINES = ['claude', 'codex', 'local', 'hermes', 'cloud'];
 const EFFORTS = ['low', 'medium', 'high', 'max'];
 
 // Engines whose executor actually reads a `model` field (claude_code_executor
 // / codex_executor's `--model` flag — see api/services/agent_worker/
-// assignment.py). Local and Hermes never take a model override: local
-// always runs the on-box model, Hermes reports whatever model it served a
-// turn with (model_readout.py) rather than accepting a request for one.
+// assignment.py). Local, Hermes, and cloud never take a board model
+// override: local always runs the on-box model, Hermes/cloud report
+// whatever model their provider served rather than accepting a picker value.
 const ENGINES_WITH_MODEL_PICKER = new Set(['claude', 'codex']);
-// Engines whose executor reads an `effort` field. Hermes has no effort
-// override (see assignment.py's module docstring).
+// Engines whose executor reads an `effort` field. Hermes/cloud have no
+// effort override (see assignment.py's module docstring).
 const ENGINES_WITH_EFFORT_PICKER = new Set(['claude', 'codex', 'local']);
 // Engines a `host` field can steer over ssh (api/services/agent_worker/
-// remote_spawn.py) — local/Hermes always run wherever the API process does.
+// remote_spawn.py) — local/Hermes/cloud always run wherever the API process does.
 const ENGINES_WITH_HOST_PICKER = new Set(['claude', 'codex']);
 
 function escapeHtml(s) {
@@ -61,7 +61,7 @@ function loadModelCatalog(fetchImpl = fetch) {
   if (!_catalogPromise) {
     _catalogPromise = fetchImpl('/api/agents/models')
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .catch(() => ({ engines: { claude: [], codex: [], local: [], hermes: [] } }));
+      .catch(() => ({ engines: { claude: [], codex: [], local: [], hermes: [], cloud: [] } }));
   }
   return _catalogPromise;
 }
