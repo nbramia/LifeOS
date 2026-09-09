@@ -20,8 +20,8 @@ tests/test_agents_graph_redesign_ui_browser.py — so this carries no
 `requires_server` marker and runs at pre-push (`browser and not
 requires_server`). `/agents` loads d3 from
 `https://d3js.org/d3.v7.min.js`, left unstubbed (real network), same as
-every other test in this family — the force simulation and zoom-to-fit's
-bounding-box math both need the real thing.
+every other test in this family — the timeline and zoom-to-fit's
+bounding-box math both need real SVG rendering.
 """
 import http.server
 import json
@@ -68,13 +68,7 @@ def agents_base_url():
 
 
 def _row(i):
-    # Every node shares the same host column and lane band — `columnTargetX`
-    # and `laneTargetY` (web/agents/graph.js) pull the whole graph toward
-    # ONE cell, so with many nodes the collision force (which keeps
-    # same-cell nodes from overlapping — sized off each node's actual
-    # label width) is what spreads the bounding box far beyond a single
-    # column/lane's nominal share of the viewBox, the way a real board
-    # with most of its sessions crowded into one lane on one host does.
+    # Every node is a root, producing one densely populated timeline row.
     return {
         "session_id": f"sess-legibility-{i}",
         "task_id": None,
@@ -140,9 +134,7 @@ def _open_agents(page: Page, base_url, snapshot=None, width=1280, height=800):
     page.wait_for_selector("#filter-route")
     page.select_option("#filter-recency", "all")
     page.locator("#filter-terminal").check()
-    # Let the force simulation settle enough for zoom-to-fit's own bounding
-    # box (computed from live node `x`/`y`) to reflect the converged, not
-    # still-collapsing-from-center, layout.
+    # Let the first render and filter reconciliation complete before fitting.
     page.wait_for_timeout(1200)
 
 
@@ -237,19 +229,17 @@ class TestLabelLegibilityAtZoomToFit:
         assert sizes, "no node labels rendered at all"
         assert all(px >= LABEL_MIN_SCREEN_PX - _EPSILON for px in sizes), sizes
 
-    def test_labels_meet_legibility_floor_after_fit_with_moderate_graph(self, page: Page, agents_base_url):
-        """A moderate, realistic node count (well under the density that
-        forces a hide) must still clear the legibility floor after Fit —
-        `zoomFit`'s own `k` doesn't drop far at this density, so a
-        threshold based on `k` alone would leave these labels both small
-        and shown."""
+    def test_labels_hide_when_timeline_fit_would_make_them_overlap(self, page: Page, agents_base_url):
+        """Fitting 19 chronological columns is an overview: keeping every
+        label at the legibility floor would overlap adjacent nodes."""
         _open_agents(page, agents_base_url, snapshot=_snapshot(19))
         page.click("#graph-zoom-fit")
         page.wait_for_timeout(600)
         k = float(page.get_attribute("#graph-svg", "data-zoom-k"))
-        sizes = _label_screen_sizes(page)
-        assert sizes, f"no node labels shown after Fit (k={k})"
-        assert all(px >= LABEL_MIN_SCREEN_PX - _EPSILON for px in sizes), (k, sizes)
+        assert k < 1.0
+        states = _label_display_states(page)
+        assert states
+        assert all(state == "none" for state in states), (k, states)
 
     def test_labels_hidden_at_zoom_to_fit_with_100_nodes(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)

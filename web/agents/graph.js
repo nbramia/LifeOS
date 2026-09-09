@@ -1,7 +1,7 @@
 // web/agents/graph.js
 //
-// The Graph tab — the force-directed session map. Node rendering,
-// simulation, filters, chips, and search live here; the side panel's
+// The Graph tab — a deterministic delegation timeline. Node rendering,
+// layout, filters, chips, and search live here; the side panel's
 // rendering, event feed, label edit, and summary fetch come from the
 // shared `SessionPanel` in ./panel.js (also used by the Board tab's
 // drawer), and the pure encoding functions (label precedence, engine
@@ -22,7 +22,7 @@ import {
   nodeLabel, isRawIdValue, engineOf, ENGINE_SHAPES, shapeTagFor,
   radiusForActiveSeconds, ringWidthForToolCalls, laneColor, routingFilterValue,
   isKnownSearchField, SEARCH_TIER, SEARCH_BADGE, hoverCardRows,
-  descendantsOf as sharedDescendantsOf,
+  descendantsOf as sharedDescendantsOf, delegationTimelineLayout,
 } from './graph_encoding.js';
 import {
   getFilters, setFilter, setFilters, resetFilters, subscribe as subscribeFilters,
@@ -67,12 +67,6 @@ export function initGraph(boardApi) {
   let allSessions = [];
   let allEdges = [];
   let selectedSessionId = null;
-  // A selected card/host anchor — mutually exclusive with
-  // `selectedSessionId`: selecting one clears the other. Anchors render in
-  // their own SVG group (`anchorLayer`, below) and never carry a transcript
-  // of their own, so selecting one never opens the session panel.
-  let selectedAnchorId = null;
-  let lastAnchorsById = new Map();
   let apiHost = '';
   // Whether the first `/api/agents/snapshot` payload has landed — a tab
   // activation (or a URL deep link, set while this module has not yet
@@ -146,11 +140,9 @@ export function initGraph(boardApi) {
 
   function closePanel() {
     selectedSessionId = null;
-    selectedAnchorId = null;
     panel.close();
     panelEl.innerHTML = '<div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>';
     applySelectionStyles();
-    applyAnchorSelectionStyles();
     clearPanelActions();
     setSelectedGraphCardId(null);
   }
@@ -158,7 +150,6 @@ export function initGraph(boardApi) {
   function openPanel(sessionId) {
     const s = allSessions.find(x => x.session_id === sessionId);
     if (!s) return;
-    selectedAnchorId = null;
     selectedSessionId = sessionId;
     applySelectionStyles();
     // `getCardForSession` returns null both for a genuinely bare session
@@ -169,28 +160,7 @@ export function initGraph(boardApi) {
     // renders a half-decided action set; the next snapshot tick's
     // `updateMeta` call below picks the card up once it's available.
     panel.open(s, getCardForSession(sessionId));
-    applyAnchorSelectionStyles();
     renderPanelActions(s);
-  }
-
-  // A card/host anchor's own selection — no transcript to show (an anchor
-  // groups several sessions, not one), so the transcript panel goes back to
-  // its empty state while `#graph-panel-actions` (below) still renders for
-  // the anchor's own card id / pending question.
-  function selectAnchor(anchorId) {
-    const a = lastAnchorsById.get(anchorId);
-    if (!a) return;
-    selectedSessionId = null;
-    selectedAnchorId = anchorId;
-    panel.close();
-    panelEl.innerHTML = '<div class="panel-empty" id="panel-empty">This is a card cluster — click one of its session nodes to inspect a transcript.</div>';
-    applySelectionStyles();
-    applyAnchorSelectionStyles();
-    renderPanelActions(a);
-  }
-
-  function applyAnchorSelectionStyles() {
-    anchorLayer.selectAll('.anchor-shape').classed('selected', d => d.id === selectedAnchorId);
   }
 
   // --- Card actions above the transcript panel ---------------------------
@@ -199,34 +169,14 @@ export function initGraph(boardApi) {
     if (panelActionsEl) panelActionsEl.innerHTML = '';
   }
 
-  // A source is either a session row (`pending_question` lives directly on
-  // it) or a card anchor (`_hasPendingQuestion`/`_sessions` — the first of
-  // its sessions carrying one, since the anchor itself never owns a
-  // question, only the sessions it groups do).
-  function pendingQuestionFor(source) {
-    if (!source) return null;
-    if (source.anchor) {
-      const withQuestion = (source._sessions || []).find(s => s.pending_question);
-      return withQuestion ? withQuestion.pending_question : null;
-    }
-    return source.pending_question || null;
-  }
-
   function renderPanelActions(source) {
     if (!panelActionsEl) return;
     if (!source) { clearPanelActions(); setSelectedGraphCardId(null); return; }
     const cardId = source.card_id || null;
     setSelectedGraphCardId(cardId);
-    const pq = pendingQuestionFor(source);
     let html = '';
     if (cardId) {
       html += `<button type="button" class="graph-panel-action" data-action="show-on-board">Show on board</button>`;
-    }
-    // A session's Answer action belongs to SessionPanel's shared action
-    // row. Anchors have no SessionPanel header, so their Answer affordance
-    // lives in this auxiliary strip instead.
-    if (source.anchor && pq) {
-      html += `<button type="button" class="graph-panel-action" data-action="answer">Answer</button>`;
     }
     panelActionsEl.innerHTML = html;
     const showBtn = panelActionsEl.querySelector('[data-action="show-on-board"]');
@@ -236,47 +186,6 @@ export function initGraph(boardApi) {
         activateTab('board');
       });
     }
-    const answerBtn = panelActionsEl.querySelector('[data-action="answer"]');
-    if (answerBtn) answerBtn.addEventListener('click', () => openInlineAnswerForm(pq));
-  }
-
-  // Reveals an inline textarea + Send inside `#graph-panel-actions` — the
-  // same `/api/agents/pending-questions/{id}/answer` endpoint
-  // `openAnswerPrompt` in board.js posts to, so an answer sent from either
-  // tab is indistinguishable to the worker on the other end.
-  function openInlineAnswerForm(pq) {
-    if (!panelActionsEl || !pq) return;
-    const answerBtn = panelActionsEl.querySelector('[data-action="answer"]');
-    if (answerBtn) answerBtn.remove();
-    const form = document.createElement('div');
-    form.className = 'graph-panel-answer-form';
-    form.innerHTML = `
-      <textarea placeholder="Your answer…"></textarea>
-      <button type="button" class="graph-panel-action">Send</button>
-    `;
-    panelActionsEl.appendChild(form);
-    const textEl = form.querySelector('textarea');
-    const sendBtn = form.querySelector('button');
-    sendBtn.addEventListener('click', async () => {
-      const answer = textEl.value.trim();
-      if (!answer) return;
-      sendBtn.disabled = true;
-      sendBtn.textContent = 'Sending…';
-      try {
-        const r = await fetch(`/api/agents/pending-questions/${encodeURIComponent(pq.id)}/answer`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ answer }),
-        });
-        if (!r.ok) throw new Error(await r.text());
-        showToast('Answer sent.', false);
-        fetchSnapshotOnce();
-      } catch (err) {
-        showToast(`Couldn't send answer: ${err.message}`, true);
-        sendBtn.disabled = false;
-        sendBtn.textContent = 'Send';
-      }
-    });
   }
 
   // Standalone Go To for the node dblclick handler — fires regardless of
@@ -307,22 +216,17 @@ export function initGraph(boardApi) {
   }
 
   // -------------------------------------------------------------------
-  // D3 force-directed graph (mirrors /crm/graph patterns).
+  // D3 renders and zooms the graph; coordinates are computed deterministically.
   // -------------------------------------------------------------------
   const svg = d3.select('#graph-svg');
-  const VIEW_W = 1600;
-  const VIEW_H = 1100;
+  const VIEW_W = 1000;
+  const VIEW_H = 700;
   svg.attr('viewBox', `0 0 ${VIEW_W} ${VIEW_H}`);
   svg.attr('data-zoom-k', '1');
   svg.style('overflow', 'visible');
   const viewport = svg.append('g').attr('class', 'viewport');
-  const columnLayer = viewport.append('g').attr('class', 'host-columns');
+  const guideLayer = viewport.append('g').attr('class', 'timeline-guides');
   const linkLayer = viewport.append('g').attr('class', 'links');
-  // Card/host anchor clusters — its own group, between the links and
-  // the session nodes, so an anchor's rect never sits on top of a node and
-  // an anchor is never mistaken for one by any `.node`-scoped selector
-  // (selection styling, badges, drag, hover — all session-node-only).
-  const anchorLayer = viewport.append('g').attr('class', 'anchors');
   const nodeLayer = viewport.append('g').attr('class', 'nodes');
 
   // A `.node-label`'s on-screen CSS pixel size is its font-size in SVG
@@ -352,13 +256,7 @@ export function initGraph(boardApi) {
   // tuned for the 12px base font. Counter-scaling `font-size` without
   // scaling these by the same factor is what makes a boosted multi-line
   // label's lines draw on top of each other (the per-tspan `dy` stays a
-  // fixed 12px-era user-space value) and neighbouring nodes' labels
-  // collide (the collision force's radius estimate stays sized for the
-  // unboosted label). `_labelBoost` is the single current boost factor
-  // (1 = unboosted), read by `collideRadius` on every force tick and
-  // applied to every label's line spacing by `applyLabelBoost`, keeping
-  // the two in lockstep.
-  let _labelBoost = 1;
+  // fixed 12px-era user-space value), so apply the same boost to spacing.
 
   // `#graph-svg` carries `preserveAspectRatio="xMidYMid meet"`
   // (web/agents.html) — the SVG is letterboxed to fit inside its rendered
@@ -413,12 +311,6 @@ export function initGraph(boardApi) {
     // it as unboosted for layout/collision purposes.
     const effectiveBoost = hide ? 1 : boost;
     applyLabelBoost(effectiveBoost);
-    // `collideRadius` (below) reads `_labelBoost` on every force tick —
-    // reheat the simulation whenever it changes enough to matter, so
-    // nodes whose labels just grew (or shrank) actually move apart (or
-    // back together) instead of the new radius sitting unused on an
-    // already-settled layout.
-    _labelBoost = effectiveBoost;
   }
 
   const zoom = d3.zoom()
@@ -445,7 +337,7 @@ export function initGraph(boardApi) {
   svg.on('mouseup.cursor',   () => svg.style('cursor', 'grab'));
 
   svg.on('click', (event) => {
-    if (event.target === svg.node() && (selectedSessionId || selectedAnchorId)) closePanel();
+    if (event.target === svg.node() && selectedSessionId) closePanel();
   });
 
   function transitionMs() {
@@ -483,63 +375,9 @@ export function initGraph(boardApi) {
   if (zoomResetBtn) zoomResetBtn.addEventListener('click', zoomReset);
 
   let visibleCount = 0;
-  let _lastSimKey = '';
-  let _simStopTimer = null;
-
-  // Host columns — the x-position signal is which host a session
-  // runs on, not recency (recency stays a filter — see `applyFilters`
-  // below). Recomputed every render from the currently-visible set so an
-  // idle host's column disappears once nothing on it is shown.
-  let columnHosts = [];
-  let columnCenters = new Map();
-
   function hostOf(s) {
     return s.host || apiHost || 'unknown';
   }
-
-  const LANE_ORDER = LANES.map(l => l.id);
-  function laneIndex(d) {
-    const i = LANE_ORDER.indexOf(d.lane);
-    return i >= 0 ? i : LANE_ORDER.length;
-  }
-
-  const COLUMN_HEADER_H = 60;
-  function laneTargetY(d) {
-    const bands = LANE_ORDER.length + 1;
-    const usable = VIEW_H - COLUMN_HEADER_H - 20;
-    const bandH = usable / bands;
-    return COLUMN_HEADER_H + laneIndex(d) * bandH + bandH / 2;
-  }
-
-  function columnTargetX(d) {
-    const c = columnCenters.get(hostOf(d));
-    return c == null ? VIEW_W / 2 : c;
-  }
-
-  const simulation = d3.forceSimulation()
-    .force('link', d3.forceLink().id(d => d.session_id).distance(80).strength(0.04))
-    .force('charge', d3.forceManyBody().strength(-220).distanceMax(600))
-    .force('col-x', d3.forceX(columnTargetX).strength(0.22))
-    .force('lane-y', d3.forceY(laneTargetY).strength(0.16))
-    // Anchors get their own (larger) collide radius, computed from their
-    // rendered box — never `collideRadius` itself, which is sized for a
-    // session node's own radius + wrapped label.
-    .force('collide', d3.forceCollide().radius(d => d.anchor ? anchorCollideRadius(d) : collideRadius(d)).strength(0.9))
-    .alphaDecay(0.025)
-    .alphaMin(0.001)
-    .velocityDecay(0.45);
-
-  simulation.on('tick', () => {
-    nodeLayer.selectAll('.node').attr('transform', d => `translate(${d.x},${d.y})`);
-    anchorLayer.selectAll('.anchor').attr('transform', d => `translate(${d.x},${d.y})`);
-    linkLayer.selectAll('.link').attr('d', d => {
-      const sx = d.source.x, sy = d.source.y;
-      const tx = d.target.x, ty = d.target.y;
-      const dx = tx - sx, dy = ty - sy;
-      const dr = Math.sqrt(dx * dx + dy * dy) * 1.6 || 1;
-      return `M${sx},${sy}A${dr},${dr} 0 0,1 ${tx},${ty}`;
-    });
-  });
 
   function shortenCwd(p) {
     if (!p) return p;
@@ -622,7 +460,7 @@ export function initGraph(boardApi) {
       if (route !== 'all' && routingFilterValue(s) !== route) return false;
       if (status !== 'all' && s.status !== status) return false;
       // `s.lane` is only ever absent from a fixture synthesized without it
-      // (predating card/host anchors) — treat that as "not excludable by
+      // (predating linked-card metadata) — treat that as "not excludable by
       // lane" rather than hiding it, since a real snapshot row always
       // carries one. The `done` lane is the one exception: whether a
       // done-lane session renders is decided by `showTerm` (include
@@ -654,19 +492,33 @@ export function initGraph(boardApi) {
     return haystack.some(h => h.includes(q));
   }
 
-  // Subagent trees: a session with `parent_session_id` set is
-  // dropped from the visible set unless its parent is in
-  // `expandedParents` — collapsing it into a count badge on the parent
-  // instead. A child whose parent isn't itself in the filtered set (e.g.
-  // the parent was filtered out) is shown directly — there's nothing to
-  // collapse it into.
+  // Active branches stay visible. Terminal-only branches collapse into a
+  // count badge until their parent is explicitly expanded.
   function applyCollapse(filtered) {
-    const ids = new Set(filtered.map(s => s.session_id));
-    return filtered.filter(s => {
-      if (!s.parent_session_id) return true;
-      if (!ids.has(s.parent_session_id)) return true;
-      return expandedParents.has(s.parent_session_id);
-    });
+    const byId = new Map(filtered.map(s => [s.session_id, s]));
+    const activeBranch = new Set(filtered.filter(s => !TERMINAL.has(s.status)).map(s => s.session_id));
+    for (const session of filtered) {
+      if (!activeBranch.has(session.session_id)) continue;
+      let parent = byId.get(session.parent_session_id);
+      while (parent && !activeBranch.has(parent.session_id)) {
+        activeBranch.add(parent.session_id);
+        parent = byId.get(parent.parent_session_id);
+      }
+    }
+    const visibleMemo = new Map();
+    function isVisible(session, visiting = new Set()) {
+      if (visibleMemo.has(session.session_id)) return visibleMemo.get(session.session_id);
+      const parent = byId.get(session.parent_session_id);
+      if (!parent || visiting.has(session.session_id)) return true;
+      const next = new Set(visiting);
+      next.add(session.session_id);
+      const shown = isVisible(parent, next) && (
+        expandedParents.has(parent.session_id) || activeBranch.has(session.session_id)
+      );
+      visibleMemo.set(session.session_id, shown);
+      return shown;
+    }
+    return filtered.filter(session => isVisible(session));
   }
 
   // Direct-child counts per parent (in the filtered set, before collapse) —
@@ -676,10 +528,27 @@ export function initGraph(boardApi) {
   // would remove the only affordance that collapses it back.
   function totalChildCounts(filtered) {
     const ids = new Set(filtered.map(s => s.session_id));
+    const children = new Map();
+    for (const session of filtered) {
+      if (!children.has(session.parent_session_id)) children.set(session.parent_session_id, []);
+      children.get(session.parent_session_id).push(session);
+    }
+    const activeMemo = new Map();
+    function branchIsActive(session, visiting = new Set()) {
+      if (activeMemo.has(session.session_id)) return activeMemo.get(session.session_id);
+      if (!TERMINAL.has(session.status)) return true;
+      if (visiting.has(session.session_id)) return false;
+      const next = new Set(visiting);
+      next.add(session.session_id);
+      const active = (children.get(session.session_id) || []).some(child => branchIsActive(child, next));
+      activeMemo.set(session.session_id, active);
+      return active;
+    }
     const counts = new Map();
     for (const s of filtered) {
       if (!s.parent_session_id) continue;
       if (!ids.has(s.parent_session_id)) continue;
+      if (branchIsActive(s)) continue;
       counts.set(s.parent_session_id, (counts.get(s.parent_session_id) || 0) + 1);
     }
     return counts;
@@ -764,22 +633,6 @@ export function initGraph(boardApi) {
     });
     d._labelLines = lines.length;
     d._labelW = Math.max(...lines.map(l => l.length)) * LABEL_CHAR_W;
-  }
-
-  function collideRadius(d) {
-    const r = nodeRadius(d);
-    const lines = d._labelLines || 1;
-    // A boosted label renders wider and taller (in user-space units) than
-    // its `_labelW`/`LABEL_LINE_H`/`LABEL_GAP` estimate assumes — those
-    // are fixed at the 12px base font — so scale the whole footprint by
-    // the current boost factor (`_labelBoost`, kept current by
-    // `updateLabelLegibility`) rather than the collision radius silently
-    // under-defending a font it doesn't know grew.
-    const boost = _labelBoost;
-    const halfW = Math.max(r, ((d._labelW || 0) * boost) / 2) + 6;
-    const labelBottom = r + LABEL_GAP + (lines - 1) * LABEL_LINE_H + LABEL_LINE_H * 0.5;
-    const enclose = Math.hypot(halfW, labelBottom) * 0.85;
-    return Math.max(r + 14, enclose);
   }
 
   function isActivelyWriting(d) {
@@ -920,196 +773,35 @@ export function initGraph(boardApi) {
   function toggleParentExpanded(sessionId) {
     if (expandedParents.has(sessionId)) expandedParents.delete(sessionId);
     else expandedParents.add(sessionId);
-    renderGraph(allSessions, allEdges);
+    renderGraph(allSessions);
   }
 
-  // -------------------------------------------------------------------
-  // Card/host anchors — one synthetic cluster node per distinct
-  // `card_id` among the visible sessions (labelled with the card's title),
-  // plus one per host among sessions with no card at all (labelled with
-  // the host name). Every visible session links to exactly one anchor —
-  // its card anchor if it has one, else its host anchor.
-  // -------------------------------------------------------------------
-
-  const ANCHOR_PAD_X = 14;
-  const ANCHOR_CHAR_W = 6.5;
-  const ANCHOR_MAX_CHARS = 26;
-  const ANCHOR_H = 30;
-
-  function anchorLabelText(d) {
-    const raw = String(d.label || d.card_id || d.host || '?');
-    if (raw.length <= ANCHOR_MAX_CHARS) return raw;
-    return raw.slice(0, ANCHOR_MAX_CHARS - 1) + '…';
-  }
-
-  function anchorBoxFor(d) {
-    const text = anchorLabelText(d);
-    const w = Math.max(64, text.length * ANCHOR_CHAR_W + ANCHOR_PAD_X * 2);
-    return { w, h: ANCHOR_H };
-  }
-
-  function anchorCollideRadius(d) {
-    const { w, h } = anchorBoxFor(d);
-    return Math.hypot(w, h) / 2 + 12;
-  }
-
-  // Groups `visible` sessions into one anchor per distinct `card_id`, plus
-  // one per host among sessions with none — a session whose `card_id` is
-  // null, undefined, OR whose linked task doesn't exist (`card_id`
-  // stamped null by the server the same way) all land in the host bucket.
-  function buildAnchors(visible) {
-    const byCard = new Map();
-    const byHost = new Map();
-    for (const s of visible) {
-      if (s.card_id != null) {
-        if (!byCard.has(s.card_id)) byCard.set(s.card_id, []);
-        byCard.get(s.card_id).push(s);
-      } else {
-        const h = hostOf(s);
-        if (!byHost.has(h)) byHost.set(h, []);
-        byHost.get(h).push(s);
-      }
-    }
-    const anchors = [];
-    for (const [cardId, sessions] of byCard) {
-      // The anchor's own host is the host most of its sessions run on —
-      // ties break on the alphabetically first host, so the choice is
-      // deterministic across renders (no dependence on Map insertion order).
-      const hostCounts = new Map();
-      for (const s of sessions) hostCounts.set(hostOf(s), (hostCounts.get(hostOf(s)) || 0) + 1);
-      let bestHost = hostOf(sessions[0]);
-      let bestCount = -1;
-      for (const h of [...hostCounts.keys()].sort()) {
-        const c = hostCounts.get(h);
-        if (c > bestCount) { bestCount = c; bestHost = h; }
-      }
-      const withTitle = sessions.find(s => s.card_title);
-      anchors.push({
-        anchor: true, anchor_kind: 'card',
-        id: 'card:' + cardId, session_id: 'card:' + cardId,
-        card_id: cardId, label: (withTitle && withTitle.card_title) || cardId,
-        lane: sessions[0].lane, host: bestHost,
-        _sessions: sessions,
-      });
-    }
-    for (const [host, sessions] of byHost) {
-      anchors.push({
-        anchor: true, anchor_kind: 'host',
-        id: 'host:' + host, session_id: 'host:' + host,
-        card_id: null, label: host,
-        lane: null, host,
-        _sessions: sessions,
-      });
-    }
-    return anchors;
-  }
-
-  function anchorTargetIdFor(s) {
-    return s.card_id != null ? ('card:' + s.card_id) : ('host:' + hostOf(s));
-  }
-
-  function applyAnchorAttrs(sel) {
-    sel.each(function(d) {
-      const el = d3.select(this);
-      const { w, h } = anchorBoxFor(d);
-      const strokeColor = d.anchor_kind === 'card' ? laneColor(d.lane) : 'rgba(232,232,237,0.35)';
-      el.select('rect.anchor-shape')
-        .attr('x', -w / 2).attr('y', -h / 2)
-        .attr('width', w).attr('height', h)
-        .attr('rx', 8).attr('ry', 8)
-        .attr('fill', 'rgba(255,255,255,0.04)')
-        .attr('stroke', strokeColor)
-        .attr('stroke-width', 2)
-        .attr('stroke-dasharray', d.anchor_kind === 'host' ? '4 3' : null);
-      el.select('text.anchor-label')
-        .attr('y', 4)
-        .text(anchorLabelText(d));
-    });
-  }
-
-  // Renders the question badge on the anchor itself — a card anchor whose
-  // sessions include any row with a non-null `pending_question` — never via
-  // `applyBadges`, which only ever touches a session `.node`.
-  function applyAnchorBadge(sel) {
-    sel.each(function(d) {
-      const g = d3.select(this);
-      const { w, h } = anchorBoxFor(d);
-      const hasQuestion = d.anchor_kind === 'card' && (d._sessions || []).some(s => !!s.pending_question);
-      g.select('.anchor-badge-question-ring')
-        .style('display', hasQuestion ? '' : 'none')
-        .attr('cx', w / 2 - 2).attr('cy', -h / 2 + 2).attr('r', 8);
-      g.select('text.anchor-badge-question')
-        .style('display', hasQuestion ? '' : 'none')
-        .attr('x', w / 2 - 2).attr('y', -h / 2 + 2)
-        .text('?');
-    });
-  }
-
-  function renderGraph(sessions, snapshotEdges) {
+  function renderGraph(sessions) {
     const filtered = applyFilters(sessions);
     const visible = applyCollapse(filtered);
     const totalCounts = totalChildCounts(filtered);
     const visibleIds = new Set(visible.map(s => s.session_id));
 
-    const hosts = [...new Set(visible.map(hostOf))].sort();
-    const colWidth = VIEW_W / Math.max(1, hosts.length);
-    columnHosts = hosts;
-    columnCenters = new Map(hosts.map((h, i) => [h, colWidth * (i + 0.5)]));
-    const hostCounts = new Map();
-    for (const h of visible.map(hostOf)) hostCounts.set(h, (hostCounts.get(h) || 0) + 1);
+    const visibleLinks = visible
+      .filter(session => session.parent_session_id && visibleIds.has(session.parent_session_id))
+      .map(session => ({
+        id: `${session.parent_session_id}->${session.session_id}`,
+        source: session.parent_session_id,
+        target: session.session_id,
+      }));
 
-    const columnSel = columnLayer.selectAll('text.host-column-label')
-      .data(hosts, h => h)
-      .join(
-        enter => enter.append('text').attr('class', 'host-column-label'),
-        update => update,
-        exit => exit.remove()
-      );
-    columnSel
-      .attr('x', h => columnCenters.get(h))
-      .attr('y', 28)
-      .text(h => `${h} · ${hostCounts.get(h)}`);
-
-    const visibleLinks = (snapshotEdges || [])
-      .filter(e => visibleIds.has(e.from) && visibleIds.has(e.to))
-      .map(e => ({ id: `${e.from}->${e.to}`, source: e.from, target: e.to, _anchorLink: false }));
-
-    // One anchor link per visible session, in addition to the spawn edges
-    // above — a distinct `link-anchor` class keeps their styling (and the
-    // existing `relatedTo`/selection highlighting, which matches on any
-    // `path.link`) coherent with the spawn edges rather than colliding.
-    const anchors = buildAnchors(visible);
-    lastAnchorsById = new Map(anchors.map(a => [a.id, a]));
-    const anchorLinks = visible.map(s => ({
-      id: `anchor:${s.session_id}`, source: s.session_id, target: anchorTargetIdFor(s), _anchorLink: true,
-    }));
-
-    // The SAME array (and the SAME link objects) feed both this DOM data
-    // join and `simulation.force('link').links(...)` below — `d3.forceLink`
-    // mutates each link's `source`/`target` in place (string id -> resolved
-    // node object) once the simulation ticks, and the tick handler's own
-    // path-drawing code reads `d.source.x`/`d.target.x` off exactly these
-    // bound objects; a copy here would leave the DOM-bound data permanently
-    // holding the un-resolved string ids instead.
-    const allLinkData = [...visibleLinks, ...anchorLinks];
     linkLayer.selectAll('path.link')
-      .data(allLinkData, d => d.id)
+      .data(visibleLinks, d => d.id)
       .join(
-        enter => enter.append('path').attr('class', d => d._anchorLink ? 'link link-anchor' : 'link'),
-        update => update.attr('class', d => d._anchorLink ? 'link link-anchor' : 'link'),
+        enter => enter.append('path').attr('class', 'link'),
+        update => update.attr('class', 'link'),
         exit => exit.remove()
       );
 
-    const oldById = new Map();
-    nodeLayer.selectAll('.node').each(function(d) { oldById.set(d.session_id, d); });
-    const merged = visible.map(s => {
-      const prev = oldById.get(s.session_id);
-      const row = prev ? Object.assign(prev, s) : Object.assign(
-        { x: columnTargetX(s), y: laneTargetY(s) }, s,
-      );
-      const total = totalCounts.get(s.session_id) || 0;
+    const merged = delegationTimelineLayout(visible).map(row => {
+      const total = totalCounts.get(row.session_id) || 0;
       row._totalChildren = total;
-      row._collapsedChildren = expandedParents.has(s.session_id) ? 0 : total;
+      row._collapsedChildren = expandedParents.has(row.session_id) ? 0 : total;
       return row;
     });
 
@@ -1118,20 +810,6 @@ export function initGraph(boardApi) {
 
     const entered = sel.enter().append('g')
       .attr('class', 'node')
-      .style('cursor', 'grab')
-      .call(d3.drag()
-        .on('start', (event, d) => {
-          if (!event.active) simulation.alphaTarget(0.1).restart();
-          d.fx = d.x;
-          d.fy = d.y;
-        })
-        .on('drag', (event, d) => {
-          d.fx = event.x;
-          d.fy = event.y;
-        })
-        .on('end', (event, d) => {
-          if (!event.active) simulation.alphaTarget(0);
-        }))
       .on('click', (event, d) => {
         // `event.detail` is the click count in the browser's own
         // click/click/dblclick sequence — the second click of a
@@ -1212,58 +890,49 @@ export function initGraph(boardApi) {
     // across re-renders via `oldAnchorsById`) but never runs through
     // `applyShapeAttrs`/`applyBadges`/`renderNodeLabel` — those are the
     // session node's own rendering, off limits here by design.
-    const oldAnchorsById = new Map();
-    anchorLayer.selectAll('.anchor').each(function(d) { oldAnchorsById.set(d.id, d); });
-    const anchorMerged = anchors.map(a => {
-      const prev = oldAnchorsById.get(a.id);
-      return prev ? Object.assign(prev, a) : Object.assign(
-        { x: columnTargetX(a), y: laneTargetY(a) }, a,
-      );
-    });
-
-    const anchorSel = anchorLayer.selectAll('.anchor')
-      .data(anchorMerged, d => d.id);
-    const anchorEntered = anchorSel.enter().append('g')
-      .attr('class', 'anchor')
-      .on('click', (event, d) => {
-        if (event.detail > 1) return;
-        if (d.id === selectedAnchorId) closePanel();
-        else selectAnchor(d.id);
-      });
-    anchorEntered.append('rect').attr('class', 'anchor-shape');
-    anchorEntered.append('text').attr('class', 'anchor-label');
-    anchorEntered.append('circle').attr('class', 'anchor-badge-question-ring')
-      .attr('fill', 'none').attr('stroke', 'var(--accent, #6366f1)').attr('stroke-width', 2);
-    anchorEntered.append('text').attr('class', 'anchor-badge-question')
-      .attr('text-anchor', 'middle').attr('font-size', 11).attr('fill', 'var(--accent, #6366f1)');
-    const anchorAll = anchorEntered.merge(anchorSel);
-    applyAnchorAttrs(anchorAll);
-    applyAnchorBadge(anchorAll);
-    anchorSel.exit().remove();
+    const byId = new Map(merged.map(row => [row.session_id, row]));
 
     visibleCount = merged.length;
-    simulation.nodes([...merged, ...anchorMerged]);
-    simulation.force('link').links(allLinkData);
-    // Restart when either the visible-id set, any node's size, OR the
-    // anchor set changed — a card just linked to (or dropped by) a session
-    // reshapes the clusters even when no session itself entered or left.
-    const idsKey = visible.map(s => s.session_id).sort().join('|');
-    const sizeKey = visible.map(s => `${s.session_id}:${Math.round(nodeRadius(s))}`).sort().join('|');
-    const anchorKey = anchors.map(a => a.id).sort().join('|');
-    const simKey = idsKey + '::' + sizeKey + '::' + anchorKey;
-    if (simKey !== _lastSimKey) {
-      _lastSimKey = simKey;
-      simulation.alpha(0.3).restart();
-      if (_simStopTimer) clearTimeout(_simStopTimer);
-      _simStopTimer = setTimeout(() => simulation.alpha(0).stop(), 8000);
-    }
+    nodeLayer.selectAll('.node')
+      .attr('transform', d => `translate(${d.x},${d.y})`)
+      .attr('data-depth', d => d._delegationDepth)
+      .attr('data-timeline-order', d => d._timelineOrder);
+    linkLayer.selectAll('path.link').attr('d', edge => {
+      const source = byId.get(edge.source);
+      const target = byId.get(edge.target);
+      if (!source || !target) return '';
+      const midX = source.x + (target.x - source.x) / 2;
+      return `M${source.x},${source.y} C${midX},${source.y} ${midX},${target.y} ${target.x},${target.y}`;
+    });
+
+    const maxX = merged.reduce((max, row) => Math.max(max, row.x), 130);
+    const depths = [...new Set(merged.map(row => row._delegationDepth))].sort((a, b) => a - b);
+    guideLayer.selectAll('line.timeline-row')
+      .data(depths, d => d)
+      .join('line')
+      .attr('class', 'timeline-row')
+      .attr('x1', 70).attr('x2', maxX + 90)
+      .attr('y1', d => 120 + d * 190).attr('y2', d => 120 + d * 190);
+    guideLayer.selectAll('text.depth-label')
+      .data(depths, d => d)
+      .join('text')
+      .attr('class', 'depth-label')
+      .attr('x', 70).attr('y', d => 124 + d * 190)
+      .text(d => d === 0 ? 'ROOT' : `LEVEL ${d}`);
+    guideLayer.selectAll('text.time-label')
+      .data(merged.length ? ['EARLIER', 'LATER'] : [])
+      .join('text')
+      .attr('class', 'time-label')
+      .attr('x', d => d === 'EARLIER' ? 130 : maxX)
+      .attr('y', 44)
+      .attr('text-anchor', d => d === 'EARLIER' ? 'start' : 'end')
+      .text(d => d);
 
     emptyStateEl.style.display = visible.length === 0 ? '' : 'none';
     updateChips(filtered);
     updateCwdOptions(allSessions);
     updateHostOptions(allSessions);
     applySelectionStyles();
-    applyAnchorSelectionStyles();
   }
 
   function linkEndpoints(e) {
@@ -1275,11 +944,24 @@ export function initGraph(boardApi) {
   function relatedTo(sessionId) {
     const out = new Set();
     if (!sessionId) return out;
+    const neighbors = new Map();
     linkLayer.selectAll('path.link').each(function(e) {
       const [s, t] = linkEndpoints(e);
-      if (s === sessionId) out.add(t);
-      if (t === sessionId) out.add(s);
+      if (!neighbors.has(s)) neighbors.set(s, []);
+      if (!neighbors.has(t)) neighbors.set(t, []);
+      neighbors.get(s).push(t);
+      neighbors.get(t).push(s);
     });
+    const queue = [sessionId];
+    const seen = new Set(queue);
+    while (queue.length) {
+      for (const neighbor of (neighbors.get(queue.shift()) || [])) {
+        if (seen.has(neighbor)) continue;
+        seen.add(neighbor);
+        out.add(neighbor);
+        queue.push(neighbor);
+      }
+    }
     return out;
   }
 
@@ -1299,12 +981,14 @@ export function initGraph(boardApi) {
       .classed('highlighted', e => {
         if (!hasSelection) return false;
         const [s, t] = linkEndpoints(e);
-        return s === selectedSessionId || t === selectedSessionId;
+        const lineage = new Set([selectedSessionId, ...related]);
+        return lineage.has(s) && lineage.has(t);
       })
       .classed('dimmed', e => {
         if (!hasSelection) return false;
         const [s, t] = linkEndpoints(e);
-        return s !== selectedSessionId && t !== selectedSessionId;
+        const lineage = new Set([selectedSessionId, ...related]);
+        return !lineage.has(s) || !lineage.has(t);
       });
   }
 
@@ -1328,7 +1012,7 @@ export function initGraph(boardApi) {
     allEdges = snap.edges || [];
     apiHost = snap.api_host || apiHost;
     snapshotLoaded = true;
-    renderGraph(allSessions, allEdges);
+    renderGraph(allSessions);
     if (selectedSessionId) {
       const s = allSessions.find(x => x.session_id === selectedSessionId);
       // Passing the card on every tick (not just at `open`) is what lets
@@ -1340,10 +1024,6 @@ export function initGraph(boardApi) {
         renderPanelActions(s);
       }
     }
-    if (selectedAnchorId) {
-      const a = lastAnchorsById.get(selectedAnchorId);
-      if (a) renderPanelActions(a);
-    }
     // Resolves a pending `?session=<id>` deep link, or a session chip's
     // `requestGraphFocus`, once this snapshot is the first to land after
     // the intent was set — a no-op on every other tick, since
@@ -1353,23 +1033,19 @@ export function initGraph(boardApi) {
   }
 
   // --- Filters ---
-  function releasePins() {
-    nodeLayer.selectAll('.node').each(function(d) { d.fx = null; d.fy = null; });
-  }
   function onFilterChange() {
-    releasePins();
     svg.transition().duration(300).call(zoom.transform, d3.zoomIdentity);
-    renderGraph(allSessions, allEdges);
+    renderGraph(allSessions);
     if (searchQuery.trim()) renderSearchResults();
   }
   // Re-renders for a shared-filter change (from either tab, a card-chip
   // jump's relaxation, or a keystroke in the search/tag inputs) WITHOUT
-  // resetting the pan/zoom transform or releasing drag pins — unlike
+  // resetting the pan/zoom transform — unlike
   // `onFilterChange` above, which stays the right behaviour for the
   // graph's own local-only controls (recency/cwd/status/include-finished),
   // still called directly below.
   function renderForSharedChange() {
-    renderGraph(allSessions, allEdges);
+    renderGraph(allSessions);
     if (searchQuery.trim()) renderSearchResults();
   }
   filterTerminalEl.addEventListener('change', () => {
@@ -1767,11 +1443,10 @@ export function initGraph(boardApi) {
     // force one here for the local-only relax/expand paths, which don't go
     // through it.
     if (needsRerender && !sharedChanged) {
-      releasePins();
-      renderGraph(allSessions, allEdges);
+      renderGraph(allSessions);
     }
     openPanel(sessionId);
-    panToNode(sessionId, needsRerender ? 400 : 0);
+    panToNode(sessionId, 0);
   }
 
   function drainGraphFocus() {
@@ -1829,7 +1504,7 @@ export function initGraph(boardApi) {
       panelResizerEl.classList.remove('dragging');
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
-      try { simulation.alpha(0.1).restart(); } catch (_) {}
+      updateLabelLegibility(currentZoomK());
     });
   })();
 

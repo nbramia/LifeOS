@@ -4,7 +4,7 @@
 > **Owner:** Agent Worker
 > **Last Updated:** 2026-09-08
 
-`/agents` is a Kanban board of the operator's work queue — vault tasks, agent questions, and scheduled work in one place, organized into lanes by status and tag. A **Graph** tab keeps the earlier force-directed session graph as a secondary, read-mostly view for watching what's actively running: every LifeOS agent worker task (`#agent`-tagged), local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`), and Claude Code / Codex sessions registered from **any other machine** on the tailnet via a lightweight hook script.
+`/agents` is a Kanban board of the operator's work queue — vault tasks, agent questions, and scheduled work in one place, organized into lanes by status and tag. A **Graph** tab shows a deterministic delegation timeline as a secondary, read-mostly view for watching what's actively running: every LifeOS agent worker task (`#agent`-tagged), local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`), and Claude Code / Codex sessions registered from **any other machine** on the tailnet via a lightweight hook script.
 
 The point is one place to see what needs attention: what's waiting on an assignment, what an agent is stuck asking about, what's scheduled to run next, and — when you want to watch the machinery — what's actually executing right now.
 
@@ -100,8 +100,7 @@ Manual card reordering within a lane. Display sorting is client-only and does no
 
 ## Graph tab — what you see
 
-The Graph tab is a force-directed session map, laid out in labelled columns
-by host. Each node is one session:
+The Graph tab is a deterministic delegation timeline. Each node is one session:
 
 | Encoding | Meaning |
 |---|---|
@@ -111,10 +110,11 @@ by host. Each node is one session:
 | **Secondary ring** | A thin accent ring around the node sized by tool-call count. |
 | **Question badge** | A small ring + `?` glyph, offset from the label, when a pending question is open for the operator on this session. |
 | **Error badge** | A count, offset from the label, when `error_count > 0`. |
-| **Collapsed-subagent badge** | On a parent with subagents: `+N` for the currently-hidden direct-child count, or a plain collapse glyph once fully expanded. Click to toggle. |
+| **Collapsed-subagent badge** | On a parent with completed child branches: `+N` for the currently-hidden direct-child count, or a plain collapse glyph once fully expanded. Click to toggle. |
 | **White pulsing border** | Session is `running` AND has written to its transcript in the last 60 seconds (i.e. *actively producing output right now*) |
 | **Edge** | Spawn relationship — parent → subagent. Hidden while the subagent side is collapsed. |
-| **Position** | Columns group nodes by host (column header: `<host> · <count>`); inside a column, a lane sub-band groups nodes by the same lane the fill colour encodes. Recency is a filter only, not a position signal. |
+| **Horizontal position** | Earlier sessions appear to the left and later sessions to the right. Equal timestamps use a stable id tie-breaker, with parents always preceding their descendants. |
+| **Vertical position** | Root sessions occupy level 0. Each generation of delegated work occupies the next level down. Dashed row guides label the depth explicitly. |
 
 **Node label** — the text under each node, first non-empty of: an
 operator-pinned custom label, the derived label (task description for
@@ -132,28 +132,16 @@ same model never read as the same node. A node never renders a bare `?`.
 
 ### Subagent trees
 
-A session with a parent (a Task/Agent-tool subagent) is hidden by default;
-its parent shows the collapsed-subagent badge above. Clicking the badge
-expands the children (and their own spawn edges) into view; clicking again
-collapses them back. Searching for a session inside a collapsed tree
-expands its ancestors automatically so the match is visible.
+Active delegation branches remain expanded. Completed child branches are
+collapsed by default; their parent shows the collapsed-subagent badge.
+Clicking the badge expands those sessions and their delegation edges;
+clicking again collapses them. Searching or deep-linking to a session
+expands its ancestors automatically.
 
-### Card clusters
-
-Every visible session linked to a board card renders attached to a card
-anchor — a rounded rectangle labelled with the card's title, its stroke
-coloured the same lane colour a session node's own fill uses, positioned
-in the column of the host most of its sessions run on and the lane band
-its own lane occupies. Every session sharing that card attaches to the
-same anchor by a dashed link, distinct from the solid spawn edges above.
-A session with no linked card attaches instead to a host anchor labelled
-with its host name — one per host among the sessions with no card. A
-card anchor whose sessions include an open pending question renders the
-same question-ring badge a session node shows, on the anchor itself.
-
-Clicking an anchor doesn't open the transcript panel — an anchor groups
-several sessions, not one — but shows the same card actions a selected
-session node shows (see [Linking the board and the graph](#linking-the-board-and-the-graph)) for the card it represents.
+Machines and linked cards are session metadata, not graph nodes. Host stays
+available as a filter and in the hover card and side panel; a linked card's
+title labels the session and **Show on board** navigates to it. The graph
+draws only actual parent-child delegation edges.
 
 ### Hover card and canvas controls
 
@@ -175,18 +163,17 @@ with no delay; moving off hides it.
   hover card still names whichever node the operator points at. Reset
   always shows labels again, at their normal size.
 - **Click a node** — opens its transcript in the side panel immediately
-  (no artificial delay) and highlights its parent/child relationships
-  (selected node gets a thick white border, 1-hop neighbors get a thinner
-  white border, everything else dims).
+  (no artificial delay) and highlights its delegation tree (the selected
+  node gets a thick white border, its connected lineage gets a thinner
+  white border, and unrelated sessions dim).
 - **Double-click a non-subagent Claude Code or Codex node** — jumps focus
   to its terminal (see [Operator controls — resume and Go To](#graph-tab--operator-controls--resume-and-go-to)); the side panel opening on the first click of the pair is expected.
 - **Click the same node again, or click empty background** — deselects and closes the panel. Double-clicking a non-subagent Claude Code or Codex node is the exception: the pair's first click closes the panel and the double-click reopens it on that same session as focus jumps to its terminal.
-- **Filter change** — releases any drag-pinned positions and resets the pan/zoom transform so the new visible set lays out from scratch at the natural scale.
+- **Filter change** — resets the pan/zoom transform so the deterministic visible set returns to its natural scale.
 
-The simulation restarts whenever the visible-id set OR any visible node's
-size changes (a session growing in active seconds reheats the layout, not
-just a session appearing or disappearing), and auto-stops 8 seconds after
-its last restart.
+An unchanged snapshot produces exactly the same coordinates. New sessions
+are inserted according to creation time without any settling animation or
+periodic movement.
 
 ---
 
@@ -373,9 +360,9 @@ The board and the graph describe the same work from two angles, kept in one navi
 
 **Card session chip → graph.** A task card whose linked session exists shows a small clickable session chip (↗ session) among its other chips; clicking it switches to the Graph tab, pans to that session's node, and selects it.
 
-**Node → board.** Selecting a node, or a card anchor (see [Card clusters](#card-clusters)), shows a **Show on board** action above the transcript panel whenever it — or, for an anchor, one of its sessions — is linked to a card. Clicking it — or simply switching to the Board tab while that node or anchor stays selected — scrolls to the card and briefly highlights it, relaxing whichever shared filters (lane, assignee, host, engine, tag, search, recency) currently hide it first.
+**Node → board.** Selecting a node shows a **Show on board** action above the transcript panel whenever the session is linked to a card. Clicking it — or simply switching to the Board tab while that node stays selected — scrolls to the card and briefly highlights it, relaxing whichever shared filters (lane, assignee, host, engine, tag, search, recency) currently hide it first.
 
-**Answer from the graph.** A selected node or card anchor with an open pending question shows an **Answer** action next to Show on board; it reveals an inline reply box in place and posts through the same endpoint the board drawer's own Answer button uses.
+**Answer from the graph.** A selected node with an open pending question shows the same **Answer** action as the board drawer and posts through the same endpoint.
 
 **Deep links.** `/agents?session=<id>` opens the Graph tab with that session selected and centred; `/agents?card=<id>` opens the Board tab with that card's drawer open. An id that doesn't resolve — no such session, no such card — shows a toast and leaves the default view.
 
@@ -424,7 +411,7 @@ All in `.env`. None are required — the defaults work for the standard LifeOS i
 
 - [API Reference](api-reference.md) — HTTP contracts for the board's lane, accept, and cancel endpoints
 - [ADR-011: External Agent Ingest](../../adr/011-external-agent-ingest.md) — Why Claude Code sessions surface read-only via a foreign-schema adapter
-- [Agent Viz — Technical](../technical/agent-viz.md) — Endpoint shapes, D3 force config, status inference rules, security boundaries, and the board's lane-derivation rules
+- [Agent Viz — Technical](../technical/agent-viz.md) — Endpoint shapes, delegation timeline layout, status inference rules, security boundaries, and the board's lane-derivation rules
 - [Agent Worker](agent-worker.md) — The other half of the picture: how `#agent` tasks get claimed and run
 - [Claude Code Orchestration (product)](claude-code-orchestration.md) — The orchestrator that spawns the Claude Code sessions surfaced here
 - [Agent Worker — Technical](../technical/agent-worker.md) — Sessions, transcripts, kill primitives
