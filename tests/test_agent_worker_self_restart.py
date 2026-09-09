@@ -68,6 +68,30 @@ class _FakeApi:
             tags[tags.index(from_tag)] = to_tag
             task["tags"] = tags
             return httpx.Response(200, json={"swapped": True})
+        if request.method == "POST" and path.endswith("/claim-agent"):
+            task_id = path.split("/")[-2]
+            task = self.tasks.get(task_id)
+            if not task:
+                return httpx.Response(200, json={"claimed": False, "reason": "task not found"})
+            tags = list(task.get("tags", []))
+            consumed = "agent" in tags
+            if consumed:
+                tags[tags.index("agent")] = "agent-running"
+            else:
+                tags.append("agent-running")
+            task["tags"] = tags
+            task["status"] = "in_progress"
+            return httpx.Response(200, json={"claimed": True, "consumed_queue_tag": consumed})
+        if request.method == "POST" and path.endswith("/remove-tag"):
+            task_id = path.split("/")[-2]
+            tag = request.url.params.get("tag")
+            task = self.tasks.get(task_id)
+            if not task or tag not in task.get("tags", []):
+                return httpx.Response(200, json={"ok": False, "reason": "tag not present"})
+            tags = list(task["tags"])
+            tags.remove(tag)
+            task["tags"] = tags
+            return httpx.Response(200, json={"ok": True})
         if request.method == "PUT" and path.endswith("/complete"):
             task_id = path.split("/")[-2]
             task = self.tasks.get(task_id)
@@ -157,7 +181,7 @@ def test_resume_pending_self_restart_finalizes_quietly(tmp_path: Path):
     assert w._sent_telegram == [], f"expected no rollback notice; got {w._sent_telegram}"
     refreshed = w.session_store.get("doctor_task")
     assert refreshed.status == STATUS_COMPLETED
-    # Tag advanced to completed, NOT rolled back to #agent.
+    # Tag advanced to completed; engine consent tag remains.
     assert COMPLETED_TAG in api.tasks["doctor_task"]["tags"]
     assert AGENT_TAG not in api.tasks["doctor_task"]["tags"]
     # Vault checkbox advanced to done ([x]) too — not left stuck at in_progress
@@ -212,7 +236,11 @@ def test_resume_pending_without_marker_still_rolls_back(tmp_path: Path):
     assert n == 1
     assert len(w._sent_telegram) == 1
     assert "could not be safely resumed" in w._sent_telegram[0]
-    assert AGENT_TAG in api.tasks["crashed_task"]["tags"]
+    assert AGENT_TAG not in api.tasks["crashed_task"]["tags"]
+    assert RUNNING_TAG not in api.tasks["crashed_task"]["tags"]
+    assert "cloud-sonnet" in api.tasks["crashed_task"]["tags"]
+    assert RUNNING_TAG not in api.tasks["crashed_task"]["tags"]
+    assert "cloud-sonnet" in api.tasks["crashed_task"]["tags"]
     kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
     assert "resume_failed" in kinds
 

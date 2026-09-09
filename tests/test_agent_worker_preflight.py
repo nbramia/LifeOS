@@ -785,8 +785,15 @@ def test_default_llm_caller_uses_anthropic_when_key_set_no_probe(monkeypatch):
     from config.settings import settings
     from api.services.llm_client import AnthropicLLMClient, LocalLLMClient
 
+    # Host .env may force LIFEOS_AGENT_PREFLIGHT_ENGINE=remote; pin auto so
+    # this exercises the Anthropic-first default-caller path.
+    monkeypatch.setattr(settings, "agent_preflight_engine", "auto", raising=False)
     monkeypatch.setattr(settings, "anthropic_api_key", "test-anthropic-key", raising=False)
     monkeypatch.setattr(settings, "agent_preflight_model", "claude-haiku-4-5", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
 
     captured = {}
 
@@ -823,6 +830,7 @@ def test_default_llm_caller_falls_back_to_local_when_reachable(monkeypatch):
     from config.settings import settings
     from api.services.llm_client import LocalLLMClient
 
+    monkeypatch.setattr(settings, "agent_preflight_engine", "auto", raising=False)
     monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
     monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
     monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)

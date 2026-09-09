@@ -33,6 +33,7 @@ that.
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -563,12 +564,30 @@ def _as_set(dict_list):
 
 
 @pytest.fixture
-def stores(tmp_path):
+def stores(tmp_path, monkeypatch):
     interaction_db = str(tmp_path / "interactions.db")
     person_db = str(tmp_path / "crm.db")
     istore = InteractionStore(interaction_db, strict=False)
     pstore = PersonEntityStore(person_db)
     pstore._blocklist.clear()
+    # Oracle expects no tracked relationships (no committed family_members.json).
+    # A developer machine with a local gitignored copy would otherwise leak
+    # Parent/Coparent rows into every Me-interactions assertion.
+    family_cfg = (
+        Path(__file__).resolve().parents[1] / "config" / "family_members.json"
+    )
+    real_exists = Path.exists
+
+    def _exists(self):
+        try:
+            if self.resolve() == family_cfg.resolve():
+                return False
+        except Exception:
+            if str(self) == str(family_cfg):
+                return False
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", _exists)
     return istore, pstore
 
 
