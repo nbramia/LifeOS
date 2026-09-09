@@ -22,6 +22,12 @@ import { descendantsOf } from './graph_encoding.js';
 import { cardActionHandlers, cancelCard, openDeleteCardModal } from './card_actions.js';
 import { renderAssignmentPickers } from './assignment.js';
 import { LANES, laneColor } from './lanes.js';
+import { routingFilterValue } from './graph_encoding.js';
+import {
+  getFilters, setFilter, setFilters, resetFilters, subscribe as subscribeFilters,
+  requestGraphFocus, requestBoardFocus, takeBoardFocus,
+  onTabActivate, activateTab, getSelectedGraphCardId,
+} from './linking.js';
 
 const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local'];
 // plan_lane_move (api/services/agent_board.py) 409s a lane=in_progress move
@@ -66,45 +72,15 @@ const SCHEDULE_EXECUTORS = ['local', 'cloud', 'cloud-haiku', 'cloud-sonnet'];
 // Lane filter — multi-select checkbox dropdown. Hidden lanes are
 // removed from the grid entirely (not just emptied), so the remaining
 // .board-lane columns (flex: 1 1 260px, see web/agents.html CSS) widen to
-// fill the space.
-const LANE_FILTER_STORAGE_KEY = 'lifeos.agents.board.lanes';
+// fill the space. The selection itself is the shared `lanes` filter
+// (web/agents/linking.js) — persistence, migration, and validation of a
+// stored id list all live there now; `visibleLanes` below is a local mirror
+// kept in sync via `subscribeFilters`.
 const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done').map(l => l.id);
 // plan_lane_move (api/services/agent_board.py) rejects `review` and
 // `scheduled` with "cannot be set directly" — no per-lane "+" button for
 // either, and both are excluded from the new-card composer's lane select.
 const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled').map(l => l.id));
-
-function loadLaneSelection() {
-  try {
-    const raw = localStorage.getItem(LANE_FILTER_STORAGE_KEY);
-    if (!raw) return new Set(DEFAULT_VISIBLE_LANE_IDS);
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return new Set(DEFAULT_VISIBLE_LANE_IDS);
-    // A deliberately emptied selection ([]) is a valid, intentional state —
-    // AC 2 says the selection is restored from storage, and the empty-state
-    // hint already covers the UI for it — so it must round-trip as empty,
-    // not be treated as malformed.
-    if (parsed.length === 0) return new Set();
-    const validIds = new Set(LANES.map(l => l.id));
-    // Tolerate an id naming a lane that isn't in the current LANES list — drop it, but
-    // keep whatever's still valid. Only fall back to the default when
-    // nothing valid survives (a malformed store, or a stored selection that
-    // was every lane the operator once had but none exist anymore) — never
-    // render zero lanes from a bad stored value that wasn't actually an
-    // intentional empty selection.
-    const filtered = parsed.filter(id => validIds.has(id));
-    if (filtered.length === 0) return new Set(DEFAULT_VISIBLE_LANE_IDS);
-    return new Set(filtered);
-  } catch (_) {
-    return new Set(DEFAULT_VISIBLE_LANE_IDS);
-  }
-}
-
-function saveLaneSelection(ids) {
-  try {
-    localStorage.setItem(LANE_FILTER_STORAGE_KEY, JSON.stringify([...ids]));
-  } catch (_) {}
-}
 
 export function initBoard() {
   const lanesEl = document.getElementById('board-lanes');
@@ -117,17 +93,23 @@ export function initBoard() {
   const laneFilterClearBtn = document.getElementById('board-lane-filter-clear');
   const assigneeFilterEl = document.getElementById('board-filter-assignee');
   const hostFilterEl = document.getElementById('board-filter-host');
+  const engineFilterEl = document.getElementById('board-filter-engine');
   const tagFilterEl = document.getElementById('board-filter-tag');
   const contextFilterEl = document.getElementById('board-filter-context');
   const recencyFilterEl = document.getElementById('board-filter-recency');
   const includeDoneEl = document.getElementById('board-filter-done');
+  const filterClearBtn = document.getElementById('board-filter-clear');
   const newCardBtn = document.getElementById('board-new-card');
   const connStateEl = document.getElementById('board-connection-state');
   const drawerBackdrop = document.getElementById('board-drawer-backdrop');
   const drawerEl = document.getElementById('board-drawer');
 
   let board = { lanes: Object.fromEntries(LANES.map(l => [l.id, []])) };
-  let visibleLanes = loadLaneSelection();
+  let visibleLanes = new Set(getFilters().lanes);
+  // Whether the first GET /api/agents/board (or board/stream tick) has
+  // landed — see `drainBoardFocus` below, the same "re-queue if not loaded
+  // yet" pattern graph.js's `drainGraphFocus` uses.
+  let boardLoaded = false;
   let openCardId = null;
   let openCardLane = null;
   let openCardSnapshot = null;  // last card object the drawer was fully rendered from
@@ -190,6 +172,13 @@ export function initBoard() {
     restoreFocusedTextField(captured);
   }
 
+  // `revealCard`'s highlight — kept here (not just poked onto a DOM node
+  // once) so a `render()` that rebuilds every card element in the middle of
+  // the ~2s window (a board-stream SSE tick, common on a cold load) still
+  // stamps it back onto the freshly-built element instead of losing it.
+  let revealedCardId = null;
+  let revealHighlightTimer = null;
+
   // ------------------------------------------------------------------
   // Data load + live updates
   // ------------------------------------------------------------------
@@ -208,6 +197,7 @@ export function initBoard() {
 
   function applyBoard(next) {
     board = next;
+    boardLoaded = true;
     updateFilterOptions();
     render();
     if (openCardId) {
@@ -215,6 +205,10 @@ export function initBoard() {
       if (!fresh) { closeDrawer(); return; }
       updateOpenDrawer(fresh);
     }
+    // Resolves a pending `?card=<id>` deep link, or a graph node's "Show on
+    // board", once this board payload is the first to land after the
+    // intent was set — a no-op on every other tick.
+    drainBoardFocus();
   }
 
   // A board tick (SSE, ~every 0.75s) reaches here even when nothing about
@@ -302,13 +296,32 @@ export function initBoard() {
     const hosts = [...new Set(
       allCards().flatMap(c => [c.session && c.session.host, c.fields && c.fields.host]).filter(Boolean)
     )].sort();
-    const hostKey = hosts.join('|');
+    // The shared `host` filter (linking.js) can name a host no board card
+    // currently uses at all — e.g. a session running on it never got linked
+    // to a task, so `_task_card` never surfaces it — in which case the
+    // option list above would never contain it and the select would fall
+    // back to blank. Inject it as a selectable option too, so the control
+    // always shows what's actually filtering rather than rendering blank.
+    const sharedHost = getFilters().host;
+    const optionHosts = (sharedHost && sharedHost !== 'all' && !hosts.includes(sharedHost))
+      ? [...hosts, sharedHost].sort()
+      : hosts;
+    const hostKey = optionHosts.join('|');
     if (hostFilterEl && hostKey !== _lastHostKey) {
       _lastHostKey = hostKey;
       const current = hostFilterEl.value;
       hostFilterEl.innerHTML = '<option value="all">all hosts</option>'
-        + hosts.map(h => `<option value="${escapeHtml(h)}">${escapeHtml(h)}</option>`).join('');
-      if (current && (current === 'all' || hosts.includes(current))) hostFilterEl.value = current;
+        + optionHosts.map(h => `<option value="${escapeHtml(h)}">${escapeHtml(h)}</option>`).join('');
+      // `host` is shared (linking.js) — the persisted/cross-tab value wins
+      // over the select's own pre-repopulation value once it's actually a
+      // valid option, so a host filter restored from localStorage before
+      // this option list existed yet still lands once it can.
+      const preferred = getFilters().host;
+      if (preferred && (preferred === 'all' || optionHosts.includes(preferred))) {
+        hostFilterEl.value = preferred;
+      } else if (current && (current === 'all' || optionHosts.includes(current))) {
+        hostFilterEl.value = current;
+      }
     }
 
     const contexts = [...new Set(
@@ -325,7 +338,14 @@ export function initBoard() {
   }
 
   function cardMatchesFilters(card) {
-    const search = (searchEl?.value || '').trim().toLowerCase();
+    // Read every SHARED key straight from the store rather than trusting a
+    // DOM select's current value — a select can lag the store (its option
+    // list populated asynchronously, e.g. `host` above) or simply not be
+    // the thing the render loop should trust, the same reasoning
+    // `applyFilters` in graph.js already follows.
+    const shared = getFilters();
+
+    const search = (shared.search || '').trim().toLowerCase();
     if (search) {
       const haystack = card.kind === 'schedule'
         ? (card.name || '')
@@ -333,7 +353,7 @@ export function initBoard() {
       if (!haystack.toLowerCase().includes(search)) return false;
     }
 
-    const assigneeSel = assigneeFilterEl?.value || 'all';
+    const assigneeSel = shared.assignee || 'all';
     if (assigneeSel !== 'all') {
       if (card.kind !== 'task') return false;
       if (assigneeSel === 'unassigned') {
@@ -343,7 +363,7 @@ export function initBoard() {
       }
     }
 
-    const hostSel = hostFilterEl?.value || 'all';
+    const hostSel = shared.host || 'all';
     if (hostSel !== 'all') {
       // Matches on either the assignment or the observation — a
       // card matches a selected host when its fields.host names it OR its
@@ -353,19 +373,32 @@ export function initBoard() {
       if (sessionHost !== hostSel && assignedHost !== hostSel) return false;
     }
 
-    const tagQuery = (tagFilterEl?.value || '').trim().toLowerCase().replace(/^#/, '');
+    const tagQuery = (shared.tag || '').trim().toLowerCase().replace(/^#/, '');
     if (tagQuery) {
       if (card.kind !== 'task') return false;
       if (!(card.tags || []).some(t => t.toLowerCase().includes(tagQuery))) return false;
     }
 
+    // Shared engine filter — mirrored on the graph as `#filter-route`.
+    // A card matches when its linked session's routing/source (the same
+    // notion `routingFilterValue` computes for a graph node) matches; a
+    // card with no linked session matches only when the filter is "all".
+    const engineSel = shared.engine || 'all';
+    if (engineSel !== 'all') {
+      if (!card.session || routingFilterValue(card.session) !== engineSel) return false;
+    }
+
+    // Context stays board-local — not one of the seven shared keys.
     const contextSel = contextFilterEl?.value || 'all';
     if (contextSel !== 'all') {
       if (card.kind !== 'task' || card.context !== contextSel) return false;
     }
 
-    const recencyRaw = recencyFilterEl?.value || 'all';
-    if (recencyRaw !== 'all') {
+    // `null` (the shared default) means "the operator has never set a
+    // recency" — the board's own default is all time, so it filters
+    // nothing, same as an explicit 'all'.
+    const recencyRaw = shared.recency;
+    if (recencyRaw != null && recencyRaw !== 'all') {
       const recencySec = Number(recencyRaw);
       const stamp = card.kind === 'schedule' ? card.next_fire_at : card.updated_at;
       if (stamp) {
@@ -414,6 +447,13 @@ export function initBoard() {
     if (card.session && card.session.host && !(assignedChipRendered && card.session.host === assignedHost)) {
       chips.push(`<span class="board-chip board-chip-host" title="ran on">${escapeHtml(card.session.host)}</span>`);
     }
+    // Session chip → graph tab — clickable only when a session is
+    // actually linked; `renderTaskCard` wires its click once this markup
+    // is mounted (a `stopPropagation` handler can't be expressed inline
+    // here without re-escaping into an attribute).
+    if (card.session) {
+      chips.push(`<span class="board-chip board-chip-session" data-session-id="${escapeHtml(card.session.session_id)}" title="Open in graph">↗ session</span>`);
+    }
     for (const t of (card.tags || [])) {
       if (ASSIGNEES.includes(t.toLowerCase())) continue;  // already shown as the assignee chip
       chips.push(`<span class="board-chip board-chip-tag">#${escapeHtml(t)}</span>`);
@@ -427,6 +467,12 @@ export function initBoard() {
     div.className = 'board-card';
     div.dataset.cardId = card.id;
     div.dataset.lane = card.lane;
+    // Re-stamps the reveal highlight on a freshly-built element — a
+    // `render()` in the middle of `revealCard`'s ~2s window (e.g. a
+    // board-stream SSE tick) rebuilds every card node from scratch, so this
+    // is what keeps the highlight surviving that rebuild rather than a
+    // one-time class added to a node that gets discarded.
+    if (card.id === revealedCardId) div.classList.add('reveal-highlight');
     div.innerHTML = `
       <div class="board-card-title">${live ? '<span class="live-dot" title="live"></span>' : ''}${escapeHtml(card.title || '(untitled)')}</div>
       ${card.pending_question ? `<div class="board-card-question">❓ ${escapeHtml(card.pending_question.question)}</div>` : ''}
@@ -436,6 +482,14 @@ export function initBoard() {
       if (suppressNextClick === card.id) { suppressNextClick = null; return; }
       openDrawer(card.id);
     });
+    const sessionChip = div.querySelector('.board-chip-session');
+    if (sessionChip) {
+      sessionChip.addEventListener('click', (e) => {
+        e.stopPropagation();
+        requestGraphFocus(sessionChip.dataset.sessionId);
+        activateTab('graph');
+      });
+    }
     div.addEventListener('mousedown', (e) => onCardMouseDown(e, card));
     return div;
   }
@@ -445,6 +499,7 @@ export function initBoard() {
     div.className = 'board-card board-card-schedule';
     div.dataset.cardId = card.id;
     div.dataset.lane = card.lane;
+    if (card.id === revealedCardId) div.classList.add('reveal-highlight');
     const nextFire = card.next_fire_at ? new Date(card.next_fire_at).toLocaleString() : '—';
     div.innerHTML = `
       <div class="board-card-title">${escapeHtml(card.name || '(schedule)')}</div>
@@ -504,6 +559,99 @@ export function initBoard() {
       lanesEl.appendChild(column);
     }
   }
+
+  // Makes card `cardId` visible and scrolls it into view — the graph tab's
+  // "Show on board" action, a `?card=<id>` deep link, and activating the
+  // board tab with a card selected on the graph (see `drainBoardFocus`
+  // below) all land here. Relaxes EVERY shared filter that currently hides
+  // the card (lanes, assignee, host, engine, tag, search, recency) through
+  // one batched `setFilters` call, then confirms the card actually rendered
+  // before scrolling/highlighting — a board-local filter (context, include
+  // cancelled) is left as-is, the operator set those on purpose and they
+  // have no shared counterpart to relax. An unknown id is reported rather
+  // than left to fail silently.
+  function revealCard(cardId, opts) {
+    const openDrawerFlag = !!(opts && opts.openDrawer);
+    const card = findCard(cardId);
+    if (!card) {
+      showToast(`No such card: ${cardId}`, true);
+      return;
+    }
+    const shared = getFilters();
+    const updates = {};
+    if (!visibleLanes.has(card.lane)) updates.lanes = [...shared.lanes, card.lane];
+    if (shared.assignee !== 'all') {
+      const matches = shared.assignee === 'unassigned' ? !card.assignee : card.assignee === shared.assignee;
+      if (!matches) updates.assignee = 'all';
+    }
+    if (shared.host !== 'all') {
+      const sessionHost = card.session && card.session.host;
+      const assignedHost = card.fields && card.fields.host;
+      if (sessionHost !== shared.host && assignedHost !== shared.host) updates.host = 'all';
+    }
+    if (shared.engine !== 'all' && (!card.session || routingFilterValue(card.session) !== shared.engine)) {
+      updates.engine = 'all';
+    }
+    if (shared.tag) {
+      const tagQuery = shared.tag.trim().toLowerCase().replace(/^#/, '');
+      if (!(card.tags || []).some(t => t.toLowerCase().includes(tagQuery))) updates.tag = '';
+    }
+    if (shared.search) {
+      const search = shared.search.trim().toLowerCase();
+      const haystack = card.kind === 'schedule' ? (card.name || '') : `${card.title || ''} ${card.notes || ''}`;
+      if (!haystack.toLowerCase().includes(search)) updates.search = '';
+    }
+    if (shared.recency != null && shared.recency !== 'all') {
+      const stamp = card.kind === 'schedule' ? card.next_fire_at : card.updated_at;
+      if (stamp && (Date.now() - new Date(stamp).getTime()) / 1000 > Number(shared.recency)) {
+        updates.recency = 'all';
+      }
+    }
+    // `setFilters` notifies synchronously — by the time it returns, this
+    // module's own `syncSharedFilterControls` subscriber has already
+    // re-rendered the board against the widened filters, so the card's
+    // element (if nothing board-local still hides it) already exists below.
+    if (Object.keys(updates).length > 0) setFilters(updates);
+
+    revealedCardId = cardId;
+    const el = lanesEl.querySelector(`.board-card[data-card-id="${CSS.escape(cardId)}"]`);
+    if (el) {
+      el.scrollIntoView({ block: 'nearest' });
+      el.classList.add('reveal-highlight');
+    }
+    clearTimeout(revealHighlightTimer);
+    revealHighlightTimer = setTimeout(() => {
+      revealedCardId = null;
+      const current = lanesEl.querySelector(`.board-card[data-card-id="${CSS.escape(cardId)}"]`);
+      if (current) current.classList.remove('reveal-highlight');
+    }, 2000);
+    if (openDrawerFlag) openDrawer(cardId);
+  }
+
+  function drainBoardFocus() {
+    const intent = takeBoardFocus();
+    if (intent) {
+      if (!boardLoaded) {
+        // Data hasn't arrived yet (a tab-activation drain can fire before
+        // the first GET /api/agents/board resolves) — put the intent back
+        // so `applyBoard`'s own drain resolves it once it actually can,
+        // rather than wrongly reporting a real card as unknown.
+        requestBoardFocus(intent.cardId, { openDrawer: intent.openDrawer });
+        return;
+      }
+      revealCard(intent.cardId, { openDrawer: intent.openDrawer });
+      return;
+    }
+    // No explicit chip/URL intent pending — if the graph currently has a
+    // card selected (a session or card anchor carrying a `card_id`),
+    // activating the board tab reveals that card too, without requiring the
+    // panel's own "Show on board" button click. That button stays as a
+    // separate, explicit way to do the same thing.
+    if (!boardLoaded) return;
+    const graphCardId = getSelectedGraphCardId();
+    if (graphCardId) revealCard(graphCardId, { openDrawer: false });
+  }
+  onTabActivate((name) => { if (name === 'board') drainBoardFocus(); });
 
   // ------------------------------------------------------------------
   // Drag and drop — pointer-based (mousedown/mousemove/mouseup), not the
@@ -1587,21 +1735,32 @@ export function initBoard() {
     else laneFilterLabel.textContent = `${visibleLanes.size} lane${visibleLanes.size === 1 ? '' : 's'}`;
   }
 
-  function applyLaneSelection(ids) {
-    visibleLanes = new Set(ids);
-    saveLaneSelection(visibleLanes);
+  // Reconciles `visibleLanes`, the checkbox dropdown, and the label against
+  // the shared `lanes` filter — called both by the checkbox listeners'
+  // round trip through `setFilter` and by any OTHER origin of a `lanes`
+  // change (the graph tab's own lane select, a storage restore, Clear).
+  function syncLaneFilterUI(laneIds) {
+    visibleLanes = new Set(laneIds);
+    laneFilterCheckboxes().forEach(cb => { cb.checked = visibleLanes.has(cb.value); });
     updateLaneFilterLabel();
-    render();
   }
 
-  // Reveals `laneId` in the filter (and persists it) if it's currently
-  // hidden — used after creating a card straight into a lane the filter
-  // was hiding, so the new card doesn't vanish with no feedback. A no-op
-  // when the lane is already visible.
+  // The lane selection is the shared `lanes` filter (linking.js) — this
+  // just forwards to it; `syncSharedFilterControls` (below, in "Wire
+  // filters + boot") is what actually updates `visibleLanes`, the
+  // checkboxes, and the label once the store notifies, so a lane change
+  // made from the graph tab (or restored from storage) reaches this UI the
+  // same way a change made here does.
+  function applyLaneSelection(ids) {
+    setFilter('lanes', ids);
+  }
+
+  // Reveals `laneId` in the filter if it's currently hidden — used after
+  // creating a card straight into a lane the filter was hiding, so the new
+  // card doesn't vanish with no feedback. A no-op when the lane is already
+  // visible.
   function ensureLaneVisible(laneId) {
     if (visibleLanes.has(laneId)) return;
-    const checkbox = laneFilterOptions && laneFilterOptions.querySelector(`input[value="${laneId}"]`);
-    if (checkbox) checkbox.checked = true;
     applyLaneSelection([...visibleLanes, laneId]);
   }
 
@@ -1648,11 +1807,51 @@ export function initBoard() {
   // Wire filters + boot
   // ------------------------------------------------------------------
 
-  [searchEl, assigneeFilterEl, hostFilterEl, tagFilterEl,
-   contextFilterEl, recencyFilterEl, includeDoneEl].filter(Boolean).forEach(el => {
+  // Context and "include cancelled" stay board-local — not part of the
+  // seven shared keys (linking.js).
+  [contextFilterEl, includeDoneEl].filter(Boolean).forEach(el => {
     const evt = (el.tagName === 'SELECT' || el.type === 'checkbox') ? 'change' : 'input';
     el.addEventListener(evt, () => render());
   });
+
+  // Search/assignee/host/engine/tag/recency — shared with the graph
+  // tab's own filter bar via linking.js; each control pushes to the store,
+  // and `syncSharedFilterControls` (below) reconciles every control
+  // (including these) against whatever the store ends up holding, no
+  // matter which control or tab caused it.
+  if (searchEl) searchEl.addEventListener('input', () => setFilter('search', searchEl.value));
+  if (assigneeFilterEl) assigneeFilterEl.addEventListener('change', () => setFilter('assignee', assigneeFilterEl.value));
+  if (hostFilterEl) hostFilterEl.addEventListener('change', () => setFilter('host', hostFilterEl.value));
+  if (engineFilterEl) engineFilterEl.addEventListener('change', () => setFilter('engine', engineFilterEl.value));
+  if (tagFilterEl) tagFilterEl.addEventListener('input', () => setFilter('tag', tagFilterEl.value));
+  if (recencyFilterEl) recencyFilterEl.addEventListener('change', () => setFilter('recency', recencyFilterEl.value));
+  if (filterClearBtn) filterClearBtn.addEventListener('click', () => resetFilters());
+
+  function syncSharedFilterControls(state) {
+    // Rebuild (and, if needed, inject) the host option list against the
+    // now-current shared state BEFORE assigning `hostFilterEl.value` below —
+    // otherwise a host that isn't yet a real `<option>` silently coerces the
+    // assignment to `""`, same as any other absent-value `<select>` write.
+    updateFilterOptions();
+    if (searchEl && document.activeElement !== searchEl && searchEl.value !== state.search) {
+      searchEl.value = state.search;
+    }
+    if (assigneeFilterEl && assigneeFilterEl.value !== state.assignee) assigneeFilterEl.value = state.assignee;
+    if (hostFilterEl && hostFilterEl.value !== state.host) hostFilterEl.value = state.host;
+    if (engineFilterEl && engineFilterEl.value !== state.engine) engineFilterEl.value = state.engine;
+    if (tagFilterEl && document.activeElement !== tagFilterEl && tagFilterEl.value !== state.tag) {
+      tagFilterEl.value = state.tag;
+    }
+    // `null` (the shared default — "the operator has never set it") reads
+    // as "all time" here, the board's own longstanding default; only a
+    // concrete value is ever written back to `localStorage`.
+    const recencyDisplay = state.recency == null ? 'all' : state.recency;
+    if (recencyFilterEl && recencyFilterEl.value !== recencyDisplay) recencyFilterEl.value = recencyDisplay;
+    syncLaneFilterUI(state.lanes);
+    render();
+  }
+  subscribeFilters(syncSharedFilterControls);
+  syncSharedFilterControls(getFilters());
 
   fetchBoard();
   connectStream();

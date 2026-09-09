@@ -173,6 +173,9 @@ def _open_agents(page: Page, base_url, snapshot=None, focus_calls=None, search_m
     page.click('[data-tab="graph"]')
     page.wait_for_selector("#filter-route")
     page.select_option("#filter-recency", "all")
+    # `include finished` alone is enough to reveal a fixture with
+    # `lane: "done"` — the `done` lane is never governed by the shared lane
+    # selection (see `applyFilters` in graph.js), only by this checkbox.
     page.locator("#filter-terminal").check()
     # Nodes render synchronously once the filters above are applied — wait
     # for the first one rather than for a fixed delay.

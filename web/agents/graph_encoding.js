@@ -114,6 +114,17 @@ export function engineOf(d) {
   return 'claude';
 }
 
+// The routing identity a session is matched against for the shared engine
+// filter (`#filter-route` / `#board-filter-engine`) — the same
+// source-over-routing precedence `engineOf` uses (a CC/Codex row's `source`
+// wins), but preserving the full routing value space rather than collapsing
+// engines into the five shape buckets: `remote`, `hermes`, and `ask` stay
+// distinct, matching the filter's own option list.
+export function routingFilterValue(d) {
+  if (d.source === 'claude_code' || d.source === 'codex') return d.source;
+  return d.routing || 'local';
+}
+
 // One glyph name (used as the node's `data-shape` attribute and the shape
 // legend's swatch) and one legend label per engine.
 export const ENGINE_SHAPES = {
