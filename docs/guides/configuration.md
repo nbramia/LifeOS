@@ -154,12 +154,12 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 
 ## Agent Worker — Defaults and Budgets
 
-`#agent`-tagged task worker. Product spec: [agent-worker.md](../specs/product/agent-worker.md). Operator setup: [agent-worker-setup.md](agent-worker-setup.md).
+Engine-assigned task worker. Product spec: [agent-worker.md](../specs/product/agent-worker.md). Operator setup: [agent-worker-setup.md](agent-worker-setup.md).
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
 | `LIFEOS_AGENT_WORKER_AUTOSTART` | bool | `false` | When `true`, the worker starts on boot. Default off to require explicit opt-in. |
-| `LIFEOS_AGENT_WORKER_POLL_SECONDS` | float | `60` | Poll interval for new `#agent`-tagged tasks. |
+| `LIFEOS_AGENT_WORKER_POLL_SECONDS` | float | `60` | Poll interval for new engine-assigned tasks. |
 | `LIFEOS_HUMAN_QUEUE_POLL_SECONDS` | float | `300` | Poll interval for Human-queue `done_when` checks. See [human-queue.md](human-queue.md). |
 | `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | float | `5.00` | Per-task $-cap when the task title doesn't specify one. |
 | `LIFEOS_AGENT_DEFAULT_WALL_SECONDS` | int | `14400` (4 h) | Per-task wall-time cap when title doesn't specify. |
@@ -493,7 +493,7 @@ LIFEOS_ALERT_EMAIL=you@example.com
 - [Installation](installation.md) — Initial setup; points back here for env-var reference.
 - [First Run](first-run.md) — Post-install verification.
 - [Voice Setup](voice-setup.md) — The `/chat` Agent/Hermes text-backend toggle and voice dock that the vars above configure.
-- [Agent Worker Setup](agent-worker-setup.md) — Operator setup for the `#agent` worker; references many of the `LIFEOS_AGENT_*` vars above in operator-flow context.
+- [Agent Worker Setup](agent-worker-setup.md) — Operator setup for the agent worker; references many of the `LIFEOS_AGENT_*` vars above in operator-flow context.
 - [Claude Code Orchestration](claude-code-orchestration.md) — `/claude` setup; references the `LIFEOS_CLAUDE_*` vars in operator-flow context.
 - [Journal Ring Ingest](journal-ring-ingest.md) — `LIFEOS_JOURNAL_INGEST_TOKEN` in operator-flow context.
 - [Doctor Bot](doctor-bot.md) — The self-repair orchestration bot; setup of its `TELEGRAM_DOCTOR_*` vars and the repair flow.

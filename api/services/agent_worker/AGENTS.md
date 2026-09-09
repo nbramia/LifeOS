@@ -1,6 +1,12 @@
 # Agent Worker
 
-External long-running worker that picks up `#agent`-tagged tasks, executes them via Claude (Managed Agents), local Gemma (llama-server), the Claude Code CLI, or the Codex CLI, and notifies via Telegram. Lives outside the FastAPI process — talks to LifeOS over HTTP via `/api/tasks`.
+External long-running worker that picks up engine-assigned tasks (`#claude` / `#codex` / `#hermes` / `#local` / `#cloud`, plus `#cloud-haiku` / `#cloud-sonnet`), executes them via Claude (Managed Agents), local Gemma (llama-server), the Claude Code CLI, or the Codex CLI, and notifies via Telegram. Lives outside the FastAPI process — talks to LifeOS over HTTP via `/api/tasks`.
+
+> **Dual claim:** pickup is bare `#agent` **OR** an
+> engine assignee (`#claude`/`#codex`/`#hermes`/`#local`/`#cloud`) **OR** a
+> Managed Agents consent tag (`#cloud-haiku`/`#cloud-sonnet`). Engine tags alone
+> are enough; bare `#agent` must remain claimable. Do not purge `#agent` from
+> `AGENT_PICKUP_TAGS`.
 
 ## Files in this package
 
@@ -28,7 +34,7 @@ External long-running worker that picks up `#agent`-tagged tasks, executes them 
 
 ## Routing destinations
 
-The `sessions.routing` column drives dispatch. Values come from preflight (for `#agent` tasks) or from the spawn helper (for operator-spawned sessions).
+The `sessions.routing` column drives dispatch. Values come from preflight (for engine-assigned tasks) or from the spawn helper (for operator-spawned sessions).
 
 | `routing` | Executor | How sessions are created |
 |-----------|----------|--------------------------|
@@ -43,17 +49,17 @@ The `sessions.routing` column drives dispatch. Values come from preflight (for `
 
 ```
 poll → can_start_task(default_budget)?
-     → list /api/tasks?status=todo&tag=agent   (preflight-driven path)
-     → atomic swap #agent → #agent-running
+     → list /api/tasks?status=todo|urgent × tag=claude|codex|hermes|local|cloud|…
+     → atomic claim: add #agent-running
      → session row + transcript "claim" event
      → preflight (Haiku) → routing + budget
      → dispatch to LocalExecutor / ManagedExecutor / block on routing-ask
      → handle terminal outcome + Telegram notify
 ```
 
-Parallel to the `#agent` claim path, `_dispatch_spawned_sessions` picks up sessions that arrive already-claimed with an explicit routing — operator spawns (`/agent`, `/claude`) and `lifeos_agent_spawn` children. `routing='claude_code'` sessions are handled by a dedicated `_dispatch_claude_code_session` that picks `execute()` vs `resume()` based on whether the CLI session UUID has been captured yet.
+Parallel to the engine-assignee claim path, `_dispatch_spawned_sessions` picks up sessions that arrive already-claimed with an explicit routing — operator spawns (`/agent`, `/claude`) and `lifeos_agent_spawn` children. `routing='claude_code'` sessions are handled by a dedicated `_dispatch_claude_code_session` that picks `execute()` vs `resume()` based on whether the CLI session UUID has been captured yet.
 
-## Terminal tags (#agent path)
+## Terminal tags (engine-assigned path)
 
 | Tag | When |
 |-----|------|
@@ -62,9 +68,9 @@ Parallel to the `#agent` claim path, `_dispatch_spawned_sessions` picks up sessi
 | `#agent-budget-exceeded` | Executor returned `STATUS_BUDGET_EXCEEDED` (token / wall / dollar cap hit) |
 | `#agent-blocked` | Awaiting Telegram clarification, or Managed Agents not configured |
 
-To re-run a terminal task, the operator must swap the tag back to `#agent` (Obsidian: edit the line; API: `POST /api/tasks/{id}/swap-tag?from=agent-failed&to=agent`).
+To re-run a terminal task, the operator must clear the terminal lifecycle tag and keep (or restore) an engine assignee.
 
-On startup, `resume_pending()` scans non-terminal sessions and either marks them complete or rolls the tag back to `#agent` for retry. This makes the worker SIGKILL-safe.
+On startup, `resume_pending()` scans non-terminal sessions and either marks them complete or removes `#agent-running` for retry. This makes the worker SIGKILL-safe.
 
 ## Follow-up replies
 

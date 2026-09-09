@@ -20,7 +20,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 - **Entity resolution**: Links emails, phones, and names across sources to canonical people using fuzzy matching with scoring.
 - **Sync phases**: Seven-phase nightly pipeline — Collection → Entity Processing → Relationship Building → Indexing → Content Sync → Entity Cleanup → Consistency Verification.
 - **Agentic chat**: Orchestrator LLM autonomously calls 15+ tools (search, calendar, email, tasks, etc.) across multiple rounds to answer queries.
-- **Agent worker**: Autonomous executor for `#agent`-tagged tasks (or work delegated from chat/Telegram). Runs long, multi-step sessions with the full MCP tool catalog, reports progress through the originating channel, and routes to local Gemma, cloud Claude via Managed Agents, or a configured remote provider (`#cloud`, `#local`, etc. sub-tags; `LIFEOS_AGENT_DEFAULT_ROUTE`). See [specs/product/agent-worker.md](docs/specs/product/agent-worker.md).
+- **Agent worker**: Autonomous executor for engine-assigned tasks (or work delegated from chat/Telegram). Runs long, multi-step sessions with the full MCP tool catalog, reports progress through the originating channel, and routes to local Gemma, cloud Claude via Managed Agents, or a configured remote provider (`#cloud`, `#local`, etc. sub-tags; `LIFEOS_AGENT_DEFAULT_ROUTE`). See [specs/product/agent-worker.md](docs/specs/product/agent-worker.md).
 - **HTTP client surfaces**: Web chat, Telegram, whisper-relay (voice), and the Hermes gateway (an external front door persona bots can route Telegram turns through) share a stable HTTP contract — see [specs/technical/client-surfaces.md](docs/specs/technical/client-surfaces.md) before changing chat or conversation APIs.
 
 ## Tech Stack
@@ -63,7 +63,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | What does the code structure look like? | [specs/technical/architecture.md](docs/specs/technical/architecture.md) |
 | How does hybrid search work internally? | [specs/technical/search-indexing.md](docs/specs/technical/search-indexing.md) |
 | How is perf traced and monitored? | [specs/technical/observability.md](docs/specs/technical/observability.md) |
-| What does `#agent` do? | [specs/product/agent-worker.md](docs/specs/product/agent-worker.md) |
+| What does the agent worker do? | [specs/product/agent-worker.md](docs/specs/product/agent-worker.md) |
 | How does the agent worker work internally? | [specs/technical/agent-worker.md](docs/specs/technical/agent-worker.md) |
 | How does the task store work internally (id-addressed writes, notes body, conflict files)? | [specs/technical/task-management.md](docs/specs/technical/task-management.md) |
 | What can I do with tasks (statuses, API, chat)? | [specs/product/task-management.md](docs/specs/product/task-management.md) |
@@ -231,7 +231,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | `README.md` | Architecture overview with diagrams |
 | `api/services/perf_trace.py` | Request-level performance tracing (spans, SQLite) |
 | `api/routes/perf.py` | Performance trace query API |
-| `api/services/agent_worker/` | Autonomous worker for `#agent`-tagged tasks (local Gemma or cloud Claude via Managed Agents) |
+| `api/services/agent_worker/` | Autonomous worker for engine-assigned tasks (local Gemma or cloud Claude via Managed Agents) |
 | `mcp_server.py` | MCP server — stdio for Claude Code + HTTP transport for Managed Agents (67 tools: 59 from `CURATED_ENDPOINTS` plus 8 `lifeos_agent_*` tools registered separately by `_register_inter_agent_tools()` from `INTER_AGENT_TOOL_SCHEMAS`) |
 | `tests/test_perf_benchmark.py` | Benchmark suite for query performance and quality |
 

@@ -65,14 +65,14 @@ def test_open_card_not_found(client, manager, session_store):
 
 
 def test_open_card_no_assignee_tag(client, manager, session_store):
-    task = manager.create(description="fix the thing", tags=["agent"])
+    task = manager.create(description="fix the thing", tags=[])
     resp = client.post(f"/api/agents/board/cards/{task.id}/open")
     assert resp.status_code == 409
     assert "assignee" in resp.json()["detail"]
 
 
 def test_open_claude_card_spawns_local_launcher(client, manager, session_store, monkeypatch):
-    task = manager.create(description="fix the printer", tags=["agent", "claude"])
+    task = manager.create(description="fix the printer", tags=["claude"])
 
     proc = MagicMock()
     proc.pid = 4242
@@ -94,7 +94,7 @@ def test_open_claude_card_spawns_local_launcher(client, manager, session_store, 
 
 
 def test_open_codex_card_spawns_local_launcher(client, manager, session_store, monkeypatch):
-    task = manager.create(description="deploy the service", tags=["agent", "codex"])
+    task = manager.create(description="deploy the service", tags=["codex"])
 
     proc = MagicMock()
     proc.pid = 5151
@@ -110,7 +110,7 @@ def test_open_codex_card_spawns_local_launcher(client, manager, session_store, m
 
 
 def test_open_card_not_todo_is_409(client, manager, session_store, monkeypatch):
-    task = manager.create(description="fix the printer", tags=["agent", "claude"])
+    task = manager.create(description="fix the printer", tags=["claude"])
     manager.update(task.id, status="in_progress")
     resp = client.post(f"/api/agents/board/cards/{task.id}/open")
     assert resp.status_code == 409
@@ -118,7 +118,7 @@ def test_open_card_not_todo_is_409(client, manager, session_store, monkeypatch):
 
 
 def test_open_card_with_running_session_is_409(client, manager, session_store):
-    task = manager.create(description="fix the printer", tags=["agent", "claude"])
+    task = manager.create(description="fix the printer", tags=["claude"])
     session_store.create(task_id=task.id, status="running", routing="claude_code")
     resp = client.post(f"/api/agents/board/cards/{task.id}/open")
     assert resp.status_code == 409
@@ -136,7 +136,7 @@ def test_open_card_double_click_is_serialized(client, manager, session_store, mo
     import threading as _threading
     import time as _time
 
-    task = manager.create(description="fix the printer", tags=["agent", "claude"])
+    task = manager.create(description="fix the printer", tags=["claude"])
 
     start_barrier = _threading.Barrier(2)
     call_count = {"n": 0}
@@ -175,7 +175,7 @@ def test_open_card_reopens_after_grace_period_following_success(client, manager,
     the rest of the process lifetime even after the session reached a
     terminal status and the task went back to `todo`. Advancing past
     `_OPENING_GRACE_SECONDS` must let a second, genuinely new open through."""
-    task = manager.create(description="fix the printer", tags=["agent", "claude"])
+    task = manager.create(description="fix the printer", tags=["claude"])
 
     proc = MagicMock()
     proc.pid = 4242
@@ -219,7 +219,7 @@ def test_open_card_remote_host_wraps_in_ssh(client, manager, session_store, monk
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_hosts", {"studio": "user@studio.example"}, raising=False)
     task = manager.create(
-        description="fix the printer", tags=["agent", "claude"],
+        description="fix the printer", tags=["claude"],
         fields={"host": "studio"},
     )
 
@@ -238,7 +238,7 @@ def test_open_card_remote_host_wraps_in_ssh(client, manager, session_store, monk
 
 def test_open_card_unregistered_host_is_409(client, manager, session_store, monkeypatch):
     task = manager.create(
-        description="fix the printer", tags=["agent", "claude"],
+        description="fix the printer", tags=["claude"],
         fields={"host": "vanished-box"},
     )
     resp = client.post(f"/api/agents/board/cards/{task.id}/open")
@@ -259,6 +259,14 @@ def test_open_hermes_card_with_conversation_returns_open_url(client, manager, se
     resp = client.post(f"/api/agents/board/cards/{task.id}/open")
     assert resp.status_code == 200
     assert resp.json() == {"open_url": "/chat?conversation=conv-xyz"}
+
+
+def test_open_cloud_card_is_refused(client, manager, session_store):
+    """`#cloud` is a board assignee but has no CLI Open path — keep refused."""
+    task = manager.create(description="run on remote provider", tags=["cloud"])
+    resp = client.post(f"/api/agents/board/cards/{task.id}/open")
+    assert resp.status_code == 409
+    assert "assignee" in resp.json()["detail"].lower()
 
 
 def test_get_models_endpoint_returns_engines_shape(client, monkeypatch):

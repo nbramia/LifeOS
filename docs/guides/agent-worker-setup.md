@@ -4,7 +4,7 @@
 > **Last Updated:** 2026-09-05
 > **Audience:** Operators
 
-One-time setup for the external agent worker that picks up `#agent`-tagged tasks and executes them via Claude (Anthropic Managed Agents) or a local Gemma model.
+One-time setup for the external agent worker that picks up engine-assigned tasks (`#claude` / `#codex` / `#hermes` / `#local` / `#cloud`) and executes them via Claude (Anthropic Managed Agents), Hermes, a remote OpenAI-compatible provider, or a local Gemma model.
 
 > **Env-var reference:** every `LIFEOS_*` and third-party variable mentioned below is defined in [configuration.md](configuration.md) with its default, type, and "when to change" notes. This guide gives operator-flow context; configuration.md is the catalog.
 
@@ -136,7 +136,7 @@ Hardening upgrade (deferred to a later issue): swap the bearer-token check for a
 
 ## Step 4b — Provision the Managed Agents preset, environment, and vault (Claude path)
 
-`#agent` tasks tagged `#cloud-haiku` / `#cloud-sonnet` route to Claude on Anthropic's [Managed Agents](https://platform.claude.com/docs/en/managed-agents/overview) platform. (Since #809, bare `#cloud` no longer means this — it routes to your configured remote OpenAI-compatible provider instead; see [configuration.md](configuration.md#openai-compatible-remote-provider).) Since [ADR-018](../adr/018-api-spend-requires-consent.md) an explicit tag is required: an untagged task whose title merely *implies* cloud connectors asks you which engine to use rather than dispatching to the API. Set this section up if you want the Managed Agents path available at all — it is the API-billed route, and the only one that reaches Vault-authenticated connectors. The architecture has three reusable resources you set up once in the [Anthropic console](https://platform.claude.com):
+Tasks tagged `#cloud-haiku` / `#cloud-sonnet` route to Claude on Anthropic's [Managed Agents](https://platform.claude.com/docs/en/managed-agents/overview) platform. Bare `#cloud` routes to your configured remote OpenAI-compatible provider instead (see [configuration.md](configuration.md#openai-compatible-remote-provider)). Per [ADR-018](../adr/018-api-spend-requires-consent.md) an explicit tag is required: an untagged task whose title merely *implies* cloud connectors asks you which engine to use rather than dispatching to the API. Set this section up if you want the Managed Agents path available at all — it is the API-billed route, and the only one that reaches Vault-authenticated connectors. The architecture has three reusable resources you set up once in the [Anthropic console](https://platform.claude.com):
 
 - **Agent preset** (`agent_…`) — model, system prompt, MCP servers, tools, skills. Sessions reference it by ID.
 - **Environment** (`env_…`) — where tool calls execute. Cloud container by default; self-hosted sandbox tracked in [#111](https://github.com/nbramia/LifeOS/issues/111).
@@ -199,7 +199,7 @@ model:
 system: |-
   <role>
   You are an autonomous task executor running outside the operator's
-  LifeOS personal-assistant system. You receive tasks tagged #agent from
+  LifeOS personal-assistant system. You receive engine-assigned tasks from
   the operator's task list and complete them end to end without further
   input.
   </role>
@@ -326,7 +326,7 @@ The Vault holds **only credentials**. Live data (Obsidian, photos, monarch, cale
 
 ## Step 5 — Enable the agent worker
 
-`setup-systemd.sh` installs `lifeos-agent-worker.service`, which polls `/api/tasks` for `#agent`-tagged tasks. It's **off by default** so a fresh clone doesn't start consuming tasks unless you opt in.
+`setup-systemd.sh` installs `lifeos-agent-worker.service`, which polls `/api/tasks` for claimable tasks (engine assignees). It's **off by default** so a fresh clone doesn't start consuming tasks unless you opt in.
 
 To enable:
 
@@ -346,18 +346,18 @@ sudo systemctl status lifeos-agent-worker
 tail -f logs/agent-worker.log
 ```
 
-Once enabled, the worker claims `#agent`-tagged tasks and executes them: `#agent #local` tasks run on the local Gemma path, and other `#agent` tasks route to Claude via the managed-agents path configured in Step 4b.
+Once enabled, the worker claims engine-assigned todo/urgent tasks (engine tag alone is enough; bare `#agent` still works) and executes them: `#local` runs on the local Gemma path, `#cloud` on the configured remote provider, `#hermes` via Hermes, `#claude`/`#codex` via their CLIs, and Managed Agents when `#cloud-haiku`/`#cloud-sonnet` consent tags are present.
 
 To smoke-test the claim path:
 
 ```bash
-# Create a task with the #agent tag
+# Create a task assigned to an engine (Hermes here)
 curl -X POST http://localhost:8000/api/tasks \
   -H 'Content-Type: application/json' \
-  -d '{"description":"agent worker smoke test","tags":["agent"]}'
+  -d '{"description":"agent worker smoke test","tags":["hermes"]}'
 
 # Within ~60s, the worker should:
-#   1. swap #agent → #agent-running on the task
+#   1. add #agent-running on the task
 #   2. record a session row in data/agent_sessions.db
 #   3. append events to data/agent_transcripts/<session_id>.jsonl
 #   4. mark the task complete
@@ -375,7 +375,7 @@ By design, the local executor runs `Bash`, `Read`, `Write`, `Edit`, and `WebFetc
 - Fetch any URL the host can reach (SSRF surface — an internal HTTP service accessible from the host is reachable to the agent)
 
 The Haiku preflight sanity-check is the only guard against destructive-shaped tasks. Operators should:
-- Audit `#agent`-tagged tasks before they reach the worker (look at your task list)
+- Audit engine-assigned tasks before they reach the worker (look at your task list)
 - Keep the daily $-cap set so even a runaway loop can't burn unlimited budget
 - Treat agent-touchable secrets the same as operator-touchable secrets
 
@@ -383,7 +383,7 @@ The Haiku preflight sanity-check is the only guard against destructive-shaped ta
 
 ## Codex MCP setup (`#codex` path)
 
-`#agent #codex` tasks (and `/codex`) run the Codex CLI through `CodexExecutor`.
+`#codex` tasks (and `/codex`) run the Codex CLI through `CodexExecutor`.
 Unlike Claude Code — which inherits the `lifeos` MCP server from
 `~/.claude.json` automatically — Codex only reaches LifeOS data through an
 `[mcp_servers.*]` block in its own config. A fresh Codex install has none, so
@@ -604,7 +604,7 @@ commands to an isolated checkout instead.
 inline `[key:: value]` field on the task line:
 
 ```
-- [ ] Fix the off-by-one in the paginator #agent #cloud [working_dir:: /srv/checkouts/example]
+- [ ] Fix the off-by-one in the paginator #cloud [working_dir:: /srv/checkouts/example]
 ```
 
 **Guardrails, checked before the model ever runs:**
@@ -632,7 +632,7 @@ same trust model the worker already has everywhere else (see
 
 ## Cost-aware iteration
 
-Iterating on cloud `#agent` prompts has a hidden tax: every fresh managed
+Iterating on Managed Agents prompts has a hidden tax: every fresh managed
 session pays ~$0.40 cache_creation up front on the 100k-token preset. A few
 suggestions to keep iteration cheap:
 
@@ -642,7 +642,7 @@ suggestions to keep iteration cheap:
   full cache-cold cost. If you're iterating on a prompt shape, fire your
   reruns back-to-back, not spread across the hour.
 - **Use `dry_run=true` to inspect routing without billing.** `lifeos_task_create`
-  accepts a `dry_run` flag on `#agent` tasks — it runs the cheap Haiku
+  accepts a `dry_run` flag on engine-assigned tasks — it runs the cheap Haiku
   preflight (~$0.001), returns the routing decision and cost estimate, and
   does *not* dispatch a managed session. Use this when you're verifying tag
   parsing or routing logic; only flip `dry_run=false` once the dispatch
@@ -670,7 +670,7 @@ suggestions to keep iteration cheap:
 | `llama-server` crashes on Gemma | Insufficient VRAM, or stale cached model | Check `nvidia-smi`/`rocm-smi`; re-download with `llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF` once and confirm |
 | `llama-server` starts but `/v1/models` returns `503 Loading model` or `404`, log shows "sha256 mismatch" + "HEAD failed, status: 404" | Upstream HF model was updated; local cache fails llama.cpp's integrity check and the redownload 404s, leaving the server in router mode with no model loaded | Point at the local GGUF directly: set `LIFEOS_LLM_MODEL_PATH=/absolute/path/to/cached.gguf` (and `LIFEOS_LLM_MMPROJ_PATH` for vision models) in `.env`, then re-run `sudo ./scripts/setup-systemd.sh` |
 | Agent worker logs "daily spend cap reached" | `LIFEOS_AGENT_DAILY_CAP_DOLLARS` is 0 or already exceeded today | Raise the cap or wait until local midnight |
-| Worker doesn't pick up a `#agent` task | Task isn't `status=todo`, or worker isn't enabled | `systemctl status lifeos-agent-worker`; `curl 'http://localhost:8000/api/tasks?status=todo&tag=agent'` |
+| Worker doesn't pick up an engine-assigned task | Task isn't `status=todo`/`urgent`, missing engine tag, or worker isn't enabled | `systemctl status lifeos-agent-worker`; `curl 'http://localhost:8000/api/tasks?status=todo&tag=local'` |
 | `#codex` agent can't find personal data / doesn't call `lifeos_*` tools | No `[mcp_servers.lifeos]` in `~/.codex/config.toml` | Add the block (see [Codex MCP setup](#codex-mcp-setup-codex-path)); confirm with `codex mcp list` |
 | Managed Agents session stuck running | Worker can't reach the API, or the remote session is genuinely long | Find the `managed_agent_session_id` in `data/agent_sessions.db` (`SELECT task_id, session_id, managed_agent_session_id FROM sessions WHERE status='running'`). Cancel via the Anthropic console, or `curl -X DELETE -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" -H "anthropic-beta: managed-agents-2026-04-01" https://api.anthropic.com/v1/sessions/<remote_id>`. The worker's next poll sees a 404 (mapped to `cancelled`) and finalizes. |
 

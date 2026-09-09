@@ -741,18 +741,15 @@ class TestCancelBoardCard:
         assert updated.status == "cancelled"
         assert "agent-running" not in updated.tags
 
-    def test_cancel_claimed_bare_agent_card_with_no_assignee_tears_down_and_cancels(
+    def test_cancel_claimed_card_with_no_assignee_tears_down_and_cancels(
         self, client, stores, monkeypatch,
     ):
-        """The no-assignee claimed shape (the worker's own claim swap on a
-        bare `#agent` queue card never adds an engine-specific assignee
-        tag) is still agent-owned — Cancel must work on it exactly like an
-        engine-assigned claimed card, tearing down the live session and
-        marking the task cancelled."""
+        """A claimed card with no engine assignee is still agent-owned —
+        Cancel tears down the live session and marks the task cancelled."""
         task_manager, _sched, session_store, transcript_store = stores
         monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
-        task = task_manager.create("A bare #agent card the worker claimed", tags=["agent", "agent-running"])
-        assert task.tags == ["agent", "agent-running"]  # no assignee tag at all
+        task = task_manager.create("A claimed card with no assignee", tags=["agent-running"])
+        assert task.tags == ["agent-running"]
         root = session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
 
         r = client.post(f"/api/agents/board/cards/{task.id}/cancel")

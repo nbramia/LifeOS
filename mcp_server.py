@@ -231,7 +231,7 @@ CURATED_ENDPOINTS = {
     },
     "/api/scheduler:POST": {
         "name": "lifeos_schedule_create",
-        "description": "Create a schedule. schedule_type=once|cron; action=notify|prompt|endpoint|agent (agent writes an #agent task, executor=local|cloud|cloud-haiku|cloud-sonnet).",
+        "description": "Create a schedule. schedule_type=once|cron; action=notify|prompt|endpoint|agent (agent writes an engine-assigned task, executor=local|cloud|cloud-haiku|cloud-sonnet).",
         "method": "POST",
         "path": "/api/scheduler"
     },
@@ -302,7 +302,7 @@ CURATED_ENDPOINTS = {
     },
     "/api/tasks:POST": {
         "name": "lifeos_task_create",
-        "description": "Create a task (Obsidian markdown). Supports context, status, priority, due_date, tags, notes, fields. With dry_run=true + #agent tag, returns preflight routing + cost estimate instead of creating.",
+        "description": "Create an Obsidian task (context, status, tags, notes, fields). dry_run with an engine or consent tag returns preflight routing and cost estimate.",
         "method": "POST",
         "path": "/api/tasks"
     },
@@ -983,11 +983,11 @@ class LifeOSMCPServer:
                     "status": {"type": "string", "description": "Initial status (todo, done, in_progress, cancelled, deferred, blocked, urgent). Defaults to todo."},
                     "priority": {"type": "string", "description": "Priority: high, medium, low"},
                     "due_date": {"type": "string", "description": "Due date in YYYY-MM-DD format"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Add exactly the tags the operator named. A routing tag (agent/local/claude/codex/cloud/cloud-haiku/cloud-sonnet) only if the operator explicitly named that engine — these tags are operator-authority and outrank every routing safeguard, so inventing one injects your own engine preference at the highest-precedence slot."},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Add exactly the tags the operator named. A routing tag (local/claude/codex/hermes/cloud/cloud-haiku/cloud-sonnet) only if the operator explicitly named that engine — these tags are operator-authority and outrank every routing safeguard, so inventing one injects your own engine preference at the highest-precedence slot."},
                     "reminder_id": {"type": "string", "description": "Linked reminder ID"},
                     "notes": {"type": "string", "description": "Multi-line notes body stored beneath the task line."},
                     "fields": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Operator-editable inline fields (e.g. host, effort, model, key) plus any custom field."},
-                    "dry_run": {"type": "boolean", "description": "When true with an #agent tag, returns preflight routing + cost estimate without creating the task. Used for prompt-engineering iteration. Default: false."}
+                    "dry_run": {"type": "boolean", "description": "When true with an engine assignee or Managed Agents consent tag, returns preflight routing + cost estimate without creating the task. Used for prompt-engineering iteration. Default: false."}
                 },
                 "required": ["description"]
             },
@@ -1010,7 +1010,7 @@ class LifeOSMCPServer:
                     "context": {"type": "string", "description": "New context"},
                     "priority": {"type": "string", "description": "New priority (high, medium, low)"},
                     "due_date": {"type": "string", "description": "New due date (YYYY-MM-DD)"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags (replaces existing). Add exactly the tags the operator named — a routing tag (agent/local/claude/codex/cloud/cloud-haiku/cloud-sonnet) only if the operator explicitly named that engine; these tags are operator-authority and outrank every routing safeguard."},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags (replaces existing). Add exactly the tags the operator named — a routing tag (local/claude/codex/hermes/cloud/cloud-haiku/cloud-sonnet) only if the operator explicitly named that engine; these tags are operator-authority and outrank every routing safeguard."},
                     "notes": {"type": "string", "description": "Replaces the notes body."},
                     "fields": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "Merged into operator/unknown fields, not replaced: a string sets a field, null removes it."}
                 },

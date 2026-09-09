@@ -607,13 +607,13 @@ class TestActionDispatch:
             with patch("api.services.telegram.send_message_async",
                        new_callable=AsyncMock) as mock_send:
                 await scheduler._fire_entry(entry)
-        # The agent worker discovers #agent tasks; the executor tag rides along.
+        # The agent worker claims engine-assignee tags on the handed-off task.
         fake_tm.create.assert_called_once()
         kwargs = fake_tm.create.call_args.kwargs
         assert kwargs["description"] == "Draft my weekly review"
         # Cron (recurring) schedules carry a sched-<id> tag so the worker
         # appends each fire's output to one shared note per schedule.
-        assert kwargs["tags"] == ["agent", "cloud", f"sched-{entry.id}"]
+        assert kwargs["tags"] == ["cloud", f"sched-{entry.id}"]
         # No Telegram for an agent hand-off; the worker reports through its channel.
         mock_send.assert_not_called()
         refreshed = scheduler.store.get(entry.id)
@@ -630,7 +630,7 @@ class TestActionDispatch:
         fake_tm.create.return_value = MagicMock(id="t1")
         with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
             await scheduler._fire_entry(entry)
-        assert fake_tm.create.call_args.kwargs["tags"] == ["agent", "local", f"sched-{entry.id}"]
+        assert fake_tm.create.call_args.kwargs["tags"] == ["local", f"sched-{entry.id}"]
 
     @pytest.mark.asyncio
     async def test_once_agent_action_has_no_sched_tag(self, scheduler):
@@ -645,7 +645,20 @@ class TestActionDispatch:
         fake_tm.create.return_value = MagicMock(id="t9")
         with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
             await scheduler._fire_entry(entry)
-        assert fake_tm.create.call_args.kwargs["tags"] == ["agent", "local"]
+        assert fake_tm.create.call_args.kwargs["tags"] == ["local"]
+
+    @pytest.mark.asyncio
+    async def test_agent_action_without_executor_uses_legacy_default_route_handoff(self, scheduler):
+        entry = scheduler.store.create(
+            name="No executor", schedule_type="once",
+            schedule_value="2999-01-01T09:00:00",
+            action="agent", executor="", message_content="do it",
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="legacy-task")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry)
+        assert fake_tm.create.call_args.kwargs["tags"] == ["agent"]
 
     @pytest.mark.asyncio
     async def test_run_history_surfaced_in_dashboard(self, scheduler):

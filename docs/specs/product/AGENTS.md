@@ -3,7 +3,7 @@ This directory contains product specifications — what the system does from a c
 ## Contents
 
 - `agent-viz.md` — The `/agents` page (D3 graph + side panel) that visualizes agent worker and Claude Code sessions
-- `agent-worker.md` — The `#agent`-tagged task workflow (Telegram-triggered autonomous worker)
+- `agent-worker.md` — The engine-assigned task workflow (Telegram-triggered autonomous worker)
 - `api-crm.md` — CRM-specific HTTP endpoints (people, interactions, graph data)
 - `api-reference.md` — HTTP endpoint catalog (request/response shapes, query parameters)
 - `chat-ui.md` — The web chat interface
