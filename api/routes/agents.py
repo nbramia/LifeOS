@@ -3455,6 +3455,11 @@ async def focus_claude_code_session(
     }
 
 
+# A CLI session has no DB status, so its stream closes once this many seconds
+# pass with no new transcript event. Heartbeats do not postpone the close.
+_CLI_STREAM_IDLE_CLOSE_SECONDS = 300.0
+
+
 async def _stream_claude_code_session(session_id: str, backfill: int):
     """Per-session SSE generator for Claude Code (cc:-prefixed) sessions."""
     yield ": ok\n\n"
@@ -3488,10 +3493,7 @@ async def _stream_claude_code_session(session_id: str, backfill: int):
         elif time.time() - last_heartbeat_at >= 15.0:
             yield ": heartbeat\n\n"
             last_heartbeat_at = time.time()
-        # Claude Code has no DB status — close after 5 minutes of no new
-        # transcript events so we don't hold connections forever. Heartbeats
-        # do NOT postpone this — only real new events do.
-        if time.time() - last_new_event_at > 300.0:
+        if time.time() - last_new_event_at > _CLI_STREAM_IDLE_CLOSE_SECONDS:
             yield (
                 "event: closed\n"
                 f"data: {json.dumps({'session_id': session_id, 'status': 'idle'})}\n\n"
@@ -3536,7 +3538,7 @@ async def _stream_codex_session(session_id: str, backfill: int):
         elif time.time() - last_heartbeat_at >= 15.0:
             yield ": heartbeat\n\n"
             last_heartbeat_at = time.time()
-        if time.time() - last_new_event_at > 300.0:
+        if time.time() - last_new_event_at > _CLI_STREAM_IDLE_CLOSE_SECONDS:
             yield (
                 "event: closed\n"
                 f"data: {json.dumps({'session_id': session_id, 'status': 'idle'})}\n\n"

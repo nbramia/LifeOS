@@ -53,12 +53,12 @@ jobs:
   execute-candidate:
     name: candidate-execution
     runs-on: ubuntu-latest
-    # Both retained lanes run in this one job, and a healthy run has
-    # measured anywhere from roughly half an hour to just under an hour
-    # depending on runner speed. The ceiling exists to fail a genuinely
-    # stuck job, so it sits above the slowest healthy run observed rather
-    # than near the middle of the range.
-    timeout-minutes: 65
+    # Both retained lanes run in this one job, at the runner's full width
+    # with the capacity headroom the step below establishes. The ceiling
+    # exists to fail a genuinely stuck job, so it sits above the slowest
+    # healthy run observed with enough margin for dependency and Chromium
+    # setup, rather than near the middle of the range.
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -137,12 +137,16 @@ jobs:
           echo "LANES=$LANES" >> "$GITHUB_ENV"
       - name: Verify the retained lanes this candidate's changes can affect
         run: |
-          # Two workers is the width with a completed-run record on this
-          # runner class: every run at two workers finished, and every run at
-          # the runner's full core count exceeded the ceiling. Record the
-          # runner's shape alongside it so a future change to this number
-          # rests on measurements rather than on the core count alone.
-          WORKERS=2
+          # The run width must stay strictly below the host capacity total.
+          # Two fast-unit tests dispatch their own nested verifier runs, and
+          # those acquire capacity slots of their own; when the outer run is
+          # allowed to hold every slot, they wait for one that never frees
+          # and the lane hangs until the ceiling rather than failing. Give
+          # the run the runner's full width and the total twice that, so the
+          # nested runs always have slots to take.
+          WORKERS="$(nproc)"
+          python trusted-runner/scripts/test_capacity.py configure \
+            --total-workers "$((WORKERS * 2))" --max-run-workers "$WORKERS"
           echo "runner reports $(nproc) logical processors; using $WORKERS test workers"
           free -h || true
           python trusted-runner/scripts/verify_candidate.py pushed-ref \
@@ -152,6 +156,7 @@ jobs:
             --evidence-root "$RUNNER_TEMP/lifeos-verification-evidence" \
             --lanes "$LANES" \
             --workers "$WORKERS" \
+            --capacity-max-run-workers "$WORKERS" \
             --parallel-browser-free
 
   publish-aggregate:
