@@ -150,17 +150,27 @@ def test_snapshot_mutation_during_execution_records_incomplete_not_success(tmp_p
 def test_runtime_data_created_during_execution_is_not_source_mutation(tmp_path):
     root = _source_repo(tmp_path)
 
+    written: list[Path] = []
+
     def writing_runtime_data(snapshot: Path, lane: str, nodeids: tuple[str, ...]) -> LaneOutcome:
+        # The verifier resolves the candidate's whole ``data`` directory to
+        # runtime storage before the lane runs, so a store writing to its
+        # repo-root-anchored default lands outside the snapshot.
         data = snapshot / "data"
-        data.mkdir()
+        assert data.is_symlink()
         for name in ("task_index.json", "imessage.db", "gpu_embed.lock"):
             (data / name).write_text("isolated runtime state\n")
+            written.append(data.resolve() / name)
         return LaneOutcome(lane, nodeids, 0, "success")
 
     result = _verify(root, tmp_path, executor=writing_runtime_data)
 
     assert not result.reused
     assert result.outcomes[0].result == "success"
+    snapshot_root = (tmp_path / "snapshot-0").resolve()
+    for path in written:
+        assert path.is_file()
+        assert not path.is_relative_to(snapshot_root)
 
 
 @pytest.mark.unit
@@ -1158,10 +1168,16 @@ def test_pushed_ref_protocol_executes_detached_candidate_not_dirty_cwd(tmp_path)
 def test_pushed_ref_cli_retries_interrupted_exact_candidate_with_reason(tmp_path):
     root = _source_repo(tmp_path)
     sentinel = tmp_path / "allow-completion"
+    # The lane process announces that it reached the candidate's own test
+    # before it parks, so the interrupt below lands mid-execution rather
+    # than at whatever point a fixed sleep happens to catch on a busy host.
+    started = tmp_path / "lane-started"
     (root / "tests" / "test_synthetic.py").write_text(
         "import pathlib, pytest, time\n\n"
         "@pytest.mark.unit\n"
-        f"def test_synthetic():\n    if not pathlib.Path({str(sentinel)!r}).exists(): time.sleep(20)\n"
+        f"def test_synthetic():\n"
+        f"    pathlib.Path({str(started)!r}).touch()\n"
+        f"    if not pathlib.Path({str(sentinel)!r}).exists(): time.sleep(20)\n"
     )
     _git(root, "add", "tests/test_synthetic.py")
     _git(root, "commit", "-qm", "interruptible candidate")
@@ -1173,7 +1189,11 @@ def test_pushed_ref_cli_retries_interrupted_exact_candidate_with_reason(tmp_path
         "--lanes", "fast-unit", "--evidence-root", str(evidence),
     ]
     process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1)
+    deadline = time.monotonic() + 120
+    while not started.exists() and time.monotonic() < deadline:
+        assert process.poll() is None, "candidate exited before its lane began"
+        time.sleep(0.05)
+    assert started.exists(), "candidate never reached its own test"
     process.terminate()
     assert process.wait(timeout=10) == 128 + signal.SIGTERM
     assert json.loads(next(evidence.glob("*.json")).read_text())["attempts"][-1]["result"] == "infrastructure_failure"

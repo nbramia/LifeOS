@@ -3,12 +3,33 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
 pytestmark = pytest.mark.unit
+
+# Candidate verification runs lanes on a deliberately narrow PATH, which does
+# not reach every layout that ships node (a hosted runner puts it under
+# /usr/local/bin, nvm under the user's own prefix). Resolve the interpreter
+# from the usual install roots too so this coverage runs wherever node exists.
+_NODE_SEARCH_ROOTS = ("/usr/local/bin", "/usr/bin", "/bin", "/opt/homebrew/bin")
+
+
+def _node_binary() -> str:
+    found = shutil.which("node")
+    if found:
+        return found
+    for root in _NODE_SEARCH_ROOTS:
+        candidate = Path(root) / "node"
+        if candidate.is_file():
+            return str(candidate)
+    for candidate in sorted(Path("/opt/hostedtoolcache/node").glob("*/*/bin/node"), reverse=True):
+        if candidate.is_file():
+            return str(candidate)
+    raise AssertionError("node is required to exercise the board's pure JS modules")
 
 
 def _import_test(module: str, assertions: str) -> None:
@@ -19,7 +40,7 @@ def _import_test(module: str, assertions: str) -> None:
       {assertions}
     """
     result = subprocess.run(
-        ["node", "--input-type=module", "--eval", script],
+        [_node_binary(), "--input-type=module", "--eval", script],
         capture_output=True,
         text=True,
         check=False,
