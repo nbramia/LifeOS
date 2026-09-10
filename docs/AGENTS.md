@@ -1,15 +1,15 @@
 # Documentation Strategy
 
 **Status:** Complete
-**Last Updated:** 2026-09-04
+**Last Updated:** 2026-09-10
 
 > **Backlog lives in GitHub issues.** Future work, deferred features, bugs, and enhancements are tracked as GitHub issues — never as `backlog.md` files in this directory. Plan files are reserved for time-bounded execution notes (migration plans, gap analyses, point-in-time issue-drafting context).
 
-**This document defines mandatory documentation standards. All contributors — human and AI — must follow these rules when creating or modifying documentation. Consistency is not optional; it ensures documentation remains navigable, maintainable, and valuable as a shared context layer.**
+**This document defines documentation standards for LifeOS. Its structural requirements are mandatory for all contributors — human and AI — because they keep documentation navigable, maintainable, and valuable as a shared context layer; the style guidance within it is advisory (see Purpose, below, for the split).**
 
 ## Purpose
 
-This strategy defines how we organize and maintain documentation in LifeOS. These are **rules, not guidelines** — following this strategy faithfully is critical to maintaining documentation quality across a collaborative human + AI agent project.
+This strategy defines how we organize and maintain documentation in LifeOS. Its structural requirements — frontmatter, document placement, a present Related Documents section, ADR immutability, synthetic data only, and current-behavior-only — are **rules, not guidelines**: a violation is a reportable finding under the [Development Lifecycle](specs/standards/development-lifecycle.md#risk-and-review) contract. The style guidance elsewhere in this document — phrasing, sentence structure, prose tone, link taglines — adds polish but is not independently reportable; apply it, but a reviewer does not raise a finding over a stylistic reading that leaves the structural requirements and the meaning intact.
 
 Documentation in LifeOS serves two readers equally:
 - **Human contributors** who need to onboard, debug, and design changes.
@@ -225,12 +225,19 @@ When splitting, keep a thin **index document** at the original path with pointer
 ## Cross-Linking Standards
 
 Every document must include a "Related Documents" section at the bottom.
+This is a structural requirement: its absence is a reportable finding.
 
 **Requirements:**
-1. **Bidirectional** — if A links to B, B must link to A. When you add a link in one direction, add the reciprocal link in the same PR.
-2. **Contextual** — every link has a "— short tagline" explaining the relationship.
-3. **Specific** — link to code with line numbers (`path/to/file.py:120-145`) when relevant.
-4. **Use the 4-bucket structure** below for consistency.
+1. **Present** — a Related Documents section listing at least the documents that motivated or are motivated by this one.
+2. **Specific** — link to code with line numbers (`path/to/file.py:120-145`) when relevant.
+3. **Use the 4-bucket structure** below for consistency.
+
+Linking back (B links to A because A links to B) and a short "— tagline"
+explaining each link are guidance, not enforced requirements: add them when
+touching a document anyway, but a missing reciprocal link or tagline is not
+a reportable finding. It blocks no reader following the forward link and
+has never been observed catching a defect — enforcing it as a rule mainly
+produced find-and-fix chores on every document touch.
 
 **Standard Related Documents template:**
 
@@ -274,6 +281,17 @@ Use only the buckets that apply — omit empty buckets rather than including the
 
 **Guides decay:**
 - Test commands you document before shipping. Stale guides are worse than missing guides.
+
+## Pull Request Descriptions
+
+A pull-request description is a short summary: what changed and why, in a
+few sentences. For work outside the [named risk
+triggers](specs/standards/development-lifecycle.md#risk-and-review), it does
+not require a verification matrix, a separate evidence section, or a risk
+table — the verification lane's preserved result is the evidence, and
+restating it in prose is not required. A change touching a named risk
+trigger states what verification evidence exists and where to find it, but
+the description still stays a summary, not an audited artifact.
 
 ## Writing for AI Readability
 
@@ -388,6 +406,7 @@ Aim for ≤30 lines. Subdirectory AGENTS.md files are wayfinding, not extended c
 ### Specifications
 - [vision/philosophy.md](vision/philosophy.md) — The privacy-first, local-first principles that frame doc decisions
 - [specs/standards/](specs/standards/) — Coding and testing conventions referenced by docs
+- [Development Lifecycle](specs/standards/development-lifecycle.md) — Defines the risk triggers this document's Purpose and Pull Request Descriptions sections reference
 
 ### Operational
 - [guides/](guides/) — Operator-facing setup and troubleshooting
