@@ -44,6 +44,24 @@ for _var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
     os.environ.pop(_var, None)
 
 
+def pytest_sessionfinish(session, exitstatus):
+    """Remove runtime state created inside a verifier-owned source snapshot."""
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    hermetic = (
+        os.environ.get("PYTHONDONTWRITEBYTECODE") == "1"
+        and "LIFEOS_PARALLEL_BROWSER_FREE" in os.environ
+        and os.path.isabs(os.environ.get("LIFEOS_CHROMA_PATH", ""))
+        and not os.path.lexists(os.path.join(project_root, ".git"))
+    )
+    if not hermetic:
+        return
+    for name in ("task_index.json", "imessage.db", "gpu_embed.lock"):
+        try:
+            os.unlink(os.path.join(project_root, "data", name))
+        except FileNotFoundError:
+            pass
+
+
 def wait_for_condition(predicate, timeout: float, interval: float = 0.2):
     """Poll ``predicate`` until it returns truthy, or ``timeout`` seconds pass.
 
