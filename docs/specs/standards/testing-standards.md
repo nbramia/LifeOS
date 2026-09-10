@@ -113,26 +113,39 @@ on top, so `git status`/`auto`'s diff match the source exactly.
 
 ## Tests as Evidence
 
-A test is evidence for a change only when it fails without that change.
-Before relying on a test to justify a change, revert the production diff and
-confirm the test fails; a test that still passes with the production change
-reverted is not evidence for it. Review treats a change carrying only such
-tests as missing a test, in the sense the [Development
-Lifecycle](development-lifecycle.md#risk-and-review) finding kinds define.
+A test that passes against the pre-change code is not evidence for the
+change it accompanies. A hardening test added in response to review must be
+shown to fail against the pre-change code before it merges: revert the
+production diff, confirm the new test fails, then restore the diff. Review
+treats a change carrying only such tests as missing a test, in the sense the
+[Development Lifecycle](development-lifecycle.md#risk-and-review) finding
+kinds define.
 
-Tests assert behavior. They never assert the wording of a comment, a
-docstring, a pull-request description, or a documentation sentence — a
-rewritten sentence that preserves meaning must not break a test.
+Tests never assert the content of a comment, a docstring, a pull-request
+description, or a documentation sentence — a rewritten sentence that
+preserves meaning must not break a test. This is a preventive rule, not a
+response to an observed problem: an audit of the highest-ratio changes in
+this repository found no test asserting prose.
 
-A change's tests pin the behavior it claims to deliver. Enumerating inputs no
-caller can produce is not required coverage, and review does not request it.
-This is a review consideration judged against what the diff claims to do,
-not a line-count ratio between test and production code.
+Reduce duplication instead of adding more of it:
+- When several tests share one setup-and-assert skeleton and differ only in
+  an injected value, parametrize them rather than copy the skeleton per
+  case.
+- When a large fixture literal repeats across tests, build it with a shared
+  helper rather than copy the literal into each test.
 
-This section changes what a new or reworked test must do to count as
-evidence. It is not authorization to delete an existing test — [When Tests
-Fail After Your Changes](#when-tests-fail-after-your-changes), below, still
-governs that.
+Scope tests to reachable behavior:
+- A failure mode that requires a stubbed system binary to fail
+  conditionally on its own arguments is out of scope for the suite.
+- A branch a test's own description calls otherwise unreachable is covered
+  by extending an existing test, not by adding a new one.
+
+These are review considerations, not a line-count ratio between test and
+production code, and they do not authorize deleting existing coverage of
+real races, security gates, or crash-recovery paths. This section changes
+what a new or reworked test must do; it is not authorization to delete or
+weaken an existing test — [When Tests Fail After Your
+Changes](#when-tests-fail-after-your-changes), below, still governs that.
 
 ## Remote Testing Workflow
 
