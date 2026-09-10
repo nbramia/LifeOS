@@ -625,8 +625,89 @@ class TestBoardLoad:
         for row in result:
             assert row["actual"] == row["expected"], row
 
+    def test_mobile_tabs_filters_and_hidden_done_target_are_compact_and_reachable(
+        self, page: Page, agents_base_url,
+    ):
+        page.set_viewport_size({"width": 390, "height": 844})
+        _open_board(page, agents_base_url)
+        expect(page.locator("#tab-btn-board .tab-short")).to_be_visible()
+        expect(page.locator("#tab-btn-board .tab-label")).to_be_hidden()
+        expect(page.locator("#tab-btn-graph .tab-short")).to_be_visible()
+        expect(page.locator("#board-filter-toggle")).to_be_visible()
+        expect(page.locator("#board-filter-toggle")).to_have_attribute("aria-expanded", "false")
+        expect(page.locator("#board-filter-controls")).to_be_hidden()
+        expect(page.locator("#board-done-drop")).to_be_visible()
+
+        page.locator("#board-filter-toggle").click()
+        expect(page.locator("#board-filter-toggle")).to_have_attribute("aria-expanded", "true")
+        expect(page.locator("#board-filter-controls")).to_be_visible()
+
+    def test_assignee_tray_click_then_card_is_an_accessible_assignment_alternative(
+        self, page: Page, agents_base_url,
+    ):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator(".board-assignee-drop[data-assignee='codex']").click()
+        expect(page.locator("#board-drop-status")).to_contain_text("codex")
+        page.locator("[data-card-id='t1']").click()
+        expect(page.locator(".board-lane[data-lane='assigned'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+        assert lane_calls == [{"lane": "assigned", "assignee": "codex"}]
+
+    def test_touch_pointer_drag_from_assignee_tray_assigns_a_card(self, page: Page, agents_base_url):
+        lane_calls = []
+        page.set_viewport_size({"width": 390, "height": 844})
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.evaluate(
+            """() => {
+                const source = document.querySelector('.board-assignee-drop[data-assignee="codex"]');
+                const card = document.querySelector('[data-card-id="t1"]');
+                const a = source.getBoundingClientRect();
+                const b = card.getBoundingClientRect();
+                const event = (type, x, y) => new PointerEvent(type, {
+                    bubbles: true, clientX: x, clientY: y, pointerId: 8,
+                    pointerType: 'touch', isPrimary: true,
+                });
+                source.dispatchEvent(event('pointerdown', a.left + 20, a.top + 20));
+                document.dispatchEvent(event('pointermove', b.left + 20, b.top + 20));
+                document.dispatchEvent(event('pointerup', b.left + 20, b.top + 20));
+            }"""
+        )
+        expect(page.locator(".board-lane[data-lane='assigned'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+        assert lane_calls == [{"lane": "assigned", "assignee": "codex"}]
+
+    def test_done_target_accepts_a_focused_card_without_dragging(self, page: Page, agents_base_url):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator("[data-card-id='t1']").focus()
+        page.locator("#board-done-drop").click()
+        expect(page.locator(".board-lane[data-lane='unassigned'] [data-card-id='t1']")).to_have_count(0, timeout=5000)
+        assert lane_calls == [{"lane": "done"}]
+
 
 class TestDragBetweenLanes:
+    def test_touch_pointer_drag_moves_a_card_between_lanes(self, page: Page, agents_base_url):
+        lane_calls = []
+        page.set_viewport_size({"width": 390, "height": 844})
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.evaluate(
+            """() => {
+                const card = document.querySelector('[data-card-id="t1"]');
+                const lane = document.querySelector('.board-lane[data-lane="in_progress"] .board-lane-cards');
+                lane.scrollIntoView({block: 'nearest', inline: 'center'});
+                const a = card.getBoundingClientRect();
+                const b = lane.getBoundingClientRect();
+                const event = (type, x, y) => new PointerEvent(type, {
+                    bubbles: true, clientX: x, clientY: y, pointerId: 7,
+                    pointerType: 'touch', isPrimary: true,
+                });
+                card.dispatchEvent(event('pointerdown', a.left + 20, a.top + 20));
+                document.dispatchEvent(event('pointermove', b.left + 20, b.top + 20));
+                document.dispatchEvent(event('pointerup', b.left + 20, b.top + 20));
+            }"""
+        )
+        expect(page.locator(".board-lane[data-lane='in_progress'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+        assert lane_calls == [{"lane": "in_progress"}]
+
     def test_drag_issues_lane_put_with_expected_body(self, page: Page, agents_base_url):
         lane_calls = []
         _open_board(page, agents_base_url, lane_calls=lane_calls, lane_status_code=[200])

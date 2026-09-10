@@ -169,8 +169,14 @@ export function initBoard() {
   const sortFilterEl = document.getElementById('board-filter-sort');
   const includeDoneEl = document.getElementById('board-filter-done');
   const filterClearBtn = document.getElementById('board-filter-clear');
+  const filterToggleBtn = document.getElementById('board-filter-toggle');
+  const filterSummaryEl = document.getElementById('board-filter-summary');
+  const filterControlsEl = document.getElementById('board-filter-controls');
   const newCardBtn = document.getElementById('board-new-card');
   const connStateEl = document.getElementById('board-connection-state');
+  const assigneeDropsEl = document.getElementById('board-assignee-drops');
+  const doneDropEl = document.getElementById('board-done-drop');
+  const dropStatusEl = document.getElementById('board-drop-status');
   const drawerBackdrop = document.getElementById('board-drawer-backdrop');
   const drawerEl = document.getElementById('board-drawer');
 
@@ -187,6 +193,8 @@ export function initBoard() {
   let openCardSnapshot = null;  // last card object the drawer was fully rendered from
   let panel = null;  // SessionPanel for the drawer's linked-session transcript
   let assignmentHandle = null;  // renderAssignmentPickers()'s return value for the open drawer, or null
+  let selectedAssignee = null;
+  let quickActionCardId = null;
 
   // A card snapshot older than an in-flight picker save re-seeds the
   // model/effort/host pickers with the pre-save value on remount -- a
@@ -469,6 +477,102 @@ export function initBoard() {
     return true;
   }
 
+  function setDropStatus(message = '', isError = false) {
+    if (!dropStatusEl) return;
+    dropStatusEl.textContent = message;
+    dropStatusEl.classList.toggle('error', isError);
+  }
+
+  function assignmentPolicyReason(card) {
+    const policy = card && card.policy && card.policy.assignee;
+    return policy && policy.allowed === false
+      ? (policy.reason || "This card's assignee can't be changed right now.")
+      : null;
+  }
+
+  function canDropCard(card, targetLane) {
+    if (!card || card.kind !== 'task') return { allowed: false, reason: 'Only task cards can be moved.' };
+    if (!DIRECT_LANE_IDS.has(targetLane)) {
+      return { allowed: false, reason: `Can't move card to ${laneLabel(targetLane)}.` };
+    }
+    const policy = card.policy && card.policy.lanes && card.policy.lanes[targetLane];
+    if (policy && policy.allowed === false) {
+      return { allowed: false, reason: policy.reason || `Can't move card to ${laneLabel(targetLane)}.` };
+    }
+    return { allowed: true, reason: '' };
+  }
+
+  function assignSelectedAssignee(card) {
+    if (!selectedAssignee || !card || card.kind !== 'task') return false;
+    const assignee = selectedAssignee;
+    selectedAssignee = null;
+    renderAssigneeDrops();
+    const reason = assignmentPolicyReason(card);
+    if (reason) {
+      setDropStatus(reason, true);
+      showToast(reason, true);
+      return true;
+    }
+    setDropStatus(`Assigning ${assignee}…`);
+    moveCard(card.id, 'assigned', assignee)
+      .then(() => setDropStatus(`Assigned to ${assignee}.`))
+      .catch(() => setDropStatus('Assignment refused.', true));
+    return true;
+  }
+
+  function assignAssigneeToCard(cardId, assignee) {
+    const card = findCard(cardId);
+    if (!card || card.kind !== 'task') return;
+    const reason = assignmentPolicyReason(card);
+    if (reason) {
+      setDropStatus(reason, true);
+      showToast(reason, true);
+      return;
+    }
+    setDropStatus(`Assigning ${assignee}…`);
+    // Keep this on the same lane endpoint and request shape as the drawer's
+    // assignee select. The server remains authoritative for claimed cards
+    // and for cards whose derived lane cannot change with the tag update.
+    moveCard(card.id, 'assigned', assignee)
+      .then(() => setDropStatus(`Assigned to ${assignee}.`))
+      .catch(() => setDropStatus('Assignment refused.', true));
+  }
+
+  function renderAssigneeDrops() {
+    if (!assigneeDropsEl) return;
+    assigneeDropsEl.innerHTML = ASSIGNEES.map(assignee => `
+      <button type="button" class="board-drop-target board-assignee-drop${selectedAssignee === assignee ? ' selected' : ''}"
+              data-assignee="${assignee}" aria-pressed="${selectedAssignee === assignee}"
+              aria-label="Assign selected card to ${assignee}">
+        ${assignee}
+      </button>
+    `).join('');
+    assigneeDropsEl.querySelectorAll('.board-assignee-drop').forEach(button => {
+      button.addEventListener('click', () => {
+        if (suppressNextTrayClick === `assignee:${button.dataset.assignee}`) {
+          suppressNextTrayClick = null;
+          return;
+        }
+        selectedAssignee = selectedAssignee === button.dataset.assignee ? null : button.dataset.assignee;
+        renderAssigneeDrops();
+        setDropStatus(selectedAssignee
+          ? `Tap a card to assign it to ${selectedAssignee}, or drag this button onto a card.`
+          : '');
+      });
+      button.addEventListener('pointerdown', e => onPointerDown(e, {
+        kind: 'assignee', assignee: button.dataset.assignee, sourceEl: button,
+      }));
+    });
+  }
+
+  function updateQuickDropTargets() {
+    if (!doneDropEl) return;
+    const hidden = !visibleLanes.has('done');
+    doneDropEl.hidden = !hidden;
+    doneDropEl.setAttribute('aria-label', hidden
+      ? 'Drop a card here to move it to Done' : 'Done lane is visible');
+  }
+
   // ------------------------------------------------------------------
   // Rendering
   // ------------------------------------------------------------------
@@ -521,6 +625,8 @@ export function initBoard() {
     div.className = 'board-card';
     div.dataset.cardId = card.id;
     div.dataset.lane = card.lane;
+    div.tabIndex = 0;
+    div.setAttribute('role', 'article');
     // Re-stamps the reveal highlight on a freshly-built element — a
     // `render()` in the middle of `revealCard`'s ~2s window (e.g. a
     // board-stream SSE tick) rebuilds every card node from scratch, so this
@@ -536,6 +642,14 @@ export function initBoard() {
     `;
     div.addEventListener('click', () => {
       if (suppressNextClick === card.id) { suppressNextClick = null; return; }
+      if (assignSelectedAssignee(card)) return;
+      openDrawer(card.id);
+    });
+    div.addEventListener('focus', () => { quickActionCardId = card.id; });
+    div.addEventListener('keydown', e => {
+      if (e.target !== div || (e.key !== 'Enter' && e.key !== ' ')) return;
+      e.preventDefault();
+      if (assignSelectedAssignee(card)) return;
       openDrawer(card.id);
     });
     const sessionChip = div.querySelector('.board-chip-session');
@@ -546,7 +660,9 @@ export function initBoard() {
         activateTab('graph');
       });
     }
-    div.addEventListener('mousedown', (e) => onCardMouseDown(e, card));
+    div.addEventListener('pointerdown', (e) => onPointerDown(e, {
+      kind: 'card', card, sourceEl: div,
+    }));
     if (showAccept) {
       const acceptBtn = div.querySelector('.board-card-accept');
       acceptBtn.addEventListener('mousedown', (e) => e.stopPropagation());
@@ -722,25 +838,44 @@ export function initBoard() {
   onTabActivate((name) => { if (name === 'board') drainBoardFocus(); });
 
   // ------------------------------------------------------------------
-  // Drag and drop — pointer-based (mousedown/mousemove/mouseup), not the
-  // native HTML5 Drag and Drop API. draggable="true" + dragstart/drop only
-  // fires through the browser's OS-level drag gesture, which synthetic
-  // mouse events (Playwright included) can't reliably trigger — a plain
-  // pointer drag works the same in real use and is what the server-free
-  // browser test drives.
+  // Drag and drop — one Pointer Events model for mouse, pen, and touch. A
+  // short/vertical gesture remains a normal tap/scroll; only a deliberate
+  // horizontal move starts a drag. This keeps lane scrolling usable on a
+  // narrow viewport and avoids the native HTML5 DnD path, which is not
+  // available to touch users.
   // ------------------------------------------------------------------
 
-  let dragState = null;   // { cardId, sourceLane, cardEl, ghost, startX, startY, moved }
-  let suppressNextClick = null;  // card id whose trailing click (after a real drag) should be swallowed
+  let dragState = null;   // { kind, card, assignee, sourceEl, ghost, startX, startY, moved }
+  let suppressNextClick = null;  // card/assignee id whose trailing click should be swallowed
+  let suppressNextTrayClick = null;
 
-  function onCardMouseDown(e, card) {
-    if (e.button !== 0) return;
+  function clearDragTarget() {
+    document.querySelectorAll('.board-lane.drag-over, .board-drop-target.drop-allowed, .board-drop-target.drop-refused')
+      .forEach(el => el.classList.remove('drag-over', 'drop-allowed', 'drop-refused'));
+  }
+
+  function endPointerDrag() {
+    document.removeEventListener('pointermove', onDragMove);
+    document.removeEventListener('pointerup', onDragUp);
+    document.removeEventListener('pointercancel', onDragCancel);
+    clearDragTarget();
+    if (!dragState) return;
+    const { ghost, sourceEl } = dragState;
+    if (ghost && ghost.parentNode) ghost.parentNode.removeChild(ghost);
+    if (sourceEl) sourceEl.classList.remove('dragging-source');
+    document.body.classList.remove('board-dragging');
+  }
+
+  function onPointerDown(e, source) {
+    if (!e.isPrimary || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    if (e.target.closest('button, input, select, textarea, a') && source.kind === 'card') return;
     dragState = {
-      cardId: card.id, sourceLane: card.lane, cardEl: e.currentTarget,
-      startX: e.clientX, startY: e.clientY, moved: false, ghost: null,
+      ...source, sourceEl: source.sourceEl || e.currentTarget,
+      startX: e.clientX, startY: e.clientY, moved: false, cancelled: false, ghost: null,
     };
-    document.addEventListener('mousemove', onDragMove);
-    document.addEventListener('mouseup', onDragUp);
+    document.addEventListener('pointermove', onDragMove);
+    document.addEventListener('pointerup', onDragUp);
+    document.addEventListener('pointercancel', onDragCancel);
   }
 
   function clearDragSelection() {
@@ -753,13 +888,23 @@ export function initBoard() {
     const dx = e.clientX - dragState.startX;
     const dy = e.clientY - dragState.startY;
     if (!dragState.moved && Math.hypot(dx, dy) < 4) return;
+    // Let the browser own vertical scrolling from a card. Once cancelled,
+    // pointerup is ignored and the card still receives its ordinary click
+    // only when the browser decides this was a tap rather than a scroll.
+    if (dragState.kind === 'card' && !dragState.moved && Math.abs(dy) > Math.abs(dx)) {
+      dragState.cancelled = true;
+      endPointerDrag();
+      dragState = null;
+      return;
+    }
     if (!dragState.moved) {
       dragState.moved = true;
+      if (e.cancelable) e.preventDefault();
       document.body.classList.add('board-dragging');
       clearDragSelection();
-      dragState.cardEl.classList.add('dragging-source');
-      const rect = dragState.cardEl.getBoundingClientRect();
-      const ghost = dragState.cardEl.cloneNode(true);
+      dragState.sourceEl.classList.add('dragging-source');
+      const rect = dragState.sourceEl.getBoundingClientRect();
+      const ghost = dragState.sourceEl.cloneNode(true);
       ghost.classList.add('board-card-ghost');
       ghost.style.position = 'fixed';
       ghost.style.pointerEvents = 'none';
@@ -768,32 +913,78 @@ export function initBoard() {
       document.body.appendChild(ghost);
       dragState.ghost = ghost;
     }
+    if (dragState.kind === 'card' && lanesEl) {
+      const lanesRect = lanesEl.getBoundingClientRect();
+      const edge = 28;
+      if (e.clientX < lanesRect.left + edge) lanesEl.scrollLeft -= 18;
+      else if (e.clientX > lanesRect.right - edge) lanesEl.scrollLeft += 18;
+    }
     dragState.ghost.style.left = (e.clientX + 12) + 'px';
     dragState.ghost.style.top = (e.clientY + 12) + 'px';
-    document.querySelectorAll('.board-lane.drag-over').forEach(el => el.classList.remove('drag-over'));
-    const laneEl = document.elementFromPoint(e.clientX, e.clientY)?.closest('.board-lane');
-    if (laneEl) laneEl.classList.add('drag-over');
+    clearDragTarget();
+    const under = document.elementFromPoint(e.clientX, e.clientY);
+    if (dragState.kind === 'card') {
+      const target = under?.closest('.board-lane, #board-done-drop');
+      if (target) {
+        const targetLane = target.id === 'board-done-drop' ? 'done' : target.dataset.lane;
+        const decision = canDropCard(dragState.card, targetLane);
+        target.classList.add(decision.allowed ? 'drop-allowed' : 'drop-refused');
+        if (target.classList.contains('board-lane')) target.classList.add('drag-over');
+        dragState.targetLane = targetLane;
+        dragState.targetEl = target;
+        setDropStatus(decision.allowed ? `Drop in ${laneLabel(targetLane)}.` : decision.reason, !decision.allowed);
+      } else {
+        dragState.targetLane = null;
+        dragState.targetEl = null;
+        setDropStatus('');
+      }
+    } else {
+      const cardEl = under?.closest('.board-card[data-card-id]');
+      if (cardEl) {
+        const targetCard = findCard(cardEl.dataset.cardId);
+        const reason = !targetCard || targetCard.kind !== 'task'
+          ? 'Only task cards can be assigned.'
+          : assignmentPolicyReason(targetCard);
+        cardEl.classList.add(reason ? 'drop-refused' : 'drop-allowed');
+        dragState.targetCardId = targetCard && targetCard.kind === 'task' ? targetCard.id : null;
+        setDropStatus(reason || `Drop to assign ${dragState.assignee}.`, !!reason);
+      } else {
+        dragState.targetCardId = null;
+        setDropStatus('');
+      }
+    }
   }
 
   function onDragUp(e) {
-    document.removeEventListener('mousemove', onDragMove);
-    document.removeEventListener('mouseup', onDragUp);
     if (!dragState) return;
-    const { cardId, sourceLane, moved, ghost, cardEl } = dragState;
-    document.querySelectorAll('.board-lane.drag-over').forEach(el => el.classList.remove('drag-over'));
-    if (ghost && ghost.parentNode) ghost.parentNode.removeChild(ghost);
-    if (cardEl) cardEl.classList.remove('dragging-source');
-    document.body.classList.remove('board-dragging');
-    if (moved) {
+    const state = dragState;
+    endPointerDrag();
+    dragState = null;
+    if (state.moved) {
       clearDragSelection();
-      const laneEl = document.elementFromPoint(e.clientX, e.clientY)?.closest('.board-lane');
-      const targetLane = laneEl && laneEl.dataset.lane;
-      if (targetLane && targetLane !== sourceLane) {
-        suppressNextClick = cardId;  // the mouseup will also fire a click — swallow it
-        onCardDropped(cardId, targetLane);
+      if (state.kind === 'card') {
+        // A drag that ends in the source lane (or outside a lane) is still
+        // a drag, not a request to open the drawer through its trailing tap.
+        suppressNextClick = state.card.id;
+        if (state.targetLane && state.targetLane !== state.card.lane) {
+          onCardDropped(state.card.id, state.targetLane);
+        }
+      } else {
+        suppressNextTrayClick = `assignee:${state.assignee}`;
+        if (state.targetCardId) {
+          suppressNextClick = state.targetCardId;
+          assignAssigneeToCard(state.targetCardId, state.assignee);
+        }
       }
     }
+    setDropStatus('');
+  }
+
+  function onDragCancel() {
+    if (!dragState) return;
+    endPointerDrag();
     dragState = null;
+    setDropStatus('');
   }
 
   function onCardDropped(cardId, targetLane) {
@@ -823,6 +1014,12 @@ export function initBoard() {
       // class and resets `suppressNextClick` so the operator's next click
       // on this card still opens the drawer.
       render();
+      return;
+    }
+    if (targetLane === 'done' && card.lane === 'review') {
+      // Review -> Done is the same explicit acceptance path as the drawer
+      // and the card's inline Accept button, including its tag transition.
+      acceptCard(card, fetchBoard);
       return;
     }
     let assignee;
@@ -2003,6 +2200,7 @@ export function initBoard() {
     visibleLanes = new Set(laneIds);
     laneFilterCheckboxes().forEach(cb => { cb.checked = visibleLanes.has(cb.value); });
     updateLaneFilterLabel();
+    updateQuickDropTargets();
   }
 
   // The lane selection is the shared `lanes` filter (linking.js) — this
@@ -2060,8 +2258,27 @@ export function initBoard() {
     }
   });
 
+  if (filterToggleBtn && filterControlsEl) {
+    filterToggleBtn.addEventListener('click', () => {
+      const open = document.getElementById('board-filters').classList.toggle('filters-open');
+      filterToggleBtn.setAttribute('aria-expanded', String(open));
+    });
+  }
+
   renderLaneFilterCheckboxes();
   updateLaneFilterLabel();
+  renderAssigneeDrops();
+  updateQuickDropTargets();
+  if (doneDropEl) {
+    doneDropEl.addEventListener('click', () => {
+      const card = quickActionCardId && findCard(quickActionCardId);
+      if (!card) {
+        setDropStatus('Focus a task card first, then activate Done.', true);
+        return;
+      }
+      onCardDropped(card.id, 'done');
+    });
+  }
 
   // ------------------------------------------------------------------
   // Wire filters + boot
@@ -2070,7 +2287,7 @@ export function initBoard() {
   // "Include cancelled" and sorting stay board-local.
   [includeDoneEl].filter(Boolean).forEach(el => {
     const evt = (el.tagName === 'SELECT' || el.type === 'checkbox') ? 'change' : 'input';
-    el.addEventListener(evt, () => render());
+    el.addEventListener(evt, () => { updateFilterSummary(getFilters()); render(); });
   });
 
   // Search/assignee/host/engine/tag/recency — shared with the graph
@@ -2088,6 +2305,7 @@ export function initBoard() {
     sortFilterEl.addEventListener('change', () => {
       sortMode = SORT_OPTIONS.has(sortFilterEl.value) ? sortFilterEl.value : DEFAULT_SORT;
       saveSortSelection(sortMode);
+      updateFilterSummary(getFilters());
       render();
     });
   }
@@ -2097,8 +2315,27 @@ export function initBoard() {
     sortMode = DEFAULT_SORT;
     if (sortFilterEl) sortFilterEl.value = DEFAULT_SORT;
     saveSortSelection(DEFAULT_SORT);
+    updateFilterSummary(getFilters());
     render();
   });
+
+  function updateFilterSummary(state) {
+    if (!filterSummaryEl) return;
+    const active = [];
+    if (state.search) active.push(`search “${state.search}”`);
+    if (state.assignee !== 'all') active.push(state.assignee);
+    if (state.host !== 'all') active.push(`host ${state.host}`);
+    if (state.engine !== 'all') active.push(`engine ${state.engine}`);
+    if (state.tag) active.push(`#${state.tag.replace(/^#/, '')}`);
+    if (state.recency != null && state.recency !== 'all') active.push('recent');
+    if (visibleLanes.size !== DEFAULT_VISIBLE_LANE_IDS.length
+        || DEFAULT_VISIBLE_LANE_IDS.some(id => !visibleLanes.has(id))) active.push('lanes');
+    if (includeDoneEl && includeDoneEl.checked) active.push('cancelled');
+    if (sortMode !== DEFAULT_SORT) active.push('sorted');
+    filterSummaryEl.textContent = active.length ? `${active.length} active` : 'default';
+    filterToggleBtn?.setAttribute('aria-label', active.length
+      ? `Filters: ${active.join(', ')}` : 'Filters: default');
+  }
 
   function syncSharedFilterControls(state) {
     // Rebuild (and, if needed, inject) the host option list against the
@@ -2121,6 +2358,7 @@ export function initBoard() {
     const recencyDisplay = state.recency == null ? 'all' : state.recency;
     if (recencyFilterEl && recencyFilterEl.value !== recencyDisplay) recencyFilterEl.value = recencyDisplay;
     syncLaneFilterUI(state.lanes);
+    updateFilterSummary(state);
     render();
   }
   subscribeFilters(syncSharedFilterControls);

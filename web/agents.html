@@ -1015,7 +1015,6 @@
     }
     .chips { display: none; }
   }
-
   /* -------------------------------------------------------------------
      Board tab (#850) — Kanban board that reuses the styles above for
      chips, panel-*, modal-*, and toast markup (the drawer's session
@@ -1039,6 +1038,7 @@
   }
   .tab-btn:hover { background: var(--bg-card); color: var(--text-primary); }
   .tab-btn.active { background: var(--accent); color: var(--bg-primary); }
+  .tab-short { display: none; }
   .tab-view[hidden] { display: none; }
   #board-view {
     height: calc(100vh - 56px - 45px);
@@ -1077,6 +1077,21 @@
     cursor: pointer;
   }
   #board-filter-clear:hover { border-color: var(--accent); }
+  .board-filters select, .board-drawer select, .board-drawer button { touch-action: manipulation; }
+  .board-filter-toggle {
+    display: none;
+    align-items: center;
+    gap: 0.4rem;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .board-filter-summary { color: var(--text-secondary); font-size: 0.74rem; }
+  .board-filter-controls { display: contents; }
   #board-new-card {
     margin-left: auto;
     background: var(--accent);
@@ -1196,6 +1211,41 @@
   }
   .board-lane-filter-option:hover { background: var(--bg-elev); }
   .board-lane-filter-option input { margin: 0; }
+  .board-drop-tray {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-height: 58px;
+    padding: 0.45rem 1.25rem;
+    border-top: 1px solid var(--border);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+  }
+  .board-drop-tray-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .board-assignee-drop,
+  .board-done-drop {
+    min-height: 42px;
+    min-width: 58px;
+    padding: 0.35rem 0.65rem;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-size: 0.78rem;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  .board-assignee-drop:hover,
+  .board-assignee-drop.selected,
+  .board-done-drop:hover { border-color: var(--accent); }
+  .board-assignee-drop.dragging-source { opacity: 0.45; }
+  .board-done-drop { border-color: var(--completed); color: var(--text-primary); }
+  .board-drop-target.drop-allowed { border-color: var(--running); box-shadow: 0 0 0 2px rgba(52, 211, 153, 0.25); }
+  .board-drop-target.drop-refused { border-color: var(--failed); box-shadow: 0 0 0 2px rgba(248, 113, 113, 0.2); }
+  .board-drop-status { min-width: 0; margin-left: auto; font-size: 0.74rem; color: var(--text-secondary); }
+  .board-drop-status:empty { display: none; }
+  .board-drop-status.error { color: var(--failed); }
   .board-lane-header {
     padding: 0.5rem 0.75rem;
     font-size: 0.78rem;
@@ -1225,6 +1275,7 @@
     padding: 0.5rem 0.6rem;
     font-size: 0.8rem;
     cursor: pointer;
+    touch-action: pan-x pan-y;
   }
   .board-card:hover { border-color: var(--accent); }
   .board-card.dragging-source { opacity: 0.4; }
@@ -1476,6 +1527,25 @@
   }
   .assignment-ran { color: var(--text-dim); font-size: 0.75rem; margin-top: 0.3rem; }
   .assignment-error { color: var(--failed); font-size: 0.75rem; margin-top: 0.3rem; }
+  @media (max-width: 600px) {
+    .header-nav { margin-left: 0; }
+    .header-nav .nav-link { padding-left: 0.4rem; padding-right: 0.4rem; font-size: 0.75rem; }
+    .tabs { margin-left: auto; }
+    .tab-btn { min-width: 42px; padding: 0.5rem 0.65rem; }
+    .tab-label { display: none; }
+    .tab-short { display: inline; }
+    .board-filter-toggle { display: inline-flex; }
+    .board-filter-controls { display: none; width: 100%; flex-wrap: wrap; gap: 0.4rem; }
+    .board-filters.filters-open .board-filter-controls { display: flex; }
+    .board-filter-controls > * { max-width: 100%; }
+    .board-filter-controls #board-new-card { margin-left: 0; }
+    #board-connection-state { margin-left: 0; }
+    .board-filters { padding: 0.45rem 0.65rem; gap: 0.4rem; }
+    #board-lanes { padding: 0.5rem 0.65rem; gap: 0.5rem; }
+    .board-lane { min-width: min(84vw, 280px); }
+    .board-drop-tray { overflow-x: auto; padding: 0.45rem 0.65rem; min-height: 66px; }
+    .board-drop-status { flex: 0 0 10rem; }
+  }
 </style>
 </head>
 <body>
@@ -1487,8 +1557,8 @@
     <a href="/agents" class="nav-link active">🛠️ Agents</a>
   </nav>
   <div class="tabs" id="tabs">
-    <button class="tab-btn active" id="tab-btn-board" data-tab="board">Board</button>
-    <button class="tab-btn" id="tab-btn-graph" data-tab="graph">Graph</button>
+    <button class="tab-btn active" id="tab-btn-board" data-tab="board" aria-label="Board"><span class="tab-label">Board</span><span class="tab-short" aria-hidden="true">B</span></button>
+    <button class="tab-btn" id="tab-btn-graph" data-tab="graph" aria-label="Graph"><span class="tab-label">Graph</span><span class="tab-short" aria-hidden="true">G</span></button>
   </div>
   <div class="chips" id="graph-chips" hidden>
     <span class="chip running">running <strong id="chip-running">0</strong></span>
@@ -1502,6 +1572,10 @@
 <!-- Board tab (#850) — the primary /agents view. -->
 <div class="tab-view" id="board-view">
   <div class="board-filters" id="board-filters">
+    <button type="button" class="board-filter-toggle" id="board-filter-toggle" aria-expanded="false" aria-controls="board-filter-controls">
+      <span>Filters</span><span class="board-filter-summary" id="board-filter-summary">default</span>
+    </button>
+    <div class="board-filter-controls" id="board-filter-controls">
     <input type="search" id="board-search" placeholder="Search cards…" autocomplete="off" spellcheck="false" />
     <div class="board-lane-filter-dropdown" id="board-lane-filter-dropdown">
       <button type="button" class="board-lane-filter-btn" id="board-lane-filter-btn" title="Lanes">
@@ -1558,8 +1632,15 @@
     <button type="button" id="board-filter-clear" title="Reset all board filters to defaults">Clear filters</button>
     <button id="board-new-card" type="button">+ New card</button>
     <span id="board-connection-state">connecting…</span>
+    </div>
   </div>
   <div id="board-lanes"></div>
+  <div class="board-drop-tray" id="board-drop-tray" aria-label="Board quick actions">
+    <span class="board-drop-tray-label">Assign</span>
+    <div id="board-assignee-drops" role="group" aria-label="Assign card to"></div>
+    <button type="button" class="board-drop-target board-done-drop" id="board-done-drop" hidden>Done</button>
+    <span class="board-drop-status" id="board-drop-status" role="status" aria-live="polite"></span>
+  </div>
 </div>
 <div class="board-drawer-backdrop" id="board-drawer-backdrop" hidden>
   <aside class="board-drawer" id="board-drawer"></aside>
