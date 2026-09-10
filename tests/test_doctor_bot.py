@@ -824,6 +824,56 @@ class TestGoalApproval:
         assert q["kind"] == "goal_approval"
         assert q["session_id"] == result["session_id"]
 
+        # The same dispatch records the durable revision that question gates:
+        # version 1, the goal body alone as the condition, and a resume action
+        # that replays the executor's own goal command. The reply mechanics
+        # appended to the sent message are not part of either.
+        proposal = w.session_store.get_proposal_by_question_id(q["id"])
+        assert proposal is not None
+        assert proposal["version"] == 1
+        assert proposal["condition"] == "all tests pass"
+        assert proposal["resume_action"]["payload"] == "/goal all tests pass"
+        assert proposal["workflow_id"] == (
+            w.session_store.get_by_session_id(result["session_id"]).workflow_id
+        )
+
+    def test_a_doctor_session_owns_a_repair_from_diagnosis(self, tmp_path):
+        """The repair record exists from the moment the session is created —
+        before any goal is proposed — so the gate covers the diagnosis window
+        rather than starting at the first `[GOAL]`."""
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+        from api.services.agent_worker.session_store import REPAIR_DIAGNOSIS
+
+        w = self._make_worker(tmp_path, self._goal_blocked_stub())
+        result = spawn_claude_code_session(
+            w.session_store, "the calendar view is wrong", chat_id="123", bot="doctor",
+        )
+
+        workflow_id = w.session_store.get_by_session_id(
+            result["session_id"],
+        ).workflow_id
+        assert workflow_id
+        assert w.session_store.get_repair(workflow_id)["phase"] == REPAIR_DIAGNOSIS
+
+    def test_an_ordinary_claude_code_session_owns_no_repair(self, tmp_path):
+        """`[GOAL]` is a generic protocol tag. A session that is not the
+        doctor's gets an ordinary approval prompt and no repair record, so
+        nothing about its dispatch changes."""
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+
+        w = self._make_worker(tmp_path, self._goal_blocked_stub())
+        result = spawn_claude_code_session(
+            w.session_store, "make the suite green", chat_id="123",
+        )
+        w._dispatch_spawned_sessions()
+
+        session = w.session_store.get_by_session_id(result["session_id"])
+        assert session.workflow_id is None
+        msg_id, _, _ = w._sent_with_ids[-1]
+        q = w.session_store.get_open_question_by_message_id(msg_id)
+        assert q["kind"] == "goal_approval"
+        assert w.session_store.get_proposal_by_question_id(q["id"]) is None
+
     def _seed_blocked_goal_session(self, w, *, condition="all tests pass"):
         """Drop a BLOCKED doctor session with an open goal_approval question
         and the goal revision that question gates — the shape left behind
@@ -1030,6 +1080,92 @@ class TestGoalApproval:
             PROPOSAL_SUPERSEDED
         )
 
+    def test_a_decline_closes_the_repair_and_launches_nothing(self, tmp_path):
+        from api.services.agent_worker.session_store import (
+            PROPOSAL_DECLINED, REPAIR_DECLINED,
+        )
+        from api.services.agent_worker import doctor_repair
+
+        w = self._make_worker(tmp_path, self._goal_blocked_stub())
+        session, qid = self._seed_blocked_goal_session(
+            w, condition="merge the parser fix and verify the service health check",
+        )
+        proposal = w.session_store.get_proposal_by_question_id(qid)
+
+        assert w.session_store.deposit_answer(9100, "leave it", bot="doctor") is True
+        w._process_clarification_answers()
+
+        assert w.session_store.get_proposal(proposal["proposal_id"])["status"] == (
+            PROPOSAL_DECLINED
+        )
+        repair = w.session_store.get_repair(proposal["workflow_id"])
+        assert repair["phase"] == REPAIR_DECLINED
+        assert repair["approved_proposal_id"] is None
+        # Nothing may be dispatched for a declined repair, but the doctor is
+        # resumed with the reply so it can file the work as an issue and stop.
+        assert doctor_repair.dispatch_allowed(repair, "implement").allowed is False
+        assert [m["content"] for m in
+                w.session_store.drain_pending_messages(session.session_id)] == [
+            "leave it",
+        ]
+
+    def test_a_refinement_is_not_read_as_a_decline(self, tmp_path):
+        """Only a reply that is nothing but a decline declines. A reply that
+        carries changes retires the revision for re-proposal instead."""
+        from api.services.agent_worker.session_store import (
+            PROPOSAL_SUPERSEDED, REPAIR_DIAGNOSIS,
+        )
+
+        w = self._make_worker(tmp_path, self._goal_blocked_stub())
+        _, qid = self._seed_blocked_goal_session(
+            w, condition="merge the parser fix and verify the service health check",
+        )
+        proposal = w.session_store.get_proposal_by_question_id(qid)
+
+        w.session_store.deposit_answer(9100, "no, also require lint", bot="doctor")
+        w._process_clarification_answers()
+
+        assert w.session_store.get_proposal(proposal["proposal_id"])["status"] == (
+            PROPOSAL_SUPERSEDED
+        )
+        assert w.session_store.get_repair(
+            proposal["workflow_id"],
+        )["phase"] == REPAIR_DIAGNOSIS
+
+    def test_an_approval_after_a_cancel_approves_nothing(self, tmp_path):
+        """A cancel lands while the goal question is still outstanding. The
+        approval reply that follows leaves the revision unconsumed, enqueues
+        no resume action, and tells the operator rather than going silent."""
+        from api.services.agent_worker.session_store import (
+            PROPOSAL_PROPOSED, REPAIR_CANCELLED,
+        )
+
+        notices: list[tuple] = []
+        w = self._make_worker(tmp_path, self._goal_blocked_stub())
+        w._telegram_send = lambda text, chat_id=None, bot=None: (
+            notices.append((text, bot)) or True
+        )
+        session, qid = self._seed_blocked_goal_session(
+            w, condition="merge the parser fix and verify the service health check",
+        )
+        proposal = w.session_store.get_proposal_by_question_id(qid)
+        w.session_store.cancel_repair(proposal["workflow_id"], "operator kill")
+
+        assert w.session_store.deposit_answer(9100, "yes", bot="doctor") is True
+        w._process_clarification_answers()
+
+        assert w.session_store.get_proposal(proposal["proposal_id"])["status"] == (
+            PROPOSAL_PROPOSED
+        )
+        repair = w.session_store.get_repair(proposal["workflow_id"])
+        assert repair["phase"] == REPAIR_CANCELLED
+        assert repair["approved_proposal_id"] is None
+        assert w.session_store.drain_pending_messages(session.session_id) == []
+        kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
+        assert "doctor_goal_reply_ignored" in kinds
+        assert "claude_code_goal_locked" not in kinds
+        assert notices and notices[-1][1] == "doctor"
+
 
 class TestRepairSpawnGate:
     """`lifeos_agent_spawn` is how a repair dispatches implementation work, so
@@ -1047,33 +1183,38 @@ class TestRepairSpawnGate:
             caps=inter_agent.Caps(),
         )
 
-    def _repair_caller(self, tmp_path):
-        from api.services.agent_worker import doctor_repair
-        from api.services.agent_worker.session_store import STATUS_RUNNING, SessionStore
+    def _doctor_root(self, tmp_path):
+        """A doctor root session created the way production creates one, in
+        the diagnosis window: a repair on record, no goal proposed yet."""
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+        from api.services.agent_worker.session_store import SessionStore
 
         store = SessionStore(db_path=tmp_path / "sessions.db")
-        workflow_id = store.create_repair()["workflow_id"]
-        caller = store.create(
-            task_id="task-doctor-root",
-            routing="claude_code",
-            origin="operator",
-            bot="doctor",
-            status=STATUS_RUNNING,
-            budget={"max_dollars": 10.0, "max_tokens": 500_000, "wall_seconds": 3600},
-            workflow_id=workflow_id,
+        result = spawn_claude_code_session(
+            store, "the calendar view is wrong", chat_id="123", bot="doctor",
         )
+        caller = store.get_by_session_id(result["session_id"])
+        return store, caller.workflow_id, caller
+
+    def _propose(self, store, workflow_id):
+        from api.services.agent_worker import doctor_repair
+
         condition = "merge the parser fix and verify the service health check"
-        proposal = store.propose_goal(
+        return store.propose_goal(
             workflow_id,
             condition=condition,
             resume_action=doctor_repair.goal_resume_action(condition),
         )
-        return store, workflow_id, caller, proposal
 
-    def test_spawn_is_refused_while_the_goal_awaits_approval(self, tmp_path):
+    def test_spawn_is_refused_during_the_diagnosis_window(self, tmp_path):
+        """Before any goal is proposed — the window the doctor spends reading
+        the codebase — an implementation dispatch is already refused."""
         from api.services.agent_worker import inter_agent
+        from api.services.agent_worker.session_store import REPAIR_DIAGNOSIS
 
-        store, workflow_id, caller, _ = self._repair_caller(tmp_path)
+        store, workflow_id, caller = self._doctor_root(tmp_path)
+        assert store.get_repair(workflow_id)["phase"] == REPAIR_DIAGNOSIS
+
         ctx = self._ctx(tmp_path, caller.session_id)
         result = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
             "prompt": "implement the parser fix", "model": "claude_code",
@@ -1083,16 +1224,33 @@ class TestRepairSpawnGate:
         assert result["error"] == "repair_awaiting_approval"
         # No child session was created: the gate refuses the dispatch itself.
         assert [s.task_id for s in store.list_repair_sessions(workflow_id)] == [
-            "task-doctor-root",
+            caller.task_id,
+        ]
+
+    def test_spawn_is_refused_while_the_goal_awaits_approval(self, tmp_path):
+        from api.services.agent_worker import inter_agent
+
+        store, workflow_id, caller = self._doctor_root(tmp_path)
+        self._propose(store, workflow_id)
+        ctx = self._ctx(tmp_path, caller.session_id)
+        result = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
+            "prompt": "implement the parser fix", "model": "claude_code",
+        })
+
+        assert result["ok"] is False
+        assert result["error"] == "repair_awaiting_approval"
+        assert [s.task_id for s in store.list_repair_sessions(workflow_id)] == [
+            caller.task_id,
         ]
         # The supervisor's own session is untouched — the gate governs what
         # LifeOS dispatches, not what the running CLI process may do.
-        assert store.get("task-doctor-root").status == "running"
+        assert store.get(caller.task_id).status == caller.status
 
     def test_spawn_is_allowed_once_the_goal_is_approved(self, tmp_path):
         from api.services.agent_worker import inter_agent
 
-        store, workflow_id, caller, proposal = self._repair_caller(tmp_path)
+        store, workflow_id, caller = self._doctor_root(tmp_path)
+        proposal = self._propose(store, workflow_id)
         store.approve_goal(proposal["proposal_id"])
 
         ctx = self._ctx(tmp_path, caller.session_id)
@@ -1104,23 +1262,76 @@ class TestRepairSpawnGate:
         child = store.get_by_session_id(result["child_session_id"])
         assert child.workflow_id == workflow_id
 
-    def test_an_ordinary_agent_task_is_not_gated(self, tmp_path):
+    def test_the_hermes_anchor_carries_the_same_gate(self, tmp_path):
+        """Hermes has no shell, so the worker it spawns is the only way it
+        changes anything — and that spawn reads the repair off its anchor."""
         from api.services.agent_worker import inter_agent
-        from api.services.agent_worker.session_store import STATUS_RUNNING, SessionStore
+        from api.services.agent_worker.hermes_session import (
+            resolve_hermes_caller_session_id,
+        )
+        from api.services.agent_worker.session_store import (
+            REPAIR_DIAGNOSIS, SessionStore,
+        )
 
         store = SessionStore(db_path=tmp_path / "sessions.db")
-        caller = store.create(
-            task_id="task-ordinary-root",
-            routing="claude_code",
-            origin="operator",
-            status=STATUS_RUNNING,
-            budget={"max_dollars": 10.0, "max_tokens": 500_000, "wall_seconds": 3600},
+        anchor_id = resolve_hermes_caller_session_id(store, "conv-doctor", bot="doctor")
+        anchor = store.get_by_session_id(anchor_id)
+        assert anchor.workflow_id
+        assert store.get_repair(anchor.workflow_id)["phase"] == REPAIR_DIAGNOSIS
+
+        ctx = self._ctx(tmp_path, anchor_id)
+        refused = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
+            "prompt": "implement the parser fix", "model": "claude_code",
+        })
+        assert refused["ok"] is False
+        assert refused["error"] == "repair_awaiting_approval"
+
+        proposal = self._propose(store, anchor.workflow_id)
+        store.approve_goal(proposal["proposal_id"])
+        allowed = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
+            "prompt": "implement the parser fix", "model": "claude_code",
+        })
+        assert allowed["ok"] is True, allowed
+        assert store.get_by_session_id(
+            allowed["child_session_id"],
+        ).workflow_id == anchor.workflow_id
+
+    def test_a_non_doctor_hermes_anchor_owns_no_repair(self, tmp_path):
+        from api.services.agent_worker.hermes_session import (
+            resolve_hermes_caller_session_id,
         )
+        from api.services.agent_worker.session_store import SessionStore
+
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        anchor_id = resolve_hermes_caller_session_id(store, "conv-fitness", bot="fitness")
+        assert store.get_by_session_id(anchor_id).workflow_id is None
+
+    def test_an_ordinary_agent_task_that_proposes_a_goal_is_not_gated(self, tmp_path):
+        """An ordinary session emitting the generic `[GOAL]` tag keeps the
+        spawn it has: no repair is opened for it, so no gate applies."""
+        from api.services.agent_worker import inter_agent
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+        from api.services.agent_worker.session_store import SessionStore
+
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        w = TestGoalApproval()._make_worker(tmp_path, TestGoalApproval()._goal_blocked_stub())
+        spawned = spawn_claude_code_session(
+            w.session_store, "make the suite green", chat_id="123",
+        )
+        w._dispatch_spawned_sessions()
+
+        caller = store.get_by_session_id(spawned["session_id"])
+        assert caller.workflow_id is None
+        # The session really did register a goal-approval gate of its own.
+        msg_id, _, _ = w._sent_with_ids[-1]
+        assert w.session_store.get_open_question_by_message_id(
+            msg_id,
+        )["kind"] == "goal_approval"
+
         ctx = self._ctx(tmp_path, caller.session_id)
         result = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
             "prompt": "summarize a file", "model": "claude_code",
         })
-
         assert result["ok"] is True, result
         assert store.get_by_session_id(result["child_session_id"]).workflow_id is None
 
@@ -1130,7 +1341,8 @@ class TestRepairSpawnGate:
         from api.services.agent_worker import inter_agent
         from api.services.agent_worker.session_store import STATUS_RUNNING
 
-        store, workflow_id, caller, proposal = self._repair_caller(tmp_path)
+        store, workflow_id, caller = self._doctor_root(tmp_path)
+        proposal = self._propose(store, workflow_id)
         store.approve_goal(proposal["proposal_id"])
         child = store.create(
             task_id="task-doctor-child",
@@ -1227,6 +1439,56 @@ class TestRepairResultsAdvancePhases:
         )
         w._apply_repair_result(loose, self._result_text())
         assert w.transcript_store.read(loose.session_id) == []
+
+    def test_a_terminal_worker_turn_advances_the_repair(self, tmp_path):
+        """The result is drained by the worker's own terminal path, driven by
+        an executor that completes carrying the result line — not by calling
+        the fold directly."""
+        from dataclasses import dataclass
+
+        from api.services.agent_worker import doctor_repair
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+        from api.services.agent_worker.local_executor import ExecutorOutcome
+        from api.services.agent_worker.session_store import (
+            REPAIR_SHIPPED, STATUS_COMPLETED,
+        )
+
+        @dataclass
+        class _Completes:
+            outcome: ExecutorOutcome
+
+            def execute(self, session, task):
+                return self.outcome
+
+            def resume(self, session, message, working_dir=None):
+                return self.outcome
+
+        final_text = (
+            "Merged the parser fix as "
+            "https://github.com/example/synthetic/pull/4321 and verified the "
+            "service health check. Revert with: gh pr revert 4321.\n"
+            + self._result_text()
+        )
+        w = TestGoalApproval()._make_worker(tmp_path, _Completes(ExecutorOutcome(
+            status=STATUS_COMPLETED, final_text=final_text,
+        )))
+        spawned = spawn_claude_code_session(
+            w.session_store, "implement the parser fix", chat_id="123", bot="doctor",
+        )
+        session = w.session_store.get_by_session_id(spawned["session_id"])
+        workflow_id = session.workflow_id
+        condition = "merge the parser fix and verify the service health check"
+        proposal = w.session_store.propose_goal(
+            workflow_id, condition=condition,
+            resume_action=doctor_repair.goal_resume_action(condition),
+        )
+        w.session_store.approve_goal(proposal["proposal_id"])
+
+        w._dispatch_spawned_sessions()
+
+        kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
+        assert "code_handled_completion" in kinds
+        assert w.session_store.get_repair(workflow_id)["phase"] == REPAIR_SHIPPED
 
 
 class TestRepairReadSurface:

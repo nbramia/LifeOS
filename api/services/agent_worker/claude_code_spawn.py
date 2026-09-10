@@ -19,6 +19,7 @@ from dataclasses import asdict
 
 from config.settings import settings
 
+from . import doctor_repair
 from .session_store import STATUS_CLAIMED, SessionStore, new_session_id
 from .execution import ExecutionRequest
 
@@ -74,6 +75,13 @@ def spawn_claude_code_session(
     notices (NULL = primary). An orchestration bot like the doctor passes its
     name so the worker routes [NOTIFY]/[CLARIFY]/completion back to that bot.
 
+    A doctor session is a self-repair run, so it opens its repair record here,
+    at creation — the record exists from `diagnosis` onward, which is what
+    makes the single human gate refuse an implementation dispatch during the
+    read-only diagnosis window rather than only after a goal is proposed. No
+    other persona gets a repair: an ordinary task is an ordinary task whatever
+    protocol tags its session happens to emit.
+
     Returns ``{"ok": True, "session_id", "task_id"}`` on success, or
     ``{"ok": False, "error"}`` when ``prompt`` is empty.
 
@@ -103,6 +111,9 @@ def spawn_claude_code_session(
     canonical = execution_request or ExecutionRequest(
         executor="claude_code", working_dir=working_dir,
     )
+    workflow_id = None
+    if doctor_repair.is_doctor_session(persona_id, bot):
+        workflow_id = session_store.create_repair()["workflow_id"]
     session = session_store.create(
         task_id=task_id,
         session_id=session_id,
@@ -115,6 +126,7 @@ def spawn_claude_code_session(
         bot=bot,
         execution_request=asdict(canonical),
         persona_id=persona_id,
+        workflow_id=workflow_id,
     )
 
     logger.info(

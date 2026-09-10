@@ -119,6 +119,36 @@ class VerificationResult:
     lane_totals: Mapping[str, int] = dataclasses.field(default_factory=dict)
 
 
+def result_payload(result: VerificationResult) -> dict:
+    """The JSON object this script prints for one verification run.
+
+    The verifier's only machine-readable output, and the whole of what a
+    consumer may rely on. It is pinned to the candidate it ran over
+    (`candidate_id`); there is no commit identity in it, so anything relaying
+    it downstream binds to the candidate, not to a sha.
+    """
+    return {
+        "candidate_id": result.candidate_id,
+        "evidence_key": result.evidence_key,
+        "reused": result.reused,
+        "result": (
+            "success"
+            if result.outcomes and all(
+                outcome.result == "success" and outcome.exit_status == 0
+                for outcome in result.outcomes
+            )
+            else "failure"
+        ),
+        "reason": result.reason,
+        "lanes": [outcome.lane for outcome in result.outcomes],
+        # Per lane: the full collected count (independent of this run's
+        # shard) next to the count this run actually selected and ran, so a
+        # coverage gap is visible from this one shard's own run log.
+        "lane_totals": dict(result.lane_totals),
+        "lane_selected_counts": {outcome.lane: len(outcome.nodeids) for outcome in result.outcomes},
+    }
+
+
 def _snapshot_modes_ok(snapshot: SnapshotResult) -> tuple[bool, list[str]]:
     """Use candidate_snapshot's shared byte/mode/runtime mismatch policy."""
     # ``data/`` is excluded when the candidate is built because it contains
@@ -1174,27 +1204,7 @@ def _main(argv: Sequence[str]) -> int:
             shutil.rmtree(snapshot.parent, ignore_errors=True)
     else:
         return 2
-    payload = {
-        "candidate_id": result.candidate_id,
-        "evidence_key": result.evidence_key,
-        "reused": result.reused,
-        "result": (
-            "success"
-            if result.outcomes and all(
-                outcome.result == "success" and outcome.exit_status == 0
-                for outcome in result.outcomes
-            )
-            else "failure"
-        ),
-        "reason": result.reason,
-        "lanes": [outcome.lane for outcome in result.outcomes],
-        # Per lane: the full collected count (independent of this run's
-        # shard) next to the count this run actually selected and ran, so a
-        # coverage gap is visible from this one shard's own run log.
-        "lane_totals": dict(result.lane_totals),
-        "lane_selected_counts": {outcome.lane: len(outcome.nodeids) for outcome in result.outcomes},
-    }
-    print(json.dumps(payload, sort_keys=True))
+    print(json.dumps(result_payload(result), sort_keys=True))
     return 0 if all(outcome.result == "success" and outcome.exit_status == 0 for outcome in result.outcomes) else 1
 
 

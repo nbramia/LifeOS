@@ -57,6 +57,7 @@ import sqlite3
 
 from config.settings import settings
 
+from . import doctor_repair
 from .session_store import STATUS_YIELDED, SessionStore, new_session_id
 
 # Caller routing tag for a Hermes-rooted session. Checked by the spend guard
@@ -123,6 +124,14 @@ def resolve_hermes_caller_session_id(
             return session_id
 
     task_id = f"hermes_{session_id.removeprefix('sess_')}"
+    # A doctor conversation is a self-repair run, so its anchor owns a repair
+    # record from creation. Hermes has no shell: every change it makes goes
+    # through a worker it spawns, and that spawn reads this anchor's workflow,
+    # so without the record here the single human gate would never see the
+    # Hermes doctor at all. Every other persona's anchor carries no workflow.
+    workflow_id = None
+    if doctor_repair.is_doctor_session(None, bot):
+        workflow_id = session_store.create_repair()["workflow_id"]
     try:
         session_store.create(
             task_id=task_id,
@@ -133,6 +142,7 @@ def resolve_hermes_caller_session_id(
             expected_output="text",
             origin="hermes",
             bot=bot,
+            workflow_id=workflow_id,
         )
     except sqlite3.IntegrityError:
         # Lost a create race against a concurrent request for the same

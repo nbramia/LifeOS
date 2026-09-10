@@ -389,6 +389,9 @@ def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
         "host": cli.host,
         "branch": cli.branch,
         "prompt_preview": cli.prompt_preview,
+        # A CLI session on another machine has no LifeOS session row and so no
+        # repair, but the field is on every snapshot row regardless.
+        "repair": None,
     }
 
 

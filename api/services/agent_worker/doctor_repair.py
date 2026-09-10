@@ -42,10 +42,25 @@ _RESULT_LINE = re.compile(rf"^\s*{re.escape(RESULT_MARKER)}\s*(\{{.*\}})\s*$", r
 # record has yet to be opened can adopt a revision without its transcript.
 _INSTRUCTION_LEAD_IN = "Reply to this message with"
 
-# LifeOS-owned dispatches that the single human gate covers. Anything else —
-# investigating, diagnosing, proposing a goal — is read-only orchestration and
-# stays available before approval.
-GATED_ACTIONS = frozenset({"implement", "merge", "deploy", "restart"})
+# The persona whose sessions are self-repair runs. A session carrying it —
+# as `persona_id` or as the `bot` its notices route through — owns a repair
+# record from the moment it is created; every other session, including an
+# ordinary `#agent` task that happens to emit a `[GOAL]`, owns none and is
+# never gated here.
+DOCTOR_PERSONA_ID = "doctor"
+
+# LifeOS-owned dispatches that the single human gate covers. Spawning a worker
+# to implement the goal is the one such dispatch LifeOS makes on a repair's
+# behalf: merging, deploying, and restarting are shell work the supervisor
+# does inside its own session, which this gate deliberately does not sandbox.
+# Anything else — investigating, diagnosing, proposing a goal — is read-only
+# orchestration and stays available before approval.
+GATED_ACTIONS = frozenset({"implement"})
+
+
+def is_doctor_session(persona_id: str | None, bot: str | None) -> bool:
+    """Whether a session belongs to the doctor, and so to a repair run."""
+    return DOCTOR_PERSONA_ID in {persona_id, bot}
 
 
 @dataclass(frozen=True)
@@ -112,10 +127,10 @@ def dispatch_allowed(repair: Mapping[str, Any] | None, action: str) -> GateDecis
     """Whether `action` may be dispatched for `repair` right now.
 
     A session with no repair is an ordinary worker task and is never gated
-    here. Read-only investigation is allowed in every phase. An implementation,
-    merge, deploy, or restart dispatch requires an approved goal revision and a
-    live repair. This is an orchestration gate over LifeOS's own dispatch
-    boundaries, not a sandbox over what a CLI process can do once running.
+    here. Read-only investigation is allowed in every phase. An implementation
+    dispatch requires an approved goal revision and a live repair. This is an
+    orchestration gate over LifeOS's own dispatch boundaries, not a sandbox
+    over what a CLI process can do once running.
     """
     if repair is None:
         return GateDecision(True)
@@ -158,10 +173,10 @@ def evaluate_shipped(
     """Whether `evidence` proves the approved goal revision reached production.
 
     Every clause names a way a repair can look finished without being finished:
-    a result for a different goal revision, a verification run against a commit
-    other than the one that merged, a review that never passed, a deployment
-    whose running process is still on the old revision, a failed restart or
-    health check, or prose with no structured result behind it at all.
+    a result for a different goal revision, a verification that never ran, a
+    review that never passed, a deployment whose running process is still on
+    the old revision, a failed restart or health check, or prose with no
+    structured result behind it at all.
     """
     missing: list[str] = []
 
@@ -185,17 +200,23 @@ def evaluate_shipped(
     if not isinstance(merged_commit, str) or not merged_commit:
         missing.append("merge_missing")
 
-    # The verifier's own lane result, pinned to the commit that merged. An
-    # agent-authored review comment produces no such record, and a run against
-    # an earlier candidate leaves the shas disagreeing.
+    # The candidate verifier's own lane result, relayed verbatim. It is pinned
+    # to the candidate it ran over — its `candidate_id` — not to a commit: the
+    # verifier emits no commit identity, so requiring one here could only ever
+    # be satisfied by a sha the reporting agent typed itself. What binds the
+    # repair to the merged commit is the deployment evidence below, whose
+    # revisions come from the running processes rather than from prose. A
+    # bundle with no `candidate_id` is not a verifier result at all — an
+    # agent-authored review comment produces no such record.
     verification = evidence.get("verification")
     if not isinstance(verification, Mapping):
         missing.append("verification_missing")
     else:
+        candidate_id = verification.get("candidate_id")
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            missing.append("verification_not_candidate_pinned")
         if verification.get("result") != "success":
             missing.append("verification_failed")
-        if merged_commit and not _shas_match(verification.get("source_sha"), merged_commit):
-            missing.append("verification_stale_commit")
 
     # RuntimeEvidence from the deployment verifier. `expected_revision` is the
     # checkout HEAD; the observed identities are the revisions the processes

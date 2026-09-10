@@ -3542,32 +3542,45 @@ class SessionStore:
         The conditional UPDATE is the whole idempotency guarantee: a duplicate
         reply, or a reply targeting a superseded revision, matches no row and
         returns None, so no resume action is enqueued and no child session is
-        spawned. On success the repair records the approved revision and moves
-        to `implementing`.
+        spawned. A reply that lands after the repair reached a terminal phase
+        returns None too, with the revision left `proposed`: the approval is
+        refused outright rather than burned onto a repair that records no
+        approval. On success the repair records the approved revision, clears
+        the evidence collected for the previous one — evidence proves the
+        revision it was gathered for and nothing else — and moves to
+        `implementing`.
         """
         now = _now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                cur = conn.execute(
-                    "UPDATE goal_proposals SET status = ?, updated_at = ? "
-                    "WHERE proposal_id = ? AND status = ?",
-                    (PROPOSAL_APPROVED, now, proposal_id, PROPOSAL_PROPOSED),
-                )
-                if cur.rowcount != 1:
+                proposal_row = conn.execute(
+                    "SELECT workflow_id, version, status FROM goal_proposals "
+                    "WHERE proposal_id = ?",
+                    (proposal_id,),
+                ).fetchone()
+                if proposal_row is None or proposal_row["status"] != PROPOSAL_PROPOSED:
                     conn.rollback()
                     return None
-                row = conn.execute(
-                    "SELECT * FROM goal_proposals WHERE proposal_id = ?", (proposal_id,),
+                repair = conn.execute(
+                    "SELECT phase FROM doctor_repairs WHERE workflow_id = ?",
+                    (proposal_row["workflow_id"],),
                 ).fetchone()
+                if repair is None or repair["phase"] in REPAIR_TERMINAL_PHASES:
+                    conn.rollback()
+                    return None
+                conn.execute(
+                    "UPDATE goal_proposals SET status = ?, updated_at = ? "
+                    "WHERE proposal_id = ?",
+                    (PROPOSAL_APPROVED, now, proposal_id),
+                )
                 conn.execute(
                     "UPDATE doctor_repairs SET phase = ?, waiting_reason = NULL, "
-                    "approved_proposal_id = ?, approved_version = ?, updated_at = ? "
-                    "WHERE workflow_id = ? AND phase NOT IN "
-                    f"({','.join('?' * len(REPAIR_TERMINAL_PHASES))})",
+                    "approved_proposal_id = ?, approved_version = ?, "
+                    "evidence = '{}', updated_at = ? WHERE workflow_id = ?",
                     (
-                        REPAIR_IMPLEMENTING, proposal_id, row["version"], now,
-                        row["workflow_id"], *sorted(REPAIR_TERMINAL_PHASES),
+                        REPAIR_IMPLEMENTING, proposal_id, proposal_row["version"],
+                        now, proposal_row["workflow_id"],
                     ),
                 )
                 conn.commit()
@@ -3581,45 +3594,90 @@ class SessionStore:
 
         Applied the moment the refinement reply lands, so a later stale reply
         to the same revision cannot approve it. The next version is created
-        when the doctor emits its reworked goal.
+        when the doctor emits its reworked goal. A reply that lands after the
+        repair reached a terminal phase returns None and changes nothing.
         """
         now = _now()
         with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE goal_proposals SET status = ?, updated_at = ? "
-                "WHERE proposal_id = ? AND status = ?",
-                (PROPOSAL_SUPERSEDED, now, proposal_id, PROPOSAL_PROPOSED),
-            )
-            if cur.rowcount != 1:
-                return None
-            conn.execute(
-                "UPDATE doctor_repairs SET phase = ?, waiting_reason = ?, updated_at = ? "
-                "WHERE workflow_id = (SELECT workflow_id FROM goal_proposals "
-                "WHERE proposal_id = ?) AND phase = ?",
-                (
-                    REPAIR_DIAGNOSIS, "goal_refinement", now, proposal_id,
-                    REPAIR_AWAITING_APPROVAL,
-                ),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                proposal_row = conn.execute(
+                    "SELECT workflow_id, status FROM goal_proposals "
+                    "WHERE proposal_id = ?",
+                    (proposal_id,),
+                ).fetchone()
+                if proposal_row is None or proposal_row["status"] != PROPOSAL_PROPOSED:
+                    conn.rollback()
+                    return None
+                repair = conn.execute(
+                    "SELECT phase FROM doctor_repairs WHERE workflow_id = ?",
+                    (proposal_row["workflow_id"],),
+                ).fetchone()
+                if repair is None or repair["phase"] in REPAIR_TERMINAL_PHASES:
+                    conn.rollback()
+                    return None
+                conn.execute(
+                    "UPDATE goal_proposals SET status = ?, updated_at = ? "
+                    "WHERE proposal_id = ?",
+                    (PROPOSAL_SUPERSEDED, now, proposal_id),
+                )
+                conn.execute(
+                    "UPDATE doctor_repairs SET phase = ?, waiting_reason = ?, "
+                    "updated_at = ? WHERE workflow_id = ? AND phase = ?",
+                    (
+                        REPAIR_DIAGNOSIS, "goal_refinement", now,
+                        proposal_row["workflow_id"], REPAIR_AWAITING_APPROVAL,
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         return self.get_proposal(proposal_id)
 
     def decline_goal(self, proposal_id: str) -> dict | None:
-        """Decline a proposed revision. A declined goal launches nothing."""
+        """Decline a proposed revision. A declined goal launches nothing.
+
+        The repair goes terminal, so the gate refuses every dispatch for it
+        from here on. A decline that lands after the repair already reached a
+        terminal phase returns None and changes nothing.
+        """
         now = _now()
         with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE goal_proposals SET status = ?, updated_at = ? "
-                "WHERE proposal_id = ? AND status = ?",
-                (PROPOSAL_DECLINED, now, proposal_id, PROPOSAL_PROPOSED),
-            )
-            if cur.rowcount != 1:
-                return None
-            conn.execute(
-                "UPDATE doctor_repairs SET phase = ?, waiting_reason = ?, updated_at = ? "
-                "WHERE workflow_id = (SELECT workflow_id FROM goal_proposals "
-                "WHERE proposal_id = ?)",
-                (REPAIR_DECLINED, "goal_declined", now, proposal_id),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                proposal_row = conn.execute(
+                    "SELECT workflow_id, status FROM goal_proposals "
+                    "WHERE proposal_id = ?",
+                    (proposal_id,),
+                ).fetchone()
+                if proposal_row is None or proposal_row["status"] != PROPOSAL_PROPOSED:
+                    conn.rollback()
+                    return None
+                repair = conn.execute(
+                    "SELECT phase FROM doctor_repairs WHERE workflow_id = ?",
+                    (proposal_row["workflow_id"],),
+                ).fetchone()
+                if repair is None or repair["phase"] in REPAIR_TERMINAL_PHASES:
+                    conn.rollback()
+                    return None
+                conn.execute(
+                    "UPDATE goal_proposals SET status = ?, updated_at = ? "
+                    "WHERE proposal_id = ?",
+                    (PROPOSAL_DECLINED, now, proposal_id),
+                )
+                conn.execute(
+                    "UPDATE doctor_repairs SET phase = ?, waiting_reason = ?, "
+                    "updated_at = ? WHERE workflow_id = ?",
+                    (
+                        REPAIR_DECLINED, "goal_declined", now,
+                        proposal_row["workflow_id"],
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         return self.get_proposal(proposal_id)
 
     def set_repair_phase(
@@ -3653,19 +3711,6 @@ class SessionStore:
         with self._connect() as conn:
             cur = conn.execute(
                 f"UPDATE doctor_repairs SET {', '.join(sets)} {where}", params,
-            )
-        return cur.rowcount == 1
-
-    def set_repair_scope(self, workflow_id: str, target_scope: dict | None) -> bool:
-        """Record the repository/outcome scope an approval covers."""
-        with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE doctor_repairs SET target_scope = ?, updated_at = ? "
-                "WHERE workflow_id = ?",
-                (
-                    json.dumps(target_scope) if target_scope else None,
-                    _now(), workflow_id,
-                ),
             )
         return cur.rowcount == 1
 

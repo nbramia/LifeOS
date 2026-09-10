@@ -55,12 +55,18 @@ def shipped_evidence(goal_version=1, **overrides):
         "goal_version": goal_version,
         "pull_requests": [4321],
         "review": {"outcome": "approved", "rounds": 1},
+        # Shaped exactly like the candidate verifier's printed payload — see
+        # TestVerificationEvidenceContract, which builds this half from the
+        # verifier itself rather than by hand.
         "verification": {
             "candidate_id": "cand-synthetic",
             "evidence_key": "key-synthetic",
-            "lanes": ["fast-unit", "browser-free"],
+            "reused": False,
             "result": "success",
-            "source_sha": MERGED_SHA,
+            "reason": "executed",
+            "lanes": ["fast-unit", "browser-free"],
+            "lane_totals": {"fast-unit": 2, "browser-free": 1},
+            "lane_selected_counts": {"fast-unit": 2, "browser-free": 1},
         },
         "merge": {"pr": 4321, "merged_commit": MERGED_SHA},
         "deployment": {
@@ -153,6 +159,21 @@ class TestProposalVersioning:
         ) is None
         assert store.get_repair(workflow_id)["phase"] == REPAIR_CANCELLED
 
+    def test_a_cancelled_repair_accepts_no_reply_to_its_open_revision(self, store):
+        """A reply landing after the repair was cancelled is refused outright:
+        the revision stays `proposed` rather than being burned onto a repair
+        that records no approval."""
+        workflow_id, proposal = _propose(store)
+        store.cancel_repair(workflow_id)
+
+        assert store.approve_goal(proposal["proposal_id"]) is None
+        assert store.supersede_goal(proposal["proposal_id"]) is None
+        assert store.decline_goal(proposal["proposal_id"]) is None
+        assert store.get_proposal(proposal["proposal_id"])["status"] == PROPOSAL_PROPOSED
+        repair = store.get_repair(workflow_id)
+        assert repair["phase"] == REPAIR_CANCELLED
+        assert repair["approved_proposal_id"] is None
+
     def test_question_resolves_to_exactly_one_revision(self, store):
         workflow_id, first = _propose(store, question_id=11)
         _, second = _propose(store, workflow_id, condition=REFINED_GOAL, question_id=12)
@@ -172,12 +193,17 @@ class TestPreApprovalDispatchGate:
         assert decision.allowed is False
         assert decision.reason == "repair_awaiting_approval"
 
-    @pytest.mark.parametrize("action", ["implement", "merge", "deploy", "restart"])
-    def test_every_gated_action_is_refused_before_approval(self, store, action):
+    def test_the_gate_covers_the_dispatches_lifeos_actually_makes(self, store):
+        """Spawning a worker to implement the goal is the one dispatch LifeOS
+        makes on a repair's behalf, so it is the one the gate covers. Merging,
+        deploying, and restarting happen inside the supervisor's own session,
+        which this gate does not sandbox."""
+        assert doctor_repair.GATED_ACTIONS == {"implement"}
         workflow_id, _ = _propose(store)
-        assert doctor_repair.dispatch_allowed(
-            store.get_repair(workflow_id), action,
-        ).allowed is False
+        repair = store.get_repair(workflow_id)
+        assert doctor_repair.dispatch_allowed(repair, "implement").allowed is False
+        for ungoverned in ("merge", "deploy", "restart"):
+            assert doctor_repair.dispatch_allowed(repair, ungoverned).allowed is True
 
     @pytest.mark.parametrize("action", ["investigate", "diagnose", "propose"])
     def test_read_only_investigation_stays_available(self, store, action):
@@ -200,7 +226,9 @@ class TestPreApprovalDispatchGate:
         workflow_id, proposal = _propose(store)
         store.approve_goal(proposal["proposal_id"])
         store.cancel_repair(workflow_id)
-        decision = doctor_repair.dispatch_allowed(store.get_repair(workflow_id), "merge")
+        decision = doctor_repair.dispatch_allowed(
+            store.get_repair(workflow_id), "implement",
+        )
         assert decision.allowed is False
         assert decision.reason == "repair_cancelled"
 
@@ -221,12 +249,15 @@ class TestShippedEvidence:
         assert decision.shipped is False
         assert "no_pull_requests" in decision.missing
 
-    def test_stale_commit_verification_does_not_ship(self):
+    def test_hand_written_verification_does_not_ship(self):
+        """Verification is the verifier's own payload, identified by the
+        candidate it ran over. A bundle an agent composed from prose carries no
+        `candidate_id` and proves nothing."""
         evidence = shipped_evidence()
-        evidence["verification"] = {**evidence["verification"], "source_sha": STALE_SHA}
+        evidence["verification"] = {"result": "success", "summary": "tests green"}
         decision = doctor_repair.evaluate_shipped(evidence, approved_version=1)
         assert decision.shipped is False
-        assert "verification_stale_commit" in decision.missing
+        assert "verification_not_candidate_pinned" in decision.missing
 
     def test_failed_verification_does_not_ship(self):
         evidence = shipped_evidence()
@@ -348,6 +379,126 @@ class TestDeploymentEvidenceContract:
         assert "running_revision_stale" in decision.missing
 
 
+class TestVerificationEvidenceContract:
+    """The verification half of the bundle is the candidate verifier's own
+    printed payload, so it is built here with that verifier rather than by
+    hand. What `evaluate_shipped` requires and what the verifier emits are one
+    contract; a requirement no producer can satisfy makes `shipped`
+    unreachable."""
+
+    @staticmethod
+    def _payload(lane_result="success", exit_status=0):
+        import sys
+
+        sys.path.insert(0, "scripts")
+        try:
+            from verification_evidence import LaneOutcome
+            from verify_candidate import VerificationResult, result_payload
+        finally:
+            sys.path.pop(0)
+
+        return result_payload(VerificationResult(
+            candidate_id="cand-synthetic",
+            evidence_key="key-synthetic",
+            reused=False,
+            reason="executed",
+            outcomes=(
+                LaneOutcome(
+                    lane="fast-unit",
+                    nodeids=("tests/test_synthetic.py::test_one",),
+                    exit_status=exit_status,
+                    result=lane_result,
+                ),
+            ),
+            lane_totals={"fast-unit": 1},
+        ))
+
+    def test_verifier_output_satisfies_the_shipped_requirements(self):
+        evidence = shipped_evidence(verification=self._payload())
+        assert doctor_repair.evaluate_shipped(evidence, approved_version=1).shipped is True
+
+    def test_a_failed_verifier_run_does_not_ship(self):
+        evidence = shipped_evidence(
+            verification=self._payload(lane_result="failure", exit_status=1),
+        )
+        decision = doctor_repair.evaluate_shipped(evidence, approved_version=1)
+        assert decision.shipped is False
+        assert "verification_failed" in decision.missing
+
+    def test_the_verifier_emits_no_commit_identity(self):
+        """`shipped` cannot require a field the producer never prints — that
+        is what makes the deployment evidence, whose revisions come from the
+        running processes, the thing that binds a repair to its merged
+        commit."""
+        assert "source_sha" not in self._payload()
+        assert "git_head" not in self._payload()
+
+
+class TestEvidenceAccumulation:
+    def _approved(self, store):
+        workflow_id = store.create_repair()["workflow_id"]
+        proposal = store.propose_goal(
+            workflow_id, condition=GOAL,
+            resume_action=doctor_repair.goal_resume_action(GOAL),
+        )
+        store.approve_goal(proposal["proposal_id"])
+        return workflow_id
+
+    def test_partial_results_assemble_into_a_ship(self, store):
+        """Two turns each reporting part of the bundle reach `shipped`
+        together, and neither reaches it alone."""
+        workflow_id = self._approved(store)
+        full = shipped_evidence()
+        first = {
+            "goal_version": 1,
+            "pull_requests": full["pull_requests"],
+            "review": full["review"],
+            "verification": full["verification"],
+        }
+        second = {
+            "goal_version": 1,
+            "merge": full["merge"],
+            "deployment": full["deployment"],
+            "revert_handle": full["revert_handle"],
+        }
+
+        one = doctor_repair.apply_result(store.get_repair(workflow_id), first)
+        assert one.phase != REPAIR_SHIPPED
+        store.set_repair_phase(
+            workflow_id, one.phase, waiting_reason=one.waiting_reason,
+            evidence=one.evidence,
+        )
+
+        two = doctor_repair.apply_result(store.get_repair(workflow_id), second)
+        assert two.phase == REPAIR_SHIPPED
+        assert two.evidence["pull_requests"] == full["pull_requests"]
+
+    def test_evidence_from_a_prior_revision_cannot_satisfy_the_next(self, store):
+        """Approving a new revision clears the bundle, so a bare versioned
+        result for the expanded goal ships nothing on the old revision's
+        evidence."""
+        workflow_id = self._approved(store)
+        first = doctor_repair.apply_result(
+            store.get_repair(workflow_id), shipped_evidence(),
+        )
+        store.set_repair_phase(workflow_id, first.phase, evidence=first.evidence)
+        assert store.get_repair(workflow_id)["phase"] == REPAIR_SHIPPED
+
+        second = store.propose_goal(
+            workflow_id, condition=REFINED_GOAL,
+            resume_action=doctor_repair.goal_resume_action(REFINED_GOAL),
+        )
+        store.approve_goal(second["proposal_id"])
+        assert store.get_repair(workflow_id)["evidence"] == {}
+
+        bare = doctor_repair.apply_result(
+            store.get_repair(workflow_id), {"goal_version": 2},
+        )
+        assert bare.applied is True
+        assert bare.phase != REPAIR_SHIPPED
+        assert bare.waiting_reason == "no_pull_requests"
+
+
 class TestApplyResult:
     def _approved_repair(self, store, version=1):
         workflow_id = store.create_repair()["workflow_id"]
@@ -453,7 +604,6 @@ class TestRoutinePhaseChanges:
             resume_action=doctor_repair.goal_resume_action(GOAL),
         )
         store.approve_goal(first["proposal_id"])
-        store.set_repair_scope(workflow_id, {"repository": "LifeOS"})
 
         # A materially larger outcome is a new revision, and until it is
         # approved the repair is back at the gate.
@@ -464,12 +614,12 @@ class TestRoutinePhaseChanges:
         assert second["version"] == 2
         repair = store.get_repair(workflow_id)
         assert repair["phase"] == REPAIR_AWAITING_APPROVAL
-        assert doctor_repair.dispatch_allowed(repair, "merge").allowed is False
+        assert doctor_repair.dispatch_allowed(repair, "implement").allowed is False
 
         store.approve_goal(second["proposal_id"])
         repair = store.get_repair(workflow_id)
         assert repair["approved_version"] == 2
-        assert doctor_repair.dispatch_allowed(repair, "merge").allowed is True
+        assert doctor_repair.dispatch_allowed(repair, "implement").allowed is True
 
 
 class TestEventIdempotency:

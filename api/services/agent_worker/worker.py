@@ -194,6 +194,14 @@ _GOAL_REFINE_SIGNALS = (
     "add ", "remove", "stricter", "actually", "with change", "no,", "don't",
     "rather", "tweak", "adjust",
 )
+# Replies that decline a proposed goal outright rather than asking for a
+# different one. Matched against the whole reply, so "no, make it stricter"
+# stays a refinement — only a reply that is nothing but a decline declines.
+_GOAL_DECLINE = {
+    "no", "nope", "no thanks", "leave it", "leave it for now", "decline",
+    "declined", "drop it", "forget it", "never mind", "nevermind", "not now",
+    "skip it", "cancel", "cancel it", "abandon",
+}
 
 
 # Filename of the self-restart marker the detached worker-restart primitive
@@ -298,6 +306,15 @@ def _is_affirmative(text: str) -> bool:
         return False
     t = t.rstrip("!. ")
     return t in _GOAL_AFFIRMATIVE or t.startswith("yes") or t.startswith("approve")
+
+
+def _is_declining(text: str) -> bool:
+    """True when a goal-approval reply declines the goal outright.
+
+    A declined goal launches nothing, so the bar is an unambiguous reply:
+    anything carrying further instructions is a refinement instead.
+    """
+    return text.strip().lower().rstrip("!. ") in _GOAL_DECLINE
 
 
 def _slugify(text: str) -> str:
@@ -1828,10 +1845,16 @@ class Worker:
                 )
 
     def _ensure_repair(self, session: Session) -> str | None:
-        """The repair workflow a session belongs to, opening one when the
-        session is a root that has none. A child inherits its root's workflow,
-        so a resumed supervisor joins the existing repair instead of starting
-        a second one."""
+        """The repair workflow a session belongs to, or None.
+
+        A doctor session carries its workflow from creation, and a child
+        inherits its root's, so this normally just reads the id off the row or
+        its lineage root — a resumed supervisor joins the existing repair
+        instead of starting a second one. A repair is opened here only for a
+        doctor session that predates its record; a session belonging to any
+        other persona never has one opened for it, whatever protocol tags it
+        emits.
+        """
         if session.workflow_id:
             return session.workflow_id
         root = session
@@ -1840,6 +1863,8 @@ class Worker:
             root = self.session_store.get_by_session_id(root_id) or session
         workflow_id = root.workflow_id
         if not workflow_id:
+            if not doctor_repair.is_doctor_session(root.persona_id, root.bot):
+                return None
             workflow_id = self.session_store.create_repair()["workflow_id"]
             self.session_store.link_session_to_repair(root.task_id, workflow_id)
             self.transcript_store.append(root.session_id, "doctor_repair_opened", {
@@ -1852,7 +1877,12 @@ class Worker:
     def _record_goal_proposal(
         self, session: Session, condition: str, question_id: int,
     ) -> None:
-        """Record the goal revision a freshly-sent approval prompt gates."""
+        """Record the goal revision a freshly-sent approval prompt gates.
+
+        Only a session that belongs to a repair records one. `[GOAL]` is a
+        generic protocol tag, so an ordinary task can emit it too — that task
+        gets an ordinary approval prompt and no repair record.
+        """
         if not condition or not question_id:
             return
         workflow_id = self._ensure_repair(session)
@@ -1901,16 +1931,51 @@ class Worker:
                 condition = (event.get("payload") or {}).get("condition")
         return condition
 
+    def _goal_reply_not_applied(self, q: dict, session: Session, proposal: dict) -> None:
+        """Retire a goal reply that its revision could not accept.
+
+        Reached when the revision has left `proposed` state — a duplicate or
+        stale reply — or when the repair itself is terminal, which is the case
+        the operator cannot see from the message they replied to. The
+        reply enqueues nothing and spawns nothing; the question is retired so
+        the tick does not re-read the same answer forever, and the operator is
+        told, because this message was the only gate they had.
+        """
+        current = self.session_store.get_proposal(proposal["proposal_id"]) or {}
+        repair = self.session_store.get_repair(proposal["workflow_id"]) or {}
+        self.transcript_store.append(
+            session.session_id, "doctor_goal_reply_ignored", {
+                "proposal_id": proposal["proposal_id"],
+                "version": proposal["version"],
+                "status": current.get("status"),
+                "phase": repair.get("phase"),
+            },
+        )
+        self.session_store.mark_question_processed(q["id"])
+        notice = (
+            f"That goal (revision {proposal['version']}) is no longer awaiting "
+            f"your answer — the repair is {repair.get('phase') or 'closed'}. "
+            f"Nothing was started."
+        )
+        try:
+            if session.bot:
+                self._telegram_send(notice, bot=session.bot)
+            else:
+                self._telegram_send(notice)
+        except Exception:  # noqa: BLE001 — a send failure must not strand the row
+            logger.warning("goal reply notice send failed", exc_info=True)
+
     def _resume_goal(self, q: dict, session: Session, answer: str) -> None:
         """Operator replied to a proposed [GOAL].
 
         The reply resolves to the exact proposal revision its question gates.
         Approval replays that revision's stored resume action and starts
-        autonomous execution; a refinement retires the revision so a later
-        stale reply cannot lock it, and passes the raw answer back so the
-        doctor re-proposes. A reply whose revision is not in `proposed` state —
-        a duplicate approval, or one aimed at a superseded revision — enqueues
-        nothing and spawns nothing.
+        autonomous execution; a decline retires the repair and launches
+        nothing; a refinement retires the revision so a later stale reply
+        cannot lock it, and passes the raw answer back so the doctor
+        re-proposes. A reply its revision cannot accept — a duplicate
+        approval, one aimed at a superseded revision, or one arriving after
+        the repair went terminal — enqueues nothing and spawns nothing.
         """
         sid = session.session_id
         task_id = session.task_id
@@ -1925,7 +1990,8 @@ class Worker:
             self.session_store.mark_question_processed(q["id"])
             return
         proposal = self._adopt_goal_proposal(q, session)
-        affirmative = _is_affirmative(answer)
+        declining = _is_declining(answer)
+        affirmative = not declining and _is_affirmative(answer)
         if proposal is None:
             if affirmative:
                 resume_msg = (
@@ -1943,13 +2009,7 @@ class Worker:
         elif affirmative:
             approved = self.session_store.approve_goal(proposal["proposal_id"])
             if approved is None:
-                current = self.session_store.get_proposal(proposal["proposal_id"]) or {}
-                self.transcript_store.append(sid, "doctor_goal_reply_ignored", {
-                    "proposal_id": proposal["proposal_id"],
-                    "version": proposal["version"],
-                    "status": current.get("status"),
-                })
-                self.session_store.mark_question_processed(q["id"])
+                self._goal_reply_not_applied(q, session, proposal)
                 return
             resume_msg = doctor_repair.resume_message(approved.get("resume_action"))
             if not resume_msg:
@@ -1967,16 +2027,23 @@ class Worker:
                     "version": approved["version"],
                     "condition_chars": len(approved["condition"]),
                 })
+        elif declining:
+            declined = self.session_store.decline_goal(proposal["proposal_id"])
+            if declined is None:
+                self._goal_reply_not_applied(q, session, proposal)
+                return
+            # The repair is terminal from here: nothing more is dispatched for
+            # it. The answer still goes back so the doctor can file the work
+            # as an issue for later and stop.
+            resume_msg = answer
+            self.transcript_store.append(sid, "doctor_goal_declined", {
+                "proposal_id": proposal["proposal_id"],
+                "version": proposal["version"],
+            })
         else:
             superseded = self.session_store.supersede_goal(proposal["proposal_id"])
             if superseded is None:
-                current = self.session_store.get_proposal(proposal["proposal_id"]) or {}
-                self.transcript_store.append(sid, "doctor_goal_reply_ignored", {
-                    "proposal_id": proposal["proposal_id"],
-                    "version": proposal["version"],
-                    "status": current.get("status"),
-                })
-                self.session_store.mark_question_processed(q["id"])
+                self._goal_reply_not_applied(q, session, proposal)
                 return
             resume_msg = answer  # refinement — doctor re-proposes
             self.transcript_store.append(sid, "claude_code_goal_refine", {
@@ -2016,9 +2083,11 @@ class Worker:
     def _apply_repair_result(self, session: Session, final_text: str | None) -> None:
         """Fold a session's structured repair result into its repair record.
 
-        The event identity is the session's exact executor turn, so a
-        redelivered completion claims nothing a second time and wakes at most
-        one continuation. A repair that has already reached a terminal phase —
+        Called from every route's terminal path, on the turn that ends the
+        session — the turn the personas ask for the result line on. The event
+        identity is the session's exact executor turn, so a redelivered
+        completion claims nothing a second time and wakes at most one
+        continuation. A repair that has already reached a terminal phase —
         cancelled included — is never revived by a late result.
         """
         workflow_id = session.workflow_id
@@ -3335,9 +3404,11 @@ class Worker:
                     turn_id=session.turn_id,
                 )
                 if kind == "goal_approval":
-                    # The durable goal revision this prompt gates. Whichever
-                    # surface the operator answers on resolves its reply to
-                    # this revision, so both converge on one transition.
+                    # For a repair session, the durable goal revision this
+                    # prompt gates: whichever surface the operator answers on
+                    # resolves its reply to this revision, so both converge on
+                    # one transition. For any other session this records
+                    # nothing and the prompt stays an ordinary approval.
                     self._record_goal_proposal(
                         session, (outcome.final_text or "").strip(), question_id,
                     )
@@ -3417,6 +3488,7 @@ class Worker:
             self.transcript_store.append(sid, "code_handled_completion", {
                 "final_chars": len(body),
             })
+            self._apply_repair_result(session, outcome.final_text)
             self._reconcile_vault_terminal(session, STATUS_COMPLETED)
             # A reply that arrived MID-RUN (status-anchor route, #458) is
             # queued in pending_messages with nothing to deliver it — the
@@ -3747,6 +3819,7 @@ class Worker:
             self.transcript_store.append(sid, "codex_handled_completion", {
                 "final_chars": len(body),
             })
+            self._apply_repair_result(session, outcome.final_text)
             self._reconcile_vault_terminal(session, STATUS_COMPLETED)
             return
 
