@@ -42,6 +42,14 @@ from api.services.agent_worker.worker import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _redirect_agent_output(tmp_path, monkeypatch):
+    """Write completed-task output to a throwaway vault for these tests."""
+    from config.settings import settings as _settings
+
+    monkeypatch.setattr(_settings, "vault_path", tmp_path / "vault", raising=False)
+
+
 class FakeApi:
     def __init__(self, tasks):
         self.tasks = {t["id"]: t for t in tasks}
