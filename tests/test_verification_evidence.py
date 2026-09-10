@@ -237,7 +237,7 @@ def test_reuse_never_invokes_the_lane_executor_a_second_time(tmp_path):
 
 @pytest.mark.unit
 def test_local_cli_commit_and_pushed_ref_cli_reuse_matching_real_hook_semantics(tmp_path):
-    """#978 end-to-end: the real ``local`` CLI (as ``test.sh`` invokes it,
+    """The real ``local`` CLI (as ``test.sh`` invokes it,
     inferring its base from the upstream tip) captures a dirty tree; once
     committed, the real ``pushed-ref`` CLI (as pre-push invokes it, with the
     base pre-push actually computes for an existing-branch push -- the
@@ -341,7 +341,7 @@ def test_one_bad_outcome_in_a_success_attempt_blocks_reuse_of_every_lane(tmp_pat
 
 @pytest.mark.unit
 def test_local_capture_on_base_a_does_not_authorize_pushed_ref_once_base_moves_to_b(tmp_path):
-    """#978 regression: identical tested content captured against base A must
+    """Identical tested content captured against base A must
     never authorize a pushed-ref check once the real target has moved to
     base B -- missing/changed provenance fails closed rather than silently
     following the move."""
@@ -365,7 +365,7 @@ def test_local_capture_on_base_a_does_not_authorize_pushed_ref_once_base_moves_t
 
 @pytest.mark.unit
 def test_full_lane_success_serves_a_requested_lane_subset_without_re_execution(tmp_path):
-    """#978: a success covering every lane can serve a later request for a
+    """A success covering every lane can serve a later request for a
     strict subset of those lanes without re-running anything -- but the
     subset is only ever whole lanes, never opportunistically promoted from
     the wrong lane."""
@@ -399,7 +399,7 @@ def test_full_lane_success_serves_a_requested_lane_subset_without_re_execution(t
 
 @pytest.mark.unit
 def test_explicit_partial_nodeid_selection_is_not_served_by_a_broader_recorded_success(tmp_path):
-    """#978: exact node-ID inventory per requested lane must be preserved --
+    """Exact node-ID inventory per requested lane must be preserved --
     a narrower explicit --nodeids selection is never opportunistically
     satisfied by a broader lane success that happens to include those IDs."""
     root = _source_repo(tmp_path)
@@ -435,7 +435,7 @@ def test_explicit_partial_nodeid_selection_is_not_served_by_a_broader_recorded_s
 
 @pytest.mark.unit
 def test_local_cli_infers_upstream_base_and_pushed_ref_reuses_it(tmp_path):
-    """#978: the ``local`` CLI defaults to a real inferred base (this
+    """The ``local`` CLI defaults to a real inferred base (this
     checkout's upstream tip) rather than leaving it unattributed, so a
     pushed-ref check naming that same tip can actually reuse the capture --
     and an explicit ``--base`` still overrides the inferred one."""
@@ -473,7 +473,7 @@ def test_local_cli_infers_upstream_base_and_pushed_ref_reuses_it(tmp_path):
 
 @pytest.mark.unit
 def test_local_cli_infers_merge_base_on_a_fresh_branch_first_push(tmp_path):
-    """#978: the common pre-commit -> first-push path is a brand-new feature
+    """The common pre-commit -> first-push path is a feature
     branch with no upstream tracking yet. ``local`` must fall back to the
     resolved merge-base with origin/main (matching scripts/pre-push's own
     new-branch ``MERGE_BASE`` provenance, lines 71-83) rather than leaving
