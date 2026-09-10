@@ -2963,17 +2963,29 @@ class SessionStore:
         takes. There's no Telegram message to match, so `sent_message_id` is a
         sentinel 0 (web follow-ups are created already-answered, so they never
         participate in reply-id matching via `deposit_answer`).
+
+        The row carries the session's current execution identity, the same
+        way a Telegram question does: the worker only resumes an answer whose
+        attempt and turn still match the session it names.
         """
         now = _now()
         with self._connect() as conn:
+            row = conn.execute(
+                "SELECT task_id, attempt_id, turn_id FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is not None and row["task_id"] != task_id:
+                return 0
+            attempt_id = row["attempt_id"] if row is not None else None
+            turn_id = row["turn_id"] if row is not None else None
             cur = conn.execute(
                 """
                 INSERT INTO pending_questions (
                     session_id, task_id, question, sent_message_id, sent_at,
-                    kind, answer, answered_at
-                ) VALUES (?, ?, '', 0, ?, 'followup', ?, ?)
+                    kind, answer, answered_at, attempt_id, turn_id
+                ) VALUES (?, ?, '', 0, ?, 'followup', ?, ?, ?, ?)
                 """,
-                (session_id, task_id, now, answer, now),
+                (session_id, task_id, now, answer, now, attempt_id, turn_id),
             )
         return cur.lastrowid
 

@@ -637,7 +637,14 @@ class Worker:
         session = self.session_store.get(task_id)
         if session is None or session.origin == "operator" or session.parent_session_id:
             return False
-        task = self._fetch_task(task_id)
+        try:
+            task = self._fetch_task(task_id)
+        except Exception as exc:
+            # The status itself is already persisted; a task surface that
+            # cannot be read leaves the projection undone rather than
+            # aborting the caller that just recorded the transition.
+            logger.warning("status projection task fetch %s failed: %s", task_id, exc)
+            return False
         if task is None:
             return False
         event = LifecycleEvent(
