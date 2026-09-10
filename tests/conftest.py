@@ -18,6 +18,7 @@ Run categories:
 """
 import gc
 import os
+import shutil
 import time
 
 import pytest
@@ -48,18 +49,15 @@ def pytest_sessionfinish(session, exitstatus):
     """Remove runtime state created inside a verifier-owned source snapshot."""
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     hermetic = (
-        os.environ.get("PYTHONDONTWRITEBYTECODE") == "1"
+        not hasattr(session.config, "workerinput")
+        and os.environ.get("PYTHONDONTWRITEBYTECODE") == "1"
         and "LIFEOS_PARALLEL_BROWSER_FREE" in os.environ
         and os.path.isabs(os.environ.get("LIFEOS_CHROMA_PATH", ""))
         and not os.path.lexists(os.path.join(project_root, ".git"))
     )
     if not hermetic:
         return
-    for name in ("task_index.json", "imessage.db", "gpu_embed.lock"):
-        try:
-            os.unlink(os.path.join(project_root, "data", name))
-        except FileNotFoundError:
-            pass
+    shutil.rmtree(os.path.join(project_root, "data"), ignore_errors=True)
 
 
 def wait_for_condition(predicate, timeout: float, interval: float = 0.2):
