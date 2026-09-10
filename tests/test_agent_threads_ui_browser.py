@@ -4,7 +4,7 @@ Drives the Agents panel, the "run as agent" composer affordance, and the
 click-to-open thread view with the `/api/agents/*` endpoints mocked via
 Playwright route interception — so the spawn → appear → open → reply flow is
 deterministic and free of real worker/LLM side effects. Requires the server
-serving the chat page on localhost:8000 (like all browser tests in this repo).
+serving the chat page on the owned candidate instance.
 """
 import json
 import re
@@ -59,7 +59,7 @@ def _install_agent_mocks(page: Page, state: dict):
 
 class TestAgentThreadsUI:
     @pytest.fixture(autouse=True)
-    def setup(self, page: Page):
+    def setup(self, page: Page, candidate_base_url):
         page.set_viewport_size(DESKTOP_VIEWPORT)
         self.state = {
             "threads": [{
@@ -81,7 +81,26 @@ class TestAgentThreadsUI:
             "spawned": [], "replies": [],
         }
         _install_agent_mocks(page, self.state)
-        page.goto("http://localhost:8000")
+        page.route(
+            "**/api/agent/status",
+            lambda route: route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({"available": True, "configured": True, "reachable": True}),
+            ),
+        )
+        page.route(
+            "**/api/agent/ask/stream",
+            lambda route: route.fulfill(
+                status=200,
+                content_type="text/event-stream",
+                body=(
+                    'data: {"type":"content","content":"synthetic agent backend response"}\n\n'
+                    'data: {"type":"done"}\n\n'
+                ),
+            ),
+        )
+        page.goto(f"{candidate_base_url}/chat")
         page.wait_for_selector("#agentsPanel")
 
     def test_panel_lists_threads_with_status(self, page: Page):
@@ -97,18 +116,31 @@ class TestAgentThreadsUI:
         page.locator("#agentsThreadsList .agent-thread").first.click()
         expect(page.locator(".agent-thread-banner .agent-route.cloud")).to_be_visible(timeout=8000)
 
-    def test_composer_has_run_as_agent_controls(self, page: Page):
-        expect(page.locator("#agentRouting")).to_be_visible()
-        expect(page.locator("#agentSpawnBtn")).to_be_visible()
-        values = page.locator("#agentRouting option").evaluate_all("els => els.map(e => e.value)")
-        assert set(values) == {"auto", "local", "claude"}
+    def test_composer_has_backend_controls(self, page: Page):
+        """The current composer exposes the configured Agent backend toggle."""
+        expect(page.locator("#backendAgent")).to_be_visible()
+        expect(page.locator("#backendLifeos")).to_be_visible()
+        expect(page.locator("#backendHermes")).to_be_hidden()
 
-    def test_spawn_from_composer_appears_in_panel(self, page: Page):
-        page.locator("#inputField").fill("research the best CRMs")
-        page.locator("#agentRouting").select_option("claude")
-        page.locator("#agentSpawnBtn").click()
-        expect(page.locator(".agent-badge.running")).to_be_visible(timeout=8000)
-        assert self.state["spawned"] and self.state["spawned"][0]["routing"] == "claude"
+    def test_agent_backend_toggle_updates_composer(self, page: Page):
+        """Selecting Agent applies current backend semantics and hides picks it ignores."""
+        page.locator("#backendAgent").click()
+        expect(page.locator("#backendAgent")).to_have_class("backend-option active")
+        expect(page.locator("body")).to_have_class(re.compile(r"(^|\s)agent-mode(\s|$)"))
+        expect(page.locator("#personaPicker")).to_be_hidden()
+        expect(page.locator("#modelPicker")).to_be_hidden()
+
+    def test_agent_backend_submission_completes(self, page: Page):
+        """The current Agent backend submits a turn and returns to Ready."""
+        page.locator("#backendAgent").click()
+        page.locator("#inputField").fill("synthetic agent question")
+        page.locator("#sendBtn").click()
+        expect(page.locator(".message.assistant .message-content").last).to_have_text(
+            "synthetic agent backend response", timeout=30000
+        )
+        expect(page.locator("#sendBtn")).to_be_enabled()
+        expect(page.locator("#stopBtn")).not_to_have_class("visible")
+        expect(page.locator("#statusText")).to_have_text("Ready")
 
     def test_click_thread_opens_conversation_in_main_body(self, page: Page):
         page.locator("#agentsThreadsList .agent-thread").first.click()
@@ -166,7 +198,7 @@ class TestLargeThreadRendering:
     N_TURNS = 90  # well above THREAD_INITIAL_TURNS (30)
 
     @pytest.fixture(autouse=True)
-    def setup(self, page: Page):
+    def setup(self, page: Page, candidate_base_url):
         page.set_viewport_size(DESKTOP_VIEWPORT)
         conv = _large_conversation(self.N_TURNS)
         self.state = {
@@ -185,7 +217,7 @@ class TestLargeThreadRendering:
             "spawned": [], "replies": [],
         }
         _install_agent_mocks(page, self.state)
-        page.goto("http://localhost:8000")
+        page.goto(f"{candidate_base_url}/chat")
         page.wait_for_selector("#agentsPanel")
 
     def test_initial_render_is_capped_to_newest_turns(self, page: Page):

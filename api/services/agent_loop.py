@@ -483,6 +483,10 @@ class AgentResult:
     # read either in isolation, or it will double- or under-count.
     provisional_input_tokens: int = 0
     provisional_output_tokens: int = 0
+    # Sanitized terminal failure for the transport layer.  Provider exceptions
+    # are handled inside this generator so callers otherwise see a normal
+    # result and cannot emit the contract's fatal SSE `error` event.
+    error_message: str | None = None
 
 
 async def run_agent_loop(
@@ -730,6 +734,7 @@ async def run_agent_loop(
                         yield {"type": "text", "content": "\n\n(Search interrupted: the request could not be completed.)"}
                     else:
                         yield {"type": "text", "content": "Sorry, I encountered an error and could not complete this request."}
+                    result.error_message = "The request could not be completed."
                     api_error_fatal = True
                     break
         if api_error_fatal:
@@ -872,6 +877,7 @@ async def run_agent_loop(
             # Deliberately not error_msg here (#787) -- see the matching
             # comment in the tool-round loop above. Full detail is still
             # logged on the line above.
+            result.error_message = "The request could not be completed."
             yield {"type": "text", "content": "\n\n(Error during synthesis: the request could not be completed.)"}
 
     # If we ran tools but still ended up with no text, construct a fallback

@@ -10,12 +10,9 @@ Verifies the FRONTEND: that a conversation whose `GET` returns a
 `pending_question` renders the answer card, that Send POSTs to `/answer`, and
 that a successful answer clears the affordance. The server-side deposit/resume
 (#403) is covered separately; this never spawns a real session. Requires the
-server serving the chat page (defaults to localhost:8000; override the base via
-LIFEOS_TEST_BASE_URL, e.g. a worktree run on a spare port), like the rest of the
-browser suite.
+server serving the chat page on the owned candidate instance.
 """
 import json
-import os
 import re
 
 import pytest
@@ -24,13 +21,6 @@ from playwright.sync_api import Page, expect
 pytestmark = [pytest.mark.browser, pytest.mark.slow, pytest.mark.requires_server]
 
 DESKTOP_VIEWPORT = {"width": 1280, "height": 800}
-# The production server owns :8000; a worktree run can point at its own instance
-# (e.g. a localhost-only server on a spare port serving the worktree's web/) via
-# this env var. Defaults to :8000 to match the rest of the browser suite. The
-# chat SPA is served at /chat (the canonical route; `/` may be the landing page).
-BASE_URL = os.environ.get("LIFEOS_TEST_BASE_URL", "http://localhost:8000")
-CHAT_URL = BASE_URL.rstrip("/") + "/chat"
-
 CONV_ID = "conv_doctor_1"
 SESSION_ID = "sess_doctor_1"
 
@@ -114,7 +104,7 @@ def _install_conversation_mocks(page: Page, state: dict):
 
 class TestPendingQuestionUI:
     @pytest.fixture(autouse=True)
-    def setup(self, page: Page):
+    def setup(self, page: Page, candidate_base_url):
         page.set_viewport_size(DESKTOP_VIEWPORT)
         self.state = {
             "awaiting": True,
@@ -130,12 +120,13 @@ class TestPendingQuestionUI:
             ],
         }
         _install_conversation_mocks(page, self.state)
-        page.goto(CHAT_URL)
+        page.goto(f"{candidate_base_url}/chat")
         page.wait_for_selector("#messages")
 
     def _open_conversation(self, page: Page):
         # loadConversation() loads the detail (with pending_question) and starts
         # polling — the same entry the sidebar click uses.
+        page.wait_for_function("() => typeof window.loadConversation === 'function'")
         page.evaluate(f"window.loadConversation('{CONV_ID}')")
 
     def test_pending_question_renders_answer_card(self, page: Page):

@@ -11,14 +11,41 @@ Exercised in plan-only mode (mirrors tests/test_prepush_gate.py) with a
 deletion-only ref on stdin, so the hook takes its fastest exit path and never
 shells out to the real test suite or scripts/test.sh.
 """
+import functools
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 HOOK = REPO / "scripts" / "pre-push"
+
+
+@functools.lru_cache(maxsize=1)
+def _git_backed_repo_root() -> Path:
+    """scripts/pre-push's very first line is `git rev-parse --show-
+    toplevel`, so it needs a real git working tree as cwd. REPO has no
+    .git when this test runs inside an isolated verifier snapshot
+    (scripts/candidate_snapshot.py's build_snapshot never copies .git, by
+    design) -- stage the exact current content into an owned disposable
+    git repo instead; cached, since rebuilding a repo-sized copy per call
+    would be wasteful and the content is fixed for this process's
+    lifetime."""
+    if (REPO / ".git").exists():
+        return REPO
+    fixture = Path(tempfile.mkdtemp(prefix="lifeos-pre-push-fixture-"))
+    subprocess.run(["rsync", "-a", "--exclude=.git", f"{REPO}/", f"{fixture}/"], check=True)
+    subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=fixture, check=True)
+    # Gitignored-but-force-tracked in the real repo (see .gitignore's own
+    # comments on these two entries) -- a fresh `git add -A` in a brand-new
+    # repo has no tracked-history override for either.
+    for forced in ("AGENTS.md", "tests/test_p91_data_integrity.py"):
+        if (fixture / forced).exists():
+            subprocess.run(["git", "add", "-f", "--", forced], cwd=fixture, check=True)
+    return fixture
 
 
 def _run(remote_url: str) -> str:
@@ -30,7 +57,7 @@ def _run(remote_url: str) -> str:
     }
     result = subprocess.run(
         ["bash", str(HOOK), "origin", remote_url],
-        capture_output=True, text=True, env=env, cwd=str(REPO),
+        capture_output=True, text=True, env=env, cwd=str(_git_backed_repo_root()),
         stdin=subprocess.DEVNULL,
     )
     assert result.returncode == 0, f"stderr: {result.stderr}"
@@ -72,7 +99,7 @@ def test_no_remote_url_is_silent():
     }
     result = subprocess.run(
         ["bash", str(HOOK)],
-        capture_output=True, text=True, env=env, cwd=str(REPO),
+        capture_output=True, text=True, env=env, cwd=str(_git_backed_repo_root()),
         stdin=subprocess.DEVNULL,
     )
     assert result.returncode == 0, f"stderr: {result.stderr}"

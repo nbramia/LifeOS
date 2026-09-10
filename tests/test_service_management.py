@@ -7,15 +7,16 @@ Acceptance Criteria:
 - Health endpoint returns service status
 - Can check status via launchctl
 """
-import pytest
-
-# These tests use TestClient which initializes the app (slow)
-pytestmark = pytest.mark.slow
 import os
 from pathlib import Path
+
+import pytest
 from fastapi.testclient import TestClient
 
 from api.main import app
+
+# These tests use TestClient which initializes the app (slow)
+pytestmark = pytest.mark.slow
 
 
 class TestHealthEndpoint:
@@ -52,8 +53,8 @@ class TestLaunchdConfiguration:
 
     @pytest.fixture
     def plist_path(self):
-        """Path to launchd plist."""
-        return Path(__file__).parent.parent / "config" / "launchd" / "com.lifeos.api.plist"
+        """Path to the tracked launchd configuration template."""
+        return Path(__file__).parent.parent / "config" / "launchd" / "com.lifeos.api.plist.template"
 
     def test_plist_exists(self, plist_path):
         """Plist file should exist."""

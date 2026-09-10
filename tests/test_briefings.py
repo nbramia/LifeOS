@@ -212,7 +212,11 @@ class TestBriefingsAPI:
 
     def test_briefing_endpoint_exists(self, client):
         """Briefing endpoint should exist."""
-        response = client.post("/api/briefing", json={"person_name": "test"})
+        with patch('api.routes.briefings.get_briefings_service') as mock_service:
+            mock_service.return_value.generate_briefing = AsyncMock(return_value={
+                "status": "not_found", "person_name": "test", "metadata": {}, "sources": [],
+            })
+            response = client.post("/api/briefing", json={"person_name": "test"})
         assert response.status_code != 404
         assert response.status_code != 405
 
@@ -223,7 +227,11 @@ class TestBriefingsAPI:
 
     def test_briefing_get_endpoint_exists(self, client):
         """GET briefing endpoint should exist."""
-        response = client.get("/api/briefing/test")
+        with patch('api.routes.briefings.get_briefings_service') as mock_service:
+            mock_service.return_value.generate_briefing = AsyncMock(return_value={
+                "status": "not_found", "person_name": "test", "metadata": {}, "sources": [],
+            })
+            response = client.get("/api/briefing/test")
         assert response.status_code != 404
         assert response.status_code != 405
 

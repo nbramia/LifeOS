@@ -193,6 +193,18 @@ def _nodes(page: Page):
     )
 
 
+def _badge_hit_handle(page: Page, session_id: str):
+    # Playwright's CSS engine can't select by the D3 datum's session_id (a
+    # JS property, not a DOM attribute) -- evaluate_handle gets a real
+    # ElementHandle so .click(position=...) can use Playwright's own
+    # actionability/stability wait against the live element.
+    return page.evaluate_handle(
+        "(sid) => [...document.querySelectorAll('.node')].find(n => n.__data__.session_id === sid)"
+        ".querySelector('.node-badge-children-hit')",
+        session_id,
+    ).as_element()
+
+
 class TestLabelPrecedence:
     def test_linked_card_shows_the_card_title(self, page: Page, agents_base_url):
         # Long labels wrap across multiple <tspan> children (graph.js's
@@ -414,17 +426,21 @@ class TestSubagentCollapse:
         # The clickable hit target (`.node-badge-children-hit`) is a
         # transparent circle sized well beyond the tiny `+N`/`−` text glyph
         # itself, so a click near but not exactly on the glyph still toggles
-        # collapse/expand.
+        # collapse/expand. Expansion re-renders the timeline (as above),
+        # which can move the badge -- an ElementHandle click with a bounded
+        # 10s timeout requires the element's own actionability and
+        # stability (an unchanging position across consecutive frames)
+        # as its dispatch precondition, so `position` is always the +8px
+        # offset from wherever the badge currently is at click time, never
+        # a stale earlier snapshot.
         _open_agents(page, agents_base_url)
-        hit = page.evaluate(
-            "() => { const g = [...document.querySelectorAll('.node')]"
-            ".find(n => n.__data__.session_id === 'cc:redesign-parent');"
-            " const b = g.querySelector('.node-badge-children-hit');"
-            " const box = b.getBoundingClientRect();"
-            " return { x: box.x + box.width / 2, y: box.y + box.height / 2 }; }"
+        badge = _badge_hit_handle(page, "cc:redesign-parent")
+        box = badge.bounding_box()
+        badge.click(position={"x": box["width"] / 2 + 8, "y": box["height"] / 2}, timeout=10000)
+        page.wait_for_function(
+            "() => [...document.querySelectorAll('.node')].some(n => n.__data__.session_id === 'cc:redesign-subagent')",
+            timeout=2000,
         )
-        page.mouse.click(hit["x"] + 8, hit["y"])
-        page.wait_for_timeout(300)
         ids = {r["session_id"] for r in _nodes(page)}
         assert "cc:redesign-subagent" in ids
 

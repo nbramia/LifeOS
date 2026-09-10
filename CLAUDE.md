@@ -6,7 +6,7 @@
 
 - Use plan mode for non-trivial tasks (3+ files, architectural decisions, unclear requirements).
 - After modifying docs, verify compliance with [docs/AGENTS.md](docs/AGENTS.md) standards.
-- After modifying code, restart server before testing.
+- Production restarts belong to deployment; isolated test runs must not restart or stop a production server.
 - When creating new directories or modules, check if an AGENTS.md + CLAUDE.md pair is appropriate.
 
 ## Skills
@@ -20,6 +20,7 @@ The development lifecycle comes from elsewhere: the user-scope `implement-lifecy
 **Read these first:**
 - [AGENTS.md](AGENTS.md) — Full project reference (principles, invariants, key files, commands)
 - [docs/AGENTS.md](docs/AGENTS.md) — Documentation standards
+- [Development lifecycle](docs/specs/standards/development-lifecycle.md) — Shared risk, review, and verification contract
 
 ## Common Mistakes
 

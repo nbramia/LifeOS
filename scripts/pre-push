@@ -15,6 +15,7 @@ set -e
 
 PROJECT_ROOT="$(git rev-parse --show-toplevel)"
 cd "$PROJECT_ROOT"
+source "$PROJECT_ROOT/scripts/test-lanes.sh"
 
 # git exports GIT_DIR (absolute when pushing from a worktree) while running
 # hooks. Test subprocesses that spawn `git` in fixture repos inherit it and
@@ -57,6 +58,7 @@ ZERO_SHA="0000000000000000000000000000000000000000"
 # this separately is what lets a pure deletion exit early instead of running
 # the whole suite just to delete a branch.
 HAVE_CONTENT=0
+PUSH_CANDIDATES=""
 # First local_ref seen on stdin — used below to derive a per-branch log path.
 PUSH_LOCAL_REF=""
 while read local_ref local_sha remote_ref remote_sha; do
@@ -66,11 +68,22 @@ while read local_ref local_sha remote_ref remote_sha; do
     HAVE_CONTENT=1
     [ -z "$PUSH_LOCAL_REF" ] && PUSH_LOCAL_REF="$local_ref"
     if [ "$remote_sha" = "$ZERO_SHA" ]; then
-        # New branch: diff against origin/main if available, else last 10 commits.
-        MERGE_BASE=$(git merge-base "$local_sha" origin/main 2>/dev/null || echo "${local_sha}~10")
+        # New branch: provenance must be the actual resolved merge-base. A
+        # guessed parent (or the all-zero remote SHA) would make the verifier
+        # report a falsely known candidate base, so fail closed if origin/main
+        # is unavailable or the histories have no common ancestor.
+        MERGE_BASE=$(git merge-base "$local_sha" origin/main 2>/dev/null || true)
+        if [ -z "$MERGE_BASE" ] || [ "$MERGE_BASE" = "$ZERO_SHA" ]; then
+            echo "pre-push: FAILED — cannot resolve an actual merge-base for new branch $local_ref; refusing unknown provenance" >&2
+            exit 1
+        fi
         DIFF=$(git diff --name-only "$MERGE_BASE" "$local_sha" 2>/dev/null || true)
+        # The pushed-ref verifier consumes this as the candidate's base
+        # identity; use the resolved merge-base, never the zero remote SHA.
+        PUSH_CANDIDATES="$PUSH_CANDIDATES$local_sha $MERGE_BASE"$'\n'
     else
         DIFF=$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null || true)
+        PUSH_CANDIDATES="$PUSH_CANDIDATES$local_sha $remote_sha"$'\n'
     fi
     CHANGED_FILES="$CHANGED_FILES"$'\n'"$DIFF"
 done
@@ -302,55 +315,68 @@ fail() {
 echo "Log: $LOG"
 echo -n "Running unit tests... "
 
-# #682: this scope (`-m "unit and not slow"`) and scripts/test.sh's unit
-# scope (the negative filter over browser/requires_server/integration/slow)
-# are meant to agree, and after the #682 marker triage they collect the
-# identical set (verified via --collect-only on both filters). Getting there
-# required removing a conftest.py auto-marker that used to tag any test whose
-# *name* contained "real_" or "integration" with `integration` on top of
-# whatever marker it already carried — see tests/conftest.py's
-# pytest_collection_modifyitems for the full story.
+# Every non-deletion ref is verified by its exact local SHA in one detached
+# outer candidate. The verifier collects once, owns one capacity lease, then
+# dispatches both broad gate lanes in separate supervised pytest processes.
+# Its per-lane JSON receipts are retained beside these private hook logs.
+LANE_LOG_DIR="${LOG%.log}-lanes"
+PUSH_FAILED_LANE=""
+run_pushed_candidate() {
+    local output="$1" source_sha base_sha candidate_logs status=0
+    : > "$output"
+    rm -f "$BROWSER_LOG"
+    mkdir -m 700 "$LANE_LOG_DIR" || return 1
+    while read -r source_sha base_sha; do
+        [ -z "$source_sha" ] && continue
+        candidate_logs="$LANE_LOG_DIR/$source_sha"
+        python "$PROJECT_ROOT/scripts/verify_candidate.py" pushed-ref \
+            --repository "$PROJECT_ROOT" --sha "$source_sha" --base "$base_sha" \
+            --evidence-root "${XDG_CACHE_HOME:-$HOME/.cache}/lifeos/verification-evidence" \
+            --lanes "fast-unit,browser-free" --workers 2 \
+            --lane-log-dir "$candidate_logs" >> "$output" 2>&1 || status=$?
+        [ -f "$candidate_logs/fast-unit.log" ] && cat "$candidate_logs/fast-unit.log" >> "$output"
+        if [ -f "$candidate_logs/browser-free.json" ]; then
+            [ -f "$candidate_logs/browser-free.log" ] && cat "$candidate_logs/browser-free.log" >> "$BROWSER_LOG"
+        fi
+        if [ "$status" -ne 0 ] && [ -f "$candidate_logs/browser-free.json" ]; then
+            PUSH_FAILED_LANE="browser-free"
+        fi
+        [ -f "$candidate_logs/fast-unit.json" ] && [ -f "$candidate_logs/browser-free.json" ] || status=1
+        [ "$status" -eq 0 ] || break
+    done <<EOF
+$PUSH_CANDIDATES
+EOF
+    # A candidate's execution receipt is the lane-attributable browser log;
+    # do not claim a green browser stage if the exact receipt is absent.
+    [ "$status" -eq 0 ]
+}
+
+# The shared lane registry is also used by test.sh and future CI. Keep this
+# gate intentionally broad: fast-unit plus all server-free browser coverage.
+# Fail before snapshotting when the required browser dependency is absent.
+if ! python -c "import playwright" 2>/dev/null; then
+    echo "FAILED: server-free browser lane requires Playwright. Run: pip install playwright && playwright install"
+    exit 1
+fi
 #
-# Parallelize across all cores via pytest-xdist (-n auto). --ff runs
-# previously-failed tests first, so a repeat failure surfaces in seconds
-# without narrowing what actually runs.
-#
-# Deliberately no last-failed-only flag. Restricting the run to previously
-# failed tests whenever a lastfailed cache existed collapsed the gate: fail
-# once, fix it, and the next push ran a handful of tests out of ~2400 and
-# passed — at exactly the moment the code had just changed. --ff keeps the
-# fast-feedback ordering; it just doesn't deselect anything.
-python -m pytest -m "unit and not slow" tests/ -q --tb=line --no-header \
-    -n auto --ff > "$LOG" 2>&1 || fail
+# The isolated verifier executes every selected node ID from a fresh
+# collection; it deliberately disables pytest's cache provider, so no stale
+# last-failed selection or cache file can influence a candidate receipt.
+if ! run_pushed_candidate "$LOG"; then
+    [ "$PUSH_FAILED_LANE" = "browser-free" ] && LOG="$BROWSER_LOG"
+    fail
+fi
 echo "passed ($(tail -1 "$LOG"))"
 
-# Browser tests that need no running server. Server-dependent ones carry
-# `requires_server`; including those would tie every push to the health of a
-# shared lifeos-api that other agents bounce constantly. The rest serve web/
-# themselves and stub every /api/ call, and are the only gate that catches a
-# regression in the chat SPA's JS before it reaches main.
-#
-# Deliberately a second pytest process, not another marker in the run above:
-# pytest-playwright's sync API leaves its own event loop current, so any async
-# test that lands after a browser test in the same process fails with
-# `RuntimeError: Runner.run() cannot be called from a running event loop`.
-# Under `-n auto` that ordering is nondeterministic.
-#
-# -p no:cacheprovider keeps this run out of .pytest_cache so it can't disturb
-# the unit run's --ff ordering data.
-if python -c "import playwright" 2>/dev/null; then
-    # Its own log, so a browser failure doesn't clobber the unit-run output
-    # someone may still need to read.
-    LOG="$BROWSER_LOG"
-    echo "Log: $LOG"
-    echo -n "Running server-free browser tests... "
-    python -m pytest -m "browser and not requires_server" tests/ -q --tb=line \
-        --no-header -p no:cacheprovider > "$LOG" 2>&1 || fail
-    echo "passed ($(tail -1 "$LOG"))"
-else
-    # Say so rather than silently degrading — on a machine without Playwright
-    # this gate is simply absent, and that should be visible.
-    echo "Skipping browser tests (playwright not installed)"
-fi
+# Browser tests remain a separate pytest process inside the shared outer
+# candidate: pytest-playwright's sync API leaves its own event loop current,
+# so any async test that lands after a browser test in the same process fails
+# with `RuntimeError: Runner.run() cannot be called from a running event loop`.
+# The browser receipt is its own log, so it never clobbers the unit verifier
+# output someone may still need to read.
+LOG="$BROWSER_LOG"
+echo "Log: $LOG"
+echo -n "Running server-free browser tests... "
+echo "passed ($(tail -1 "$LOG"))"
 
 exit 0

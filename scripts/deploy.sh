@@ -107,6 +107,10 @@ run_tests() {
 }
 
 # Restart server using server.sh (handles cleanup, lock files, proper timeouts)
+# This is the direct-hotfix path's own explicit, intentional restart — this
+# script is deployment, so it owns restart. scripts/post-commit (which also
+# fires on the `git commit` below) never restarts anything; it only
+# normalizes the commit's timestamp, so there is no double-restart here.
 restart_server() {
     log_step "Step 2/5: Restarting server"
     echo ""

@@ -153,6 +153,23 @@ def expand_person_names(query: str) -> str:
     return " ".join(expanded)
 
 
+def vector_fusion_id(doc_id: str) -> str:
+    """Map a vectorstore-native id (``{file_path}::{chunk_index}``) to the
+    fusion identity BM25 uses for the same chunk (``{path}_{chunk_index}``,
+    from ``IndexerService``), so RRF recognizes a chunk found by both
+    indexes as one document. Splits on the LAST ``::`` only, so a path that
+    itself contains ``::`` is never corrupted — a global replace would.
+    A non-numeric suffix (no vector id has one today) is left unchanged
+    rather than guessed.
+    """
+    if "::" not in doc_id:
+        return doc_id
+    file_path, _, suffix = doc_id.rpartition("::")
+    if not suffix.isdigit():
+        return doc_id
+    return f"{file_path}_{suffix}"
+
+
 def reciprocal_rank_fusion(
     vector_results: list[str],
     bm25_results: list[str],
@@ -434,15 +451,18 @@ class HybridSearch:
             vector_store = self._get_vector_store()
             vector_results = vector_store.search(query=expanded_query, top_k=fetch_k)
 
-        # Extract doc IDs and create lookup
+        # Fusion keys are normalized (vector_fusion_id) so a chunk found by
+        # both vector and BM25 fuses into one RRF entry; the result dict's
+        # own "id" field keeps the untouched, actual stored Chroma id.
         vector_doc_ids = []
         results_by_id = {}
 
         for result in vector_results:
             doc_id = result.get("id")
             if doc_id:
-                vector_doc_ids.append(doc_id)
-                results_by_id[doc_id] = result
+                fusion_id = vector_fusion_id(doc_id)
+                vector_doc_ids.append(fusion_id)
+                results_by_id[fusion_id] = result
 
         # Get BM25 results (use expanded query for name resolution)
         with trace_span("search_bm25", parent="tool_search_vault"):
@@ -496,8 +516,17 @@ class HybridSearch:
                 elif doc_id in bm25_results_by_id:
                     # BM25-only result - use the content from BM25
                     bm25_result = bm25_results_by_id[doc_id]
-                    # Extract file path from doc_id (format: /path/to/file.md_chunkN)
-                    file_path = doc_id.rsplit("_", 1)[0] if "_" in doc_id else doc_id
+                    # doc_id is "/path/file.md_chunkN" (numbered chunk) or
+                    # "/path/file.md::summary" (IndexerService summary).
+                    # Check the "::summary" suffix first — a filename that
+                    # itself contains "_" would otherwise get cut instead
+                    # of the deliberate suffix.
+                    if doc_id.endswith("::summary"):
+                        file_path = doc_id[: -len("::summary")]
+                    elif "_" in doc_id:
+                        file_path = doc_id.rsplit("_", 1)[0]
+                    else:
+                        file_path = doc_id
                     result = {
                         "id": doc_id,
                         "content": bm25_result.get("content", ""),

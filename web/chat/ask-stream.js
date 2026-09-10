@@ -153,8 +153,8 @@ export async function sendMessage() {
   let fullContent = '';
   let sources = [];
   let routingSources = [];  // Track which sources were used
-  // The server-`error` event stops the stream and (matching the original
-  // behavior) leaves the composer locked — no Ready status, no re-enable.
+  // A server `error` event marks the turn failed while the shared cleanup
+  // below still releases the composer for a retry.
   let serverError = false;
 
   try {
@@ -311,7 +311,7 @@ export async function sendMessage() {
         } else if (data.type === 'error') {
           // Handle error from server
           const errorMsg = data.message || 'An error occurred';
-          let userMessage = 'Sorry, something went wrong.';
+          let userMessage = 'Sorry, I encountered an error and could not complete this request.';
 
           // Provide helpful messages for common errors
           if (errorMsg.toLowerCase().includes('api') ||
@@ -326,7 +326,14 @@ export async function sendMessage() {
           }
 
           console.error('Stream error:', errorMsg);
-          updateMessage(msgId, userMessage);
+          // Keep any content already rendered (and persisted by the server)
+          // visible when the terminal error follows a partial response. Only
+          // use the generic failure copy when no useful content arrived.
+          if (fullContent) {
+            updateMessage(msgId, fullContent);
+          } else {
+            updateMessage(msgId, userMessage);
+          }
           setStatus('error', 'Error');
           serverError = true;
           return true; // Stop processing
@@ -334,9 +341,7 @@ export async function sendMessage() {
       },
     });
 
-    if (serverError) return;
-
-    setStatus('', 'Ready');
+    if (!serverError) setStatus('', 'Ready');
 
   } catch (error) {
     console.error('Error:', error);

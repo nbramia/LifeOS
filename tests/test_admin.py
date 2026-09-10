@@ -15,6 +15,14 @@ pytestmark = pytest.mark.slow
 class TestAdminEndpoints:
     """Test admin API endpoints."""
 
+    @pytest.fixture(autouse=True)
+    def isolated_job_queue(self, tmp_path, monkeypatch):
+        """Keep endpoint shape checks out of the immutable candidate tree."""
+        import api.services.job_queue as job_queue
+
+        monkeypatch.setattr(job_queue, "_DEFAULT_DB_PATH", str(tmp_path / "jobs.db"))
+        monkeypatch.setattr(job_queue, "_instance", None)
+
     @pytest.fixture
     def client(self):
         """Create test client."""

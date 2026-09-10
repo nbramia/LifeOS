@@ -256,7 +256,11 @@ class VectorStore:
                     "score": combined_score,
                     "semantic_score": semantic_score,
                     "recency_score": recency_score,
-                    **metadata
+                    **metadata,
+                    # Set AFTER **metadata: add_document() permits arbitrary
+                    # extra chunk keys through, so a chunk with its own "id"
+                    # field must not overwrite the real stored Chroma id.
+                    "id": doc_id,
                 }
                 # Parse JSON fields
                 if "people" in result and isinstance(result["people"], str):

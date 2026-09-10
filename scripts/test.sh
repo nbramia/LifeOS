@@ -6,15 +6,15 @@
 #
 # Test levels:
 #   unit        - Fast tests, no external dependencies (~2min, parallelized)
-#   integration - Tests requiring server to be running
-#   browser     - Playwright browser tests (requires server)
+#   integration - Integration lane (server prerequisites are checked per lane)
+#   browser     - All browser lanes (server-free and server-dependent)
 #   smoke       - Unit + critical browser test (used by deploy.sh)
 #   all         - Run all tests in sequence
 #   auto        - Pick scope from the git diff (see decide_plan below)
 #   health      - Quick server health check
 #
-# Note: Integration, browser, and smoke tests require the server to be running.
-# If not running, this script will start it automatically (takes 30-60s for ML model loading).
+# Note: Only server-dependent lanes start the server automatically (takes 30-60s
+# for ML model loading). Server-free browser tests remain independent of it.
 #
 # Related Scripts:
 #   ./scripts/deploy.sh   - Full deployment (test, restart, commit, push)
@@ -28,6 +28,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
+source "$SCRIPT_DIR/test-lanes.sh"
 
 # Force CPU-only embeddings for every test run (#521). This host's iGPU has
 # only 8 SDMA queues; `pytest -n auto` below spawns one worker process per
@@ -60,7 +61,13 @@ log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 # avoids ordering surprises from shared singletons within a group.
 # Browser/integration runs stay serial (single shared server + Playwright),
 # so they don't use this.
-PYTEST_PARALLEL=(-n auto --dist loadscope)
+PYTEST_PARALLEL=()
+# Cold/synthetic runners may intentionally have only pytest installed. The
+# lane remains complete serially there; a configured parallel dispatch never
+# turns into an unrecognized-option collection failure.
+if python -c "import xdist" >/dev/null 2>&1; then
+    PYTEST_PARALLEL=(-n "${LIFEOS_TEST_PARALLEL_WORKERS:-auto}" --dist loadscope)
+fi
 
 # Activate virtual environment (located outside Documents for faster startup)
 activate_venv() {
@@ -82,94 +89,51 @@ check_server() {
     fi
 }
 
-# Run unit tests (fast, no external deps)
-#
-# #682: this negative filter and the pre-push hook's `-m "unit and not slow"`
-# are meant to select the same set, and after the #682 marker triage they
-# collect the identical set (verified via --collect-only on both filters) —
-# see scripts/pre-push and tests/conftest.py's pytest_collection_modifyitems
-# for how a pre-existing name-substring auto-marker used to break that
-# agreement and why it was removed rather than special-cased.
-run_unit_tests() {
-    log_step "Running unit tests..."
-    python -m pytest tests/ -v \
-        --ignore=tests/test_ui_browser.py \
-        --ignore=tests/archive \
-        -m "not browser and not requires_server and not integration and not slow" \
-        --tb=short \
-        -q \
-        "${PYTEST_PARALLEL[@]}"
-}
-
-# Run integration tests (requires server)
-run_integration_tests() {
-    log_step "Running integration tests..."
-
-    if ! check_server; then
-        log_warn "Server not running. Starting server for integration tests..."
-        start_server_background
+ensure_lane_prerequisites() {
+    local lane="$1"
+    if test_lane_requires_playwright "$lane" && ! python -c "import playwright" 2>/dev/null; then
+        log_error "Lane '$lane' requires Playwright. Run: pip install playwright && playwright install"
+        return 1
+    fi
+    if test_lane_requires_server "$lane" && ! check_server; then
+        log_warn "Server not running. Starting it for lane '$lane'..."
+        start_server_background || return 1
         sleep 3
     fi
-
-    # #682: was hardcoded to tests/test_e2e_flow.py only, so every other
-    # `integration`-marked test (including the direct-DB data-integrity
-    # suites) had no scope that ever ran them. Sweep the whole tree instead —
-    # this is the only place `integration`-marked tests run on this box.
-    python -m pytest tests/ -v \
-        --ignore=tests/archive \
-        -m "integration" \
-        --tb=short
 }
 
-# Run browser tests (requires server + playwright)
+# Run one explicit, disjoint lane.  Browser and server lanes stay in their own
+# process; fast and isolated-slow lanes retain the existing xdist behaviour.
+run_lane() {
+    local lane="$1"
+    shift
+    local marker
+    marker=$(test_lane_marker "$lane") || return
+    if [ -n "${LIFEOS_TEST_DISPATCH_ONLY:-}" ]; then
+        echo "auto-dispatch: $lane"
+        return 0
+    fi
+    ensure_lane_prerequisites "$lane" || return 1
+    log_step "Running test lane: $lane"
+    local parallel=()
+    case "$lane" in fast-unit|slow) parallel=("${PYTEST_PARALLEL[@]}") ;; esac
+    local browser_args=()
+    test_lane_requires_playwright "$lane" && browser_args=(--browser chromium)
+    python -m pytest "$@" -v --ignore=tests/archive -m "$marker" --tb=short -q \
+        "${parallel[@]}" "${browser_args[@]}"
+}
+
+run_unit_tests() { run_candidate_verification fast-unit; }
+run_integration_tests() { run_candidate_verification server,integration; }
 run_browser_tests() {
-    log_step "Running browser tests..."
-
-    if ! check_server; then
-        log_warn "Server not running. Starting server for browser tests..."
-        start_server_background
-        sleep 3
-    fi
-
-    # Check if playwright is installed
-    if ! python -c "import playwright" 2>/dev/null; then
-        log_error "Playwright not installed. Run: pip install playwright && playwright install"
-        exit 1
-    fi
-
-    # test_voice_mic_block_ui_browser.py serves web/ itself on an ephemeral port
-    # and stubs every /api/ call, so it needs no server and carries no
-    # `requires_server` marker — that's what lets pre-push run it. This scope
-    # deliberately runs the full `browser` set, server-dependent tests included.
-    python -m pytest tests/test_ui_browser.py tests/test_e2e_flow.py \
-        tests/test_voice_mic_block_ui_browser.py -v \
-        --ignore=tests/archive \
-        -m "browser" \
-        --tb=short \
-        --browser chromium
+    run_candidate_verification browser-free
+    run_candidate_verification browser-server
 }
 
 # Run the single critical browser test that verifies the full user flow.
-# Serial (single shared server + Playwright). Shared by smoke and auto.
+# Serial (single shared server + Playwright). Used by the smoke command.
 run_critical_browser_test() {
-    log_step "Running critical browser smoke test..."
-
-    if ! check_server; then
-        log_warn "Server not running. Starting server for browser test..."
-        start_server_background
-        sleep 3
-    fi
-
-    # Check if playwright is installed
-    if ! python -c "import playwright" 2>/dev/null; then
-        log_error "Playwright not installed. Run: pip install playwright && playwright install"
-        exit 1
-    fi
-
-    # Run only the critical e2e test that verifies the full user flow
-    python -m pytest tests/test_e2e_flow.py::TestRealUserFlow::test_user_sends_query_gets_response -v \
-        --tb=short \
-        --browser chromium
+    run_candidate_verification "browser-server" "" "tests/test_e2e_flow.py::TestRealUserFlow::test_user_sends_query_gets_response"
 }
 
 # Run smoke tests (unit + critical browser test for deployment verification)
@@ -191,27 +155,71 @@ run_smoke_tests() {
     log_info "Smoke tests passed in ${duration}s"
 }
 
-# Run slow tests (ChromaDB, embeddings, heavy processing). Parallelized.
-run_slow_tests() {
-    log_step "Running slow tests..."
-    python -m pytest tests/ -v \
-        --ignore=tests/test_ui_browser.py \
-        --ignore=tests/archive \
-        -m "slow and not browser and not requires_server and not integration" \
-        --tb=short \
-        -q \
-        "${PYTEST_PARALLEL[@]}"
+run_slow_tests() { run_candidate_verification slow; }
+
+# Verify a complete local candidate through the same snapshot/evidence/
+# capacity/supervisor path used by pre-push. Covers every lane, including
+# server-owned ones: verify_candidate.py's pytest_lane_executor spins up an
+# owned TestInstance itself whenever a lane's prerequisites include
+# "server" (and adds --browser chromium whenever they include "playwright"),
+# so a server-owned lane never touches the shared production server or its
+# localhost:8000 default.
+run_candidate_verification() {
+    local lanes="${1:-fast-unit,browser-free}"
+    local paths="${2:-}"
+    local nodeids="${3:-}"
+    if [ -n "${LIFEOS_TEST_DISPATCH_ONLY:-}" ]; then
+        echo "auto-dispatch: $lanes"
+        return 0
+    fi
+    local evidence_root="${XDG_CACHE_HOME:-$HOME/.cache}/lifeos/verification-evidence"
+    local path_args=()
+    [ -n "$paths" ] && path_args=(--paths "$paths")
+    [ -n "$nodeids" ] && path_args+=(--nodeids "$nodeids")
+    python "$SCRIPT_DIR/verify_candidate.py" local \
+        --source "$PROJECT_DIR" --evidence-root "$evidence_root" \
+        --lanes "$lanes" \
+        --workers "${LIFEOS_TEST_PARALLEL_WORKERS:-1}" "${path_args[@]}"
 }
 
-# Run a specific list of changed test files (parallelized). `slow` is NOT
-# excluded here on purpose: if you changed a test file, run all of its cases.
+# Collection drives changed-test dispatch.  A mixed-marker file may correctly
+# execute in more than one lane; a test ID itself remains in exactly one lane.
 run_changed_test_files() {
-    log_step "Running changed test files: $*"
-    python -m pytest "$@" -v \
-        -m "not browser and not requires_server and not integration" \
-        --tb=short \
-        -q \
-        "${PYTEST_PARALLEL[@]}"
+    if [ -z "${LIFEOS_TEST_DISPATCH_ONLY:-}" ]; then
+        local selected_paths
+        selected_paths=$(IFS=,; echo "$*")
+        run_candidate_verification "fast-unit,slow,browser-free,browser-server,server,integration" "$selected_paths"
+        return $?
+    fi
+    local inventory_dir inventory selected=0 lane count
+    inventory_dir=$(mktemp -d) || { log_error "Could not create lane inventory directory"; return 1; }
+    inventory="$inventory_dir/lane-inventory.json"
+    if ! test_lane_collect "$inventory" "$@"; then
+        log_error "Could not collect changed test files into a lane inventory."
+        rm -rf "$inventory_dir"
+        return 1
+    fi
+    if ! test_lane_inventory_is_usable "$inventory"; then
+        log_error "Changed test collection did not produce a usable lane inventory."
+        rm -rf "$inventory_dir"
+        return 1
+    fi
+    for lane in "${TEST_LANE_NAMES[@]}"; do
+        count=$(test_lane_count "$inventory" "$lane")
+        [ "$count" = "0" ] && continue
+        selected=$((selected + count))
+        if [ -n "${LIFEOS_TEST_DISPATCH_ONLY:-}" ]; then
+            echo "auto-dispatch: $lane ($count tests)"
+        else
+            run_candidate_verification "$lane" "$(IFS=,; echo "$*")"
+        fi
+    done
+    if [ "$selected" = "0" ]; then
+        log_error "Changed test files selected zero tests in every lane; check markers or deleted paths."
+        rm -rf "$inventory_dir"
+        return 1
+    fi
+    rm -rf "$inventory_dir"
 }
 
 # Start server in background for tests using server.sh
@@ -234,28 +242,54 @@ start_server_background() {
     # Use server.sh for robust startup (handles cleanup, lock files, proper timeouts)
     if ! "$SCRIPT_DIR/server.sh" start; then
         log_error "Server failed to start. Check logs: $PROJECT_DIR/logs/server.log"
-        exit 1
+        return 1
     fi
 }
 
-# Run all tests
+# Verify that marker precedence partitions every non-archived collected test.
+# An optional caller-owned receipt lets `all` reuse this one collection for
+# dispatch, avoiding a second startup just to learn which lanes are nonempty.
+verify_lane_inventory() {
+    local temp_dir="" inventory="${1:-}"
+    if [ -z "$inventory" ]; then
+        temp_dir=$(mktemp -d) || { log_error "Could not create lane inventory directory"; return 1; }
+        inventory="$temp_dir/lane-inventory.json"
+    fi
+    if ! test_lane_collect "$inventory" tests/; then
+        log_error "Could not collect the full test inventory."
+        [ -n "$temp_dir" ] && rm -rf "$temp_dir"
+        return 1
+    fi
+    if ! test_lane_inventory_is_usable "$inventory"; then
+        log_error "Test lanes do not partition the collected non-archived inventory."
+        [ -n "$temp_dir" ] && rm -rf "$temp_dir"
+        return 1
+    fi
+    if [ -n "$temp_dir" ]; then
+        rm -rf "$temp_dir"
+    fi
+    return 0
+}
+
+run_inventory_lane() {
+    local inventory="$1" lane="$2"
+    local count
+    count=$(test_lane_count "$inventory" "$lane") || return 1
+    case "$count" in
+        ''|*[!0-9]*) log_error "Lane '$lane' inventory count is invalid."; return 1 ;;
+    esac
+    [ "$count" = "0" ] && return 0
+    run_lane "$lane" tests/
+}
+
+# Run all non-archived tests through the complete lane partition.
 run_all_tests() {
     local start_time=$(date +%s)
 
     log_step "Running full test suite..."
     echo ""
 
-    # Unit tests first (fast feedback)
-    run_unit_tests
-    echo ""
-
-    # Integration tests
-    run_integration_tests
-    echo ""
-
-    # Browser tests
-    run_browser_tests
-    echo ""
+    run_candidate_verification "fast-unit,slow,browser-free,browser-server,server,integration" || return $?
 
     local end_time=$(date +%s)
     local duration=$((end_time - start_time))
@@ -385,28 +419,37 @@ run_auto() {
                 [ -f "$f" ] && existing+=("$f")
             done
             if [ ${#existing[@]} -eq 0 ]; then
-                log_warn "Changed test files no longer exist — running full unit suite."
+                log_warn "Changed test files no longer exist — running the conservative fast-unit lane."
                 run_unit_tests
             else
                 run_changed_test_files "${existing[@]}"
             fi
             ;;
         *)
-            run_unit_tests
+            local lanes="fast-unit"
             case "$plan" in
-                *browser*) echo ""; run_critical_browser_test ;;
+                *browser*) lanes="$lanes,browser-free,browser-server" ;;
             esac
             case "$plan" in
-                *slow*) echo ""; run_slow_tests ;;
+                *slow*) lanes="$lanes,slow" ;;
             esac
+            run_candidate_verification "$lanes"
             ;;
     esac
 }
 
 # Main
-# Plan-only auto runs are pure (no pytest), so they don't need the venv.
-if [ "${1:-}" = "auto" ] && [ -n "${LIFEOS_TEST_PLAN_ONLY:-}" ]; then
+# Plan-only auto runs are pure. Dispatch-only runs collect synthetic node IDs
+# in tests but never execute pytest, so neither needs the venv.
+if [ "${1:-}" = "auto" ] && { [ -n "${LIFEOS_TEST_PLAN_ONLY:-}" ] || [ -n "${LIFEOS_TEST_DISPATCH_ONLY:-}" ]; }; then
     run_auto
+    exit 0
+fi
+
+# Test-only inventory mode validates lane partitioning with a synthetic pytest
+# collector. It deliberately stops before venv activation or test execution.
+if [ "${1:-}" = "all" ] && [ -n "${LIFEOS_TEST_LANE_INVENTORY_ONLY:-}" ]; then
+    verify_lane_inventory
     exit 0
 fi
 
@@ -428,6 +471,9 @@ case "${1:-unit}" in
     all)
         run_all_tests
         ;;
+    candidate)
+        run_candidate_verification
+        ;;
     auto)
         run_auto
         ;;
@@ -437,7 +483,7 @@ case "${1:-unit}" in
     *)
         echo "LifeOS Test Runner"
         echo ""
-        echo "Usage: $0 [unit|integration|browser|smoke|all|auto|health]"
+        echo "Usage: $0 [unit|integration|browser|smoke|all|auto|candidate|health]"
         echo ""
         echo "Test levels:"
         echo "  unit         Fast tests, no external dependencies (default)"
@@ -446,6 +492,7 @@ case "${1:-unit}" in
         echo "  smoke        Unit tests + critical browser test (for deployment)"
         echo "  all          Run all tests in sequence"
         echo "  auto         Pick scope from the git diff (unit/browser/slow/skip)"
+        echo "  candidate    Isolated fast-unit + server-free-browser candidate verification"
         echo "  health       Quick server health check"
         exit 1
         ;;

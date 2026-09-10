@@ -831,10 +831,23 @@ class TestSidebarPersonaValidationRace:
         # Release "/api/personas": "deleted-bot" isn't in the list, so
         # loadPersonas() must correct config.personaId to "primary" before
         # the (still-pending) listing is allowed to fire.
-        held["route"].fulfill(
-            status=200, content_type="application/json",
-            body=json.dumps({"personas": [{"id": "primary", "label": "Primary"}]}),
-        )
+        #
+        # `backendReady` resolving only proves initBackend() reached its
+        # (unawaited) `loadConversations()` call -- not that the resulting
+        # `/api/conversations` request has already crossed back over CDP to
+        # this handler and been recorded into `requests`, which is a
+        # separate round-trip with no ordering guarantee against the
+        # in-page promise chain settling. `expect_response` blocks on the
+        # actual completing network event for that request, which the
+        # handler below only fires (`route.fulfill()`) after its own
+        # `requests.append()` already ran, so waiting on it closes that gap.
+        with page.expect_response(
+            lambda r: "/api/conversations" in r.url and "/api/conversations/" not in r.url
+        ):
+            held["route"].fulfill(
+                status=200, content_type="application/json",
+                body=json.dumps({"personas": [{"id": "primary", "label": "Primary"}]}),
+            )
         _wait_for_backend_ready(page)  # only resolves once persona is unblocked too
         assert requests == ["primary"]
         assert page.evaluate("window.lifeChat.config.personaId") == "primary"

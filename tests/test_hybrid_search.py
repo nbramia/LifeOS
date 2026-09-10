@@ -555,6 +555,285 @@ class TestChunkDeduplication:
         assert len(deduplicated) == 1
 
 
+class TestVectorFusionIdentity:
+    """HybridSearch fuses a chunk found by both vector and BM25 search into
+    one result, carrying semantic_score and vector-only metadata, by
+    matching each side's id through ``vector_fusion_id``. Vector chunks are
+    stored as "{file_path}::{chunk_index}"; BM25 stores the same logical
+    chunk as "{resolved_path}_{chunk_index}". ``vector_fusion_id`` maps the
+    former to the latter by splitting on the LAST "::" only (the separator
+    ``add_document`` appends), never a blind global replace, so a path
+    containing "::" or "_" is handled correctly.
+
+    Tests above (``test_hybrid_search_with_recency`` etc.) mock vector ids
+    as plain strings like "old_chunk" that already match their BM25
+    counterpart. Every test below instead uses the real id formats both
+    indexers actually produce.
+    """
+
+    @pytest.fixture
+    def temp_db(self):
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            yield f.name
+        os.unlink(f.name)
+
+    # -- vector_fusion_id unit coverage -----------------------------------
+
+    def test_fusion_id_normalizes_chunk_zero(self):
+        from api.services.hybrid_search import vector_fusion_id
+        assert vector_fusion_id("/vault/Notes.md::0") == "/vault/Notes.md_0"
+
+    def test_fusion_id_normalizes_a_later_chunk(self):
+        from api.services.hybrid_search import vector_fusion_id
+        assert vector_fusion_id("/vault/Notes.md::12") == "/vault/Notes.md_12"
+
+    def test_fusion_id_preserves_double_colon_inside_the_filename(self):
+        """Only the LAST "::" (the deliberate separator) is split on, so a
+        filename that itself contains "::" is never corrupted -- a global
+        str.replace("::", "_") would wrongly rewrite both occurrences."""
+        from api.services.hybrid_search import vector_fusion_id
+        assert vector_fusion_id("/vault/Section::Notes.md::3") == "/vault/Section::Notes.md_3"
+
+    def test_fusion_id_preserves_underscore_inside_the_filename(self):
+        from api.services.hybrid_search import vector_fusion_id
+        assert vector_fusion_id("/vault/Q4_Report.md::0") == "/vault/Q4_Report.md_0"
+
+    def test_fusion_id_leaves_a_non_numeric_suffix_unchanged(self):
+        """No vector chunk is ever stored with a non-numeric suffix today
+        (summary records are BM25-only), but a non-numeric trailing segment
+        after "::" has nothing safe to normalize, so it is left as-is
+        rather than guessing."""
+        from api.services.hybrid_search import vector_fusion_id
+        assert vector_fusion_id("/vault/Doc.md::summary") == "/vault/Doc.md::summary"
+
+    def test_fusion_id_leaves_an_id_without_a_separator_unchanged(self):
+        from api.services.hybrid_search import vector_fusion_id
+        assert vector_fusion_id("no-separator-here") == "no-separator-here"
+
+    # -- integration: fusion + metadata retention with real id formats ----
+
+    def test_semantic_score_and_metadata_survive_when_bm25_also_matches(self, temp_db):
+        """semantic_score and vector-only metadata (note_type) must survive
+        fusion when BM25 also returns a match for the same logical chunk —
+        the two id representations fuse into exactly one result, sourced
+        from the vector side, regardless of which side's own recency date
+        is more recent (the BM25 side is deliberately given the more
+        recent date here specifically to rule that out as a factor).
+        """
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+        from datetime import datetime, timedelta
+
+        file_path = "/vault/Budget Review.md"
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(
+            f"{file_path}_0", "Q4 budget planning meeting", "Budget Review.md",
+            modified_date=datetime.now().strftime("%Y-%m-%d"),
+        )
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [{
+            "id": f"{file_path}::0",  # the actual Chroma-native format
+            "content": "Q4 budget planning meeting",
+            "file_path": file_path,
+            "file_name": "Budget Review.md",
+            "note_type": "Work",
+            "modified_date": (datetime.now() - timedelta(days=1000)).strftime("%Y-%m-%d"),
+            "semantic_score": 0.87,
+            "recency_score": 0.5,
+            "chunk_index": 0,
+        }]
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search("budget", top_k=5, use_reranker=False)
+
+        assert len(results) == 1, "the same logical chunk found by both indexes must fuse into ONE result"
+        assert results[0].get("semantic_score") == 0.87, "semantic score must survive when BM25 also matches"
+        assert results[0].get("note_type") == "Work", "vector-only metadata must survive when BM25 also matches"
+        # Both lists rank this chunk #1 (only candidate in each), so a TRUE
+        # fusion accumulates both contributions: 1/(60+1) + 1/(60+1) = 2/61.
+        # A single unfused representation would show only one list's
+        # contribution (1/61).
+        assert results[0].get("rrf_score") == pytest.approx(2 / 61), (
+            "the same chunk must accumulate rank contributions from both lists"
+        )
+
+    def test_distinct_chunks_of_the_same_file_do_not_incorrectly_fuse(self, temp_db):
+        """Two DIFFERENT (non-adjacent, so overlap dedup doesn't also
+        remove one) chunks of the same file must never collapse into one
+        result just because they share a file_path prefix."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        file_path = "/vault/Notes.md"
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(f"{file_path}_0", "chunk zero content", "Notes.md")
+        bm25.add_document(f"{file_path}_5", "chunk five content", "Notes.md")
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": f"{file_path}::0", "content": "chunk zero content", "file_path": file_path, "semantic_score": 0.9, "chunk_index": 0},
+            {"id": f"{file_path}::5", "content": "chunk five content", "file_path": file_path, "semantic_score": 0.8, "chunk_index": 5},
+        ]
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search("chunk content", top_k=5, use_reranker=False)
+
+        ids = {r["id"] for r in results}
+        assert ids == {f"{file_path}::0", f"{file_path}::5"}
+
+    def test_vector_only_match_retains_metadata_when_bm25_has_unrelated_results(self, temp_db):
+        """A chunk found ONLY by vector search (absent from BM25's result
+        set entirely) must still surface with its semantic score and
+        metadata intact, even though BM25 found OTHER, different chunks
+        for the SAME query — i.e. this must actually exercise the fusion
+        branch, not accidentally take the "no BM25 results at all" early
+        return (``HybridSearch.search``'s ``if not bm25_doc_ids: return
+        vector_results[:top_k]`` path), which would prove nothing about
+        fusion."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        vector_only_path = "/vault/Semantic Only.md"
+        bm25_path = "/vault/Keyword Match.md"
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(f"{bm25_path}_0", "keyword heavy content", "Keyword Match.md")
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [{
+            "id": f"{vector_only_path}::0",
+            "content": "conceptually related content",
+            "file_path": vector_only_path,
+            "semantic_score": 0.91,
+            "note_type": "Personal",
+            "chunk_index": 0,
+        }]
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search("keyword content", top_k=5, use_reranker=False)
+
+        ids = {r["id"] for r in results}
+        assert f"{bm25_path}_0" in ids, "the BM25 branch must actually be exercised (nonempty), not the vector-only early return"
+
+        vector_only_result = next(r for r in results if r["id"] == f"{vector_only_path}::0")
+        assert vector_only_result["semantic_score"] == 0.91
+        assert vector_only_result["note_type"] == "Personal"
+
+    def test_summary_id_stays_bm25_only_and_never_falsely_fuses(self, temp_db):
+        """Summary chunks exist only in BM25 (an "::summary" suffix; they
+        are never indexed into the vector store — see
+        IndexerService.index_file) and must never be mistaken for a
+        numbered vector chunk of the same file. The query is chosen to
+        match BOTH BM25 documents under BM25Index's own OR semantics
+        (each document contributes distinct terms), so this genuinely
+        exercises the fusion branch for the real chunk while the summary
+        stays a real, independent BM25 hit alongside it."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        file_path = "/vault/Doc.md"
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(f"{file_path}::summary", "a generated summary of the document", "Doc.md")
+        bm25.add_document(f"{file_path}_0", "the real chunk content", "Doc.md")
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [{
+            "id": f"{file_path}::0", "content": "the real chunk content",
+            "file_path": file_path, "semantic_score": 0.8, "chunk_index": 0,
+        }]
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search("summary document chunk content", top_k=5, use_reranker=False)
+
+        ids = {r["id"] for r in results}
+        assert f"{file_path}::summary" in ids, "the BM25-only summary result must survive, unfused"
+        real_chunk = next(r for r in results if r["id"] == f"{file_path}::0")
+        assert real_chunk["semantic_score"] == 0.8, "the numbered chunk must still fuse and keep its semantic score"
+
+    def test_summary_file_path_not_corrupted_when_filename_contains_underscore(self, temp_db):
+        """A summary id whose filename itself contains an underscore
+        ("/vault/my_note.md::summary") must resolve to the full filename,
+        not get cut at the underscore inside it."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        file_path = "/vault/my_note.md"
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(f"{file_path}::summary", "a generated summary of my note", "my_note.md")
+
+        empty_vector_store = MagicMock()
+        empty_vector_store.search.return_value = []
+        hybrid = HybridSearch(vector_store=empty_vector_store, bm25_index=bm25)
+        results = hybrid.search("generated summary", top_k=5, use_reranker=False)
+
+        assert len(results) == 1
+        assert results[0]["file_path"] == file_path
+        assert results[0]["metadata"]["file_path"] == file_path
+
+    def test_fusion_handles_a_filename_containing_an_underscore(self, temp_db):
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        file_path = "/vault/Q4_Report.md"  # the filename itself contains an underscore
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(f"{file_path}_0", "quarterly numbers", "Q4_Report.md")
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [{
+            "id": f"{file_path}::0", "content": "quarterly numbers",
+            "file_path": file_path, "semantic_score": 0.75, "chunk_index": 0,
+        }]
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search("quarterly", top_k=5, use_reranker=False)
+
+        assert len(results) == 1
+        assert results[0]["semantic_score"] == 0.75
+
+    def test_recency_changes_ordering_with_the_actual_vector_id_format(self, temp_db):
+        """Same pairwise-recency proof as test_hybrid_search_with_recency /
+        test_recency_boost_disabled_keeps_semantic_order above, but with
+        BOTH documents present in BOTH indexes using their real,
+        differently-formatted ids — proving the id-fusion fix and the
+        recency boost compose correctly, not just each in isolation.
+
+        The second (unboosted) call is the mutation check: if recency
+        boosting silently became a no-op, the FIRST assertion below would
+        fail (the older, semantically-favored-by-listing-order doc would
+        stay on top), so this test only passes when recency demonstrably
+        changes the ordering.
+        """
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+        from datetime import datetime, timedelta
+
+        old_path, new_path = "/vault/Old.md", "/vault/New.md"
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(f"{old_path}_0", "Budget content old", "Old.md")
+        bm25.add_document(f"{new_path}_0", "Budget content new", "New.md")
+
+        old_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        new_date = datetime.now().strftime("%Y-%m-%d")
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": f"{old_path}::0", "content": "Budget content old", "file_path": old_path, "modified_date": old_date, "chunk_index": 0},
+            {"id": f"{new_path}::0", "content": "Budget content new", "file_path": new_path, "modified_date": new_date, "chunk_index": 0},
+        ]
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+
+        boosted = hybrid.search("budget", top_k=5, use_reranker=False, apply_recency_boost=True)
+        assert boosted[0]["id"] == f"{new_path}::0", "recency boost must promote the newer, equally-relevant doc"
+
+        unboosted = hybrid.search("budget", top_k=5, use_reranker=False, apply_recency_boost=False)
+        assert unboosted[0]["id"] == f"{old_path}::0", (
+            "mutation check: without the boost, the doc listed first (better raw rank) must stay on "
+            "top — proving the boosted assertion above actually depends on recency, not coincidence"
+        )
+
+
 class TestQueryAwareReranking:
     """Test query-aware reranking in hybrid search."""
 

@@ -33,14 +33,21 @@ See CLAUDE.md for full instructions for AI coding agents.
 # candidate IS the repo root there), so server behavior is unchanged, while
 # a nested import (worktree, tests) only loads a `.env` that actually lives
 # in that same checkout — never a parent's.
+#
+# Exception: an isolated test instance sets LIFEOS_TEST_INSTANCE=1 and must
+# never source a real `.env`, even
+# one that happens to exist at this path (e.g. a source snapshot built from
+# a checkout that somehow still had one) — its own sanitized environment is
+# the only configuration source.
+import os
 from pathlib import Path
-from dotenv import load_dotenv
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+if os.environ.get("LIFEOS_TEST_INSTANCE") != "1":
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import asyncio
 import hashlib
 import logging
-import os
 import socket
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -135,128 +142,139 @@ async def lifespan(app: FastAPI):
     # below, this must actually stop startup on a mismatch.
     check_server_host_guard()
 
-    # Startup: Recover any incomplete merge operations
-    try:
-        from scripts.merge_people import recover_incomplete_merge
-        if recover_incomplete_merge():
-            logger.warning("Recovered incomplete merge operation on startup")
-    except Exception as e:
-        logger.error(f"Failed to check for incomplete merges: {e}")
-
-    # Startup: Initialize and start Calendar indexer at specific times (Eastern)
-    try:
-        from api.services.calendar_indexer import get_calendar_indexer
-        _calendar_indexer = get_calendar_indexer()
-        # Sync at 8 AM, noon, and 3 PM Eastern
-        _calendar_indexer.start_time_scheduler(
-            schedule_times=[(8, 0), (12, 0), (15, 0)],
-            timezone=settings.timezone
-        )
-        logger.info("Calendar indexer scheduler started (8:00, 12:00, 15:00 Eastern)")
-    except Exception as e:
-        logger.error(f"Failed to start Calendar indexer: {e}")
-
-    # Health monitoring (previously an in-process 2:30/7:00 scheduler) now runs
-    # out-of-band in nbramia/local-processing via the lifeos_health watcher.
-
-    # Startup: Start Telegram bot listeners (primary + any specialized bots)
-    try:
-        from api.services.telegram import get_telegram_listeners
-        _telegram_listeners = get_telegram_listeners()
-        for _listener in _telegram_listeners:
-            _listener.start()
-    except Exception as e:
-        logger.error(f"Failed to start Telegram bot listeners: {e}")
-
-    # Startup: Start the scheduler (cron/one-off triggers → actions) and watch
-    # LifeOS/Scheduler/ for external edits (e.g. via Obsidian). Markdown is the
-    # source of truth, so rebuild the index from the vault before firing.
-    try:
-        from api.services.scheduler_store import get_scheduler, get_scheduler_store
-        from api.services.scheduler_watcher import SchedulerWatcher
-        store = get_scheduler_store()
-        store.rebuild_index()
-        _reminder_scheduler = get_scheduler()
-        _reminder_scheduler.start()
-        _scheduler_watcher = SchedulerWatcher(scheduler_dir=store.scheduler_dir)
-        _scheduler_watcher.start()
-    except Exception as e:
-        logger.error(f"Failed to start scheduler: {e}")
-
-    # Startup: Start job queue worker
-    try:
-        from api.services.job_queue import get_job_queue
-        _job_queue = get_job_queue()
-        _job_queue.start_worker()
-        logger.info("Job queue worker started")
-    except Exception as e:
-        logger.error(f"Failed to start job queue worker: {e}")
-
-    # Startup: Watch LifeOS/Tasks/ for external edits (e.g. via Obsidian) so
-    # the task index and auto-generated Dashboard stay in sync.
-    try:
-        from api.services.task_manager import get_task_manager
-        from api.services.task_watcher import TaskWatcher
-        tm = get_task_manager()
-        # Pull tasks from disk once at startup in case files changed while we were down
-        tm.rebuild_index()
-        _task_watcher = TaskWatcher(tasks_dir=tm.tasks_dir)
-        _task_watcher.start()
-    except Exception as e:
-        logger.error(f"Failed to start task file watcher: {e}")
-
-    # Pebble archive consumer is deliberately separate from native Journal
-    # capture.  The producer retains ownership of LifeOS/Log/Pebble and this
-    # watcher only reads validated frames; effect writes stay disabled by
-    # default until dry-run validation is complete.
-    if settings.pebble_capture_enabled:
+    # An isolated test instance never starts any background job:
+    # calendar sync, Telegram polling, the scheduler/task watchers, the job
+    # queue worker, and the agent-viz/transcript-mirror prefetch loops all
+    # talk to the operator's real vault/services or run on wall-clock
+    # schedules that have no place in a short-lived synthetic instance. Every
+    # shutdown block below is already a no-op when its global was never set,
+    # so skipping straight to `yield` here is sufficient — no matching
+    # shutdown-side guard is needed.
+    if os.environ.get("LIFEOS_TEST_INSTANCE") != "1":
+        # Startup: Recover any incomplete merge operations
         try:
-            from api.services.pebble_capture import CaptureLedger, PebbleCaptureConsumer
-            from api.services.pebble_capture_watcher import PebbleCaptureWatcher
-            from api.services.scheduler_store import get_scheduler_store
-            from api.services.task_manager import get_task_manager
-            capture_dir = (settings.vault_path / settings.pebble_capture_dir).resolve()
-            if capture_dir.parent != (settings.vault_path / "LifeOS" / "Log").resolve():
-                raise ValueError("Pebble capture directory must be LifeOS/Log/Pebble")
-            ledger = CaptureLedger(Path("data") / "pebble_capture.db")
-            consumer = PebbleCaptureConsumer(
-                ledger, get_task_manager(), get_scheduler_store(), apply=settings.pebble_capture_apply,
-            )
-            _pebble_capture_watcher = PebbleCaptureWatcher(
-                capture_dir, consumer, scan_seconds=settings.pebble_capture_scan_seconds,
-            )
-            # Observer setup may touch a network-backed vault. Keep even that
-            # bounded filesystem work off FastAPI's event loop; startup
-            # recovery itself is queued onto the watcher's consumer thread.
-            await asyncio.to_thread(_pebble_capture_watcher.start)
+            from scripts.merge_people import recover_incomplete_merge
+            if recover_incomplete_merge():
+                logger.warning("Recovered incomplete merge operation on startup")
         except Exception as e:
-            logger.error(f"Failed to start Pebble capture watcher: {e}")
+            logger.error(f"Failed to check for incomplete merges: {e}")
 
-    # Startup: Background prefetch for /agents session summaries — so the
-    # graph already shows real short labels by the time the operator looks.
-    try:
-        from api.services import agent_viz_summary_prefetch
-        agent_viz_summary_prefetch.start()
-    except Exception as e:
-        logger.error(f"Failed to start agent_viz prefetch loop: {e}")
+        # Startup: Initialize and start Calendar indexer at specific times (Eastern)
+        try:
+            from api.services.calendar_indexer import get_calendar_indexer
+            _calendar_indexer = get_calendar_indexer()
+            # Sync at 8 AM, noon, and 3 PM Eastern
+            _calendar_indexer.start_time_scheduler(
+                schedule_times=[(8, 0), (12, 0), (15, 0)],
+                timezone=settings.timezone
+            )
+            logger.info("Calendar indexer scheduler started (8:00, 12:00, 15:00 Eastern)")
+        except Exception as e:
+            logger.error(f"Failed to start Calendar indexer: {e}")
 
-    # Startup: background transcript mirror — pulls each registered
-    # host's Claude Code/Codex transcripts onto this box so remote sessions
-    # reach parity with local ones on /agents. No-op when no hosts are
-    # registered.
-    try:
-        from api.services import agent_transcript_mirror
-        agent_transcript_mirror.start()
-    except Exception as e:
-        logger.error(f"Failed to start agent transcript mirror loop: {e}")
+        # Health monitoring (previously an in-process 2:30/7:00 scheduler) now runs
+        # out-of-band in nbramia/local-processing via the lifeos_health watcher.
 
-    # Hint for new users who haven't set their person ID yet
-    if not settings.my_person_id and settings.user_name and settings.user_name != "User":
-        logger.info(
-            "LIFEOS_MY_PERSON_ID not set. After your first sync, find your ID with:\n"
-            f'  curl "http://localhost:8000/api/crm/people?q={settings.user_name}" | jq \'.people[0].id\'\n'
-            "Then add to .env: LIFEOS_MY_PERSON_ID=<your-id>"
-        )
+        # Startup: Start Telegram bot listeners (primary + any specialized bots)
+        try:
+            from api.services.telegram import get_telegram_listeners
+            _telegram_listeners = get_telegram_listeners()
+            for _listener in _telegram_listeners:
+                _listener.start()
+        except Exception as e:
+            logger.error(f"Failed to start Telegram bot listeners: {e}")
+
+        # Startup: Start the scheduler (cron/one-off triggers → actions) and watch
+        # LifeOS/Scheduler/ for external edits (e.g. via Obsidian). Markdown is the
+        # source of truth, so rebuild the index from the vault before firing.
+        try:
+            from api.services.scheduler_store import get_scheduler, get_scheduler_store
+            from api.services.scheduler_watcher import SchedulerWatcher
+            store = get_scheduler_store()
+            store.rebuild_index()
+            _reminder_scheduler = get_scheduler()
+            _reminder_scheduler.start()
+            _scheduler_watcher = SchedulerWatcher(scheduler_dir=store.scheduler_dir)
+            _scheduler_watcher.start()
+        except Exception as e:
+            logger.error(f"Failed to start scheduler: {e}")
+
+        # Startup: Start job queue worker
+        try:
+            from api.services.job_queue import get_job_queue
+            _job_queue = get_job_queue()
+            _job_queue.start_worker()
+            logger.info("Job queue worker started")
+        except Exception as e:
+            logger.error(f"Failed to start job queue worker: {e}")
+
+        # Startup: Watch LifeOS/Tasks/ for external edits (e.g. via Obsidian) so
+        # the task index and auto-generated Dashboard stay in sync.
+        try:
+            from api.services.task_manager import get_task_manager
+            from api.services.task_watcher import TaskWatcher
+            tm = get_task_manager()
+            # Pull tasks from disk once at startup in case files changed while we were down
+            tm.rebuild_index()
+            _task_watcher = TaskWatcher(tasks_dir=tm.tasks_dir)
+            _task_watcher.start()
+        except Exception as e:
+            logger.error(f"Failed to start task file watcher: {e}")
+
+        # Pebble archive consumer is deliberately separate from native Journal
+        # capture.  The producer retains ownership of LifeOS/Log/Pebble and this
+        # watcher only reads validated frames; effect writes stay disabled by
+        # default until dry-run validation is complete.
+        if settings.pebble_capture_enabled:
+            try:
+                from api.services.pebble_capture import CaptureLedger, PebbleCaptureConsumer
+                from api.services.pebble_capture_watcher import PebbleCaptureWatcher
+                from api.services.scheduler_store import get_scheduler_store
+                from api.services.task_manager import get_task_manager
+                capture_dir = (settings.vault_path / settings.pebble_capture_dir).resolve()
+                if capture_dir.parent != (settings.vault_path / "LifeOS" / "Log").resolve():
+                    raise ValueError("Pebble capture directory must be LifeOS/Log/Pebble")
+                ledger = CaptureLedger(Path("data") / "pebble_capture.db")
+                consumer = PebbleCaptureConsumer(
+                    ledger, get_task_manager(), get_scheduler_store(), apply=settings.pebble_capture_apply,
+                )
+                _pebble_capture_watcher = PebbleCaptureWatcher(
+                    capture_dir, consumer, scan_seconds=settings.pebble_capture_scan_seconds,
+                )
+                # Observer setup may touch a network-backed vault. Keep even that
+                # bounded filesystem work off FastAPI's event loop; startup
+                # recovery itself is queued onto the watcher's consumer thread.
+                await asyncio.to_thread(_pebble_capture_watcher.start)
+            except Exception as e:
+                logger.error(f"Failed to start Pebble capture watcher: {e}")
+
+        # Startup: Background prefetch for /agents session summaries — so the
+        # graph already shows real short labels by the time the operator looks.
+        try:
+            from api.services import agent_viz_summary_prefetch
+            agent_viz_summary_prefetch.start()
+        except Exception as e:
+            logger.error(f"Failed to start agent_viz prefetch loop: {e}")
+
+        # Startup: background transcript mirror — pulls each registered
+        # host's Claude Code/Codex transcripts onto this box so remote sessions
+        # reach parity with local ones on /agents. No-op when no hosts are
+        # registered.
+        try:
+            from api.services import agent_transcript_mirror
+            agent_transcript_mirror.start()
+        except Exception as e:
+            logger.error(f"Failed to start agent transcript mirror loop: {e}")
+
+        # Hint for new users who haven't set their person ID yet
+        if not settings.my_person_id and settings.user_name and settings.user_name != "User":
+            logger.info(
+                "LIFEOS_MY_PERSON_ID not set. After your first sync, find your ID with:\n"
+                f'  curl "http://localhost:8000/api/crm/people?q={settings.user_name}" | jq \'.people[0].id\'\n'
+                "Then add to .env: LIFEOS_MY_PERSON_ID=<your-id>"
+            )
+    else:
+        logger.info("LIFEOS_TEST_INSTANCE=1: skipping all lifespan background jobs")
 
     yield  # Application runs here
 
@@ -507,6 +525,21 @@ async def health_check():
         "service": "lifeos",
         "checks": checks,
     }
+
+
+if os.environ.get("LIFEOS_TEST_INSTANCE") == "1":
+    # Scoped test-only identity route — mounted only inside an
+    # isolated test instance, never in a normal server. This exists so a
+    # runner can positively confirm *this exact* candidate answered (not
+    # merely that some server is healthy) without adding a public endpoint:
+    # the route itself doesn't exist unless LIFEOS_TEST_INSTANCE=1, and its
+    # response is sourced only from this process's own sanitized env.
+    @app.get("/_test_instance/identity")
+    async def _test_instance_identity():
+        return {
+            "candidate_id": os.environ.get("LIFEOS_TEST_CANDIDATE_ID", ""),
+            "token": os.environ.get("LIFEOS_TEST_TOKEN", ""),
+        }
 
 
 @app.get("/health/raw-state")

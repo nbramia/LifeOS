@@ -1,13 +1,178 @@
 """Tests for dependency-skip behavior and LLM memory gating in run_all_syncs."""
 
+import functools
 import subprocess
 import sys
+import tempfile
 import time
+import logging
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
 
 pytestmark = pytest.mark.unit
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@functools.lru_cache(maxsize=1)
+def _git_backed_repo_root() -> Path:
+    """REPO_ROOT has no .git when this test runs inside an isolated
+    verifier snapshot (scripts/candidate_snapshot.py's build_snapshot never
+    copies .git, by design), but build_snapshot itself requires a git
+    source to enumerate from. Stage the exact current content into an
+    owned disposable git repo instead; cached, since rebuilding a
+    repo-sized copy per call would be wasteful and the content is fixed
+    for this process's lifetime."""
+    if (REPO_ROOT / ".git").exists():
+        return REPO_ROOT
+    fixture = Path(tempfile.mkdtemp(prefix="lifeos-sync-snapshot-fixture-"))
+    subprocess.run(["rsync", "-a", "--exclude=.git", f"{REPO_ROOT}/", f"{fixture}/"], check=True)
+    subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=fixture, check=True)
+    # Gitignored-but-force-tracked in the real repo (see .gitignore's own
+    # comments on these two entries) -- a fresh `git add -A` in a brand-new
+    # repo has no tracked-history override for either.
+    for forced in ("AGENTS.md", "tests/test_p91_data_integrity.py"):
+        if (fixture / forced).exists():
+            subprocess.run(["git", "add", "-f", "--", forced], cwd=fixture, check=True)
+    return fixture
+
+
+@pytest.fixture(autouse=True)
+def isolated_sync_file_logging(tmp_path, monkeypatch):
+    """Isolate sync logging and restore the process logging state afterward."""
+    from scripts import run_all_syncs
+
+    root = logging.getLogger()
+    httpx_logger = logging.getLogger("httpx")
+    root_level_before = root.level
+    httpx_level_before = httpx_logger.level
+    root_filters_before = list(root.filters)
+    handlers_before = list(root.handlers)
+    handler_filters_before = {id(handler): list(handler.filters) for handler in handlers_before}
+
+    old_handler = run_all_syncs._sync_log_handler
+    old_log_file = run_all_syncs.log_file
+    if old_handler is not None:
+        root.removeHandler(old_handler)
+    run_all_syncs._sync_log_handler = None
+    run_all_syncs.log_file = None
+    monkeypatch.setattr(run_all_syncs, "LOG_DIR", tmp_path / "logs")
+    yield
+    handler = run_all_syncs._sync_log_handler
+    if handler is not None and handler is not old_handler:
+        root.removeHandler(handler)
+        handler.close()
+
+    for h in list(root.handlers):
+        root.removeHandler(h)
+        if h not in handlers_before:
+            h.close()
+    for h in handlers_before:
+        h.filters = handler_filters_before[id(h)]
+        root.addHandler(h)
+    root.setLevel(root_level_before)
+    httpx_logger.setLevel(httpx_level_before)
+    root.filters = root_filters_before
+    run_all_syncs._sync_log_handler = old_handler
+    run_all_syncs.log_file = old_log_file
+
+
+def test_isolated_sync_file_logging_restores_preexisting_handler(tmp_path, monkeypatch):
+    """The fixture restores a pre-existing sync handler and logging state."""
+    from scripts import run_all_syncs
+
+    root = logging.getLogger()
+    httpx_logger = logging.getLogger("httpx")
+    pre_existing = logging.FileHandler(tmp_path / "pre-existing-sync.log")
+    root.addHandler(pre_existing)
+    httpx_logger.setLevel(logging.INFO)
+    root.setLevel(logging.WARNING)
+    run_all_syncs._sync_log_handler = pre_existing
+    original_log_file = tmp_path / "pre-existing-sync.log"
+    run_all_syncs.log_file = original_log_file
+    fixture = isolated_sync_file_logging.__wrapped__(tmp_path, monkeypatch)
+    try:
+        baseline_root_level = root.level
+        baseline_httpx_level = httpx_logger.level
+        baseline_root_filters = list(root.filters)
+        baseline_handlers = list(root.handlers)
+        baseline_pre_existing_filters = list(pre_existing.filters)
+
+        next(fixture)
+        run_all_syncs.configure_sync_logging()
+        assert httpx_logger.level != baseline_httpx_level
+
+        with pytest.raises(StopIteration):
+            next(fixture)
+
+        assert httpx_logger.level == baseline_httpx_level
+        assert root.level == baseline_root_level
+        assert root.filters == baseline_root_filters
+        assert list(root.handlers) == baseline_handlers
+        assert pre_existing.filters == baseline_pre_existing_filters
+        assert pre_existing.stream is not None
+        assert run_all_syncs._sync_log_handler is pre_existing
+        assert run_all_syncs.log_file == original_log_file
+    finally:
+        if pre_existing in root.handlers:
+            root.removeHandler(pre_existing)
+        pre_existing.close()
+        run_all_syncs._sync_log_handler = None
+        run_all_syncs.log_file = None
+
+
+def test_import_does_not_create_timestamped_sync_log(tmp_path):
+    """A fresh candidate import creates neither a log directory nor a file."""
+    from scripts.candidate_snapshot import build_snapshot
+
+    fresh_source = tmp_path / "fresh-source"
+    build_snapshot(_git_backed_repo_root(), fresh_source)
+    log_dir = fresh_source / "logs"
+    assert not log_dir.exists()
+    result = subprocess.run(
+        [sys.executable, "-c", "import scripts.run_all_syncs"],
+        cwd=fresh_source,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not log_dir.exists()
+
+
+def test_explicit_sync_logging_writes_a_redacted_file(tmp_path):
+    """The lazy setup retains a timestamped file and Telegram redaction."""
+    program = """
+from pathlib import Path
+import logging
+from scripts import run_all_syncs
+run_all_syncs.LOG_DIR = Path(__import__('sys').argv[1])
+path = run_all_syncs.configure_sync_logging()
+logging.getLogger('synthetic.sync').warning('synthetic bot123456:secret-value')
+for handler in logging.getLogger().handlers:
+    handler.flush()
+print(f'LOG_PATH={path}')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", program, str(tmp_path)],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    log_path = Path(next(
+        line.split("=", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("LOG_PATH=")
+    ))
+    assert log_path.parent == tmp_path
+    contents = log_path.read_text()
+    assert "bot<REDACTED>" in contents
+    assert "secret-value" not in contents
 
 # Minimal SYNC_SOURCES for tests — only defines metadata (depends_on, frequency, phase).
 # The actual sync logic is mocked via run_sync.

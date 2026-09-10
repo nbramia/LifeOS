@@ -29,6 +29,38 @@ def _run(project_dir: Path, *command: str) -> subprocess.CompletedProcess:
     )
 
 
+def _git_ls_files_mode(path: Path, tmp_path: Path) -> str:
+    """`git ls-files -s` reports the INDEX mode, distinct from the file's
+    own filesystem stat() bit -- the check this exists for. Run against
+    REPO_ROOT when it's a real git checkout: this proves the actual
+    committed index entry, catching a bad index entry even when a local
+    `chmod +x` masks it on the working-tree copy. When REPO_ROOT has no
+    `.git` (an isolated verifier snapshot, which never includes one -- see
+    scripts/candidate_snapshot.py), there is no original index entry
+    available to check at all; stage this file's own snapshotted content
+    and executable mode into an owned disposable repo instead, so the
+    check exercises real `git add`/`ls-files` mechanics on that
+    snapshotted state rather than erroring out -- this proves the
+    snapshotted content's mode round-trips through git correctly, not the
+    original repository's committed index entry."""
+    if (REPO_ROOT / ".git").exists():
+        return subprocess.run(
+            ["git", "ls-files", "-s", "--", str(path)],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+        ).stdout
+    fixture = tmp_path / "git-index-mode-fixture"
+    fixture.mkdir()
+    staged = fixture / path.name
+    staged.write_bytes(path.read_bytes())
+    staged.chmod(path.stat().st_mode)
+    subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+    subprocess.run(["git", "add", "--", path.name], cwd=fixture, check=True)
+    return subprocess.run(
+        ["git", "ls-files", "-s", "--", path.name],
+        cwd=fixture, capture_output=True, text=True, check=True,
+    ).stdout
+
+
 @pytest.mark.unit
 def test_wrapper_exports_plain_value(tmp_path: Path):
     if not WRAPPER.exists():
@@ -148,7 +180,7 @@ def test_wrapper_usage_error_with_fewer_than_two_args(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_wrapper_is_executable():
+def test_wrapper_is_executable(tmp_path: Path):
     """Checks the git INDEX mode, not the working-tree file's stat() bit
     (found on re-review of an equivalent test in test_auto_update_macos.py)
     — a local `chmod +x` on the working-tree copy alone would pass this
@@ -156,8 +188,5 @@ def test_wrapper_is_executable():
     mode is actually committed."""
     if not WRAPPER.exists():
         pytest.skip("scripts/launchd-env-wrapper.sh not present")
-    ls_files = subprocess.run(
-        ["git", "ls-files", "-s", "--", str(WRAPPER)],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
-    ).stdout
+    ls_files = _git_ls_files_mode(WRAPPER, tmp_path)
     assert ls_files.startswith("100755"), f"git index mode is not 100755: {ls_files!r}"

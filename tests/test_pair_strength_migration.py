@@ -6,11 +6,115 @@ maintains reasonable behavior and doesn't break the system.
 
 Run with: pytest tests/test_pair_strength_migration.py -v
 """
+import sqlite3
+from pathlib import Path
+
 import pytest
 from datetime import datetime, timedelta, timezone
 
 # Mark all tests as unit tests
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture
+def worker_relationship_db(tmp_path_factory):
+    """Return a unique synthetic CRM path for this test invocation.
+
+    xdist workers get separate basetemp trees, and each test gets a fresh
+    child, so relationship stores cannot accidentally share a process-wide
+    singleton or a real workspace database.
+    """
+    return tmp_path_factory.mktemp("pair-strength-crm") / "crm.db"
+
+
+@pytest.fixture(autouse=True)
+def isolate_relationship_and_person_stores(monkeypatch, worker_relationship_db):
+    """Point both singleton stores at an isolated synthetic database."""
+    import api.services.person_entity as person_entity
+    from api.services.person_entity import PersonEntity, get_person_entity_store
+    from api.services.relationship import Relationship, get_relationship_store, reset_relationship_store
+    from config.settings import settings
+
+    monkeypatch.setattr(
+        "api.services.relationship.get_crm_db_path",
+        lambda: str(worker_relationship_db),
+    )
+    monkeypatch.setattr(
+        person_entity.PersonEntityStore,
+        "CRM_DB_PATH",
+        worker_relationship_db,
+    )
+
+    def reset_person_store():
+        old_store = person_entity._entity_store
+        if old_store is not None and old_store._data_version_conn is not None:
+            old_store._data_version_conn.close()
+        person_entity._entity_store = None
+
+    reset_relationship_store()
+    reset_person_store()
+    monkeypatch.setattr(settings, "my_person_id", "synthetic-owner", raising=False)
+
+    person_store = get_person_entity_store()
+    for person, strength in (
+        (PersonEntity(id="synthetic-owner", canonical_name="Synthetic Owner"), 0),
+        (PersonEntity(id="synthetic-contact", canonical_name="Synthetic Contact"), 83),
+        (PersonEntity(id="synthetic-peer", canonical_name="Synthetic Peer"), 37),
+    ):
+        person.relationship_strength = strength
+        person_store.add(person)
+
+    now = datetime.now(timezone.utc)
+    relationship_store = get_relationship_store()
+    relationship_store.add(Relationship(
+        id="synthetic-owner-contact",
+        person_a_id="synthetic-owner",
+        person_b_id="synthetic-contact",
+        shared_events_count=4,
+        last_seen_together=now,
+    ))
+    relationship_store.add(Relationship(
+        id="synthetic-contact-peer",
+        person_a_id="synthetic-contact",
+        person_b_id="synthetic-peer",
+        shared_threads_count=3,
+        last_seen_together=now,
+    ))
+    yield
+    reset_relationship_store()
+    reset_person_store()
+
+
+def test_relationship_store_uses_unique_populated_synthetic_db(worker_relationship_db):
+    """The fixture creates the schema in its own path, not cwd/data/crm.db."""
+    from api.services.relationship import get_relationship_store
+
+    store = get_relationship_store()
+    assert Path(store.db_path) == worker_relationship_db
+    with sqlite3.connect(worker_relationship_db) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert "relationships" in tables
+
+
+def test_existing_synthetic_cwd_db_is_not_modified(
+    tmp_path, worker_relationship_db, monkeypatch,
+):
+    """An existing synthetic cwd/data/crm.db remains an untouched sentinel."""
+    cwd_db = tmp_path / "data" / "crm.db"
+    cwd_db.parent.mkdir()
+    cwd_db.write_bytes(b"synthetic-cwd-sentinel")
+    monkeypatch.chdir(tmp_path)
+
+    from api.services.relationship import get_relationship_store
+
+    get_relationship_store().get_all_relationships()
+    assert cwd_db.read_bytes() == b"synthetic-cwd-sentinel"
+    assert worker_relationship_db.exists()
 
 
 class TestPairStrengthBaseline:
@@ -172,13 +276,11 @@ class TestNetworkGraphIntegration:
         # Use settings.my_person_id to get the correct owner ID
         # (get_by_name may return wrong ID if there are duplicates)
         owner = person_store.get_by_id(settings.my_person_id)
-        if owner is None:
-            pytest.skip("Owner PersonEntity not populated (expected for open-source default)")
+        assert owner is not None, "Synthetic owner fixture must be populated"
 
         rel_store = get_relationship_store()
         rels = rel_store.get_for_person(owner.id)
-        if not rels:
-            pytest.skip("Owner has no relationships (expected for fresh install)")
+        assert rels, "Synthetic owner fixture must have relationships"
 
         # All should have edge_weight (or pair_strength after migration)
         for rel in rels[:10]:
@@ -199,27 +301,21 @@ class TestEdgeWeightSourceLogic:
         rel_store = get_relationship_store()
         owner_id = settings.my_person_id
 
-        # Find a person with relationship_strength
-        all_people = person_store.get_all()
-        test_person = None
-        for p in all_people:
-            if p.id != owner_id and p.relationship_strength > 0:
-                rel = rel_store.get_between(owner_id, p.id)
-                if rel:
-                    test_person = p
-                    break
+        test_person = person_store.get_by_id("synthetic-contact")
+        assert test_person is not None
 
-        if test_person is None:
-            pytest.skip("No populated owner relationships (expected for fresh install)")
-
-        # For owner edges, weight should match relationship_strength (not pair_strength)
+        # For owner edges, weight should match relationship_strength (not
+        # pair_strength), using the production helper that renders graph data.
         rel = rel_store.get_between(owner_id, test_person.id)
         expected_weight = int(test_person.relationship_strength)
+        from api.routes.crm import _rendered_edge_weight
 
-        # The API should return this weight for owner edges
-        # (We verify the logic is implemented, actual API test would need HTTP call)
-        assert rel.pair_strength != expected_weight or rel.pair_strength == expected_weight, \
-            "Logic should differentiate between relationship_strength and pair_strength"
+        people_by_id = {person.id: person for person in person_store.get_all()}
+        rendered_weight = _rendered_edge_weight(
+            rel, owner_id, test_person.id, owner_id, people_by_id,
+        )
+        assert rendered_weight == expected_weight
+        assert rendered_weight != rel.pair_strength
 
     def test_non_owner_edge_uses_pair_strength(self):
         """Edges not involving the owner should use pair_strength."""
@@ -229,18 +325,21 @@ class TestEdgeWeightSourceLogic:
         rel_store = get_relationship_store()
         owner_id = settings.my_person_id
 
-        # Find a relationship between two non-owner people
-        all_rels = rel_store.get_all_relationships()
-        non_owner_rel = None
-        for rel in all_rels:
-            if rel.person_a_id != owner_id and rel.person_b_id != owner_id:
-                if rel.total_shared_interactions > 0:
-                    non_owner_rel = rel
-                    break
+        non_owner_rel = rel_store.get_between("synthetic-contact", "synthetic-peer")
+        assert non_owner_rel is not None
 
-        if non_owner_rel is None:
-            pytest.skip("No populated non-owner relationships (expected for fresh install)")
+        # For non-owner edges, the production renderer returns pair_strength.
+        from api.routes.crm import _rendered_edge_weight
+        from api.services.person_entity import get_person_entity_store
 
-        # For non-owner edges, weight should be pair_strength
-        expected_weight = non_owner_rel.pair_strength
-        assert 0 <= expected_weight <= 100, f"pair_strength should be 0-100, got {expected_weight}"
+        person_store = get_person_entity_store()
+        people_by_id = {person.id: person for person in person_store.get_all()}
+        rendered_weight = _rendered_edge_weight(
+            non_owner_rel,
+            non_owner_rel.person_a_id,
+            non_owner_rel.person_b_id,
+            owner_id,
+            people_by_id,
+        )
+        assert rendered_weight == non_owner_rel.pair_strength
+        assert 0 <= rendered_weight <= 100

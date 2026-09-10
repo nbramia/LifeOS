@@ -677,6 +677,29 @@ class TestSyncHealth:
 class TestDataHealth:
     """Tests for data health endpoints."""
 
+    @pytest.fixture(autouse=True)
+    def _initialize_data_health_stores(self, tmp_path, monkeypatch):
+        """Point data health at a complete, owned CRM schema."""
+        from api.routes import crm as crm_routes
+        from api.services import person_entity
+        from api.services.person_entity import PersonEntityStore
+        from api.services.relationship import RelationshipStore
+        from api.services.source_entity import SourceEntityStore
+
+        crm_path = tmp_path / "data" / "crm.db"
+        monkeypatch.setattr(
+            crm_routes,
+            "__file__",
+            str(tmp_path / "api" / "routes" / "crm.py"),
+        )
+        monkeypatch.setattr(
+            person_entity,
+            "_entity_store",
+            PersonEntityStore(db_path=str(crm_path)),
+        )
+        SourceEntityStore(db_path=str(crm_path))
+        RelationshipStore(db_path=str(crm_path))
+
     def test_get_data_health(self, client):
         """GET /data-health returns data quality info."""
         response = client.get("/api/crm/data-health")

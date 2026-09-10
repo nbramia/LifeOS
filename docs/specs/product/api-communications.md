@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-04
+**Last Updated:** 2026-09-09
 
 Chat/search, Google integration (Calendar/Gmail/Drive), and messaging (iMessage/Slack) HTTP endpoints, with request/response shapes. Split out of [api-reference.md](api-reference.md) alongside its other adjacent catalogs (CRM, MCP tools, agent activity) because the combined file was over the product-spec size target.
 
@@ -57,9 +57,20 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 
 **Wire format:** lines `data: {json}\n`. Clients may ignore `routing`, `sources`, `usage`, and `done` if they handle stream close.
 
+**Terminal failures and persistence:** A provider failure handled by the agent
+loop emits the content accumulated so far, then an `error` event whose message
+is the sanitized `"The request could not be completed."`, and then `done`.
+That content is persisted as the assistant message, including any useful text
+from earlier rounds. A genuine failure in the outer stream handler emits the
+same sanitized `error` event but no `done`; any content already emitted is
+persisted with the visible cut-off marker and `routing.truncated: true` (with
+`routing.truncation_reason: "stream_error"`). The web client keeps already
+rendered content visible in both cases, shows the error status, and releases
+the composer for a subsequent turn.
+
 `cost_usd` on the `usage` event is omitted (not `0`) for a turn this server can't price — e.g. the `remote` model pick (#654) with no configured rate — so a client must distinguish "absent/non-numeric" (unpriced) from a real `0` (genuinely free) rather than treating both as free; `web/chat/ask-stream.js` already does this.
 
-**A disconnect no longer stops the turn (#611).** The turn keeps running server-side and persists its complete reply once done — closing the tab, backgrounding the app, or a network switch no longer loses the answer. Two ways to cancel it explicitly: `POST /api/conversations/{id}/cancel` (by conversation id) and [`POST /api/chat/cancel`](#post-apichatcancel) (by `client_turn_id`, for a turn that hasn't reached its first SSE frame yet). `GET /api/conversations/{id}`'s `active_turn` field reports whether one is still running. `modality: "voice"` is the one exception — a voice turn's disconnect still cancels it immediately, matching pre-#611 behavior, because whisper-relay uses abandoning the stream as its deliberate barge-in/hangup cancel gesture. See [client-surfaces.md § Turn lifetime and cancellation](../technical/client-surfaces.md#turn-lifetime-and-cancellation-611) for the full contract.
+**Disconnect handling:** A disconnected client does not stop a server-side turn; the complete reply is persisted. This applies to every modality, including voice; voice cancellation uses an explicit cancel request. Two ways to cancel a turn explicitly are `POST /api/conversations/{id}/cancel` (by conversation id) and [`POST /api/chat/cancel`](#post-apichatcancel) (by `client_turn_id`, for a turn that hasn't reached its first SSE frame yet). `GET /api/conversations/{id}`'s `active_turn` field reports whether a turn is running. See [client-surfaces.md § Turn lifetime and cancellation](../technical/client-surfaces.md#turn-lifetime-and-cancellation-611) for the full contract.
 
 **Pipeline routing (in order of priority):**
 1. **Ambiguous task/reminder** — asks user for clarification (task vs reminder vs both).

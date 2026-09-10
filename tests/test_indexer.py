@@ -287,6 +287,8 @@ This is freshly created content about testing.
 
     def test_detects_file_modification(self, indexer, temp_vault):
         """Modified file should be re-indexed."""
+        from tests.conftest import wait_for_condition
+        from api.services.indexer import VaultEventHandler
         # Create initial file
         test_file = temp_vault / "modify_test.md"
         test_file.write_text("# Original\n\nOriginal content.")
@@ -301,12 +303,10 @@ This is freshly created content about testing.
         # Modify the file
         test_file.write_text("# Modified\n\nCompletely different updated content.")
 
-        # Wait for re-indexing
-        time.sleep(3)
+        def _reindexed():
+            return bool(indexer.vector_store.search("different updated content"))
 
-        # Search should find new content
-        results = indexer.vector_store.search("different updated content")
-        assert len(results) >= 1
+        assert wait_for_condition(_reindexed, timeout=VaultEventHandler._BATCH_DELAY + 30)
 
     def test_detects_file_deletion(self, indexer, temp_vault):
         """Deleted file should be removed from index."""

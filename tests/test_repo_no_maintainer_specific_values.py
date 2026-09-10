@@ -42,8 +42,10 @@ mechanism.
 """
 from __future__ import annotations
 
+import functools
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -140,12 +142,35 @@ def _is_excluded(rel_path: str) -> bool:
     return rel_path.startswith(_EXCLUDED_DIR_PREFIXES)
 
 
+@functools.lru_cache(maxsize=1)
+def _git_ls_files_root() -> Path:
+    """_REPO_ROOT has no .git when this test runs inside an isolated
+    verifier snapshot (scripts/candidate_snapshot.py never copies .git,
+    by design -- see build_snapshot). Stage the exact current content into
+    an owned disposable git repo instead, so `git ls-files` still works;
+    cached, since rebuilding a full repo-sized copy on every call would be
+    wasteful and the content is fixed for this process's lifetime."""
+    if (_REPO_ROOT / ".git").exists():
+        return _REPO_ROOT
+    fixture = Path(tempfile.mkdtemp(prefix="lifeos-tracked-files-fixture-"))
+    subprocess.run(["rsync", "-a", "--exclude=.git", f"{_REPO_ROOT}/", f"{fixture}/"], check=True)
+    subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=fixture, check=True)
+    # Gitignored-but-force-tracked in the real repo (see .gitignore's own
+    # comments on these two entries) -- a fresh `git add -A` in a brand-new
+    # repo has no tracked-history override for either.
+    for forced in ("AGENTS.md", "tests/test_p91_data_integrity.py"):
+        if (fixture / forced).exists():
+            subprocess.run(["git", "add", "-f", "--", forced], cwd=fixture, check=True)
+    return fixture
+
+
 def _tracked_files() -> list[Path]:
     """Every git-tracked file, excluding tests/, docs/, and this file
     itself (redundant with the tests/ exclusion today, kept explicit per
     #789's own wording in case the allowlist ever moves out of tests/)."""
     result = subprocess.run(
-        ["git", "ls-files"], cwd=_REPO_ROOT, check=True, capture_output=True, text=True,
+        ["git", "ls-files"], cwd=_git_ls_files_root(), check=True, capture_output=True, text=True,
     )
     paths = []
     for rel in result.stdout.splitlines():

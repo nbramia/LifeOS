@@ -86,6 +86,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | Why does LifeOS exist? What guides decisions? | [vision/philosophy.md](docs/vision/philosophy.md) |
 | Why was X chosen over Y? | `docs/adr/` (specific ADR) |
 | How do we review PRs? | `/implement <pr> just review`, `/pr-check`, `/merge-pr` — from the user-scope `implement-lifecycle` plugin |
+| What lifecycle applies to a change? | [Development lifecycle standard](docs/specs/standards/development-lifecycle.md) |
 
 ---
 
@@ -186,7 +187,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 
 | Tier | Action |
 |------|--------|
-| **Always** | Run full test suite before commit (on the server — see § Testing) |
+| **Always** | Obtain current evidence for every lane selected by the lifecycle contract before commit; run broad gates when the current repository gate requires them |
 | **Always** | Restart server after **deploying** Python changes (test-only runs in isolated copies don't need it) |
 | **Always** | Use `./scripts/server.sh` for server management |
 | **Always** | Use obviously synthetic data in tests and docs |
@@ -209,9 +210,8 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 **Branch naming:** `<type>/<short-description>` where type is one of: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`. Lowercase, hyphen-separated.
 
 1. **Edit code**
-2. **Restart server**: `./scripts/server.sh restart` (or `sudo systemctl restart lifeos-api`)
-3. **Test manually** or run tests: `./scripts/test.sh`
-4. **Deploy**: `./scripts/deploy.sh "Your commit message"`
+2. **Test**: obtain current evidence for the selected lane(s) with `./scripts/test.sh` or the applicable isolated runner
+3. **Deploy**: `./scripts/deploy.sh "Your commit message"`; deployment owns any production restart
 
 `deploy.sh` is the direct-to-main hotfix path. PR-based work (e.g. `/implement`) uses feature branches + `merge-pr` and never calls `deploy.sh`.
 
@@ -226,7 +226,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | `api/services/task_manager.py` | Task management service (Obsidian Tasks integration) |
 | `api/routes/tasks.py` | Task CRUD API endpoints |
 | `config/settings.py` | Environment configuration |
-| `config/people_dictionary.json` | Known people and aliases (restart required after edits) |
+| `config/people_dictionary.json` | Known people and aliases (deployed server restart required after edits) |
 | `web/` | Vanilla HTML/JS frontend served as static files (`index.html`, `home.html`, `crm.html`; SPA at `/chat`) |
 | `README.md` | Architecture overview with diagrams |
 | `api/services/perf_trace.py` | Request-level performance tracing (spans, SQLite) |
@@ -258,7 +258,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 
 1. Add to `requirements.txt`
 2. Install: `~/.venvs/lifeos/bin/pip install -r requirements.txt`
-3. Restart server: `./scripts/server.sh restart`
+3. Restart the deployed server: `./scripts/server.sh restart` (an isolated test run never restarts production)
 
 ### Testing
 
@@ -286,7 +286,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 ```bash
 ./scripts/server.sh start    # Start server (background)
 ./scripts/server.sh stop     # Stop server
-./scripts/server.sh restart  # Restart after code changes
+./scripts/server.sh restart  # Restart after deploying code changes (never for isolated test runs)
 ./scripts/server.sh status   # Check if running
 ```
 
@@ -300,7 +300,8 @@ sudo systemctl status lifeos-llm         # Check local LLM (llama-server)
 systemctl list-timers lifeos-*           # Check sync/watchdog timers
 ```
 
-Always restart the server after modifying Python files. The server does NOT auto-reload.
+Restart the server after deploying Python changes because it does not auto-reload.
+Isolated test runs never restart or stop a production server.
 
 ### Why This Matters
 
@@ -396,7 +397,7 @@ Operational procedures live in [guides/operations.md](docs/guides/operations.md)
 ## Common Mistakes to Avoid
 
 1. **Running uvicorn directly** → Use `./scripts/server.sh start`
-2. **Forgetting to restart server after code changes** → Use `./scripts/server.sh restart`
+2. **Forgetting to restart the deployed server after deploying code changes** → Use `./scripts/server.sh restart`; isolated test runs must not restart or stop a production server
 3. **Committing without testing** → Use `./scripts/deploy.sh`
 4. **Starting server on localhost only** → Must use 0.0.0.0 for Tailscale
 5. **Overfitting to specific test cases** → Consider effects on the full system
