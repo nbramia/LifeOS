@@ -1064,6 +1064,15 @@ class Worker:
                 self._resume_as_followup(q, session, answer)
                 continue
 
+            task = None
+            if session.origin != "operator":
+                task = self._revalidate_task_resume(
+                    session, "clarification_resume", {BLOCKED_TAG},
+                )
+                if task is None:
+                    self.session_store.mark_question_processed(q["id"])
+                    continue
+
             # Routing-ask resolution: if session.routing == "ask", the answer
             # should contain "local" or "claude". Update the session's routing
             # before dispatching so the right executor handles the resume.
@@ -1128,11 +1137,9 @@ class Worker:
             self._set_task_status(task_id, "in_progress")
             self.session_store.update_status(task_id, STATUS_RUNNING)
 
-            task = self._fetch_task(task_id)
-            if task is None or not self._task_claim_is_current(task):
-                self._fail_closed_task_resume(session, "clarification_resume")
-                self.session_store.mark_question_processed(q["id"])
-                continue
+            if task is None:
+                # Operator-root sessions have no backing vault task by design.
+                task = {"id": task_id, "description": task_id}
             if session.routing == ROUTE_HERMES:
                 if not self.session_store.question_claimed(q["id"]):
                     continue
@@ -1247,6 +1254,11 @@ class Worker:
                 "question_id": q["id"], "operation": "goal_resume",
             })
             return
+        if session.origin != "operator" and self._revalidate_task_resume(
+            session, "goal_resume", {BLOCKED_TAG},
+        ) is None:
+            self.session_store.mark_question_processed(q["id"])
+            return
         condition = self._pending_goal_condition(sid)
         if _is_affirmative(answer):
             if condition:
@@ -1321,6 +1333,17 @@ class Worker:
             })
             return
 
+        task = None
+        if session.origin != "operator":
+            task = self._revalidate_task_resume(
+                session,
+                "followup_resume",
+                {COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG},
+            )
+            if task is None:
+                self.session_store.mark_question_processed(q["id"])
+                return
+
         # The task may be parked at any terminal tag — completed, failed, or
         # budget-exceeded are all replyable now. Swap whichever is current
         # back to running. Operator root-spawns (#235) have no backing vault
@@ -1347,13 +1370,6 @@ class Worker:
             "question_id": q["id"], "answer_chars": len(answer),
         })
 
-        task = self._fetch_task(task_id)
-        if session.origin != "operator" and (
-            task is None or not self._task_claim_is_current(task)
-        ):
-            self._fail_closed_task_resume(session, "followup_resume")
-            self.session_store.mark_question_processed(q["id"])
-            return
         if task is None:
             # Operator-root sessions have no backing vault task by design.
             task = {"id": task_id, "description": task_id}
@@ -1793,6 +1809,24 @@ class Worker:
             "task_id": session.task_id, "phase": phase,
         })
         self.session_store.update_status(session.task_id, STATUS_FAILED)
+
+    def _revalidate_task_resume(
+        self,
+        session: Session,
+        phase: str,
+        resumable_tags: set[str],
+    ) -> dict[str, Any] | None:
+        """Fetch and validate a backing task before mutating resume state."""
+        try:
+            task = self._fetch_task(session.task_id)
+        except Exception as exc:
+            logger.warning("resume task fetch %s failed: %s", session.task_id, exc)
+            task = None
+        tags = self._norm_task_tags(task)
+        if not task or REASSIGNED_TAG in tags or not tags.intersection(resumable_tags):
+            self._fail_closed_task_resume(session, phase)
+            return None
+        return task
 
     def _complete_task(self, task_id: str) -> bool:
         try:

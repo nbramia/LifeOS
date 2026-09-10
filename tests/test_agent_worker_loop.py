@@ -867,7 +867,7 @@ def test_dispatch_fetch_failure_fails_closed_without_executor(tmp_path: Path, mo
 
 @pytest.mark.unit
 def test_followup_fetch_failure_fails_closed_without_executor(tmp_path: Path, monkeypatch):
-    """A task disappearing during follow-up reopen cannot execute old context."""
+    """A failed follow-up fetch cannot mutate the answer or vault lifecycle."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "stale synthetic followup", "status": "done",
          "tags": [COMPLETED_TAG, "local"]},
@@ -885,6 +885,44 @@ def test_followup_fetch_failure_fails_closed_without_executor(tmp_path: Path, mo
 
     assert executor.calls == []
     assert w.session_store.get("t1").status == STATUS_FAILED
+    assert api.tasks["t1"]["status"] == "done"
+    assert api.tasks["t1"]["tags"] == [COMPLETED_TAG, "local"]
+    assert w.session_store.get_messages(session.session_id) == []
+    kinds = [event["kind"] for event in w.transcript_store.read(session.session_id)]
+    assert "followup_received" not in kinds
+
+
+@pytest.mark.unit
+def test_clarification_fetch_exception_fails_closed_before_mutation(tmp_path: Path, monkeypatch):
+    """A failed clarification fetch cannot mutate the answer or vault lifecycle."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "stale synthetic clarification", "status": "blocked",
+         "tags": [BLOCKED_TAG, "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(
+        tmp_path, api, preflight_caller=_golden_preflight(routing="local"),
+        local_executor=executor,
+    )
+    session = w.session_store.create(task_id="t1", status=STATUS_BLOCKED, routing="local")
+    w.session_store.create_pending_question(
+        session_id=session.session_id, task_id="t1", question="Continue?", sent_message_id=78,
+    )
+    w.session_store.deposit_answer(78, "yes")
+
+    def fetch_raises(task_id):
+        raise RuntimeError("synthetic fetch failure")
+
+    monkeypatch.setattr(w, "_fetch_task", fetch_raises)
+    w._process_clarification_answers()
+
+    assert executor.calls == []
+    assert w.session_store.get("t1").status == STATUS_FAILED
+    assert api.tasks["t1"]["status"] == "blocked"
+    assert api.tasks["t1"]["tags"] == [BLOCKED_TAG, "local"]
+    assert w.session_store.get_messages(session.session_id) == []
+    kinds = [event["kind"] for event in w.transcript_store.read(session.session_id)]
+    assert "clarification_answered" not in kinds
 
 
 @pytest.mark.unit
