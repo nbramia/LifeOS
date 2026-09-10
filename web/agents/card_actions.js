@@ -14,6 +14,7 @@
 
 import { TERMINAL, sourceLabelFor, escapeHtml, showToast } from './session_actions.js';
 import { LANES } from './lanes.js';
+import { refreshAfterFailure } from './action_refresh.js';
 
 function laneLabelFor(laneId) {
   const lane = LANES.find(l => l.id === laneId);
@@ -47,6 +48,10 @@ export async function undoAcceptedCard(cardId, onChanged) {
     if (onChanged) await onChanged();
   } catch (err) {
     showToast(`Undo failed: ${err.message}`, true);
+    // The write may have failed because another actor changed the card. Keep
+    // the original failure visible, but refresh the caller's board so the
+    // stale card/action row is not left on screen.
+    await refreshAfterFailure(onChanged);
     throw err;
   }
 }

@@ -24,6 +24,13 @@ import { renderAssignmentPickers } from './assignment.js';
 import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
 import {
+  POINTER_SLOP, TOUCH_HOLD_MS, pointerIsActive, shouldCancelPointerGesture,
+} from './board_gesture.js';
+import {
+  compareSortValues, loadSortSelection as readSortSelection,
+  saveSortSelection as writeSortSelection, sortCards,
+} from './board_sort.js';
+import {
   getFilters, setFilter, setFilters, resetFilters, subscribe as subscribeFilters,
   requestGraphFocus, requestBoardFocus, takeBoardFocus,
   onTabActivate, activateTab, getSelectedGraphCardId,
@@ -90,68 +97,13 @@ const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done').map(l => l.i
 const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled').map(l => l.id));
 
 function loadSortSelection() {
-  try {
-    const value = localStorage.getItem(SORT_STORAGE_KEY);
-    if (value && SORT_OPTIONS.has(value)) return value;
-  } catch (_) {}
-  return DEFAULT_SORT;
+  return readSortSelection(localStorage, SORT_STORAGE_KEY, SORT_OPTIONS, DEFAULT_SORT);
 }
 
 function saveSortSelection(value) {
-  try { localStorage.setItem(SORT_STORAGE_KEY, value); } catch (_) {}
+  writeSortSelection(localStorage, SORT_STORAGE_KEY, value);
 }
 
-function normalizedSortKey(card, mode) {
-  if (mode.startsWith('created')) {
-    const raw = card.created_at || card.created_date || card.next_fire_at || '';
-    const timestamp = raw ? Date.parse(raw) : NaN;
-    return {
-      missing: !Number.isFinite(timestamp),
-      value: Number.isFinite(timestamp) ? timestamp : 0,
-    };
-  }
-  if (mode.startsWith('modified')) {
-    const raw = card.updated_at || (card.last_run && card.last_run.at) || card.next_fire_at || '';
-    const timestamp = raw ? Date.parse(raw) : NaN;
-    return {
-      missing: !Number.isFinite(timestamp),
-      value: Number.isFinite(timestamp) ? timestamp : 0,
-    };
-  }
-  if (mode === 'assignee_asc') {
-    if (card.kind === 'schedule') return { missing: false, value: '\uffff' };
-    return { missing: false, value: (card.assignee || '\ufffe').toLowerCase() };
-  }
-  return { missing: false, value: 0 };
-}
-
-function compareSortValues(a, b) {
-  if (a === b) return 0;
-  return a < b ? -1 : 1;
-}
-
-function sortCards(cards, mode) {
-  if (!mode || mode === 'file') return cards;
-  const descending = mode.endsWith('_desc');
-  return cards
-    .map(card => ({
-      card,
-      key: normalizedSortKey(card, mode),
-      // The id tie-breaker is part of the ordering rather than a stable-sort
-      // fallback, so equal timestamps and missing timestamps reverse exactly
-      // when the direction changes, regardless of file/input order.
-      tie: `${card.kind || ''}:${card.id || ''}`,
-    }))
-    .sort((a, b) => {
-      const missingComparison = Number(a.key.missing) - Number(b.key.missing);
-      if (missingComparison) return descending ? -missingComparison : missingComparison;
-      const valueComparison = compareSortValues(a.key.value, b.key.value);
-      if (valueComparison) return descending ? -valueComparison : valueComparison;
-      const tieComparison = compareSortValues(a.tie, b.tie);
-      return descending ? -tieComparison : tieComparison;
-    })
-    .map(({ card }) => card);
-}
 
 export function initBoard() {
   const lanesEl = document.getElementById('board-lanes');
@@ -194,6 +146,7 @@ export function initBoard() {
   let openCardSnapshot = null;  // last card object the drawer was fully rendered from
   let panel = null;  // SessionPanel for the drawer's linked-session transcript
   let assignmentHandle = null;  // renderAssignmentPickers()'s return value for the open drawer, or null
+  let tagPickerHandle = null;
   let selectedAssignee = null;
   let quickActionCardId = null;
 
@@ -550,8 +503,7 @@ export function initBoard() {
     `).join('');
     assigneeDropsEl.querySelectorAll('.board-assignee-drop').forEach(button => {
       button.addEventListener('click', () => {
-        if (suppressNextTrayClick === `assignee:${button.dataset.assignee}`) {
-          suppressNextTrayClick = null;
+        if (consumeClickSuppression('tray', `assignee:${button.dataset.assignee}`)) {
           return;
         }
         selectedAssignee = selectedAssignee === button.dataset.assignee ? null : button.dataset.assignee;
@@ -642,7 +594,7 @@ export function initBoard() {
       ${showAccept ? '<button type="button" class="board-card-accept">Accept</button>' : ''}
     `;
     div.addEventListener('click', () => {
-      if (suppressNextClick === card.id) { suppressNextClick = null; return; }
+      if (consumeClickSuppression('card', card.id)) return;
       if (assignSelectedAssignee(card)) return;
       openDrawer(card.id);
     });
@@ -670,7 +622,7 @@ export function initBoard() {
       acceptBtn.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
-        acceptCard(card, fetchBoard);
+        runCardAction(() => acceptCard(card, fetchBoard));
       });
     }
     return div;
@@ -700,14 +652,6 @@ export function initBoard() {
   }
 
   function render() {
-    // A drop's re-render replaces every card node, so the trailing click
-    // that `suppressNextClick` was set to swallow often never reaches a
-    // card's own click handler (mouseup can land on a different lane's
-    // element, whose click event never bubbles through the original card).
-    // Clear it here instead of waiting for a click that may not arrive —
-    // otherwise it lingers and eats the operator's next genuine click on
-    // that same card id (#850 verify-1 finding 3).
-    suppressNextClick = null;
     lanesEl.innerHTML = '';
     if (visibleLanes.size === 0) {
       const hint = document.createElement('div');
@@ -846,9 +790,31 @@ export function initBoard() {
   // available to touch users.
   // ------------------------------------------------------------------
 
-  let dragState = null;   // { kind, card, assignee, sourceEl, ghost, startX, startY, moved }
-  let suppressNextClick = null;  // card/assignee id whose trailing click should be swallowed
+  let dragState = null;   // { kind, card, assignee, sourceEl, pointerId, pointerType, ghost, startX, startY, moved }
+  let suppressNextClick = null;
   let suppressNextTrayClick = null;
+
+  function setClickSuppression(kind, key) {
+    const slot = kind === 'tray' ? 'suppressNextTrayClick' : 'suppressNextClick';
+    const current = { key, timer: null };
+    current.timer = setTimeout(() => {
+      if ((kind === 'tray' ? suppressNextTrayClick : suppressNextClick) === current) {
+        if (kind === 'tray') suppressNextTrayClick = null;
+        else suppressNextClick = null;
+      }
+    }, 700);
+    if (kind === 'tray') suppressNextTrayClick = current;
+    else suppressNextClick = current;
+  }
+
+  function consumeClickSuppression(kind, key) {
+    const current = kind === 'tray' ? suppressNextTrayClick : suppressNextClick;
+    if (!current || current.key !== key) return false;
+    clearTimeout(current.timer);
+    if (kind === 'tray') suppressNextTrayClick = null;
+    else suppressNextClick = null;
+    return true;
+  }
 
   function clearDragTarget() {
     document.querySelectorAll('.board-lane.drag-over, .board-drop-target.drop-allowed, .board-drop-target.drop-refused')
@@ -861,19 +827,35 @@ export function initBoard() {
     document.removeEventListener('pointercancel', onDragCancel);
     clearDragTarget();
     if (!dragState) return;
-    const { ghost, sourceEl } = dragState;
+    const { ghost, sourceEl, holdTimer, pointerId } = dragState;
+    if (holdTimer) clearTimeout(holdTimer);
+    if (sourceEl && pointerId != null && sourceEl.releasePointerCapture) {
+      try { sourceEl.releasePointerCapture(pointerId); } catch (_) {}
+    }
     if (ghost && ghost.parentNode) ghost.parentNode.removeChild(ghost);
     if (sourceEl) sourceEl.classList.remove('dragging-source');
     document.body.classList.remove('board-dragging');
   }
 
   function onPointerDown(e, source) {
-    if (!e.isPrimary || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    if (e.isPrimary === false || dragState || (e.pointerType === 'mouse' && e.button !== 0)) return;
     if (e.target.closest('button, input, select, textarea, a') && source.kind === 'card') return;
-    dragState = {
+    const pointerType = e.pointerType || 'mouse';
+    const state = {
       ...source, sourceEl: source.sourceEl || e.currentTarget,
+      pointerId: e.pointerId, pointerType,
       startX: e.clientX, startY: e.clientY, moved: false, cancelled: false, ghost: null,
+      holdReady: pointerType !== 'touch', holdTimer: null,
     };
+    if (pointerType === 'touch') {
+      state.holdTimer = setTimeout(() => {
+        if (dragState === state && !state.moved && !state.cancelled) state.holdReady = true;
+      }, TOUCH_HOLD_MS);
+    }
+    dragState = state;
+    if (state.sourceEl && state.sourceEl.setPointerCapture && e.pointerId != null) {
+      try { state.sourceEl.setPointerCapture(e.pointerId); } catch (_) {}
+    }
     document.addEventListener('pointermove', onDragMove);
     document.addEventListener('pointerup', onDragUp);
     document.addEventListener('pointercancel', onDragCancel);
@@ -885,14 +867,20 @@ export function initBoard() {
   }
 
   function onDragMove(e) {
-    if (!dragState) return;
+    if (!pointerIsActive(dragState, e)) return;
     const dx = e.clientX - dragState.startX;
     const dy = e.clientY - dragState.startY;
-    if (!dragState.moved && Math.hypot(dx, dy) < 4) return;
+    if (!dragState.moved && Math.hypot(dx, dy) < POINTER_SLOP) return;
+    if (!dragState.moved && dragState.pointerType === 'touch' && !dragState.holdReady) {
+      dragState.cancelled = true;
+      endPointerDrag();
+      dragState = null;
+      return;
+    }
     // Let the browser own vertical scrolling from a card. Once cancelled,
     // pointerup is ignored and the card still receives its ordinary click
     // only when the browser decides this was a tap rather than a scroll.
-    if (dragState.kind === 'card' && !dragState.moved && Math.abs(dy) > Math.abs(dx)) {
+    if (!dragState.moved && shouldCancelPointerGesture(dragState, dx, dy)) {
       dragState.cancelled = true;
       endPointerDrag();
       dragState = null;
@@ -957,7 +945,7 @@ export function initBoard() {
   }
 
   function onDragUp(e) {
-    if (!dragState) return;
+    if (!dragState || e.isPrimary === false || e.pointerId !== dragState.pointerId) return;
     const state = dragState;
     endPointerDrag();
     dragState = null;
@@ -966,14 +954,14 @@ export function initBoard() {
       if (state.kind === 'card') {
         // A drag that ends in the source lane (or outside a lane) is still
         // a drag, not a request to open the drawer through its trailing tap.
-        suppressNextClick = state.card.id;
+        setClickSuppression('card', state.card.id);
         if (state.targetLane && state.targetLane !== state.card.lane) {
           onCardDropped(state.card.id, state.targetLane);
         }
       } else {
-        suppressNextTrayClick = `assignee:${state.assignee}`;
+        setClickSuppression('tray', `assignee:${state.assignee}`);
         if (state.targetCardId) {
-          suppressNextClick = state.targetCardId;
+          setClickSuppression('card', state.targetCardId);
           assignAssigneeToCard(state.targetCardId, state.assignee);
         }
       }
@@ -981,8 +969,8 @@ export function initBoard() {
     setDropStatus('');
   }
 
-  function onDragCancel() {
-    if (!dragState) return;
+  function onDragCancel(e) {
+    if (!dragState || e && (e.isPrimary === false || e.pointerId !== dragState.pointerId)) return;
     endPointerDrag();
     dragState = null;
     setDropStatus('');
@@ -1012,15 +1000,14 @@ export function initBoard() {
     if (laneEntry && laneEntry.allowed === false) {
       showToast(laneEntry.reason || `Can't move card to ${laneLabel(targetLane)}.`, true);
       // Matches moveCard's own failure path: clears any stray drag-over
-      // class and resets `suppressNextClick` so the operator's next click
-      // on this card still opens the drawer.
+      // class while the short-lived trailing-click guard expires normally.
       render();
       return;
     }
     if (targetLane === 'done' && card.lane === 'review') {
       // Review -> Done is the same explicit acceptance path as the drawer
       // and the card's inline Accept button, including its tag transition.
-      acceptCard(card, fetchBoard);
+      runCardAction(() => acceptCard(card, fetchBoard));
       return;
     }
     let assignee;
@@ -1248,12 +1235,24 @@ export function initBoard() {
   // ------------------------------------------------------------------
 
   function closeDrawer() {
+    if (tagPickerHandle && tagPickerHandle.cancel) tagPickerHandle.cancel();
+    tagPickerHandle = null;
     openCardId = null;
     openCardLane = null;
     openCardSnapshot = null;
     if (panel) { panel.close(); panel = null; }
     if (drawerBackdrop) drawerBackdrop.hidden = true;
     if (drawerEl) drawerEl.innerHTML = '';
+  }
+
+  function cancelTagPickerWrites() {
+    if (tagPickerHandle && tagPickerHandle.cancel) tagPickerHandle.cancel();
+    tagPickerHandle = null;
+  }
+
+  function runCardAction(action) {
+    cancelTagPickerWrites();
+    return action();
   }
 
   function openDrawer(cardId) {
@@ -1311,6 +1310,21 @@ export function initBoard() {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    return r.json();
+  }
+
+  async function putBoardTags(taskId, tags) {
+    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(taskId)}/tags`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tags }),
     });
     if (!r.ok) {
       const text = await r.text();
@@ -1441,9 +1455,11 @@ export function initBoard() {
     let selected = uniqueEditableTags(initialTags);
     let confirmed = selected.slice();
     let saveChain = Promise.resolve();
+    let pendingSaves = 0;
     let suppressBlur = false;
     let activeOption = -1;
     let showingLegacyValue = true;
+    let cancelled = false;
 
     function renderChips() {
       chips.innerHTML = selected.map(tag => `
@@ -1490,16 +1506,13 @@ export function initBoard() {
       const requested = uniqueEditableTags(nextTags);
       selected = requested;
       renderChips();
+      pendingSaves += 1;
       saveChain = saveChain.then(async () => {
-        const current = findCard(card.id) || card;
-        const protectedTags = (current.tags || []).filter(tag => {
-          const normalized = String(tag).toLowerCase().replace(/^#/, '');
-          return ASSIGNEES.includes(normalized) || LIFECYCLE_TAGS.has(normalized);
-        });
         try {
-          await putTask(card.id, { tags: [...protectedTags, ...requested] });
+          if (cancelled) return;
+          await putBoardTags(card.id, requested);
           confirmed = requested.slice();
-          await fetchBoard();
+          if (!cancelled) await fetchBoard();
         } catch (err) {
           // A later queued edit is still the operator's current intent; only
           // revert if this failed request is what is currently displayed.
@@ -1507,7 +1520,9 @@ export function initBoard() {
             selected = confirmed.slice();
             renderChips();
           }
-          showToast(`Couldn't save tags: ${err.message}`, true);
+          if (!cancelled) showToast(`Couldn't save tags: ${err.message}`, true);
+        } finally {
+          pendingSaves -= 1;
         }
       });
     }
@@ -1601,10 +1616,18 @@ export function initBoard() {
         search.setAttribute('aria-expanded', 'false');
       }
     });
+    const handle = {
+      cancel: () => { cancelled = true; },
+      isSaving: () => !cancelled && pendingSaves > 0,
+      whenIdle: () => saveChain,
+    };
+    tagPickerHandle = handle;
+    return handle;
   }
 
   function renderDrawer(card) {
     if (!drawerEl) return;
+    cancelTagPickerWrites();
     assignmentHandle = null;
     const isTask = card.kind === 'task';
     // The Tags field never shows an assignee tag OR a worker lifecycle
@@ -2103,6 +2126,10 @@ export function initBoard() {
   function renderDrawerActions(card) {
     const actionsEl = drawerEl.querySelector('[data-field="actions"]');
     if (!actionsEl) return;
+    const cardHandlers = cardActionHandlers(card, { onChanged: fetchBoard, onAccepted: closeDrawer });
+    const guardedCardHandlers = Object.fromEntries(
+      Object.entries(cardHandlers).map(([name, handler]) => [name, (...args) => runCardAction(() => handler(...args))]),
+    );
     renderActionRow(actionsEl, {
       session: card.session || null,
       card,
@@ -2114,8 +2141,8 @@ export function initBoard() {
         // starts the same edit; this just gives the drawer's own action
         // row a working button for it too.
         rename: () => { if (panel) panel.startRename(); },
-        ...cardActionHandlers(card, { onChanged: fetchBoard, onAccepted: closeDrawer }),
-        cancel: () => cancelCard(card, async () => {
+        ...guardedCardHandlers,
+        cancel: () => runCardAction(() => cancelCard(card, async () => {
           // Tear the session panel down through its own cleanup path right
           // here, rather than leaving it to whichever render call below
           // happens to touch the session-panel container next — a
@@ -2132,11 +2159,11 @@ export function initBoard() {
           // it 409s.
           const fresh = findCard(card.id);
           if (fresh) { renderDrawer(fresh); openCardSnapshot = fresh; }
-        }),
-        delete: () => openDeleteCardModal(card, {
+        })),
+        delete: () => runCardAction(() => openDeleteCardModal(card, {
           findCard,
           onDeleted: async () => { closeDrawer(); await fetchBoard(); },
-        }),
+        })),
       },
     });
   }

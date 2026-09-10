@@ -1198,6 +1198,11 @@ class ReviewActionRequest(BaseModel):
     assignee: str | None = Field(default=None, max_length=40)
 
 
+class BoardTagsRequest(BaseModel):
+    """The user-editable portion of a board card's tag list."""
+    tags: list[str] = Field(default_factory=list)
+
+
 @router.put("/board/cards/{card_id}/lane")
 async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]:
     """Move a task card to `lane`, writing the corresponding status/tag at
@@ -1241,6 +1246,42 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
 
 
+@router.put("/board/cards/{card_id}/tags")
+async def update_board_card_tags(card_id: str, body: BoardTagsRequest) -> dict[str, Any]:
+    """Replace editable card tags while preserving worker-owned tags.
+
+    The TaskManager merge is evaluated against the latest CAS snapshot, so a
+    lifecycle or assignee tag added during this request survives the write.
+    """
+    from api.services import agent_board
+    from api.services.task_manager import get_task_manager, TaskConflictError
+
+    task_manager = get_task_manager()
+    if task_manager.get(card_id) is None:
+        raise HTTPException(status_code=404, detail="card not found")
+    protected = agent_board.PROTECTED_TAGS
+    requested_protected = [
+        tag for tag in body.tags
+        if str(tag).lstrip("#").lower() in protected
+    ]
+    if requested_protected:
+        raise HTTPException(
+            status_code=409,
+            detail="assignee and lifecycle tags are managed by the board actions",
+        )
+    try:
+        task = task_manager.update_tags_preserving(card_id, body.tags, protected)
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail="card not found")
+    _invalidate_board_cache()
+    lane = agent_board.derive_lane(task.status, task.tags)
+    return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
+
+
 @router.post("/board/cards/{card_id}/accept")
 async def accept_board_card(card_id: str) -> dict[str, Any]:
     """Move a Review card to Done by adding the `accepted` tag. Idempotent —
@@ -1262,9 +1303,17 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
     needs_tag = not already_accepted
     needs_status = task.status != "done"
     if needs_tag or needs_status:
-        new_tags = list(task.tags) + ([agent_board.ACCEPTED_TAG] if needs_tag else [])
         try:
-            task = task_manager.update(card_id, status="done", tags=new_tags)
+            def add_accepted(tags: list[str]) -> list[str]:
+                if agent_board.ACCEPTED_TAG in {
+                    str(tag).lstrip("#").lower() for tag in tags
+                }:
+                    return list(tags)
+                return [*tags, agent_board.ACCEPTED_TAG]
+
+            task = task_manager.update(
+                card_id, status="done", _tags_merge=add_accepted,
+            )
         except TaskConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if task is None:
@@ -1296,13 +1345,26 @@ async def undo_accept_board_card(card_id: str) -> dict[str, Any]:
     accepted = agent_board.ACCEPTED_TAG
     normalized = {t.lstrip("#").lower() for t in task.tags}
     if accepted not in normalized:
+        if agent_board.derive_lane(task.status, task.tags) == "review":
+            # A second undo after the first one is a harmless retry. Preserve
+            # the existing 409 for an unrelated, never-accepted card below.
+            lane = agent_board.derive_lane(task.status, task.tags)
+            return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
         raise HTTPException(status_code=409, detail="card is not accepted")
 
-    new_tags = [t for t in task.tags if t.lstrip("#").lower() != accepted]
-    if agent_board.COMPLETED_TAG not in {t.lstrip("#").lower() for t in new_tags}:
-        new_tags.append(agent_board.COMPLETED_TAG)
     try:
-        task = task_manager.update(card_id, tags=new_tags)
+        def remove_accepted(tags: list[str]) -> list[str]:
+            new_tags = [
+                tag for tag in tags
+                if str(tag).lstrip("#").lower() != accepted
+            ]
+            if agent_board.COMPLETED_TAG not in {
+                str(tag).lstrip("#").lower() for tag in new_tags
+            }:
+                new_tags.append(agent_board.COMPLETED_TAG)
+            return new_tags
+
+        task = task_manager.update(card_id, _tags_merge=remove_accepted)
     except TaskConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if task is None:

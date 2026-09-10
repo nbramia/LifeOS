@@ -1165,6 +1165,30 @@ class TestAcceptBoardCard:
         # Second call is a true no-op — no write, so updated_at is unchanged.
         assert updated.updated_at == updated_at_1
 
+    def test_accept_preserves_lifecycle_added_during_cas_retry(
+        self, client, stores, monkeypatch,
+    ):
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Accept with concurrent lifecycle", tags=["codex", "agent-completed", "keep-me"], status="done",
+        )
+        path = Path(task.source_file)
+        original_mtime = task_manager_module._mtime_or_none
+        calls = {"count": 0}
+
+        def race_once(candidate):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                path.write_text(path.read_text().replace("#keep-me", "#keep-me #agent-failed"))
+            return original_mtime(candidate)
+
+        monkeypatch.setattr(task_manager_module, "_mtime_or_none", race_once)
+        response = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert response.status_code == 200
+        assert set(task_manager.get(task.id).tags) == {
+            "codex", "agent-completed", "keep-me", "agent-failed", "accepted",
+        }
+
     def test_accept_missing_card_is_404(self, client, stores):
         r = client.post("/api/agents/board/cards/nope/accept")
         assert r.status_code == 404
@@ -1199,6 +1223,45 @@ class TestAcceptBoardCard:
         task = task_manager.create("Not accepted")
         r = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
         assert r.status_code == 409
+
+    def test_undo_accept_is_idempotent_after_first_undo(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Retry undo", tags=["codex", "agent-completed", "accepted"], status="done",
+        )
+        first = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        second = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["lane"] == "review"
+        assert task_manager.get(task.id).tags == ["codex", "agent-completed"]
+
+    def test_board_tags_preserve_lifecycle_added_during_cas_retry(
+        self, client, stores, monkeypatch,
+    ):
+        """A stale full-list picker save must not erase a worker tag added
+        between its initial read and the CAS write."""
+        task_manager, *_ = stores
+        task = task_manager.create("Concurrent picker", tags=["codex", "keep-me"])
+        path = Path(task.source_file)
+        original_mtime = task_manager_module._mtime_or_none
+        calls = {"count": 0}
+
+        def race_once(candidate):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                path.write_text(path.read_text().replace("#codex", "#codex #agent-running"))
+            return original_mtime(candidate)
+
+        monkeypatch.setattr(task_manager_module, "_mtime_or_none", race_once)
+        response = client.put(
+            f"/api/agents/board/cards/{task.id}/tags",
+            json={"tags": ["keep-me", "new-label"]},
+        )
+        assert response.status_code == 200
+        assert set(task_manager.get(task.id).tags) == {
+            "codex", "agent-running", "keep-me", "new-label",
+        }
 
 
 # ---------------------------------------------------------------------------

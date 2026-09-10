@@ -1221,8 +1221,14 @@
     border-top: 1px solid var(--border);
     background: var(--bg-secondary);
     color: var(--text-secondary);
+    touch-action: pan-x;
   }
   .board-drop-tray-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  #board-assignee-drops {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 0.5rem;
+  }
   .board-assignee-drop,
   .board-done-drop {
     min-height: 42px;
@@ -1235,6 +1241,7 @@
     font-size: 0.78rem;
     cursor: pointer;
     touch-action: manipulation;
+    flex: 0 0 auto;
   }
   .board-assignee-drop:hover,
   .board-assignee-drop.selected,
@@ -1275,6 +1282,7 @@
     padding: 0.5rem 0.6rem;
     font-size: 0.8rem;
     cursor: pointer;
+    /* Native scrolling wins until a long-press turns this into a drag. */
     touch-action: pan-x pan-y;
   }
   .board-card:hover { border-color: var(--accent); }

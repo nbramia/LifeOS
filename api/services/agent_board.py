@@ -32,6 +32,15 @@ HUMAN_TAG = "human"
 # symbol, per the issue's constraints.
 ACCEPTED_TAG = "accepted"
 
+# Tags whose ownership/lifecycle is outside the board's free-text Tags field.
+# Board tag edits replace only the user-editable portion and preserve every
+# member of this set from the latest CAS snapshot.
+PROTECTED_TAGS: frozenset[str] = frozenset({
+    "me", "claude", "codex", "hermes", "local", "cloud",
+    RUNNING_TAG, BLOCKED_TAG, COMPLETED_TAG, "agent-failed",
+    "agent-budget-exceeded", REASSIGNED_TAG, ACCEPTED_TAG,
+})
+
 # Assignee is exactly one tag from this set. "me" is the operator; the rest
 # are agent engines. An engine assignee on a todo/urgent task is what makes
 # it claimable by the worker — see agent-worker claim pickup.
