@@ -97,6 +97,8 @@ export async function acceptCard(card, onChanged, onAccepted) {
  * retaining the prior session transcript as the next run's context.
  */
 export function openReviewActionModal(card, action, onChanged, {
+  onMutationOpened,
+  onMutationCancelled,
   onMutationConfirmed,
   onMutationFailed,
 } = {}) {
@@ -127,13 +129,19 @@ export function openReviewActionModal(card, action, onChanged, {
   `;
   document.body.appendChild(backdrop);
   const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
-  backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
-  backdrop.querySelector('#review-action-cancel').onclick = cleanup;
+  const cancel = () => {
+    if (onMutationCancelled) onMutationCancelled();
+    cleanup();
+  };
+  backdrop.addEventListener('click', e => { if (e.target === backdrop) cancel(); });
+  backdrop.querySelector('#review-action-cancel').onclick = cancel;
+  if (onMutationOpened) onMutationOpened();
   backdrop.querySelector('#review-action-submit').onclick = async () => {
     const note = backdrop.querySelector('#review-note').value.trim();
     const noteEl = backdrop.querySelector('#review-note');
     const errorEl = backdrop.querySelector('[data-field="review-note-error"]');
     if (isReject && !note) {
+      if (onMutationFailed) onMutationFailed();
       noteEl.setAttribute('aria-invalid', 'true');
       noteEl.focus();
       if (errorEl) errorEl.hidden = false;
@@ -227,6 +235,8 @@ export async function cancelCard(card, onChanged) {
 export function openDeleteCardModal(card, {
   findCard,
   onDeleted,
+  onMutationOpened,
+  onMutationCancelled,
   onMutationConfirmed,
   onMutationFailed,
 } = {}) {
@@ -271,8 +281,14 @@ export function openDeleteCardModal(card, {
   // detached button on failure instead of the modal staying open.
   let pending = false;
   const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
-  backdrop.addEventListener('click', e => { if (!pending && e.target === backdrop) cleanup(); });
-  backdrop.querySelector('#delete-cancel').onclick = () => { if (!pending) cleanup(); };
+  const cancel = () => {
+    if (pending) return;
+    if (onMutationCancelled) onMutationCancelled();
+    cleanup();
+  };
+  backdrop.addEventListener('click', e => { if (e.target === backdrop) cancel(); });
+  backdrop.querySelector('#delete-cancel').onclick = cancel;
+  if (onMutationOpened) onMutationOpened();
   backdrop.querySelector('#delete-confirm').onclick = async () => {
     const confirmBtn = backdrop.querySelector('#delete-confirm');
     // Re-resolve the card from the live source rather than trusting the
@@ -343,6 +359,7 @@ export function openDeleteCardModal(card, {
 // generic network call) spreads this and replaces just that key.
 export function cardActionHandlers(card, {
   findCard, onChanged, onAccepted,
+  onMutationOpened, onMutationCancelled,
   onMutationConfirmed, onMutationFailed,
 } = {}) {
   const changed = onChanged || (() => {});
@@ -350,15 +367,18 @@ export function cardActionHandlers(card, {
     open: () => openCard(card, changed),
     accept: () => acceptCard(card, changed, onAccepted),
     reject: () => openReviewActionModal(card, 'reject', changed, {
+      onMutationOpened, onMutationCancelled,
       onMutationConfirmed, onMutationFailed,
     }),
     reassign: () => openReviewActionModal(card, 'reassign', changed, {
+      onMutationOpened, onMutationCancelled,
       onMutationConfirmed, onMutationFailed,
     }),
     resolve: () => resolveCard(card, changed),
     cancel: () => cancelCard(card, changed),
     delete: () => openDeleteCardModal(card, {
-      findCard, onDeleted: changed, onMutationConfirmed, onMutationFailed,
+      findCard, onDeleted: changed, onMutationOpened, onMutationCancelled,
+      onMutationConfirmed, onMutationFailed,
     }),
   };
 }

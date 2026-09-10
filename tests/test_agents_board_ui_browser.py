@@ -26,6 +26,8 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
+from api.services import agent_board
+
 pytestmark = [pytest.mark.browser, pytest.mark.slow]
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -195,15 +197,38 @@ def _stub_derive_lane(card: dict) -> str:
     an atomic tag response must still move a card when an editable tag such as
     ``human`` changes its derived lane.
     """
-    tags = {str(tag).lstrip("#").lower() for tag in card.get("tags", [])}
-    status = str(card.get("status", "todo")).lower()
-    if "human" in tags or status == "blocked":
-        return "human_queue"
-    if status == "done" and "agent-completed" in tags and "accepted" not in tags:
+    tags = {str(tag).lstrip("#").lower() for tag in (card.get("tags") or [])}
+    status = (card.get("status") or "todo").lower()
+    if "agent-completed" in tags and "accepted" not in tags:
         return "review"
+    if "agent-blocked" in tags or "human" in tags or status == "blocked":
+        return "human_queue"
+    if status == "in_progress" or "agent-running" in tags:
+        return "in_progress"
     if status in {"done", "cancelled"}:
         return "done"
     return "assigned" if tags & _ASSIGNEE_TAGS else "unassigned"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("status", "tags"),
+    [
+        ("todo", []),
+        ("todo", ["me"]),
+        ("in_progress", []),
+        ("todo", ["agent-running"]),
+        ("blocked", ["human"]),
+        ("todo", ["agent-blocked"]),
+        ("done", ["agent-completed"]),
+        ("done", ["agent-completed", "accepted"]),
+        ("done", ["human", "agent-completed"]),
+        ("cancelled", []),
+    ],
+)
+def test_stub_derive_lane_matches_production_priority(status, tags):
+    card = {"status": status, "tags": tags}
+    assert _stub_derive_lane(card) == agent_board.derive_lane(status, tags)
 
 
 def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: list, lane_status_code: list,
@@ -927,6 +952,35 @@ class TestDrawerTagsEdit:
         page.locator('[data-card-id="t-review"]').click()
         tags = page.locator(".drawer-tags")
 
+        # Hold the first atomic request in a browser-side fetch wrapper so the
+        # second edit is definitely queued, without blocking Playwright's
+        # route callback thread.
+        page.evaluate("""() => {
+            const originalFetch = window.fetch;
+            let held = false;
+            window.__releaseTagSave = null;
+            window.fetch = (input, init) => {
+                if (!held && String(input).includes('/tags')) {
+                    held = true;
+                    return new Promise(resolve => {
+                        window.__releaseTagSave = () => {
+                            window.fetch = originalFetch;
+                            resolve(originalFetch(input, init));
+                        };
+                    });
+                }
+                return originalFetch(input, init);
+            };
+        }""")
+
+        # Queue two edits back-to-back, then dismiss the modal while the
+        # second write is still serialized behind the first. The obsolete
+        # second payload must be discarded rather than landing after Cancel.
+        tags.fill("stale-one")
+        page.locator(".drawer-title").click()
+        tags.fill("stale-two")
+        page.locator(".drawer-title").click()
+
         for action, cancel_selector, tag in (
             ("reject", "#review-action-cancel", "after-reject"),
             ("reassign", "#review-action-cancel", "after-reassign"),
@@ -936,6 +990,9 @@ class TestDrawerTagsEdit:
             expect(page.locator(".modal")).to_be_visible()
             page.locator(cancel_selector).click()
             expect(page.locator(".modal")).to_have_count(0)
+            if action == "reject":
+                _wait_for(lambda: page.evaluate("Boolean(window.__releaseTagSave)"), page)
+                page.evaluate("window.__releaseTagSave()")
             tags.fill(tag)
             page.locator(".drawer-title").click()  # blur commits the atomic edit
             _wait_for(
@@ -943,8 +1000,9 @@ class TestDrawerTagsEdit:
                 page=page,
             )
 
+        assert not any("stale-two" in (payload.get("tags") or []) for payload in task_puts)
         assert [payload["tags"] for payload in task_puts] == [
-            ["after-reject"], ["after-reassign"], ["after-delete"],
+            ["stale-one"], ["after-reject"], ["after-reassign"], ["after-delete"],
         ]
         review = next(card for card in board_state["lanes"]["review"] if card["id"] == "t-review")
         assert review["tags"] == ["codex", "agent-completed", "after-delete"]
@@ -3733,8 +3791,12 @@ class TestAgentCardMoveRulesAndCancel:
         page.locator(".drawer-title").click()  # blur the tags field
         _wait_for(lambda: bool(task_puts), page=page)
         assert task_puts == [{"tags": ["notes", "extra"]}], task_puts
-        t15 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t15")
+        t15 = next(
+            card for cards in board_state["lanes"].values() for card in cards
+            if card["id"] == "t15"
+        )
         assert t15["tags"] == ["claude", "agent-running", "notes", "extra"]
+        assert t15 in board_state["lanes"]["in_progress"]
 
 
 class TestDeleteCard:

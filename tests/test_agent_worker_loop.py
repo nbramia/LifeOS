@@ -845,6 +845,49 @@ def test_reassigned_answer_claim_fails_closed_before_executor(tmp_path: Path, mo
 
 
 @pytest.mark.unit
+def test_dispatch_fetch_failure_fails_closed_without_executor(tmp_path: Path, monkeypatch):
+    """A deleted/unavailable backing task must not run the old session."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "stale synthetic dispatch", "status": "in_progress",
+         "tags": [RUNNING_TAG, "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(
+        tmp_path, api, preflight_caller=_golden_preflight(routing="local"),
+        local_executor=executor,
+    )
+    w.session_store.create(task_id="t1", status=STATUS_CLAIMED, routing="local")
+    monkeypatch.setattr(w, "_fetch_task", lambda task_id: None)
+
+    w._dispatch(api.tasks["t1"])
+
+    assert executor.calls == []
+    assert w.session_store.get("t1").status == STATUS_FAILED
+
+
+@pytest.mark.unit
+def test_followup_fetch_failure_fails_closed_without_executor(tmp_path: Path, monkeypatch):
+    """A task disappearing during follow-up reopen cannot execute old context."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "stale synthetic followup", "status": "done",
+         "tags": [COMPLETED_TAG, "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(
+        tmp_path, api, preflight_caller=_golden_preflight(routing="local"),
+        local_executor=executor,
+    )
+    session = w.session_store.create(task_id="t1", status=STATUS_COMPLETED, routing="local")
+    w.session_store.enqueue_web_followup(session.session_id, "t1", "continue")
+    monkeypatch.setattr(w, "_fetch_task", lambda task_id: None)
+
+    w._process_clarification_answers()
+
+    assert executor.calls == []
+    assert w.session_store.get("t1").status == STATUS_FAILED
+
+
+@pytest.mark.unit
 def test_completion_summary_uses_transcript_pointer_when_final_text_empty(tmp_path: Path):
     """When the agent idles without producing an `agent.message` (sometimes
     happens after a tool call on tight budgets), Telegram surfaces a
@@ -2426,7 +2469,8 @@ def test_cli_inflight_guard_covers_top_level_dispatch(tmp_path: Path):
             return ExecutorOutcome(status=STATUS_COMPLETED, final_text="done")
 
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["claude"]},
+        {"id": "t1", "description": "do the thing", "status": "in_progress",
+         "tags": [RUNNING_TAG, "claude"]},
     ])
     pool = _CapturingPool()  # never runs -> the session stays "in flight"
     w = _make_worker(tmp_path, api,

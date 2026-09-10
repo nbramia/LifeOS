@@ -1260,10 +1260,9 @@ export function initBoard() {
     tagPickerHandle = null;
   }
 
-  // Confirmation modals must not cancel the picker merely because they were
-  // opened: Cancel leaves the drawer alive, and a failed confirmed mutation
-  // must leave the Tags field usable. The handle itself is rearmed after a
-  // failed write so any edits made after the failure still serialize normally.
+  // Confirmation modals invalidate queued picker writes while they are open:
+  // Cancel leaves the drawer alive without allowing an obsolete save to land,
+  // and a failed confirmed mutation re-arms the picker for a fresh edit.
   function pauseTagPickerWrites() {
     if (tagPickerHandle && tagPickerHandle.cancel) tagPickerHandle.cancel();
   }
@@ -1482,6 +1481,7 @@ export function initBoard() {
     let activeOption = -1;
     let showingLegacyValue = true;
     let cancelled = false;
+    let saveGeneration = 0;
 
     function renderChips() {
       chips.innerHTML = selected.map(tag => `
@@ -1526,15 +1526,16 @@ export function initBoard() {
 
     function queueSave(nextTags) {
       const requested = uniqueEditableTags(nextTags);
+      const generation = saveGeneration;
       selected = requested;
       renderChips();
       pendingSaves += 1;
       saveChain = saveChain.then(async () => {
         try {
-          if (cancelled) return;
+          if (cancelled || generation !== saveGeneration) return;
           await putBoardTags(card.id, requested);
           confirmed = requested.slice();
-          if (!cancelled) await fetchBoard();
+          if (!cancelled && generation === saveGeneration) await fetchBoard();
         } catch (err) {
           // A later queued edit is still the operator's current intent; only
           // revert if this failed request is what is currently displayed.
@@ -1639,7 +1640,13 @@ export function initBoard() {
       }
     });
     const handle = {
-      cancel: () => { cancelled = true; },
+      cancel: () => {
+        cancelled = true;
+        saveGeneration += 1;
+        selected = confirmed.slice();
+        renderChips();
+        search.value = selected.join(' ');
+      },
       rearm: () => { cancelled = false; },
       isSaving: () => !cancelled && pendingSaves > 0,
       whenIdle: () => saveChain,
@@ -2152,6 +2159,8 @@ export function initBoard() {
     const cardHandlers = cardActionHandlers(card, {
       onChanged: fetchBoard,
       onAccepted: closeDrawer,
+      onMutationOpened: pauseTagPickerWrites,
+      onMutationCancelled: rearmTagPickerWrites,
       onMutationConfirmed: pauseTagPickerWrites,
       onMutationFailed: rearmTagPickerWrites,
     });
@@ -2195,6 +2204,8 @@ export function initBoard() {
         })),
         delete: () => openDeleteCardModal(card, {
           findCard,
+          onMutationOpened: pauseTagPickerWrites,
+          onMutationCancelled: rearmTagPickerWrites,
           onMutationConfirmed: pauseTagPickerWrites,
           onMutationFailed: rearmTagPickerWrites,
           onDeleted: async () => { closeDrawer(); await fetchBoard(); },

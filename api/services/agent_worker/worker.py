@@ -131,11 +131,9 @@ _BLOCKED_PROMPT_SEND_ATTEMPTS = 3
 _BLOCKED_PROMPT_RETRY_DELAY_S = 0.5
 
 # Answered-question claims use the existing `processed` integer as a small
-# durable lease: 0 = queued, 2 = claimed, 1 = conclusively handled. A worker
-# restart can release every claim it inherited; while a process remains up,
-# the answered_at timestamp bounds recovery of a claim abandoned by a stuck
-# dispatch without adding a database column.
-_QUESTION_CLAIM_LEASE_SECONDS = 15 * 60
+# durable lease: 0 = queued, 2 = claimed, 1 = conclusively handled. SessionStore
+# releases only claims inherited at process start; live claims are cleaned up by
+# the same-process exception/ownership path in `_process_clarification_answers`.
 _QUESTION_CLAIM_RECOVERY_LIMIT = 100
 
 # A recurring (cron) schedule stamps its handed-off #agent task with a
@@ -625,7 +623,7 @@ class Worker:
         # Release a bounded batch so processed=2 rows are recoverable after a
         # crash/abandonment without changing the pending_questions schema.
         recovered_claims = self.session_store.recover_question_claims(
-            max_age_seconds=None, limit=_QUESTION_CLAIM_RECOVERY_LIMIT,
+            limit=_QUESTION_CLAIM_RECOVERY_LIMIT,
         )
         if recovered_claims:
             logger.info("released %d abandoned answered-question claim(s)", recovered_claims)
@@ -738,12 +736,6 @@ class Worker:
 
     def tick(self) -> int:
         """Process one poll cycle. Returns the number of tasks handled (for tests)."""
-        recovered_claims = self.session_store.recover_question_claims(
-            max_age_seconds=_QUESTION_CLAIM_LEASE_SECONDS,
-            limit=_QUESTION_CLAIM_RECOVERY_LIMIT,
-        )
-        if recovered_claims:
-            logger.info("released %d stale answered-question claim(s)", recovered_claims)
         # Resolve Human-queue cards whose done_when condition now passes.
         # Runs before the spend-cap guard below: it never starts a new
         # task or spends money, so it must not stop just because the
@@ -821,9 +813,13 @@ class Worker:
             if not all_done:
                 continue
 
-            task = self._fetch_task(session.task_id) or {
-                "id": session.task_id, "description": session.task_id,
-            }
+            task = self._fetch_task(session.task_id)
+            if session.origin != "operator" and not session.parent_session_id:
+                if task is None or not self._task_claim_is_current(task):
+                    self._fail_closed_task_resume(session, "resume_after_children")
+                    continue
+            if task is None:
+                task = {"id": session.task_id, "description": session.task_id}
 
             # Build the resume turn — same shape for local and cloud, but
             # cloud also pulls each child's final_text (from the managed_cursor
@@ -981,10 +977,13 @@ class Worker:
         if managed is None:
             return  # operator removed credentials between starts; sessions are stuck
         for session in active:
-            task = self._fetch_task(session.task_id) or {
-                "id": session.task_id,
-                "description": session.task_id,
-            }
+            task = self._fetch_task(session.task_id)
+            if session.origin != "operator" and not session.parent_session_id:
+                if task is None or not self._task_claim_is_current(task):
+                    self._fail_closed_task_resume(session, "managed_poll")
+                    continue
+            if task is None:
+                task = {"id": session.task_id, "description": session.task_id}
             pre_dollars = session.total_dollars or 0.0
             try:
                 outcome = managed.poll(session)
@@ -1032,8 +1031,8 @@ class Worker:
         finally:
             # Any exception, including a Managed Agents start failure or a
             # Telegram/transcript write failure, must not strand processed=2.
-            # Successful paths have already changed the row to 1; a row
-            # retired by reassignment is no longer claim-owned and is left so.
+            # Successful paths have already changed the row to 1; rows whose
+            # ownership marker was cleared are left at their current state.
             for q in answered:
                 if self.session_store.question_claimed(q["id"]):
                     self.session_store.release_question_claim(q["id"])
@@ -1129,7 +1128,11 @@ class Worker:
             self._set_task_status(task_id, "in_progress")
             self.session_store.update_status(task_id, STATUS_RUNNING)
 
-            task = self._fetch_task(task_id) or {"id": task_id, "description": task_id}
+            task = self._fetch_task(task_id)
+            if task is None or not self._task_claim_is_current(task):
+                self._fail_closed_task_resume(session, "clarification_resume")
+                self.session_store.mark_question_processed(q["id"])
+                continue
             if session.routing == ROUTE_HERMES:
                 if not self.session_store.question_claimed(q["id"]):
                     continue
@@ -1344,7 +1347,16 @@ class Worker:
             "question_id": q["id"], "answer_chars": len(answer),
         })
 
-        task = self._fetch_task(task_id) or {"id": task_id, "description": task_id}
+        task = self._fetch_task(task_id)
+        if session.origin != "operator" and (
+            task is None or not self._task_claim_is_current(task)
+        ):
+            self._fail_closed_task_resume(session, "followup_resume")
+            self.session_store.mark_question_processed(q["id"])
+            return
+        if task is None:
+            # Operator-root sessions have no backing vault task by design.
+            task = {"id": task_id, "description": task_id}
 
         if session.routing in (ROUTE_LOCAL, ROUTE_REMOTE):
             # Surface-neutral prefix: follow-ups arrive from Telegram replies and
@@ -1643,7 +1655,13 @@ class Worker:
             self.transcript_store.append(session_id, "wake", {})
             # Re-fetch the task description from the API so the conversation
             # context stays accurate (someone may have edited the title).
-            task = self._fetch_task(session.task_id) or {"id": session.task_id, "description": ""}
+            task = self._fetch_task(session.task_id)
+            if session.origin != "operator" and not session.parent_session_id:
+                if task is None or not self._task_claim_is_current(task):
+                    self._fail_closed_task_resume(session, "wake_sleep")
+                    continue
+            if task is None:
+                task = {"id": session.task_id, "description": ""}
             # (#809) A remote-routed session that slept must wake back onto
             # the remote provider, not silently switch to local Gemma — same
             # conversation-history-based resume, different target client.
@@ -1756,6 +1774,11 @@ class Worker:
     def _norm_task_tags(task: dict[str, Any] | None) -> set[str]:
         return {str(t).lstrip("#").lower() for t in ((task or {}).get("tags") or [])}
 
+    def _task_claim_is_current(self, task: dict[str, Any] | None) -> bool:
+        """Return whether a fetched task still carries this worker's claim."""
+        tags = self._norm_task_tags(task)
+        return bool(task) and RUNNING_TAG in tags and REASSIGNED_TAG not in tags
+
     def _claim_is_current(self, task_id: str, *, allow_reassigned: bool = False) -> bool:
         """Confirm the worker still owns the lifecycle claim before acting."""
         task = self._fetch_task(task_id)
@@ -1763,6 +1786,13 @@ class Worker:
         return bool(task) and RUNNING_TAG in tags and (
             allow_reassigned or REASSIGNED_TAG not in tags
         )
+
+    def _fail_closed_task_resume(self, session, phase: str) -> None:
+        """Stop a session when its backing task cannot be revalidated."""
+        self.transcript_store.append(session.session_id, "task_ownership_unavailable", {
+            "task_id": session.task_id, "phase": phase,
+        })
+        self.session_store.update_status(session.task_id, STATUS_FAILED)
 
     def _complete_task(self, task_id: str) -> bool:
         try:
@@ -2221,6 +2251,12 @@ class Worker:
         )
         from api.services.agent_worker.claude_code_spawn import parse_claude_code_spawn_payload
 
+        if session.origin != "operator" and not session.parent_session_id:
+            current_task = self._fetch_task(session.task_id)
+            if current_task is None or not self._task_claim_is_current(current_task):
+                self._fail_closed_task_resume(session, "claude_code_dispatch")
+                return
+
         # The owning bot (NULL = primary) routes every operator-facing notice for
         # this session — the streaming [NOTIFY]/[CLARIFY] (via the executor's
         # callback) and the worker-sent block/completion/failure messages below.
@@ -2636,6 +2672,12 @@ class Worker:
         from api.services.agent_worker.codex_executor import REASON_KILLED
         from api.services.agent_worker.codex_spawn import parse_codex_spawn_payload
 
+        if session.origin != "operator" and not session.parent_session_id:
+            current_task = self._fetch_task(session.task_id)
+            if current_task is None or not self._task_claim_is_current(current_task):
+                self._fail_closed_task_resume(session, "codex_dispatch")
+                return
+
         codex = self._get_codex_executor()
         sid = session.session_id
 
@@ -2883,20 +2925,19 @@ class Worker:
             return
         sid = session.session_id
 
-        # A review reassignment can race this dispatch after `_claim()` has
-        # returned. Re-read the task immediately before preflight/session
-        # mutation and fail closed if the lifecycle claim is no longer ours.
+        # Re-read the task immediately before preflight/session mutation and
+        # require a current lifecycle claim before dispatch proceeds.
         current_task = self._fetch_task(task_id)
-        # Direct executor harnesses may supply only an id/description; the
-        # production claim path always carries the original tag snapshot.
-        # Keep that compatibility while still enforcing the recheck for real
-        # claimed candidates.
-        if task.get("tags") and current_task is not None and not self._claim_is_current(task_id):
+        if current_task is None or not self._task_claim_is_current(current_task):
             self.transcript_store.append(sid, "claim_retired_before_dispatch", {
                 "task_id": task_id,
             })
-            self.session_store.update_status(task_id, STATUS_FAILED)
+            self._fail_closed_task_resume(session, "dispatch")
             return
+        # Use the revalidated snapshot for title, tags, and executor context;
+        # the candidate list may have gone stale while the claim was acquired.
+        task = current_task
+        title = task.get("description", task_id)
 
         # Preflight: budget, routing, ambiguity, sanity.
         try:

@@ -83,25 +83,29 @@ def test_answered_followup_claim_is_atomic_and_reassignment_retires_claim(tmp_pa
 
 
 @pytest.mark.unit
-def test_answered_question_claim_recovers_after_restart_or_stale_lease(tmp_path: Path):
-    """A processed=2 row is a recoverable lease, not a permanently consumed answer."""
+def test_answered_question_claim_recovers_after_restart_but_not_live_claim(tmp_path: Path):
+    """Only a claim inherited by a new store instance is recoverable."""
     store = SessionStore(db_path=tmp_path / "sessions.db")
     session = store.create(task_id="t-recover", status=STATUS_COMPLETED)
     question_id = store.enqueue_web_followup(session.session_id, "t-recover", "retry synthetic work")
 
     assert [q["id"] for q in store.claim_answered_unprocessed_questions()] == [question_id]
-    assert store.recover_question_claims(max_age_seconds=None, limit=10) == 1
-    assert [q["id"] for q in store.claim_answered_unprocessed_questions()] == [question_id]
-
-    # Existing answered_at is the bounded tick lease clock; an old answer can
-    # be released without adding a claim timestamp column.
     with store._connect() as conn:
         conn.execute(
-            "UPDATE pending_questions SET answered_at = answered_at - 3600 WHERE id = ?",
+            "UPDATE pending_questions SET answered_at = answered_at - 86400 WHERE id = ?",
             (question_id,),
         )
-    assert store.recover_question_claims(max_age_seconds=60, limit=10) == 1
-    assert [q["id"] for q in store.claim_answered_unprocessed_questions()] == [question_id]
+    # A long-running answer owned by this process must not be stolen by its
+    # regular tick even when its answer is old; recovery is process-start-only.
+    assert store.recover_question_claims(limit=10) == 0
+    assert store.question_claimed(question_id)
+
+    # A fresh process/store inherits the durable marker and recovers it at
+    # startup, without consulting the answer's age.
+    restarted = SessionStore(db_path=tmp_path / "sessions.db")
+    assert restarted.recover_question_claims(limit=10) == 1
+    assert not store.question_claimed(question_id)
+    assert [q["id"] for q in restarted.claim_answered_unprocessed_questions()] == [question_id]
 
 
 @pytest.mark.unit

@@ -380,6 +380,12 @@ class SessionStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        # ``processed=2`` is an in-flight marker, not a durable owner id.
+        # Keep ownership in memory so a live claim in this process is never
+        # recovered by its own cleanup pass. Rows that predate this store
+        # instance are the only claims eligible for process-start recovery.
+        self._owned_question_claims: set[int] = set()
+        self._inherited_question_claims = self._list_question_claim_ids()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), isolation_level=None, timeout=10.0)
@@ -526,6 +532,14 @@ class SessionStore:
             # one.
             if "hermes_model" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN hermes_model TEXT")
+
+    def _list_question_claim_ids(self) -> set[int]:
+        """Snapshot claims inherited from an earlier worker process."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM pending_questions WHERE processed = 2",
+            ).fetchall()
+        return {int(row["id"]) for row in rows}
 
     # ------------------------------------------------------------------
     # Session CRUD
@@ -1704,33 +1718,29 @@ class SessionStore:
                     item = dict(row)
                     item["processed"] = 2
                     claimed.append(item)
+                    self._owned_question_claims.add(int(row["id"]))
         return claimed
 
     def recover_question_claims(
-        self, *, max_age_seconds: int | None = None, limit: int = 100,
+        self, *, limit: int = 100,
     ) -> int:
         """Return abandoned ``processed=2`` answer rows to the retry queue.
 
         ``processed=2`` is deliberately kept as the lease state so this
-        recovery needs no schema change. On worker startup every in-flight
-        claim belongs to the abandoned process and is safe to release. During
-        normal ticks callers pass a bounded age based on the existing
-        ``answered_at`` timestamp; a long-running resume is therefore given a
-        lease window while a killed worker becomes retryable on a later tick.
+        recovery needs no schema change. Only claims observed when this store
+        instance started are eligible; claims made by this live process remain
+        owned until the normal success/exception cleanup path releases them.
         """
         limit = max(1, int(limit))
-        params: list[int] = []
-        age_clause = ""
-        if max_age_seconds is not None:
-            cutoff = _now() - max(0, int(max_age_seconds))
-            age_clause = " AND answered_at <= ?"
-            params.append(cutoff)
+        inherited = sorted(self._inherited_question_claims)[:limit]
+        if not inherited:
+            return 0
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT id FROM pending_questions "
-                "WHERE answered_at IS NOT NULL AND processed = 2"
-                + age_clause + " ORDER BY id ASC LIMIT ?",
-                (*params, limit),
+                "WHERE processed = 2 AND id IN (%s) ORDER BY id ASC" %
+                ",".join("?" for _ in inherited),
+                inherited,
             ).fetchall()
             recovered = 0
             for row in rows:
@@ -1740,34 +1750,49 @@ class SessionStore:
                     (row["id"],),
                 )
                 recovered += cur.rowcount
+                self._inherited_question_claims.discard(int(row["id"]))
         return recovered
 
     def question_claimed(self, question_id: int) -> bool:
         """Return whether this worker still owns an answered row claim."""
+        question_id = int(question_id)
+        if question_id not in self._owned_question_claims:
+            return False
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT 1 FROM pending_questions WHERE id = ? AND processed = 2",
-                (int(question_id),),
+                (question_id,),
             ).fetchone()
-        return row is not None
+        if row is None:
+            self._owned_question_claims.discard(question_id)
+            return False
+        return True
 
     def release_question_claim(self, question_id: int) -> bool:
         """Return a claimed row to the retryable unprocessed state."""
+        question_id = int(question_id)
+        if question_id not in self._owned_question_claims:
+            return False
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE pending_questions SET processed = 0 "
                 "WHERE id = ? AND processed = 2",
-                (int(question_id),),
+                (question_id,),
             )
+        self._owned_question_claims.discard(question_id)
         return cur.rowcount > 0
 
     def mark_question_processed(self, question_id: int) -> bool:
+        question_id = int(question_id)
+        if question_id not in self._owned_question_claims:
+            return False
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE pending_questions SET processed = 1 "
                 "WHERE id = ? AND processed = 2",
-                (int(question_id),),
+                (question_id,),
             )
+        self._owned_question_claims.discard(question_id)
         return cur.rowcount > 0
 
     def list_timed_out_questions(self, before_ts: int) -> list[dict]:
