@@ -90,9 +90,17 @@ class HermesExecutor:
         self._cancelled: set[tuple[str, str | None, str | None]] = set()
         self._active_lock = threading.Lock()
 
-    def execute(self, session, task: dict) -> ExecutorOutcome:
-        """Start a new Hermes conversation turn."""
-        return self._execute_turn(session, task, operation="execute")
+    def execute(
+        self, session, task: dict, prompt: str | None = None,
+    ) -> ExecutorOutcome:
+        """Start a Hermes turn, staying in-thread when the session has one."""
+        return self._execute_turn(
+            session,
+            task,
+            prompt=prompt,
+            conversation_id=getattr(session, "conversation_id", None),
+            operation="execute",
+        )
 
     def resume(self, session, message: str, working_dir: str | None = None) -> ExecutorOutcome:
         """Continue the persisted Hermes conversation for this session."""
@@ -111,11 +119,11 @@ class HermesExecutor:
         return self.resume(session, request)
 
     def _execute_turn(
-        self, session, task: dict, *, conversation_id: str | None = None,
-        operation: str = "execute",
+        self, session, task: dict, *, prompt: str | None = None,
+        conversation_id: str | None = None, operation: str = "execute",
     ) -> ExecutorOutcome:
         sid = session.session_id
-        prompt = self._build_prompt(task)
+        prompt = (prompt if prompt is not None else self._build_prompt(task)).strip()
         if not prompt:
             self.transcript_store.append(sid, "hermes_no_prompt", {})
             self.session_store.update_status(
@@ -487,6 +495,7 @@ class HermesExecutor:
         self.transcript_store.append(sid, "hermes_completed", {
             "conversation_id": conversation_id,
             "final_chars": len(final_text),
+            "final_text": final_text[:6000],
             "done_seen": done_seen,
             "error_seen": error_seen,
             "stream_truncated": stream_truncated,
@@ -659,6 +668,7 @@ class HermesExecutor:
         invocation's `--append-system-prompt` does."""
         title = (task.get("description") or "").strip()
         notes = (task.get("notes") or "").strip()
+        notes = notes[-6000:]
         if title and notes:
             return f"{title}\n\n{notes}"
         return title or notes

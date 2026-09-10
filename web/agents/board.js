@@ -4,15 +4,15 @@
 // task store via GET/PUT /api/agents/board*, with a card drawer that reuses
 // the shared SessionPanel (./panel.js) for the linked session's transcript,
 // exactly like the Graph tab's side panel does. The drawer's own action
-// row (Open, Go To, Resume, Kill, Answer, Accept, Resolve, Cancel, Delete)
+// row (Open, Go To, Resume, Kill, Answer, Accept, Reject, Reassign, Mark Done, Cancel, Delete)
 // is rendered by session_actions.js's `renderActionRow` — the same
 // function the Graph tab's side panel uses for its own header — so the
 // embedded SessionPanel here is constructed with `showActions: false`
 // (see `renderDrawerSession`) to avoid rendering the same session's
 // Kill/Resume/Go To twice.
 //
-// No card reordering within a lane (file order is lane order, per the
-// issue) — drag only ever changes which lane a card is in.
+// Sorting is client-only — drag only ever changes which lane a card is in;
+// no sort choice rewrites the vault's file order.
 
 import {
   TERMINAL, routingLabel, escapeHtml, showToast, SessionPanel,
@@ -23,6 +23,11 @@ import { acceptCard, cardActionHandlers, cancelCard, openDeleteCardModal } from 
 import { renderAssignmentPickers } from './assignment.js';
 import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
+import { POINTER_SLOP, pointerIsActive, shouldCancelPointerGesture } from './board_gesture.js';
+import {
+  compareSortValues, loadSortSelection as readSortSelection,
+  saveSortSelection as writeSortSelection, sortCards,
+} from './board_sort.js';
 import {
   getFilters, setFilter, setFilters, resetFilters, subscribe as subscribeFilters,
   requestGraphFocus, requestBoardFocus, takeBoardFocus,
@@ -36,7 +41,7 @@ const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud'];
 const AGENT_ASSIGNEES = ASSIGNEES.filter(a => a !== 'me');
 
 const SORT_STORAGE_KEY = 'lifeos.agents.board.sort';
-const DEFAULT_SORT = 'file';
+const DEFAULT_SORT = 'modified_desc';
 const SORT_OPTIONS = new Set([
   'file', 'created_asc', 'created_desc', 'modified_asc', 'modified_desc', 'assignee_asc',
 ]);
@@ -53,8 +58,10 @@ const SORT_OPTIONS = new Set([
 // operator-editable label, not a claim), and an operator label that
 // happens to start with `agent-` must stay editable too.
 const LIFECYCLE_TAGS = new Set([
+  'cloud-haiku', 'cloud-sonnet',
   'agent-running', 'agent-blocked', 'agent-completed',
   'agent-failed', 'agent-budget-exceeded', 'accepted',
+  'agent-reassigned',
 ]);
 
 // Card fields the drawer renders as editable inputs — used to decide
@@ -89,51 +96,13 @@ const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done').map(l => l.i
 const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled').map(l => l.id));
 
 function loadSortSelection() {
-  try {
-    const value = localStorage.getItem(SORT_STORAGE_KEY);
-    if (value && SORT_OPTIONS.has(value)) return value;
-  } catch (_) {}
-  return DEFAULT_SORT;
+  return readSortSelection(localStorage, SORT_STORAGE_KEY, SORT_OPTIONS, DEFAULT_SORT);
 }
 
 function saveSortSelection(value) {
-  try { localStorage.setItem(SORT_STORAGE_KEY, value); } catch (_) {}
+  writeSortSelection(localStorage, SORT_STORAGE_KEY, value);
 }
 
-function cardSortKey(card, mode) {
-  if (mode.startsWith('created')) {
-    const raw = card.created_at || card.created_date || card.next_fire_at || '';
-    const timestamp = raw ? Date.parse(raw) : NaN;
-    return Number.isFinite(timestamp) ? timestamp : null;
-  }
-  if (mode.startsWith('modified')) {
-    const raw = card.updated_at || card.next_fire_at || '';
-    const timestamp = raw ? Date.parse(raw) : NaN;
-    return Number.isFinite(timestamp) ? timestamp : null;
-  }
-  if (mode === 'assignee_asc') {
-    if (card.kind === 'schedule') return '\uffff';
-    return (card.assignee || '\ufffe').toLowerCase();
-  }
-  return null;
-}
-
-function sortCards(cards, mode) {
-  if (!mode || mode === DEFAULT_SORT) return cards;
-  const descending = mode.endsWith('_desc');
-  return cards
-    .map((card, index) => ({ card, index, key: cardSortKey(card, mode) }))
-    .sort((a, b) => {
-      if (a.key == null && b.key == null) return a.index - b.index;
-      if (a.key == null) return 1;
-      if (b.key == null) return -1;
-      const comparison = typeof a.key === 'string'
-        ? a.key.localeCompare(b.key)
-        : a.key - b.key;
-      return comparison === 0 ? a.index - b.index : (descending ? -comparison : comparison);
-    })
-    .map(({ card }) => card);
-}
 
 export function initBoard() {
   const lanesEl = document.getElementById('board-lanes');
@@ -152,8 +121,14 @@ export function initBoard() {
   const sortFilterEl = document.getElementById('board-filter-sort');
   const includeDoneEl = document.getElementById('board-filter-done');
   const filterClearBtn = document.getElementById('board-filter-clear');
+  const filterToggleBtn = document.getElementById('board-filter-toggle');
+  const filterSummaryEl = document.getElementById('board-filter-summary');
+  const filterControlsEl = document.getElementById('board-filter-controls');
   const newCardBtn = document.getElementById('board-new-card');
   const connStateEl = document.getElementById('board-connection-state');
+  const assigneeDropsEl = document.getElementById('board-assignee-drops');
+  const doneDropEl = document.getElementById('board-done-drop');
+  const dropStatusEl = document.getElementById('board-drop-status');
   const drawerBackdrop = document.getElementById('board-drawer-backdrop');
   const drawerEl = document.getElementById('board-drawer');
 
@@ -170,6 +145,9 @@ export function initBoard() {
   let openCardSnapshot = null;  // last card object the drawer was fully rendered from
   let panel = null;  // SessionPanel for the drawer's linked-session transcript
   let assignmentHandle = null;  // renderAssignmentPickers()'s return value for the open drawer, or null
+  let tagPickerHandle = null;
+  let selectedAssignee = null;
+  let quickActionCardId = null;
 
   // A card snapshot older than an in-flight picker save re-seeds the
   // model/effort/host pickers with the pre-save value on remount -- a
@@ -177,6 +155,13 @@ export function initBoard() {
   // saves hasn't settled yet.
   function assignmentSaveInFlight() {
     return !!(assignmentHandle && assignmentHandle.isSaving && assignmentHandle.isSaving());
+  }
+
+  // A board refresh during an atomic tag save must not rebuild the drawer:
+  // renderDrawer cancels the picker handle, which would discard any later
+  // queued tag edits before their CAS writes run.
+  function tagPickerSaveInFlight() {
+    return !!(tagPickerHandle && tagPickerHandle.isSaving && tagPickerHandle.isSaving());
   }
 
   // A focused TEXTAREA or text INPUT inside the drawer holds uncommitted
@@ -309,7 +294,8 @@ export function initBoard() {
       f => JSON.stringify(prev[f]) !== JSON.stringify(fresh[f])
     ) || prevPendingId !== freshPendingId || prevSessionStatus !== freshSessionStatus;
     const focused = !!(drawerEl && drawerEl.contains(document.activeElement));
-    if ((fieldsChanged || !sessionUnchanged) && !focused && !assignmentSaveInFlight()) {
+    if ((fieldsChanged || !sessionUnchanged) && !focused
+      && !assignmentSaveInFlight() && !tagPickerSaveInFlight()) {
       renderDrawer(fresh);
       // Only advance the snapshot on the branch that actually rendered —
       // otherwise a frame skipped because the drawer had focus is treated
@@ -452,6 +438,101 @@ export function initBoard() {
     return true;
   }
 
+  function setDropStatus(message = '', isError = false) {
+    if (!dropStatusEl) return;
+    dropStatusEl.textContent = message;
+    dropStatusEl.classList.toggle('error', isError);
+  }
+
+  function assignmentPolicyReason(card) {
+    const policy = card && card.policy && card.policy.assignee;
+    return policy && policy.allowed === false
+      ? (policy.reason || "This card's assignee can't be changed right now.")
+      : null;
+  }
+
+  function canDropCard(card, targetLane) {
+    if (!card || card.kind !== 'task') return { allowed: false, reason: 'Only task cards can be moved.' };
+    if (!DIRECT_LANE_IDS.has(targetLane)) {
+      return { allowed: false, reason: `Can't move card to ${laneLabel(targetLane)}.` };
+    }
+    const policy = card.policy && card.policy.lanes && card.policy.lanes[targetLane];
+    if (policy && policy.allowed === false) {
+      return { allowed: false, reason: policy.reason || `Can't move card to ${laneLabel(targetLane)}.` };
+    }
+    return { allowed: true, reason: '' };
+  }
+
+  function assignSelectedAssignee(card) {
+    if (!selectedAssignee || !card || card.kind !== 'task') return false;
+    const assignee = selectedAssignee;
+    selectedAssignee = null;
+    renderAssigneeDrops();
+    const reason = assignmentPolicyReason(card);
+    if (reason) {
+      setDropStatus(reason, true);
+      showToast(reason, true);
+      return true;
+    }
+    setDropStatus(`Assigning ${assignee}…`);
+    moveCard(card.id, 'assigned', assignee)
+      .then(() => setDropStatus(`Assigned to ${assignee}.`))
+      .catch(() => setDropStatus('Assignment refused.', true));
+    return true;
+  }
+
+  function assignAssigneeToCard(cardId, assignee) {
+    const card = findCard(cardId);
+    if (!card || card.kind !== 'task') return;
+    const reason = assignmentPolicyReason(card);
+    if (reason) {
+      setDropStatus(reason, true);
+      showToast(reason, true);
+      return;
+    }
+    setDropStatus(`Assigning ${assignee}…`);
+    // Keep this on the same lane endpoint and request shape as the drawer's
+    // assignee select. The server remains authoritative for claimed cards
+    // and for cards whose derived lane cannot change with the tag update.
+    moveCard(card.id, 'assigned', assignee)
+      .then(() => setDropStatus(`Assigned to ${assignee}.`))
+      .catch(() => setDropStatus('Assignment refused.', true));
+  }
+
+  function renderAssigneeDrops() {
+    if (!assigneeDropsEl) return;
+    assigneeDropsEl.innerHTML = ASSIGNEES.map(assignee => `
+      <button type="button" class="board-drop-target board-assignee-drop${selectedAssignee === assignee ? ' selected' : ''}"
+              data-assignee="${assignee}" aria-pressed="${selectedAssignee === assignee}"
+              aria-label="Assign selected card to ${assignee}">
+        ${assignee}
+      </button>
+    `).join('');
+    assigneeDropsEl.querySelectorAll('.board-assignee-drop').forEach(button => {
+      button.addEventListener('click', () => {
+        if (consumeClickSuppression('tray', `assignee:${button.dataset.assignee}`)) {
+          return;
+        }
+        selectedAssignee = selectedAssignee === button.dataset.assignee ? null : button.dataset.assignee;
+        renderAssigneeDrops();
+        setDropStatus(selectedAssignee
+          ? `Tap a card to assign it to ${selectedAssignee}, or drag this button onto a card.`
+          : '');
+      });
+      button.addEventListener('pointerdown', e => onPointerDown(e, {
+        kind: 'assignee', assignee: button.dataset.assignee, sourceEl: button,
+      }));
+    });
+  }
+
+  function updateQuickDropTargets() {
+    if (!doneDropEl) return;
+    const hidden = !visibleLanes.has('done');
+    doneDropEl.hidden = !hidden;
+    doneDropEl.setAttribute('aria-label', hidden
+      ? 'Drop a card here to move it to Done' : 'Done lane is visible');
+  }
+
   // ------------------------------------------------------------------
   // Rendering
   // ------------------------------------------------------------------
@@ -504,6 +585,8 @@ export function initBoard() {
     div.className = 'board-card';
     div.dataset.cardId = card.id;
     div.dataset.lane = card.lane;
+    div.tabIndex = 0;
+    div.setAttribute('role', 'article');
     // Re-stamps the reveal highlight on a freshly-built element — a
     // `render()` in the middle of `revealCard`'s ~2s window (e.g. a
     // board-stream SSE tick) rebuilds every card node from scratch, so this
@@ -518,7 +601,15 @@ export function initBoard() {
       ${showAccept ? '<button type="button" class="board-card-accept">Accept</button>' : ''}
     `;
     div.addEventListener('click', () => {
-      if (suppressNextClick === card.id) { suppressNextClick = null; return; }
+      if (consumeClickSuppression('card', card.id)) return;
+      if (assignSelectedAssignee(card)) return;
+      openDrawer(card.id);
+    });
+    div.addEventListener('focus', () => { quickActionCardId = card.id; });
+    div.addEventListener('keydown', e => {
+      if (e.target !== div || (e.key !== 'Enter' && e.key !== ' ')) return;
+      e.preventDefault();
+      if (assignSelectedAssignee(card)) return;
       openDrawer(card.id);
     });
     const sessionChip = div.querySelector('.board-chip-session');
@@ -529,14 +620,19 @@ export function initBoard() {
         activateTab('graph');
       });
     }
-    div.addEventListener('mousedown', (e) => onCardMouseDown(e, card));
+    div.addEventListener('pointerdown', (e) => onPointerDown(e, {
+      kind: 'card', card, sourceEl: div,
+    }));
     if (showAccept) {
       const acceptBtn = div.querySelector('.board-card-accept');
       acceptBtn.addEventListener('mousedown', (e) => e.stopPropagation());
       acceptBtn.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
-        acceptCard(card, fetchBoard);
+        acceptBtn.disabled = true;
+        runCardAction(() => acceptCard(card, fetchBoard)).finally(() => {
+          if (acceptBtn.isConnected) acceptBtn.disabled = false;
+        });
       });
     }
     return div;
@@ -566,14 +662,6 @@ export function initBoard() {
   }
 
   function render() {
-    // A drop's re-render replaces every card node, so the trailing click
-    // that `suppressNextClick` was set to swallow often never reaches a
-    // card's own click handler (mouseup can land on a different lane's
-    // element, whose click event never bubbles through the original card).
-    // Clear it here instead of waiting for a click that may not arrive —
-    // otherwise it lingers and eats the operator's next genuine click on
-    // that same card id (#850 verify-1 finding 3).
-    suppressNextClick = null;
     lanesEl.innerHTML = '';
     if (visibleLanes.size === 0) {
       const hint = document.createElement('div');
@@ -705,25 +793,85 @@ export function initBoard() {
   onTabActivate((name) => { if (name === 'board') drainBoardFocus(); });
 
   // ------------------------------------------------------------------
-  // Drag and drop — pointer-based (mousedown/mousemove/mouseup), not the
-  // native HTML5 Drag and Drop API. draggable="true" + dragstart/drop only
-  // fires through the browser's OS-level drag gesture, which synthetic
-  // mouse events (Playwright included) can't reliably trigger — a plain
-  // pointer drag works the same in real use and is what the server-free
-  // browser test drives.
+  // Drag and drop — one Pointer Events model for mouse, pen, and touch. CSS
+  // reserves the horizontal axis on draggable sources (`pan-y`), so the UA
+  // cannot negotiate away a horizontal drag after pointerdown; vertical
+  // movement remains native scrolling. This avoids the native HTML5 DnD path,
+  // which is not available to touch users.
   // ------------------------------------------------------------------
 
-  let dragState = null;   // { cardId, sourceLane, cardEl, ghost, startX, startY, moved }
-  let suppressNextClick = null;  // card id whose trailing click (after a real drag) should be swallowed
+  let dragState = null;   // { kind, card, assignee, sourceEl, pointerId, pointerType, ghost, startX, startY, moved }
+  let suppressNextClick = null;
+  let suppressNextTrayClick = null;
 
-  function onCardMouseDown(e, card) {
-    if (e.button !== 0) return;
-    dragState = {
-      cardId: card.id, sourceLane: card.lane, cardEl: e.currentTarget,
-      startX: e.clientX, startY: e.clientY, moved: false, ghost: null,
+  function setClickSuppression(kind, key) {
+    const slot = kind === 'tray' ? 'suppressNextTrayClick' : 'suppressNextClick';
+    const current = { key, timer: null };
+    current.timer = setTimeout(() => {
+      if ((kind === 'tray' ? suppressNextTrayClick : suppressNextClick) === current) {
+        if (kind === 'tray') suppressNextTrayClick = null;
+        else suppressNextClick = null;
+      }
+    }, 700);
+    if (kind === 'tray') suppressNextTrayClick = current;
+    else suppressNextClick = current;
+  }
+
+  function consumeClickSuppression(kind, key) {
+    const current = kind === 'tray' ? suppressNextTrayClick : suppressNextClick;
+    if (!current || current.key !== key) return false;
+    clearTimeout(current.timer);
+    if (kind === 'tray') suppressNextTrayClick = null;
+    else suppressNextClick = null;
+    return true;
+  }
+
+  function clearDragTarget() {
+    document.querySelectorAll('.board-lane.drag-over, .board-drop-target.drop-allowed, .board-drop-target.drop-refused')
+      .forEach(el => el.classList.remove('drag-over', 'drop-allowed', 'drop-refused'));
+  }
+
+  function endPointerDrag() {
+    document.removeEventListener('pointermove', onDragMove);
+    document.removeEventListener('pointerup', onDragUp);
+    document.removeEventListener('pointercancel', onDragCancel);
+    clearDragTarget();
+    if (!dragState) return;
+    const { ghost, sourceEl, pointerId } = dragState;
+    if (sourceEl && pointerId != null && sourceEl.releasePointerCapture) {
+      try { sourceEl.releasePointerCapture(pointerId); } catch (_) {}
+    }
+    if (ghost && ghost.parentNode) ghost.parentNode.removeChild(ghost);
+    if (sourceEl) sourceEl.classList.remove('dragging-source');
+    document.body.classList.remove('board-dragging');
+  }
+
+  function onPointerDown(e, source) {
+    if (e.isPrimary === false || dragState || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    if (e.target.closest('button, input, select, textarea, a') && source.kind === 'card') return;
+    // A session chip has its own click navigation. Do not let the card's
+    // drag handler capture that pointer on the card, or the browser retargets
+    // the trailing pointerup/click to the card and opens its drawer instead
+    // of running the chip's graph jump.
+    if (source.kind === 'card' && e.target.closest('.board-chip-session')) return;
+    const pointerType = e.pointerType || 'mouse';
+    const state = {
+      ...source, sourceEl: source.sourceEl || e.currentTarget,
+      pointerId: e.pointerId, pointerType,
+      startX: e.clientX, startY: e.clientY, moved: false, cancelled: false, ghost: null,
+      holdReady: true,
     };
-    document.addEventListener('mousemove', onDragMove);
-    document.addEventListener('mouseup', onDragUp);
+    dragState = state;
+    // Capturing a touch pointer at pointerdown can make the UA's scroll
+    // negotiation race the custom drag. Let the browser retain the touch
+    // target until a horizontal drag has actually started; mouse/pen still
+    // capture immediately so leaving the source does not lose the gesture.
+    if (pointerType !== 'touch' && state.sourceEl && state.sourceEl.setPointerCapture && e.pointerId != null) {
+      try { state.sourceEl.setPointerCapture(e.pointerId); } catch (_) {}
+    }
+    document.addEventListener('pointermove', onDragMove);
+    document.addEventListener('pointerup', onDragUp);
+    document.addEventListener('pointercancel', onDragCancel);
   }
 
   function clearDragSelection() {
@@ -732,17 +880,30 @@ export function initBoard() {
   }
 
   function onDragMove(e) {
-    if (!dragState) return;
+    if (!pointerIsActive(dragState, e)) return;
     const dx = e.clientX - dragState.startX;
     const dy = e.clientY - dragState.startY;
-    if (!dragState.moved && Math.hypot(dx, dy) < 4) return;
+    if (!dragState.moved && Math.hypot(dx, dy) < POINTER_SLOP) return;
+    // Let the browser own vertical scrolling from a card. Once cancelled,
+    // pointerup is ignored and the card still receives its ordinary click
+    // only when the browser decides this was a tap rather than a scroll.
+    if (!dragState.moved && shouldCancelPointerGesture(dragState, dx, dy)) {
+      dragState.cancelled = true;
+      endPointerDrag();
+      dragState = null;
+      return;
+    }
     if (!dragState.moved) {
       dragState.moved = true;
+      if (e.cancelable) e.preventDefault();
       document.body.classList.add('board-dragging');
       clearDragSelection();
-      dragState.cardEl.classList.add('dragging-source');
-      const rect = dragState.cardEl.getBoundingClientRect();
-      const ghost = dragState.cardEl.cloneNode(true);
+      dragState.sourceEl.classList.add('dragging-source');
+      if (dragState.pointerType === 'touch' && dragState.sourceEl.setPointerCapture && e.pointerId != null) {
+        try { dragState.sourceEl.setPointerCapture(e.pointerId); } catch (_) {}
+      }
+      const rect = dragState.sourceEl.getBoundingClientRect();
+      const ghost = dragState.sourceEl.cloneNode(true);
       ghost.classList.add('board-card-ghost');
       ghost.style.position = 'fixed';
       ghost.style.pointerEvents = 'none';
@@ -751,32 +912,78 @@ export function initBoard() {
       document.body.appendChild(ghost);
       dragState.ghost = ghost;
     }
+    if (dragState.kind === 'card' && lanesEl) {
+      const lanesRect = lanesEl.getBoundingClientRect();
+      const edge = 28;
+      if (e.clientX < lanesRect.left + edge) lanesEl.scrollLeft -= 18;
+      else if (e.clientX > lanesRect.right - edge) lanesEl.scrollLeft += 18;
+    }
     dragState.ghost.style.left = (e.clientX + 12) + 'px';
     dragState.ghost.style.top = (e.clientY + 12) + 'px';
-    document.querySelectorAll('.board-lane.drag-over').forEach(el => el.classList.remove('drag-over'));
-    const laneEl = document.elementFromPoint(e.clientX, e.clientY)?.closest('.board-lane');
-    if (laneEl) laneEl.classList.add('drag-over');
+    clearDragTarget();
+    const under = document.elementFromPoint(e.clientX, e.clientY);
+    if (dragState.kind === 'card') {
+      const target = under?.closest('.board-lane, #board-done-drop');
+      if (target) {
+        const targetLane = target.id === 'board-done-drop' ? 'done' : target.dataset.lane;
+        const decision = canDropCard(dragState.card, targetLane);
+        target.classList.add(decision.allowed ? 'drop-allowed' : 'drop-refused');
+        if (target.classList.contains('board-lane')) target.classList.add('drag-over');
+        dragState.targetLane = targetLane;
+        dragState.targetEl = target;
+        setDropStatus(decision.allowed ? `Drop in ${laneLabel(targetLane)}.` : decision.reason, !decision.allowed);
+      } else {
+        dragState.targetLane = null;
+        dragState.targetEl = null;
+        setDropStatus('');
+      }
+    } else {
+      const cardEl = under?.closest('.board-card[data-card-id]');
+      if (cardEl) {
+        const targetCard = findCard(cardEl.dataset.cardId);
+        const reason = !targetCard || targetCard.kind !== 'task'
+          ? 'Only task cards can be assigned.'
+          : assignmentPolicyReason(targetCard);
+        cardEl.classList.add(reason ? 'drop-refused' : 'drop-allowed');
+        dragState.targetCardId = targetCard && targetCard.kind === 'task' ? targetCard.id : null;
+        setDropStatus(reason || `Drop to assign ${dragState.assignee}.`, !!reason);
+      } else {
+        dragState.targetCardId = null;
+        setDropStatus('');
+      }
+    }
   }
 
   function onDragUp(e) {
-    document.removeEventListener('mousemove', onDragMove);
-    document.removeEventListener('mouseup', onDragUp);
-    if (!dragState) return;
-    const { cardId, sourceLane, moved, ghost, cardEl } = dragState;
-    document.querySelectorAll('.board-lane.drag-over').forEach(el => el.classList.remove('drag-over'));
-    if (ghost && ghost.parentNode) ghost.parentNode.removeChild(ghost);
-    if (cardEl) cardEl.classList.remove('dragging-source');
-    document.body.classList.remove('board-dragging');
-    if (moved) {
+    if (!dragState || e.isPrimary === false || e.pointerId !== dragState.pointerId) return;
+    const state = dragState;
+    endPointerDrag();
+    dragState = null;
+    if (state.moved) {
       clearDragSelection();
-      const laneEl = document.elementFromPoint(e.clientX, e.clientY)?.closest('.board-lane');
-      const targetLane = laneEl && laneEl.dataset.lane;
-      if (targetLane && targetLane !== sourceLane) {
-        suppressNextClick = cardId;  // the mouseup will also fire a click — swallow it
-        onCardDropped(cardId, targetLane);
+      if (state.kind === 'card') {
+        // A drag that ends in the source lane (or outside a lane) is still
+        // a drag, not a request to open the drawer through its trailing tap.
+        setClickSuppression('card', state.card.id);
+        if (state.targetLane && state.targetLane !== state.card.lane) {
+          onCardDropped(state.card.id, state.targetLane);
+        }
+      } else {
+        setClickSuppression('tray', `assignee:${state.assignee}`);
+        if (state.targetCardId) {
+          setClickSuppression('card', state.targetCardId);
+          assignAssigneeToCard(state.targetCardId, state.assignee);
+        }
       }
     }
+    setDropStatus('');
+  }
+
+  function onDragCancel(e) {
+    if (!dragState || e && (e.isPrimary === false || e.pointerId !== dragState.pointerId)) return;
+    endPointerDrag();
     dragState = null;
+    setDropStatus('');
   }
 
   function onCardDropped(cardId, targetLane) {
@@ -803,17 +1010,21 @@ export function initBoard() {
     if (laneEntry && laneEntry.allowed === false) {
       showToast(laneEntry.reason || `Can't move card to ${laneLabel(targetLane)}.`, true);
       // Matches moveCard's own failure path: clears any stray drag-over
-      // class and resets `suppressNextClick` so the operator's next click
-      // on this card still opens the drawer.
+      // class while the short-lived trailing-click guard expires normally.
       render();
+      return;
+    }
+    if (targetLane === 'done' && card.lane === 'review') {
+      // Review -> Done is the same explicit acceptance path as the drawer
+      // and the card's inline Accept button, including its tag transition.
+      runCardAction(() => acceptCard(card, fetchBoard));
       return;
     }
     let assignee;
     if (targetLane === 'assigned') {
-      // No mid-drag assignee picker with plain HTML5 DnD — default to "me"
-      // (the common case: an operator claiming a card for themself) unless
-      // the card already has one, which the lane endpoint keeps as-is only
-      // when we pass it through explicitly.
+      // Dragging onto Assigned defaults to "me" (the common case: an
+      // operator claiming a card for themself) unless the card already has
+      // an assignee, which the lane endpoint keeps when passed explicitly.
       assignee = card.assignee || 'me';
     }
     // moveCard already toasts and re-renders on failure — nothing more to
@@ -1034,12 +1245,35 @@ export function initBoard() {
   // ------------------------------------------------------------------
 
   function closeDrawer() {
+    if (tagPickerHandle && tagPickerHandle.cancel) tagPickerHandle.cancel();
+    tagPickerHandle = null;
     openCardId = null;
     openCardLane = null;
     openCardSnapshot = null;
     if (panel) { panel.close(); panel = null; }
     if (drawerBackdrop) drawerBackdrop.hidden = true;
     if (drawerEl) drawerEl.innerHTML = '';
+  }
+
+  function cancelTagPickerWrites() {
+    if (tagPickerHandle && tagPickerHandle.cancel) tagPickerHandle.cancel();
+    tagPickerHandle = null;
+  }
+
+  // Confirmation modals invalidate queued picker writes while they are open:
+  // Cancel leaves the drawer alive without allowing an obsolete save to land,
+  // and a failed confirmed mutation re-arms the picker for a fresh edit.
+  function pauseTagPickerWrites() {
+    if (tagPickerHandle && tagPickerHandle.cancel) tagPickerHandle.cancel();
+  }
+
+  function rearmTagPickerWrites() {
+    if (tagPickerHandle && tagPickerHandle.rearm) tagPickerHandle.rearm();
+  }
+
+  function runCardAction(action) {
+    cancelTagPickerWrites();
+    return action();
   }
 
   function openDrawer(cardId) {
@@ -1097,6 +1331,21 @@ export function initBoard() {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    return r.json();
+  }
+
+  async function putBoardTags(taskId, tags) {
+    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(taskId)}/tags`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tags }),
     });
     if (!r.ok) {
       const text = await r.text();
@@ -1173,17 +1422,249 @@ export function initBoard() {
     el.style.height = Math.min(el.scrollHeight + borderY, maxHeight) + 'px';
   }
 
+  const TAG_TOKEN = /^[\w-]+$/;
+  function normalizeEditableTag(raw) {
+    const normalized = String(raw || '')
+      .trim()
+      .replace(/^#+/, '')
+      .replace(/\s+/g, '-')
+      .replace(/[^\w-]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^[-_]+|[-_]+$/g, '')
+      .toLowerCase();
+    if (!normalized || !TAG_TOKEN.test(normalized)
+      || ASSIGNEES.includes(normalized) || LIFECYCLE_TAGS.has(normalized)) return null;
+    return normalized;
+  }
+
+  function uniqueEditableTags(tags) {
+    const seen = new Set();
+    const result = [];
+    for (const tag of tags || []) {
+      const normalized = normalizeEditableTag(tag);
+      if (normalized && !seen.has(normalized)) {
+        seen.add(normalized);
+        result.push(normalized);
+      }
+    }
+    return result;
+  }
+
+  function editableTagsForCard(card) {
+    return uniqueEditableTags((card.tags || []).filter(
+      tag => !ASSIGNEES.includes(String(tag).toLowerCase().replace(/^#/, ''))
+        && !LIFECYCLE_TAGS.has(String(tag).toLowerCase().replace(/^#/, '')),
+    ));
+  }
+
+  function availableEditableTags() {
+    return uniqueEditableTags(allCards().flatMap(card => card.tags || []))
+      .sort((a, b) => compareSortValues(a, b));
+  }
+
+  function sameTags(left, right) {
+    return left.length === right.length && left.every((tag, index) => tag === right[index]);
+  }
+
+  function mountTagPicker(card, initialTags) {
+    const picker = drawerEl.querySelector('[data-field="tags-picker"]');
+    const search = picker && picker.querySelector('[data-field="tags"]');
+    const chips = picker && picker.querySelector('[data-field="tag-chips"]');
+    const options = picker && picker.querySelector('[data-field="tag-options"]');
+    if (!picker || !search || !chips || !options) return;
+
+    let selected = uniqueEditableTags(initialTags);
+    let confirmed = selected.slice();
+    let saveChain = Promise.resolve();
+    let pendingSaves = 0;
+    let suppressBlur = false;
+    let activeOption = -1;
+    let showingLegacyValue = true;
+    let cancelled = false;
+    let saveGeneration = 0;
+
+    function renderChips() {
+      chips.innerHTML = selected.map(tag => `
+        <span class="drawer-tag-chip" data-tag="${escapeHtml(tag)}">
+          <span>#${escapeHtml(tag)}</span>
+          <button type="button" class="drawer-tag-chip-remove" data-remove-tag="${escapeHtml(tag)}"
+                  aria-label="Remove tag ${escapeHtml(tag)}">×</button>
+        </span>
+      `).join('');
+      chips.querySelectorAll('[data-remove-tag]').forEach(button => {
+        button.addEventListener('click', () => removeTag(button.dataset.removeTag));
+      });
+    }
+
+    function renderOptions() {
+      const query = search.value.trim().replace(/^#+/, '').toLowerCase();
+      const applied = new Set(selected);
+      const matches = availableEditableTags().filter(tag => !applied.has(tag)
+        && (!query || tag.includes(query)));
+      const canCreate = !!query && !applied.has(normalizeEditableTag(query))
+        && !availableEditableTags().includes(normalizeEditableTag(query))
+        && !!normalizeEditableTag(query);
+      options.innerHTML = matches.map(tag =>
+        `<button type="button" class="drawer-tag-option" role="option" data-select-tag="${escapeHtml(tag)}">#${escapeHtml(tag)}</button>`
+      ).join('');
+      if (canCreate) {
+        options.innerHTML += `<button type="button" class="drawer-tag-option drawer-tag-option-create" role="option" data-create-tag="${escapeHtml(normalizeEditableTag(query))}">Create new #${escapeHtml(normalizeEditableTag(query))}</button>`;
+      }
+      options.hidden = document.activeElement !== search || (!matches.length && !canCreate);
+      activeOption = -1;
+      options.querySelectorAll('[data-select-tag], [data-create-tag]').forEach(button => {
+        button.addEventListener('mousedown', () => { suppressBlur = true; });
+        button.addEventListener('click', () => {
+          if (button.dataset.createTag) addTag(button.dataset.createTag);
+          else addTag(button.dataset.selectTag);
+          suppressBlur = false;
+          search.focus();
+        });
+      });
+      search.setAttribute('aria-expanded', String(!options.hidden));
+    }
+
+    function queueSave(nextTags) {
+      const requested = uniqueEditableTags(nextTags);
+      const generation = saveGeneration;
+      selected = requested;
+      renderChips();
+      pendingSaves += 1;
+      saveChain = saveChain.then(async () => {
+        try {
+          if (cancelled || generation !== saveGeneration) return;
+          await putBoardTags(card.id, requested);
+          confirmed = requested.slice();
+          if (!cancelled && generation === saveGeneration) await fetchBoard();
+        } catch (err) {
+          // A later queued edit is still the operator's current intent; only
+          // revert if this failed request is what is currently displayed.
+          if (sameTags(selected, requested)) {
+            selected = confirmed.slice();
+            renderChips();
+          }
+          if (!cancelled) showToast(`Couldn't save tags: ${err.message}`, true);
+        } finally {
+          pendingSaves -= 1;
+        }
+      });
+    }
+
+    function addTag(raw) {
+      const tag = normalizeEditableTag(raw);
+      if (!tag || selected.includes(tag)) return;
+      search.value = '';
+      queueSave([...selected, tag]);
+      renderOptions();
+    }
+
+    function removeTag(raw) {
+      const tag = normalizeEditableTag(raw);
+      if (!tag) return;
+      queueSave(selected.filter(current => current !== tag));
+      renderOptions();
+      search.focus();
+    }
+
+    function saveLegacyText() {
+      const raw = search.value.trim();
+      // Preserve the old space-separated edit affordance for pasted text and
+      // invalid tokens while keeping a normal one-word search non-mutating.
+      if (!raw) return;
+      if (!/[\s#<>]/.test(raw)) {
+        const normalized = normalizeEditableTag(raw);
+        // A new single token retains the old blur-to-save behavior. Existing
+        // tags remain searches until the operator selects them explicitly.
+        if (normalized && !availableEditableTags().includes(normalized)) {
+          search.value = normalized;
+          queueSave([normalized]);
+        }
+        return;
+      }
+      const parsed = [];
+      const rejected = [];
+      raw.split(/\s+/).forEach(token => {
+        const plain = token.replace(/^#/, '');
+        if (TAG_TOKEN.test(plain) && normalizeEditableTag(plain)) parsed.push(plain);
+        else rejected.push(token);
+      });
+      const normalized = uniqueEditableTags(parsed);
+      if (rejected.length) {
+        showToast(`Ignored invalid tag${rejected.length > 1 ? 's' : ''}: ${rejected.join(', ')}`, true);
+      }
+      search.value = normalized.join(' ');
+      queueSave(normalized);
+    }
+
+    renderChips();
+    // Keep the old space-separated value visible until the search control is
+    // first focused; this makes the migration legible to keyboard users and
+    // preserves pasted-text compatibility without making it the live picker
+    // query once the control is opened.
+    search.value = selected.join(' ');
+    search.addEventListener('focus', () => {
+      if (showingLegacyValue) {
+        showingLegacyValue = false;
+        search.value = '';
+      }
+      renderOptions();
+    });
+    search.addEventListener('input', renderOptions);
+    search.addEventListener('blur', () => {
+      if (suppressBlur) return;
+      saveLegacyText();
+      setTimeout(() => {
+        if (document.activeElement && picker.contains(document.activeElement)) return;
+        options.hidden = true;
+        search.setAttribute('aria-expanded', 'false');
+      }, 0);
+    });
+    search.addEventListener('keydown', (event) => {
+      const optionButtons = [...options.querySelectorAll('[data-select-tag], [data-create-tag]')];
+      if (event.key === 'ArrowDown' && optionButtons.length) {
+        event.preventDefault();
+        activeOption = (activeOption + 1) % optionButtons.length;
+        optionButtons[activeOption].focus();
+      } else if (event.key === 'ArrowUp' && optionButtons.length) {
+        event.preventDefault();
+        activeOption = (activeOption - 1 + optionButtons.length) % optionButtons.length;
+        optionButtons[activeOption].focus();
+      } else if (event.key === 'Enter') {
+        event.preventDefault();
+        const active = optionButtons[activeOption];
+        if (active) active.click();
+        else if (normalizeEditableTag(search.value)) addTag(search.value);
+      } else if (event.key === 'Escape') {
+        options.hidden = true;
+        search.setAttribute('aria-expanded', 'false');
+      }
+    });
+    const handle = {
+      cancel: () => {
+        cancelled = true;
+        saveGeneration += 1;
+        selected = confirmed.slice();
+        renderChips();
+        search.value = selected.join(' ');
+      },
+      rearm: () => { cancelled = false; },
+      isSaving: () => !cancelled && pendingSaves > 0,
+      whenIdle: () => saveChain,
+    };
+    tagPickerHandle = handle;
+    return handle;
+  }
+
   function renderDrawer(card) {
     if (!drawerEl) return;
+    cancelTagPickerWrites();
     assignmentHandle = null;
     const isTask = card.kind === 'task';
     // The Tags field never shows an assignee tag OR a worker lifecycle
     // tag as an editable token — both are managed elsewhere (the
     // Assignee select above, and the worker/accept endpoint respectively)
     // and must survive a Tags-field save untouched.
-    const editableTags = (card.tags || []).filter(
-      t => !ASSIGNEES.includes(t.toLowerCase()) && !LIFECYCLE_TAGS.has(t.toLowerCase()),
-    );
+    const editableTags = editableTagsForCard(card);
     const titleValue = isTask ? (card.title || '') : (card.name || '');
     // `card.policy` is the server's own decision — the drawer never
     // re-derives these rules, it just disables-and-explains. A schedule
@@ -1214,8 +1695,14 @@ export function initBoard() {
           <input class="drawer-context" data-field="context" value="${escapeHtml(card.context || '')}" />
         </div>
       </div>
-      <label class="drawer-label">Tags</label>
-      <input class="drawer-tags" data-field="tags" value="${escapeHtml(editableTags.join(' '))}" placeholder="space-separated tags" ${assigneeDisabled ? 'disabled' : ''} />
+      <label class="drawer-label" id="drawer-tags-label-${escapeHtml(card.id)}">Tags</label>
+      <div class="drawer-tags-picker" data-field="tags-picker" role="group" aria-labelledby="drawer-tags-label-${escapeHtml(card.id)}">
+        <div class="drawer-tag-chips" data-field="tag-chips" role="list"></div>
+        <input class="drawer-tags drawer-tags-search" data-field="tags" type="search" role="combobox"
+               aria-autocomplete="list" aria-expanded="false" autocomplete="off"
+               placeholder="Search or add tags…" ${assigneeDisabled ? 'disabled' : ''} />
+        <div class="drawer-tag-options" data-field="tag-options" role="listbox" hidden></div>
+      </div>
       ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="tags-reason">${escapeHtml(assigneePolicy.reason || "This card's tags can't be changed right now.")}</div>` : ''}
       <div class="drawer-assignment" data-field="assignment"></div>
       <div class="drawer-actions" data-field="actions"></div>
@@ -1303,6 +1790,8 @@ export function initBoard() {
     notesEl.addEventListener('input', () => autosizeNotesTextarea(notesEl));
     autosizeNotesTextarea(notesEl);  // size to existing content on open/re-render
 
+    mountTagPicker(card, editableTags);
+
     const assigneeEl = drawerEl.querySelector('[data-field="assignee"]');
     assigneeEl.addEventListener('change', async () => {
       const value = assigneeEl.value;
@@ -1367,45 +1856,6 @@ export function initBoard() {
       if (!value || value === card.context) return;
       try { await putTask(card.id, { context: value }); await fetchBoard(); }
       catch (err) { showToast(`Couldn't save context: ${err.message}`, true); contextEl.value = card.context || ''; }
-    });
-
-    const tagsEl = drawerEl.querySelector('[data-field="tags"]');
-    const VALID_TAG = /^[\w-]+$/;
-    tagsEl.addEventListener('blur', async () => {
-      const tokens = tagsEl.value.split(/\s+/).map(t => t.replace(/^#/, '')).filter(Boolean);
-      // Free text here writes straight to the task store — reject anything
-      // that isn't a plain word/hyphen token (blocks a vault-comment
-      // injection like `<!--id:...-->` stealing another task's id), drop
-      // any assignee-name token (the assignee comes from the select above,
-      // not this field) rather than letting it silently double up as a tag,
-      // and reject a worker lifecycle tag the same way — typing
-      // `agent-running` into a `me` card's Tags field must not be able to
-      // grant it a claim tag the worker never gave it.
-      const parsed = [];
-      const rejected = [];
-      for (const t of tokens) {
-        const lower = t.toLowerCase();
-        if (VALID_TAG.test(t) && !ASSIGNEES.includes(lower) && !LIFECYCLE_TAGS.has(lower)) parsed.push(t);
-        else rejected.push(t);
-      }
-      if (rejected.length) {
-        showToast(`Ignored invalid tag${rejected.length > 1 ? 's' : ''}: ${rejected.join(', ')}`, true);
-      }
-      tagsEl.value = parsed.join(' ');
-      // Read the card's CURRENT assignee/lifecycle tags from the live board
-      // state, not the `card` this handler closed over at render time.
-      // `updateOpenDrawer` skips rebuilding the drawer while this field
-      // holds focus (see above), so a claim written by another process
-      // while the operator is mid-edit here never reaches the `card`
-      // variable at all — re-appending from a stale snapshot would save
-      // exactly the claim tag this box never showed and was never asked to
-      // remove. Falls back to the render-time `card` only if the card has
-      // since disappeared from the board entirely.
-      const current = findCard(card.id) || card;
-      const assigneeTag = current.assignee ? [current.assignee] : [];
-      const lifecycleTags = (current.tags || []).filter(t => LIFECYCLE_TAGS.has(t.toLowerCase()));
-      try { await putTask(card.id, { tags: [...assigneeTag, ...lifecycleTags, ...parsed] }); await fetchBoard(); }
-      catch (err) { showToast(`Couldn't save tags: ${err.message}`, true); tagsEl.value = editableTags.join(' '); }
     });
 
     // The drawer's own Assignee select above is the one assignee writer —
@@ -1689,8 +2139,9 @@ export function initBoard() {
     return descendantsOf(snap.sessions || [], session);
   }
 
-  // The drawer's action row — Open, Go To, Resume, Kill, Answer, Accept,
-  // Resolve, Cancel, Delete. Which of these apply and whether each is
+  // The drawer's action row — Open, Go To, Resume, Kill, Answer, Accept, Reject,
+  // Reassign, Mark Done, Cancel, Delete.
+  // Which of these apply and whether each is
   // enabled or disabled-with-a-reason is decided once, by
   // session_actions.js's `decideActions`, and rendered by its
   // `renderActionRow` — the exact same function the Graph tab's side panel
@@ -1698,13 +2149,29 @@ export function initBoard() {
   // shared session. Go To/Resume/Kill/Answer are built into
   // `renderActionRow` itself (it owns Kill's cascade-preview modal,
   // Resume's host select, and Go To's "Locating…" state); Open, Accept,
-  // Resolve, Cancel, and Delete come from ./card_actions.js, shared with a
+  // Reject, Reassign, Mark Done, Cancel, and Delete come from ./card_actions.js, shared with a
   // card-linked Graph tab side panel — Cancel and Delete are overridden
   // below with the extra drawer-specific bookkeeping (closing/rebuilding
   // this drawer) that a bare handoff to `fetchBoard` doesn't cover.
   function renderDrawerActions(card) {
     const actionsEl = drawerEl.querySelector('[data-field="actions"]');
     if (!actionsEl) return;
+    const cardHandlers = cardActionHandlers(card, {
+      onChanged: fetchBoard,
+      onAccepted: closeDrawer,
+      onMutationOpened: pauseTagPickerWrites,
+      onMutationCancelled: rearmTagPickerWrites,
+      onMutationConfirmed: pauseTagPickerWrites,
+      onMutationFailed: rearmTagPickerWrites,
+    });
+    const modalActions = new Set(['reject', 'reassign', 'delete']);
+    const guardedCardHandlers = Object.fromEntries(
+      Object.entries(cardHandlers).map(([name, handler]) => [name, (...args) => (
+        modalActions.has(name)
+          ? handler(...args)
+          : runCardAction(() => handler(...args))
+      )]),
+    );
     renderActionRow(actionsEl, {
       session: card.session || null,
       card,
@@ -1716,8 +2183,8 @@ export function initBoard() {
         // starts the same edit; this just gives the drawer's own action
         // row a working button for it too.
         rename: () => { if (panel) panel.startRename(); },
-        ...cardActionHandlers(card, { onChanged: fetchBoard }),
-        cancel: () => cancelCard(card, async () => {
+        ...guardedCardHandlers,
+        cancel: () => runCardAction(() => cancelCard(card, async () => {
           // Tear the session panel down through its own cleanup path right
           // here, rather than leaving it to whichever render call below
           // happens to touch the session-panel container next — a
@@ -1734,9 +2201,13 @@ export function initBoard() {
           // it 409s.
           const fresh = findCard(card.id);
           if (fresh) { renderDrawer(fresh); openCardSnapshot = fresh; }
-        }),
+        })),
         delete: () => openDeleteCardModal(card, {
           findCard,
+          onMutationOpened: pauseTagPickerWrites,
+          onMutationCancelled: rearmTagPickerWrites,
+          onMutationConfirmed: pauseTagPickerWrites,
+          onMutationFailed: rearmTagPickerWrites,
           onDeleted: async () => { closeDrawer(); await fetchBoard(); },
         }),
       },
@@ -1803,6 +2274,7 @@ export function initBoard() {
     visibleLanes = new Set(laneIds);
     laneFilterCheckboxes().forEach(cb => { cb.checked = visibleLanes.has(cb.value); });
     updateLaneFilterLabel();
+    updateQuickDropTargets();
   }
 
   // The lane selection is the shared `lanes` filter (linking.js) — this
@@ -1860,8 +2332,27 @@ export function initBoard() {
     }
   });
 
+  if (filterToggleBtn && filterControlsEl) {
+    filterToggleBtn.addEventListener('click', () => {
+      const open = document.getElementById('board-filters').classList.toggle('filters-open');
+      filterToggleBtn.setAttribute('aria-expanded', String(open));
+    });
+  }
+
   renderLaneFilterCheckboxes();
   updateLaneFilterLabel();
+  renderAssigneeDrops();
+  updateQuickDropTargets();
+  if (doneDropEl) {
+    doneDropEl.addEventListener('click', () => {
+      const card = quickActionCardId && findCard(quickActionCardId);
+      if (!card) {
+        setDropStatus('Focus a task card first, then activate Done.', true);
+        return;
+      }
+      onCardDropped(card.id, 'done');
+    });
+  }
 
   // ------------------------------------------------------------------
   // Wire filters + boot
@@ -1870,7 +2361,7 @@ export function initBoard() {
   // "Include cancelled" and sorting stay board-local.
   [includeDoneEl].filter(Boolean).forEach(el => {
     const evt = (el.tagName === 'SELECT' || el.type === 'checkbox') ? 'change' : 'input';
-    el.addEventListener(evt, () => render());
+    el.addEventListener(evt, () => { updateFilterSummary(getFilters()); render(); });
   });
 
   // Search/assignee/host/engine/tag/recency — shared with the graph
@@ -1888,6 +2379,7 @@ export function initBoard() {
     sortFilterEl.addEventListener('change', () => {
       sortMode = SORT_OPTIONS.has(sortFilterEl.value) ? sortFilterEl.value : DEFAULT_SORT;
       saveSortSelection(sortMode);
+      updateFilterSummary(getFilters());
       render();
     });
   }
@@ -1897,8 +2389,27 @@ export function initBoard() {
     sortMode = DEFAULT_SORT;
     if (sortFilterEl) sortFilterEl.value = DEFAULT_SORT;
     saveSortSelection(DEFAULT_SORT);
+    updateFilterSummary(getFilters());
     render();
   });
+
+  function updateFilterSummary(state) {
+    if (!filterSummaryEl) return;
+    const active = [];
+    if (state.search) active.push(`search “${state.search}”`);
+    if (state.assignee !== 'all') active.push(state.assignee);
+    if (state.host !== 'all') active.push(`host ${state.host}`);
+    if (state.engine !== 'all') active.push(`engine ${state.engine}`);
+    if (state.tag) active.push(`#${state.tag.replace(/^#/, '')}`);
+    if (state.recency != null && state.recency !== 'all') active.push('recent');
+    if (visibleLanes.size !== DEFAULT_VISIBLE_LANE_IDS.length
+        || DEFAULT_VISIBLE_LANE_IDS.some(id => !visibleLanes.has(id))) active.push('lanes');
+    if (includeDoneEl && includeDoneEl.checked) active.push('cancelled');
+    if (sortMode !== DEFAULT_SORT) active.push('sorted');
+    filterSummaryEl.textContent = active.length ? `${active.length} active` : 'default';
+    filterToggleBtn?.setAttribute('aria-label', active.length
+      ? `Filters: ${active.join(', ')}` : 'Filters: default');
+  }
 
   function syncSharedFilterControls(state) {
     // Rebuild (and, if needed, inject) the host option list against the
@@ -1921,6 +2432,7 @@ export function initBoard() {
     const recencyDisplay = state.recency == null ? 'all' : state.recency;
     if (recencyFilterEl && recencyFilterEl.value !== recencyDisplay) recencyFilterEl.value = recencyDisplay;
     syncLaneFilterUI(state.lanes);
+    updateFilterSummary(state);
     render();
   }
   subscribeFilters(syncSharedFilterControls);

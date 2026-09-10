@@ -398,6 +398,7 @@ run_pushed_candidate() {
             --repository "$PROJECT_ROOT" --sha "$source_sha" --base "$base_sha" \
             --evidence-root "${XDG_CACHE_HOME:-$HOME/.cache}/lifeos/verification-evidence" \
             --lanes "fast-unit,browser-free" --workers 2 \
+            --retry-reason "pre-push retry after an interrupted or infrastructure-failed exact candidate" \
             --lane-log-dir "$candidate_logs" >> "$output" 2>&1 || status=$?
         [ -f "$candidate_logs/fast-unit.log" ] && cat "$candidate_logs/fast-unit.log" >> "$output"
         if [ -f "$candidate_logs/browser-free.json" ]; then

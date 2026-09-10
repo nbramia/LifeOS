@@ -125,6 +125,12 @@ def _user_message_for(task: dict, session_id: str, expected_output: str, budget:
     parts = [CAPABILITIES_PREAMBLE, f"Task: {title}"]
     if context:
         parts.append(f"Context: {context}")
+    notes = (task.get("notes") or "").strip()
+    if notes:
+        # Reassignment notes include a bounded transcript/output handoff;
+        # retain the latest operator direction without allowing an unbounded
+        # vault note to dominate the first remote prompt.
+        parts.append(f"Task notes:\n{notes[-6000:]}")
     from api.services.agent_worker.inter_agent import caller_proof_for_session
     from config.settings import settings
     proof = caller_proof_for_session(session_id, getattr(settings, "mcp_bearer_token", ""))

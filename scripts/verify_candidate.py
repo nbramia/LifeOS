@@ -244,7 +244,37 @@ def make_hermetic_environment(runtime_root: Path, *, workers: int, parallel_brow
         # the immutable snapshot -- writing there would fail the strict
         # snapshot-unmodified check on every browser-marked collection/run.
         "LIFEOS_CHROMA_PATH": str(runtime_root / "chromadb"),
+        "LIFEOS_VAULT_PATH": str(runtime_root / "vault"),
     }
+
+
+
+def link_candidate_data_directory(snapshot_root: Path, runtime_root: Path) -> Path:
+    """Resolve the candidate's whole ``data`` directory to runtime storage.
+
+    Every LifeOS data store places its default under the checkout's ``data``
+    directory -- most anchored at the repo root through ``Path(__file__)``
+    (the deliberate invariant of ``tests/test_data_path_anchoring.py``), a
+    few relative to the process cwd. For a candidate, both of those roots
+    are the immutable snapshot, so any lane touching such a store would fail
+    the strict snapshot-unmodified check, and neither the execution
+    environment nor the working directory can move a repo-root-anchored
+    default. Redirecting the single directory they all share leaves each
+    store exactly where the candidate's own code computes it while the bytes
+    land in verifier-owned storage.
+
+    ``data`` is never snapshot content (``candidate_snapshot`` excludes it),
+    and the strict check walks the snapshot without following directory
+    symlinks, so every other new file, content change, or mode change is
+    still reported.
+    """
+    runtime_data = runtime_root / "data"
+    runtime_data.mkdir(mode=0o700, parents=True, exist_ok=True)
+    link = snapshot_root / "data"
+    if os.path.lexists(link):
+        raise CandidateVerificationError(f"candidate already carries its own data path: {link}")
+    link.symlink_to(runtime_data, target_is_directory=True)
+    return runtime_data
 
 
 def collect_lane_inventory(snapshot_root: Path, receipt_dir: Path, environment: Mapping[str, str]) -> dict:
@@ -675,6 +705,13 @@ def verify_candidate(
     its own opaque run identity without this function needing to know
     anything about that caller.
     """
+    if retry_reason is not None and (
+        not retry_reason.strip()
+        or retry_reason != retry_reason.strip()
+        or len(retry_reason) > 160
+        or any(ord(character) < 32 or ord(character) == 127 for character in retry_reason)
+    ):
+        raise CandidateVerificationError("invalid retry reason")
     snapshot = build_snapshot(source_root, snapshot_root)
     binder = getattr(execute_lane, "bind_snapshot", None)
     if binder is not None:
@@ -694,6 +731,7 @@ def verify_candidate(
             metrics = None
     actual_runtime_root = runtime_root or (inventory_receipt_root or evidence_root) / f"runtime-{snapshot.candidate_id}"
     execution_environment = make_hermetic_environment(actual_runtime_root, workers=workers)
+    link_candidate_data_directory(Path(snapshot.dest_root), actual_runtime_root)
     if environment:
         if set(environment) - {"LIFEOS_TEST_PARALLEL_WORKERS", "PYTHONHASHSEED", "LIFEOS_PARALLEL_BROWSER_FREE"}:
             raise CandidateVerificationError("caller environment is not a safe execution control")
@@ -734,6 +772,7 @@ def verify_candidate(
         return VerificationResult(snapshot.candidate_id, inputs.key, True, reason, outcomes, lane_totals)
     if reason == "prior_infrastructure_failure" and not retry_reason:
         raise CandidateVerificationError("infrastructure retry requires a recorded reason")
+    recorded_retry_reason = retry_reason if reason == "prior_infrastructure_failure" else None
 
     valid, mismatches = _snapshot_modes_ok(snapshot)
     if not valid:
@@ -761,7 +800,7 @@ def verify_candidate(
             outcomes.append(outcome)
             if outcome.result != "success" or outcome.exit_status != 0:
                 lane_result = outcome.result if outcome.result != "success" else "failure"
-                store.record(inputs, outcomes, result=lane_result, retry_reason=retry_reason)
+                store.record(inputs, outcomes, result=lane_result, retry_reason=recorded_retry_reason)
                 recorded = True
                 _record_metric(
                     metrics, phase="verification-execution", phase_kind="execution",
@@ -774,12 +813,12 @@ def verify_candidate(
         valid, mismatches = _snapshot_modes_ok(snapshot)
         if not valid:
             store.record(
-                inputs, outcomes, result="incomplete", retry_reason=retry_reason,
+                inputs, outcomes, result="incomplete", retry_reason=recorded_retry_reason,
                 diagnostics=_bounded_snapshot_diagnostics(mismatches),
             )
             recorded = True
             raise CandidateVerificationError("snapshot changed during execution: " + "; ".join(mismatches[:3]))
-        store.record(inputs, outcomes, result="success", retry_reason=retry_reason)
+        store.record(inputs, outcomes, result="success", retry_reason=recorded_retry_reason)
         recorded = True
         _record_metric(metrics, phase="verification-execution", phase_kind="execution", elapsed_seconds=time.monotonic() - started, result="success", suite=scope, worker_count=workers, evidence_ref=inputs.key[:24])
         return VerificationResult(snapshot.candidate_id, inputs.key, False, reason, tuple(outcomes), lane_totals)
@@ -791,7 +830,7 @@ def verify_candidate(
         # re-raises the exact original exception unchanged (`raise` with no
         # arguments), never substituting a different one or swallowing it.
         if not recorded:
-            store.record(inputs, outcomes, result="infrastructure_failure", retry_reason=retry_reason)
+            store.record(inputs, outcomes, result="infrastructure_failure", retry_reason=recorded_retry_reason)
         metric_result = "interrupted" if isinstance(exc, KeyboardInterrupt) else "infrastructure_failure"
         _record_metric(
             metrics, phase="verification-execution", phase_kind="execution",
@@ -848,6 +887,7 @@ def verify_pytest_candidate(
     external_capacity_wait_seconds: float | None = None,
     metrics_run_id: str | None = None,
     parallel_browser_free: bool = False,
+    retry_reason: str | None = None,
 ) -> VerificationResult:
     """Concrete hermetic pytest entry point used by local runner adapters."""
     runtime_root = snapshot_root.parent / f"{snapshot_root.name}-runtime"
@@ -870,6 +910,7 @@ def verify_pytest_candidate(
         capacity_held_externally=capacity_held_externally,
         external_capacity_wait_seconds=external_capacity_wait_seconds,
         metrics_run_id=metrics_run_id,
+        retry_reason=retry_reason,
     )
     if result.reused and lane_log_dir is not None:
         # No lane process ran this call, so pytest_lane_executor never wrote
@@ -949,6 +990,7 @@ def verify_git_ref(
     lane_log_dir: Path | None = None,
     shard: tuple[int, int] | None = None,
     parallel_browser_free: bool = False,
+    retry_reason: str | None = None,
 ) -> VerificationResult:
     """Verify a pushed commit in a temporary detached worktree, never cwd.
 
@@ -997,6 +1039,7 @@ def verify_git_ref(
             capacity_held_externally=True,
             process_started=register_group,
             external_capacity_wait_seconds=capacity_wait_seconds,
+            retry_reason=retry_reason,
         )
     finally:
         for fd in (owner_write, process_write):
@@ -1031,6 +1074,7 @@ def _main(argv: Sequence[str]) -> int:
         "--workers as its worker count; browser-free never touches a live server, so this is "
         "safe, but the default stays serial until measurements justify changing it",
     )
+    pushed.add_argument("--retry-reason")
     local = sub.add_parser("local", help="verify this exact dirty working tree in an isolated snapshot")
     local.add_argument("--source", default=Path.cwd(), type=Path)
     local.add_argument("--evidence-root", type=Path, default=None)
@@ -1075,6 +1119,7 @@ def _main(argv: Sequence[str]) -> int:
                 required_lanes=lanes, workers=args.workers, capacity=capacity,
                 lane_log_dir=args.lane_log_dir, shard=shard,
                 parallel_browser_free=args.parallel_browser_free,
+                retry_reason=args.retry_reason,
             )
         except (CapacityError, CandidateVerificationError, EvidenceError, subprocess.CalledProcessError) as exc:
             print(f"candidate verification failed: {exc}", file=sys.stderr)

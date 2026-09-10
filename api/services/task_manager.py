@@ -434,6 +434,19 @@ class TaskManager:
         `description`/`notes`/`fields` content — see `_validate_text_fields`.
         """
         fields_patch = kwargs.pop("fields", None)
+        notes_merge = kwargs.pop("_notes_merge", None)
+        expected_updated_at = kwargs.pop("_expected_updated_at", None)
+        # Internal board action hook: unlike a literal ``tags=`` patch, this
+        # callback is evaluated against the latest in-memory task on every
+        # CAS retry. That lets lifecycle writers and the board's user-tag
+        # editor compose without one stale request stripping the other's tags.
+        tags_merge = kwargs.pop("_tags_merge", None)
+        if tags_merge is not None and "tags" in kwargs:
+            raise ValueError("_tags_merge cannot be combined with tags")
+        if tags_merge is not None and not callable(tags_merge):
+            raise ValueError("_tags_merge must be callable")
+        if notes_merge is not None and not callable(notes_merge):
+            raise ValueError("_notes_merge must be callable")
         if "status" in kwargs and kwargs["status"] is not None and kwargs["status"] not in VALID_STATUSES:
             raise ValueError(
                 f"Invalid status '{kwargs['status']}'. "
@@ -458,6 +471,8 @@ class TaskManager:
                 # immediately, even though nothing was ever persisted; only
                 # the CAS success branch below may rebind `self._tasks`.
                 t = copy.copy(t)
+                if expected_updated_at is not None and t.updated_at != expected_updated_at:
+                    raise TaskConflictError("task changed since the action was opened")
                 for key, value in kwargs.items():
                     if key == "status" and value == "done" and t.status != "done":
                         t.done_date = _today()
@@ -465,6 +480,11 @@ class TaskManager:
                         t.cancelled_date = _today()
                     if hasattr(t, key) and value is not None:
                         setattr(t, key, value)
+                if tags_merge is not None:
+                    t.tags = list(tags_merge(list(t.tags)))
+                if notes_merge is not None:
+                    t.notes = notes_merge(t.notes or "")
+                    _validate_text_fields(notes=t.notes)
                 if fields_patch:
                     merged = dict(t.fields)
                     for k, v in fields_patch.items():
@@ -508,6 +528,32 @@ class TaskManager:
             self._save_index()
             self._write_dashboard()
             return task
+
+    def update_tags_preserving(
+        self,
+        task_id: str,
+        editable_tags: list[str],
+        protected_tags: set[str] | frozenset[str],
+    ) -> Optional[Task]:
+        """Replace user-editable tags while preserving protected tags.
+
+        The merge callback runs against the latest task on every CAS retry,
+        so a worker lifecycle/assignee update observed during the write is
+        retained rather than being overwritten by a stale full tag list.
+        """
+        protected = {
+            str(tag).lstrip("#").lower() for tag in (protected_tags or set())
+        }
+        requested = list(editable_tags or [])
+
+        def merge(current_tags: list[str]) -> list[str]:
+            preserved = [
+                tag for tag in current_tags
+                if str(tag).lstrip("#").lower() in protected
+            ]
+            return [*preserved, *requested]
+
+        return self.update(task_id, _tags_merge=merge)
 
     def swap_tag(self, task_id: str, from_tag: str, to_tag: str) -> bool:
         """Atomically replace `from_tag` with `to_tag` on a task.

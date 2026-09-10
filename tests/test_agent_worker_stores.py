@@ -66,6 +66,49 @@ def test_session_store_update_status(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_answered_followup_claim_is_atomic_and_reassignment_retires_claim(tmp_path: Path):
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    session = store.create(task_id="t-followup", status=STATUS_COMPLETED)
+    question_id = store.enqueue_web_followup(session.session_id, "t-followup", "continue synthetic work")
+
+    claimed = store.claim_answered_unprocessed_questions()
+    assert [q["id"] for q in claimed] == [question_id]
+    assert store.question_claimed(question_id)
+
+    # This is the race boundary: reassignment retires an already-claimed row,
+    # and a worker holding the claimed row must observe that the claim is retired.
+    assert store.retire_completion_followups(session.session_id) == 1
+    assert not store.question_claimed(question_id)
+    assert store.claim_answered_unprocessed_questions() == []
+
+
+@pytest.mark.unit
+def test_answered_question_claim_recovers_after_restart_but_not_live_claim(tmp_path: Path):
+    """Only a claim inherited by a new store instance is recoverable."""
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    session = store.create(task_id="t-recover", status=STATUS_COMPLETED)
+    question_id = store.enqueue_web_followup(session.session_id, "t-recover", "retry synthetic work")
+
+    assert [q["id"] for q in store.claim_answered_unprocessed_questions()] == [question_id]
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE pending_questions SET answered_at = answered_at - 86400 WHERE id = ?",
+            (question_id,),
+        )
+    # A long-running answer owned by this process must not be stolen by its
+    # regular tick even when its answer is old; recovery is process-start-only.
+    assert store.recover_question_claims(limit=10) == 0
+    assert store.question_claimed(question_id)
+
+    # A fresh process/store inherits the durable marker and recovers it at
+    # startup, without consulting the answer's age.
+    restarted = SessionStore(db_path=tmp_path / "sessions.db")
+    assert restarted.recover_question_claims(limit=10) == 1
+    assert not store.question_claimed(question_id)
+    assert [q["id"] for q in restarted.claim_answered_unprocessed_questions()] == [question_id]
+
+
+@pytest.mark.unit
 def test_session_store_list_non_terminal(tmp_path: Path):
     store = SessionStore(db_path=tmp_path / "sessions.db")
     store.create(task_id="t1", status=STATUS_RUNNING)

@@ -529,6 +529,25 @@ Move a Review card to Done by adding the `accepted` tag. Idempotent.
 Returns **409** if the card isn't in the Review lane and isn't already
 accepted.
 
+### POST /api/agents/board/cards/{id}/undo-accept
+
+Accepts an optional `{ "token": "..." }` body returned by the matching
+Accept call; a stale token is rejected with 409. Legacy callers may omit it.
+
+Restore an accepted card to Review by removing its `accepted` tag. The
+transition is server-authoritative and preserves unrelated tags and fields;
+returns **409** when the card is not accepted.
+
+### POST /api/agents/board/cards/{id}/review-action
+
+Apply an operator action to a blocked or Review card. Body:
+`{action, note?, assignee?}`. `respond` requires a note and deposits it into
+the card's open question; `reject` requires a note, queues a follow-up, and
+returns the card to In progress; `reassign` requires a supported assignee,
+optionally records a context note, and returns the card to Assigned while
+preserving prior session context. Returns **409** for stale card/session
+state or a CAS conflict, and **422** for a task-write validation failure.
+
 ### POST /api/agents/board/cards/{id}/cancel
 
 Cancel an agent-assigned card — available whether or not the worker has

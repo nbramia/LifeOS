@@ -28,6 +28,14 @@ from api.services.conversation_store import ConversationStore
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _redirect_agent_output(tmp_path, monkeypatch):
+    """Write completed-task output to a throwaway vault for these tests."""
+    from config.settings import settings as _settings
+
+    monkeypatch.setattr(_settings, "vault_path", tmp_path / "vault", raising=False)
+
+
 @dataclass
 class _StubClaudeCodeExecutor:
     """Minimal ClaudeCodeExecutor stand-in: records calls + returns a canned outcome."""
@@ -87,6 +95,13 @@ def _recording_worker(tmp_path: Path, claude_code_executor):
 
     def handler(req: httpx.Request) -> httpx.Response:
         calls.append((req.method, req.url.path))
+        if req.method == "GET" and req.url.path.startswith("/api/tasks/"):
+            task_id = req.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json={
+                "id": task_id,
+                "description": "synthetic Claude task",
+                "tags": ["agent-running", "claude"],
+            })
         if req.url.path.endswith("/swap-tag"):
             return httpx.Response(200, json={"swapped": True})
         return httpx.Response(200, json={"tasks": []})

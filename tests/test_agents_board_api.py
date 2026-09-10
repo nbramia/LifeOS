@@ -1,7 +1,7 @@
 """API tests for the /agents Kanban board (#850).
 
 Covers GET /api/agents/board, PUT .../board/cards/{id}/lane,
-POST .../board/cards/{id}/accept, GET /api/agents/pending-questions,
+POST .../board/cards/{id}/accept and /undo-accept, GET /api/agents/pending-questions,
 POST .../pending-questions/{id}/answer, the Hermes label fix, and the
 Codex (`cx:`) transcript stream dispatch. Uses temp-dir-backed stores via
 monkeypatch so the real vault/data directories are never touched.
@@ -219,6 +219,7 @@ class TestGetBoard:
         assert pq["question"] == "Which environment — staging or prod?"
         assert pq["session_id"] == session.session_id
 
+
     def test_locally_scanned_cc_session_does_not_bogus_link_to_a_task(
         self, client, stores, monkeypatch, tmp_path: Path,
     ):
@@ -412,6 +413,206 @@ class TestGetBoard:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
+class TestReviewActions:
+    def test_reject_requires_note_and_queues_context(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done")
+        session = session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="local")
+
+        missing = client.post(f"/api/agents/board/cards/{task.id}/review-action", json={"action": "reject"})
+        assert missing.status_code == 400
+        assert task_manager.get(task.id).status == "done"
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Please add a synthetic edge-case check."},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["lane"] == "in_progress"
+        updated = task_manager.get(task.id)
+        assert updated.status == "in_progress"
+        assert "agent-running" in updated.tags
+        assert "Please add a synthetic edge-case check." in (updated.notes or "")
+        queued = session_store.list_answered_unprocessed_questions()
+        assert len(queued) == 1
+        assert queued[0]["session_id"] == session.session_id
+        assert queued[0]["answer"] == "Please add a synthetic edge-case check."
+
+    def test_reassign_preserves_session_context_and_moves_to_assigned(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done", notes="Prior output")
+        session = session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+        session_store.append_message(session.session_id, "assistant", "Prior synthetic result")
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude", "note": "Try a second synthetic approach."},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["lane"] == "assigned"
+        updated = task_manager.get(task.id)
+        assert updated.status == "todo"
+        assert updated.tags == ["claude", "agent-reassigned"]
+        assert "Prior output" in (updated.notes or "")
+        assert "Try a second synthetic approach." in (updated.notes or "")
+        assert session_store.get(task.id).session_id == session.session_id
+        assert session_store.get_messages(session.session_id)[0]["content"] == "Prior synthetic result"
+
+    def test_reassign_removes_managed_executor_tag_before_setting_target(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create(
+            "Review managed synthetic output",
+            tags=["cloud-haiku", "agent-completed"], status="done",
+        )
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="claude")
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "codex"},
+        )
+        assert response.status_code == 200, response.text
+        assert task_manager.get(task.id).tags == ["codex", "agent-reassigned"]
+
+    def test_review_action_conflict_leaves_card_and_queue_unchanged(self, client, stores, monkeypatch):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="local")
+        from api.services.task_manager import TaskConflictError
+        monkeypatch.setattr(task_manager, "update", lambda *_a, **_k: (_ for _ in ()).throw(TaskConflictError("race")))
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry the synthetic example."},
+        )
+        assert response.status_code == 409
+        assert task_manager.get(task.id).status == "done"
+        assert task_manager.get(task.id).tags == ["codex", "agent-completed"]
+        assert session_store.list_answered_unprocessed_questions() == []
+
+    def test_blocked_respond_uses_existing_question_path(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Need synthetic clarification", tags=["agent-blocked"], status="blocked")
+        session = session_store.create(task_id=task.id, status=STATUS_BLOCKED)
+        question_id = session_store.create_pending_question(
+            session.session_id, task.id, "Which synthetic fixture?", 17,
+        )
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "respond", "note": "Use fixture alpha."},
+        )
+        assert response.status_code == 200
+        assert response.json()["question_id"] == question_id
+        answered = session_store.list_answered_unprocessed_questions()
+        assert answered[0]["answer"] == "Use fixture alpha."
+
+    def test_reject_queues_only_after_card_transition_and_rolls_back_on_queue_failure(
+        self, client, stores, monkeypatch,
+    ):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Synthetic rollback", tags=["codex", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+        monkeypatch.setattr(
+            session_store, "enqueue_web_followup",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("synthetic queue failure")),
+        )
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry synthetic output."},
+        )
+        assert response.status_code == 409
+        restored = task_manager.get(task.id)
+        assert restored.status == "done"
+        assert restored.tags == ["codex", "agent-completed"]
+        assert session_store.list_answered_unprocessed_questions() == []
+
+    def test_reject_rollback_does_not_clobber_a_concurrent_note(self, client, stores, monkeypatch):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Synthetic rollback race", tags=["codex", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+        original_update = task_manager.update
+        transition_seen = False
+
+        def raced_update(task_id, **kwargs):
+            nonlocal transition_seen
+            result = original_update(task_id, **kwargs)
+            if "_tags_merge" in kwargs and not transition_seen:
+                transition_seen = True
+                original_update(task_id, notes="Concurrent synthetic note")
+            return result
+
+        monkeypatch.setattr(task_manager, "update", raced_update)
+        monkeypatch.setattr(
+            session_store, "enqueue_web_followup",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("synthetic queue failure")),
+        )
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry synthetic output."},
+        )
+        assert response.status_code == 409
+        assert "rollback conflict" in response.json()["detail"]
+        assert task_manager.get(task.id).notes == "Concurrent synthetic note"
+
+    def test_reassign_retires_old_completion_anchor_and_reports_context_reality(self, client, stores):
+        task_manager, _sched, session_store, transcript_store = stores
+        task = task_manager.create("Synthetic reassign", tags=["codex", "agent-completed"], status="done")
+        session = session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+        session_store.register_completion_followup(session.session_id, task.id, [91], label="Synthetic reassign")
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude"},
+        )
+        assert response.status_code == 200
+        assert response.json()["context_preserved"] is False
+        with session_store._connect() as conn:
+            row = conn.execute(
+                "SELECT processed, timed_out FROM pending_questions WHERE sent_message_id = 91",
+            ).fetchone()
+        assert tuple(row) == (1, 1)
+
+    def test_accept_undo_rejects_stale_transition_token(self, client, stores):
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create("Synthetic token", tags=["agent-completed"], status="done")
+        accepted = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert accepted.status_code == 200
+        token = accepted.json()["undo_token"]
+        task_manager.update(task.id, notes="unrelated synthetic edit")
+        undo = client.post(
+            f"/api/agents/board/cards/{task.id}/undo-accept",
+            json={"token": token},
+        )
+        assert undo.status_code == 409
+        assert "accepted" in task_manager.get(task.id).tags
+
+    def test_reassign_keeps_native_handles_until_worker_selects_route(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Synthetic native context", tags=["claude", "agent-completed"], status="done")
+        _session = session_store.create(
+            task_id=task.id, status=STATUS_COMPLETED, routing="claude_code",
+        )
+        session_store.set_claude_code_session_id(task.id, "synthetic-cli-thread")
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude"},
+        )
+        assert response.status_code == 200
+        rearmed = session_store.rearm_for_claim(task.id)
+        assert rearmed is not None
+        assert rearmed.claude_code_session_id == "synthetic-cli-thread"
+
+    def test_hermes_reject_without_conversation_id_refuses_before_mutation(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Synthetic Hermes review", tags=["hermes", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="hermes")
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Continue synthetic work."},
+        )
+        assert response.status_code == 409
+        assert task_manager.get(task.id).status == "done"
+        assert session_store.list_answered_unprocessed_questions() == []
+
+
 class TestBoardStream:
     async def test_stream_emits_a_second_frame_after_a_task_mutation(self, stores):
         """Round-1 finding 12(a): the SSE path itself (GET
@@ -1085,6 +1286,30 @@ class TestAcceptBoardCard:
         # Second call is a true no-op — no write, so updated_at is unchanged.
         assert updated.updated_at == updated_at_1
 
+    def test_accept_preserves_lifecycle_added_during_cas_retry(
+        self, client, stores, monkeypatch,
+    ):
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Accept with concurrent lifecycle", tags=["codex", "agent-completed", "keep-me"], status="done",
+        )
+        path = Path(task.source_file)
+        original_mtime = task_manager_module._mtime_or_none
+        calls = {"count": 0}
+
+        def race_once(candidate):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                path.write_text(path.read_text().replace("#keep-me", "#keep-me #agent-failed"))
+            return original_mtime(candidate)
+
+        monkeypatch.setattr(task_manager_module, "_mtime_or_none", race_once)
+        response = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert response.status_code == 200
+        assert set(task_manager.get(task.id).tags) == {
+            "codex", "agent-completed", "keep-me", "agent-failed", "accepted",
+        }
+
     def test_accept_missing_card_is_404(self, client, stores):
         r = client.post("/api/agents/board/cards/nope/accept")
         assert r.status_code == 404
@@ -1099,6 +1324,65 @@ class TestAcceptBoardCard:
         updated = task_manager.get(task.id)
         assert updated.status == "todo"
         assert "accepted" not in updated.tags
+
+    def test_undo_accept_restores_review_without_touching_unrelated_tags(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Restore this review",
+            tags=["hermes", "agent-completed", "keep-me", "accepted"],
+            status="done",
+        )
+        r = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        assert r.status_code == 200
+        assert r.json()["lane"] == "review"
+        updated = task_manager.get(task.id)
+        assert updated.status == "done"
+        assert updated.tags == ["hermes", "agent-completed", "keep-me"]
+
+    def test_undo_accept_rejects_unaccepted_card(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Not accepted")
+        r = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        assert r.status_code == 409
+
+    def test_undo_accept_is_idempotent_after_first_undo(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Retry undo", tags=["codex", "agent-completed", "accepted"], status="done",
+        )
+        first = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        second = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["lane"] == "review"
+        assert task_manager.get(task.id).tags == ["codex", "agent-completed"]
+
+    def test_board_tags_preserve_lifecycle_added_during_cas_retry(
+        self, client, stores, monkeypatch,
+    ):
+        """A stale full-list picker save must not erase a worker tag added
+        between its initial read and the CAS write."""
+        task_manager, *_ = stores
+        task = task_manager.create("Concurrent picker", tags=["codex", "keep-me"])
+        path = Path(task.source_file)
+        original_mtime = task_manager_module._mtime_or_none
+        calls = {"count": 0}
+
+        def race_once(candidate):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                path.write_text(path.read_text().replace("#codex", "#codex #agent-running"))
+            return original_mtime(candidate)
+
+        monkeypatch.setattr(task_manager_module, "_mtime_or_none", race_once)
+        response = client.put(
+            f"/api/agents/board/cards/{task.id}/tags",
+            json={"tags": ["keep-me", "new-label"]},
+        )
+        assert response.status_code == 200
+        assert set(task_manager.get(task.id).tags) == {
+            "codex", "agent-running", "keep-me", "new-label",
+        }
 
 
 # ---------------------------------------------------------------------------

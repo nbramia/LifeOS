@@ -2,7 +2,7 @@
 //
 // The network call, toast, and (for Delete) the kill-then-delete
 // confirmation modal behind each card-only action in the shared action row
-// (Open, Accept, Resolve, Cancel, Delete — see ./session_actions.js's
+// (Open, Accept, Reject, Reassign, Mark Done, Cancel, Delete — see ./session_actions.js's
 // `decideActions`) — the part that's identical wherever a card-aware panel
 // offers them: the Board drawer (web/agents/board.js) and a card-linked
 // Graph tab side panel (web/agents/panel.js). A caller supplies `onChanged`
@@ -14,11 +14,14 @@
 
 import { TERMINAL, sourceLabelFor, escapeHtml, showToast } from './session_actions.js';
 import { LANES } from './lanes.js';
+import { refreshAfterFailure } from './action_refresh.js';
 
 function laneLabelFor(laneId) {
   const lane = LANES.find(l => l.id === laneId);
   return lane ? lane.label : laneId;
 }
+
+const acceptInFlight = new Set();
 
 export async function openCard(card, onChanged) {
   try {
@@ -34,16 +37,147 @@ export async function openCard(card, onChanged) {
   } catch (err) { showToast(`Open failed: ${err.message}`, true); }
 }
 
-export async function acceptCard(card, onChanged) {
+export async function undoAcceptedCard(cardId, onChanged, token = null) {
   try {
-    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/accept`, { method: 'POST' });
-    if (!r.ok) throw new Error(await r.text());
-    showToast('Accepted.', false);
+    const options = { method: 'POST' };
+    if (token) {
+      options.headers = { 'Content-Type': 'application/json' };
+      options.body = JSON.stringify({ token });
+    }
+    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(cardId)}/undo-accept`, options);
+    if (!r.ok) {
+      const text = await r.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    showToast('Acceptance undone.', false);
     if (onChanged) await onChanged();
-  } catch (err) { showToast(`Accept failed: ${err.message}`, true); }
+  } catch (err) {
+    showToast(`Undo failed: ${err.message}`, true);
+    // The write may have failed because another actor changed the card. Keep
+    // the original failure visible, but refresh the caller's board so the
+    // stale card/action row is not left on screen.
+    await refreshAfterFailure(onChanged);
+    throw err;
+  }
 }
 
-// Resolve is a drop onto Done under the hood.
+export async function acceptCard(card, onChanged, onAccepted) {
+  if (acceptInFlight.has(card.id)) return;
+  acceptInFlight.add(card.id);
+  try {
+    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/accept`, { method: 'POST' });
+    if (!r.ok) {
+      const text = await r.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    const accepted = await r.json();
+    showToast('Accepted.', false, {
+      duration: 3500 * 1.5,
+      actionLabel: 'Undo',
+      actionAriaLabel: 'Undo acceptance',
+      onAction: ({ toast, action }) => {
+        action.textContent = 'Undoing…';
+        return undoAcceptedCard(card.id, onChanged, accepted.undo_token)
+          .then(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); })
+          .catch(() => { action.textContent = 'Undo'; });
+      },
+    });
+    if (onAccepted) onAccepted();
+    if (onChanged) await onChanged();
+  } catch (err) { showToast(`Accept failed: ${err.message}`, true); }
+  finally { acceptInFlight.delete(card.id); }
+}
+
+/**
+ * Reject a completed review with operator context, or reassign it while
+ * retaining the prior session transcript as the next run's context.
+ */
+export function openReviewActionModal(card, action, onChanged, {
+  onMutationOpened,
+  onMutationCancelled,
+  onMutationConfirmed,
+  onMutationFailed,
+} = {}) {
+  const isReject = action === 'reject';
+  const title = isReject ? 'Reject review' : 'Reassign review';
+  const assignees = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud'];
+  const assigneeHtml = isReject ? '' : `
+    <label for="review-assignee">Assignee</label>
+    <select id="review-assignee">
+      ${assignees.map(a => `<option value="${a}" ${a === card.assignee ? 'selected' : ''}>${a}</option>`).join('')}
+    </select>
+  `;
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  backdrop.innerHTML = `
+    <div class="modal" role="dialog" aria-labelledby="review-action-title">
+      <h2 id="review-action-title">${title}</h2>
+      <div class="target">${escapeHtml(card.title || card.id)}</div>
+      ${assigneeHtml}
+      <label for="review-note">${isReject ? 'Note (required)' : 'Context note (optional)'}</label>
+      <textarea id="review-note" aria-describedby="review-note-error" placeholder="${isReject ? 'What should be changed?' : 'What should the next run know?'}"></textarea>
+      ${isReject ? '<div id="review-note-error" data-field="review-note-error" role="alert" hidden>Tell the agent what should be changed.</div>' : ''}
+      <div class="actions">
+        <button id="review-action-cancel">Cancel</button>
+        <button class="danger" id="review-action-submit">${isReject ? 'Reject' : 'Reassign'}</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(backdrop);
+  const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
+  const cancel = () => {
+    if (onMutationCancelled) onMutationCancelled();
+    cleanup();
+  };
+  backdrop.addEventListener('click', e => { if (e.target === backdrop) cancel(); });
+  backdrop.querySelector('#review-action-cancel').onclick = cancel;
+  if (onMutationOpened) onMutationOpened();
+  backdrop.querySelector('#review-action-submit').onclick = async () => {
+    const note = backdrop.querySelector('#review-note').value.trim();
+    const noteEl = backdrop.querySelector('#review-note');
+    const errorEl = backdrop.querySelector('[data-field="review-note-error"]');
+    if (isReject && !note) {
+      if (onMutationFailed) onMutationFailed();
+      noteEl.setAttribute('aria-invalid', 'true');
+      noteEl.focus();
+      if (errorEl) errorEl.hidden = false;
+      return;
+    }
+    noteEl.removeAttribute('aria-invalid');
+    if (errorEl) errorEl.hidden = true;
+    const btn = backdrop.querySelector('#review-action-submit');
+    btn.disabled = true;
+    btn.textContent = isReject ? 'Rejecting…' : 'Reassigning…';
+    const payload = { action, note };
+    if (!isReject) payload.assignee = backdrop.querySelector('#review-assignee').value;
+    try {
+      if (onMutationConfirmed) onMutationConfirmed();
+      const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/review-action`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        let msg = text;
+        try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+        throw new Error(msg || `HTTP ${r.status}`);
+      }
+      showToast(isReject ? 'Review rejected; resuming with your note.' : 'Review reassigned.', false);
+      cleanup();
+      if (onChanged) await onChanged(await r.json());
+    } catch (err) {
+      if (onMutationFailed) onMutationFailed();
+      showToast(`${isReject ? 'Reject' : 'Reassign'} failed: ${err.message}`, true);
+      btn.disabled = false;
+      btn.textContent = isReject ? 'Reject' : 'Reassign';
+    }
+  };
+}
+
+// Mark Done is a drop onto Done under the hood.
 export async function resolveCard(card, onChanged) {
   try {
     const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/lane`, {
@@ -98,7 +232,14 @@ export async function cancelCard(card, onChanged) {
 // CLI-backed live session is deleted without a kill attempt, since the
 // operator has to close that pane by hand. A scheduled card never carries a
 // session, so it always deletes straight through.
-export function openDeleteCardModal(card, { findCard, onDeleted } = {}) {
+export function openDeleteCardModal(card, {
+  findCard,
+  onDeleted,
+  onMutationOpened,
+  onMutationCancelled,
+  onMutationConfirmed,
+  onMutationFailed,
+} = {}) {
   const resolveCard_ = (id) => (findCard ? findCard(id) : card);
   const isTask = card.kind === 'task';
   const label = isTask ? (card.title || card.id) : (card.name || card.id);
@@ -140,8 +281,14 @@ export function openDeleteCardModal(card, { findCard, onDeleted } = {}) {
   // detached button on failure instead of the modal staying open.
   let pending = false;
   const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
-  backdrop.addEventListener('click', e => { if (!pending && e.target === backdrop) cleanup(); });
-  backdrop.querySelector('#delete-cancel').onclick = () => { if (!pending) cleanup(); };
+  const cancel = () => {
+    if (pending) return;
+    if (onMutationCancelled) onMutationCancelled();
+    cleanup();
+  };
+  backdrop.addEventListener('click', e => { if (e.target === backdrop) cancel(); });
+  backdrop.querySelector('#delete-cancel').onclick = cancel;
+  if (onMutationOpened) onMutationOpened();
   backdrop.querySelector('#delete-confirm').onclick = async () => {
     const confirmBtn = backdrop.querySelector('#delete-confirm');
     // Re-resolve the card from the live source rather than trusting the
@@ -165,6 +312,7 @@ export function openDeleteCardModal(card, { findCard, onDeleted } = {}) {
     confirmBtn.disabled = true;
     confirmBtn.textContent = 'Deleting…';
     try {
+      if (onMutationConfirmed) onMutationConfirmed();
       if (freshNeedsKill) {
         const kr = await fetch(`/api/agents/sessions/${encodeURIComponent(fresh.session.session_id)}/kill`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),
@@ -196,6 +344,7 @@ export function openDeleteCardModal(card, { findCard, onDeleted } = {}) {
       showToast('Deleted.', false);
       if (onDeleted) await onDeleted();
     } catch (err) {
+      if (onMutationFailed) onMutationFailed();
       showToast(`Delete failed: ${err.message}`, true);
       pending = false;
       confirmBtn.disabled = false;
@@ -208,13 +357,28 @@ export function openDeleteCardModal(card, { findCard, onDeleted } = {}) {
 // that needs to override one action's behaviour (the Board drawer's own
 // Cancel and Delete, which do extra drawer-specific bookkeeping around the
 // generic network call) spreads this and replaces just that key.
-export function cardActionHandlers(card, { findCard, onChanged } = {}) {
+export function cardActionHandlers(card, {
+  findCard, onChanged, onAccepted,
+  onMutationOpened, onMutationCancelled,
+  onMutationConfirmed, onMutationFailed,
+} = {}) {
   const changed = onChanged || (() => {});
   return {
     open: () => openCard(card, changed),
-    accept: () => acceptCard(card, changed),
+    accept: () => acceptCard(card, changed, onAccepted),
+    reject: () => openReviewActionModal(card, 'reject', changed, {
+      onMutationOpened, onMutationCancelled,
+      onMutationConfirmed, onMutationFailed,
+    }),
+    reassign: () => openReviewActionModal(card, 'reassign', changed, {
+      onMutationOpened, onMutationCancelled,
+      onMutationConfirmed, onMutationFailed,
+    }),
     resolve: () => resolveCard(card, changed),
     cancel: () => cancelCard(card, changed),
-    delete: () => openDeleteCardModal(card, { findCard, onDeleted: changed }),
+    delete: () => openDeleteCardModal(card, {
+      findCard, onDeleted: changed, onMutationOpened, onMutationCancelled,
+      onMutationConfirmed, onMutationFailed,
+    }),
   };
 }

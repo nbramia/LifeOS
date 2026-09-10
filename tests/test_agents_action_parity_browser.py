@@ -180,6 +180,23 @@ class TestDecideActions:
         out = _decide(page, None, card)
         assert _ids(out) == ["accept", "delete"], out
 
+    def test_review_with_prior_session_offers_reject_and_reassign(self, page: Page, web_base_url):
+        _load_actions_module(page, web_base_url)
+        card = {"kind": "task", "lane": "review", "assignee": "claude", "pending_question": None}
+        session = dict(_BARE_SESSION, status="completed")
+        out = _decide(page, session, card)
+        assert _ids(out) == ["rename", "focus", "resume", "accept", "reject", "reassign", "delete"], out
+
+    def test_human_queue_action_is_named_mark_done(self, page: Page, web_base_url):
+        _load_actions_module(page, web_base_url)
+        card = {
+            "kind": "task", "lane": "human_queue", "assignee": None, "pending_question": None,
+            "policy": {"lanes": {}},
+        }
+        out = _decide(page, None, card)
+        done = next(d for d in out if d["id"] == "resolve")
+        assert done["label"] == "Mark Done"
+
     def test_card_human_queue_offers_resolve_when_done_move_allowed(self, page: Page, web_base_url):
         _load_actions_module(page, web_base_url)
         card = {
@@ -237,7 +254,7 @@ class TestDecideActions:
         out = _decide(page, session, card)
         # Open needs lane=assigned (not review) and Resolve needs
         # lane=human_queue, so neither applies here — everything else does.
-        assert _ids(out) == ["rename", "focus", "resume", "kill", "answer", "accept", "cancel", "delete"], out
+        assert _ids(out) == ["rename", "focus", "resume", "kill", "answer", "accept", "reject", "reassign", "cancel", "delete"], out
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +467,7 @@ class TestActionParity:
         )
 
         assert board_actions == panel_actions, (board_actions, panel_actions)
-        assert [a["id"] for a in board_actions] == ["rename", "focus", "resume", "kill", "accept", "delete"], board_actions
+        assert [a["id"] for a in board_actions] == ["rename", "focus", "resume", "kill", "accept", "reject", "reassign", "delete"], board_actions
 
 
 # ---------------------------------------------------------------------------

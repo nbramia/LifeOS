@@ -665,7 +665,10 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
             # never trusted from the request), not on who's asking.
             old_tags = agent_board.normalize_tags(current.tags)
             new_tags = agent_board.normalize_tags(updates["tags"])
-            assignee_tag_set = set(agent_board.ASSIGNEE_TAGS)
+            # Managed Agents consent tags are executor assignments too. They
+            # are not board assignee lanes, but removing one through a raw
+            # tags PUT would silently change the worker's requested target.
+            assignee_tag_set = set(agent_board.AGENT_EXECUTOR_TAGS)
             # Every lifecycle tag the worker or the accept endpoint writes
             # is off-limits to a bare tags PUT, not just the two claim
             # tags — `agent-completed` and `accepted` are just as

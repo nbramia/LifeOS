@@ -23,6 +23,7 @@ from typing import Iterable, Optional
 RUNNING_TAG = "agent-running"
 COMPLETED_TAG = "agent-completed"
 BLOCKED_TAG = "agent-blocked"
+REASSIGNED_TAG = "agent-reassigned"
 MACHINE_WAIT_TAGS = frozenset({"agent-wait-provider", "agent-wait-dependency"})
 
 # A `#human` card is filed for the operator directly (not by the worker).
@@ -31,6 +32,16 @@ HUMAN_TAG = "human"
 # The accepted marker for Review -> Done (#850) — a tag, not a new status
 # symbol, per the issue's constraints.
 ACCEPTED_TAG = "accepted"
+
+# Tags whose ownership/lifecycle is outside the board's free-text Tags field.
+# Board tag edits replace only the user-editable portion and preserve every
+# member of this set from the latest CAS snapshot.
+PROTECTED_TAGS: frozenset[str] = frozenset({
+    "me", "claude", "codex", "hermes", "local", "cloud",
+    "cloud-haiku", "cloud-sonnet",
+    RUNNING_TAG, BLOCKED_TAG, COMPLETED_TAG, "agent-failed",
+    "agent-budget-exceeded", REASSIGNED_TAG, ACCEPTED_TAG,
+})
 
 # Assignee is exactly one tag from this set. "me" is the operator; the rest
 # are agent engines. An engine assignee on a todo/urgent task is what makes
@@ -157,6 +168,11 @@ CANCEL_ALREADY_FINISHED_ERROR: tuple[int, str] = (
 # The actions every server write path that can touch an agent-owned card's
 # lane, assignee, or status funnels through `evaluate_card_action`.
 CARD_ACTIONS: tuple[str, ...] = ("lane_move", "assignee_change", "field_edit", "cancel")
+
+REVIEW_ASSIGNEE_ERROR: tuple[int, str] = (
+    400,
+    "assignee is required and must be one of: " + ", ".join(ASSIGNEE_TAGS),
+)
 
 
 def status_claim_possible(status: str, tags: Iterable[str]) -> bool:
@@ -368,6 +384,56 @@ class LaneMovePlan:
     status: Optional[str] = None
     tags: Optional[list[str]] = None
     error: Optional[tuple[int, str]] = None
+
+
+@dataclass
+class ReviewActionPlan:
+    """The task mutation for an operator action on a completed review."""
+
+    status: Optional[str] = None
+    tags: Optional[list[str]] = None
+    error: Optional[tuple[int, str]] = None
+
+
+def plan_review_action(
+    current_status: str,
+    current_tags: Iterable[str],
+    action: str,
+    assignee: Optional[str] = None,
+) -> ReviewActionPlan:
+    """Plan a review reject or reassignment without touching any stores.
+
+    Reject returns the same card to worker-owned execution. Reassignment
+    clears worker lifecycle markers and leaves the task in Assigned so the
+    worker can claim it later; the existing session/transcript is deliberately
+    not changed here, preserving prior-run context for that claim.
+    """
+    if action not in ("reject", "reassign"):
+        raise ValueError(f"unknown review action: {action!r}")
+    tags = [str(t) for t in (current_tags or [])]
+    if not is_review_pending(tags):
+        return ReviewActionPlan(error=(409, "card is not in the Review lane"))
+
+    normalized = (assignee or "").lstrip("#").lower()
+    if action == "reassign" and normalized not in ASSIGNEE_TAGS:
+        return ReviewActionPlan(error=REVIEW_ASSIGNEE_ERROR)
+
+    lifecycle = {
+        RUNNING_TAG, BLOCKED_TAG, COMPLETED_TAG, "agent-failed",
+        "agent-budget-exceeded", REASSIGNED_TAG, ACCEPTED_TAG,
+    }
+    cleaned = [t for t in tags if t.lstrip("#").lower() not in lifecycle]
+    if action == "reject":
+        cleaned.append(RUNNING_TAG)
+        return ReviewActionPlan(status="in_progress", tags=cleaned)
+
+    # Managed Agents consent tags are executor assignments too, even though
+    # they are not board lanes/assignees. A reassignment must remove both
+    # vocabularies so a stale #cloud-haiku cannot outrank the requested target.
+    cleaned = [t for t in cleaned if t.lstrip("#").lower() not in AGENT_EXECUTOR_TAGS]
+    cleaned.append(normalized)
+    cleaned.append(REASSIGNED_TAG)
+    return ReviewActionPlan(status="todo", tags=cleaned)
 
 
 def plan_lane_move(

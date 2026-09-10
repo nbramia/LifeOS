@@ -397,6 +397,11 @@ def _user_message_for(task: dict) -> str:
     parts = [CAPABILITIES_PREAMBLE, f"Task: {title}"]
     if context:
         parts.append(f"Context: {context}")
+    notes = (task.get("notes") or "").strip()
+    if notes:
+        # Notes may contain a prior-run handoff. Keep the first prompt
+        # bounded while retaining the most recent operator direction.
+        parts.append(f"Task notes:\n{notes[-6000:]}")
     parts.append("Please complete this task using the tools available.")
     return "\n\n".join(parts)
 

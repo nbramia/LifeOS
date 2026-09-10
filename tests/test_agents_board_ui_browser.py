@@ -26,6 +26,8 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
+from api.services import agent_board
+
 pytestmark = [pytest.mark.browser, pytest.mark.slow]
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -188,6 +190,47 @@ def _remove_card_from_state(board_state: dict, card_id: str) -> None:
                 return
 
 
+def _stub_derive_lane(card: dict) -> str:
+    """Small faithful projection of agent_board.derive_lane for tag writes.
+
+    The browser harness is not a second unit-test suite for lane policy, but
+    an atomic tag response must still move a card when an editable tag such as
+    ``human`` changes its derived lane.
+    """
+    tags = {str(tag).lstrip("#").lower() for tag in (card.get("tags") or [])}
+    status = (card.get("status") or "todo").lower()
+    if "agent-completed" in tags and "accepted" not in tags:
+        return "review"
+    if "agent-blocked" in tags or "human" in tags or status == "blocked":
+        return "human_queue"
+    if status == "in_progress" or "agent-running" in tags:
+        return "in_progress"
+    if status in {"done", "cancelled"}:
+        return "done"
+    return "assigned" if tags & _ASSIGNEE_TAGS else "unassigned"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("status", "tags"),
+    [
+        ("todo", []),
+        ("todo", ["me"]),
+        ("in_progress", []),
+        ("todo", ["agent-running"]),
+        ("blocked", ["human"]),
+        ("todo", ["agent-blocked"]),
+        ("done", ["agent-completed"]),
+        ("done", ["agent-completed", "accepted"]),
+        ("done", ["human", "agent-completed"]),
+        ("cancelled", []),
+    ],
+)
+def test_stub_derive_lane_matches_production_priority(status, tags):
+    card = {"status": status, "tags": tags}
+    assert _stub_derive_lane(card) == agent_board.derive_lane(status, tags)
+
+
 def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: list, lane_status_code: list,
                   schedule_puts: list, board_stream_frames: list, stream_gate: "threading.Event | None" = None,
                   lane_response: "list | None" = None, open_calls: "list | None" = None,
@@ -321,6 +364,20 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": card_id, "lane": "done"}))
             return
 
+        undo_match = re.search(r"/api/agents/board/cards/([^/]+)/undo-accept$", url)
+        if undo_match and method == "POST":
+            card_id = undo_match.group(1)
+            _move_card_in_state(board_state, card_id, "review")
+            for card in board_state["lanes"]["review"]:
+                if card["id"] == card_id:
+                    tags = [t for t in card.get("tags", []) if t != "accepted"]
+                    if "agent-completed" not in tags:
+                        tags.append("agent-completed")
+                    card["tags"] = tags
+                    card["status"] = "done"
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": card_id, "lane": "review"}))
+            return
+
         if re.search(r"/api/agents/models$", url) and method == "GET":
             route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
             return
@@ -387,6 +444,63 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             }
             board_state["lanes"].setdefault("assigned" if assignee else "unassigned", []).append(new_card)
             route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": new_id, "description": new_card["title"]}))
+            return
+
+        tag_match = re.search(r"/api/agents/board/cards/([^/]+)/tags$", url)
+        if tag_match and method == "PUT":
+            try:
+                body = json.loads(route.request.post_data or "{}")
+            except ValueError:
+                body = {}
+            # This is the narrow board-tags request, not the legacy task PUT:
+            # apply the endpoint's atomic merge against the latest card state,
+            # then record the exact editable-only payload after the response
+            # has been fulfilled so callers waiting on the intercepted list
+            # observe a completed browser request.
+            task_id = tag_match.group(1)
+            requested = body.get("tags") or []
+            protected = _ASSIGNEE_TAGS | {
+                "cloud-haiku", "cloud-sonnet", "agent-running", "agent-blocked",
+                "agent-completed", "agent-failed", "agent-budget-exceeded",
+                "agent-reassigned", "accepted",
+            }
+            card = next(
+                (candidate for cards in board_state["lanes"].values() for candidate in cards
+                 if candidate["id"] == task_id),
+                None,
+            )
+            if card is None:
+                route.fulfill(
+                    status=404, content_type="application/json",
+                    body=json.dumps({"detail": "card not found"}),
+                )
+                return
+            requested_protected = [
+                tag for tag in requested
+                if str(tag).lstrip("#").lower() in protected
+            ]
+            if requested_protected:
+                route.fulfill(
+                    status=409, content_type="application/json",
+                    body=json.dumps({
+                        "detail": "assignee and lifecycle tags are managed by the board actions",
+                    }),
+                )
+                return
+            merged = list(requested)
+            preserved = [
+                tag for tag in card.get("tags", [])
+                if str(tag).lstrip("#").lower() in protected
+            ]
+            merged = [*preserved, *requested]
+            card["tags"] = merged
+            landed = _stub_derive_lane(card)
+            _move_card_in_state(board_state, task_id, landed)
+            route.fulfill(
+                status=200, content_type="application/json",
+                body=json.dumps({"id": task_id, "lane": landed, "status": card["status"], "tags": merged}),
+            )
+            task_puts.append(body)
             return
 
         task_match = re.search(r"/api/tasks/([^/]+)$", url)
@@ -611,8 +725,95 @@ class TestBoardLoad:
         for row in result:
             assert row["actual"] == row["expected"], row
 
+    def test_mobile_tabs_filters_and_hidden_done_target_are_compact_and_reachable(
+        self, page: Page, agents_base_url,
+    ):
+        page.set_viewport_size({"width": 390, "height": 844})
+        _open_board(page, agents_base_url)
+        expect(page.locator("#tab-btn-board .tab-short")).to_be_visible()
+        expect(page.locator("#tab-btn-board .tab-label")).to_be_hidden()
+        expect(page.locator("#tab-btn-graph .tab-short")).to_be_visible()
+        expect(page.locator("#board-filter-toggle")).to_be_visible()
+        expect(page.locator("#board-filter-toggle")).to_have_attribute("aria-expanded", "false")
+        expect(page.locator("#board-filter-controls")).to_be_hidden()
+        expect(page.locator("#board-done-drop")).to_be_visible()
+
+        page.locator("#board-filter-toggle").click()
+        expect(page.locator("#board-filter-toggle")).to_have_attribute("aria-expanded", "true")
+        expect(page.locator("#board-filter-controls")).to_be_visible()
+
+    def test_assignee_tray_click_then_card_is_an_accessible_assignment_alternative(
+        self, page: Page, agents_base_url,
+    ):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator(".board-assignee-drop[data-assignee='codex']").click()
+        expect(page.locator("#board-drop-status")).to_contain_text("codex")
+        page.locator("[data-card-id='t1']").click()
+        expect(page.locator(".board-lane[data-lane='assigned'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+        assert lane_calls == [{"lane": "assigned", "assignee": "codex"}]
+
+    def test_touch_pointer_drag_from_assignee_tray_assigns_a_card(self, page: Page, agents_base_url):
+        lane_calls = []
+        page.set_viewport_size({"width": 390, "height": 844})
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.evaluate(
+            """() => {
+                const source = document.querySelector('.board-assignee-drop[data-assignee="codex"]');
+                const card = document.querySelector('[data-card-id="t1"]');
+                const a = source.getBoundingClientRect();
+                const b = card.getBoundingClientRect();
+                const event = (type, x, y) => new PointerEvent(type, {
+                    bubbles: true, clientX: x, clientY: y, pointerId: 8,
+                    pointerType: 'touch', isPrimary: true,
+                });
+                source.dispatchEvent(event('pointerdown', a.left + 20, a.top + 20));
+                // `.board-assignee-drop` reserves the horizontal axis for the
+                // custom drag (`touch-action: pan-y`). A real touch gesture
+                // must cross that axis first; once the drag starts, board.js
+                // captures the pointer and the gesture can travel vertically
+                // to the card without handing control back to page scrolling.
+                source.dispatchEvent(event('pointermove', a.left + 120, a.top + 20));
+                document.dispatchEvent(event('pointermove', b.left + 20, b.top + 20));
+                document.dispatchEvent(event('pointerup', b.left + 20, b.top + 20));
+            }"""
+        )
+        expect(page.locator(".board-lane[data-lane='assigned'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+        assert lane_calls == [{"lane": "assigned", "assignee": "codex"}]
+
+    def test_done_target_accepts_a_focused_card_without_dragging(self, page: Page, agents_base_url):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator("[data-card-id='t1']").focus()
+        page.locator("#board-done-drop").click()
+        expect(page.locator(".board-lane[data-lane='unassigned'] [data-card-id='t1']")).to_have_count(0, timeout=5000)
+        assert lane_calls == [{"lane": "done"}]
+
 
 class TestDragBetweenLanes:
+    def test_touch_pointer_drag_moves_a_card_between_lanes(self, page: Page, agents_base_url):
+        lane_calls = []
+        page.set_viewport_size({"width": 390, "height": 844})
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.evaluate(
+            """() => {
+                const card = document.querySelector('[data-card-id="t1"]');
+                const lane = document.querySelector('.board-lane[data-lane="in_progress"] .board-lane-cards');
+                lane.scrollIntoView({block: 'nearest', inline: 'center'});
+                const a = card.getBoundingClientRect();
+                const b = lane.getBoundingClientRect();
+                const event = (type, x, y) => new PointerEvent(type, {
+                    bubbles: true, clientX: x, clientY: y, pointerId: 7,
+                    pointerType: 'touch', isPrimary: true,
+                });
+                card.dispatchEvent(event('pointerdown', a.left + 20, a.top + 20));
+                document.dispatchEvent(event('pointermove', b.left + 20, b.top + 20));
+                document.dispatchEvent(event('pointerup', b.left + 20, b.top + 20));
+            }"""
+        )
+        expect(page.locator(".board-lane[data-lane='in_progress'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+        assert lane_calls == [{"lane": "in_progress"}]
+
     def test_drag_issues_lane_put_with_expected_body(self, page: Page, agents_base_url):
         lane_calls = []
         _open_board(page, agents_base_url, lane_calls=lane_calls, lane_status_code=[200])
@@ -655,14 +856,53 @@ class TestDrawerNotesEdit:
 
 
 class TestDrawerTagsEdit:
+    def test_tag_picker_search_create_remove_and_protects_system_tags(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["unassigned"][0]["tags"] = ["Urgent"]
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        search = page.locator(".drawer-tags")
+        search.fill("urg")
+        expect(page.locator('[data-field="tag-options"] [data-select-tag="urgent"]')).to_be_visible()
+        page.locator('[data-field="tag-options"] [data-select-tag="urgent"]').click()
+        _wait_for(lambda: any("urgent" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert task_puts == [{"tags": ["urgent"]}]
+        # The atomic save re-fetches the board before the next queued picker
+        # action. Wait for that visible board-state convergence rather than
+        # racing the first response's promise continuation.
+        expect(page.locator('[data-card-id="t2"] .board-chip-tag')).to_contain_text("urgent", timeout=5000)
+        expect(page.locator(".drawer-tag-chip")).to_contain_text("#urgent")
+
+        search.fill("Fresh Tag")
+        expect(page.locator(".drawer-tag-option-create")).to_contain_text("#fresh-tag")
+        page.locator(".drawer-tag-option-create").click()
+        _wait_for(lambda: any("fresh-tag" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert task_puts[1] == {"tags": ["urgent", "fresh-tag"]}
+        expect(page.locator('[data-card-id="t2"] .board-chip-tag')).to_have_count(2, timeout=5000)
+        expect(page.locator(".drawer-tag-chip")).to_have_count(2)
+        expect(page.locator('[data-remove-tag="urgent"]')).to_be_visible()
+        # Deliver the chip's click handler without blurring the search field;
+        # the blur-save path is covered by the free-text tests below.
+        page.locator('[data-remove-tag="urgent"]').dispatch_event("click")
+        _wait_for(lambda: any("urgent" not in (p.get("tags") or []) and "fresh-tag" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert task_puts[2] == {"tags": ["fresh-tag"]}
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        assert t2["tags"] == ["me", "fresh-tag"]
+
+        search.fill("agent-running")
+        expect(page.locator(".drawer-tag-option-create")).to_have_count(0)
+
     def test_invalid_and_assignee_tokens_are_dropped(self, page: Page, agents_base_url):
         """Round-1 finding 8: the Tags field must not let a vault-comment
         injection or a duplicate assignee token reach the task store. t2 is
         assigned #me — typing an assignee token, a plain word, and an
-        HTML-comment-shaped token must save only the plain word alongside
-        the real assignee tag."""
+        HTML-comment-shaped token must send only the plain word in the
+        editable-tag payload while the endpoint preserves the real assignee
+        tag in the merged card state."""
+        board_state = copy.deepcopy(_board_fixture())
         task_puts = []
-        _open_board(page, agents_base_url, task_puts=task_puts)
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
         page.locator('[data-card-id="t2"]').click()
         tags = page.locator(".drawer-tags")
         expect(tags).to_be_visible()
@@ -670,11 +910,102 @@ class TestDrawerTagsEdit:
         page.locator(".drawer-title").click()  # blur the tags field
         expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
         expect(tags).to_have_value("foo")
-        assert any(
-            sorted(p.get("tags") or []) == ["foo", "me"] for p in task_puts
-        ), task_puts
+        assert task_puts == [{"tags": ["foo"]}], task_puts
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        assert t2["tags"] == ["me", "foo"]
         assert not any("<" in t for p in task_puts for t in (p.get("tags") or []))
         assert not any("codex" in (p.get("tags") or []) for p in task_puts)
+
+    def test_atomic_tag_save_relocates_card_from_editable_human_tag(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        tags = page.locator(".drawer-tags")
+        tags.fill("human")
+        page.locator('[data-field="tag-options"] [data-select-tag="human"]').click()
+        page.locator(".drawer-title").click()
+        _wait_for(lambda: task_puts == [{"tags": ["human"]}], page=page)
+        expect(page.locator('.board-lane[data-lane="human_queue"] [data-card-id="t2"]')).to_be_visible()
+        assert next(card for card in board_state["lanes"]["human_queue"] if card["id"] == "t2")["tags"] == [
+            "me", "human",
+        ]
+
+    def test_cancelled_review_modals_do_not_disable_atomic_tag_saves(
+        self, page: Page, agents_base_url,
+    ):
+        """Opening and cancelling each review/delete modal leaves the drawer's
+        tag picker live; the atomic route still persists the next edit."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["review"].append({
+            "kind": "task", "id": "t-review", "title": "Review synthetic result",
+            "notes": "", "status": "done", "tags": ["codex", "agent-completed"],
+            "assignee": "codex", "fields": {}, "context": "Ops",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "sess-review", "status": "completed", "source": "local",
+                "routing": "local", "started_at": 1000, "last_activity_at": 1000,
+            }, "pending_question": None,
+        })
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t-review"]').click()
+        tags = page.locator(".drawer-tags")
+
+        # Hold the first atomic request in a browser-side fetch wrapper so the
+        # second edit is definitely queued, without blocking Playwright's
+        # route callback thread.
+        page.evaluate("""() => {
+            const originalFetch = window.fetch;
+            let held = false;
+            window.__releaseTagSave = null;
+            window.fetch = (input, init) => {
+                if (!held && String(input).includes('/tags')) {
+                    held = true;
+                    return new Promise(resolve => {
+                        window.__releaseTagSave = () => {
+                            window.fetch = originalFetch;
+                            resolve(originalFetch(input, init));
+                        };
+                    });
+                }
+                return originalFetch(input, init);
+            };
+        }""")
+
+        # Queue two edits back-to-back, then dismiss the modal while the
+        # second write is still serialized behind the first. The obsolete
+        # second payload must be discarded rather than landing after Cancel.
+        tags.fill("stale-one")
+        page.locator(".drawer-title").click()
+        tags.fill("stale-two")
+        page.locator(".drawer-title").click()
+
+        for action, cancel_selector, tag in (
+            ("reject", "#review-action-cancel", "after-reject"),
+            ("reassign", "#review-action-cancel", "after-reassign"),
+            ("delete", "#delete-cancel", "after-delete"),
+        ):
+            page.locator(f'[data-action="{action}"]').click()
+            expect(page.locator(".modal")).to_be_visible()
+            page.locator(cancel_selector).click()
+            expect(page.locator(".modal")).to_have_count(0)
+            if action == "reject":
+                _wait_for(lambda: page.evaluate("Boolean(window.__releaseTagSave)"), page)
+                page.evaluate("window.__releaseTagSave()")
+            tags.fill(tag)
+            page.locator(".drawer-title").click()  # blur commits the atomic edit
+            _wait_for(
+                lambda tag=tag: any(tag in (payload.get("tags") or []) for payload in task_puts),
+                page=page,
+            )
+
+        assert not any("stale-two" in (payload.get("tags") or []) for payload in task_puts)
+        assert [payload["tags"] for payload in task_puts] == [
+            ["stale-one"], ["after-reject"], ["after-reassign"], ["after-delete"],
+        ]
+        review = next(card for card in board_state["lanes"]["review"] if card["id"] == "t-review")
+        assert review["tags"] == ["codex", "agent-completed", "after-delete"]
 
 
 class TestDrawerAssigneeRevert:
@@ -936,7 +1267,7 @@ class TestLiveUpdates:
         )
         page.locator('[data-card-id="t3"]').click()  # t3: pending_question id 1, human_queue
         expect(page.get_by_role("button", name="Answer")).to_be_visible()
-        expect(page.get_by_role("button", name="Resolve")).to_have_count(0)
+        expect(page.get_by_role("button", name="Mark Done")).to_have_count(0)
 
         for card in board_state["lanes"]["human_queue"]:
             if card["id"] == "t3":
@@ -945,7 +1276,7 @@ class TestLiveUpdates:
         stream_gate.set()
 
         expect(page.get_by_role("button", name="Answer")).to_have_count(0, timeout=5000)
-        expect(page.get_by_role("button", name="Resolve")).to_be_visible()
+        expect(page.get_by_role("button", name="Mark Done")).to_be_visible()
 
     def test_kill_button_cleared_when_linked_session_reaches_terminal_status(self, page: Page, agents_base_url):
         """#850 round-2 finding 3's other half (round-4 finding 1): when the
@@ -1061,8 +1392,24 @@ class TestFilters:
         expect(page.locator("#board-search")).to_have_value("")
         expect(page.locator("#board-filter-assignee")).to_have_value("all")
         expect(page.locator("#board-filter-tag")).to_have_value("")
-        expect(page.locator("#board-filter-sort")).to_have_value("file")
+        expect(page.locator("#board-filter-sort")).to_have_value("modified_desc")
         expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+
+    def test_modified_sort_is_default_and_chronological_directions_reverse(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"] = [
+            {"kind": "task", "id": "new", "title": "New", "notes": "", "status": "todo", "tags": ["me"], "assignee": "me", "fields": {}, "context": "Inbox", "created_date": "2026-01-03", "updated_at": "2026-01-03T00:00:00+00:00", "session": None, "pending_question": None},
+            {"kind": "task", "id": "same-b", "title": "Same B", "notes": "", "status": "todo", "tags": ["me"], "assignee": "me", "fields": {}, "context": "Inbox", "created_date": "2026-01-02", "updated_at": "2026-01-02T00:00:00+00:00", "session": None, "pending_question": None},
+            {"kind": "task", "id": "same-a", "title": "Same A", "notes": "", "status": "todo", "tags": ["me"], "assignee": "me", "fields": {}, "context": "Inbox", "created_date": "2026-01-02", "updated_at": "2026-01-02T00:00:00+00:00", "session": None, "pending_question": None},
+            {"kind": "task", "id": "missing", "title": "Missing", "notes": "", "status": "todo", "tags": ["me"], "assignee": "me", "fields": {}, "context": "Inbox", "session": None, "pending_question": None},
+        ]
+        _open_board(page, agents_base_url, board_state=board_state)
+        expect(page.locator("#board-filter-sort")).to_have_value("modified_desc")
+        lane = '.board-lane[data-lane="assigned"] .board-card'
+        newest = page.locator(lane).evaluate_all("els => els.map(e => e.dataset.cardId)")
+        page.locator("#board-filter-sort").select_option("modified_asc")
+        oldest = page.locator(lane).evaluate_all("els => els.map(e => e.dataset.cardId)")
+        assert oldest == list(reversed(newest))
 
     def test_sort_by_assignee_orders_lane(self, page: Page, agents_base_url):
         board_state = copy.deepcopy(_board_fixture())
@@ -1105,6 +1452,25 @@ class TestFilters:
         card.locator(".board-card-accept").click()
         expect(page.locator('.board-lane[data-lane="review"] [data-card-id="tr"]')).to_have_count(0)
         assert any(card["id"] == "tr" for card in board_state["lanes"]["done"])
+
+    def test_accept_dismisses_drawer_and_undo_restores_review(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["review"] = [{
+            "kind": "task", "id": "tr", "title": "Ready for review", "notes": "",
+            "status": "done", "tags": ["agent-completed", "hermes", "keep-me"],
+            "assignee": "hermes", "fields": {}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00", "session": None, "pending_question": None,
+        }]
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="tr"]').click()
+        page.locator('[data-action="accept"]').click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+        toast = page.locator(".toast").filter(has_text="Accepted.")
+        expect(toast).to_be_visible()
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        expect(toast.locator(".toast-action")).to_have_css("text-decoration-line", "underline")
+        toast.locator(".toast-action").click()
+        expect(page.locator('.board-lane[data-lane="review"] [data-card-id="tr"]')).to_be_visible(timeout=5000)
 
     def test_assignee_filter_lists_cloud(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
@@ -3144,15 +3510,18 @@ class TestAgentCardMoveRulesAndCancel:
         by typing it into the free-text Tags field — rejected the same
         way an assignee name already is, on an otherwise-editable
         (unclaimed, `me`-assigned) card."""
+        board_state = copy.deepcopy(_board_fixture())
         task_puts = []
-        _open_board(page, agents_base_url, task_puts=task_puts)
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
         page.locator('[data-card-id="t2"]').click()  # t2: tags=["me"], unclaimed
         tags = page.locator(".drawer-tags")
         tags.fill("agent-running foo")
         page.locator(".drawer-title").click()  # blur the tags field
         expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
         expect(tags).to_have_value("foo")
-        assert any(sorted(p.get("tags") or []) == ["foo", "me"] for p in task_puts), task_puts
+        assert task_puts == [{"tags": ["foo"]}], task_puts
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        assert t2["tags"] == ["me", "foo"]
         assert not any("agent-running" in (p.get("tags") or []) for p in task_puts)
 
     def test_review_card_tags_edit_preserves_agent_completed_tag(self, page: Page, agents_base_url):
@@ -3187,9 +3556,10 @@ class TestAgentCardMoveRulesAndCancel:
         expect(tags).to_have_value("")  # agent-completed never shows as an editable token
         tags.fill("urgent")
         page.locator(".drawer-title").click()  # blur
-        assert any(
-            sorted(p.get("tags") or []) == ["agent-completed", "codex", "urgent"] for p in task_puts
-        ), task_puts
+        _wait_for(lambda: bool(task_puts), page=page)
+        assert task_puts == [{"tags": ["urgent"]}], task_puts
+        t10 = next(card for card in board_state["lanes"]["review"] if card["id"] == "t10")
+        assert t10["tags"] == ["codex", "agent-completed", "urgent"]
 
     def test_dropping_on_scheduled_is_refused_locally_with_zero_requests(self, page: Page, agents_base_url):
         """Scheduled is never a direct drag target — refused client-side
@@ -3245,7 +3615,7 @@ class TestAgentCardMoveRulesAndCancel:
         })
         _open_board(page, agents_base_url, board_state=board_state)
         page.locator('[data-card-id="t12"]').click()
-        expect(page.get_by_role("button", name="Resolve", exact=True)).to_be_visible()
+        expect(page.get_by_role("button", name="Mark Done", exact=True)).to_be_visible()
 
     def test_cancel_with_an_untorn_down_cli_session_toasts_a_warning(self, page: Page, agents_base_url):
         """When Cancel's response carries `failures` (a live CLI session
@@ -3342,9 +3712,10 @@ class TestAgentCardMoveRulesAndCancel:
 
         tags.fill("agent-notes notes")  # remove "agent"
         page.locator(".drawer-title").click()  # blur the tags field
-        assert any(
-            sorted(p.get("tags") or []) == ["agent-notes", "me", "notes"] for p in task_puts
-        ), task_puts
+        _wait_for(lambda: bool(task_puts), page=page)
+        assert task_puts == [{"tags": ["agent-notes", "notes"]}], task_puts
+        t13 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t13")
+        assert t13["tags"] == ["me", "agent-notes", "notes"]
         assert not any("agent" in (p.get("tags") or []) for p in task_puts)
 
     def test_kill_disabled_for_a_claude_code_cli_backed_live_session(self, page: Page, agents_base_url):
@@ -3418,7 +3789,14 @@ class TestAgentCardMoveRulesAndCancel:
         expect(tags).to_have_value("notes extra")  # drawer not rebuilt while focused
 
         page.locator(".drawer-title").click()  # blur the tags field
-        assert any("agent-running" in (p.get("tags") or []) for p in task_puts), task_puts
+        _wait_for(lambda: bool(task_puts), page=page)
+        assert task_puts == [{"tags": ["notes", "extra"]}], task_puts
+        t15 = next(
+            card for cards in board_state["lanes"].values() for card in cards
+            if card["id"] == "t15"
+        )
+        assert t15["tags"] == ["claude", "agent-running", "notes", "extra"]
+        assert t15 in board_state["lanes"]["in_progress"]
 
 
 class TestDeleteCard:

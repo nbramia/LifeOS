@@ -88,6 +88,24 @@ def _is_excluded(rel_path: str, extra_exclude_dir_names: frozenset[str],
     return False
 
 
+def _is_runtime_directory_link(source_root: Path, rel_path: str,
+                                extra_exclude_dir_names: frozenset[str]) -> bool:
+    """True for a symlink standing in for one of the excluded runtime
+    directories (``data``, ``logs``, …).
+
+    Those names hold runtime state wherever they live, never candidate
+    source: an operator's checkout may point one at another filesystem, and
+    candidate verification points the candidate's own ``data`` at
+    verifier-owned storage. ``_is_excluded`` only sees such a name as a
+    parent segment, so the link itself has to be excluded here — exactly
+    like the directory it names, rather than rejected for resolving outside
+    the source root. Decided from the link's own `lstat`, never its target.
+    """
+    if Path(rel_path).name not in DEFAULT_EXCLUDE_DIR_NAMES | extra_exclude_dir_names:
+        return False
+    return os.path.islink(source_root / rel_path)
+
+
 def _candidate_paths(source_root: Path) -> list[str]:
     """Tracked (working-tree content) + untracked-non-ignored relative paths, deduped."""
     cached = _git(["ls-files", "-z", "--cached"], source_root).split("\0")
@@ -280,6 +298,11 @@ def build_snapshot(
         files: list[SnapshotFile] = []
         for rel_path in rel_paths_before:
             if _is_excluded(rel_path, extra_exclude_dir_names, extra_exclude_globs):
+                continue
+            # Necessarily before the lexical validation below: such a link's
+            # target is legitimately outside the source root, and this decides
+            # on the link's own lstat without dereferencing it.
+            if _is_runtime_directory_link(source_root, rel_path, extra_exclude_dir_names):
                 continue
             src_path = source_root / rel_path
             if not os.path.lexists(src_path):

@@ -109,6 +109,29 @@ def test_snapshot_excludes_runtime_data_preserves_modes_includes_untracked(tmp_p
     assert len(result.candidate_id) > 0
 
 
+def test_snapshot_excludes_a_runtime_directory_that_is_a_symlink(tmp_path):
+    """A checkout whose `data` directory is a link to storage elsewhere --
+    an operator pointing it at another filesystem, or candidate
+    verification pointing it at verifier-owned storage -- carries runtime
+    state, not source, so the link is excluded like the directory it names
+    instead of failing the escaping-symlink rule."""
+    src = tmp_path / "repo"
+    src.mkdir()
+    _init_synthetic_repo(src)
+    external = tmp_path / "elsewhere" / "data"
+    external.mkdir(parents=True)
+    (external / "real.db").write_text("synthetic runtime state")
+    (src / "app.py").write_text("VALUE = 1\n")
+    (src / "data").symlink_to(external, target_is_directory=True)
+    subprocess.run(["git", "add", "-A"], cwd=src, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "linked data directory"], cwd=src, check=True)
+
+    result = build_snapshot(src, tmp_path / "snapshot")
+
+    assert {f.rel_path for f in result.files} == {"app.py"}
+    assert not os.path.lexists(tmp_path / "snapshot" / "data")
+
+
 def test_snapshot_rejects_unsafe_external_symlink_without_dereferencing(tmp_path):
     src = tmp_path / "repo"
     src.mkdir()

@@ -557,6 +557,12 @@ class SessionStore:
         self._status_projector = None
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        # ``processed=2`` is an in-flight marker, not a durable owner id.
+        # Keep ownership in memory so a live claim in this process is never
+        # recovered by its own cleanup pass. Rows that predate this store
+        # instance are the only claims eligible for process-start recovery.
+        self._owned_question_claims: set[int] = set()
+        self._inherited_question_claims = self._list_question_claim_ids()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), isolation_level=None, timeout=10.0)
@@ -761,6 +767,14 @@ class SessionStore:
                     ON execution_turns(session_id, attempt_id, turn_number);
                 """
             )
+
+    def _list_question_claim_ids(self) -> set[int]:
+        """Snapshot claims inherited from an earlier worker process."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM pending_questions WHERE processed = 2",
+            ).fetchall()
+        return {int(row["id"]) for row in rows}
 
     # ------------------------------------------------------------------
     # Session CRUD
@@ -1547,6 +1561,67 @@ class SessionStore:
             except Exception:
                 conn.rollback()
                 raise
+
+    def rearm_for_claim(self, task_id: str) -> Session | None:
+        """Re-open a terminal session for a reassigned task.
+
+        The task id remains the session's stable primary key, so rearming the
+        row lets the next worker run reuse its conversation/messages and
+        transcript instead of deleting the prior context and creating an
+        unrelated session. Executor-specific cursors are reset; durable
+        conversation history and native handles are intentionally retained.
+        The worker decides whether a retained handle is usable for the newly
+        selected route.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM sessions WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None or row["status"] not in TERMINAL_STATUSES:
+                return None
+            conn.execute(
+                """
+                UPDATE sessions
+                SET status = ?, routing = NULL, budget_json = NULL,
+                    expected_output = NULL, preset_class = NULL,
+                    remote_pgid = NULL,
+                    host = NULL, model = NULL, effort = NULL,
+                    last_activity_at = ?
+                WHERE task_id = ?
+                """,
+                (STATUS_CLAIMED, _now(), task_id),
+            )
+        return self.get(task_id)
+
+    def reset_executor_handles(self, task_id: str) -> None:
+        """Forget route-specific handles before a deliberately fresh run."""
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE sessions SET managed_agent_session_id = NULL,
+                    claude_code_session_id = NULL, conversation_id = NULL,
+                    remote_pgid = NULL, last_activity_at = ?
+                    WHERE task_id = ?""",
+                (_now(), task_id),
+            )
+
+    def restore_session_state(self, session: Session) -> None:
+        """Restore a session snapshot after a failed rearm post-step."""
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE sessions SET status = ?, routing = ?, budget_json = ?,
+                    expected_output = ?, preset_class = ?,
+                    managed_agent_session_id = ?, claude_code_session_id = ?,
+                    conversation_id = ?, remote_pgid = ?, host = ?, model = ?,
+                    effort = ?, last_activity_at = ? WHERE task_id = ?""",
+                (
+                    session.status, session.routing,
+                    json.dumps(session.budget) if session.budget else None,
+                    session.expected_output, session.preset_class,
+                    session.managed_agent_session_id, session.claude_code_session_id,
+                    session.conversation_id, session.remote_pgid, session.host,
+                    session.model, session.effort, _now(), session.task_id,
+                ),
+            )
 
     def list_by_status(self, status: str) -> list[Session]:
         with self._connect() as conn:
@@ -2888,19 +2963,52 @@ class SessionStore:
         takes. There's no Telegram message to match, so `sent_message_id` is a
         sentinel 0 (web follow-ups are created already-answered, so they never
         participate in reply-id matching via `deposit_answer`).
+
+        The row carries the session's current execution identity, the same
+        way a Telegram question does: the worker only resumes an answer whose
+        attempt and turn still match the session it names.
         """
         now = _now()
         with self._connect() as conn:
+            row = conn.execute(
+                "SELECT task_id, attempt_id, turn_id FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is not None and row["task_id"] != task_id:
+                return 0
+            attempt_id = row["attempt_id"] if row is not None else None
+            turn_id = row["turn_id"] if row is not None else None
             cur = conn.execute(
                 """
                 INSERT INTO pending_questions (
                     session_id, task_id, question, sent_message_id, sent_at,
-                    kind, answer, answered_at
-                ) VALUES (?, ?, '', 0, ?, 'followup', ?, ?)
+                    kind, answer, answered_at, attempt_id, turn_id
+                ) VALUES (?, ?, '', 0, ?, 'followup', ?, ?, ?, ?)
                 """,
-                (session_id, task_id, now, answer, now),
+                (session_id, task_id, now, answer, now, attempt_id, turn_id),
             )
         return cur.lastrowid
+
+    def delete_pending_question(self, question_id: int) -> bool:
+        """Remove a just-enqueued web follow-up when its paired write fails."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM pending_questions WHERE id = ? AND kind = 'followup'",
+                (int(question_id),),
+            )
+        return cur.rowcount > 0
+
+    def retire_completion_followups(self, session_id: str) -> int:
+        """Retire terminal notification anchors before a reassign."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE pending_questions
+                   SET processed = 1, timed_out = 1
+                 WHERE session_id = ? AND kind = 'followup'
+                   AND processed IN (0, 2) AND timed_out = 0""",
+                (session_id,),
+            )
+        return cur.rowcount
 
     def get_recent_resumable_followup(self, within_seconds: int) -> dict | None:
         """Return the most recent open follow-up whose notification was sent
@@ -2985,12 +3093,107 @@ class SessionStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def mark_question_processed(self, question_id: int) -> None:
+    def claim_answered_unprocessed_questions(self) -> list[dict]:
+        """Atomically reserve answered rows for one worker pass.
+
+        ``processed=2`` is an internal in-flight marker using the existing
+        integer column. Reassignment retires both unclaimed and in-flight
+        follow-ups, and the worker verifies ownership before acting, so a
+        stale in-memory list cannot resume a retired row.
+        """
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE pending_questions SET processed = 1 WHERE id = ?",
-                (int(question_id),),
+            rows = conn.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE answered_at IS NOT NULL AND processed = 0 "
+                "ORDER BY id ASC",
+            ).fetchall()
+            claimed: list[dict] = []
+            for row in rows:
+                cur = conn.execute(
+                    "UPDATE pending_questions SET processed = 2 "
+                    "WHERE id = ? AND answered_at IS NOT NULL AND processed = 0",
+                    (row["id"],),
+                )
+                if cur.rowcount:
+                    item = dict(row)
+                    item["processed"] = 2
+                    claimed.append(item)
+                    self._owned_question_claims.add(int(row["id"]))
+        return claimed
+
+    def recover_question_claims(
+        self, *, limit: int = 100,
+    ) -> int:
+        """Return abandoned ``processed=2`` answer rows to the retry queue.
+
+        ``processed=2`` is deliberately kept as the lease state so this
+        recovery needs no schema change. Only claims observed when this store
+        instance started are eligible; claims made by this live process remain
+        owned until the normal success/exception cleanup path releases them.
+        """
+        limit = max(1, int(limit))
+        inherited = sorted(self._inherited_question_claims)[:limit]
+        if not inherited:
+            return 0
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM pending_questions "
+                "WHERE processed = 2 AND id IN (%s) ORDER BY id ASC" %
+                ",".join("?" for _ in inherited),
+                inherited,
+            ).fetchall()
+            recovered = 0
+            for row in rows:
+                cur = conn.execute(
+                    "UPDATE pending_questions SET processed = 0 "
+                    "WHERE id = ? AND processed = 2",
+                    (row["id"],),
+                )
+                recovered += cur.rowcount
+                self._inherited_question_claims.discard(int(row["id"]))
+        return recovered
+
+    def question_claimed(self, question_id: int) -> bool:
+        """Return whether this worker still owns an answered row claim."""
+        question_id = int(question_id)
+        if question_id not in self._owned_question_claims:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM pending_questions WHERE id = ? AND processed = 2",
+                (question_id,),
+            ).fetchone()
+        if row is None:
+            self._owned_question_claims.discard(question_id)
+            return False
+        return True
+
+    def release_question_claim(self, question_id: int) -> bool:
+        """Return a claimed row to the retryable unprocessed state."""
+        question_id = int(question_id)
+        if question_id not in self._owned_question_claims:
+            return False
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE pending_questions SET processed = 0 "
+                "WHERE id = ? AND processed = 2",
+                (question_id,),
             )
+        self._owned_question_claims.discard(question_id)
+        return cur.rowcount > 0
+
+    def mark_question_processed(self, question_id: int) -> bool:
+        question_id = int(question_id)
+        if question_id not in self._owned_question_claims:
+            return False
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE pending_questions SET processed = 1 "
+                "WHERE id = ? AND processed = 2",
+                (question_id,),
+            )
+        self._owned_question_claims.discard(question_id)
+        return cur.rowcount > 0
 
     def list_timed_out_questions(self, before_ts: int) -> list[dict]:
         """Open questions sent before `before_ts` that haven't been answered

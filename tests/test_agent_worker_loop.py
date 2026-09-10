@@ -855,6 +855,150 @@ def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_managed_resume_start_crash_releases_answer_claim(tmp_path: Path):
+    """A Managed start exception must not strand the processed=2 lease."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "resume synthetic review", "status": "blocked",
+         "tags": [BLOCKED_TAG, "cloud-sonnet"]},
+    ])
+    w = _make_worker(
+        tmp_path, api, preflight_caller=_golden_preflight(routing="claude"),
+        local_executor=_StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED)),
+    )
+    session = w.session_store.create(task_id="t1", status=STATUS_BLOCKED, routing="claude")
+    qid = w.session_store.create_pending_question(
+        session_id=session.session_id, task_id="t1", question="Continue?", sent_message_id=77,
+    )
+    w.session_store.deposit_answer(77, "yes")
+
+    class _ExplodingManaged:
+        driver = object()
+
+        def start(self, session, task):
+            raise RuntimeError("synthetic managed startup crash")
+
+    w._managed_executor = _ExplodingManaged()
+    w._process_clarification_answers()
+
+    with w.session_store._connect() as conn:
+        row = conn.execute("SELECT processed FROM pending_questions WHERE id = ?", (qid,)).fetchone()
+    assert row["processed"] == 0
+
+
+@pytest.mark.unit
+def test_reassigned_answer_claim_fails_closed_before_executor(tmp_path: Path, monkeypatch):
+    """A row retired after claim cannot reopen the old task or execute it."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "stale synthetic followup", "status": "done",
+         "tags": [COMPLETED_TAG, "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(
+        tmp_path, api, preflight_caller=_golden_preflight(routing="local"),
+        local_executor=executor,
+    )
+    session = w.session_store.create(task_id="t1", status=STATUS_COMPLETED, routing="local")
+    qid = w.session_store.enqueue_web_followup(session.session_id, "t1", "yes")
+    claim = w.session_store.claim_answered_unprocessed_questions
+
+    def claim_then_retire():
+        rows = claim()
+        if rows:
+            w.session_store.retire_completion_followups(session.session_id)
+        return rows
+
+    monkeypatch.setattr(w.session_store, "claim_answered_unprocessed_questions", claim_then_retire)
+    w._process_clarification_answers()
+
+    assert executor.calls == []
+    assert w.session_store.get("t1").status == STATUS_COMPLETED
+    with w.session_store._connect() as conn:
+        row = conn.execute("SELECT processed FROM pending_questions WHERE id = ?", (qid,)).fetchone()
+    assert row["processed"] == 1
+
+
+@pytest.mark.unit
+def test_dispatch_fetch_failure_fails_closed_without_executor(tmp_path: Path, monkeypatch):
+    """A deleted/unavailable backing task must not run the old session."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "stale synthetic dispatch", "status": "in_progress",
+         "tags": [RUNNING_TAG, "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(
+        tmp_path, api, preflight_caller=_golden_preflight(routing="local"),
+        local_executor=executor,
+    )
+    w.session_store.create(task_id="t1", status=STATUS_CLAIMED, routing="local")
+    monkeypatch.setattr(w, "_fetch_task", lambda task_id: None)
+
+    w._dispatch(api.tasks["t1"])
+
+    assert executor.calls == []
+    assert w.session_store.get("t1").status == STATUS_FAILED
+
+
+@pytest.mark.unit
+def test_followup_fetch_failure_fails_closed_without_executor(tmp_path: Path, monkeypatch):
+    """A failed follow-up fetch cannot mutate the answer or vault lifecycle."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "stale synthetic followup", "status": "done",
+         "tags": [COMPLETED_TAG, "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(
+        tmp_path, api, preflight_caller=_golden_preflight(routing="local"),
+        local_executor=executor,
+    )
+    session = w.session_store.create(task_id="t1", status=STATUS_COMPLETED, routing="local")
+    w.session_store.enqueue_web_followup(session.session_id, "t1", "continue")
+    monkeypatch.setattr(w, "_fetch_task", lambda task_id: None)
+
+    w._process_clarification_answers()
+
+    assert executor.calls == []
+    assert w.session_store.get("t1").status == STATUS_FAILED
+    assert api.tasks["t1"]["status"] == "done"
+    assert api.tasks["t1"]["tags"] == [COMPLETED_TAG, "local"]
+    assert w.session_store.get_messages(session.session_id) == []
+    kinds = [event["kind"] for event in w.transcript_store.read(session.session_id)]
+    assert "followup_received" not in kinds
+
+
+@pytest.mark.unit
+def test_clarification_fetch_exception_fails_closed_before_mutation(tmp_path: Path, monkeypatch):
+    """A failed clarification fetch cannot mutate the answer or vault lifecycle."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "stale synthetic clarification", "status": "blocked",
+         "tags": [BLOCKED_TAG, "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(
+        tmp_path, api, preflight_caller=_golden_preflight(routing="local"),
+        local_executor=executor,
+    )
+    session = w.session_store.create(task_id="t1", status=STATUS_BLOCKED, routing="local")
+    w.session_store.create_pending_question(
+        session_id=session.session_id, task_id="t1", question="Continue?", sent_message_id=78,
+    )
+    w.session_store.deposit_answer(78, "yes")
+
+    def fetch_raises(task_id):
+        raise RuntimeError("synthetic fetch failure")
+
+    monkeypatch.setattr(w, "_fetch_task", fetch_raises)
+    w._process_clarification_answers()
+
+    assert executor.calls == []
+    assert w.session_store.get("t1").status == STATUS_FAILED
+    assert api.tasks["t1"]["status"] == "blocked"
+    assert api.tasks["t1"]["tags"] == [BLOCKED_TAG, "local"]
+    assert w.session_store.get_messages(session.session_id) == []
+    kinds = [event["kind"] for event in w.transcript_store.read(session.session_id)]
+    assert "clarification_answered" not in kinds
+
+
+@pytest.mark.unit
 def test_completion_summary_uses_transcript_pointer_when_final_text_empty(tmp_path: Path):
     """When the agent idles without producing an `agent.message` (sometimes
     happens after a tool call on tight budgets), Telegram surfaces a
@@ -2188,6 +2332,29 @@ def test_worker_skips_already_claimed_tasks(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_worker_rearms_only_explicitly_reassigned_terminal_session(tmp_path: Path):
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "hi", "status": "todo", "tags": ["local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    w.tick()
+    original = w.session_store.get("t1")
+    assert original is not None
+    # The stub executor does not perform the real executor's terminal status
+    # write, so model the persisted completed session before reassignment.
+    w.session_store.update_status("t1", STATUS_COMPLETED)
+    api.tasks["t1"]["tags"] = ["local", "agent-reassigned"]
+    api.tasks["t1"]["status"] = "todo"
+    assert w.tick() == 1
+    assert len(executor.calls) == 2
+    assert w.session_store.get("t1").session_id == original.session_id
+    assert "agent-reassigned" not in api.tasks["t1"]["tags"]
+
+
+@pytest.mark.unit
 def test_worker_pauses_at_daily_cap(tmp_path: Path):
     api = FakeApi(tasks=[
         {"id": "t1", "description": "x", "status": "todo", "tags": ["local"]},
@@ -2531,7 +2698,8 @@ def test_cli_inflight_guard_covers_top_level_dispatch(tmp_path: Path):
             return ExecutorOutcome(status=STATUS_COMPLETED, final_text="done")
 
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["claude"]},
+        {"id": "t1", "description": "do the thing", "status": "in_progress",
+         "tags": [RUNNING_TAG, "claude"]},
     ])
     pool = _CapturingPool()  # never runs -> the session stays "in flight"
     w = _make_worker(tmp_path, api,

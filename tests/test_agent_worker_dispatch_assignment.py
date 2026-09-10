@@ -23,6 +23,14 @@ from api.services.conversation_store import ConversationStore
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _redirect_agent_output(tmp_path, monkeypatch):
+    """Write completed-task output to a throwaway vault for these tests."""
+    from config.settings import settings as _settings
+
+    monkeypatch.setattr(_settings, "vault_path", tmp_path / "vault", raising=False)
+
+
 @dataclass
 class _StubExecutor:
     outcome: ExecutorOutcome
@@ -30,6 +38,16 @@ class _StubExecutor:
 
     def execute(self, session, task):
         self.calls.append((session.task_id, session.host, session.model, session.effort))
+        return self.outcome
+
+
+@dataclass
+class _TaskCaptureExecutor:
+    outcome: ExecutorOutcome
+    tasks: list = field(default_factory=list)
+
+    def execute(self, session, task):
+        self.tasks.append(task)
         return self.outcome
 
 
@@ -46,8 +64,23 @@ def _golden_preflight_reply(routing: str = "local", routing_reason: str = "guess
     })
 
 
-def _make_worker(tmp_path: Path, *, claude_code_executor=None, hermes_executor=None):
-    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"tasks": []}))
+def _make_worker(
+    tmp_path: Path,
+    *,
+    backing_task: dict | None = None,
+    claude_code_executor=None,
+    hermes_executor=None,
+):
+    def handler(req: httpx.Request) -> httpx.Response:
+        if (
+            backing_task is not None
+            and req.method == "GET"
+            and req.url.path == f"/api/tasks/{backing_task['id']}"
+        ):
+            return httpx.Response(200, json=backing_task)
+        return httpx.Response(200, json={"tasks": []})
+
+    transport = httpx.MockTransport(handler)
     client = httpx.Client(transport=transport, base_url="http://api")
     return Worker(
         api_base="http://api",
@@ -71,15 +104,16 @@ def test_dispatch_records_assignment_fields_on_session_before_cli_executor_runs(
     monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
 
     stub = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
-    worker = _make_worker(tmp_path, claude_code_executor=stub)
-    worker.session_store.create(task_id="board-1", status="claimed")
-
     task = {
         "id": "board-1",
         "description": "fix the printer",
         "tags": ["agent", "claude"],
         "fields": {"model": "opus", "effort": "high", "assigned_by": "board"},
     }
+    backing_task = {**task, "tags": ["agent-running", "claude"]}
+    worker = _make_worker(tmp_path, backing_task=backing_task, claude_code_executor=stub)
+    worker.session_store.create(task_id="board-1", status="claimed")
+
     worker._dispatch(task)
 
     session = worker.session_store.get("board-1")
@@ -94,15 +128,16 @@ def test_dispatch_records_host_field_on_session(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "agent_hosts", {"studio": "user@studio.example"}, raising=False)
 
     stub = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
-    worker = _make_worker(tmp_path, claude_code_executor=stub)
-    worker.session_store.create(task_id="board-2", status="claimed")
-
     task = {
         "id": "board-2",
         "description": "deploy the thing",
         "tags": ["agent", "claude"],
         "fields": {"host": "studio"},
     }
+    backing_task = {**task, "tags": ["agent-running", "claude"]}
+    worker = _make_worker(tmp_path, backing_task=backing_task, claude_code_executor=stub)
+    worker.session_store.create(task_id="board-2", status="claimed")
+
     worker._dispatch(task)
 
     session = worker.session_store.get("board-2")
@@ -129,20 +164,48 @@ def test_dispatch_untagged_task_has_no_assignment(tmp_path, monkeypatch):
     assert session.effort is None
 
 
+def test_reassignment_context_reaches_fresh_local_executor_prompt(tmp_path, monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
+    capture = _TaskCaptureExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    backing_task = {
+        "id": "reassigned-1", "description": "Continue synthetic task",
+        "notes": "Latest synthetic direction", "tags": ["local", "agent-running"],
+    }
+    worker = _make_worker(tmp_path, backing_task=backing_task)
+    worker._local_executor = capture
+    session = worker.session_store.create(task_id="reassigned-1", status="claimed", routing="local")
+    worker.transcript_store.append(session.session_id, "operator_reassigned", {
+        "assignee": "local", "prior_routing": "cloud", "context_preserved": True,
+    })
+    worker.session_store.append_message(session.session_id, "assistant", "Prior synthetic output")
+
+    worker._dispatch({
+        "id": "reassigned-1", "description": "Continue synthetic task",
+        "notes": "Latest synthetic direction", "tags": ["local", "agent-reassigned"],
+    })
+
+    assert len(capture.tasks) == 1
+    notes = capture.tasks[0]["notes"]
+    assert "Latest synthetic direction" in notes
+    assert "Prior synthetic output" in notes
+
+
 def test_hermes_tag_dispatches_through_hermes_executor(tmp_path, monkeypatch):
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
 
     stub = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="hi there"))
-    worker = _make_worker(tmp_path, hermes_executor=stub)
-    worker.session_store.create(task_id="hermes-1", status="claimed")
-
     task = {
         "id": "hermes-1",
         "description": "ask hermes what's on my calendar",
         "tags": ["agent", "hermes"],
         "fields": {},
     }
+    backing_task = {**task, "tags": ["agent-running", "hermes"]}
+    worker = _make_worker(tmp_path, backing_task=backing_task, hermes_executor=stub)
+    worker.session_store.create(task_id="hermes-1", status="claimed")
+
     worker._dispatch(task)
 
     session = worker.session_store.get("hermes-1")
