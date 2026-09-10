@@ -341,6 +341,18 @@ if ! blocking_local_verification_enabled; then
             echo "ruff: no changed Python files"
         fi
 
+        # Every test needs one category marker or it is silently excluded from
+        # both the push gate and test.sh's default scope, and the hosted gate
+        # rejects the collection outright. Collection alone surfaces that in a
+        # few seconds instead of a full hosted verification round trip.
+        local collect_output
+        if ! collect_output=$(python -m pytest tests --collect-only -qq -p no:cacheprovider 2>&1); then
+            printf '%s\n' "$collect_output" | grep -E "carry none of the recognized category markers|^ERROR" || printf '%s\n' "$collect_output" | tail -20
+            echo "test marker guard: FAILED (collection rejected; every test needs one category marker)" >&2
+            return 1
+        fi
+        echo "test marker guard: ok ($(printf '%s\n' "$collect_output" | grep -oE '[0-9]+ tests collected' | head -1))"
+
         if ! audit_output=$(python -m pytest \
             tests/test_fixtures_no_personal_data.py::test_no_fixture_contains_a_real_sensitive_value \
             -q -r s 2>&1); then

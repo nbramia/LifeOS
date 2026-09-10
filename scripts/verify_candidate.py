@@ -533,7 +533,7 @@ def pytest_lane_executor(
         else:
             receipt = runtime_root / f"execution-{uuid.uuid4().hex}.json"
             output_log = None
-        command = [sys.executable, "-m", "pytest", "tests", "-q", "--tb=short", "--ignore=tests/archive", "-p", "no:cacheprovider", "-p", "scripts.test_lane_plugin", "--lifeos-lane-nodeids", str(nodeid_file), "--lifeos-lane-execution", str(receipt), "-m", marker(BY_NAME[lane])]
+        command = [sys.executable, "-m", "pytest", "tests", "-q", "--tb=short", "--durations=25", "--durations-min=1.0", "--ignore=tests/archive", "-p", "no:cacheprovider", "-p", "scripts.test_lane_plugin", "--lifeos-lane-nodeids", str(nodeid_file), "--lifeos-lane-execution", str(receipt), "-m", marker(BY_NAME[lane])]
         if lane == "browser-free" and parallel_browser_free and workers > 1:
             # Explicit opt-in only -- default false, so an ordinary caller's
             # workers>1 request never silently changes browser-free from

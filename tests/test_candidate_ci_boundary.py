@@ -346,3 +346,44 @@ def test_environment_audit_accepts_a_policy_naming_exactly_main():
         },
     }))
     require_environment_locked_to_main(result)  # does not raise
+
+
+@pytest.mark.unit
+def test_candidate_workflow_lane_selection_defaults_to_every_lane_before_narrowing():
+    """Lane selection must fail closed.
+
+    The gate skips the server-free browser lane only when the candidate's diff
+    touches no ``web/`` path. Every other outcome — an unavailable diff, an
+    empty diff, a fetch failure — has to run every retained lane, so the
+    default assignment precedes any narrowing and the narrowing sits inside a
+    guard that requires a successful, non-empty diff.
+    """
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/candidate-verification.yml").read_text())
+    steps = workflow["jobs"]["execute-candidate"]["steps"]
+    selection = next(s for s in steps if "Select the lanes" in (s.get("name") or ""))
+    script = selection["run"]
+
+    default_at = script.index("LANES=fast-unit,browser-free")
+    narrow_at = script.index("LANES=fast-unit\n")
+    assert default_at < narrow_at, "the every-lane default must precede any narrowing"
+
+    # The narrowing is reachable only through a successful, non-empty diff.
+    guard = script[:narrow_at]
+    assert "git -C candidate diff --name-only" in guard
+    assert '[ -n "$CHANGED" ]' in guard
+
+    # Anchored, so a path merely containing "web/" cannot suppress the lane.
+    assert "grep -q '^web/'" in script
+
+    verify = next(s for s in steps if "Verify the retained lanes" in (s.get("name") or ""))
+    assert '--lanes "$LANES"' in verify["run"], "the verifier must consume the selected lanes"
+
+
+@pytest.mark.unit
+def test_lane_command_records_slowest_test_durations():
+    """The lane command captures durations so gate cost can be attributed."""
+    source = (ROOT / "scripts/verify_candidate.py").read_text()
+    assert '"--durations=25"' in source
+    assert '"--durations-min=1.0"' in source
