@@ -19,6 +19,7 @@ from api.services.agent_worker.session_store import (
     REPAIR_DECLINED,
     REPAIR_DEPLOYING,
     REPAIR_IMPLEMENTING,
+    REPAIR_REVIEWING,
     REPAIR_SHIPPED,
     REPAIR_VERIFYING,
     SessionStore,
@@ -463,15 +464,21 @@ class TestEvidenceAccumulation:
         }
 
         one = doctor_repair.apply_result(store.get_repair(workflow_id), first)
-        assert one.phase != REPAIR_SHIPPED
+        assert one.applied is True
+        assert one.phase == REPAIR_REVIEWING
+        assert one.waiting_reason == "merge_missing"
         store.set_repair_phase(
             workflow_id, one.phase, waiting_reason=one.waiting_reason,
             evidence=one.evidence,
         )
+        assert store.get_repair(workflow_id)["phase"] == REPAIR_REVIEWING
 
         two = doctor_repair.apply_result(store.get_repair(workflow_id), second)
         assert two.phase == REPAIR_SHIPPED
+        # The second turn reported none of these; they survive from the first.
         assert two.evidence["pull_requests"] == full["pull_requests"]
+        assert two.evidence["review"] == full["review"]
+        assert two.evidence["verification"] == full["verification"]
 
     def test_evidence_from_a_prior_revision_cannot_satisfy_the_next(self, store):
         """Approving a new revision clears the bundle, so a bare versioned

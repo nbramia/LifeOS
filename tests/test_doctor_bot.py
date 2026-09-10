@@ -824,6 +824,14 @@ class TestGoalApproval:
         assert q["kind"] == "goal_approval"
         assert q["session_id"] == result["session_id"]
 
+        # The prompt this dispatch built is one the adoption path can split:
+        # the worker writes the lead-in, `condition_from_question` splits on
+        # it, and a recorded approval that has to recover its condition from
+        # the question row alone depends on those two agreeing.
+        from api.services.agent_worker import doctor_repair
+
+        assert doctor_repair.condition_from_question(q["question"]) == "all tests pass"
+
         # The same dispatch records the durable revision that question gates:
         # version 1, the goal body alone as the condition, and a resume action
         # that replays the executor's own goal command. The reply mechanics
@@ -1490,6 +1498,61 @@ class TestRepairResultsAdvancePhases:
         assert "code_handled_completion" in kinds
         assert w.session_store.get_repair(workflow_id)["phase"] == REPAIR_SHIPPED
 
+    def test_a_result_on_a_turn_that_pauses_advances_nothing(self, tmp_path):
+        """The repair reads the result from the turn that ends the session,
+        which is what both personas instruct. A turn that stops to ask the
+        operator something is still mid-run: its text is a question, not a
+        report, and it leaves the phase where it was."""
+        from dataclasses import dataclass
+
+        from api.services.agent_worker import doctor_repair
+        from api.services.agent_worker.claude_code_executor import (
+            REASON_AWAITING_CLARIFICATION,
+        )
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+        from api.services.agent_worker.local_executor import ExecutorOutcome
+        from api.services.agent_worker.session_store import (
+            REPAIR_IMPLEMENTING, STATUS_BLOCKED,
+        )
+
+        @dataclass
+        class _Blocks:
+            outcome: ExecutorOutcome
+
+            def execute(self, session, task):
+                return self.outcome
+
+            def resume(self, session, message, working_dir=None):
+                return self.outcome
+
+        w = TestGoalApproval()._make_worker(tmp_path, _Blocks(ExecutorOutcome(
+            status=STATUS_BLOCKED,
+            reason=REASON_AWAITING_CLARIFICATION,
+            final_text=(
+                "Which service should the health check cover?\n"
+                + self._result_text()
+            ),
+        )))
+        spawned = spawn_claude_code_session(
+            w.session_store, "implement the parser fix", chat_id="123", bot="doctor",
+        )
+        session = w.session_store.get_by_session_id(spawned["session_id"])
+        condition = "merge the parser fix and verify the service health check"
+        proposal = w.session_store.propose_goal(
+            session.workflow_id, condition=condition,
+            resume_action=doctor_repair.goal_resume_action(condition),
+        )
+        w.session_store.approve_goal(proposal["proposal_id"])
+
+        w._dispatch_spawned_sessions()
+
+        kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
+        assert "code_block_prompt_registered" in kinds
+        assert "doctor_repair_phase" not in kinds
+        repair = w.session_store.get_repair(session.workflow_id)
+        assert repair["phase"] == REPAIR_IMPLEMENTING
+        assert repair["evidence"] == {}
+
 
 class TestRepairReadSurface:
     """Both surfaces read one durable repair state off the agents snapshot."""
@@ -1540,18 +1603,33 @@ class TestRepairReadSurface:
         assert _session_to_dict(session, transcript, {})["repair"] is None
 
 
-class TestPersonaExecutionContract:
-    """Both doctor paths default to Claude Code and never request an API-billed
-    child implicitly."""
+class TestPersonaResultMarkerContract:
+    """The one coupling between persona prose and code: the marker each doctor
+    persona instructs its worker to emit has to be the marker the parser
+    matches. Everything else about what the personas say is prose, and the
+    behavior it describes is pinned where it is enforced."""
 
     @pytest.mark.parametrize("name", ["doctor.md", "doctor.hermes.md"])
-    def test_persona_defaults_to_claude_code_and_refuses_the_api(self, name):
+    def test_persona_instructs_the_marker_the_parser_matches(self, name):
+        from api.services.agent_worker import doctor_repair
+
         body = (Path("config/personas") / name).read_text(encoding="utf-8")
-        assert "claude_code" in body
-        assert 'model="claude"' in body
-        assert "LIFEOS_REPAIR_RESULT" in body
-
-    @pytest.mark.parametrize("name", ["doctor.md", "doctor.hermes.md"])
-    def test_persona_states_the_single_gate(self, name):
-        body = (Path("config/personas") / name).read_text(encoding="utf-8").lower()
-        assert "one human gate" in body or "single human gate" in body
+        assert doctor_repair.RESULT_MARKER in body
+        # The example line the persona shows is one the parser actually reads.
+        example = next(
+            line for line in body.splitlines()
+            if line.strip().startswith(doctor_repair.RESULT_MARKER)
+        )
+        parsed = doctor_repair.parse_result(
+            example.replace("<the JSON scripts/verify_candidate.py printed>", "{}")
+                   .replace(
+                       "<the JSON that ./scripts/server.sh verify-runtime-evidence "
+                       "printed>", "{}",
+                   )
+                   .replace(
+                       "<the JSON ./scripts/server.sh verify-runtime-evidence "
+                       "printed>", "{}",
+                   )
+        )
+        assert parsed is not None
+        assert parsed["goal_version"] == 1
