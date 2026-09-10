@@ -118,19 +118,40 @@ jobs:
         run: |
           test "$(git -C trusted-runner rev-parse HEAD)" = "$TRUSTED_RUNNER_SHA"
           test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
-      - name: Verify the retained fast unit and server-free browser lanes
+      - name: Select the lanes this candidate's changes can affect
         run: |
-          WORKERS="$(nproc)"
-          echo "runner reports $WORKERS logical processors"
+          # Fails closed: any doubt about the changed set runs both lanes.
+          LANES=fast-unit,browser-free
+          if git -C candidate fetch --no-tags --depth=1 origin "$TRUSTED_RUNNER_SHA" 2>/dev/null \
+            && CHANGED="$(git -C candidate diff --name-only "$TRUSTED_RUNNER_SHA" "$CANDIDATE_SHA")" \
+            && [ -n "$CHANGED" ]; then
+            echo "changed files:"; printf '%s\n' "$CHANGED" | sed 's/^/  /'
+            if ! printf '%s\n' "$CHANGED" | grep -q '^web/'; then
+              LANES=fast-unit
+              echo "no web/ file changed: the server-free browser lane cannot be affected"
+            fi
+          else
+            echo "changed set unavailable: running every retained lane"
+          fi
+          echo "lanes=$LANES"
+          echo "LANES=$LANES" >> "$GITHUB_ENV"
+      - name: Verify the retained lanes this candidate's changes can affect
+        run: |
+          # Two workers is the width with a completed-run record on this
+          # runner class: every run at two workers finished, and every run at
+          # the runner's full core count exceeded the ceiling. Record the
+          # runner's shape alongside it so a future change to this number
+          # rests on measurements rather than on the core count alone.
+          WORKERS=2
+          echo "runner reports $(nproc) logical processors; using $WORKERS test workers"
           free -h || true
           python trusted-runner/scripts/verify_candidate.py pushed-ref \
             --repository "$GITHUB_WORKSPACE/candidate" \
             --sha "$CANDIDATE_SHA" \
             --base "$TRUSTED_RUNNER_SHA" \
             --evidence-root "$RUNNER_TEMP/lifeos-verification-evidence" \
-            --lanes fast-unit,browser-free \
+            --lanes "$LANES" \
             --workers "$WORKERS" \
-            --capacity-max-run-workers "$WORKERS" \
             --parallel-browser-free
 
   publish-aggregate:
