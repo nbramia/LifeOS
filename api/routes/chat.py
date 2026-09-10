@@ -5,7 +5,7 @@ import json
 import asyncio
 import logging
 import re
-from typing import Optional
+from typing import Any, Optional
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException
@@ -423,6 +423,9 @@ class AskStreamRequest(BaseModel):
     # backend (the local backend is already local); the "claude_code" handoff
     # works on any backend. Unknown values fall back to auto.
     model_override: Optional[str] = None
+    # Additive strict execution contract. Authenticated persona/session/reply
+    # identity is derived by the server and is never accepted here.
+    execution: Optional[dict[str, Any]] = None
     # Response modality. "voice" tells the orchestrator this turn will be read
     # aloud, so the selected persona's `voice` rules are appended to the system
     # prompt; None/"text" is a normal typed turn. Set by the voice gateway
@@ -573,8 +576,10 @@ def resolve_effective_persona_id(persona_id: Optional[str], persona: Optional[st
     `persona` both given, or a `persona_id` that doesn't resolve to any
     registered persona (including `""`, which resolves to nothing).
     Returns `persona_id` once validated; otherwise, when only `persona` (a
-    raw preamble) was given, the registered bot name whose preamble matches
-    it verbatim — `None` if neither field is given or no bot matches.
+    raw preamble) was given, the registered persona id whose preamble matches
+    it verbatim — `None` if neither field is given or no persona matches.
+    This reverse lookup uses credential-free definitions because HTTP and
+    voice persona identity does not require Telegram listener readiness.
     """
     if persona_id is not None:
         if persona is not None:
@@ -589,7 +594,8 @@ def resolve_effective_persona_id(persona_id: Optional[str], persona: Optional[st
             )
         return persona_id
     if persona:
-        return next((b.name for b in settings.telegram_bots if b.persona == persona), None)
+        return next((definition.id for definition in settings.persona_definitions
+                     if definition.id != "primary" and definition.persona == persona), None)
     return None
 
 
@@ -646,6 +652,86 @@ async def ask_stream(request: AskStreamRequest):
     """
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    canonical_spec = None
+    if request.execution is not None:
+        if request.model_override not in (None, "", "auto"):
+            raise HTTPException(
+                status_code=409,
+                detail="model_override conflicts with execution",
+            )
+        from datetime import datetime, timezone
+        from api.services.agent_worker.execution import (
+            BillingClass,
+            CatalogFacts,
+            CatalogState,
+            ExecutionFacts,
+            ExecutionLayer,
+            ExecutorFacts,
+            ReadinessState,
+            parse_execution_request,
+            resolve_execution,
+        )
+
+        parsed = parse_execution_request(request.execution)
+        if not parsed.ok:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_execution", "diagnostics": [
+                    {"code": item.code, "field": item.field, "message": item.message}
+                    for item in parsed.diagnostics
+                ]},
+            )
+        requested_executor = parsed.request.executor or "native_inline"
+        if requested_executor not in {"native_inline", "claude_code", "codex"}:
+            raise HTTPException(
+                status_code=422,
+                detail="ask/stream supports native_inline, claude_code, or codex execution",
+            )
+        if requested_executor == "native_inline":
+            backend = getattr(settings, "llm_backend", "anthropic").lower()
+            native_model = (
+                settings.local_llm_model if backend == "local"
+                else settings.remote_llm_model if backend == "remote"
+                else settings.anthropic_model
+            )
+            resolution = resolve_execution(
+                parsed.request,
+                installation=ExecutionLayer(executor="native_inline"),
+                facts=ExecutionFacts(
+                    now=datetime.now(timezone.utc),
+                    executors=(ExecutorFacts(
+                        "native_inline", provider=backend, runtime="inline",
+                        readiness=(
+                            ReadinessState.READY
+                            if (
+                                (backend == "local" and bool(settings.local_llm_url))
+                                or (backend == "remote" and settings.remote_llm_configured)
+                                or (backend == "anthropic" and bool(settings.anthropic_api_key))
+                            )
+                            else ReadinessState.UNCONFIGURED
+                        ),
+                        catalog=CatalogFacts(
+                            CatalogState.UNKNOWN
+                            if backend == "anthropic"
+                            else (CatalogState.LOADED if native_model else CatalogState.EMPTY_VALID),
+                            (native_model,) if backend != "anthropic" and native_model else (),
+                        ),
+                        native_model_id=native_model,
+                        billing=(BillingClass.LOCAL_FREE if backend == "local" else BillingClass.METERED),
+                    ),),
+                ),
+            )
+            if not resolution.ok:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "execution_unresolved", "diagnostics": [
+                        item.code for item in resolution.diagnostics
+                    ]},
+                )
+            canonical_spec = resolution.spec
+        else:
+            canonical_spec = parsed.request
 
     # Resolve persona BEFORE the SSE stream opens so an invalid selection is a
     # clean 400 rather than a mid-stream error. `persona` (raw preamble text) is
@@ -826,9 +912,16 @@ async def ask_stream(request: AskStreamRequest):
             # regardless of the chat LLM backend (the handoff spawns a CLI worker,
             # not an LLM turn). The frontend treats an explicit pick as its own
             # handoff opt-in, bypassing the persona capability gate (#359).
-            if (request.model_override or "").strip().lower() == "claude_code":
-                await turn.emit(f"data: {json.dumps({'type': 'routing', 'sources': ['claude_code'], 'reasoning': 'Model picker → Claude Code', 'latency_ms': 0})}\n\n")
-                await turn.emit(f"data: {json.dumps({'type': 'claude_intent', 'task': request.question, 'engine': 'claude_code'})}\n\n")
+            canonical_cli = (
+                canonical_spec.executor
+                if canonical_spec is not None and canonical_spec.executor in {"claude_code", "codex"}
+                else None
+            )
+            if (request.model_override or "").strip().lower() == "claude_code" or canonical_cli:
+                engine = canonical_cli or "claude_code"
+                label = "Claude Code" if engine == "claude_code" else "Codex"
+                await turn.emit(f"data: {json.dumps({'type': 'routing', 'sources': [engine], 'reasoning': f'Execution request → {label}', 'latency_ms': 0})}\n\n")
+                await turn.emit(f"data: {json.dumps({'type': 'claude_intent', 'task': request.question, 'engine': engine, 'execution': request.execution})}\n\n")
                 await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                 return
 
@@ -1057,6 +1150,8 @@ async def ask_stream(request: AskStreamRequest):
             # this turn to that cloud model. "auto"/unset falls through to the
             # normal Haiku + escalation path.
             _override = (request.model_override or "").strip().lower()
+            if canonical_spec is not None and canonical_spec.executor == "native_inline" and canonical_spec.model_id:
+                _override = canonical_spec.model_id
             _backend_is_anthropic = getattr(settings, "llm_backend", "anthropic").lower() == "anthropic"
             if _override == "remote" and not settings.remote_llm_configured:
                 # The picker hides this option when unconfigured, but an
@@ -1431,6 +1526,14 @@ class HandoffRequest(BaseModel):
     engine: str  # "codex" | "claude_code"
     task: str
     conversation_id: Optional[str] = None
+    execution: Optional[dict[str, Any]] = None
+    # Flat aliases used by lightweight prompt handoff clients. These are
+    # folded into the canonical execution request; bot remains delivery-only.
+    persona_id: Optional[str] = None
+    model_id: Optional[str] = None
+    effort: Optional[str] = None
+    host: Optional[str] = None
+    working_dir: Optional[str] = None
 
 
 @router.post("/chat/handoff")
@@ -1450,10 +1553,68 @@ async def chat_handoff(request: HandoffRequest):
     if not task:
         raise HTTPException(status_code=400, detail="task is required")
 
+    from dataclasses import replace
+    from api.services.agent_worker.execution import parse_execution_request
+
+    canonical = None
+    execution_payload = dict(request.execution or {})
+    for field in ("model_id", "effort", "host", "working_dir"):
+        value = getattr(request, field)
+        if value is not None:
+            execution_payload.setdefault(field, value)
+    if execution_payload:
+        parsed = parse_execution_request({
+            **execution_payload,
+            **({} if "executor" in execution_payload else {"executor": engine}),
+        })
+        if not parsed.ok:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_execution",
+                    "diagnostics": [
+                        {"code": item.code, "field": item.field, "message": item.message}
+                        for item in parsed.diagnostics
+                    ],
+                },
+            )
+        canonical = parsed.request
+        if canonical.executor and canonical.executor != engine:
+            raise HTTPException(
+                status_code=409,
+                detail="engine conflicts with execution.executor",
+            )
+
     from api.services.directory_resolver import resolve_working_directory
     from api.services.agent_worker.session_store import SessionStore
 
     working_dir = resolve_working_directory(task)
+    conversation_store = get_store()
+    if request.conversation_id:
+        # A reply destination is server-owned state, not an arbitrary id the
+        # client may attach to a new worker. Require the conversation to
+        # exist, and do not let a new handoff steal an active session's reply
+        # scope. A terminal link may be deliberately superseded by a fresh
+        # handoff in the same thread.
+        conversation = conversation_store.get_conversation(request.conversation_id)
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        if conversation.agent_session_id:
+            linked = SessionStore().get_by_session_id(conversation.agent_session_id)
+            if linked is not None and linked.status not in {
+                "completed", "failed", "budget_exceeded",
+            }:
+                raise HTTPException(
+                    status_code=409,
+                    detail="conversation already has an active handoff session",
+                )
+    if canonical is not None:
+        canonical = replace(
+            canonical,
+            executor=canonical.executor or engine,
+            working_dir=canonical.working_dir or working_dir,
+        )
+        working_dir = canonical.working_dir or working_dir
     # Also route the worker's completion notification to the operator's Telegram.
     # As of #311 the spawned session's progress + result are mirrored back into
     # this web/voice thread too (the conversation is linked to the session
@@ -1463,7 +1624,10 @@ async def chat_handoff(request: HandoffRequest):
 
     if engine == "codex":
         from api.services.agent_worker.codex_spawn import spawn_codex_session
-        result = spawn_codex_session(SessionStore(), task, working_dir=working_dir, chat_id=chat_id)
+        result = spawn_codex_session(
+            SessionStore(), task, working_dir=working_dir, chat_id=chat_id,
+            persona_id=request.persona_id, execution_request=canonical,
+        )
     else:
         from api.services.agent_worker.claude_code_spawn import (
             spawn_claude_code_session,
@@ -1472,6 +1636,7 @@ async def chat_handoff(request: HandoffRequest):
         result = spawn_claude_code_session(
             SessionStore(), task, working_dir=working_dir,
             plan_mode=should_use_plan_mode(task), chat_id=chat_id,
+            persona_id=request.persona_id, execution_request=canonical,
         )
 
     if not result.get("ok"):
@@ -1486,7 +1651,7 @@ async def chat_handoff(request: HandoffRequest):
     )
     if request.conversation_id:
         try:
-            get_store().add_message(
+            conversation_store.add_message(
                 request.conversation_id, "assistant", ack,
                 routing={"reasoning": f"engine handoff → {label}", "sources": [engine]},
             )
@@ -1499,7 +1664,11 @@ async def chat_handoff(request: HandoffRequest):
         # persona path (chat.py set_agent_session_id after a doctor spawn).
         if session_id:
             try:
-                get_store().set_agent_session_id(request.conversation_id, session_id)
+                linked = conversation_store.set_agent_session_id(
+                    request.conversation_id, session_id,
+                )
+                if not linked:
+                    raise RuntimeError("conversation disappeared before handoff link")
             except Exception:
                 logger.warning("failed to link conversation to handoff session", exc_info=True)
 

@@ -175,6 +175,25 @@ Services are tracked on-use, not by polling. Status updates when a service is ac
 
 `run_all_syncs` flags a successful sync run that completed suspiciously fast — the source typically takes >60s but finished in under max(2s, 5% of typical) — the signature of a silent no-op. Detection records a `duration_collapse` row in `sync_errors` and adds a "Suspiciously fast" section to the Telegram sync summary; the `sync_runs` row stays `success`, so the health dashboard still shows green for that run.
 
+## Usage and provenance
+
+Agent-worker usage is recorded by the SessionStore-backed
+`api/services/agent_worker/usage_ledger.py`. The ledger separates requested
+identity from served evidence, marks each token/cost quantity as measured,
+estimated, or unknown, and classifies billing as `subscription`, `metered`,
+`local_free`, or `unknown`. Unknown served facts are rendered as unknown; a
+configured request or bridge label is not evidence that a provider served it.
+
+Observations are addressed by `(session_id, attempt_id, turn_id)` and delivery
+event ids are idempotency keys only. Duplicate observations are no-ops,
+cumulative snapshots become deltas, and an explicitly authoritative measured
+correction can replace an earlier estimate/unknown while retaining the audit
+event. Bounded reservations are kept apart from billed dollars and are checked
+against the global daily cap, including for local and subscription routes.
+`UsageLedger.replay_projection()` safely rebuilds the legacy `usage.db`
+projection after a crash; the two SQLite files are not treated as one
+transaction.
+
 ## Related Documents
 
 - [Architecture](architecture.md) -- System architecture and code structure
@@ -182,3 +201,4 @@ Services are tracked on-use, not by polling. Status updates when a service is ac
 - [API Reference](../product/api-reference.md#get-apiperfroutes) -- `GET /api/perf/routes` request/response shape
 - [Operations](../../guides/operations.md) -- Quick commands for the perf-tracing and alerting endpoints documented here
 - [Configuration](../../guides/configuration.md) -- `LIFEOS_SLOW_REQUEST_MS`, `LIFEOS_VRAM_ALERT_PCT`, and other env vars this doc's behavior depends on
+- [Agent Worker — Technical](agent-worker.md) -- SessionStore usage/provenance ledger and budget semantics

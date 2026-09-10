@@ -67,6 +67,22 @@ def test_inter_agent_tools_are_registered(server):
 
 
 @pytest.mark.unit
+def test_mcp_catalog_count_and_inter_agent_schema_contract(server):
+    """The registered fallback catalog is 59 curated + 9 inter-agent tools.
+
+    The ninth inter-agent tool is the canonical execution-override surface;
+    keeping this assertion next to the schema checks prevents docs and live
+    registration from silently disagreeing after tool additions.
+    """
+    from api.services.agent_worker.inter_agent import INTER_AGENT_TOOL_SCHEMAS
+
+    assert len(mcp_server.CURATED_ENDPOINTS) == mcp_server.CURATED_TOOL_COUNT == 59
+    assert len(INTER_AGENT_TOOL_SCHEMAS) == 9
+    assert len(server.tools) == 68
+    assert len({tool["name"] for tool in server.tools}) == len(server.tools)
+
+
+@pytest.mark.unit
 def test_inter_agent_tool_schemas_require_caller_session_id(server):
     """Remote agents must pass their own session_id explicitly."""
     for tool in server.tools:
@@ -87,6 +103,54 @@ def test_call_api_missing_caller_returns_error(server):
 
 
 @pytest.mark.unit
+def test_mcp_rejects_spoofed_caller_against_process_identity(server):
+    server._trusted_session_id = "sess-trusted"
+    result = server._call_api("lifeos_agent_check", {
+        "caller_session_id": "sess-forged",
+        "caller_proof": "ignored-for-stdio",
+        "session_id": "sess-forged",
+    })
+    assert result["error"] == "caller_session_id does not match trusted MCP identity"
+
+
+@pytest.mark.unit
+def test_mcp_accepts_matching_stdio_process_identity(server):
+    """A CLI child carrying its own trusted session id can call inter-agent
+    tools; the caller id is accepted because it matches the process identity."""
+    from api.services.agent_worker.session_store import STATUS_RUNNING, SessionStore
+
+    store = SessionStore(db_path=mcp_server.AGENT_SESSIONS_DB)
+    sess = store.create(
+        task_id="t_mcp_stdio", status=STATUS_RUNNING, routing="codex",
+        budget={"max_dollars": 5.0, "wall_seconds": 60, "max_tokens": 1000},
+    )
+    server._trusted_session_id = sess.session_id
+
+    result = server._call_api("lifeos_agent_check", {
+        "caller_session_id": sess.session_id,
+        "caller_proof": "stdio-process-identity-is-the-proof",
+        "session_id": sess.session_id,
+    })
+
+    assert result["ok"]
+    assert result["status"] == STATUS_RUNNING
+
+
+@pytest.mark.unit
+def test_mcp_rejects_caller_without_trusted_identity_or_transport_proof(server):
+    """A bare caller-supplied id is never enough when no stdio identity or
+    authenticated HTTP transport proof is available."""
+    server._trusted_session_id = ""
+    server._mcp_transport_secret = ""
+    result = server._call_api("lifeos_agent_check", {
+        "caller_session_id": "sess-forged",
+        "caller_proof": "",
+        "session_id": "sess-forged",
+    })
+    assert result["error"] == "trusted MCP caller identity is unavailable"
+
+
+@pytest.mark.unit
 def test_call_api_dispatches_to_inter_agent_handler(server):
     """End-to-end MCP → inter_agent.dispatch path."""
     # Must point at the SAME db `_handle_inter_agent` resolves to -- the
@@ -104,6 +168,9 @@ def test_call_api_dispatches_to_inter_agent_handler(server):
         task_id="t_mcp", status=STATUS_RUNNING, routing="claude",
         budget={"max_dollars": 5.0, "wall_seconds": 60, "max_tokens": 1000},
     )
+    # A direct unit invocation stands in for the process-bound stdio identity;
+    # production CLI children receive this from LIFEOS_AGENT_SESSION_ID.
+    server._trusted_session_id = sess.session_id
 
     result = server._call_api("lifeos_agent_check", {
         "caller_session_id": sess.session_id,

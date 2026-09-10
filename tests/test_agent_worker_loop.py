@@ -8,6 +8,7 @@ pause, sleeps wake-up.
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,15 @@ from pathlib import Path
 import httpx
 import pytest
 
+from api.services.agent_worker.execution import (
+    BillingClass,
+    CatalogFacts,
+    CatalogState,
+    ExecutionFacts,
+    ExecutionRequest,
+    ExecutorFacts,
+    ReadinessState,
+)
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
@@ -145,7 +155,7 @@ class FakeApi:
 
 def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_executor,
                   claude_code_executor=None, codex_executor=None, cli_pool=None,
-                  remote_executor=None):
+                  remote_executor=None, execution_facts_provider=None):
     transport = httpx.MockTransport(api.handler)
     client = httpx.Client(transport=transport, base_url="http://api")
     sent: list[str] = []
@@ -173,6 +183,7 @@ def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_execut
         claude_code_executor=claude_code_executor,
         codex_executor=codex_executor,
         cli_pool=cli_pool,
+        execution_facts_provider=execution_facts_provider,
     )
     w._sent_telegram = sent  # type: ignore[attr-defined]
     w._sent_with_ids = sent_with_ids  # type: ignore[attr-defined]
@@ -236,6 +247,68 @@ def test_worker_picks_up_urgent_status_tasks_too(tmp_path: Path):
     assert COMPLETED_TAG in api.tasks["t-urgent"]["tags"]
     # The non-#agent task is untouched
     assert api.tasks["t-other"]["tags"] == ["other"]
+
+
+@pytest.mark.unit
+def test_worker_releases_admission_when_claim_loses_race(tmp_path: Path, monkeypatch):
+    api = FakeApi(tasks=[
+        {"id": "claim-lost", "description": "race", "status": "todo", "tags": ["local"]},
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(
+                         status=STATUS_COMPLETED, final_text="done",
+                     )))
+    monkeypatch.setattr(w, "_claim", lambda task_id: False)
+
+    assert w.tick() == 0
+    with sqlite3.connect(w.usage_ledger.db_path) as conn:
+        assert conn.execute(
+            "SELECT status FROM usage_reservations WHERE reservation_id=?",
+            ("admission:claim-lost",),
+        ).fetchone()[0] == "released"
+    assert w.usage_ledger.daily_readout()["reserved_usd"] == 0
+
+
+@pytest.mark.unit
+def test_worker_claim_loser_cannot_release_winner_admission_hold(tmp_path: Path):
+    """A losing API claim may not clear the winner's shared cap hold."""
+    task = {"id": "claim-race", "description": "race", "status": "todo", "tags": ["local"]}
+    barrier = threading.Barrier(2)
+    workers = []
+    for _ in range(2):
+        worker = _make_worker(
+            tmp_path, FakeApi(tasks=[dict(task)]),
+            preflight_caller=_golden_preflight(routing="local"),
+            local_executor=_StubExecutor(outcome=ExecutorOutcome(
+                status=STATUS_COMPLETED, final_text="done",
+            )),
+        )
+        worker._list_agent_tasks = lambda task=task: [task]
+        worker._dispatch = lambda _task: None
+        workers.append(worker)
+
+    def racing_claim(worker):
+        def claim(_task_id):
+            barrier.wait(timeout=5)
+            return worker is workers[0]
+        return claim
+
+    for worker in workers:
+        worker._claim = racing_claim(worker)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda worker: worker.tick(), workers))
+
+    assert sorted(results) == [0, 1]
+    with sqlite3.connect(workers[0].usage_ledger.db_path) as conn:
+        row = conn.execute(
+            "SELECT status, owner_id FROM usage_reservations WHERE reservation_id=?",
+            ("admission:claim-race",),
+        ).fetchone()
+    assert row[0] == "held"
+    assert row[1].startswith("claim:")
+    assert workers[0].usage_ledger.daily_readout()["reserved_usd"] > 0
 
 
 @pytest.mark.unit
@@ -2216,6 +2289,124 @@ def test_top_level_cli_task_dispatched_off_tick_not_inline(tmp_path: Path):
     assert api.tasks["t1"]["status"] == "done"
     assert any("all done" in t for t in w._sent_telegram)  # type: ignore[attr-defined]
     assert w._cli_inflight == set()
+
+
+@pytest.mark.unit
+def test_spawned_dispatch_uses_persisted_canonical_route_model_effort_and_directory(
+    tmp_path: Path,
+):
+    seen: list[tuple] = []
+
+    class _Codex:
+        def execute(self, session, task):
+            seen.append((
+                session.routing,
+                session.model,
+                session.effort,
+                task.get("working_dir"),
+            ))
+            return ExecutorOutcome(
+                status=STATUS_COMPLETED,
+                final_text="synthetic done",
+                notifications_sent=1,
+            )
+
+    api = FakeApi()
+    pool = _CapturingPool()
+    local = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="wrong"))
+    w = _make_worker(
+        tmp_path,
+        api,
+        preflight_caller=_golden_preflight(),
+        local_executor=local,
+        codex_executor=_Codex(),
+        cli_pool=pool,
+    )
+    session = w.session_store.create(
+        task_id="canonical-child",
+        status=STATUS_CLAIMED,
+        routing="local",
+        budget={"wall_seconds": 600, "max_tokens": 1_000, "max_dollars": 0.0},
+        parent_session_id="synthetic-parent",
+        execution_request={
+            "executor": "codex",
+            "model_id": "gpt-synthetic",
+            "effort": "max",
+            "working_dir": str(tmp_path),
+        },
+    )
+    w.session_store.enqueue_message(
+        session.session_id, "synthetic-parent", "perform synthetic work",
+    )
+
+    w._dispatch_spawned_sessions()
+    persisted = w.session_store.get("canonical-child")
+    assert persisted.execution_spec["executor"] == "codex"
+    assert persisted.execution_spec["model_id"] == "gpt-synthetic"
+    assert persisted.execution_spec["effort"] == "max"
+    assert local.calls == []
+    assert len(pool.submitted) == 1
+    pool.run_all()
+    assert seen == [("codex", "gpt-synthetic", "max", str(tmp_path))]
+
+
+@pytest.mark.unit
+def test_persisted_execution_snapshot_is_reused_after_worker_restart(tmp_path: Path):
+    from datetime import datetime, timezone
+
+    observations = 0
+
+    def facts():
+        nonlocal observations
+        observations += 1
+        return ExecutionFacts(
+            now=datetime.now(timezone.utc),
+            executors=(ExecutorFacts(
+                "codex",
+                readiness=ReadinessState.READY,
+                catalog=CatalogFacts(CatalogState.UNKNOWN),
+                billing=BillingClass.SUBSCRIPTION,
+            ),),
+        )
+
+    api = FakeApi()
+    first = _make_worker(
+        tmp_path, api,
+        preflight_caller=_golden_preflight(),
+        local_executor=None,
+        execution_facts_provider=facts,
+    )
+    session = first.session_store.create(
+        task_id="restart-snapshot", status=STATUS_CLAIMED, routing="codex",
+    )
+    resolved = first._resolve_session_execution(
+        session, request=ExecutionRequest(
+            executor="codex", effort="max", working_dir=str(tmp_path),
+        ),
+    )
+    assert resolved.ok and observations == 1
+
+    def recomputation_is_a_bug():
+        raise AssertionError("persisted execution facts must not be recomputed")
+
+    restarted = _make_worker(
+        tmp_path, api,
+        preflight_caller=_golden_preflight(),
+        local_executor=None,
+        execution_facts_provider=recomputation_is_a_bug,
+    )
+
+    persisted = restarted.session_store.get("restart-snapshot")
+    reused = restarted._resolve_session_execution(
+        persisted, request=ExecutionRequest(executor="local"),
+    )
+    assert reused.ok
+    assert reused.spec.to_dict() == resolved.spec.to_dict()
+    resumed_task = restarted._task_with_execution_snapshot(
+        persisted, {"id": "restart-snapshot", "fields": {"working_dir": "/stale"}},
+    )
+    assert resumed_task["working_dir"] == str(tmp_path)
+    assert resumed_task["fields"]["working_dir"] == str(tmp_path)
 
 
 @pytest.mark.unit

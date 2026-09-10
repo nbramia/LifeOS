@@ -97,8 +97,10 @@ async def get_models() -> dict[str, Any]:
     """Per-engine model catalog for the board's assignment pickers.
 
     `{engines: {claude: [...], codex: [...], local: [...], hermes: [...]},
-    refreshed_at, stale}` — see `model_catalog.py` for how each engine's
-    list is sourced and cached.
+    refreshed_at, stale}` remains the legacy response. Additive
+    `engine_states` and `readiness` maps report per-engine discovery state,
+    timestamps, staleness/reason codes, and route readiness — see
+    `model_catalog.py` for bounded sources and the facts adapter.
     """
     return await get_model_catalog().get()
 

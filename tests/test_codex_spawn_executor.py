@@ -669,6 +669,43 @@ def test_codex_operator_kill_mid_run_exits_silently(stores, tmp_path):
 
 
 @pytest.mark.unit
+def test_codex_cancelled_clean_return_cannot_publish_completion(stores, tmp_path):
+    sess_store, tr_store = stores
+    session = _seed_codex_session(sess_store, task_id="cx-cancelled")
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-cancelled"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "late result"}},
+    ]
+    original_update = sess_store.update_status
+
+    def cancel_before_success(task_id, status, **kwargs):
+        if status == STATUS_COMPLETED:
+            assert sess_store.mark_cancelled(
+                task_id,
+                attempt_id=kwargs["attempt_id"],
+                turn_id=kwargs["turn_id"],
+                reason="operator requested",
+            )
+        return original_update(task_id, status, **kwargs)
+
+    sess_store.update_status = cancel_before_success
+    fake_proc = _FakeProc(lines, returncode=0)
+    executor = CodexExecutor(
+        session_store=sess_store,
+        transcript_store=tr_store,
+        spawn_fn=_spawn_capturing({}, fake_proc, final_text="late result"),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+
+    outcome = executor.execute(session, {"description": "late Codex result", "working_dir": str(tmp_path)})
+
+    assert outcome.status == STATUS_FAILED
+    assert sess_store.get(session.task_id).status == STATUS_FAILED
+    assert not any(e["kind"] == "codex_completed" for e in tr_store.read(session.session_id))
+
+
+@pytest.mark.unit
 def test_codex_clean_completion_wins_over_raced_failed_flip(stores, tmp_path):
     """#379 cascade-race guard: if the row is flipped FAILED mid-run (e.g. a
     lineage-budget cascade) but the codex subprocess exits 0 — it finished its

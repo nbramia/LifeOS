@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-09
+**Last Updated:** 2026-09-10
 
 Chat/search, Google integration (Calendar/Gmail/Drive), and messaging (iMessage/Slack) HTTP endpoints, with request/response shapes. Split out of [api-reference.md](api-reference.md) alongside its other adjacent catalogs (CRM, MCP tools, agent activity) because the combined file was over the product-spec size target.
 
@@ -30,13 +30,15 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
   "question": "What did we discuss in the product meeting?",
   "conversation_id": "optional-uuid",
   "include_sources": true,
-  "persona_id": "fitness"
+  "persona_id": "fitness",
+  "execution": {"executor": "codex", "effort": "high"}
 }
 ```
 
-- `persona_id` (optional) — selects a chat persona by id (see [`GET /api/personas`](#get-apipersonas)). The server applies the same system-prompt preamble the matching Telegram bot uses. Unknown ids return **400**. Omit it for the default (`primary`) persona. A new conversation created in this call is tagged with the persona so it can be filtered later (see [`GET /api/conversations`](api-reference.md#get-apiconversations)).
+- `persona_id` (optional) — selects a credential-free chat persona definition by id (see [`GET /api/personas`](#get-apipersonas)). If that persona also has a configured Telegram listener, both surfaces use the same system-prompt preamble; the listener token is not required here. Unknown ids return **400**. Omit it for the default (`primary`) persona. A new conversation created in this call is tagged with the persona so it can be filtered later (see [`GET /api/conversations`](api-reference.md#get-apiconversations)).
 - `persona` (optional, internal) — raw preamble text used by the in-process Telegram client. Mutually exclusive with `persona_id` (sending both returns **400**); HTTP clients should use `persona_id`.
 - `model_override` (optional) — pins the model for **this turn**. `"sonnet"` / `"opus"` (or a full model id) run the turn on that cloud model; `"gemma"` / `"local"` run it on the local llama-server; `"remote"` (#654) runs it on the configured paid OpenAI-compatible provider (e.g. Fireworks) — ignored, falling back to `"auto"`, unless that provider is fully configured (base URL, model, API key); `"auto"` or omitted uses the default orchestrator (Haiku) with escalation — which climbs only to non-API engines (`claude_code` / `codex` / `local`), so a cloud model or the remote provider is reached only by an explicit pick here or (cloud models only) a user-directed "escalate to opus" in the message. An explicit pick takes precedence over auto-escalation. Honored on the Anthropic backend; unknown values fall back to `auto`. Drives the web chat model picker.
+- `execution` (optional) — strict canonical execution choices for this turn. `executor` may be `native_inline`, `claude_code`, or `codex`; canonical model ids and effort are separate fields. Unknown fields, legacy aliases inside this object, trusted lineage/persona/reply fields, and derived provider/runtime/billing fields return **422**. A non-auto `model_override` combined with `execution` returns **409**. `backend` remains metadata-only.
 - `backend` (optional) — tags a **newly created** conversation for sidebar filtering (see `?backend=` on [`GET /api/conversations`](api-reference.md#get-apiconversations)). This is the only thing it does: it never changes routing, model selection, or persona resolution. Omitted, it tags `"lifeos"` (today's behavior, unchanged). Through #641 the web client set this to `"hermes"` itself when diverting an orchestrating persona's turn from a Hermes-selected composer to this endpoint — that persona's spawn was LifeOS-native with no Hermes equivalent, so the turn landed here regardless of the selected backend. #642 gave Hermes its own way to drive an orchestrating persona and removed that diversion, so the web client no longer sends this field on any turn; it remains a generic, supported field on this endpoint for any other caller.
 - `client_turn_id` (optional, #611) — an opaque key the **client** generates before sending the request, used to cancel this turn via [`POST /api/chat/cancel`](#post-apichatcancel). Closes a gap `conversation_id` alone can't: a brand-new conversation's id doesn't exist until the `conversation_id` SSE event arrives, so a client that wants to cancel before then (the common voice barge-in case) has nothing to cancel by unless it minted this key itself. Bounded to 200 chars, no control characters; not required to be a UUID — any locally-unique string works. Reusing the same key on a later request supersedes (cancels) whichever turn currently holds it, the same as reusing `conversation_id` does. Purely additive — omitting it changes nothing about the turn.
 
@@ -50,7 +52,7 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `self_correction` | — | Model retrying; consumers should clear buffered text |
 | `conversation_id` | `conversation_id` | Assigned or confirmed thread id (required for multi-turn clients) |
 | `sources` | `sources` | Data sources used (vault, calendar, gmail, etc.) |
-| `claude_intent` | `task`, `engine` (`claude_code` \| `codex`) | CLI engine handoff; HTTP clients POST `/api/chat/handoff` |
+| `claude_intent` | `task`, `engine` (`claude_code` \| `codex`), optional `execution` | CLI engine handoff; HTTP clients POST `/api/chat/handoff`, forwarding `execution` unchanged when present |
 | `error` | `message` | Fatal error for this turn |
 | `usage` | `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd` | Token usage and cost |
 | `done` | — | Stream complete |
@@ -107,7 +109,7 @@ the composer for a subsequent turn.
 
 ### GET /api/personas
 
-List chat personas available to HTTP clients (web chat, voice/whisper-relay). Returns the `primary` persona plus each configured specialized Telegram bot whose token env is set. No secrets are exposed. Adding a registry entry (`config/telegram_bots.json`) plus its token env var surfaces a new persona after restart — no code change.
+List chat personas available to HTTP clients (web chat, voice/whisper-relay). Returns the `primary` persona plus each valid specialized definition in the persona registry, whether or not its Telegram token is configured. No secrets are exposed. Adding a registry entry (`config/telegram_bots.json`) surfaces a new HTTP persona after restart; adding its token separately enables the Telegram listener without changing this response.
 
 **Response:**
 ```json
@@ -176,6 +178,8 @@ Cancel a chat turn (native or Hermes-relayed) by `client_turn_id` (#611) — the
 
 ### POST /api/chat/handoff
 
+Spawns a CLI worker from `engine` (`claude_code` or `codex`) and `task`. The optional strict `execution` object carries canonical model/effort/host/working-directory/budget/constraint choices into the worker's persisted request; an executor conflict with legacy `engine` returns **409**, while legacy requests containing only `engine` and `task` remain valid.
+
 Spawn a CLI engine worker session when the orchestrator emits `claude_intent` on the SSE stream. HTTP clients call this endpoint; Telegram spawns in-process instead.
 
 **Request:**
@@ -183,13 +187,15 @@ Spawn a CLI engine worker session when the orchestrator emits `claude_intent` on
 {
   "engine": "claude_code",
   "task": "refactor the parser",
-  "conversation_id": "optional-uuid"
+  "conversation_id": "optional-uuid",
+  "execution": {"executor": "claude_code", "effort": "high"}
 }
 ```
 
 - `engine` — `"claude_code"` or `"codex"` only
 - `task` — non-empty task description forwarded to the worker
 - `conversation_id` — optional; when set, an assistant acknowledgment is appended to the thread
+- `execution` — optional strict canonical choices; `executor`, when present, must match `engine`
 
 **Response (200):**
 ```json

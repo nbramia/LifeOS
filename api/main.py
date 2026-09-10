@@ -64,6 +64,7 @@ from fastapi.responses import FileResponse
 from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, agent_assignment, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends, journal_ingest
 from api.services.log_redaction import configure_telegram_log_redaction, install_query_string_redaction_filter
 from api.services.route_timing import RouteTimingMiddleware
+from api.services.runtime_identity import capture_runtime_identity, publish_runtime_identity
 from config.settings import settings
 
 # Configure root logging here, explicitly, rather than leaving it to whatever
@@ -83,6 +84,15 @@ configure_telegram_log_redaction()
 install_query_string_redaction_filter()
 
 logger = logging.getLogger(__name__)
+
+# Capture this process's source revision before the application starts serving
+# requests.  /health reports this immutable startup observation; it must never
+# resolve the checkout's current HEAD during a request.
+API_RUNTIME_IDENTITY = capture_runtime_identity("lifeos-api")
+try:
+    publish_runtime_identity(API_RUNTIME_IDENTITY)
+except OSError as exc:  # A health response still works if local evidence storage is unavailable.
+    logger.warning("could not publish API runtime identity: %s", exc)
 
 # Background services (initialized on startup)
 _calendar_indexer = None
@@ -524,6 +534,7 @@ async def health_check():
         "status": "healthy" if all_healthy else "degraded",
         "service": "lifeos",
         "checks": checks,
+        "runtime_identity": API_RUNTIME_IDENTITY.as_public_dict(),
     }
 
 

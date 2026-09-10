@@ -9,6 +9,7 @@ the proxy's httpx client through an in-process stub backend via ASGITransport
 
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import sqlite3
@@ -24,12 +25,27 @@ from fastapi.testclient import TestClient
 from api.routes import hermes_proxy as hp
 from api.services.conversation_store import ConversationStore
 from api.services.journal_capture import log_path_for
+from api.services.agent_worker.session_store import SessionStore
+from api.services.agent_worker.usage_ledger import UsageLedger
 from api.services.usage_store import UsageStore
 
 pytestmark = pytest.mark.unit
 
 stub_hermes = FastAPI()
 _received = {}
+
+
+@pytest.fixture(autouse=True)
+def _isolated_task_store(tmp_path, monkeypatch):
+    """Keep envelope task-context reads and writes in synthetic test paths."""
+    from api.services.task_manager import TaskManager
+    import api.services.task_manager as task_manager_mod
+
+    store = TaskManager(
+        vault_path=tmp_path / "task-vault",
+        index_path=tmp_path / "task_index.json",
+    )
+    monkeypatch.setattr(task_manager_mod, "_task_manager", store)
 
 
 _UPSTREAM_SSE_CHUNKS = [
@@ -284,13 +300,17 @@ async def test_envelope_defaults_to_primary_persona(proxy_client):
     # `persona` added by #591 — see the `turn` sub-object tests below for its
     # own shape and its relationship to persona.
     assert set(ctx.keys()) == {"schema_version", "modality", "persona", "turn"}
-    assert set(ctx["persona"].keys()) == {"id", "label", "preamble", "voice_rules", "orchestrates"}
+    assert set(ctx["persona"].keys()) == {
+        "id", "label", "preamble", "voice_rules", "orchestrates",
+        "tool_capabilities",
+    }
     assert ctx["schema_version"] == 1
     assert ctx["modality"] == "text"
     assert ctx["persona"]["id"] == "primary"
     assert ctx["persona"]["label"] == "Primary"
     assert ctx["persona"]["orchestrates"] is False
     assert ctx["persona"]["voice_rules"] == []
+    assert ctx["persona"]["tool_capabilities"] == []
     # Byte-identical to what the native /api/ask/stream path resolves for the
     # same id — both call settings.resolve_persona(), so this can't drift.
     assert ctx["persona"]["preamble"] == hp.settings.resolve_persona("primary")
@@ -345,6 +365,98 @@ async def test_envelope_resolves_specialized_persona(proxy_client, tmp_path, mon
     assert ctx["persona"]["preamble"] == "FITNESS PERSONA BODY"
     assert ctx["persona"]["preamble"] == hp.settings.resolve_persona("fitness")
     assert ctx["persona"]["orchestrates"] is False
+    assert ctx["persona"]["tool_capabilities"] == [{
+        "native_name": "manage_workouts",
+        "mcp_name": "lifeos_workout_manage",
+        "actions": [
+            "log", "update", "list", "history", "summary", "log_metric",
+            "metrics", "get_profile", "set_profile", "readiness",
+        ],
+    }]
+
+
+async def test_tokenless_persona_envelope_preserves_request_body(
+    proxy_client, tmp_path, monkeypatch,
+):
+    """Tokenless HTTP persona identity keeps the existing envelope shape."""
+    persona_file = tmp_path / "fitness.md"
+    persona_file.write_text("FITNESS TOKENLESS BODY")
+    reg = _registry(tmp_path, [{
+        "name": "fitness",
+        "label": "Fitness Coach",
+        "token_env": "SYNTHETIC_FITNESS_TOKEN_UNUSED",
+        "persona_file": str(persona_file),
+    }])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.delenv("SYNTHETIC_FITNESS_TOKEN_UNUSED", raising=False)
+    request_body = {
+        "question": "tokenless synthetic question",
+        "persona_id": "fitness",
+        "modality": "text",
+        "conversation_id": "synthetic-conversation",
+    }
+
+    resp = await proxy_client.post("/api/hermes/ask/stream", json=request_body)
+
+    assert resp.status_code == 200
+    forwarded = json.loads(_received["body"])
+    assert {key: forwarded[key] for key in request_body} == request_body
+    assert set(forwarded) == set(request_body) | {"lifeos_context"}
+    ctx = forwarded["lifeos_context"]
+    assert set(ctx) == {"schema_version", "modality", "persona", "turn"}
+    assert ctx["persona"] == {
+        "id": "fitness",
+        "label": "Fitness Coach",
+        "preamble": "FITNESS TOKENLESS BODY",
+        "voice_rules": [],
+        "orchestrates": False,
+        "tool_capabilities": [{
+            "native_name": "manage_workouts",
+            "mcp_name": "lifeos_workout_manage",
+            "actions": [
+                "log", "update", "list", "history", "summary", "log_metric",
+                "metrics", "get_profile", "set_profile", "readiness",
+            ],
+        }],
+    }
+
+
+async def test_tokenless_voice_orchestrating_persona_keeps_variant_metadata(
+    proxy_client, tmp_path, monkeypatch,
+):
+    """Tokenless voice orchestration retains voice rules and Hermes variant."""
+    persona_file = tmp_path / "doctor.md"
+    persona_file.write_text("---\nvoice:\n  - concise\n---\n\nPLAIN DOCTOR BODY")
+    (tmp_path / "doctor.hermes.md").write_text(
+        "HERMES DOCTOR TOKENLESS BODY"
+    )
+    reg = _registry(tmp_path, [{
+        "name": "doctor",
+        "label": "Doctor",
+        "token_env": "SYNTHETIC_DOCTOR_TOKEN_UNUSED",
+        "persona_file": str(persona_file),
+        "orchestrates": True,
+    }])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.delenv("SYNTHETIC_DOCTOR_TOKEN_UNUSED", raising=False)
+    request_body = {
+        "question": "tokenless synthetic voice question",
+        "persona_id": "doctor",
+        "modality": "voice",
+    }
+
+    resp = await proxy_client.post("/api/hermes/ask/stream", json=request_body)
+
+    assert resp.status_code == 200
+    forwarded = json.loads(_received["body"])
+    assert {key: forwarded[key] for key in request_body} == request_body
+    ctx = forwarded["lifeos_context"]
+    assert ctx["modality"] == "voice"
+    assert ctx["persona"]["id"] == "doctor"
+    assert ctx["persona"]["label"] == "Doctor"
+    assert ctx["persona"]["preamble"] == "HERMES DOCTOR TOKENLESS BODY"
+    assert ctx["persona"]["voice_rules"] == ["concise"]
+    assert ctx["persona"]["orchestrates"] is True
 
 
 async def test_envelope_voice_modality_populates_voice_rules(proxy_client, tmp_path, monkeypatch):
@@ -1657,6 +1769,38 @@ async def test_usage_event_writes_a_row_with_verbatim_cost(usage_proxy_client, u
     assert unpriced == 0
 
 
+async def test_proxy_retries_share_usage_identity_but_distinct_turns_do_not(
+    usage_proxy_client, usage_store, tmp_path, monkeypatch,
+):
+    """The canonical and legacy projections deduplicate one client retry."""
+    SessionStore(tmp_path / "canonical.db")
+    canonical = UsageLedger(tmp_path / "canonical.db")
+    monkeypatch.setattr(hp, "UsageLedger", lambda: canonical)
+    base = {
+        "question": "what's 2+2?",
+        "conversation_id": "usage-conv-retry",
+        "client_turn_id": "client-turn-1",
+    }
+
+    first = await usage_proxy_client.post("/api/hermes/ask/stream", json=base)
+    # The client key, not incidental payload drift during a retry, owns the
+    # logical identity.
+    retry = await usage_proxy_client.post(
+        "/api/hermes/ask/stream", json={**base, "question": "retry payload"},
+    )
+    distinct = await usage_proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={**base, "client_turn_id": "client-turn-2", "question": "what's 3+3?"},
+    )
+    assert first.status_code == retry.status_code == distinct.status_code == 200
+
+    with sqlite3.connect(canonical.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM usage_ledger").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM usage_observations").fetchone()[0] == 2
+    with sqlite3.connect(usage_store.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM usage").fetchone()[0] == 2
+
+
 stub_hermes_usage_no_cost = FastAPI()
 
 _USAGE_NO_COST_SSE_CHUNKS = [
@@ -1974,13 +2118,46 @@ class TestHermesTurnPersisterDirect:
 
         persister.finalize()
 
-        assert calls == [
-            ("record_usage", {
-                "model": "m", "input_tokens": 1, "output_tokens": 2,
-                "cost_usd": 0.01, "conversation_id": "usage-track-1",
-                "unpriced": False,
-            }),
-        ]
+        assert len(calls) == 1
+        assert calls[0][0] == "record_usage"
+        assert calls[0][1] == {
+            "model": "m", "input_tokens": 1, "output_tokens": 2,
+            "cost_usd": 0.01, "conversation_id": "usage-track-1",
+            "unpriced": False,
+            "usage_key": calls[0][1]["usage_key"],
+            "requested_engine": "hermes", "requested_model": "m",
+            "billing_class": "metered", "evidence_source": "hermes_usage_event",
+        }
+
+    def test_overlapping_same_turn_retries_project_one_legacy_row(
+        self, tmp_path, monkeypatch,
+    ):
+        """The proxy's canonical key is also an atomic legacy projection key."""
+        SessionStore(tmp_path / "sessions.db")
+        canonical = UsageLedger(tmp_path / "sessions.db")
+        usage = UsageStore(str(tmp_path / "usage.db"))
+        monkeypatch.setattr(hp, "UsageLedger", lambda: canonical)
+        monkeypatch.setattr(hp, "get_usage_store", lambda: usage)
+
+        def persist():
+            persister = hp._HermesTurnPersister(
+                question="q", persona_id="primary",
+                client_turn_id="turn-1", request_conversation_id="conv-1",
+            )
+            persister.observe(
+                b'data: {"type": "usage", "model": "m", '
+                b'"input_tokens": 10, "output_tokens": 4, "cost_usd": 0.2}\n\n'
+            )
+            persister.observe(b'data: {"type": "done"}\n\n')
+            persister.finalize()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda _: persist(), range(2)))
+
+        with sqlite3.connect(usage.db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM usage").fetchone()[0] == 1
+        with sqlite3.connect(canonical.db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM usage_ledger").fetchone()[0] == 1
 
     def test_usage_event_missing_model_is_ignored(self, hermes_store, usage_store):
         persister = hp._HermesTurnPersister(question="q", persona_id="primary")
@@ -2713,6 +2890,34 @@ async def test_raw_persona_preamble_journal_turn_still_captures(
         "path": log_path_for(date.today()),
         "created": True,
     }]
+
+
+async def test_tokenless_raw_persona_preamble_reverse_maps_in_envelope(
+    proxy_client, tmp_path, monkeypatch,
+):
+    """Raw tokenless persona preambles resolve through credential-free definitions."""
+    persona_file = tmp_path / "fitness.md"
+    persona_file.write_text("FITNESS TOKENLESS RAW BODY")
+    reg = _registry(tmp_path, [{
+        "name": "fitness",
+        "label": "Fitness Coach",
+        "token_env": "SYNTHETIC_RAW_FITNESS_TOKEN_UNUSED",
+        "persona_file": str(persona_file),
+    }])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.delenv("SYNTHETIC_RAW_FITNESS_TOKEN_UNUSED", raising=False)
+    request_body = {
+        "question": "tokenless raw synthetic question",
+        "persona": "FITNESS TOKENLESS RAW BODY",
+    }
+
+    resp = await proxy_client.post("/api/hermes/ask/stream", json=request_body)
+
+    assert resp.status_code == 200
+    forwarded = json.loads(_received["body"])
+    assert {key: forwarded[key] for key in request_body} == request_body
+    assert forwarded["lifeos_context"]["persona"]["id"] == "fitness"
+    assert forwarded["lifeos_context"]["persona"]["preamble"] == request_body["persona"]
 
 
 # ---------------------------------------------------------------------------

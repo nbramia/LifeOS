@@ -490,7 +490,14 @@ def test_local_cli_preserves_dispatched_lane_failure_status(tmp_path):
         text=True, capture_output=True,
     )
     assert result.returncode == 1
-    assert '"reason": "executed_failure"' in result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["result"] == "failure"
+    assert payload["reason"] == "executed_failure"
+    evidence = json.loads(
+        (tmp_path / "evidence" / f"{payload['evidence_key']}.json").read_text()
+    )
+    assert evidence["key"] == payload["evidence_key"]
+    assert evidence["attempts"][-1]["result"] == "failure"
 
 
 @pytest.mark.unit
@@ -734,8 +741,16 @@ def test_pushed_ref_protocol_executes_detached_candidate_not_dirty_cwd(tmp_path)
         capture_output=True, text=True,
     )
     assert cli.returncode == 0, cli.stderr
-    first_payload = json.loads(cli.stdout.splitlines()[-1])
+    # stdout is the authoritative top-level receipt; parsing the complete
+    # document rejects a stale mixed pytest-transcript-plus-JSON result.
+    first_payload = json.loads(cli.stdout)
     assert first_payload["reused"] is False
+    assert first_payload["result"] == "success"
+    evidence = json.loads(
+        (tmp_path / "evidence" / f"{first_payload['evidence_key']}.json").read_text()
+    )
+    assert evidence["key"] == first_payload["evidence_key"]
+    assert evidence["attempts"][-1]["result"] == "success"
     (root / "app.py").write_text("VALUE = 'candidate'\n")
     (root / "extra.py").write_text("VALUE = 'second pushed ref'\n")
     _git(root, "add", "app.py", "extra.py")

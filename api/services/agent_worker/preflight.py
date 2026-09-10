@@ -142,6 +142,22 @@ class PreflightResult:
     # the operator before dispatching (#139 §7). Driven by
     # settings.agent_cost_confirm_threshold_dollars.
     needs_cost_confirmation: bool = False
+
+    def execution_layer(self, *, working_dir: str | None = None):
+        """Adapt legacy preflight output into trusted resolver defaults."""
+        from api.services.agent_worker.execution import Budget, ExecutionLayer
+
+        return ExecutionLayer(
+            executor=self.routing,
+            model_id=self.model,
+            model_executor=self.routing if self.model else None,
+            working_dir=working_dir,
+            budget=Budget(
+                wall_seconds=self.budget.wall_seconds,
+                max_tokens=self.budget.max_tokens,
+                max_dollars=self.budget.max_dollars,
+            ),
+        )
     # Set when a non-null `ambiguity` was demoted to advisory-only because
     # `settings.agent_default_route` is configured (#751) — holds the
     # original question text so the worker can log it as context (session

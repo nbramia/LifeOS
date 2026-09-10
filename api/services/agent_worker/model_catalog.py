@@ -1,4 +1,4 @@
-"""Model catalog for the board's assignment pickers (#851).
+"""Model catalog for the board's assignment pickers.
 
 `GET /api/agents/models` (`api/routes/agent_assignment.py`) needs "what
 models can each engine actually run right now" — the same "observed, not
@@ -36,8 +36,10 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 import httpx
@@ -49,9 +51,17 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 ENGINES = ("claude", "codex", "local", "hermes")
+FACT_ENGINES = ENGINES + ("claude_code", "remote")
+
+# These are deliberately strings rather than a second policy enum.  The
+# execution resolver owns routing decisions; this module only reports what a
+# bounded discovery/readiness observation found.
+CATALOG_STATES = ("loaded", "empty-valid", "unavailable", "unconfigured", "unknown")
+READINESS_STATES = ("configured", "ready", "unavailable", "unknown")
 
 _OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 _OPENAI_TIMEOUT = httpx.Timeout(10.0)
+_ANTHROPIC_TIMEOUT_SECONDS = 10.0
 
 
 def _pricing_for(model_id: str) -> Optional[dict]:
@@ -67,6 +77,34 @@ def _entry(model_id: str, label: str | None = None) -> dict:
     }
 
 
+@dataclass(frozen=True)
+class _EngineResult:
+    models: list[dict]
+    state: str
+    reason_code: str
+    readiness: str
+    readiness_source: str
+    evidence_at: str | None = None
+
+
+def _result(
+    models: list[dict],
+    state: str,
+    reason_code: str,
+    readiness: str,
+    readiness_source: str,
+    evidence_at: str | None = None,
+) -> _EngineResult:
+    return _EngineResult(
+        models=models,
+        state=state,
+        reason_code=reason_code,
+        readiness=readiness,
+        readiness_source=readiness_source,
+        evidence_at=evidence_at,
+    )
+
+
 @dataclass
 class ModelCatalog:
     """Injectable-everything catalog builder (test seams on every provider
@@ -79,48 +117,97 @@ class ModelCatalog:
     openai_http_client_factory: Optional[Callable[[], httpx.Client]] = None
     local_probe: Optional[Callable[[], Any]] = None  # async () -> Optional[str]
     hermes_probe: Optional[Callable[[], Any]] = None  # async () -> dict (model_readout.get_hermes_models shape)
-    clock: Callable[[], float] = field(default=time.monotonic)
+    # The clock is used for both TTLs and serialized observation timestamps.
+    # Keeping one injectable clock makes a refresh's timestamps deterministic
+    # in tests and avoids mixing an observation with a later wall-clock read.
+    clock: Callable[[], float] = field(default=time.time)
 
     provider_call_count: int = field(default=0, init=False)
 
     _cached: Optional[dict] = field(default=None, init=False, repr=False)
     _cached_at: Optional[float] = field(default=None, init=False, repr=False)
 
+    def _timestamp(self) -> str:
+        return datetime.fromtimestamp(self.clock(), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     async def get(self, *, ttl_seconds: Optional[int] = None) -> dict:
         ttl = ttl_seconds if ttl_seconds is not None else settings.agent_model_catalog_ttl_seconds
         now = self.clock()
         if self._cached is not None and self._cached_at is not None and (now - self._cached_at) < ttl:
-            return {**self._cached, "stale": False}
-        try:
-            fresh = await self._fetch_all()
-        except Exception as exc:  # noqa: BLE001 — any single engine's provider failure
-            logger.warning("model catalog refresh failed: %s", exc)
-            if self._cached is not None:
-                return {**self._cached, "stale": True}
-            raise
+            return self._with_aggregate_stale(self._cached)
+        fresh = await self._fetch_all(now=now)
         self._cached = fresh
         self._cached_at = now
-        return {**fresh, "stale": False}
+        return self._with_aggregate_stale(fresh)
 
-    async def _fetch_all(self) -> dict:
-        engines = {
-            "claude": await self._fetch_claude(),
-            "codex": await self._fetch_codex(),
-            "local": await self._fetch_local(),
-            "hermes": await self._fetch_hermes(),
+    @staticmethod
+    def _with_aggregate_stale(response: dict) -> dict:
+        # Keep the original aggregate fields exactly available to existing
+        # board clients.  A partial refresh is stale only for the affected
+        # engine(s), reflected by the additive per-engine metadata below.
+        states = response.get("engine_states", {}).values()
+        return {**response, "stale": any(item.get("stale") for item in states)}
+
+    async def facts(self, *, ttl_seconds: Optional[int] = None) -> dict[str, dict]:
+        """Return bounded execution facts for execution selection.
+
+        This is a projection, not a routing decision: callers must choose
+        whether an unknown or unavailable engine should be selected/fallback.
+        """
+        return facts_from_catalog(await self.get(ttl_seconds=ttl_seconds))
+
+    async def _fetch_all(self, *, now: float | None = None) -> dict:
+        observed_at = self._timestamp() if now is None else datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fetchers = {
+            "claude": self._fetch_claude,
+            "codex": self._fetch_codex,
+            "local": self._fetch_local,
+            "hermes": self._fetch_hermes,
         }
+        states: dict[str, dict] = {}
+        for engine, fetcher in fetchers.items():
+            try:
+                result = await fetcher()
+            except Exception as exc:  # noqa: BLE001 — isolate one provider
+                logger.warning("model catalog refresh failed for %s: %s", engine, exc)
+                result = _result([], "unavailable", "refresh_failed", "unknown", "prior_failure")
+            previous = (self._cached or {}).get("engine_states", {}).get(engine, {})
+            success = result.state in {"loaded", "empty-valid"}
+            models = result.models if success else list(previous.get("models") or [])
+            last_success_at = observed_at if success else previous.get("last_success_at")
+            stale = not success and bool(models or previous.get("last_success_at"))
+            states[engine] = {
+                "models": models,
+                "state": result.state,
+                "observed_at": observed_at,
+                "evidence_at": result.evidence_at or observed_at,
+                "last_success_at": last_success_at,
+                "stale": stale,
+                "reason_code": result.reason_code,
+                "staleness_reason": result.reason_code if stale else None,
+                "readiness": {
+                    "state": result.readiness,
+                    "source": result.readiness_source,
+                    "observed_at": observed_at,
+                },
+                # No provider quota endpoint is consulted by this catalog.
+                "quota": {"state": "unknown", "source": "not_collected"},
+            }
         return {
-            "engines": engines,
-            "refreshed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            # Legacy aggregate response, retained for existing board clients.
+            "engines": {engine: state["models"] for engine, state in states.items()},
+            "refreshed_at": observed_at,
+            "engine_states": states,
+            "readiness": {engine: state["readiness"] for engine, state in states.items()},
         }
 
     # ------------------------------------------------------------------
     # Per-engine fetchers
     # ------------------------------------------------------------------
 
-    async def _fetch_claude(self) -> list[dict]:
+    async def _fetch_claude(self) -> _EngineResult:
         if not settings.anthropic_api_key:
-            return []  # unconfigured, not a failure — mirrors get_hermes_models()
+            return _result([], "unconfigured", "missing_api_key", "unavailable", "configuration")
         self.provider_call_count += 1
         client = (self.anthropic_client_factory or self._default_anthropic_client)()
 
@@ -128,31 +215,66 @@ class ModelCatalog:
             page = client.models.list()
             return [_entry(m.id, getattr(m, "display_name", None) or m.id) for m in page.data]
 
-        return await asyncio.to_thread(_list_sync)
+        models = await asyncio.to_thread(_list_sync)
+        return _result(
+            models,
+            "loaded" if models else "empty-valid",
+            "loaded" if models else "empty_catalog",
+            self._claude_readiness(),
+            "configuration_and_models_endpoint",
+        )
+
+    @staticmethod
+    def _claude_readiness() -> str:
+        if not settings.anthropic_api_key:
+            return "unavailable"
+        if getattr(settings, "agent_preset_id", "") and getattr(settings, "agent_environment_id", ""):
+            return "ready"
+        return "configured"
 
     @staticmethod
     def _default_anthropic_client():
         import anthropic
-        return anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        return anthropic.Anthropic(api_key=settings.anthropic_api_key, timeout=_ANTHROPIC_TIMEOUT_SECONDS)
 
-    async def _fetch_codex(self) -> list[dict]:
+    async def _fetch_codex(self) -> _EngineResult:
         path = os.path.expanduser(self.codex_cache_path or settings.codex_models_cache_path)
+        cache_reason = "cache_missing"
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             models = data.get("models") or []
             if models:
-                return [
+                entries = [
                     _entry(m.get("slug") or m.get("id"), m.get("display_name"))
                     for m in models if m.get("slug") or m.get("id")
                 ]
+                if entries:
+                    return _result(
+                        entries,
+                        "loaded",
+                        "cache_loaded",
+                        self._codex_readiness(),
+                        "codex_binary_presence",
+                        _cache_evidence_timestamp(data),
+                    )
+            cache_reason = "cache_empty"
         except (FileNotFoundError, OSError, json.JSONDecodeError):
-            pass
-        return await self._fetch_codex_fallback()
+            cache_reason = "cache_unreadable"
+        return await self._fetch_codex_fallback(cache_reason)
 
-    async def _fetch_codex_fallback(self) -> list[dict]:
+    @staticmethod
+    def _codex_readiness() -> str:
+        binary = getattr(settings, "codex_binary", "codex")
+        return "ready" if shutil.which(os.path.expanduser(binary)) else "unavailable"
+
+    async def _fetch_codex_fallback(self, cache_reason: str) -> _EngineResult:
+        readiness = self._codex_readiness()
         if not settings.openai_api_key:
-            return []  # unconfigured, not a failure
+            # A configured subscription CLI does not become invalid merely
+            # because its optional model-list cache/API key is unavailable.
+            state = "unknown" if readiness == "ready" else "unconfigured"
+            return _result([], state, cache_reason, readiness, "codex_binary_presence")
         self.provider_call_count += 1
         client = (self.openai_http_client_factory or (lambda: httpx.Client(timeout=_OPENAI_TIMEOUT)))()
 
@@ -166,33 +288,143 @@ class ModelCatalog:
             return [_entry(m["id"]) for m in data if isinstance(m, dict) and m.get("id")]
 
         try:
-            return await asyncio.to_thread(_list_sync)
+            models = await asyncio.to_thread(_list_sync)
+            return _result(
+                models,
+                "loaded" if models else "empty-valid",
+                "provider_loaded" if models else "provider_empty",
+                readiness,
+                "codex_binary_presence",
+            )
+        except Exception:
+            return _result([], "unavailable", "provider_unavailable", readiness, "codex_binary_presence")
         finally:
             close = getattr(client, "close", None)
             if callable(close):
                 close()
 
-    async def _fetch_local(self) -> list[dict]:
+    async def _fetch_local(self) -> _EngineResult:
+        if not settings.local_llm_url:
+            return _result([], "unconfigured", "missing_endpoint", "unavailable", "configuration")
         probe = self.local_probe or self._default_local_probe
         model = await probe()
-        return [_entry(model)] if model else []
+        if isinstance(model, list):
+            entries = [
+                _entry(item.get("id"), item.get("label"))
+                for item in model
+                if isinstance(item, dict) and item.get("id")
+            ]
+            return _result(
+                entries,
+                "loaded" if entries else "empty-valid",
+                "endpoint_loaded" if entries else "endpoint_empty",
+                "ready",
+                "models_endpoint",
+            )
+        if model:
+            return _result([_entry(model)], "loaded", "endpoint_loaded", "ready", "models_endpoint")
+        # `_probe_live_model` intentionally collapses auth, malformed, empty,
+        # and unreachable responses to None.  Keep that uncertainty explicit.
+        return _result([], "unknown", "no_observation", "unknown", "models_endpoint")
 
     @staticmethod
     async def _default_local_probe() -> Optional[str]:
         from api.services.model_readout import _probe_live_model
         return await _probe_live_model(settings.local_llm_url)
 
-    async def _fetch_hermes(self) -> list[dict]:
+    async def _fetch_hermes(self) -> _EngineResult:
+        # An injected probe is an explicit test/integration source and may be
+        # used on a synthetic install with no configured URL. The default
+        # probe still treats an absent URL as unconfigured.
+        if not settings.hermes_backend_url and self.hermes_probe is None:
+            return _result([], "unconfigured", "missing_endpoint", "unavailable", "configuration")
         probe = self.hermes_probe or self._default_hermes_probe
         readout = await probe()
         chat = (readout or {}).get("hermes_chat") or {}
         model = chat.get("model") if chat.get("status") == "ok" else None
-        return [_entry(model)] if model else []
+        if model:
+            return _result([_entry(model)], "loaded", "observed_turn", "ready", "observed_turn")
+        return _result([], "unknown", "no_observed_turn", "configured", "hermes_configuration")
 
     @staticmethod
     async def _default_hermes_probe() -> dict:
         from api.services.model_readout import get_hermes_models
         return await get_hermes_models()
+
+
+def _cache_evidence_timestamp(data: dict) -> str | None:
+    """Normalize the CLI cache's source timestamp without trusting it as now."""
+    value = data.get("fetched_at") if isinstance(data, dict) else None
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def facts_from_catalog(response: dict) -> dict[str, dict]:
+    """Project catalog metadata into a small, policy-neutral facts mapping.
+
+    The assignment/execution resolver can consume this without depending on
+    the picker response shape.  In particular, ``unknown`` and
+    ``unavailable`` are retained as facts; this adapter never turns either
+    into a fallback or a dispatch decision.
+    """
+    output: dict[str, dict] = {}
+    states = response.get("engine_states") or {}
+    refreshed_at = response.get("refreshed_at")
+    for engine in FACT_ENGINES:
+        state = states.get(engine) or {}
+        readiness = state.get("readiness") or {}
+        models = state.get("models") or (response.get("engines") or {}).get(engine) or []
+        if engine == "claude_code":
+            binary = getattr(settings, "claude_binary", "claude")
+            readiness = {
+                "state": "ready" if shutil.which(os.path.expanduser(binary)) else "unavailable",
+                "source": "claude_binary_presence",
+                "observed_at": refreshed_at,
+            }
+            state = {
+                "state": "unknown",
+                "reason_code": "discovery_not_available",
+                "stale": False,
+                "observed_at": refreshed_at,
+                "last_success_at": None,
+            }
+        elif engine == "remote":
+            configured = bool(getattr(settings, "remote_llm_configured", False))
+            readiness = {
+                "state": "configured" if configured else "unavailable",
+                "source": "remote_configuration",
+                "observed_at": refreshed_at,
+            }
+            state = {
+                "state": "unknown",
+                "reason_code": "discovery_not_available",
+                "stale": False,
+                "observed_at": refreshed_at,
+                "last_success_at": None,
+            }
+        output[engine] = {
+            "engine": engine,
+            "model_ids": tuple(item.get("id") for item in models if isinstance(item, dict) and item.get("id")),
+            "catalog_state": state.get("state", "unknown"),
+            "observed_at": state.get("observed_at"),
+            "evidence_at": state.get("evidence_at") or state.get("observed_at"),
+            "last_success_at": state.get("last_success_at"),
+            "stale": bool(state.get("stale")),
+            "reason_code": state.get("reason_code", "no_observation"),
+            "staleness_reason": state.get("staleness_reason"),
+            "readiness": readiness.get("state", "unknown"),
+            "readiness_source": readiness.get("source", "unknown"),
+            "readiness_observed_at": readiness.get("observed_at"),
+            "quota": (state.get("quota") or {}).get("state", "unknown"),
+        }
+    return output
 
 
 # Process-wide singleton — mirrors model_readout.py's in-memory-only

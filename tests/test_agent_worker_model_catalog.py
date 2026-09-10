@@ -1,6 +1,6 @@
-"""Tests for ModelCatalog (#851, AC11): per-engine model lists merged with
-pricing, a 24h TTL cache that calls no provider on a cache hit, and a
-provider failure falling back to the last cached list with `stale: true`.
+"""Tests for ModelCatalog: per-engine model lists merged with pricing, a
+24h TTL cache that calls no provider on a cache hit, and independent
+discovery/readiness state with last-good preservation on failure.
 Every provider is a stub — no network call is ever made.
 """
 from __future__ import annotations
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from api.services.agent_worker.model_catalog import ModelCatalog
+from api.services.agent_worker.model_catalog import ModelCatalog, facts_from_catalog
 
 
 pytestmark = pytest.mark.unit
@@ -115,6 +115,9 @@ async def test_codex_reads_models_cache_file(tmp_path, monkeypatch):
     result = await catalog.get(ttl_seconds=86400)
     codex_ids = {m["id"] for m in result["engines"]["codex"]}
     assert codex_ids == {"gpt-5.5", "gpt-5.5-codex"}
+    codex_state = result["engine_states"]["codex"]
+    assert codex_state["observed_at"] == "1970-01-01T00:00:00Z"
+    assert codex_state["evidence_at"] == "2026-01-01T00:00:00Z"
 
 
 @pytest.mark.asyncio
@@ -253,7 +256,7 @@ async def test_provider_failure_returns_stale_cached_list(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_first_call_provider_failure_raises_when_nothing_cached(tmp_path, monkeypatch):
+async def test_first_call_provider_failure_isolated_without_cached_data(tmp_path, monkeypatch):
     from config.settings import settings
     monkeypatch.setattr(settings, "anthropic_api_key", "sk-test", raising=False)
     failing_client = _FakeAnthropicClient([], raise_exc=RuntimeError("provider down"))
@@ -263,5 +266,155 @@ async def test_first_call_provider_failure_raises_when_nothing_cached(tmp_path, 
         local_probe=_noop_local_probe, hermes_probe=_noop_hermes_probe,
         clock=_FrozenClock(),
     )
-    with pytest.raises(RuntimeError):
-        await catalog.get(ttl_seconds=86400)
+    result = await catalog.get(ttl_seconds=86400)
+    assert result["engines"]["claude"] == []
+    assert result["engine_states"]["claude"]["state"] == "unavailable"
+    assert result["engine_states"]["claude"]["reason_code"] == "refresh_failed"
+
+
+@pytest.mark.asyncio
+async def test_engine_failure_does_not_block_another_refresh(tmp_path, monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test", raising=False)
+    local_model = {"id": "local-a"}
+    catalog = ModelCatalog(
+        anthropic_client_factory=lambda: _FakeAnthropicClient(
+            [_FakeAnthropicModel("claude-a")]
+        ),
+        codex_cache_path=str(tmp_path / "missing.json"),
+        local_probe=lambda: _local_model(local_model),
+        hermes_probe=_noop_hermes_probe,
+        clock=_FrozenClock(100),
+    )
+    first = await catalog.get(ttl_seconds=1)
+    assert first["engines"]["claude"][0]["id"] == "claude-a"
+    local_model["id"] = "local-b"
+    catalog.anthropic_client_factory = lambda: _FakeAnthropicClient(
+        [], raise_exc=RuntimeError("provider down")
+    )
+    catalog.clock.now += 2
+    second = await catalog.get(ttl_seconds=1)
+    assert second["engines"]["claude"][0]["id"] == "claude-a"
+    assert second["engine_states"]["claude"]["stale"] is True
+    assert second["engines"]["local"][0]["id"] == "local-b"
+    assert second["engine_states"]["local"]["stale"] is False
+
+
+async def _local_model(value):
+    return value["id"]
+
+
+@pytest.mark.asyncio
+async def test_empty_valid_unconfigured_and_unknown_are_distinct(tmp_path, monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test", raising=False)
+    empty = ModelCatalog(
+        anthropic_client_factory=lambda: _FakeAnthropicClient([]),
+        codex_cache_path=str(tmp_path / "missing.json"),
+        local_probe=_noop_local_probe,
+        hermes_probe=_noop_hermes_probe,
+        clock=_FrozenClock(1),
+    )
+    result = await empty.get(ttl_seconds=100)
+    assert result["engine_states"]["claude"]["state"] == "empty-valid"
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    result = await ModelCatalog(
+        codex_cache_path=str(tmp_path / "missing.json"),
+        local_probe=_noop_local_probe,
+        hermes_probe=_noop_hermes_probe,
+        clock=_FrozenClock(1),
+    ).get(ttl_seconds=100)
+    assert result["engine_states"]["claude"]["state"] == "unconfigured"
+    monkeypatch.setattr("api.services.agent_worker.model_catalog.shutil.which", lambda _: "/usr/bin/codex")
+    result = await ModelCatalog(
+        codex_cache_path=str(tmp_path / "missing.json"),
+        local_probe=_noop_local_probe,
+        hermes_probe=_noop_hermes_probe,
+        clock=_FrozenClock(1),
+    ).get(ttl_seconds=100)
+    assert result["engine_states"]["codex"]["state"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_local_valid_empty_endpoint_is_not_unknown(tmp_path, monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+
+    async def empty_local_probe():
+        return []
+
+    result = await ModelCatalog(
+        codex_cache_path=str(tmp_path / "missing.json"),
+        local_probe=empty_local_probe,
+        hermes_probe=_noop_hermes_probe,
+        clock=_FrozenClock(1),
+    ).get(ttl_seconds=100)
+    assert result["engine_states"]["local"]["state"] == "empty-valid"
+    assert result["engine_states"]["local"]["readiness"]["state"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_stale_engine_preserves_last_success_and_observation_times(tmp_path, monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test", raising=False)
+    clock = _FrozenClock(10)
+    catalog = ModelCatalog(
+        anthropic_client_factory=lambda: _FakeAnthropicClient([_FakeAnthropicModel("claude-a")]),
+        codex_cache_path=str(tmp_path / "missing.json"),
+        local_probe=_noop_local_probe,
+        hermes_probe=_noop_hermes_probe,
+        clock=clock,
+    )
+    first = await catalog.get(ttl_seconds=1)
+    first_state = first["engine_states"]["claude"]
+    catalog.anthropic_client_factory = lambda: _FakeAnthropicClient([], raise_exc=RuntimeError("down"))
+    clock.now = 20
+    second_state = (await catalog.get(ttl_seconds=1))["engine_states"]["claude"]
+    assert first_state["last_success_at"] == "1970-01-01T00:00:10Z"
+    assert second_state["observed_at"] == "1970-01-01T00:00:20Z"
+    assert second_state["last_success_at"] == first_state["last_success_at"]
+    assert second_state["reason_code"] == "refresh_failed"
+
+
+@pytest.mark.asyncio
+async def test_keyless_codex_cli_is_ready_without_discovery_or_quota(tmp_path, monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
+    monkeypatch.setattr("api.services.agent_worker.model_catalog.shutil.which", lambda _: "/usr/bin/codex")
+    result = await ModelCatalog(
+        codex_cache_path=str(tmp_path / "missing.json"),
+        local_probe=_noop_local_probe,
+        hermes_probe=_noop_hermes_probe,
+        clock=_FrozenClock(10),
+    ).get(ttl_seconds=100)
+    codex = result["engine_states"]["codex"]
+    assert codex["state"] == "unknown"
+    assert codex["readiness"]["state"] == "ready"
+    assert codex["quota"]["state"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_facts_adapter_and_legacy_fields_are_stable(tmp_path, monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    result = await ModelCatalog(
+        codex_cache_path=str(tmp_path / "missing.json"),
+        local_probe=_noop_local_probe,
+        hermes_probe=_noop_hermes_probe,
+        clock=_FrozenClock(10),
+    ).get(ttl_seconds=100)
+    assert set(("engines", "refreshed_at", "stale")).issubset(result)
+    assert set(result["engines"]) == {"claude", "codex", "local", "hermes"}
+    facts = facts_from_catalog(result)
+    assert facts["codex"]["catalog_state"] == "unknown"
+    assert facts["codex"]["quota"] == "unknown"
+    assert isinstance(facts["codex"]["model_ids"], tuple)
+    assert facts["claude_code"]["catalog_state"] == "unknown"
+    assert facts["remote"]["catalog_state"] == "unknown"

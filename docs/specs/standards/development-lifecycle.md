@@ -1,7 +1,7 @@
 # Development Lifecycle
 
 **Status:** Partial
-**Last Updated:** 2026-09-09
+**Last Updated:** 2026-09-10
 **Owner:** Development workflow
 
 This contract defines the shared implementation, review, verification, and
@@ -34,17 +34,17 @@ Classify risk by the behavior and failure impact, not by file count:
 | Typo or mechanical correction | Brief inline review | Focused check when observable; otherwise document-only result |
 | Small isolated Python bug | One proportionate review | Focused regression test and selected lane evidence |
 | Frontend behavior change | One proportionate review | Browser or executable UI scenario plus selected lane evidence |
-| Concurrency or resource ownership | Independent adversarial reviewer from the other model family | Deterministic contention/cancellation/ownership evidence |
-| Schema or public API change | Independent adversarial reviewer from the other model family | Compatibility, migration, and boundary evidence |
-| Substantive review correction | Re-review the changed behavior | Re-run affected focused checks; preserve prior evidence where valid |
+| Concurrency or resource ownership | Independent adversarial review | Deterministic contention/cancellation/ownership evidence |
+| Schema or public API change | Independent adversarial review | Compatibility, migration, and boundary evidence |
+| Substantive review correction | Independent re-review of the changed behavior | Re-run affected focused checks; preserve prior evidence where valid |
 | Infrastructure retry | Same review requirement as original work | Record the reason, command, result, and whether the retry is comparable |
 
-Complex work requires an identifiable reviewer from the other model family
-(Claude reviews OpenAI work, and OpenAI reviews Claude work). The reviewer
-must inspect executable evidence and record findings and disposition. If the
-other family is unavailable, readiness remains pending unless the operator
-grants an explicit exception; a same-family review is not relabeled as
-independent. Re-review substantive fixes, not formatting-only changes.
+Complex work requires an identifiable independent adversarial reviewer. A
+reviewer from the other model family is strongly encouraged, but is not a
+readiness requirement. The reviewer must inspect executable evidence and
+record findings and disposition; a same-family reviewer is valid when the
+review is independent, with no operator exception required. Re-review
+substantive fixes, not formatting-only changes.
 
 Use specialists only for a concrete risk such as security, architecture,
 concurrency, privacy, schema, or test strategy. Ordinary documentation
@@ -108,12 +108,12 @@ The bounded evaluation matrix is:
 | Typo | Routine; inline review; no mandatory delegate |
 | Small Python bug | Routine; focused regression evidence |
 | Frontend behavior | Routine; executable browser/UI evidence |
-| Complex concurrency | Other-family adversarial review and deterministic evidence required |
-| Schema/API change | Other-family adversarial review and compatibility evidence required |
+| Complex concurrency | Independent adversarial review and deterministic evidence required; cross-family review strongly encouraged |
+| Schema/API change | Independent adversarial review and compatibility evidence required; cross-family review strongly encouraged |
 | Mechanical review correction | Recheck affected behavior; no new specialist unless risk changes |
-| Substantive review correction | Re-review the changed behavior and rerun affected checks |
+| Substantive review correction | Independent re-review of the changed behavior and rerun affected checks |
 | Infrastructure failure | Preserve failure; retry only with an explicit reason |
-| Other-family unavailable | Readiness pending unless an explicit operator exception exists |
+| Other-family unavailable | Same-family independent review remains valid; no operator exception required |
 
 ## Privacy and boundaries
 

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Operations
-> **Last Updated:** 2026-09-04
+> **Last Updated:** 2026-09-10
 > **Audience:** Operators
 
 Operational procedures that don't belong in the day-to-day coding reference: the Apple Data Agent, Monarch Money auth, and quick observability commands. Moved here from `AGENTS.md` to keep the agent-facing file lean.
@@ -139,6 +139,24 @@ systemctl list-timers lifeos-autodeploy.timer
 ```
 
 **Watch it:** `tail -f logs/auto-deploy.log`. Failures (fetch, diverged pull, pip, restart, or `/health` not recovering post-deploy) send a Telegram alert.
+
+For a deployment result that must be consumed as running-process evidence, use
+`./scripts/server.sh verify-runtime-evidence` after the restart wrapper has
+written its machine-produced record. The result binds the expected full commit
+to the API's startup identity and, when selected, the worker's startup and
+heartbeat identity; it also requires healthy scoped checks, distinct before and
+after process identities, and a rollback reference from the recorded prior
+running revision. `restart-worker-detached` writes
+`restart-lifeos-agent-worker.json` only after it observes a new worker identity
+and an active unit. The watcher is submitted independently before the restart
+request: systemd uses its own transient unit, while macOS uses an independent
+`launchctl submit` job and clean `unload`/`load` of the worker plist (never
+`systemctl` or `launchctl kickstart`). Identity records and restart records are
+private local files under `~/.cache/lifeos/runtime-identities/`.
+`verify-runtime-evidence` binds source root and expected revision to the
+wrapper's checkout HEAD; duplicate attempts to override either binding are
+rejected. `verify-deployed` checks checkout HEAD only and does not establish
+what a running process loaded.
 
 **Caveat:** it deploys whatever lands on `main` *without* re-running the test suite — safe only because merged `main` is expected to be green. It does not gate on tests by design (running the suite would take the API down and thrash the shared server).
 

@@ -35,6 +35,13 @@ from api.services.agent_worker.session_store import (
     SessionStore,
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
+from api.services.agent_worker.usage_ledger import (
+    MEASURED,
+    UsageLedger,
+    UsageObservation,
+    identity_for_session,
+    reservation_id_for_session,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -118,9 +125,15 @@ def _user_message_for(task: dict, session_id: str, expected_output: str, budget:
     parts = [CAPABILITIES_PREAMBLE, f"Task: {title}"]
     if context:
         parts.append(f"Context: {context}")
+    from api.services.agent_worker.inter_agent import caller_proof_for_session
+    from config.settings import settings
+    proof = caller_proof_for_session(session_id, getattr(settings, "mcp_bearer_token", ""))
+    identity = f"lifeos_session_id={session_id}; "
+    if proof:
+        identity += f"lifeos_session_proof={proof}; "
     parts.append(
         f"today={_today()}; "
-        f"lifeos_session_id={session_id}; "
+        f"{identity}"
         f"expected_output={expected_output}; "
         f"soft budget ~{budget.get('wall_seconds')}s wall / "
         f"~{budget.get('max_tokens')} tokens / {dollars_str}."
@@ -195,6 +208,33 @@ class ManagedExecutor:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _is_current(self, session) -> bool:
+        return self.session_store.is_current_turn(
+            session.task_id, session.attempt_id, session.turn_id,
+        )
+
+    def _is_cancelled(self, session) -> bool:
+        """Whether this exact Managed turn has a durable cancellation fence."""
+        return self.session_store.is_cancelled(
+            session.task_id, session.attempt_id, session.turn_id,
+        )
+
+    @staticmethod
+    def _with_identity(session, outcome: ExecutorOutcome) -> ExecutorOutcome:
+        """Attach the persisted turn snapshot to every managed outcome."""
+        from dataclasses import replace
+        return replace(
+            outcome,
+            session_id=getattr(outcome, "session_id", None) or session.session_id,
+            attempt_id=getattr(outcome, "attempt_id", None) or session.attempt_id,
+            turn_id=getattr(outcome, "turn_id", None) or session.turn_id,
+            executor="claude",
+            continuation_id=(
+                getattr(outcome, "continuation_id", None)
+                or session.managed_agent_session_id
+            ),
+        )
+
     def start(self, session, task: dict) -> ExecutorOutcome:
         """Create the remote session, apply the per-class tool filter (if any),
         and post the initial user message.
@@ -210,14 +250,22 @@ class ManagedExecutor:
         On success: STATUS_RUNNING with `managed_agent_session_id` populated.
         On failure (network, API rejection, etc.): STATUS_FAILED.
         """
+        session = self.session_store.begin_executor_turn(
+            session.task_id, "start", session=session,
+        )
         sid = session.session_id
         budget = session.budget or {}
-        self.session_store.update_status(session.task_id, STATUS_RUNNING)
+        self.session_store.update_status(
+            session.task_id, STATUS_RUNNING,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         # Drop any cursor state from a prior session on this task_id. Without
         # this, the new session's first poll would carry a stale last_event_id
         # belonging to a now-defunct remote session and the events endpoint
         # would 400 on every subsequent poll.
-        self.session_store.reset_managed_cursor(session.task_id)
+        self.session_store.reset_managed_cursor(
+            session.task_id, attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         self.transcript_store.append(sid, "managed_start",
                                      {"agent_id": self.agent_id, "environment_id": self.environment_id})
 
@@ -240,11 +288,28 @@ class ManagedExecutor:
             # Log without exc_info — httpx exceptions can attach the request
             # object whose headers include the API key.
             logger.error("managed create_session failed for %s: %s", sid, type(exc).__name__)
-            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            self.session_store.update_status(
+                session.task_id, STATUS_FAILED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             self.transcript_store.append(sid, "managed_create_failed", {"error_type": type(exc).__name__})
-            return ExecutorOutcome(status=STATUS_FAILED, reason=f"create_session failed: {type(exc).__name__}")
+            return self._with_identity(
+                session, ExecutorOutcome(status=STATUS_FAILED, reason=f"create_session failed: {type(exc).__name__}")
+            )
 
-        self.session_store.set_managed_session_id(session.task_id, remote_id)
+        # Cancellation/reopen can race the remote provisioning call.  Never
+        # attach or drive a remote session for an obsolete local turn.
+        if not self._is_current(session):
+            try:
+                self.driver.kill_session(remote_id, reason="stale_lifecycle_turn")
+            except Exception:  # pragma: no cover - best effort cleanup
+                logger.warning("stale managed session cleanup failed for %s", remote_id)
+            return self._with_identity(session, ExecutorOutcome(status=STATUS_RUNNING))
+
+        self.session_store.set_managed_session_id(
+            session.task_id, remote_id,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         self.transcript_store.append(sid, "managed_created", {"remote_id": remote_id})
 
         # Step 2: apply per-class tool filter if one was selected. Skipped for
@@ -271,22 +336,31 @@ class ManagedExecutor:
 
         # Step 3: post the initial user message. cache_creation fires here on
         # the (possibly filtered) tool set.
+        if not self._is_current(session):
+            try:
+                self.driver.kill_session(remote_id, reason="stale_lifecycle_turn")
+            except Exception:  # pragma: no cover - best effort cleanup
+                logger.warning("stale managed session cleanup failed for %s", remote_id)
+            return self._with_identity(session, ExecutorOutcome(status=STATUS_RUNNING))
         try:
             self.driver.post_user_message(remote_id, initial_message)
         except Exception as exc:
             logger.error("managed post_user_message failed for %s: %s", sid, type(exc).__name__)
-            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            self.session_store.update_status(
+                session.task_id, STATUS_FAILED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             self.transcript_store.append(
                 sid, "managed_post_failed", {"error_type": type(exc).__name__},
             )
-            return ExecutorOutcome(
+            return self._with_identity(session, ExecutorOutcome(
                 status=STATUS_FAILED,
                 reason=f"post_user_message failed: {type(exc).__name__}",
-            )
+            ))
 
         # The worker's tick loop will pick this up via _poll_managed_sessions
         # on subsequent ticks.
-        return ExecutorOutcome(status=STATUS_RUNNING)
+        return self._with_identity(session, ExecutorOutcome(status=STATUS_RUNNING))
 
     def poll(self, session) -> ExecutorOutcome:
         """Fetch new events from the remote session and advance state.
@@ -295,12 +369,19 @@ class ManagedExecutor:
         - STATUS_RUNNING — no terminal event yet (worker continues polling)
         - STATUS_COMPLETED / STATUS_FAILED / STATUS_BUDGET_EXCEEDED — terminal
         """
+        poll_started = time.monotonic()
+        if not self._is_current(session):
+            return self._with_identity(session, ExecutorOutcome(status=STATUS_RUNNING))
         if not session.managed_agent_session_id:
-            return ExecutorOutcome(status=STATUS_FAILED, reason="no managed_agent_session_id")
+            return self._with_identity(
+                session, ExecutorOutcome(status=STATUS_FAILED, reason="no managed_agent_session_id")
+            )
 
         sid = session.session_id
         remote_id = session.managed_agent_session_id
-        last_event_id = self.session_store.get_managed_last_event_id(session.task_id)
+        last_event_id = self.session_store.get_managed_last_event_id(
+            session.task_id, attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
 
         try:
             state = self.driver.get_session_state(remote_id, since_event_id=last_event_id)
@@ -308,7 +389,16 @@ class ManagedExecutor:
             # Transient errors: keep going, try again next poll. Don't kill
             # the session here — operator may want to retry.
             logger.warning("managed poll failed for %s: %s", remote_id, exc)
-            return ExecutorOutcome(status=STATUS_RUNNING, reason=f"poll error: {exc}")
+            return self._with_identity(
+                session, ExecutorOutcome(status=STATUS_RUNNING, reason=f"poll error: {exc}")
+            )
+
+        if not self._is_current(session):
+            return self._with_identity(session, ExecutorOutcome(status=STATUS_RUNNING))
+        self.session_store.record_active_seconds(
+            session.task_id, time.monotonic() - poll_started,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
 
         # Mirror events to transcript, truncating oversized tool_results so
         # the transcript doesn't bloat for huge payloads that we'd re-feed
@@ -318,49 +408,113 @@ class ManagedExecutor:
             self.transcript_store.append(sid, f"managed_event_{stored.get('type', 'unknown')}", stored)
 
         # Update runaway counters from the new events (#139 Section 5).
-        runaway_kind = self._detect_runaway(session.task_id, state.new_events)
+        runaway_kind = self._detect_runaway(
+            session.task_id, state.new_events,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         if runaway_kind:
             try:
                 self.driver.kill_session(remote_id, reason=runaway_kind)
             except Exception as exc:  # pragma: no cover — best-effort kill
                 logger.warning("kill_session %s failed: %s", remote_id, exc)
-            self.session_store.update_status(session.task_id, STATUS_BUDGET_EXCEEDED)
+            self.session_store.update_status(
+                session.task_id, STATUS_BUDGET_EXCEEDED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             self.transcript_store.append(sid, "runaway_killed", {"kind": runaway_kind})
-            return ExecutorOutcome(
+            return self._with_identity(session, ExecutorOutcome(
                 status=STATUS_BUDGET_EXCEEDED,
                 reason=f"runaway killed ({runaway_kind})",
-            )
+            ))
 
-        # 1. Token spend delta — compare absolute remote totals to our row,
-        # across all four buckets (uncached input, output, cache_creation,
-        # cache_read). Anthropic bills cache_creation at 1.25× input and
-        # cache_read at 0.10× input; pricing.cost_for applies the multipliers.
-        delta_in = max(0, state.total_input_tokens - (session.total_input_tokens or 0))
-        delta_out = max(0, state.total_output_tokens - (session.total_output_tokens or 0))
-        delta_cache_creation = max(
-            0,
-            state.total_cache_creation_tokens - (session.total_cache_creation_tokens or 0),
+        # 1. Token spend delta. Managed's provider totals are cumulative over
+        # the remote session, while a LifeOS session can have several turns.
+        # Keep a provider high-water mark and a per-turn baseline so a resumed
+        # turn gets a relative cumulative snapshot instead of replaying all
+        # prior provider usage into a new canonical ledger key.
+        sid, attempt_id, turn_id = identity_for_session(session)
+        raw_totals = {
+            "input_tokens": max(0, int(state.total_input_tokens)),
+            "output_tokens": max(0, int(state.total_output_tokens)),
+            "cache_creation_tokens": max(0, int(state.total_cache_creation_tokens)),
+            "cache_read_tokens": max(0, int(state.total_cache_read_tokens)),
+        }
+        prior = self.session_store.get_managed_usage_snapshot(
+            session.task_id, attempt_id=session.attempt_id, turn_id=session.turn_id,
         )
-        delta_cache_read = max(
-            0,
-            state.total_cache_read_tokens - (session.total_cache_read_tokens or 0),
+        same_provider = prior.get("provider_session_id") == remote_id
+        prior_highwater = {
+            name: int(prior.get(name, 0) or 0) if same_provider else 0
+            for name in raw_totals
+        }
+        turn_key = f"{attempt_id}:{turn_id}"
+        if same_provider and prior.get("turn_key") != turn_key:
+            baseline = dict(prior_highwater)
+        elif same_provider:
+            baseline = {
+                name: int(prior.get(f"baseline_{name}", 0) or 0)
+                for name in raw_totals
+            }
+        else:
+            baseline = {name: 0 for name in raw_totals}
+        relative_totals = {
+            name: max(0, raw_totals[name] - baseline[name])
+            for name in raw_totals
+        }
+        provider_advanced = any(raw_totals[name] > prior_highwater[name] for name in raw_totals)
+        if provider_advanced and any(relative_totals.values()):
+            # The Managed driver exposes cumulative totals. Feed a normalized
+            # per-turn snapshot to the canonical ledger so reconnect/replay
+            # and resumed turns remain monotonic without cross-turn replay.
+            try:
+                UsageLedger(self.session_store.db_path).record(UsageObservation(
+                    session_id=sid, attempt_id=attempt_id, turn_id=turn_id,
+                    source="managed_executor",
+                    input_tokens=relative_totals["input_tokens"],
+                    output_tokens=relative_totals["output_tokens"],
+                    cache_creation_tokens=relative_totals["cache_creation_tokens"],
+                    cache_read_tokens=relative_totals["cache_read_tokens"],
+                    input_kind=MEASURED, output_kind=MEASURED,
+                    cache_creation_kind=MEASURED, cache_read_kind=MEASURED,
+                    cost_usd=cost_for(
+                        self.model,
+                        relative_totals["input_tokens"],
+                        relative_totals["output_tokens"],
+                        cache_creation_tokens=relative_totals["cache_creation_tokens"],
+                        cache_read_tokens=relative_totals["cache_read_tokens"],
+                    ),
+                    cost_kind=MEASURED, billing_class="metered",
+                    requested_engine="claude", requested_model=getattr(session, "model", None) or self.model,
+                    # The configured Managed model is a request, not
+                    # authoritative evidence of what the provider served.
+                    # Keep served identity unknown unless the provider emits
+                    # an explicit served-model record.
+                    evidence_source="managed_driver_usage_state",
+                    source_event_id=state.last_event_id or (
+                        f"totals:{raw_totals['input_tokens']}:{raw_totals['output_tokens']}:"
+                        f"{raw_totals['cache_creation_tokens']}:{raw_totals['cache_read_tokens']}"
+                    ),
+                    event_id=f"managed:{sid}:{attempt_id}:{turn_id}:"
+                    f"{state.last_event_id or raw_totals['input_tokens']}",
+                    cumulative=True,
+                    reservation_id=reservation_id_for_session(session),
+                ))
+            except Exception:  # noqa: BLE001 — accounting cannot alter execution
+                logger.warning("managed usage ledger write failed for %s", session.task_id, exc_info=True)
+        next_highwater = {
+            name: max(prior_highwater[name], raw_totals[name])
+            for name in raw_totals
+        }
+        self.session_store.set_managed_usage_snapshot(
+            session.task_id,
+            {
+                "provider_session_id": remote_id,
+                "turn_key": turn_key,
+                **{f"baseline_{name}": baseline[name] for name in raw_totals},
+                **next_highwater,
+            },
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
         )
-        token_delta_dollars = cost_for(
-            self.model,
-            delta_in,
-            delta_out,
-            cache_creation_tokens=delta_cache_creation,
-            cache_read_tokens=delta_cache_read,
-        )
-        if delta_in or delta_out or delta_cache_creation or delta_cache_read:
-            self.session_store.record_spend(
-                session.task_id,
-                delta_in,
-                delta_out,
-                token_delta_dollars,
-                cache_creation_tokens=delta_cache_creation,
-                cache_read_tokens=delta_cache_read,
-            )
 
         # 2. Session-hour overhead delta — we only want to add what's accrued
         # since the last poll. The driver doesn't tell us total wall time, so
@@ -368,29 +522,47 @@ class ManagedExecutor:
         # already-accrued figure stored on the row.
         wall_so_far = max(0.0, time.time() - float(session.started_at))
         cumulative_hourly = (wall_so_far / 3600.0) * MANAGED_SESSION_HOUR_OVERHEAD
-        prior_hourly = self.session_store.get_accrued_session_hour_dollars(session.task_id)
+        prior_hourly = self.session_store.get_accrued_session_hour_dollars(
+            session.task_id, attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         hourly_delta = max(0.0, cumulative_hourly - prior_hourly)
         if hourly_delta > 0:
-            self.session_store.add_session_hour_overhead(session.task_id, hourly_delta)
-            self.session_store.set_accrued_session_hour_dollars(session.task_id, cumulative_hourly)
+            self.session_store.add_session_hour_overhead(
+                session.task_id, hourly_delta,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
+            self.session_store.set_accrued_session_hour_dollars(
+                session.task_id, cumulative_hourly,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
 
         # 3. Mid-run budget breach: kill the remote session before it racks
         # up more cost. The check uses the refreshed in-flight totals so the
         # session-hour delta we just booked is included.
         budget = session.budget or {}
         refreshed = self.session_store.get(session.task_id)
+        if refreshed is None or not self._is_current(session):
+            return self._with_identity(session, ExecutorOutcome(status=STATUS_RUNNING))
         breach = self._budget_breach(refreshed, budget)
         if breach:
             try:
                 self.driver.kill_session(remote_id, reason=f"budget_exceeded:{breach}")
             except Exception as exc:  # pragma: no cover — best-effort kill
                 logger.warning("kill_session %s failed: %s", remote_id, exc)
-            self.session_store.update_status(session.task_id, STATUS_BUDGET_EXCEEDED)
+            self.session_store.update_status(
+                session.task_id, STATUS_BUDGET_EXCEEDED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             self.transcript_store.append(sid, "budget_exceeded", {"kind": breach, "source": "client"})
-            return ExecutorOutcome(status=STATUS_BUDGET_EXCEEDED, reason=f"budget exceeded ({breach})")
+            return self._with_identity(
+                session, ExecutorOutcome(status=STATUS_BUDGET_EXCEEDED, reason=f"budget exceeded ({breach})")
+            )
 
         if state.last_event_id:
-            self.session_store.set_managed_last_event_id(session.task_id, state.last_event_id)
+            self.session_store.set_managed_last_event_id(
+                session.task_id, state.last_event_id,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
 
         # Cache the latest non-empty agent.message text. `get_session_state`
         # advances a cursor, so a poll that returns only `session.status_idle`
@@ -398,19 +570,25 @@ class ManagedExecutor:
         # in an earlier batch. Persisting here guarantees the finalize step
         # surfaces real output instead of an empty completion summary.
         if state.final_text:
-            self.session_store.set_managed_final_text(session.task_id, state.final_text)
+            self.session_store.set_managed_final_text(
+                session.task_id, state.final_text,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
 
         # Terminal handling.
         if state.status in TERMINAL_REMOTE_STATUSES:
             return self._finalize_remote(session, state)
 
-        return ExecutorOutcome(status=STATUS_RUNNING)
+        return self._with_identity(session, ExecutorOutcome(status=STATUS_RUNNING))
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _detect_runaway(self, task_id: str, new_events: list[dict]) -> str | None:
+    def _detect_runaway(
+        self, task_id: str, new_events: list[dict], *,
+        attempt_id: str | None = None, turn_id: str | None = None,
+    ) -> str | None:
         """Walk `new_events`, update persisted runaway counters, and return
         a kill reason if any threshold tripped — else None.
 
@@ -429,7 +607,9 @@ class ManagedExecutor:
         consistent. State is reset by `agent.message` (no-progress) or a
         change in tool signature (tool-loop).
         """
-        state = self.session_store.get_runaway_state(task_id)
+        state = self.session_store.get_runaway_state(
+            task_id, attempt_id=attempt_id, turn_id=turn_id,
+        )
         signature = state["tool_loop_signature"]
         loop_count = state["tool_loop_count"]
         since_msg = state["tool_calls_since_message"]
@@ -463,6 +643,8 @@ class ManagedExecutor:
             tool_loop_signature=signature,
             tool_loop_count=loop_count,
             tool_calls_since_message=since_msg,
+            attempt_id=attempt_id,
+            turn_id=turn_id,
         )
         return kill
 
@@ -508,9 +690,11 @@ class ManagedExecutor:
         Appends any newly-visible events to the transcript (dedupe by
         event id against what's already there)."""
         remote_id = session.managed_agent_session_id
-        if not remote_id:
+        if not remote_id or not self._is_current(session):
             return
         time.sleep(self._TERMINAL_BACKFILL_DELAY_SECONDS)
+        if not self._is_current(session):
+            return
         try:
             late_events = self.driver.list_events(remote_id, after_id=None)
         except Exception as exc:
@@ -547,9 +731,19 @@ class ManagedExecutor:
             refreshed = _extract_final_text(late_events)
             if refreshed and refreshed != state.final_text:
                 state.final_text = refreshed
-                self.session_store.set_managed_final_text(session.task_id, refreshed)
+                self.session_store.set_managed_final_text(
+                    session.task_id, refreshed,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
 
     def _finalize_remote(self, session, state) -> ExecutorOutcome:
+        if not self._is_current(session):
+            return self._with_identity(session, ExecutorOutcome(status=STATUS_RUNNING))
+        if self._is_cancelled(session):
+            return self._with_identity(
+                session,
+                ExecutorOutcome(status=STATUS_FAILED, reason="managed turn cancelled"),
+            )
         # Session-hour overhead has already been booked incrementally in
         # poll(), so finalize doesn't need to add anything more — just record
         # the terminal status.
@@ -562,12 +756,31 @@ class ManagedExecutor:
             # backfill anything we missed. The status endpoint goes
             # terminal before /events fully reflects the final rounds.
             self._backfill_events_on_terminal(session, state)
+            if not self._is_current(session):
+                return self._with_identity(session, ExecutorOutcome(status=STATUS_RUNNING))
+            if self._is_cancelled(session):
+                return self._with_identity(
+                    session,
+                    ExecutorOutcome(status=STATUS_FAILED, reason="managed turn cancelled"),
+                )
             # `state.final_text` reflects only events in *this* poll batch. If
             # the agent.message arrived in a prior batch and only the idle
             # event arrived now, fall back to the cached value persisted by
             # poll().
-            final_text = state.final_text or self.session_store.get_managed_final_text(session.task_id) or ""
-            self.session_store.update_status(session.task_id, STATUS_COMPLETED)
+            final_text = state.final_text or self.session_store.get_managed_final_text(
+                session.task_id, attempt_id=session.attempt_id, turn_id=session.turn_id,
+            ) or ""
+            completed = self.session_store.update_status(
+                session.task_id, STATUS_COMPLETED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
+            if not completed:
+                if self._is_cancelled(session):
+                    return self._with_identity(
+                        session,
+                        ExecutorOutcome(status=STATUS_FAILED, reason="managed turn cancelled"),
+                    )
+                return self._with_identity(session, ExecutorOutcome(status=STATUS_RUNNING))
             # Persist the body alongside its length. The final text is also
             # sent to Telegram, but the transcript is the only durable record
             # an operator can grep later to audit what an agent actually said.
@@ -581,26 +794,39 @@ class ManagedExecutor:
                  "remote_status": state.status,
                  "init_failed_mcps": list(state.init_failed_mcps)},
             )
-            return ExecutorOutcome(
+            return self._with_identity(session, ExecutorOutcome(
                 status=STATUS_COMPLETED,
                 final_text=final_text,
                 init_failed_mcps=list(state.init_failed_mcps),
-            )
+            ))
 
         if state.status == "budget_exceeded":
-            self.session_store.update_status(session.task_id, STATUS_BUDGET_EXCEEDED)
+            self.session_store.update_status(
+                session.task_id, STATUS_BUDGET_EXCEEDED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             self.transcript_store.append(session.session_id, "managed_budget_exceeded", {})
-            return ExecutorOutcome(status=STATUS_BUDGET_EXCEEDED,
-                                   reason=state.error_reason or "remote budget exceeded")
+            return self._with_identity(session, ExecutorOutcome(
+                status=STATUS_BUDGET_EXCEEDED,
+                reason=state.error_reason or "remote budget exceeded",
+            ))
 
         if state.status == "cancelled":
-            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            self.session_store.update_status(
+                session.task_id, STATUS_FAILED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             reason = state.error_reason or "session cancelled remotely"
             self.transcript_store.append(session.session_id, "managed_cancelled", {"reason": reason})
-            return ExecutorOutcome(status=STATUS_FAILED, reason=f"cancelled: {reason}")
+            return self._with_identity(
+                session, ExecutorOutcome(status=STATUS_FAILED, reason=f"cancelled: {reason}")
+            )
 
         # failed (or unknown terminal)
-        self.session_store.update_status(session.task_id, STATUS_FAILED)
+        self.session_store.update_status(
+            session.task_id, STATUS_FAILED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         reason = state.error_reason or f"remote status={state.status}"
         self.transcript_store.append(session.session_id, "managed_failed", {"reason": reason})
-        return ExecutorOutcome(status=STATUS_FAILED, reason=reason)
+        return self._with_identity(session, ExecutorOutcome(status=STATUS_FAILED, reason=reason))

@@ -23,6 +23,7 @@ from typing import Iterable, Optional
 RUNNING_TAG = "agent-running"
 COMPLETED_TAG = "agent-completed"
 BLOCKED_TAG = "agent-blocked"
+MACHINE_WAIT_TAGS = frozenset({"agent-wait-provider", "agent-wait-dependency"})
 
 # A `#human` card is filed for the operator directly (not by the worker).
 HUMAN_TAG = "human"
@@ -115,6 +116,11 @@ def derive_lane(status: str, tags: Iterable[str]) -> str:
 
     if COMPLETED_TAG in tset and ACCEPTED_TAG not in tset:
         return "review"
+    # Provider/dependency waits are machine-owned and remain In Progress. The
+    # wait-reason badge is derived from these tags; Human Queue is reserved for
+    # operator cards/questions and legacy untyped blocked tasks.
+    if tset & MACHINE_WAIT_TAGS:
+        return "in_progress"
     if BLOCKED_TAG in tset or HUMAN_TAG in tset or status_norm == "blocked":
         return "human_queue"
     if status_norm == "in_progress" or RUNNING_TAG in tset:

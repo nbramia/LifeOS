@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import asdict
 
 from config.settings import settings
 
 from .session_store import STATUS_CLAIMED, SessionStore, new_session_id
+from .execution import ExecutionRequest
 
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,8 @@ def spawn_claude_code_session(
     plan_mode: bool = False,
     chat_id: str | None = None,
     bot: str | None = None,
+    persona_id: str | None = None,
+    execution_request: ExecutionRequest | None = None,
 ) -> dict:
     """Create a parentless ``routing='claude_code'`` session.
 
@@ -96,6 +100,9 @@ def spawn_claude_code_session(
     # See operator_spawn for the rationale on enqueueing the prompt before
     # the session row exists.
     session_store.enqueue_message(session_id, "operator", json.dumps(payload))
+    canonical = execution_request or ExecutionRequest(
+        executor="claude_code", working_dir=working_dir,
+    )
     session = session_store.create(
         task_id=task_id,
         session_id=session_id,
@@ -106,6 +113,8 @@ def spawn_claude_code_session(
         parent_session_id=None,
         origin="operator",
         bot=bot,
+        execution_request=asdict(canonical),
+        persona_id=persona_id,
     )
 
     logger.info(

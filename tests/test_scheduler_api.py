@@ -60,6 +60,21 @@ class TestSchedulerAPI:
         assert kwargs["action"] == "agent"
         assert kwargs["executor"] == "cloud"
 
+    def test_create_propagates_execution_context(self, client, mock_store):
+        response = client.post("/api/scheduler", json={
+            "name": "Pinned", "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            "action": "agent", "persona_id": "primary", "model_id": "gpt-synthetic",
+            "effort": "high", "host": "server", "working_dir": "/tmp/synthetic",
+        })
+        assert response.status_code == 200
+        kwargs = mock_store.create.call_args.kwargs
+        assert {key: kwargs[key] for key in (
+            "persona_id", "model_id", "effort", "host", "working_dir",
+        )} == {
+            "persona_id": "primary", "model_id": "gpt-synthetic", "effort": "high",
+            "host": "server", "working_dir": "/tmp/synthetic",
+        }
+
     def test_create_defaults_action_from_message_type(self, client, mock_store):
         client.post("/api/scheduler", json={
             "name": "Ping", "schedule_type": "cron", "schedule_value": "0 9 * * *",

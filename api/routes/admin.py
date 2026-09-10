@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 import logging
+from pathlib import Path
 
 from api.services.indexer import IndexerService
 from api.services.vectorstore import VectorStore
@@ -338,6 +339,17 @@ async def get_usage_summary() -> UsageSummary:
     try:
         from api.services.usage_store import get_usage_store
         usage_store = get_usage_store()
+        # Canonical worker observations are the source of truth. Materialize
+        # their additive legacy projection before serving the long-standing
+        # admin contract, but only for the configured singleton store. A
+        # caller-supplied/injected UsageStore is an isolated source of truth;
+        # replaying the process-default ledger into it mixes databases and
+        # makes an otherwise two-row fixture report unrelated production rows.
+        configured_usage_path = (Path(settings.chroma_path).parent / "usage.db").resolve()
+        usage_path = getattr(usage_store, "db_path", None)
+        if usage_path is not None and Path(usage_path).resolve() == configured_usage_path:
+            from api.services.agent_worker.usage_ledger import UsageLedger
+            UsageLedger().replay_projection(usage_store)
         summary = usage_store.get_summary()
 
         return UsageSummary(

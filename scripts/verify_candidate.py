@@ -431,8 +431,14 @@ def pytest_lane_executor(
                 receipt.unlink()
             output_log = lane_log_dir / f"{lane}.log"
         else:
-            receipt = runtime_root / f"execution-{uuid.uuid4().hex}.json"
-            output_log = None
+            # Keep pytest's human-readable output out of the verifier's
+            # stdout. Callers commonly redirect stdout to the authoritative
+            # top-level receipt, which must remain one JSON document rather
+            # than a pytest transcript followed by JSON. This private log is
+            # removed with the runtime root after the lane completes.
+            execution_id = uuid.uuid4().hex
+            receipt = runtime_root / f"execution-{execution_id}.json"
+            output_log = runtime_root / f"execution-{execution_id}.log"
         command = [sys.executable, "-m", "pytest", "tests", "-q", "--tb=short", "--ignore=tests/archive", "-p", "no:cacheprovider", "-p", "scripts.test_lane_plugin", "--lifeos-lane-nodeids", str(nodeid_file), "--lifeos-lane-execution", str(receipt), "-m", marker(BY_NAME[lane])]
         if lane == "browser-free" and parallel_browser_free and workers > 1:
             # Explicit opt-in only -- default false, so an ordinary caller's
@@ -945,7 +951,28 @@ def _main(argv: Sequence[str]) -> int:
             shutil.rmtree(snapshot.parent, ignore_errors=True)
     else:
         return 2
-    payload = {"candidate_id": result.candidate_id, "reused": result.reused, "reason": result.reason, "lanes": [outcome.lane for outcome in result.outcomes]}
+    # ``reason`` describes cache selection (and is ``missing`` on the first
+    # successful execution); it is not the verification result.  Keep it for
+    # diagnostics, but publish an authoritative top-level result so consumers
+    # cannot mistake a stale/missing receipt reason for the candidate outcome.
+    # ``evidence_key`` links this summary to the lane-attributable receipt
+    # under ``--evidence-root``.
+    outcome_result = (
+        "success"
+        if result.outcomes and all(
+            outcome.result == "success" and outcome.exit_status == 0
+            for outcome in result.outcomes
+        )
+        else "failure"
+    )
+    payload = {
+        "candidate_id": result.candidate_id,
+        "evidence_key": result.evidence_key,
+        "reused": result.reused,
+        "result": outcome_result,
+        "reason": result.reason,
+        "lanes": [outcome.lane for outcome in result.outcomes],
+    }
     print(json.dumps(payload, sort_keys=True))
     return 0 if all(outcome.result == "success" and outcome.exit_status == 0 for outcome in result.outcomes) else 1
 
