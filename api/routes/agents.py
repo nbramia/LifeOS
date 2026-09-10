@@ -1310,6 +1310,8 @@ async def undo_accept_board_card(card_id: str) -> dict[str, Any]:
     _invalidate_board_cache()
     lane = agent_board.derive_lane(task.status, task.tags)
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
+
+
 @router.post("/board/cards/{card_id}/review-action")
 async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> dict[str, Any]:
     """Apply a blocked response, review rejection, or review reassignment.
