@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "kind": "result",
+  "capture_id": "producer-text-only-001",
+  "revision": 1,
+  "recorded_at_utc": "2030-01-01T10:00:00+00:00",
+  "received_at_utc": "2030-01-01T10:01:00+00:00",
+  "source": {
+    "id": "synthetic-ring",
+    "client": null,
+    "trigger": null
+  },
+  "status": "ready",
+  "availability": {
+    "audio": false,
+    "pebble_text": true
+  },
+  "pebble_text": "Buy synthetic printer paper.",
+  "audio": null,
+  "provenance": {
+    "receipt": "durable",
+    "raw_stt": "unavailable",
+    "interpretation": "complete"
+  },
+  "whisper_raw": null,
+  "whisper_polished": null,
+  "final_text": "Buy synthetic printer paper.",
+  "comparison": "single_source",
+  "reconciliation": {
+    "status": "ready",
+    "selected_source": "pebble"
+  },
+  "models": {}
+}

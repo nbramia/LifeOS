@@ -47,6 +47,7 @@ from zoneinfo import ZoneInfo
 
 from config.settings import settings
 from api.services.atomic_write import atomic_write_text
+from api.services.operation_lock import exclusive_operation_lock
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,7 @@ class ScheduleEntry:
     timezone: str = ""  # resolved from settings.timezone when empty
     last_status: str = ""  # outcome of the most recent fire (sent/suppressed/handed-off/failed)
     last_result: str = ""  # short snippet of the most recent fire's result
+    operation_key: str = ""  # durable external-source operation identity
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -224,6 +226,8 @@ def _format_entry_line(entry: ScheduleEntry) -> str:
         parts.append(f"[created:: {entry.created_at}]")
     if entry.last_triggered_at:
         parts.append(f"[last:: {entry.last_triggered_at}]")
+    if entry.operation_key:
+        parts.append(f"[operation_key:: {entry.operation_key}]")
     parts.append(f"<!-- id:{entry.id} -->")
     return " ".join(parts)
 
@@ -274,6 +278,7 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
         created_at=fields.get("created", ""),
         last_triggered_at=fields.get("last") or None,
         timezone=fields.get("tz", ""),
+        operation_key=fields.get("operation_key", ""),
     )
 
 
@@ -365,7 +370,9 @@ class SchedulerStore:
         self.scheduler_dir = base / SCHEDULER_FOLDER
         self.inbox_path = self.scheduler_dir / INBOX_FILE
         self._entries: dict[str, ScheduleEntry] = {}
-        self._lock = threading.Lock()
+        # Reentrant because create_or_find_by_operation keeps the same write
+        # guard while delegating its new-object branch to create().
+        self._lock = threading.RLock()
 
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         self.scheduler_dir.mkdir(parents=True, exist_ok=True)
@@ -457,7 +464,7 @@ class SchedulerStore:
     # CRUD
     # ------------------------------------------------------------------
 
-    def create(self, action: Optional[str] = None, **kwargs) -> ScheduleEntry:
+    def create(self, action: Optional[str] = None, _log_content: bool = True, **kwargs) -> ScheduleEntry:
         with self._lock:
             # Default action from legacy message_type when not given explicitly.
             if action is None:
@@ -472,8 +479,49 @@ class SchedulerStore:
             self._insert_block_at_top(_format_entry_block(entry))
             self._entries = {**self._entries, entry.id: entry}
             self._save()
-            logger.info(f"Created schedule: {entry.id} - {entry.name}")
+            if _log_content:
+                logger.info(f"Created schedule: {entry.id} - {entry.name}")
+            else:
+                logger.info("Created schedule %s for an external operation", entry.id)
             return entry
+
+    def create_or_find_by_operation(
+        self, operation_key: str, *, action: Optional[str] = None, **kwargs
+    ) -> tuple[ScheduleEntry, bool]:
+        """Atomically find or create a schedule identified in Markdown.
+
+        ``operation_key`` is deliberately an inline field so a cache rebuild
+        can recover a post-write/pre-ledger crash without producing a second
+        schedule.  It is an internal primitive; callers retain authority over
+        whether a deleted acknowledged entry may ever be recreated.
+        """
+        if not operation_key:
+            raise ValueError("operation_key must not be empty")
+        with self._lock, exclusive_operation_lock(self.index_path.parent / ".scheduler-operation.lock"):
+            # Re-read the authoritative Inbox.md before deciding a cache miss
+            # is a new operation (a process may have died after its rename).
+            self.rebuild_index()
+            for entry in self._entries.values():
+                if entry.operation_key == operation_key:
+                    return entry, False
+            supplied = kwargs.pop("operation_key", operation_key)
+            if supplied != operation_key:
+                raise ValueError("operation_key must match supplied operation key")
+            return self.create(
+                action=action, operation_key=operation_key, _log_content=False, **kwargs
+            ), True
+
+    def find_by_operation(self, operation_key: str) -> Optional[ScheduleEntry]:
+        """Find an operation in authoritative Markdown without creating it."""
+        if not operation_key:
+            raise ValueError("operation_key must not be empty")
+        with self._lock, exclusive_operation_lock(self.index_path.parent / ".scheduler-operation.lock"):
+            self.rebuild_index()
+            return next(
+                (entry for entry in self._entries.values()
+                 if entry.operation_key == operation_key),
+                None,
+            )
 
     def get(self, entry_id: str) -> Optional[ScheduleEntry]:
         return self._entries.get(entry_id)
@@ -965,7 +1013,8 @@ class SchedulerScheduler:
         Recently-Fired section.
         """
         import time as _time
-        logger.info(f"Firing schedule: {entry.name} ({entry.id}, action={entry.action})")
+        label = entry.id if entry.operation_key else entry.name
+        logger.info(f"Firing schedule: {label} ({entry.id}, action={entry.action})")
 
         # Advance next_trigger_at BEFORE generating/sending to prevent
         # duplicate fires on server restart or scheduler re-entry.
@@ -979,7 +1028,10 @@ class SchedulerScheduler:
         try:
             if entry.action == "agent":
                 handoff = self._hand_off_to_agent(entry)
-                logger.info(f"Schedule {entry.name}: handed off to agent worker — {handoff}")
+                if entry.operation_key:
+                    logger.info("Schedule %s: handed off to agent worker", entry.id)
+                else:
+                    logger.info(f"Schedule {entry.name}: handed off to agent worker — {handoff}")
                 self.store.record_run(entry.id, "handed-off", handoff)
                 return
 
@@ -1000,7 +1052,7 @@ class SchedulerScheduler:
             if entry.action in ("notify", "prompt") and (
                 not message or self._should_suppress(message)
             ):
-                logger.info(f"Schedule {entry.name}: suppressed (no actionable content)")
+                logger.info(f"Schedule {label}: suppressed (no actionable content)")
                 self.store.record_run(entry.id, "suppressed", "")
                 return
 
@@ -1010,13 +1062,22 @@ class SchedulerScheduler:
                     f"{_misroute_notice(entry.bot)}*{entry.name}*\n\n{message}",
                     bot=entry.bot or None,
                 )
-                self.store.record_run(entry.id, "sent", message[:200])
+                self.store.record_run(
+                    entry.id, "sent", "" if entry.operation_key else message[:200]
+                )
             else:
                 self.store.record_run(entry.id, "empty", "")
         except Exception as e:
             elapsed = _time.monotonic() - start
-            logger.error(f"Failed to fire schedule {entry.id} after {elapsed:.1f}s: {e}")
-            self.store.record_run(entry.id, "failed", str(e)[:200])
+            if entry.operation_key:
+                logger.error(
+                    "Failed to fire schedule %s after %.1fs (%s)",
+                    entry.id, elapsed, type(e).__name__,
+                )
+                self.store.record_run(entry.id, "failed", type(e).__name__)
+            else:
+                logger.error(f"Failed to fire schedule {entry.id} after {elapsed:.1f}s: {e}")
+                self.store.record_run(entry.id, "failed", str(e)[:200])
             try:
                 from api.services.telegram import send_message_async
                 await send_message_async(
@@ -1053,6 +1114,7 @@ class SchedulerScheduler:
         task = get_task_manager().create(
             description=entry.message_content or entry.name,
             tags=tags,
+            _log_content=not bool(entry.operation_key),
         )
         return f"task {task.id} (tags: {', '.join('#' + t for t in tags)})"
 

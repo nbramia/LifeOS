@@ -1360,6 +1360,14 @@ class Settings(BaseSettings):
                     "token, separate from LIFEOS_MCP_BEARER_TOKEN/LIFEOS_HEALTH_INGEST_TOKEN."
     )
 
+    # Pebble writes finalized, framed capture evidence into this producer-owned
+    # archive.  Filing is opt-in until an operator has verified dry-run output;
+    # no network credential or cloud LLM fallback is involved.
+    pebble_capture_enabled: bool = Field(default=False, alias="LIFEOS_PEBBLE_CAPTURE_ENABLED")
+    pebble_capture_apply: bool = Field(default=False, alias="LIFEOS_PEBBLE_CAPTURE_APPLY")
+    pebble_capture_dir: str = Field(default="LifeOS/Log/Pebble", alias="LIFEOS_PEBBLE_CAPTURE_DIR")
+    pebble_capture_scan_seconds: int = Field(default=60, ge=10, alias="LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS")
+
     # Monarch Money
     monarch_email: str = Field(
         default="",

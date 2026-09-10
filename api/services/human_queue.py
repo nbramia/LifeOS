@@ -176,6 +176,7 @@ def add_card(
     source_host: Optional[str] = None,
     source_cwd: Optional[str] = None,
     source_session: Optional[str] = None,
+    _log_content: bool = True,
 ) -> Task:
     """File a human-queue card, or update the matching OPEN card if `key`
     is already open — no duplicate, notes replaced, `updated_at` advances
@@ -229,6 +230,7 @@ def add_card(
         tags=[TAG],
         notes=notes,
         fields=fields,
+        _log_content=_log_content,
     )
 
 

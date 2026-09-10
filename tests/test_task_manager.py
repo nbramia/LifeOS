@@ -5,6 +5,7 @@ Tests task CRUD operations, status transitions, context changes, fuzzy search,
 parse/format round-trip, reindexing, and persistence.
 """
 import json
+import multiprocessing
 import re
 import pytest
 from datetime import date
@@ -25,6 +26,18 @@ from api.services.task_manager import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def _create_task_operation_process(vault, index, start, results, title):
+    try:
+        manager = TaskManager(vault_path=Path(vault), index_path=Path(index))
+        start.wait()
+        task, created = manager.create_or_find_by_operation(
+            "pebble:process-task", description=title
+        )
+        results.put((task.id, created, ""))
+    except Exception as exc:  # pragma: no cover - surfaced in parent
+        results.put(("", False, repr(exc)))
 
 
 # =============================================================================
@@ -58,6 +71,110 @@ def populated_manager(task_manager):
     task_manager.create("Buy groceries", context="Personal", due_date="2025-02-15")
     task_manager.create("Schedule meeting", context="Work", due_date="2025-02-10", priority="urgent")
     return task_manager
+
+
+def test_create_or_find_by_operation_survives_index_rebuild(task_manager, tmp_vault, tmp_index):
+    """A ledger retry finds the Markdown operation key after a cache rebuild."""
+    first, created = task_manager.create_or_find_by_operation(
+        "pebble:synthetic-source:capture-a:0", description="Synthetic task"
+    )
+    assert created is True
+
+    rebuilt = TaskManager(vault_path=tmp_vault, index_path=tmp_index)
+    second, created = rebuilt.create_or_find_by_operation(
+        "pebble:synthetic-source:capture-a:0", description="Should not be used"
+    )
+    assert created is False
+    assert second.id == first.id
+
+
+def test_operation_retry_reconciles_markdown_after_pre_cache_crash(task_manager, monkeypatch):
+    """The source-operation lookup does not trust a stale in-memory cache."""
+    original = task_manager._cas_insert_at_top
+
+    def commit_then_crash(*args, **kwargs):
+        original(*args, **kwargs)
+        raise RuntimeError("synthetic post-markdown pre-cache crash")
+
+    monkeypatch.setattr(task_manager, "_cas_insert_at_top", commit_then_crash)
+    with pytest.raises(RuntimeError, match="post-markdown"):
+        task_manager.create_or_find_by_operation("pebble:synthetic:crash:0", description="Synthetic")
+    monkeypatch.setattr(task_manager, "_cas_insert_at_top", original)
+
+    task, created = task_manager.create_or_find_by_operation("pebble:synthetic:crash:0", description="Duplicate")
+    assert created is False
+    assert task.description == "Synthetic"
+
+
+def test_operation_create_is_atomic_across_independent_managers(tmp_vault, tmp_index):
+    """The shared file lock makes the Markdown check-and-create process-safe."""
+    import threading
+
+    managers = [
+        TaskManager(vault_path=tmp_vault, index_path=tmp_index),
+        TaskManager(vault_path=tmp_vault, index_path=tmp_index),
+    ]
+    barrier = threading.Barrier(2)
+    results = []
+    errors = []
+
+    def create(manager, title):
+        try:
+            barrier.wait()
+            results.append(manager.create_or_find_by_operation(
+                "pebble:atomic-task", description=title
+            ))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=create, args=(managers[0], "Synthetic A")),
+        threading.Thread(target=create, args=(managers[1], "Synthetic B")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert sum(created for _task, created in results) == 1
+    assert len({task.id for task, _created in results}) == 1
+    rebuilt = TaskManager(vault_path=tmp_vault, index_path=tmp_index)
+    assert len(rebuilt.list_tasks()) == 1
+
+
+def test_operation_create_is_atomic_across_processes(tmp_vault, tmp_index):
+    """The Markdown operation key is unique across real writer processes."""
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_create_task_operation_process,
+            args=(str(tmp_vault), str(tmp_index), start, results, f"Synthetic {index}"),
+        )
+        for index in range(2)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    observed = [results.get(timeout=10) for _ in processes]
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+    assert [error for _id, _created, error in observed if error] == []
+    assert sum(created for _id, created, _error in observed) == 1
+    assert len({task_id for task_id, _created, _error in observed}) == 1
+    rebuilt = TaskManager(vault_path=tmp_vault, index_path=tmp_index)
+    assert len(rebuilt.list_tasks()) == 1
+
+
+def test_operation_create_log_omits_description(task_manager, caplog):
+    secret = "Synthetic transcript-derived private task"
+    with caplog.at_level("INFO"):
+        task_manager.create_or_find_by_operation("pebble:opaque-task", description=secret)
+    assert secret not in caplog.text
+    assert "for an external operation" in caplog.text
 
 
 # =============================================================================
