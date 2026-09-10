@@ -2,7 +2,7 @@
 //
 // The network call, toast, and (for Delete) the kill-then-delete
 // confirmation modal behind each card-only action in the shared action row
-// (Open, Accept, Resolve, Cancel, Delete — see ./session_actions.js's
+// (Open, Accept, Reject, Reassign, Mark Done, Cancel, Delete — see ./session_actions.js's
 // `decideActions`) — the part that's identical wherever a card-aware panel
 // offers them: the Board drawer (web/agents/board.js) and a card-linked
 // Graph tab side panel (web/agents/panel.js). A caller supplies `onChanged`
@@ -76,7 +76,69 @@ export async function acceptCard(card, onChanged, onAccepted) {
   } catch (err) { showToast(`Accept failed: ${err.message}`, true); }
 }
 
-// Resolve is a drop onto Done under the hood.
+/**
+ * Reject a completed review with operator context, or reassign it while
+ * retaining the prior session transcript as the next run's context.
+ */
+export function openReviewActionModal(card, action, onChanged) {
+  const isReject = action === 'reject';
+  const title = isReject ? 'Reject review' : 'Reassign review';
+  const assignees = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud'];
+  const assigneeHtml = isReject ? '' : `
+    <label for="review-assignee">Assignee</label>
+    <select id="review-assignee">
+      ${assignees.map(a => `<option value="${a}" ${a === card.assignee ? 'selected' : ''}>${a}</option>`).join('')}
+    </select>
+  `;
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  backdrop.innerHTML = `
+    <div class="modal" role="dialog" aria-labelledby="review-action-title">
+      <h2 id="review-action-title">${title}</h2>
+      <div class="target">${escapeHtml(card.title || card.id)}</div>
+      ${assigneeHtml}
+      <label for="review-note">${isReject ? 'Note (required)' : 'Context note (optional)'}</label>
+      <textarea id="review-note" placeholder="${isReject ? 'What should be changed?' : 'What should the next run know?'}"></textarea>
+      <div class="actions">
+        <button id="review-action-cancel">Cancel</button>
+        <button class="danger" id="review-action-submit">${isReject ? 'Reject' : 'Reassign'}</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(backdrop);
+  const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
+  backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
+  backdrop.querySelector('#review-action-cancel').onclick = cleanup;
+  backdrop.querySelector('#review-action-submit').onclick = async () => {
+    const note = backdrop.querySelector('#review-note').value.trim();
+    if (isReject && !note) return;
+    const btn = backdrop.querySelector('#review-action-submit');
+    btn.disabled = true;
+    btn.textContent = isReject ? 'Rejecting…' : 'Reassigning…';
+    const payload = { action, note };
+    if (!isReject) payload.assignee = backdrop.querySelector('#review-assignee').value;
+    try {
+      const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/review-action`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        let msg = text;
+        try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+        throw new Error(msg || `HTTP ${r.status}`);
+      }
+      showToast(isReject ? 'Review rejected; resuming with your note.' : 'Review reassigned.', false);
+      cleanup();
+      if (onChanged) await onChanged(await r.json());
+    } catch (err) {
+      showToast(`${isReject ? 'Reject' : 'Reassign'} failed: ${err.message}`, true);
+      btn.disabled = false;
+      btn.textContent = isReject ? 'Reject' : 'Reassign';
+    }
+  };
+}
+
+// Mark Done is a drop onto Done under the hood.
 export async function resolveCard(card, onChanged) {
   try {
     const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/lane`, {
@@ -246,6 +308,8 @@ export function cardActionHandlers(card, { findCard, onChanged, onAccepted } = {
   return {
     open: () => openCard(card, changed),
     accept: () => acceptCard(card, changed, onAccepted),
+    reject: () => openReviewActionModal(card, 'reject', changed),
+    reassign: () => openReviewActionModal(card, 'reassign', changed),
     resolve: () => resolveCard(card, changed),
     cancel: () => cancelCard(card, changed),
     delete: () => openDeleteCardModal(card, { findCard, onDeleted: changed }),

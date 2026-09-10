@@ -11,6 +11,7 @@ import hmac
 import json
 import logging
 import socket
+import threading
 import time
 from typing import Any
 
@@ -61,6 +62,11 @@ _SUMMARY_TAIL = 100
 
 # How many sessions to list per snapshot. Sessions are returned newest-first.
 _SNAPSHOT_LIMIT = 200
+
+# Review actions pair a vault write with a session-store enqueue. Serialize
+# them in this API process so two clicks cannot both consume the same review
+# or queue two resumes before the next board tick observes the first write.
+_BOARD_REVIEW_ACTION_LOCK = threading.RLock()
 
 
 # Event kinds that count as errors. Includes operator/peer-initiated kills
@@ -1185,6 +1191,13 @@ class LaneMoveRequest(BaseModel):
     assignee: str | None = None
 
 
+class ReviewActionRequest(BaseModel):
+    """Body for the atomic blocked/review card action endpoint."""
+    action: str = Field(..., min_length=1, max_length=20)
+    note: str = Field(default="", max_length=4096)
+    assignee: str | None = Field(default=None, max_length=40)
+
+
 @router.put("/board/cards/{card_id}/lane")
 async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]:
     """Move a task card to `lane`, writing the corresponding status/tag at
@@ -1297,6 +1310,95 @@ async def undo_accept_board_card(card_id: str) -> dict[str, Any]:
     _invalidate_board_cache()
     lane = agent_board.derive_lane(task.status, task.tags)
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
+@router.post("/board/cards/{card_id}/review-action")
+async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> dict[str, Any]:
+    """Apply a blocked response, review rejection, or review reassignment.
+
+    ``respond`` deposits into the existing pending-question path. ``reject``
+    queues a follow-up against the existing terminal session and moves the
+    card back to In progress. ``reassign`` clears terminal worker markers,
+    moves the card to Assigned, and leaves the prior session history intact;
+    the worker re-arms that session when it claims the new assignment.
+    """
+    from api.services import agent_board
+    from api.services.task_manager import get_task_manager, TaskConflictError
+
+    action = body.action.strip().lower()
+    note = body.note.strip()
+    if action not in ("respond", "reject", "reassign"):
+        raise HTTPException(status_code=400, detail="action must be respond, reject, or reassign")
+    if action in ("respond", "reject") and not note:
+        raise HTTPException(status_code=400, detail="note is required")
+
+    task_manager = get_task_manager()
+    session_store = _get_session_store()
+    with _BOARD_REVIEW_ACTION_LOCK:
+        task = task_manager.get(card_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="card not found")
+
+        if action == "respond":
+            questions = [q for q in session_store.list_open_questions() if q.get("task_id") == card_id]
+            if not questions:
+                raise HTTPException(status_code=409, detail="this blocked card has no open question to answer")
+            question = questions[0]
+            if not session_store.deposit_answer_by_id(question["id"], note):
+                raise HTTPException(status_code=409, detail="the question was answered or timed out; refresh the card")
+            _invalidate_board_cache()
+            return {"id": card_id, "action": action, "queued": True, "question_id": question["id"]}
+
+        plan = agent_board.plan_review_action(
+            task.status, task.tags, action, body.assignee,
+        )
+        if plan.error is not None:
+            status_code, detail = plan.error
+            raise HTTPException(status_code=status_code, detail=detail)
+
+        session = session_store.get(card_id)
+        if session is None:
+            raise HTTPException(status_code=409, detail="the prior agent session cannot be resumed")
+        if session.status not in TERMINAL_STATUSES:
+            raise HTTPException(status_code=409, detail="the prior agent session is still running")
+
+        followup_id: int | None = None
+        if action == "reject":
+            followup_id = session_store.enqueue_web_followup(
+                session.session_id, card_id, note,
+            )
+
+        old_notes = task.notes
+        new_notes = old_notes
+        if note:
+            new_notes = f"{old_notes}\n\nOperator note: {note}" if old_notes else f"Operator note: {note}"
+        try:
+            updated = task_manager.update(
+                card_id, status=plan.status, tags=plan.tags, notes=new_notes,
+            )
+        except (TaskConflictError, ValueError) as exc:
+            if followup_id is not None:
+                session_store.delete_pending_question(followup_id)
+            raise HTTPException(status_code=409 if isinstance(exc, TaskConflictError) else 422, detail=str(exc)) from exc
+        if updated is None:
+            if followup_id is not None:
+                session_store.delete_pending_question(followup_id)
+            raise HTTPException(status_code=404, detail="card not found")
+
+        if action == "reassign":
+            _get_transcript_store().append(session.session_id, "operator_reassigned", {
+                "assignee": (body.assignee or "").lstrip("#").lower(),
+                "note_chars": len(note),
+                "context_preserved": True,
+            })
+        _invalidate_board_cache()
+        return {
+            "id": updated.id,
+            "action": action,
+            "lane": agent_board.derive_lane(updated.status, updated.tags),
+            "status": updated.status,
+            "tags": list(updated.tags),
+            "queued": followup_id is not None,
+            "context_preserved": True,
+        }
 
 
 @router.post("/board/cards/{card_id}/cancel")

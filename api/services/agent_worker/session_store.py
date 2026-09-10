@@ -632,6 +632,36 @@ class SessionStore:
                 (status, _now(), task_id),
             )
 
+    def rearm_for_claim(self, task_id: str) -> Session | None:
+        """Re-open a terminal session for a reassigned task.
+
+        The task id remains the session's stable primary key, so rearming the
+        row lets the next worker run reuse its conversation/messages and
+        transcript instead of deleting the prior context and creating an
+        unrelated session. Executor-specific cursors are reset; durable
+        conversation history is intentionally retained.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM sessions WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None or row["status"] not in TERMINAL_STATUSES:
+                return None
+            conn.execute(
+                """
+                UPDATE sessions
+                SET status = ?, routing = NULL, budget_json = NULL,
+                    expected_output = NULL, preset_class = NULL,
+                    managed_agent_session_id = NULL, claude_code_session_id = NULL,
+                    conversation_id = NULL, remote_pgid = NULL,
+                    host = NULL, model = NULL, effort = NULL,
+                    last_activity_at = ?
+                WHERE task_id = ?
+                """,
+                (STATUS_CLAIMED, _now(), task_id),
+            )
+        return self.get(task_id)
+
     def list_by_status(self, status: str) -> list[Session]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -1513,6 +1543,15 @@ class SessionStore:
                 (session_id, task_id, now, answer, now),
             )
         return cur.lastrowid
+
+    def delete_pending_question(self, question_id: int) -> bool:
+        """Remove a just-enqueued web follow-up when its paired write fails."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM pending_questions WHERE id = ? AND kind = 'followup'",
+                (int(question_id),),
+            )
+        return cur.rowcount > 0
 
     def get_recent_resumable_followup(self, within_seconds: int) -> dict | None:
         """Return the most recent open follow-up whose notification was sent

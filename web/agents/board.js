@@ -4,7 +4,7 @@
 // task store via GET/PUT /api/agents/board*, with a card drawer that reuses
 // the shared SessionPanel (./panel.js) for the linked session's transcript,
 // exactly like the Graph tab's side panel does. The drawer's own action
-// row (Open, Go To, Resume, Kill, Answer, Accept, Resolve, Cancel, Delete)
+// row (Open, Go To, Resume, Kill, Answer, Accept, Reject, Reassign, Mark Done, Cancel, Delete)
 // is rendered by session_actions.js's `renderActionRow` — the same
 // function the Graph tab's side panel uses for its own header — so the
 // embedded SessionPanel here is constructed with `showActions: false`
@@ -55,6 +55,7 @@ const SORT_OPTIONS = new Set([
 const LIFECYCLE_TAGS = new Set([
   'agent-running', 'agent-blocked', 'agent-completed',
   'agent-failed', 'agent-budget-exceeded', 'accepted',
+  'agent-reassigned',
 ]);
 
 // Card fields the drawer renders as editable inputs — used to decide
@@ -2086,8 +2087,9 @@ export function initBoard() {
     return descendantsOf(snap.sessions || [], session);
   }
 
-  // The drawer's action row — Open, Go To, Resume, Kill, Answer, Accept,
-  // Resolve, Cancel, Delete. Which of these apply and whether each is
+  // The drawer's action row — Open, Go To, Resume, Kill, Answer, Accept, Reject,
+  // Reassign, Mark Done, Cancel, Delete.
+  // Which of these apply and whether each is
   // enabled or disabled-with-a-reason is decided once, by
   // session_actions.js's `decideActions`, and rendered by its
   // `renderActionRow` — the exact same function the Graph tab's side panel
@@ -2095,7 +2097,7 @@ export function initBoard() {
   // shared session. Go To/Resume/Kill/Answer are built into
   // `renderActionRow` itself (it owns Kill's cascade-preview modal,
   // Resume's host select, and Go To's "Locating…" state); Open, Accept,
-  // Resolve, Cancel, and Delete come from ./card_actions.js, shared with a
+  // Reject, Reassign, Mark Done, Cancel, and Delete come from ./card_actions.js, shared with a
   // card-linked Graph tab side panel — Cancel and Delete are overridden
   // below with the extra drawer-specific bookkeeping (closing/rebuilding
   // this drawer) that a bare handoff to `fetchBoard` doesn't cover.

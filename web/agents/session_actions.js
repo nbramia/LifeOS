@@ -16,7 +16,7 @@
 // drawer or panel. `card` may be omitted/undefined: a session with no
 // linked board card (the Graph tab's panel before the linked card is
 // known, or a session the board never tracked at all) skips any decision
-// that needs `card` (Open, Accept, Resolve, Cancel, Delete) rather than
+// that needs `card` (Open, Accept, Reject, Reassign, Mark Done, Cancel, Delete) rather than
 // inventing one; Answer reads a pending question off `card` when present,
 // off the session directly otherwise (both carry the identical
 // `_pending_question_view` shape from the server).
@@ -28,7 +28,7 @@
 // their container establishes its own block formatting context, which the
 // caller's own `.panel-header-actions` / `.drawer-actions` wrapper does)
 // and their behaviour is built in here; the card-only actions (Open,
-// Accept, Resolve, Cancel, Delete) have no generic cross-card behaviour
+// Accept, Reject, Reassign, Mark Done, Cancel, Delete) have no generic cross-card behaviour
 // (they need a task manager id and, for Delete, a confirmation modal) so
 // the caller supplies a handler per id via `handlers` — both the Board
 // drawer (web/agents/board.js) and a card-linked Graph tab panel
@@ -125,7 +125,7 @@ export function showToast(message, isError, options = {}) {
 // ---------------------------------------------------------------------
 // Decision — the ordered, canonical action set. Both surfaces render
 // exactly this order: Open, Rename, Go To, Resume, Kill, Answer, Accept,
-// Resolve, Cancel, Delete.
+// Reject, Reassign, Mark Done, Cancel, Delete.
 // ---------------------------------------------------------------------
 
 export function decideActions(session, card) {
@@ -191,9 +191,16 @@ export function decideActions(session, card) {
   // Accept — a card sitting in Review. Card-only.
   if (c && c.lane === 'review') {
     out.push({ id: 'accept', label: 'Accept', enabled: true, reason: null, danger: false });
+    // Reject/reassign require a prior session whose context can be resumed.
+    // A card-only snapshot without one keeps the existing Accept path but
+    // never invents a resume target.
+    if (s) {
+      out.push({ id: 'reject', label: 'Reject', enabled: true, reason: null, danger: false });
+      out.push({ id: 'reassign', label: 'Reassign', enabled: true, reason: null, danger: false });
+    }
   }
 
-  // Resolve — a manually-filed Human queue card with no pending question
+  // Mark Done — a manually-filed Human queue card with no pending question
   // behind it, and only when the equivalent drop-onto-Done move is itself
   // allowed. `policy.lanes` lists ONLY refused lanes — an absent `.done`
   // entry means allowed. Card-only.
@@ -201,7 +208,7 @@ export function decideActions(session, card) {
     const doneEntry = c.policy && c.policy.lanes && c.policy.lanes.done;
     const doneAllowed = !doneEntry || doneEntry.allowed !== false;
     if (c.lane === 'human_queue' && !pendingQuestion && doneAllowed) {
-      out.push({ id: 'resolve', label: 'Resolve', enabled: true, reason: null, danger: false });
+      out.push({ id: 'resolve', label: 'Mark Done', enabled: true, reason: null, danger: false });
     }
   }
 

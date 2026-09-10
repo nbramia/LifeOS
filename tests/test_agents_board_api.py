@@ -219,6 +219,7 @@ class TestGetBoard:
         assert pq["question"] == "Which environment — staging or prod?"
         assert pq["session_id"] == session.session_id
 
+
     def test_locally_scanned_cc_session_does_not_bogus_link_to_a_task(
         self, client, stores, monkeypatch, tmp_path: Path,
     ):
@@ -412,6 +413,85 @@ class TestGetBoard:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
+class TestReviewActions:
+    def test_reject_requires_note_and_queues_context(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done")
+        session = session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="local")
+
+        missing = client.post(f"/api/agents/board/cards/{task.id}/review-action", json={"action": "reject"})
+        assert missing.status_code == 400
+        assert task_manager.get(task.id).status == "done"
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Please add a synthetic edge-case check."},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["lane"] == "in_progress"
+        updated = task_manager.get(task.id)
+        assert updated.status == "in_progress"
+        assert "agent-running" in updated.tags
+        assert "Please add a synthetic edge-case check." in (updated.notes or "")
+        queued = session_store.list_answered_unprocessed_questions()
+        assert len(queued) == 1
+        assert queued[0]["session_id"] == session.session_id
+        assert queued[0]["answer"] == "Please add a synthetic edge-case check."
+
+    def test_reassign_preserves_session_context_and_moves_to_assigned(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done", notes="Prior output")
+        session = session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+        session_store.append_message(session.session_id, "assistant", "Prior synthetic result")
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude", "note": "Try a second synthetic approach."},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["lane"] == "assigned"
+        updated = task_manager.get(task.id)
+        assert updated.status == "todo"
+        assert updated.tags == ["claude", "agent-reassigned"]
+        assert "Prior output" in (updated.notes or "")
+        assert "Try a second synthetic approach." in (updated.notes or "")
+        assert session_store.get(task.id).session_id == session.session_id
+        assert session_store.get_messages(session.session_id)[0]["content"] == "Prior synthetic result"
+
+    def test_review_action_conflict_leaves_card_and_queue_unchanged(self, client, stores, monkeypatch):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="local")
+        from api.services.task_manager import TaskConflictError
+        monkeypatch.setattr(task_manager, "update", lambda *_a, **_k: (_ for _ in ()).throw(TaskConflictError("race")))
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry the synthetic example."},
+        )
+        assert response.status_code == 409
+        assert task_manager.get(task.id).status == "done"
+        assert task_manager.get(task.id).tags == ["codex", "agent-completed"]
+        assert session_store.list_answered_unprocessed_questions() == []
+
+    def test_blocked_respond_uses_existing_question_path(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Need synthetic clarification", tags=["agent-blocked"], status="blocked")
+        session = session_store.create(task_id=task.id, status=STATUS_BLOCKED)
+        question_id = session_store.create_pending_question(
+            session.session_id, task.id, "Which synthetic fixture?", 17,
+        )
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "respond", "note": "Use fixture alpha."},
+        )
+        assert response.status_code == 200
+        assert response.json()["question_id"] == question_id
+        answered = session_store.list_answered_unprocessed_questions()
+        assert answered[0]["answer"] == "Use fixture alpha."
+
+
 class TestBoardStream:
     async def test_stream_emits_a_second_frame_after_a_task_mutation(self, stores):
         """Round-1 finding 12(a): the SSE path itself (GET

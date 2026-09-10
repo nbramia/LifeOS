@@ -1056,7 +1056,7 @@ class TestLiveUpdates:
         )
         page.locator('[data-card-id="t3"]').click()  # t3: pending_question id 1, human_queue
         expect(page.get_by_role("button", name="Answer")).to_be_visible()
-        expect(page.get_by_role("button", name="Resolve")).to_have_count(0)
+        expect(page.get_by_role("button", name="Mark Done")).to_have_count(0)
 
         for card in board_state["lanes"]["human_queue"]:
             if card["id"] == "t3":
@@ -1065,7 +1065,7 @@ class TestLiveUpdates:
         stream_gate.set()
 
         expect(page.get_by_role("button", name="Answer")).to_have_count(0, timeout=5000)
-        expect(page.get_by_role("button", name="Resolve")).to_be_visible()
+        expect(page.get_by_role("button", name="Mark Done")).to_be_visible()
 
     def test_kill_button_cleared_when_linked_session_reaches_terminal_status(self, page: Page, agents_base_url):
         """#850 round-2 finding 3's other half (round-4 finding 1): when the
@@ -3400,7 +3400,7 @@ class TestAgentCardMoveRulesAndCancel:
         })
         _open_board(page, agents_base_url, board_state=board_state)
         page.locator('[data-card-id="t12"]').click()
-        expect(page.get_by_role("button", name="Resolve", exact=True)).to_be_visible()
+        expect(page.get_by_role("button", name="Mark Done", exact=True)).to_be_visible()
 
     def test_cancel_with_an_untorn_down_cli_session_toasts_a_warning(self, page: Page, agents_base_url):
         """When Cancel's response carries `failures` (a live CLI session

@@ -40,6 +40,7 @@ from api.services.agent_board import (
     AGENT_ASSIGNEES as _BOARD_AGENT_ASSIGNEES,
     AGENT_PICKUP_TAGS,
     MANAGED_AGENT_ASSIGNEES,
+    REASSIGNED_TAG,
 )
 from api.services.agent_worker.preflight import (
     ROUTE_ASK,
@@ -60,6 +61,7 @@ from api.services.agent_worker.session_store import (
     STATUS_FAILED,
     STATUS_RUNNING,
     STATUS_YIELDED,
+    TERMINAL_STATUSES,
     Session,
     SessionStore,
 )
@@ -755,8 +757,15 @@ class Worker:
             task_id = task.get("id")
             if not task_id:
                 continue
-            # Skip tasks we've already claimed in a previous run.
-            if self.session_store.get(task_id) is not None:
+            # Skip tasks already claimed in a previous run, but allow a
+            # terminal session to be re-armed after an operator review
+            # reassignment. The rearm keeps the prior conversation context
+            # while giving the new assignment a fresh executor lifecycle.
+            existing_session = self.session_store.get(task_id)
+            reassigned = REASSIGNED_TAG in self._norm_task_tags(task)
+            if existing_session is not None and (
+                existing_session.status not in TERMINAL_STATUSES or not reassigned
+            ):
                 continue
             if not self._claim(task_id):
                 continue
@@ -1803,15 +1812,29 @@ class Worker:
         if consumed_queue_tag is None:
             return False
         try:
-            session = self.session_store.create(
-                task_id=task_id,
-                status=STATUS_CLAIMED,
-            )
+            existing = self.session_store.get(task_id)
+            if existing is not None:
+                # Review reassignment keeps the old row so its messages and
+                # transcript remain available as context. Rearm only a
+                # terminal row; a non-terminal row means another dispatch
+                # still owns the task and must fail closed.
+                session = self.session_store.rearm_for_claim(task_id)
+                if session is None:
+                    raise RuntimeError("task already has a non-terminal session")
+                claim_kind = "reassigned_claim"
+            else:
+                session = self.session_store.create(
+                    task_id=task_id,
+                    status=STATUS_CLAIMED,
+                )
+                claim_kind = "claim"
             self.transcript_store.append(
                 session.session_id,
-                "claim",
-                {"task_id": task_id, "worker": "agent-worker"},
+                claim_kind,
+                {"task_id": task_id, "worker": "agent-worker", "context_preserved": claim_kind == "reassigned_claim"},
             )
+            if claim_kind == "reassigned_claim":
+                self._remove_tag_if_present(task_id, REASSIGNED_TAG)
             return True
         except Exception as exc:
             logger.error("session create failed for %s: %s", task_id, exc)

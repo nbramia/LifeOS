@@ -2115,6 +2115,29 @@ def test_worker_skips_already_claimed_tasks(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_worker_rearms_only_explicitly_reassigned_terminal_session(tmp_path: Path):
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "hi", "status": "todo", "tags": ["local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    w.tick()
+    original = w.session_store.get("t1")
+    assert original is not None
+    # The stub executor does not perform the real executor's terminal status
+    # write, so model the persisted completed session before reassignment.
+    w.session_store.update_status("t1", STATUS_COMPLETED)
+    api.tasks["t1"]["tags"] = ["local", "agent-reassigned"]
+    api.tasks["t1"]["status"] = "todo"
+    assert w.tick() == 1
+    assert len(executor.calls) == 2
+    assert w.session_store.get("t1").session_id == original.session_id
+    assert "agent-reassigned" not in api.tasks["t1"]["tags"]
+
+
+@pytest.mark.unit
 def test_worker_pauses_at_daily_cap(tmp_path: Path):
     api = FakeApi(tasks=[
         {"id": "t1", "description": "x", "status": "todo", "tags": ["local"]},

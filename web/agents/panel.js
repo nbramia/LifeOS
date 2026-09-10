@@ -2,7 +2,7 @@
 //
 // Shared session-detail panel: header render, inline label edit, backfill +
 // live SSE transcript tail, LLM summary fetch, and the action row (Open,
-// Go To, Resume, Kill, Answer, Accept, Resolve, Cancel, Delete — decided
+// Go To, Resume, Kill, Answer, Accept, Reject, Reassign, Mark Done, Cancel, Delete — decided
 // and rendered by ./session_actions.js). Used by both the Graph tab's side
 // panel (web/agents/graph.js) and the Board tab's card drawer
 // (web/agents/board.js).
@@ -246,7 +246,7 @@ const _EVENTS_RETRY_DELAYS = [800, 1600, 3200];  // ms; ~5.6s before giving up
  *   showActions    — whether the header renders the shared action row at
  *                    all (default true). The Board drawer sets this false
  *                    and renders the row itself instead (it needs Open,
- *                    Answer, Accept, Resolve, Cancel, and Delete alongside
+ *                    Answer, Accept, Reject, Reassign, Mark Done, Cancel, and Delete alongside
  *                    Go To/Resume/Kill — actions this panel alone, with no
  *                    card, can never offer), so the two never render the
  *                    same session's Kill/Resume/Go To buttons twice.
@@ -265,7 +265,7 @@ export class SessionPanel {
     this.onLabelSaved = opts.onLabelSaved || (() => {});
     this.onSummaryFetched = opts.onSummaryFetched || (() => {});
     this.getDescendants = opts.getDescendants || (() => []);
-    // Card-only actions (Open, Accept, Resolve, Cancel, Delete) — see
+    // Card-only actions (Open, Accept, Reject, Reassign, Mark Done, Cancel, Delete) — see
     // ./card_actions.js. `findCard` resolves the freshest copy of the
     // linked card at Delete-confirm time (a caller with a live board
     // lookup, e.g. the Graph tab, can supply one; defaults to whatever
@@ -353,7 +353,7 @@ export class SessionPanel {
   }
 
   // Renders the shared action row (Open, Rename, Go To, Resume, Kill,
-  // Answer, Accept, Resolve, Cancel, Delete — decided by
+  // Answer, Accept, Reject, Reassign, Mark Done, Cancel, Delete — decided by
   // session_actions.js's `decideActions`) into this panel's own header.
   // A no-op when `showActions` is false (the Board drawer's embedded
   // panel, which renders the row itself elsewhere). Rename always gets a
