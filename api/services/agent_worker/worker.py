@@ -1005,7 +1005,7 @@ class Worker:
         before dispatching.
         """
         # Claim rows before reading/acting on them. Reassignment can retire a
-        # follow-up after this list is built; question_claimed() below then
+        # follow-up represented in this list; question_claimed() below then
         # prevents that stale row from mutating the old session/card.
         answered = self.session_store.claim_answered_unprocessed_questions()
         for q in answered:

@@ -166,7 +166,7 @@ The issue's target is "reflects an external vault edit within ~3 seconds," and t
 
 ### Pending-question answer path
 
-`SessionStore.deposit_answer_by_id` (new in #850, alongside the pre-existing `deposit_answer` keyed by Telegram message id and `deposit_answer_by_session_id` keyed by session) sets exactly the columns `deposit_answer` sets — `answer` and `answered_at` on the matched `pending_questions` row, gated on `answered_at IS NULL AND timed_out = 0 AND kind != 'status_anchor'`. `worker.py::_process_clarification_answers` atomically claims answered rows with the existing `processed` integer (`2` means in-flight), verifies the claim immediately before processing, and only then resumes; reassignment retires both queued and in-flight follow-ups so a stale list cannot revive a retired session. Failed executor resumes release the in-flight marker for retry.
+`SessionStore.deposit_answer_by_id`, alongside `deposit_answer` keyed by Telegram message id and `deposit_answer_by_session_id` keyed by session, sets exactly the columns `deposit_answer` sets — `answer` and `answered_at` on the matched `pending_questions` row, gated on `answered_at IS NULL AND timed_out = 0 AND kind != 'status_anchor'`. `worker.py::_process_clarification_answers` atomically claims answered rows with the existing `processed` integer (`2` means in-flight), verifies the claim immediately before processing, and only then resumes; reassignment retires both queued and in-flight follow-ups so a stale list cannot revive a retired session. Failed executor resumes release the in-flight marker for retry.
 
 ### Frontend module split
 

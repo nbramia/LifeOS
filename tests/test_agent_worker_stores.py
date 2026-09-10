@@ -76,7 +76,7 @@ def test_answered_followup_claim_is_atomic_and_reassignment_retires_claim(tmp_pa
     assert store.question_claimed(question_id)
 
     # This is the race boundary: reassignment retires an already-claimed row,
-    # and a worker holding the stale dict must observe that it no longer owns it.
+    # and a worker holding the claimed row must observe that the claim is retired.
     assert store.retire_completion_followups(session.session_id) == 1
     assert not store.question_claimed(question_id)
     assert store.claim_answered_unprocessed_questions() == []
