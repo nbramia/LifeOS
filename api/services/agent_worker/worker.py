@@ -1076,6 +1076,19 @@ class Worker:
             self.session_store.update_status(task_id, STATUS_RUNNING)
 
             task = self._fetch_task(task_id) or {"id": task_id, "description": task_id}
+            if session.routing == ROUTE_HERMES:
+                executor = self._get_hermes_executor()
+                try:
+                    outcome = executor.execute(
+                        session, task, prompt=f"(operator reply) {answer}",
+                    )
+                except Exception as exc:
+                    logger.exception("clarification Hermes resume crashed for %s", task_id)
+                    self._mark_failed(session, task, f"clarification resume crashed: {exc}")
+                    continue
+                self.session_store.mark_question_processed(q["id"])
+                self._handle_outcome(session, task, outcome)
+                continue
             if session.routing == "local":
                 executor = self._get_local_executor(caller_session_id=session_id)
                 try:
@@ -1248,6 +1261,24 @@ class Worker:
                 outcome = executor.execute(session, task)
             except Exception as exc:
                 logger.exception("followup local resume crashed for %s: %s", task_id, exc)
+                self._mark_failed(session, task, f"followup resume crashed: {exc}")
+                self.session_store.mark_question_processed(q["id"])
+                return
+            self.session_store.mark_question_processed(q["id"])
+            self._handle_outcome(session, task, outcome)
+            return
+
+        if session.routing == ROUTE_HERMES:
+            # Hermes turns carry the prior conversation id in SessionStore;
+            # the executor forwards it so Reject/continuation is genuinely
+            # in-thread rather than a fresh, context-free request.
+            executor = self._get_hermes_executor()
+            try:
+                outcome = executor.execute(
+                    session, task, prompt=f"(operator reply) {answer}",
+                )
+            except Exception as exc:
+                logger.exception("followup Hermes resume crashed for %s", task_id)
                 self._mark_failed(session, task, f"followup resume crashed: {exc}")
                 self.session_store.mark_question_processed(q["id"])
                 return
@@ -1811,6 +1842,8 @@ class Worker:
         consumed_queue_tag = self._claim_task(task_id)
         if consumed_queue_tag is None:
             return False
+        prior_terminal_status = None
+        rearmed = False
         try:
             existing = self.session_store.get(task_id)
             if existing is not None:
@@ -1821,6 +1854,8 @@ class Worker:
                 session = self.session_store.rearm_for_claim(task_id)
                 if session is None:
                     raise RuntimeError("task already has a non-terminal session")
+                prior_terminal_status = existing.status
+                rearmed = True
                 claim_kind = "reassigned_claim"
             else:
                 session = self.session_store.create(
@@ -1834,14 +1869,20 @@ class Worker:
                 {"task_id": task_id, "worker": "agent-worker", "context_preserved": claim_kind == "reassigned_claim"},
             )
             if claim_kind == "reassigned_claim":
-                self._remove_tag_if_present(task_id, REASSIGNED_TAG)
+                if not self._remove_tag_if_present(task_id, REASSIGNED_TAG):
+                    raise RuntimeError("could not retire reassignment marker")
             return True
         except Exception as exc:
             logger.error("session create failed for %s: %s", task_id, exc)
+            if rearmed and prior_terminal_status in TERMINAL_STATUSES:
+                # Rearming is intentionally reversible: a failure while
+                # appending the audit event or retiring the marker must not
+                # leave the old terminal session looking claimable.
+                self.session_store.restore_session_state(existing)
             if consumed_queue_tag:
                 rolled_back = self._swap_tag(task_id, RUNNING_TAG, AGENT_TAG)
             else:
-                rolled_back = self._remove_tag_if_present(task_id, RUNNING_TAG)
+                rolled_back = self._swap_tag(task_id, RUNNING_TAG, REASSIGNED_TAG) if rearmed else self._remove_tag_if_present(task_id, RUNNING_TAG)
             if not rolled_back:
                 self._notify(
                     f"⚠️ Agent worker: failed to claim task {task_id} and could "
@@ -2649,6 +2690,51 @@ class Worker:
             logger.warning("fetch_task %s failed: %s", task_id, exc)
             return None
 
+    def _last_reassignment(self, session_id: str) -> dict[str, Any] | None:
+        """Return the latest board reassign marker, if any."""
+        try:
+            events = self.transcript_store.read(session_id)
+        except Exception:
+            return None
+        for event in reversed(events):
+            if event.get("kind") == "operator_reassigned":
+                return event.get("payload") or {}
+        return None
+
+    def _reassignment_context(self, session: Session) -> str:
+        """Build a bounded context handoff for a fresh route.
+
+        Native local/CLI/Hermes continuations do not need this. Routes whose
+        native thread cannot be reused receive the last persisted messages and
+        terminal output, capped before they reach a prompt.
+        """
+        parts: list[str] = []
+        try:
+            for message in self.session_store.get_messages(session.session_id)[-8:]:
+                content = message.get("content")
+                if isinstance(content, (dict, list)):
+                    content = json.dumps(content, ensure_ascii=False)
+                if content:
+                    parts.append(f"{message.get('role', 'message')}: {content}")
+            events = self.transcript_store.read(session.session_id)
+            for event in reversed(events):
+                payload = event.get("payload") or {}
+                text = payload.get("final_text") or payload.get("text") or payload.get("content")
+                if isinstance(text, str) and text.strip():
+                    parts.append(f"prior output: {text}")
+                    break
+        except Exception as exc:
+            logger.warning("reassignment context read failed for %s: %s", session.task_id, exc)
+        text = "\n".join(parts).strip()
+        if not text:
+            return ""
+        if len(text) > 6000:
+            text = text[-6000:]
+        return (
+            "Prior run context (synthetic handoff; verify before relying on it):\n"
+            + text
+        )
+
     def _dispatch(self, task: dict[str, Any]) -> None:
         """Run preflight + route the task to the appropriate executor."""
         task_id = task["id"]
@@ -2727,6 +2813,20 @@ class Worker:
             task_id, host=assignment.host, model=assignment.model, effort=assignment.effort,
         )
         session = self.session_store.get(task_id)  # refresh
+
+        reassignment = self._last_reassignment(sid)
+        prior_route = (reassignment or {}).get("prior_routing")
+        # A terminal Managed Agents session cannot be resumed. A retained
+        # native handle is also unsafe after changing routes, so clear only in
+        # those cases; compatible CLI/Hermes routes continue natively.
+        if pre.routing == ROUTE_CLAUDE or (prior_route and prior_route != pre.routing):
+            self.session_store.reset_executor_handles(task_id)
+            session = self.session_store.get(task_id) or session
+        handoff = self._reassignment_context(session) if reassignment else ""
+        dispatch_task = dict(task)
+        if handoff and pre.routing in (ROUTE_CLAUDE, ROUTE_HERMES):
+            notes = (dispatch_task.get("notes") or "").strip()
+            dispatch_task["notes"] = f"{notes}\n\n{handoff}" if notes else handoff
 
         # Sanity gate (#747). Only a *fatal* sane=False fails the task
         # closed — an empty title, a preflight-call error, or a title the
@@ -2830,7 +2930,7 @@ class Worker:
                 )
                 return
             try:
-                outcome = managed.start(session, task)
+                outcome = managed.start(session, dispatch_task)
             except Exception as exc:
                 logger.exception("managed.start crashed for %s: %s", task_id, exc)
                 self._mark_failed(session, task, f"managed start crashed: {exc}")
@@ -2849,7 +2949,7 @@ class Worker:
         if pre.routing == ROUTE_HERMES:
             hermes = self._get_hermes_executor()
             try:
-                outcome = hermes.execute(session, task)
+                outcome = hermes.execute(session, dispatch_task)
             except Exception as exc:
                 logger.exception("hermes executor crashed for %s: %s", task_id, exc)
                 self._mark_failed(session, task, f"executor crashed: {exc}")
@@ -2874,8 +2974,17 @@ class Worker:
         if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
             from api.services.directory_resolver import resolve_working_directory
             working_dir = resolve_working_directory(title)
+            if session.claude_code_session_id:
+                # A compatible reassignment keeps the native CLI thread. Do
+                # not feed the JSON fresh-spawn envelope to resume(); pass a
+                # bounded operator direction instead.
+                prompt = "Continue this task using the prior session context."
+                if (task.get("notes") or "").strip():
+                    prompt += f"\n\nLatest task notes:\n{task['notes'].strip()[-2000:]}"
+            else:
+                prompt = title + (f"\n\n{handoff}" if handoff else "")
             payload = {
-                "prompt": title,
+                "prompt": prompt,
                 "working_dir": working_dir,
                 # No originating chat — progress/notify goes via the worker's
                 # default Telegram sender like cloud-routed #agent tasks.

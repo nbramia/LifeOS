@@ -1203,6 +1203,11 @@ class BoardTagsRequest(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
 
+class UndoAcceptRequest(BaseModel):
+    """Opaque token returned by the Accept transition (optional for legacy clients)."""
+    token: str | None = Field(default=None, max_length=200)
+
+
 @router.put("/board/cards/{card_id}/lane")
 async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]:
     """Move a task card to `lane`, writing the corresponding status/tag at
@@ -1305,10 +1310,11 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
     if needs_tag or needs_status:
         try:
             def add_accepted(tags: list[str]) -> list[str]:
-                if agent_board.ACCEPTED_TAG in {
-                    str(tag).lstrip("#").lower() for tag in tags
-                }:
+                normalized_latest = {str(tag).lstrip("#").lower() for tag in tags}
+                if agent_board.ACCEPTED_TAG in normalized_latest:
                     return list(tags)
+                if not agent_board.is_review_pending(tags):
+                    raise TaskConflictError("card changed; refresh before accepting")
                 return [*tags, agent_board.ACCEPTED_TAG]
 
             task = task_manager.update(
@@ -1321,11 +1327,14 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
         _invalidate_board_cache()
 
     lane = agent_board.derive_lane(task.status, task.tags)
-    return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
+    # updated_at is already refreshed only by the successful CAS write and is
+    # therefore a narrow opaque etag for the toast's Undo action.
+    return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags),
+            "undo_token": task.updated_at}
 
 
 @router.post("/board/cards/{card_id}/undo-accept")
-async def undo_accept_board_card(card_id: str) -> dict[str, Any]:
+async def undo_accept_board_card(card_id: str, body: UndoAcceptRequest | None = None) -> dict[str, Any]:
     """Restore an accepted Review card to Review by removing ``accepted``.
 
     The transition is deliberately server-authoritative: the client never
@@ -1342,6 +1351,9 @@ async def undo_accept_board_card(card_id: str) -> dict[str, Any]:
     if task is None:
         raise HTTPException(status_code=404, detail="card not found")
 
+    if body and body.token is not None and body.token != task.updated_at:
+        raise HTTPException(status_code=409, detail="acceptance changed; refresh before undoing")
+
     accepted = agent_board.ACCEPTED_TAG
     normalized = {t.lstrip("#").lower() for t in task.tags}
     if accepted not in normalized:
@@ -1354,6 +1366,8 @@ async def undo_accept_board_card(card_id: str) -> dict[str, Any]:
 
     try:
         def remove_accepted(tags: list[str]) -> list[str]:
+            if accepted not in {str(tag).lstrip("#").lower() for tag in tags}:
+                raise TaskConflictError("acceptance changed; refresh before undoing")
             new_tags = [
                 tag for tag in tags
                 if str(tag).lstrip("#").lower() != accepted
@@ -1364,7 +1378,10 @@ async def undo_accept_board_card(card_id: str) -> dict[str, Any]:
                 new_tags.append(agent_board.COMPLETED_TAG)
             return new_tags
 
-        task = task_manager.update(card_id, _tags_merge=remove_accepted)
+        task = task_manager.update(
+            card_id, _tags_merge=remove_accepted,
+            _expected_updated_at=body.token if body and body.token is not None else None,
+        )
     except TaskConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if task is None:
@@ -1405,6 +1422,16 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             questions = [q for q in session_store.list_open_questions() if q.get("task_id") == card_id]
             if not questions:
                 raise HTTPException(status_code=409, detail="this blocked card has no open question to answer")
+            blocked_session = session_store.get(card_id)
+            if (
+                blocked_session is not None
+                and blocked_session.routing == "hermes"
+                and not blocked_session.conversation_id
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Hermes cannot continue this card because its conversation id is missing; reassign it to retry with a fresh context",
+                )
             question = questions[0]
             if not session_store.deposit_answer_by_id(question["id"], note):
                 raise HTTPException(status_code=409, detail="the question was answered or timed out; refresh the card")
@@ -1423,36 +1450,111 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             raise HTTPException(status_code=409, detail="the prior agent session cannot be resumed")
         if session.status not in TERMINAL_STATUSES:
             raise HTTPException(status_code=409, detail="the prior agent session is still running")
+        if action == "reject" and session.routing == "hermes" and not session.conversation_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Hermes cannot continue this review because its conversation id is missing; reassign it to retry with a fresh context",
+            )
+
+        old_status = task.status
+        old_tags = list(task.tags)
+        old_notes = task.notes
+
+        def merge_review_tags(current_tags: list[str]) -> list[str]:
+            # Recompute against the CAS retry's latest snapshot. If another
+            # actor already consumed Review, fail closed rather than applying
+            # a stale action to its new lane.
+            if not agent_board.is_review_pending(current_tags):
+                raise TaskConflictError("card changed; refresh before applying this review action")
+            tags = [str(t) for t in current_tags]
+            lifecycle = {
+                agent_board.RUNNING_TAG, agent_board.BLOCKED_TAG,
+                agent_board.COMPLETED_TAG, "agent-failed",
+                "agent-budget-exceeded", agent_board.REASSIGNED_TAG,
+                agent_board.ACCEPTED_TAG,
+            }
+            cleaned = [t for t in tags if t.lstrip("#").lower() not in lifecycle]
+            if action == "reject":
+                cleaned.append(agent_board.RUNNING_TAG)
+                return cleaned
+            cleaned = [t for t in cleaned if t.lstrip("#").lower() not in agent_board.ASSIGNEE_TAGS]
+            cleaned.extend([(body.assignee or "").lstrip("#").lower(), agent_board.REASSIGNED_TAG])
+            return cleaned
+
+        def merge_note(current_notes: str) -> str:
+            if not note:
+                return current_notes
+            addition = f"Operator note: {note}"
+            return f"{current_notes}\n\n{addition}" if current_notes else addition
+
+        def restore_card() -> None:
+            try:
+                task_manager.update(card_id, status=old_status, tags=old_tags, notes=old_notes)
+            except Exception as restore_exc:  # noqa: BLE001
+                logger.error("review action rollback failed for %s: %s", card_id, restore_exc)
+
+        # Commit the paired card transition before exposing a pre-answered
+        # follow-up row. The worker cannot consume a follow-up for a card that
+        # is still in Review; failures roll the card back.
+        try:
+            updated = task_manager.update(
+                card_id, status=plan.status, _tags_merge=merge_review_tags,
+                _notes_merge=merge_note,
+            )
+        except (TaskConflictError, ValueError) as exc:
+            raise HTTPException(status_code=409 if isinstance(exc, TaskConflictError) else 422, detail=str(exc)) from exc
+        if updated is None:
+            raise HTTPException(status_code=404, detail="card not found")
 
         followup_id: int | None = None
         if action == "reject":
-            followup_id = session_store.enqueue_web_followup(
-                session.session_id, card_id, note,
-            )
-
-        old_notes = task.notes
-        new_notes = old_notes
-        if note:
-            new_notes = f"{old_notes}\n\nOperator note: {note}" if old_notes else f"Operator note: {note}"
-        try:
-            updated = task_manager.update(
-                card_id, status=plan.status, tags=plan.tags, notes=new_notes,
-            )
-        except (TaskConflictError, ValueError) as exc:
-            if followup_id is not None:
-                session_store.delete_pending_question(followup_id)
-            raise HTTPException(status_code=409 if isinstance(exc, TaskConflictError) else 422, detail=str(exc)) from exc
-        if updated is None:
-            if followup_id is not None:
-                session_store.delete_pending_question(followup_id)
-            raise HTTPException(status_code=404, detail="card not found")
+            try:
+                followup_id = session_store.enqueue_web_followup(
+                    session.session_id, card_id, note,
+                )
+            except Exception as exc:  # noqa: BLE001
+                restore_card()
+                raise HTTPException(status_code=409, detail=f"could not queue review continuation: {type(exc).__name__}") from exc
 
         if action == "reassign":
-            _get_transcript_store().append(session.session_id, "operator_reassigned", {
-                "assignee": (body.assignee or "").lstrip("#").lower(),
-                "note_chars": len(note),
-                "context_preserved": True,
-            })
+            transcript_store = _get_transcript_store()
+            target_assignee = (body.assignee or "").lstrip("#").lower()
+            native_handle_usable = bool(
+                (session.routing == "claude_code" and target_assignee == "claude" and session.claude_code_session_id)
+                or (session.routing == "codex" and target_assignee == "codex" and session.claude_code_session_id)
+                or (session.routing == "hermes" and target_assignee == "hermes" and session.conversation_id)
+            )
+            context_preserved = bool(
+                native_handle_usable
+                or session_store.get_messages(session.session_id)
+            )
+            if not context_preserved:
+                try:
+                    context_preserved = any(
+                        (event.get("payload") or {}).get("final_text")
+                        or (event.get("payload") or {}).get("text")
+                        or (event.get("payload") or {}).get("content")
+                        for event in transcript_store.read(session.session_id)
+                    )
+                except Exception:
+                    context_preserved = False
+            try:
+                transcript_store.append(session.session_id, "operator_reassigned", {
+                    "assignee": (body.assignee or "").lstrip("#").lower(),
+                    "prior_routing": session.routing,
+                    "note_chars": len(note),
+                    "context_preserved": context_preserved,
+                })
+                session_store.retire_completion_followups(session.session_id)
+            except Exception as exc:  # noqa: BLE001
+                restore_card()
+                # The session remains terminal until the worker claims it;
+                # explicitly restore it as a guard if a future implementation
+                # rearms before this post-transition bookkeeping.
+                session_store.update_status(card_id, session.status)
+                raise HTTPException(status_code=409, detail=f"could not finalize reassignment: {type(exc).__name__}") from exc
+        else:
+            context_preserved = True
         _invalidate_board_cache()
         return {
             "id": updated.id,
@@ -1461,7 +1563,7 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             "status": updated.status,
             "tags": list(updated.tags),
             "queued": followup_id is not None,
-            "context_preserved": True,
+            "context_preserved": context_preserved,
         }
 
 

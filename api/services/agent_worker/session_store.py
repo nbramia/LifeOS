@@ -639,7 +639,9 @@ class SessionStore:
         row lets the next worker run reuse its conversation/messages and
         transcript instead of deleting the prior context and creating an
         unrelated session. Executor-specific cursors are reset; durable
-        conversation history is intentionally retained.
+        conversation history and native handles are intentionally retained.
+        The worker decides whether a retained handle is usable for the newly
+        selected route.
         """
         with self._connect() as conn:
             row = conn.execute(
@@ -652,8 +654,7 @@ class SessionStore:
                 UPDATE sessions
                 SET status = ?, routing = NULL, budget_json = NULL,
                     expected_output = NULL, preset_class = NULL,
-                    managed_agent_session_id = NULL, claude_code_session_id = NULL,
-                    conversation_id = NULL, remote_pgid = NULL,
+                    remote_pgid = NULL,
                     host = NULL, model = NULL, effort = NULL,
                     last_activity_at = ?
                 WHERE task_id = ?
@@ -661,6 +662,36 @@ class SessionStore:
                 (STATUS_CLAIMED, _now(), task_id),
             )
         return self.get(task_id)
+
+    def reset_executor_handles(self, task_id: str) -> None:
+        """Forget route-specific handles before a deliberately fresh run."""
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE sessions SET managed_agent_session_id = NULL,
+                    claude_code_session_id = NULL, conversation_id = NULL,
+                    remote_pgid = NULL, last_activity_at = ?
+                    WHERE task_id = ?""",
+                (_now(), task_id),
+            )
+
+    def restore_session_state(self, session: Session) -> None:
+        """Restore a session snapshot after a failed rearm post-step."""
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE sessions SET status = ?, routing = ?, budget_json = ?,
+                    expected_output = ?, preset_class = ?,
+                    managed_agent_session_id = ?, claude_code_session_id = ?,
+                    conversation_id = ?, remote_pgid = ?, host = ?, model = ?,
+                    effort = ?, last_activity_at = ? WHERE task_id = ?""",
+                (
+                    session.status, session.routing,
+                    json.dumps(session.budget) if session.budget else None,
+                    session.expected_output, session.preset_class,
+                    session.managed_agent_session_id, session.claude_code_session_id,
+                    session.conversation_id, session.remote_pgid, session.host,
+                    session.model, session.effort, _now(), session.task_id,
+                ),
+            )
 
     def list_by_status(self, status: str) -> list[Session]:
         with self._connect() as conn:
@@ -1552,6 +1583,18 @@ class SessionStore:
                 (int(question_id),),
             )
         return cur.rowcount > 0
+
+    def retire_completion_followups(self, session_id: str) -> int:
+        """Retire terminal notification anchors before a reassign."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE pending_questions
+                   SET processed = 1, timed_out = 1
+                 WHERE session_id = ? AND kind = 'followup'
+                   AND processed = 0 AND timed_out = 0""",
+                (session_id,),
+            )
+        return cur.rowcount
 
     def get_recent_resumable_followup(self, within_seconds: int) -> dict | None:
         """Return the most recent open follow-up whose notification was sent

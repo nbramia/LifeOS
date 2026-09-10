@@ -491,6 +491,85 @@ class TestReviewActions:
         answered = session_store.list_answered_unprocessed_questions()
         assert answered[0]["answer"] == "Use fixture alpha."
 
+    def test_reject_queues_only_after_card_transition_and_rolls_back_on_queue_failure(
+        self, client, stores, monkeypatch,
+    ):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Synthetic rollback", tags=["codex", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+        monkeypatch.setattr(
+            session_store, "enqueue_web_followup",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("synthetic queue failure")),
+        )
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry synthetic output."},
+        )
+        assert response.status_code == 409
+        restored = task_manager.get(task.id)
+        assert restored.status == "done"
+        assert restored.tags == ["codex", "agent-completed"]
+        assert session_store.list_answered_unprocessed_questions() == []
+
+    def test_reassign_retires_old_completion_anchor_and_reports_context_reality(self, client, stores):
+        task_manager, _sched, session_store, transcript_store = stores
+        task = task_manager.create("Synthetic reassign", tags=["codex", "agent-completed"], status="done")
+        session = session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+        session_store.register_completion_followup(session.session_id, task.id, [91], label="Synthetic reassign")
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude"},
+        )
+        assert response.status_code == 200
+        assert response.json()["context_preserved"] is False
+        with session_store._connect() as conn:
+            row = conn.execute(
+                "SELECT processed, timed_out FROM pending_questions WHERE sent_message_id = 91",
+            ).fetchone()
+        assert tuple(row) == (1, 1)
+
+    def test_accept_undo_rejects_stale_transition_token(self, client, stores):
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create("Synthetic token", tags=["agent-completed"], status="done")
+        accepted = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert accepted.status_code == 200
+        token = accepted.json()["undo_token"]
+        task_manager.update(task.id, notes="unrelated synthetic edit")
+        undo = client.post(
+            f"/api/agents/board/cards/{task.id}/undo-accept",
+            json={"token": token},
+        )
+        assert undo.status_code == 409
+        assert "accepted" in task_manager.get(task.id).tags
+
+    def test_reassign_keeps_native_handles_until_worker_selects_route(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Synthetic native context", tags=["claude", "agent-completed"], status="done")
+        _session = session_store.create(
+            task_id=task.id, status=STATUS_COMPLETED, routing="claude_code",
+        )
+        session_store.set_claude_code_session_id(task.id, "synthetic-cli-thread")
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude"},
+        )
+        assert response.status_code == 200
+        rearmed = session_store.rearm_for_claim(task.id)
+        assert rearmed is not None
+        assert rearmed.claude_code_session_id == "synthetic-cli-thread"
+
+    def test_hermes_reject_without_conversation_id_refuses_before_mutation(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Synthetic Hermes review", tags=["hermes", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="hermes")
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Continue synthetic work."},
+        )
+        assert response.status_code == 409
+        assert task_manager.get(task.id).status == "done"
+        assert session_store.list_answered_unprocessed_questions() == []
+
 
 class TestBoardStream:
     async def test_stream_emits_a_second_frame_after_a_task_mutation(self, stores):

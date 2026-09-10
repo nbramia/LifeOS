@@ -672,7 +672,13 @@ export function renderActionRow(container, opts = {}) {
     } else if (d.id === 'answer') {
       btn.onclick = () => openAnswerPrompt(pendingQuestion, onChange);
     } else if (handlers[d.id]) {
-      btn.onclick = handlers[d.id];
+      btn.onclick = async () => {
+        // Accept is destructive enough that duplicate clicks must not issue
+        // overlapping requests while the server is committing its CAS.
+        if (d.id === 'accept') btn.disabled = true;
+        try { await handlers[d.id](); }
+        finally { if (d.id === 'accept' && btn.isConnected) btn.disabled = false; }
+      };
     }
   }
 }

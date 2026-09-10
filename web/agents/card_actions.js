@@ -21,6 +21,8 @@ function laneLabelFor(laneId) {
   return lane ? lane.label : laneId;
 }
 
+const acceptInFlight = new Set();
+
 export async function openCard(card, onChanged) {
   try {
     const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/open`, { method: 'POST' });
@@ -35,9 +37,14 @@ export async function openCard(card, onChanged) {
   } catch (err) { showToast(`Open failed: ${err.message}`, true); }
 }
 
-export async function undoAcceptedCard(cardId, onChanged) {
+export async function undoAcceptedCard(cardId, onChanged, token = null) {
   try {
-    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(cardId)}/undo-accept`, { method: 'POST' });
+    const options = { method: 'POST' };
+    if (token) {
+      options.headers = { 'Content-Type': 'application/json' };
+      options.body = JSON.stringify({ token });
+    }
+    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(cardId)}/undo-accept`, options);
     if (!r.ok) {
       const text = await r.text();
       let msg = text;
@@ -57,6 +64,8 @@ export async function undoAcceptedCard(cardId, onChanged) {
 }
 
 export async function acceptCard(card, onChanged, onAccepted) {
+  if (acceptInFlight.has(card.id)) return;
+  acceptInFlight.add(card.id);
   try {
     const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/accept`, { method: 'POST' });
     if (!r.ok) {
@@ -65,13 +74,14 @@ export async function acceptCard(card, onChanged, onAccepted) {
       try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
       throw new Error(msg || `HTTP ${r.status}`);
     }
+    const accepted = await r.json();
     showToast('Accepted.', false, {
       duration: 3500 * 1.5,
       actionLabel: 'Undo',
       actionAriaLabel: 'Undo acceptance',
       onAction: ({ toast, action }) => {
         action.textContent = 'Undoing…';
-        return undoAcceptedCard(card.id, onChanged)
+        return undoAcceptedCard(card.id, onChanged, accepted.undo_token)
           .then(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); })
           .catch(() => { action.textContent = 'Undo'; });
       },
@@ -79,6 +89,7 @@ export async function acceptCard(card, onChanged, onAccepted) {
     if (onAccepted) onAccepted();
     if (onChanged) await onChanged();
   } catch (err) { showToast(`Accept failed: ${err.message}`, true); }
+  finally { acceptInFlight.delete(card.id); }
 }
 
 /**
@@ -103,7 +114,8 @@ export function openReviewActionModal(card, action, onChanged) {
       <div class="target">${escapeHtml(card.title || card.id)}</div>
       ${assigneeHtml}
       <label for="review-note">${isReject ? 'Note (required)' : 'Context note (optional)'}</label>
-      <textarea id="review-note" placeholder="${isReject ? 'What should be changed?' : 'What should the next run know?'}"></textarea>
+      <textarea id="review-note" aria-describedby="review-note-error" placeholder="${isReject ? 'What should be changed?' : 'What should the next run know?'}"></textarea>
+      ${isReject ? '<div id="review-note-error" data-field="review-note-error" role="alert" hidden>Tell the agent what should be changed.</div>' : ''}
       <div class="actions">
         <button id="review-action-cancel">Cancel</button>
         <button class="danger" id="review-action-submit">${isReject ? 'Reject' : 'Reassign'}</button>
@@ -116,7 +128,16 @@ export function openReviewActionModal(card, action, onChanged) {
   backdrop.querySelector('#review-action-cancel').onclick = cleanup;
   backdrop.querySelector('#review-action-submit').onclick = async () => {
     const note = backdrop.querySelector('#review-note').value.trim();
-    if (isReject && !note) return;
+    const noteEl = backdrop.querySelector('#review-note');
+    const errorEl = backdrop.querySelector('[data-field="review-note-error"]');
+    if (isReject && !note) {
+      noteEl.setAttribute('aria-invalid', 'true');
+      noteEl.focus();
+      if (errorEl) errorEl.hidden = false;
+      return;
+    }
+    noteEl.removeAttribute('aria-invalid');
+    if (errorEl) errorEl.hidden = true;
     const btn = backdrop.querySelector('#review-action-submit');
     btn.disabled = true;
     btn.textContent = isReject ? 'Rejecting…' : 'Reassigning…';

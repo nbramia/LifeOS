@@ -71,9 +71,9 @@ class HermesExecutor:
         self._client_factory = http_client_factory or _default_client_factory
         self._persona_id = persona_id
 
-    def execute(self, session, task: dict) -> ExecutorOutcome:
+    def execute(self, session, task: dict, prompt: str | None = None) -> ExecutorOutcome:
         sid = session.session_id
-        prompt = self._build_prompt(task)
+        prompt = (prompt if prompt is not None else self._build_prompt(task)).strip()
         if not prompt:
             self.transcript_store.append(sid, "hermes_no_prompt", {})
             return ExecutorOutcome(status=STATUS_FAILED, reason="empty prompt")
@@ -85,7 +85,10 @@ class HermesExecutor:
                 reason="Hermes backend not configured (LIFEOS_HERMES_BACKEND_URL)",
             )
 
-        raw_body = json.dumps({"question": prompt, "persona_id": self._persona_id}).encode("utf-8")
+        request = {"question": prompt, "persona_id": self._persona_id}
+        if session.conversation_id:
+            request["conversation_id"] = session.conversation_id
+        raw_body = json.dumps(request).encode("utf-8")
         try:
             envelope_body = _build_envelope(raw_body)
         except Exception as exc:  # noqa: BLE001 — _build_envelope raises HTTPException
@@ -131,6 +134,7 @@ class HermesExecutor:
         self.transcript_store.append(sid, "hermes_completed", {
             "conversation_id": conversation_id,
             "final_chars": len(final_text),
+            "final_text": final_text[:6000],
             "done_seen": persister.done_seen,
         })
 

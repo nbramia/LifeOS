@@ -274,6 +274,7 @@ export class SessionPanel {
     // `boardApi`) can refresh it.
     this.findCard = opts.findCard || null;
     this.onCardChanged = opts.onCardChanged || (() => {});
+    this.onCardAccepted = opts.onCardAccepted || (() => {});
     this.sessionId = null;
     this.session = null;
     this.card = null;
@@ -369,6 +370,7 @@ export class SessionPanel {
       Object.assign(handlers, cardActionHandlers(this.card, {
         findCard: this.findCard,
         onChanged: () => this.onCardChanged(),
+        onAccepted: () => this.onCardAccepted(),
       }));
     }
     renderActionRow(container, {

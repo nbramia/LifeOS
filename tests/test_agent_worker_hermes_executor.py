@@ -159,6 +159,21 @@ def test_prompt_combines_title_and_notes(tmp_path, monkeypatch):
     assert "somewhere quiet, 7pm" in sent_body["question"]
 
 
+def test_followup_prompt_keeps_existing_hermes_conversation(tmp_path, monkeypatch):
+    body = _sse([
+        {"type": "conversation_id", "conversation_id": "conv-followup"},
+        {"type": "content", "content": "continued"},
+        {"type": "done"},
+    ])
+    executor, store, session, captured = _build(tmp_path, monkeypatch, body=body)
+    store.set_conversation_id(session.task_id, "conv-existing")
+    resumed = store.get(session.task_id)
+    outcome = executor.execute(resumed, {"description": "ignored"}, prompt="Please revise it")
+    assert outcome.status == STATUS_COMPLETED
+    assert json.loads(captured["content"])["conversation_id"] == "conv-existing"
+    assert json.loads(captured["content"])["question"] == "Please revise it"
+
+
 def test_empty_prompt_fails_without_request(tmp_path, monkeypatch):
     executor, store, session, captured = _build(tmp_path, monkeypatch, body=b"")
     outcome = executor.execute(session, {"description": "   "})

@@ -622,7 +622,10 @@ export function initBoard() {
       acceptBtn.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
-        runCardAction(() => acceptCard(card, fetchBoard));
+        acceptBtn.disabled = true;
+        runCardAction(() => acceptCard(card, fetchBoard)).finally(() => {
+          if (acceptBtn.isConnected) acceptBtn.disabled = false;
+        });
       });
     }
     return div;

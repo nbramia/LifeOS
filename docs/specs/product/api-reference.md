@@ -531,6 +531,9 @@ accepted.
 
 ### POST /api/agents/board/cards/{id}/undo-accept
 
+Accepts an optional `{ "token": "..." }` body returned by the matching
+Accept call; a stale token is rejected with 409. Legacy callers may omit it.
+
 Restore an accepted card to Review by removing its `accepted` tag. The
 transition is server-authoritative and preserves unrelated tags and fields;
 returns **409** when the card is not accepted.

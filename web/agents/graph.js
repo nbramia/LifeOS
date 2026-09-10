@@ -112,6 +112,10 @@ export function initGraph(boardApi) {
     // card rather than the one captured when the panel was opened.
     findCard: (boardApi && boardApi.findCard) || null,
     onCardChanged: () => { if (boardApi && boardApi.refresh) boardApi.refresh(); },
+    onCardAccepted: () => {
+      panel.close();
+      renderPanelActions(null);
+    },
     onLabelSaved: (sessionId, customLabel) => {
       const canonical = allSessions.find(x => x.session_id === sessionId);
       if (canonical) canonical.custom_label = customLabel;
