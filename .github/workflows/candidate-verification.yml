@@ -168,6 +168,7 @@ jobs:
             --shard-index "$SHARD_INDEX"
             --shard-count "$SHARD_COUNT"
             --workers "$WORKERS"
+            --capacity-max-run-workers "$WORKERS"
           )
           if [ "$LANE" = browser-free ]; then
             # browser-free never touches a live server, so independent
