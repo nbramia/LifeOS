@@ -163,19 +163,25 @@ Apply `pytestmark = pytest.mark.unit` at the module level for unit test files.
 
 `browser` and `requires_server` are independent. A browser test that points at a running `lifeos-api` carries both; one that serves `web/` itself on an ephemeral port and intercepts every `/api/` call carries only `browser`.
 
-That distinction is load-bearing: the `browser-free` lane is the set the
-pre-push hook runs, so it is the only gate that catches a `web/` JS regression
-before it reaches `main`. Pushes must not depend on a shared server that other
-agents restart, so a browser test that needs one is excluded there and runs
-under `./scripts/test.sh browser` instead. Playwright is a required
-pre-push prerequisite: when it is absent, the hook fails with its install
-command rather than reporting a green check without browser coverage.
+That distinction is load-bearing for candidate verification: the
+`browser-free` lane catches a `web/` JS regression without a shared server,
+while browser tests that need one run under `./scripts/test.sh browser`.
+The App-bound required candidate check owns those broad lanes. Ordinary
+pre-push runs keep only changed-Python Ruff checks and the direct read-only
+fixture privacy audit; the latter is either passed or explicitly
+not-applicable when no real `.env` is reachable, never silently treated as a
+pass. `./scripts/setup-hooks.sh --restore-blocking-local-verification`
+restores the blocking broad hook before hosted protection is disabled.
 
 Prefer the self-contained pattern for new frontend tests — it also means the test exercises the checkout under test rather than whatever a running server has deployed.
 
 The pre-push hook writes each suite's output to a per-branch, per-process log under `${TMPDIR:-/tmp}/lifeos-prepush/` and prints the resolved path before each run, so concurrent pushes from different worktrees never overwrite each other's log; logs past 4 days old are pruned automatically (`find -mtime +3` starts deleting at the 4-day mark, not 3). A branch name with non-ASCII characters or longer than 80 characters collapses to a less distinguishable slug in the filename, but the log path still stays unique (it's the process id, not the slug, that guarantees that). If the configured directory is unusable, the hook degrades instead of blocking the push: it tries a fixed fallback path, then a throwaway `lifeos-prepush.XXXXXX` directory, then (only if that `mktemp` call itself fails) a bare `mktemp -d`, which lands in a `tmp.XXXXXXXXXX`-style directory, then (as a true last resort) `/tmp` directly — printing which it used and why. Only a directory the hook actually created/manages this way is chmod'd to 0700 or pruned; any directory it doesn't own this way — the last resort, or a symlinked directory at any rung — still receives the log but is never tightened or swept, and gets a `lifeos-prepush-` filename prefix on its logs so they stay attributable.
 
-Because the pre-push hook always runs the unit and browser suites as separate invocations, a bug that only shows up when a `browser`-marked file and an unrelated test are *co-scheduled in one invocation* can appear or vanish with the file set under `--dist loadscope` — see AGENTS.md § Testing for the mechanism and how to bisect it deterministically.
+The broad verifier keeps browser and non-browser suites in separate
+invocations. A bug that only shows up when a `browser`-marked file and an
+unrelated test are *co-scheduled in one invocation* can appear or vanish with
+the file set under `--dist loadscope` — see AGENTS.md § Testing for the
+mechanism and how to bisect it deterministically.
 
 ## Fixture Patterns
 

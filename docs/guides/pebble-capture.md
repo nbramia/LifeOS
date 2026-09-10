@@ -1,14 +1,16 @@
 # Pebble Capture Filing
 
 **Status:** Complete
-**Last Updated:** 2026-09-09
+**Last Updated:** 2026-09-10
 **Audience:** Operators
 
-Pebble owns `LifeOS/Log/Pebble/YYYY-MM-DD.md`. LifeOS reads its framed result
-records and never rewrites the archive, transcripts, or Pebble's private
-SQLite/audio spool. Only a complete v1 `result` frame with `status: ready` is
-eligible for filing; partial, invalid, uncertain, pending, and failed records
-remain evidence only.
+Pebble owns `LifeOS/Log/Pebble`, where each recording day is two files:
+`YYYY-MM-DD-raw.md` holds the framed records and `YYYY-MM-DD.md` holds Pebble's
+readable digest of them. LifeOS reads framed result records from that directory
+and never rewrites the archive, transcripts, or Pebble's private SQLite/audio
+spool. The digest carries no frames, so scanning it produces no effects. Only a
+complete v1 `result` frame with `status: ready` is eligible for filing; partial,
+invalid, uncertain, pending, and failed records remain evidence only.
 
 ## Enable and Validate
 

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TERMINAL_FAILURES = frozenset({"failure", "cancelled", "incomplete", "infrastructure_failure"})
 PRIVACY_AUDIT_NODEID = "tests/test_fixtures_no_personal_data.py::test_no_fixture_contains_a_real_sensitive_value"
 PRIVACY_AUDIT_NOT_APPLICABLE_REASON = (
@@ -69,11 +69,33 @@ class VerificationInputs:
                 raise EvidenceError("invalid provenance identity")
 
     @property
-    def key(self) -> str:
-        return _digest(dataclasses.asdict(self))
+    def execution_fingerprint_dict(self) -> dict[str, str]:
+        """The execution-affecting subset alone: identical values here mean an
+        identical tree was already run through an identical lane selection,
+        runner, dependency set and environment -- regardless of which commit,
+        base, or lane subset a given caller happens to attribute it to.
 
-    def public_dict(self) -> dict[str, Any]:
-        return dataclasses.asdict(self)
+        ``base_identity``/``merge_identity``/``scope_identity`` are
+        publication provenance, not execution identity: a dirty pre-commit
+        run (no base, no merge SHA yet), the same tree committed and pushed
+        (a concrete SHA and base), and a later re-push against a moved base
+        are all the *same tested execution* and must share this key so the
+        proof is not silently re-run for each attribution. They are recorded
+        per attempt instead (see ``EvidenceStore.record``) so no receipt is
+        relabeled and a real base change can still be detected and enforced
+        at reuse time.
+        """
+        return {
+            "content_fingerprint": self.content_fingerprint,
+            "lane_inventory_fingerprint": self.lane_inventory_fingerprint,
+            "runner_fingerprint": self.runner_fingerprint,
+            "dependency_fingerprint": self.dependency_fingerprint,
+            "environment_fingerprint": self.environment_fingerprint,
+        }
+
+    @property
+    def key(self) -> str:
+        return _digest(self.execution_fingerprint_dict)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -171,7 +193,7 @@ class EvidenceStore:
         receipt = self._read(inputs.key)
         if receipt is None:
             return None, "missing"
-        if receipt.get("inputs") != inputs.public_dict():
+        if receipt.get("execution_inputs") != inputs.execution_fingerprint_dict:
             return None, "inputs_changed"
         attempts = receipt.get("attempts")
         if not isinstance(attempts, list) or not attempts:
@@ -179,10 +201,59 @@ class EvidenceStore:
         latest = attempts[-1]
         if latest.get("result") != "success":
             return None, f"prior_{latest.get('result', 'invalid')}"
-        actual = {outcome.get("lane"): sorted(outcome.get("nodeids", [])) for outcome in latest.get("outcomes", [])}
-        wanted = {lane: sorted(nodeids) for lane, nodeids in expected.items()}
-        if actual != wanted or any(outcome.get("exit_status") != 0 for outcome in latest.get("outcomes", [])):
-            return None, "outcomes_incomplete"
+        # A receipt this store itself wrote always has a well-formed
+        # provenance object (record() never omits it). Missing or malformed
+        # provenance -- e.g. a hand-edited or corrupted file -- is never
+        # treated as an implicit base_identity=None: that would let a
+        # base-independent request slip past a base check that should have
+        # applied. Fail closed instead of guessing.
+        provenance = latest.get("provenance")
+        if not isinstance(provenance, Mapping) or set(provenance) != {"base_identity", "merge_identity", "scope_identity"}:
+            return None, "malformed_attempt"
+        recorded_base = provenance["base_identity"]
+        if recorded_base is not None and (not isinstance(recorded_base, str) or len(recorded_base) > 128):
+            return None, "malformed_attempt"
+        # Base is a publication-authorization concern, not an execution one,
+        # but a mismatch must still fail closed: a base recorded as None
+        # matches only another None request (genuinely base-independent
+        # execution -- e.g. a checkout with no upstream at all). Any concrete
+        # base must match exactly; a moved or absent base is never silently
+        # treated as compatible, or a stale local receipt could follow a
+        # moved main without a fresh check.
+        if inputs.base_identity != recorded_base:
+            return None, "base_changed"
+        outcomes = latest.get("outcomes")
+        if not isinstance(outcomes, list) or not outcomes:
+            return None, "malformed_attempt"
+        by_lane: dict[str, set[str]] = {}
+        for outcome in outcomes:
+            lane, nodeids = outcome.get("lane"), outcome.get("nodeids")
+            if (
+                not isinstance(lane, str) or not lane or lane in by_lane
+                or not isinstance(nodeids, list) or not nodeids
+                or not all(isinstance(nodeid, str) for nodeid in nodeids)
+            ):
+                return None, "malformed_attempt"
+            # A "success" attempt must be internally consistent: every stored
+            # outcome -- not just the lanes this call happens to want -- must
+            # itself report a clean pass. A tampered or partially-written
+            # receipt that claims overall success while one outcome disagrees
+            # must never become a cache hit for anything.
+            if outcome.get("result") != "success" or outcome.get("exit_status") != 0:
+                return None, "malformed_attempt"
+            by_lane[lane] = set(nodeids)
+        # A prior success proves every *lane* it actually covered -- a request
+        # for a subset of those lanes (e.g. only "fast-unit" out of a
+        # six-lane success) is served by the same attempt without demanding
+        # every original lane back. Within a requested lane, though, the
+        # node-ID inventory must match exactly: an explicit partial-node
+        # selection is never opportunistically satisfied by a broader
+        # recorded run, matching the CLI's existing exact-selection-or-reject
+        # contract for --nodeids/--paths.
+        for lane, wanted_nodeids in expected.items():
+            entry = by_lane.get(lane)
+            if entry is None or set(wanted_nodeids) != entry:
+                return None, "scope_incomplete"
         return latest, "reused"
 
     def record(
@@ -214,11 +285,24 @@ class EvidenceStore:
                 "attempt_id": uuid.uuid4().hex,
                 "result": result,
                 "retry_reason": retry_reason,
+                # Provenance is per attempt, never collapsed into the shared
+                # receipt: each attempt keeps the exact base/merge/scope
+                # attribution it was actually run or reused under, so an
+                # earlier attempt is never relabeled by a later one.
+                "provenance": {
+                    "base_identity": inputs.base_identity,
+                    "merge_identity": inputs.merge_identity,
+                    "scope_identity": inputs.scope_identity,
+                },
                 "outcomes": [outcome.to_dict() for outcome in outcomes],
             }
             if diagnostics:
                 attempt["diagnostics"] = list(diagnostics)
-            payload = {"schema_version": SCHEMA_VERSION, "key": key, "inputs": inputs.public_dict(), "attempts": [*attempts, attempt]}
+            payload = {
+                "schema_version": SCHEMA_VERSION, "key": key,
+                "execution_inputs": inputs.execution_fingerprint_dict,
+                "attempts": [*attempts, attempt],
+            }
             temp_fd, temp_name = tempfile.mkstemp(prefix="evidence-", suffix=".tmp", dir=self.root)
             try:
                 with os.fdopen(temp_fd, "w", encoding="utf-8") as stream:

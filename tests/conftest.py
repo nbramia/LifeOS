@@ -18,6 +18,7 @@ Run categories:
 """
 import gc
 import os
+import shutil
 import time
 
 import pytest
@@ -42,6 +43,22 @@ from api.services.slack_indexer import SLACK_COLLECTION
 # resolve via their own cwd.
 for _var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
     os.environ.pop(_var, None)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Remove runtime state created inside a verifier-owned source snapshot."""
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    hermetic = (
+        not hasattr(session.config, "workerinput")
+        and os.environ.get("PYTHONDONTWRITEBYTECODE") == "1"
+        and "LIFEOS_PARALLEL_BROWSER_FREE" in os.environ
+        and os.path.isabs(os.environ.get("LIFEOS_CHROMA_PATH", ""))
+        and not os.path.lexists(os.path.join(project_root, ".git"))
+    )
+    if not hermetic:
+        return
+    for runtime_dir in ("data", "vault", "logs"):
+        shutil.rmtree(os.path.join(project_root, runtime_dir), ignore_errors=True)
 
 
 def wait_for_condition(predicate, timeout: float, interval: float = 0.2):
