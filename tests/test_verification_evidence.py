@@ -192,6 +192,286 @@ def test_base_dependency_config_and_safe_environment_change_invalidate(tmp_path)
 
 
 @pytest.mark.unit
+def test_changed_runner_script_invalidates_reuse(tmp_path):
+    """A runner-affecting file (not just app content) is part of execution
+    identity: editing it must invalidate reuse just like changed content."""
+    root = _source_repo(tmp_path)
+    first = _verify(root, tmp_path, base=None)
+    (root / "scripts" / "test.sh").write_text("#!/bin/bash\necho changed runner\n")
+    second = _verify(root, tmp_path, base=None)
+    assert not second.reused
+    assert first.evidence_key != second.evidence_key
+
+
+@pytest.mark.unit
+def test_reuse_never_invokes_the_lane_executor_a_second_time(tmp_path):
+    """Mechanism-level proof: once a candidate is proven at a given base, a
+    later request under the same base/content/runner/dependency/environment
+    never calls the lane executor again -- counted directly, not inferred
+    from timing."""
+    root = _source_repo(tmp_path)
+    (root / "app.py").write_text("VALUE = 'reused end to end'\n")
+    calls: list[str] = []
+
+    def counting_executor(snapshot, lane, nodeids):
+        calls.append(lane)
+        return _executor(snapshot, lane, nodeids)
+
+    precommit = _verify(root, tmp_path, executor=counting_executor, base="main-tip")
+    assert not precommit.reused
+    assert calls  # the precommit capture really executed at least one lane
+
+    _git(root, "add", "app.py")
+    _git(root, "commit", "-qm", "commit exact tested tree")
+
+    calls.clear()
+    pushed = verify_candidate(
+        root, tmp_path / "snapshot-pushed", tmp_path / "evidence", counting_executor,
+        base_identity="main-tip", merge_identity="pushed-sha-differs-from-none", environment={},
+        hermetic_environment=True,
+    )
+    assert pushed.reused
+    assert pushed.candidate_id == precommit.candidate_id
+    assert calls == []  # zero repeated lane commands
+
+
+@pytest.mark.unit
+def test_local_cli_commit_and_pushed_ref_cli_reuse_matching_real_hook_semantics(tmp_path):
+    """#978 end-to-end: the real ``local`` CLI (as ``test.sh`` invokes it,
+    inferring its base from the upstream tip) captures a dirty tree; once
+    committed, the real ``pushed-ref`` CLI (as pre-push invokes it, with the
+    base pre-push actually computes for an existing-branch push -- the
+    remote's current tip, see scripts/pre-push lines 84-86) must reuse that
+    capture. Both calls use identical worker/environment settings -- reuse
+    must come from genuine input equality, not a loosened comparison -- and
+    the reused call must still leave the exact per-lane receipt files
+    pre-push's file-existence gate requires, honestly labeled as reused
+    rather than a fabricated execution."""
+    root = _source_repo(tmp_path)
+    remote = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    _git(root, "remote", "add", "origin", str(remote))
+    _git(root, "push", "-q", "-u", "origin", "HEAD")
+
+    (root / "app.py").write_text("VALUE = 'hook-matching reuse'\n")
+    evidence = tmp_path / "evidence"
+    local_logs = tmp_path / "local-lanes"
+    local = subprocess.run(
+        [
+            sys.executable, str(REPO / "scripts" / "verify_candidate.py"), "local",
+            "--source", str(root), "--evidence-root", str(evidence),
+            "--lanes", "fast-unit", "--workers", "1", "--lane-log-dir", str(local_logs),
+        ],
+        text=True, capture_output=True,
+    )
+    assert local.returncode == 0, local.stdout + local.stderr
+    assert json.loads(local.stdout.splitlines()[-1])["reused"] is False
+    assert json.loads((local_logs / "fast-unit.json").read_text())["status"] == "success"
+
+    # Nothing advanced the remote in between: an existing-branch push's real
+    # base (scripts/pre-push's $remote_sha) is exactly this tracked tip.
+    remote_sha = subprocess.check_output(["git", "-C", str(root), "rev-parse", "@{upstream}"], text=True).strip()
+
+    _git(root, "add", "app.py")
+    _git(root, "commit", "-qm", "hook-matching reuse")
+    pushed_sha = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+
+    pushed_logs = tmp_path / "pushed-lanes"
+    pushed = subprocess.run(
+        [
+            sys.executable, str(REPO / "scripts" / "verify_candidate.py"), "pushed-ref",
+            "--repository", str(root), "--sha", pushed_sha, "--base", remote_sha,
+            "--evidence-root", str(evidence),
+            "--lanes", "fast-unit", "--workers", "1", "--lane-log-dir", str(pushed_logs),
+        ],
+        text=True, capture_output=True,
+    )
+    assert pushed.returncode == 0, pushed.stdout + pushed.stderr
+    payload = json.loads(pushed.stdout.splitlines()[-1])
+    assert payload["reused"] is True
+    # Pre-push's own gate: it requires exactly this file to exist to accept
+    # the candidate (scripts/pre-push, run_pushed_candidate). Its content
+    # must say "reused", never a fabricated fresh "success" execution.
+    pushed_receipt = json.loads((pushed_logs / "fast-unit.json").read_text())
+    assert pushed_receipt["status"] == "reused"
+    assert pushed_receipt["evidence_key"]
+    assert "reused" in (pushed_logs / "fast-unit.log").read_text()
+
+
+@pytest.mark.unit
+def test_missing_or_malformed_provenance_never_becomes_a_base_independent_cache_hit(tmp_path):
+    """A receipt whose attempt is missing (or has malformed) provenance must
+    never be treated as an implicit base_identity=None -- that would let a
+    base-independent request slip past a base check that should apply."""
+    inputs = VerificationInputs(*("d" * 64 for _ in range(5)))
+    store = EvidenceStore(tmp_path / "evidence")
+    outcome = LaneOutcome("fast-unit", ("tests/test_x.py::test_x",), 0, "success")
+    store.record(inputs, (outcome,), result="success")
+    receipt_path = tmp_path / "evidence" / f"{inputs.key}.json"
+    payload = json.loads(receipt_path.read_text())
+    del payload["attempts"][-1]["provenance"]
+    receipt_path.write_text(json.dumps(payload))
+
+    receipt, reason = store.reusable(inputs, {"fast-unit": outcome.nodeids})
+    assert receipt is None
+    assert reason == "malformed_attempt"
+
+
+@pytest.mark.unit
+def test_one_bad_outcome_in_a_success_attempt_blocks_reuse_of_every_lane(tmp_path):
+    """Every stored outcome in a "success" attempt must itself be a clean
+    pass, not just the lanes a given call happens to want -- a tampered
+    receipt (top-level success, one outcome disagreeing) must never become
+    a cache hit for any lane, including ones that look fine in isolation."""
+    inputs = VerificationInputs(*("e" * 64 for _ in range(5)))
+    store = EvidenceStore(tmp_path / "evidence")
+    fine = LaneOutcome("fast-unit", ("tests/test_x.py::test_x",), 0, "success")
+    store.record(inputs, (fine,), result="success")
+    receipt_path = tmp_path / "evidence" / f"{inputs.key}.json"
+    payload = json.loads(receipt_path.read_text())
+    payload["attempts"][-1]["outcomes"].append(
+        {"lane": "integration", "nodeids": ["tests/test_y.py::test_y"], "exit_status": 1, "result": "failure"}
+    )
+    receipt_path.write_text(json.dumps(payload))
+
+    receipt, reason = store.reusable(inputs, {"fast-unit": fine.nodeids})
+    assert receipt is None
+    assert reason == "malformed_attempt"
+
+
+@pytest.mark.unit
+def test_local_capture_on_base_a_does_not_authorize_pushed_ref_once_base_moves_to_b(tmp_path):
+    """#978 regression: identical tested content captured against base A must
+    never authorize a pushed-ref check once the real target has moved to
+    base B -- missing/changed provenance fails closed rather than silently
+    following the move."""
+    root = _source_repo(tmp_path)
+    (root / "app.py").write_text("VALUE = 'identical candidate content'\n")
+    local_capture = _verify(root, tmp_path, base="main-at-a")
+    assert not local_capture.reused
+
+    _git(root, "add", "app.py")
+    _git(root, "commit", "-qm", "identical candidate content")
+    sha = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+
+    stale = verify_git_ref(
+        root, sha, tmp_path / "evidence", base_identity="main-at-b",
+        required_lanes=("fast-unit",), workers=1,
+        capacity=CapacityManager.for_test(tmp_path / "capacity", total_workers=1),
+    )
+    assert not stale.reused
+    assert stale.candidate_id == local_capture.candidate_id  # same content, correctly rejected on base alone
+
+
+@pytest.mark.unit
+def test_full_lane_success_serves_a_requested_lane_subset_without_re_execution(tmp_path):
+    """#978: a success covering every lane can serve a later request for a
+    strict subset of those lanes without re-running anything -- but the
+    subset is only ever whole lanes, never opportunistically promoted from
+    the wrong lane."""
+    root = _source_repo(tmp_path)
+    (root / "tests" / "test_synthetic.py").write_text(
+        "import pytest\n\n"
+        "@pytest.mark.unit\ndef test_synthetic(): assert True\n\n"
+        "@pytest.mark.integration\ndef test_integration(): assert True\n"
+    )
+    first_logs = tmp_path / "first-logs"
+    first = verify_pytest_candidate(
+        root, tmp_path / "snapshot-one", tmp_path / "evidence",
+        required_lanes=("fast-unit", "integration"), workers=1, lane_log_dir=first_logs,
+    )
+    assert not first.reused
+    assert {path.stem for path in first_logs.glob("*.log")} == {"fast-unit", "integration"}
+
+    second_logs = tmp_path / "second-logs"
+    second = verify_pytest_candidate(
+        root, tmp_path / "snapshot-two", tmp_path / "evidence",
+        required_lanes=("fast-unit",), workers=1, lane_log_dir=second_logs,
+    )
+    assert second.reused
+    assert [outcome.lane for outcome in second.outcomes] == ["fast-unit"]
+    # A consumer's file-existence gate (pre-push) must still see exactly the
+    # requested lane's receipt -- honestly labeled reused, never "integration"
+    # (never requested this time) and never a fabricated fresh execution.
+    assert {path.stem for path in second_logs.glob("*.json")} == {"fast-unit"}
+    assert json.loads((second_logs / "fast-unit.json").read_text())["status"] == "reused"
+
+
+@pytest.mark.unit
+def test_explicit_partial_nodeid_selection_is_not_served_by_a_broader_recorded_success(tmp_path):
+    """#978: exact node-ID inventory per requested lane must be preserved --
+    a narrower explicit --nodeids selection is never opportunistically
+    satisfied by a broader lane success that happens to include those IDs."""
+    root = _source_repo(tmp_path)
+    (root / "tests" / "test_synthetic.py").write_text(
+        "import pytest\n\n"
+        "@pytest.mark.unit\ndef test_one(): assert True\n"
+        "@pytest.mark.unit\ndef test_two(): assert True\n"
+    )
+    evidence = tmp_path / "evidence"
+    full = subprocess.run(
+        [
+            sys.executable, str(REPO / "scripts" / "verify_candidate.py"), "local",
+            "--source", str(root), "--evidence-root", str(evidence),
+            "--lanes", "fast-unit", "--workers", "1",
+        ],
+        text=True, capture_output=True,
+    )
+    assert full.returncode == 0, full.stdout + full.stderr
+    assert json.loads(full.stdout.splitlines()[-1])["reused"] is False
+
+    partial = subprocess.run(
+        [
+            sys.executable, str(REPO / "scripts" / "verify_candidate.py"), "local",
+            "--source", str(root), "--evidence-root", str(evidence),
+            "--lanes", "fast-unit", "--nodeids", "tests/test_synthetic.py::test_one",
+            "--workers", "1",
+        ],
+        text=True, capture_output=True,
+    )
+    assert partial.returncode == 0, partial.stdout + partial.stderr
+    assert json.loads(partial.stdout.splitlines()[-1])["reused"] is False
+
+
+@pytest.mark.unit
+def test_local_cli_infers_upstream_base_and_pushed_ref_reuses_it(tmp_path):
+    """#978: the ``local`` CLI defaults to a real inferred base (this
+    checkout's upstream tip) rather than leaving it unattributed, so a
+    pushed-ref check naming that same tip can actually reuse the capture --
+    and an explicit ``--base`` still overrides the inferred one."""
+    root = _source_repo(tmp_path)
+    remote = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    _git(root, "remote", "add", "origin", str(remote))
+    _git(root, "push", "-q", "-u", "origin", "HEAD")
+    upstream_tip = subprocess.check_output(["git", "-C", str(root), "rev-parse", "@{upstream}"], text=True).strip()
+
+    (root / "app.py").write_text("VALUE = 'inferred base end to end'\n")
+    evidence = tmp_path / "evidence"
+    local = subprocess.run(
+        [
+            sys.executable, str(REPO / "scripts" / "verify_candidate.py"), "local",
+            "--source", str(root), "--evidence-root", str(evidence),
+            "--lanes", "fast-unit", "--workers", "1",
+        ],
+        text=True, capture_output=True,
+    )
+    assert local.returncode == 0, local.stdout + local.stderr
+    assert json.loads(local.stdout.splitlines()[-1])["reused"] is False
+
+    _git(root, "add", "app.py")
+    _git(root, "commit", "-qm", "inferred base end to end")
+    sha = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+
+    pushed = verify_git_ref(
+        root, sha, evidence, base_identity=upstream_tip,
+        required_lanes=("fast-unit",), workers=1,
+        capacity=CapacityManager.for_test(tmp_path / "capacity", total_workers=1),
+    )
+    assert pushed.reused
+
+
+@pytest.mark.unit
 def test_failed_attempt_is_retained_and_infrastructure_retry_is_reason_recorded(tmp_path):
     inputs = VerificationInputs(*( "a" * 64 for _ in range(5)))
     store = EvidenceStore(tmp_path / "evidence")
