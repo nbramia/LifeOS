@@ -849,6 +849,11 @@ export function initBoard() {
   function onPointerDown(e, source) {
     if (e.isPrimary === false || dragState || (e.pointerType === 'mouse' && e.button !== 0)) return;
     if (e.target.closest('button, input, select, textarea, a') && source.kind === 'card') return;
+    // A session chip has its own click navigation. Do not let the card's
+    // drag handler capture that pointer on the card, or the browser retargets
+    // the trailing pointerup/click to the card and opens its drawer instead
+    // of running the chip's graph jump.
+    if (source.kind === 'card' && e.target.closest('.board-chip-session')) return;
     const pointerType = e.pointerType || 'mouse';
     const state = {
       ...source, sourceEl: source.sourceEl || e.currentTarget,
