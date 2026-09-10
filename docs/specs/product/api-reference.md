@@ -543,7 +543,7 @@ the card's open question; `reject` requires a note, queues a follow-up, and
 returns the card to In progress; `reassign` requires a supported assignee,
 optionally records a context note, and returns the card to Assigned while
 preserving prior session context. Returns **409** for stale card/session
-state or a failed paired write.
+state or a CAS conflict, and **422** for a task-write validation failure.
 
 ### POST /api/agents/board/cards/{id}/cancel
 

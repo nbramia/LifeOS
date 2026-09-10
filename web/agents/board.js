@@ -1025,10 +1025,9 @@ export function initBoard() {
     }
     let assignee;
     if (targetLane === 'assigned') {
-      // No mid-drag assignee picker with plain HTML5 DnD — default to "me"
-      // (the common case: an operator claiming a card for themself) unless
-      // the card already has one, which the lane endpoint keeps as-is only
-      // when we pass it through explicitly.
+      // Dragging onto Assigned defaults to "me" (the common case: an
+      // operator claiming a card for themself) unless the card already has
+      // an assignee, which the lane endpoint keeps when passed explicitly.
       assignee = card.assignee || 'me';
     }
     // moveCard already toasts and re-renders on failure — nothing more to
