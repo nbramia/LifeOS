@@ -404,6 +404,9 @@ async def test_facts_adapter_and_legacy_fields_are_stable(tmp_path, monkeypatch)
     from config.settings import settings
 
     monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    # Every CLI engine's catalog state is derived from whether its binary
+    # resolves on PATH, so pin that rather than inheriting the host's.
+    monkeypatch.setattr("api.services.agent_worker.model_catalog.shutil.which", lambda _: "/usr/bin/codex")
     result = await ModelCatalog(
         codex_cache_path=str(tmp_path / "missing.json"),
         local_probe=_noop_local_probe,
