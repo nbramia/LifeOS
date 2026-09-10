@@ -43,6 +43,49 @@ from scripts.test_lane_registry import BY_NAME, EXECUTION_ORDER, marker
 
 RUNNER_INPUTS = ("scripts/test.sh", "scripts/test-lanes.sh", "scripts/test_lane_registry.py", "scripts/test_lane_plugin.py", "scripts/verify_candidate.py", "scripts/verification_evidence.py", "pyproject.toml")
 DEPENDENCY_INPUTS = ("requirements.txt",)
+
+
+def default_evidence_root() -> Path:
+    """The one canonical local evidence root every consumer should agree on
+    absent an explicit override (an explicit ``--evidence-root`` -- e.g. CI's
+    deliberately ephemeral runner-temp directory -- always takes precedence)."""
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "lifeos" / "verification-evidence"
+
+
+def infer_local_base(repository: Path) -> str | None:
+    """The default base identity for a local run when the caller does not
+    name one explicitly: this checkout's upstream tip when a tracking branch
+    exists, otherwise the resolved merge-base with ``origin/main`` -- the
+    same provenance scripts/pre-push itself computes for a brand-new
+    branch's first push (see its ``MERGE_BASE`` fallback). That is the
+    common pre-commit -> first-push path: a fresh feature branch has no
+    upstream yet, but pre-push still requires (and this must match) the
+    real resolved merge-base, never a guess.
+
+    Returns ``None`` only when neither is resolvable (e.g. no ``origin``
+    remote at all) -- such a checkout is genuinely base-independent rather
+    than silently exempt from base-sensitivity: ``EvidenceStore`` only
+    reuses a ``None``-based receipt for another ``None`` request. A concrete
+    inferred base means a later reuse attempt against a moved upstream/main
+    (e.g. a pushed-ref check once main has advanced) fails closed instead of
+    silently following the move.
+    """
+    upstream = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "@{upstream}"],
+        capture_output=True, text=True,
+    )
+    sha = upstream.stdout.strip()
+    if upstream.returncode == 0 and sha:
+        return sha
+    merge_base = subprocess.run(
+        ["git", "-C", str(repository), "merge-base", "HEAD", "origin/main"],
+        capture_output=True, text=True,
+    )
+    merge_sha = merge_base.stdout.strip()
+    return merge_sha if merge_base.returncode == 0 and merge_sha else None
+
+
 _HERMETIC_ENVIRONMENT = {
     "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0", "LIFEOS_TEST_PARALLEL_WORKERS": "1",
     "LIFEOS_PARALLEL_BROWSER_FREE": "0",
@@ -73,7 +116,13 @@ class VerificationResult:
 
 def _snapshot_modes_ok(snapshot: SnapshotResult) -> tuple[bool, list[str]]:
     """Use candidate_snapshot's shared byte/mode/runtime mismatch policy."""
-    ok, mismatches = verify_snapshot_unmodified(snapshot)
+    # ``data/`` is excluded when the candidate is built because it contains
+    # runtime databases, indexes, and locks. Tests may legitimately recreate
+    # those files inside their isolated snapshot; they are not candidate
+    # source and must follow the same exclusion on the post-run scan.
+    ok, mismatches = verify_snapshot_unmodified(
+        snapshot, ignore_new_file_globs=("data/**",),
+    )
     return ok, [str(mismatch) for mismatch in mismatches]
 
 
@@ -608,7 +657,20 @@ def verify_candidate(
     if not hermetic_environment:
         reusable, reason = None, "ambient_environment_unproven"
     if reusable is not None:
-        outcomes = tuple(LaneOutcome(item["lane"], tuple(item["nodeids"]), item["exit_status"], item["result"]) for item in reusable["outcomes"])
+        # The reused attempt may cover a broader scope than this call actually
+        # requested (e.g. a prior six-lane success serving a one-lane
+        # request) -- project it down to exactly the requested lanes/node
+        # IDs rather than reporting lanes nobody asked for this time.
+        by_lane = {item["lane"]: item for item in reusable["outcomes"]}
+        outcomes = []
+        for lane, lane_nodeids in expected.items():
+            item = by_lane[lane]
+            not_applicable: tuple[tuple[str, str], ...] = ()
+            stored_na = item.get("not_applicable")
+            if stored_na and stored_na["nodeid"] in lane_nodeids:
+                not_applicable = ((stored_na["nodeid"], stored_na["reason"]),)
+            outcomes.append(LaneOutcome(lane, lane_nodeids, item["exit_status"], item["result"], not_applicable=not_applicable))
+        outcomes = tuple(outcomes)
         _record_metric(metrics, phase="verification-cache", phase_kind="execution", elapsed_seconds=0, result="success", cache_hit=True, suite=scope, worker_count=workers, evidence_ref=inputs.key[:24])
         return VerificationResult(snapshot.candidate_id, inputs.key, True, reason, outcomes)
     if reason == "prior_infrastructure_failure" and not retry_reason:
@@ -683,6 +745,30 @@ def verify_candidate(
             lease.release()
 
 
+def _write_reused_lane_receipts(lane_log_dir: Path, evidence_key: str, outcomes: Sequence[LaneOutcome]) -> None:
+    """Emit an honest, existence-checkable receipt for each reused lane.
+
+    A consumer such as pre-push's ``--lane-log-dir`` file-existence gate must
+    see proof that a requested lane's result is accounted for even when no
+    lane process actually ran this time. The content is explicit that it is
+    a reuse referencing the original evidence, never a fabricated execution
+    report.
+    """
+    lane_log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for outcome in outcomes:
+        not_applicable_nodeid = outcome.not_applicable[0][0] if outcome.not_applicable else None
+        reports = {nodeid: ("skipped" if nodeid == not_applicable_nodeid else "passed") for nodeid in outcome.nodeids}
+        (lane_log_dir / f"{outcome.lane}.json").write_text(
+            json.dumps({"status": "reused", "evidence_key": evidence_key, "reports": reports}, sort_keys=True),
+            encoding="utf-8",
+        )
+        (lane_log_dir / f"{outcome.lane}.log").write_text(
+            f"reused: identical candidate already verified (evidence {evidence_key}); "
+            "no lane command was re-run.\n",
+            encoding="utf-8",
+        )
+
+
 def verify_pytest_candidate(
     source_root: Path,
     snapshot_root: Path,
@@ -706,7 +792,7 @@ def verify_pytest_candidate(
     """Concrete hermetic pytest entry point used by local runner adapters."""
     runtime_root = snapshot_root.parent / f"{snapshot_root.name}-runtime"
     environment = make_hermetic_environment(runtime_root, workers=workers, parallel_browser_free=parallel_browser_free)
-    return verify_candidate(
+    result = verify_candidate(
         source_root, snapshot_root, evidence_root,
         pytest_lane_executor(
             environment, workers=workers, lane_log_dir=lane_log_dir,
@@ -724,6 +810,12 @@ def verify_pytest_candidate(
         external_capacity_wait_seconds=external_capacity_wait_seconds,
         metrics_run_id=metrics_run_id,
     )
+    if result.reused and lane_log_dir is not None:
+        # No lane process ran this call, so pytest_lane_executor never wrote
+        # its --lifeos-lane-execution receipts -- a consumer gating on their
+        # existence (pre-push) must still see one per requested lane.
+        _write_reused_lane_receipts(lane_log_dir, result.evidence_key, result.outcomes)
+    return result
 
 
 def _start_candidate_owner(
@@ -859,7 +951,7 @@ def _main(argv: Sequence[str]) -> int:
     pushed.add_argument("--repository", required=True, type=Path)
     pushed.add_argument("--sha", required=True)
     pushed.add_argument("--base", default=None)
-    pushed.add_argument("--evidence-root", required=True, type=Path)
+    pushed.add_argument("--evidence-root", type=Path, default=None)
     pushed.add_argument("--lanes", default="fast-unit,browser-free")
     pushed.add_argument("--workers", default=1, type=int)
     pushed.add_argument(
@@ -869,7 +961,14 @@ def _main(argv: Sequence[str]) -> int:
     pushed.add_argument("--lane-log-dir", type=Path)
     local = sub.add_parser("local", help="verify this exact dirty working tree in an isolated snapshot")
     local.add_argument("--source", default=Path.cwd(), type=Path)
-    local.add_argument("--evidence-root", required=True, type=Path)
+    local.add_argument("--evidence-root", type=Path, default=None)
+    local.add_argument(
+        "--base", default=None,
+        help="explicit base identity to record/require for this run, overriding "
+        "inference. When omitted, inferred as this checkout's upstream tip, or "
+        "(no upstream yet, e.g. a fresh branch's first push) the resolved "
+        "merge-base with origin/main; None only when neither resolves",
+    )
     local.add_argument("--lanes", default="fast-unit,browser-free")
     local.add_argument("--workers", default=1, type=int)
     local.add_argument(
@@ -891,11 +990,12 @@ def _main(argv: Sequence[str]) -> int:
         "safe, but the default stays serial until measurements justify changing it",
     )
     args = parser.parse_args(argv)
+    evidence_root = args.evidence_root or default_evidence_root()
     if args.command == "pushed-ref":
         lanes = tuple(filter(None, args.lanes.split(",")))
         try:
             capacity = CapacityManager(max_run_workers=args.capacity_max_run_workers)
-            result = verify_git_ref(args.repository, args.sha, args.evidence_root, base_identity=args.base, required_lanes=lanes, workers=args.workers, capacity=capacity, lane_log_dir=args.lane_log_dir)
+            result = verify_git_ref(args.repository, args.sha, evidence_root, base_identity=args.base, required_lanes=lanes, workers=args.workers, capacity=capacity, lane_log_dir=args.lane_log_dir)
         except (CapacityError, CandidateVerificationError, EvidenceError, subprocess.CalledProcessError) as exc:
             print(f"candidate verification failed: {exc}", file=sys.stderr)
             return 1
@@ -908,6 +1008,7 @@ def _main(argv: Sequence[str]) -> int:
             print(f"candidate verification failed: {exc}", file=sys.stderr)
             return 1
         source = args.source.resolve()
+        base_identity = args.base if args.base is not None else infer_local_base(source)
         parent = Path(tempfile.mkdtemp(prefix="lifeos-local-candidate-"))
         snapshot = parent / "snapshot"
         owner_write = process_write = -1
@@ -922,7 +1023,8 @@ def _main(argv: Sequence[str]) -> int:
                 except OSError as exc:
                     raise CandidateVerificationError("candidate owner lost process registry") from exc
             result = verify_pytest_candidate(
-                source, snapshot, args.evidence_root, required_lanes=lanes,
+                source, snapshot, evidence_root, required_lanes=lanes,
+                base_identity=base_identity,
                 workers=args.workers, lane_log_dir=args.lane_log_dir,
                 capacity=capacity,
                 nodeid_paths=nodeid_paths,
@@ -973,7 +1075,7 @@ def _supervised_main(argv: Sequence[str]) -> int:
             signal.signal(signum, handler)
 
 
-__all__ = ["CandidateVerificationError", "VerificationResult", "build_inputs", "collect_lane_inventory", "make_hermetic_environment", "pytest_lane_executor", "verify_candidate", "verify_pytest_candidate", "verify_git_ref"]
+__all__ = ["CandidateVerificationError", "VerificationResult", "build_inputs", "collect_lane_inventory", "default_evidence_root", "infer_local_base", "make_hermetic_environment", "pytest_lane_executor", "verify_candidate", "verify_pytest_candidate", "verify_git_ref"]
 
 
 if __name__ == "__main__":

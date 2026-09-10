@@ -66,6 +66,8 @@ def isolated_hook_repo(tmp_path, monkeypatch):
     subprocess.run(["git", "-C", str(snapshot), "config", "user.name", "Hook Fixture"], check=True)
     subprocess.run(["git", "-C", str(snapshot), "config", "user.email", "hook-fixture@example.com"], check=True)
     (snapshot / "fixture-seed.txt").write_text("synthetic hook fixture\n")
+    (snapshot / "api").mkdir()
+    (snapshot / "api" / "main.py").write_text("value = 1\n")
     subprocess.run(["git", "-C", str(snapshot), "add", "fixture-seed.txt"], check=True)
     subprocess.run(["git", "-C", str(snapshot), "commit", "-q", "-m", "fixture seed"], check=True)
     subprocess.run(
@@ -222,6 +224,15 @@ def stub_python(tmp_path):
         "# Otherwise this is one of the two `python -m pytest -m \"...\"` calls;\n"
         "# tell them apart by the marker expression, which always names its stage.\n"
         "args=\"$*\"\n"
+        "if [[ \"$args\" == *'test_fixtures_no_personal_data.py::test_no_fixture_contains_a_real_sensitive_value'* ]]; then\n"
+        "    case \"${STUB_PRIVACY_AUDIT:-passed}\" in\n"
+        "        passed) echo '1 passed in 0.01s' ;;\n"
+        "        not-applicable) echo 'No real .env reachable from this checkout -- nothing to check fixtures against (expected on a fresh clone or CI).'; echo '1 skipped in 0.01s' ;;\n"
+        "        wrong-skip) echo 'unexpected skip'; echo '1 skipped in 0.01s' ;;\n"
+        "        failure) echo '1 failed in 0.01s'; exit 1 ;;\n"
+        "    esac\n"
+        "    exit 0\n"
+        "fi\n"
         "if [[ \"$args\" == *'--lanes browser-free'* ]] || [[ \"$args\" == *'-m browser and not requires_server'* ]]; then\n"
         "    echo \"${STUB_BROWSER_SUMMARY:-1 passed in 0.01s}\"\n"
         "    exit \"${STUB_BROWSER_EXIT:-0}\"\n"
@@ -236,6 +247,13 @@ def stub_python(tmp_path):
         "exit \"${STUB_UNIT_EXIT:-0}\"\n"
     )
     stub.chmod(0o755)
+    ruff = bin_dir / "ruff"
+    ruff.write_text(
+        "#!/bin/bash\n"
+        "[ -z \"${STUB_CAPTURE_RUFF:-}\" ] || printf '%s\\n' \"$*\" > \"$STUB_CAPTURE_RUFF\"\n"
+        "exit \"${STUB_RUFF_EXIT:-0}\"\n"
+    )
+    ruff.chmod(0o755)
     return {"bin_dir": bin_dir, "home_dir": home_dir}
 
 
@@ -272,6 +290,10 @@ def test_new_branch_verification_uses_resolved_merge_base(stub_python, tmp_path)
         ["git", "merge-base", source_sha, "origin/main"], cwd=REPO, text=True,
     ).strip()
     captured = tmp_path / "resolved-base"
+    subprocess.run(
+        ["git", "config", "lifeos.prepush.blocking-local-verification", "true"],
+        cwd=REPO, check=True,
+    )
     result = _run_real_hook(
         stub_python, tmp_path, local_ref="refs/heads/feat/new-branch-base",
         local_sha=source_sha,
@@ -291,14 +313,14 @@ _CASES = [
     # its own `\.(md|txt|rst)$` regex, which matched requirements.txt and
     # skipped the entire suite on a dep bump — while test.sh's decide_plan
     # deliberately excluded them. These pin the two back together.
-    ("requirements.txt", "run", "requirements"),
-    ("requirements-dev.txt", "run", "requirements_dev"),
-    ("constraints.txt", "run", "constraints"),
-    ("requirements.txt\nREADME.md", "run", "requirements_plus_docs"),
+    ("requirements.txt", "run-local", "requirements"),
+    ("requirements-dev.txt", "run-local", "requirements_dev"),
+    ("constraints.txt", "run-local", "constraints"),
+    ("requirements.txt\nREADME.md", "run-local", "requirements_plus_docs"),
     # code -> run
-    ("api/main.py", "run", "code_api"),
-    ("web/chat/voice.js", "run", "code_web_js"),
-    ("docs/x.md\napi/services/llm_client.py", "run", "mixed_docs_code"),
+    ("api/main.py", "run-local", "code_api"),
+    ("web/chat/voice.js", "run-local", "code_web_js"),
+    ("docs/x.md\napi/services/llm_client.py", "run-local", "mixed_docs_code"),
 ]
 
 
@@ -324,9 +346,41 @@ def test_deletion_only_push_skips(tmp_path):
 
 
 @pytest.mark.unit
-def test_unknown_changes_still_run_everything(tmp_path):
-    """An empty file list on a push that *does* carry commits must not skip."""
-    assert _decision(tmp_path, "", have_content="1") == "run"
+def test_unknown_changes_still_run_local_checks(tmp_path):
+    """An empty file list on a push that carries commits must not skip."""
+    assert _decision(tmp_path, "", have_content="1") == "run-local"
+
+
+@pytest.mark.unit
+def test_explicit_rollback_switch_restores_blocking_verification_plan(tmp_path):
+    """Only the documented local rollback switch selects the broad verifier."""
+    subprocess.run(
+        ["git", "config", "lifeos.prepush.blocking-local-verification", "true"],
+        cwd=REPO, check=True,
+    )
+    assert _decision(tmp_path, "api/main.py") == "run-blocking-local"
+
+
+@pytest.mark.unit
+def test_setup_hooks_rollback_option_persists_the_blocking_local_switch(tmp_path):
+    """The documented rollback command works even before an origin is configured."""
+    checkout = tmp_path / "rollback-checkout"
+    checkout.mkdir()
+    (checkout / "scripts").mkdir()
+    script = checkout / "scripts" / "setup-hooks.sh"
+    shutil.copy2(SOURCE_REPO / "scripts" / "setup-hooks.sh", script)
+    subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+
+    result = subprocess.run(
+        ["bash", str(script), "--restore-blocking-local-verification"],
+        cwd=checkout, text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Restored blocking local verification" in result.stdout
+    assert subprocess.check_output(
+        ["git", "config", "--bool", "--get", "lifeos.prepush.blocking-local-verification"],
+        cwd=checkout, text=True,
+    ).strip() == "true"
 
 
 @pytest.mark.unit
@@ -351,13 +405,8 @@ def test_hook_agrees_with_test_sh_on_docs_classification(tmp_path):
 
 
 @pytest.mark.unit
-def test_gate_is_not_narrowed_by_lastfailed():
-    """`--lf` must not come back.
-
-    It restricted the run to only previously-failed tests whenever a
-    lastfailed cache existed, so a fix-then-push ran a handful of tests out of
-    ~2400 and passed. `--ff` (ordering only) is the intended behaviour.
-    """
+def test_blocking_rollback_keeps_the_full_verifier_without_lastfailed():
+    """Rollback restores the exact verifier, never a narrowed cache selection."""
     # Comments are stripped: the hook explains at length *why* --lf is gone,
     # and that prose must not trip this check.
     code = "\n".join(
@@ -365,10 +414,8 @@ def test_gate_is_not_narrowed_by_lastfailed():
         if not line.lstrip().startswith("#")
     )
     assert "--lf" not in code, "pre-push must not deselect tests via --lf"
-    # The isolated verifier executes exact pushed-ref node IDs. Keep the
-    # no-deselection safety property without requiring a hook-local `--ff`
-    # argument.
-    assert "verify_candidate.py" in code, "pre-push must delegate execution to the isolated verifier"
+    assert "blocking-local-verification" in code
+    assert "verify_candidate.py" in code, "rollback must delegate execution to the isolated verifier"
 
 
 # --- Per-run log paths -----------------------------------------------------
@@ -476,34 +523,25 @@ def test_console_output_names_log_path(stub_python, tmp_path):
 
     log_dir = tmp_path / "lifeos-prepush"
     unit_logs = list(log_dir.glob("*-unit.log"))
-    browser_logs = list(log_dir.glob("*-browser.log"))
     assert len(unit_logs) == 1, f"expected exactly one unit log, found {unit_logs}"
-    assert len(browser_logs) == 1, f"expected exactly one browser log, found {browser_logs}"
+    assert not list(log_dir.glob("*-browser.log")), "cheap local mode must not run browser coverage"
 
     assert f"Log: {unit_logs[0]}" in result.stdout
-    assert f"Log: {browser_logs[0]}" in result.stdout
-    # The logs must contain the stubbed pytest's actual output, not just exist.
-    assert unit_logs[0].read_text().strip() == "1 passed in 0.01s"
-    assert browser_logs[0].read_text().strip() == "1 passed in 0.01s"
+    assert "fixture privacy audit: passed" in unit_logs[0].read_text()
     # The unconditional `chmod 700` must actually land on the directory this
     # hook owns and normally uses.
     assert log_dir.stat().st_mode & 0o777 == 0o700, (
         "the owned log directory must be tightened to 0700")
-    # The happy (owned-directory) path must keep naming logs from the branch
-    # slug alone — `LOG_FILE_PREFIX` is only for the not-owned last-resort
-    # case (test_last_resort_dir_is_never_chmod_or_pruned covers that
-    # direction). A mutant that applies the prefix unconditionally, or to
-    # only one of the two logs, would otherwise slip through undetected.
+    # The happy (owned-directory) path must keep naming its log from the
+    # branch slug alone — `LOG_FILE_PREFIX` is only for the not-owned last
+    # resort case (test_last_resort_dir_is_never_chmod_or_pruned covers that
+    # direction).
     assert not unit_logs[0].name.startswith("lifeos-prepush-"), (
         "the happy-path unit log must not carry the not-owned-dir prefix")
-    assert not browser_logs[0].name.startswith("lifeos-prepush-"), (
-        "the happy-path browser log must not carry the not-owned-dir prefix")
     assert unit_logs[0].name.startswith("feat_ac2-check-"), (
         "the happy-path unit log should be named from the branch slug")
-    assert browser_logs[0].name.startswith("feat_ac2-check-"), (
-        "the happy-path browser log should be named from the branch slug")
     # The happy path must never print a degraded-directory line, and the
-    # console output must be exactly these four lines — no more, no fewer —
+    # console output must be exactly these two lines — no more, no fewer —
     # so an extra line anywhere (e.g. a spuriously injected degraded-path
     # message) is caught.
     for phrase in ("is unusable", "is a symlink", "every fallback failed"):
@@ -511,10 +549,53 @@ def test_console_output_names_log_path(stub_python, tmp_path):
             f"happy path must not print a degraded-path message: {phrase!r}")
     assert result.stdout.splitlines() == [
         f"Log: {unit_logs[0]}",
-        "Running unit tests... passed (1 passed in 0.01s)",
-        f"Log: {browser_logs[0]}",
-        "Running server-free browser tests... passed (1 passed in 0.01s)",
+        "Running local lint and fixture privacy audit... passed (fixture privacy audit: passed)",
     ]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("outcome", "expected_returncode", "expected_text"),
+    [
+        ("not-applicable", 0, "fixture privacy audit: not applicable (no real .env reachable)"),
+        ("wrong-skip", 1, "expected one pass or the named no-real-.env not-applicable result"),
+        ("failure", 1, "FAILED (1 failed in 0.01s)"),
+    ],
+)
+def test_local_privacy_audit_accepts_only_its_named_not_applicable_result(
+    stub_python, tmp_path, outcome, expected_returncode, expected_text,
+):
+    """A skipped privacy audit is accepted only for its existing no-real-.env reason."""
+    result = _run_real_hook(
+        stub_python, tmp_path, local_ref="refs/heads/feat/privacy-audit",
+        extra_env={"STUB_PRIVACY_AUDIT": outcome},
+    )
+    assert result.returncode == expected_returncode, result.stdout + result.stderr
+    assert expected_text in result.stdout
+
+
+@pytest.mark.unit
+def test_local_mode_lints_changed_python_files(stub_python, tmp_path):
+    """The cheap replacement retains changed-Python lint feedback in its log."""
+    captured = tmp_path / "ruff-arguments"
+    result = _run_real_hook(
+        stub_python, tmp_path, local_ref="refs/heads/feat/ruff-check",
+        extra_env={"STUB_CAPTURE_RUFF": str(captured)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert captured.read_text().strip() == "check --quiet -- api/main.py"
+
+
+@pytest.mark.unit
+def test_local_mode_blocks_when_ruff_fails_even_if_privacy_audit_would_pass(stub_python, tmp_path):
+    """A failing Ruff command cannot be masked by the later passing audit."""
+    result = _run_real_hook(
+        stub_python, tmp_path, local_ref="refs/heads/feat/ruff-failure",
+        extra_env={"STUB_RUFF_EXIT": "1", "STUB_PRIVACY_AUDIT": "passed"},
+    )
+    assert result.returncode == 1
+    assert "FAILED (ruff: FAILED)" in result.stdout
+    assert "fixture privacy audit: passed" not in result.stdout
 
 
 @pytest.mark.unit
@@ -543,6 +624,7 @@ def test_preexisting_log_dir_is_tightened_to_0700(stub_python, tmp_path):
 def test_real_unit_failure_names_existing_log_with_failure_text(stub_python, tmp_path):
     """A real failing unit run must fail the push, name a log that actually
     exists, and stop before the browser stage ever runs."""
+    subprocess.run(["git", "config", "lifeos.prepush.blocking-local-verification", "true"], cwd=REPO, check=True)
     result = _run_real_hook(
         stub_python, tmp_path, local_ref="refs/heads/feat/unit-fail-check",
         extra_env={"STUB_UNIT_EXIT": "1", "STUB_UNIT_SUMMARY": "1 failed in 0.01s"},
@@ -563,6 +645,7 @@ def test_real_unit_failure_names_existing_log_with_failure_text(stub_python, tmp
 def test_ui_suite_failure_does_not_clobber_unit_log(stub_python, tmp_path):
     """A browser-stage failure must name the BROWSER log, and the unit log
     (from the same run, which passed) must survive untouched."""
+    subprocess.run(["git", "config", "lifeos.prepush.blocking-local-verification", "true"], cwd=REPO, check=True)
     result = _run_real_hook(
         stub_python, tmp_path, local_ref="refs/heads/feat/browser-fail-check",
         extra_env={"STUB_BROWSER_EXIT": "1", "STUB_BROWSER_SUMMARY": "1 failed in 0.02s"},
@@ -583,6 +666,7 @@ def test_ui_suite_failure_does_not_clobber_unit_log(stub_python, tmp_path):
 @pytest.mark.unit
 def test_missing_playwright_fails_required_ui_lane(stub_python, tmp_path):
     """The required hook cannot turn missing Playwright into a green push."""
+    subprocess.run(["git", "config", "lifeos.prepush.blocking-local-verification", "true"], cwd=REPO, check=True)
     result = _run_real_hook(
         stub_python, tmp_path, local_ref="refs/heads/feat/playwright-required",
         extra_env={"STUB_DETECT_EXIT": "1"},
@@ -599,6 +683,7 @@ def test_hook_verifies_each_nondeleted_ref_once_with_both_required_lanes(stub_py
         f"refs/heads/feat/one {_FAKE_SHA} refs/heads/one {_FAKE_SHA}\n"
         f"refs/heads/feat/two {second_sha} refs/heads/two {second_sha}\n"
     )
+    subprocess.run(["git", "config", "lifeos.prepush.blocking-local-verification", "true"], cwd=REPO, check=True)
     result = subprocess.run(
         ["bash", str(HOOK)], cwd=REPO, input=stdin, text=True, capture_output=True,
         env={
@@ -718,10 +803,9 @@ def test_unwritable_log_dir_push_still_completes(tmp_path, stub_python, make_hos
         expected_reason = _REASON_FOR_MAKER[make_hostile]
         assert f"is unusable ({expected_reason}); using" in result.stdout, result.stdout
         unit_logs = list(fallback_dir.glob("*-unit.log"))
-        browser_logs = list(fallback_dir.glob("*-browser.log"))
         assert len(unit_logs) == 1, f"expected one unit log in fallback dir, found {unit_logs}"
-        assert len(browser_logs) == 1, (
-            f"expected one browser log in fallback dir, found {browser_logs}")
+        assert not list(fallback_dir.glob("*-browser.log")), (
+            "cheap local mode must not create a browser log")
         assert "passed" in result.stdout
         assert fallback_dir.stat().st_mode & 0o777 == 0o700, (
             "an owned fallback directory must be tightened to 0700")
@@ -811,6 +895,7 @@ def test_fail_reports_empty_log(stub_python, tmp_path):
     produced no output at all. Reverting the whole `fail()` rewrite to the
     pre-round-1 two-liner, or deleting just this branch, must fail this test.
     """
+    subprocess.run(["git", "config", "lifeos.prepush.blocking-local-verification", "true"], cwd=REPO, check=True)
     result = _run_real_hook(
         stub_python, tmp_path, local_ref="refs/heads/feat/empty-log-check",
         extra_env={"STUB_UNIT_EXIT": "1", "STUB_UNIT_NO_OUTPUT": "1"},
@@ -837,6 +922,7 @@ def test_fail_reports_missing_log(stub_python, tmp_path):
     that path before exiting), so by the time `fail()` runs, `[ -e "$LOG" ]`
     is false.
     """
+    subprocess.run(["git", "config", "lifeos.prepush.blocking-local-verification", "true"], cwd=REPO, check=True)
     result = _run_real_hook(
         stub_python, tmp_path, local_ref="refs/heads/feat/missing-log-check",
         extra_env={"STUB_UNIT_DELETE_LOG": "1"},

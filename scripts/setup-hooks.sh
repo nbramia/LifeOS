@@ -17,9 +17,19 @@
 #   3. A check that the `gh` credential helper is wired up for HTTPS pushes,
 #      since that's what makes step 2 work without a password prompt.
 #
-# Usage: ./scripts/setup-hooks.sh
+# Usage: ./scripts/setup-hooks.sh [--restore-blocking-local-verification]
 
 set -euo pipefail
+
+RESTORE_BLOCKING_LOCAL_VERIFICATION=0
+case "${1:-}" in
+    "") ;;
+    --restore-blocking-local-verification) RESTORE_BLOCKING_LOCAL_VERIFICATION=1 ;;
+    *)
+        echo "Usage: $0 [--restore-blocking-local-verification]" >&2
+        exit 2
+        ;;
+esac
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
@@ -31,6 +41,11 @@ echo "  core.hooksPath = scripts"
 FETCH_URL="$(git remote get-url origin 2>/dev/null || true)"
 if [ -z "$FETCH_URL" ]; then
     echo "No 'origin' remote found -- skipping push transport setup."
+    if [ "$RESTORE_BLOCKING_LOCAL_VERIFICATION" = "1" ]; then
+        git config lifeos.prepush.blocking-local-verification true
+        echo "Restored blocking local verification for this checkout."
+    fi
+    echo "Done."
     exit 0
 fi
 
@@ -65,6 +80,11 @@ if ! git config --get-all 'credential.https://github.com.helper' 2>/dev/null | g
     echo "NOTE: the 'gh' credential helper for github.com is not configured."
     echo "  HTTPS pushes will prompt for a password/token until you run:"
     echo "    gh auth setup-git"
+fi
+
+if [ "$RESTORE_BLOCKING_LOCAL_VERIFICATION" = "1" ]; then
+    git config lifeos.prepush.blocking-local-verification true
+    echo "Restored blocking local verification for this checkout."
 fi
 
 echo "Done."

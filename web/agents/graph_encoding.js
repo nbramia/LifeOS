@@ -86,10 +86,21 @@ export function descendantsOf(sessions, session) {
 // Deterministic coordinates for the delegation timeline. Horizontal order is
 // chronological (with the id as a stable tie-breaker); vertical position is
 // delegation depth. Missing or filtered parents make a session a visible root.
+//
+// `columnGap`'s default is sized against `web/agents/graph.js`'s own label
+// legibility floor, not just visual taste: a shown label's font can be
+// boosted well past its 12px base size on a height-bound viewport (up to
+// LABEL_MAX_BOOST_PX/LABEL_BASE_FONT_PX = 3x before it's hidden instead),
+// and a full-width label (LABEL_MAX_W = 132 user units unboosted) at that
+// boost renders at up to 132 * 3 = 396 user units wide. Same-depth columns
+// (every root session, at minimum) sit exactly `columnGap` apart with no
+// other spacing mechanism between them, so a value near the unboosted
+// label width alone lets two adjacent, fully legible-boosted labels overlap
+// -- with margin added for real font-metric variance across environments.
 export function delegationTimelineLayout(sessions, {
   left = 130,
   top = 120,
-  columnGap = 190,
+  columnGap = 440,
   depthGap = 190,
 } = {}) {
   const byId = new Map(sessions.map(s => [s.session_id, s]));
