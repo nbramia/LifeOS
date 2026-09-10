@@ -825,9 +825,9 @@ class TestGoalApproval:
         assert q["session_id"] == result["session_id"]
 
     def _seed_blocked_goal_session(self, w, *, condition="all tests pass"):
-        """Drop a BLOCKED doctor session with a pending (proposed-not-locked)
-        goal in its transcript, plus an open goal_approval question — the shape
-        left behind after a goal-block round-trips through dispatch."""
+        """Drop a BLOCKED doctor session with an open goal_approval question
+        and the goal revision that question gates — the shape left behind
+        after a goal-block round-trips through dispatch."""
         from api.services.agent_worker.session_store import STATUS_BLOCKED
 
         session = w.session_store.create(
@@ -851,6 +851,7 @@ class TestGoalApproval:
             kind="goal_approval",
             bot="doctor",
         )
+        w._record_goal_proposal(session, condition, qid)
         return session, qid
 
     def test_affirmative_reply_injects_slash_goal(self, tmp_path):
@@ -891,9 +892,9 @@ class TestGoalApproval:
         assert "claude_code_goal_refine" in kinds
 
     def test_affirmative_without_recoverable_condition_reprompts(self, tmp_path):
-        """An affirmative reply when the proposed condition can't be recovered
-        (e.g. it was already locked) must NOT forward a bare 'yes' — it asks the
-        agent to re-emit the [GOAL], and records a goal_lock_failed event."""
+        """An affirmative reply that resolves to no goal revision must NOT
+        forward a bare 'yes' — it asks the agent to re-emit the [GOAL], and
+        records a goal_lock_failed event."""
         from api.services.agent_worker.session_store import STATUS_BLOCKED
 
         w = self._make_worker(tmp_path, self._goal_blocked_stub())
@@ -905,14 +906,8 @@ class TestGoalApproval:
             status=STATUS_BLOCKED,
         )
         w.session_store.set_claude_code_session_id(session.task_id, "cli-goal-nf")
-        # A proposal that was already locked → _pending_goal_condition returns None.
-        w.transcript_store.append(
-            session.session_id, "claude_code_awaiting_goal_approval",
-            {"condition": "all tests pass", "condition_chars": 14},
-        )
-        w.transcript_store.append(
-            session.session_id, "claude_code_goal_locked", {"condition_chars": 14},
-        )
+        # Neither the prompt text nor the transcript carries a condition, so
+        # no revision can be adopted for this question.
         w.session_store.create_pending_question(
             session_id=session.session_id,
             task_id=session.task_id,
@@ -936,9 +931,8 @@ class TestGoalApproval:
         assert "claude_code_goal_lock_failed" in kinds
 
     def test_goal_condition_survives_restart_and_reinjects(self, tmp_path):
-        """The #398 acceptance criterion: the proposed condition is durable via
-        the transcript (no DB column). A fresh Worker over the SAME paths
-        (simulating a restart) still injects `/goal <condition>` on approval."""
+        """The approved revision is durable: a fresh Worker over the SAME
+        paths (simulating a restart) still injects the stored resume action."""
         from api.services.agent_worker.session_store import STATUS_BLOCKED, STATUS_CLAIMED
 
         # First worker: seed the blocked goal + answered approval question.
@@ -975,23 +969,327 @@ class TestGoalApproval:
         assert [m["content"] for m in pending] == ["/goal all tests pass"]
         assert w2.session_store.get_by_session_id(session.session_id).status == STATUS_CLAIMED
 
-    def test_pending_goal_condition_returns_latest_after_relock_cycle(self, tmp_path):
-        """A later awaiting_goal_approval supersedes an earlier locked one:
-        awaiting{A} → locked → awaiting{B} resolves to B."""
-        from api.services.agent_worker.session_store import STATUS_BLOCKED
+    @staticmethod
+    def _redeliver(w, question_id):
+        """Return an already-consumed answered reply to the worker's
+        unprocessed set, the shape a redelivered reply arrives in."""
+        import sqlite3
+
+        conn = sqlite3.connect(str(w.session_store.db_path))
+        try:
+            conn.execute(
+                "UPDATE pending_questions SET processed = 0 WHERE id = ?",
+                (int(question_id),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_duplicate_reply_enqueues_no_second_resume(self, tmp_path):
+        """A redelivered approval resolves to a revision that is not in
+        `proposed` state: no second resume action and no second dispatch."""
+        w = self._make_worker(tmp_path, self._goal_blocked_stub())
+        session, qid = self._seed_blocked_goal_session(
+            w, condition="merge the parser fix and verify the service health check",
+        )
+
+        assert w.session_store.deposit_answer(9100, "yes", bot="doctor") is True
+        w._process_clarification_answers()
+        assert len(w.session_store.drain_pending_messages(session.session_id)) == 1
+
+        self._redeliver(w, qid)
+        w._process_clarification_answers()
+        assert w.session_store.drain_pending_messages(session.session_id) == []
+        kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
+        assert "doctor_goal_reply_ignored" in kinds
+
+    def test_stale_reply_cannot_lock_a_superseded_revision(self, tmp_path):
+        """A refinement retires the revision it answered. A later reply aimed
+        at that same revision locks nothing."""
+        from api.services.agent_worker.session_store import PROPOSAL_SUPERSEDED
 
         w = self._make_worker(tmp_path, self._goal_blocked_stub())
-        session = w.session_store.create(
-            task_id="task-goal-cycle",
+        session, qid = self._seed_blocked_goal_session(
+            w, condition="merge the parser fix and verify the service health check",
+        )
+        proposal = w.session_store.get_proposal_by_question_id(qid)
+
+        assert w.session_store.deposit_answer(9100, "also require lint", bot="doctor") is True
+        w._process_clarification_answers()
+        assert w.session_store.get_proposal(proposal["proposal_id"])["status"] == (
+            PROPOSAL_SUPERSEDED
+        )
+        w.session_store.drain_pending_messages(session.session_id)
+
+        # A stale "yes" on the same, now-superseded revision.
+        self._redeliver(w, qid)
+        w.session_store.deposit_answer_by_id(qid, "yes")
+        w._process_clarification_answers()
+        assert w.session_store.drain_pending_messages(session.session_id) == []
+        assert w.session_store.get_proposal(proposal["proposal_id"])["status"] == (
+            PROPOSAL_SUPERSEDED
+        )
+
+
+class TestRepairSpawnGate:
+    """`lifeos_agent_spawn` is how a repair dispatches implementation work, so
+    it is the LifeOS-owned boundary the single human gate sits on."""
+
+    def _ctx(self, tmp_path, caller_session_id):
+        from api.services.agent_worker import inter_agent
+        from api.services.agent_worker.session_store import SessionStore
+        from api.services.agent_worker.transcript_store import TranscriptStore
+
+        return inter_agent.InterAgentContext(
+            session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+            transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+            caller_session_id=caller_session_id,
+            caps=inter_agent.Caps(),
+        )
+
+    def _repair_caller(self, tmp_path):
+        from api.services.agent_worker import doctor_repair
+        from api.services.agent_worker.session_store import STATUS_RUNNING, SessionStore
+
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        workflow_id = store.create_repair()["workflow_id"]
+        caller = store.create(
+            task_id="task-doctor-root",
             routing="claude_code",
             origin="operator",
             bot="doctor",
-            status=STATUS_BLOCKED,
+            status=STATUS_RUNNING,
+            budget={"max_dollars": 10.0, "max_tokens": 500_000, "wall_seconds": 3600},
+            workflow_id=workflow_id,
         )
-        sid = session.session_id
-        w.transcript_store.append(sid, "claude_code_awaiting_goal_approval",
-                                  {"condition": "A", "condition_chars": 1})
-        w.transcript_store.append(sid, "claude_code_goal_locked", {"condition_chars": 1})
-        w.transcript_store.append(sid, "claude_code_awaiting_goal_approval",
-                                  {"condition": "B", "condition_chars": 1})
-        assert w._pending_goal_condition(sid) == "B"
+        condition = "merge the parser fix and verify the service health check"
+        proposal = store.propose_goal(
+            workflow_id,
+            condition=condition,
+            resume_action=doctor_repair.goal_resume_action(condition),
+        )
+        return store, workflow_id, caller, proposal
+
+    def test_spawn_is_refused_while_the_goal_awaits_approval(self, tmp_path):
+        from api.services.agent_worker import inter_agent
+
+        store, workflow_id, caller, _ = self._repair_caller(tmp_path)
+        ctx = self._ctx(tmp_path, caller.session_id)
+        result = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
+            "prompt": "implement the parser fix", "model": "claude_code",
+        })
+
+        assert result["ok"] is False
+        assert result["error"] == "repair_awaiting_approval"
+        # No child session was created: the gate refuses the dispatch itself.
+        assert [s.task_id for s in store.list_repair_sessions(workflow_id)] == [
+            "task-doctor-root",
+        ]
+        # The supervisor's own session is untouched — the gate governs what
+        # LifeOS dispatches, not what the running CLI process may do.
+        assert store.get("task-doctor-root").status == "running"
+
+    def test_spawn_is_allowed_once_the_goal_is_approved(self, tmp_path):
+        from api.services.agent_worker import inter_agent
+
+        store, workflow_id, caller, proposal = self._repair_caller(tmp_path)
+        store.approve_goal(proposal["proposal_id"])
+
+        ctx = self._ctx(tmp_path, caller.session_id)
+        result = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
+            "prompt": "implement the parser fix", "model": "claude_code",
+        })
+
+        assert result["ok"] is True, result
+        child = store.get_by_session_id(result["child_session_id"])
+        assert child.workflow_id == workflow_id
+
+    def test_an_ordinary_agent_task_is_not_gated(self, tmp_path):
+        from api.services.agent_worker import inter_agent
+        from api.services.agent_worker.session_store import STATUS_RUNNING, SessionStore
+
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        caller = store.create(
+            task_id="task-ordinary-root",
+            routing="claude_code",
+            origin="operator",
+            status=STATUS_RUNNING,
+            budget={"max_dollars": 10.0, "max_tokens": 500_000, "wall_seconds": 3600},
+        )
+        ctx = self._ctx(tmp_path, caller.session_id)
+        result = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
+            "prompt": "summarize a file", "model": "claude_code",
+        })
+
+        assert result["ok"] is True, result
+        assert store.get_by_session_id(result["child_session_id"]).workflow_id is None
+
+    def test_a_repair_child_cannot_launder_a_dispatch_past_the_gate(self, tmp_path):
+        """A grandchild spawn reads the repair from the lineage root, so an
+        intermediate session cannot dispatch work the gate has not opened."""
+        from api.services.agent_worker import inter_agent
+        from api.services.agent_worker.session_store import STATUS_RUNNING
+
+        store, workflow_id, caller, proposal = self._repair_caller(tmp_path)
+        store.approve_goal(proposal["proposal_id"])
+        child = store.create(
+            task_id="task-doctor-child",
+            routing="claude_code",
+            status=STATUS_RUNNING,
+            parent_session_id=caller.session_id,
+            root_session_id=caller.session_id,
+            spawn_depth=1,
+            budget={"max_dollars": 5.0, "max_tokens": 200_000, "wall_seconds": 1800},
+        )
+        store.cancel_repair(workflow_id)
+
+        ctx = self._ctx(tmp_path, child.session_id)
+        result = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
+            "prompt": "keep going anyway", "model": "claude_code",
+        })
+        assert result["ok"] is False
+        assert result["error"] == "repair_cancelled"
+
+
+class TestRepairResultsAdvancePhases:
+    """The worker folds a session's structured result into its repair. Fake or
+    partial results never reach `shipped`."""
+
+    def _worker_with_repair(self, tmp_path):
+        from api.services.agent_worker import doctor_repair
+        from api.services.agent_worker.session_store import STATUS_RUNNING
+
+        w = TestGoalApproval()._make_worker(tmp_path, None)
+        workflow_id = w.session_store.create_repair()["workflow_id"]
+        condition = "merge the parser fix and verify the service health check"
+        proposal = w.session_store.propose_goal(
+            workflow_id,
+            condition=condition,
+            resume_action=doctor_repair.goal_resume_action(condition),
+        )
+        w.session_store.approve_goal(proposal["proposal_id"])
+        session = w.session_store.create(
+            task_id="task-repair-run",
+            routing="claude_code",
+            origin="operator",
+            bot="doctor",
+            status=STATUS_RUNNING,
+            workflow_id=workflow_id,
+        )
+        return w, workflow_id, session
+
+    @staticmethod
+    def _result_text(**overrides):
+        from tests.test_doctor_repair_record import shipped_evidence
+
+        return "Done.\nLIFEOS_REPAIR_RESULT:" + json.dumps(shipped_evidence(**overrides))
+
+    def test_complete_evidence_marks_the_repair_shipped(self, tmp_path):
+        from api.services.agent_worker.session_store import REPAIR_SHIPPED
+
+        w, workflow_id, session = self._worker_with_repair(tmp_path)
+        w._apply_repair_result(session, self._result_text())
+        assert w.session_store.get_repair(workflow_id)["phase"] == REPAIR_SHIPPED
+
+    def test_prose_only_success_advances_nothing(self, tmp_path):
+        from api.services.agent_worker.session_store import REPAIR_IMPLEMENTING
+
+        w, workflow_id, session = self._worker_with_repair(tmp_path)
+        w._apply_repair_result(session, "Shipped it! Everything is merged and live.")
+        assert w.session_store.get_repair(workflow_id)["phase"] == REPAIR_IMPLEMENTING
+
+    def test_a_duplicate_result_event_is_applied_once(self, tmp_path):
+        w, workflow_id, session = self._worker_with_repair(tmp_path)
+        w._apply_repair_result(session, self._result_text())
+        w._apply_repair_result(session, self._result_text())
+
+        kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
+        assert kinds.count("doctor_repair_phase") == 1
+        assert "doctor_repair_event_duplicate" in kinds
+
+    def test_a_cancelled_repair_is_not_revived_by_a_late_result(self, tmp_path):
+        from api.services.agent_worker.session_store import REPAIR_CANCELLED
+
+        w, workflow_id, session = self._worker_with_repair(tmp_path)
+        w.session_store.cancel_repair(workflow_id, "operator kill")
+        w._apply_repair_result(session, self._result_text())
+
+        assert w.session_store.get_repair(workflow_id)["phase"] == REPAIR_CANCELLED
+        kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
+        assert "doctor_repair_result_rejected" in kinds
+
+    def test_a_session_outside_a_repair_records_nothing(self, tmp_path):
+        from api.services.agent_worker.session_store import STATUS_RUNNING
+
+        w, _, _ = self._worker_with_repair(tmp_path)
+        loose = w.session_store.create(
+            task_id="task-loose", routing="claude_code", status=STATUS_RUNNING,
+        )
+        w._apply_repair_result(loose, self._result_text())
+        assert w.transcript_store.read(loose.session_id) == []
+
+
+class TestRepairReadSurface:
+    """Both surfaces read one durable repair state off the agents snapshot."""
+
+    def test_repair_phase_and_evidence_ride_along_on_the_session(self, tmp_path):
+        from api.routes.agents import _session_to_dict
+        from api.services.agent_worker import doctor_repair
+        from api.services.agent_worker.session_store import SessionStore
+        from api.services.agent_worker.transcript_store import TranscriptStore
+
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        transcript = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+        workflow_id = store.create_repair()["workflow_id"]
+        condition = "merge the parser fix and verify the service health check"
+        proposal = store.propose_goal(
+            workflow_id, condition=condition,
+            resume_action=doctor_repair.goal_resume_action(condition),
+        )
+        store.approve_goal(proposal["proposal_id"])
+        store.set_repair_phase(
+            workflow_id, "verifying", waiting_reason="running_revision_stale",
+            evidence={"pull_requests": [4321]},
+        )
+        session = store.create(
+            task_id="task-surface", routing="claude_code", origin="operator",
+            bot="doctor", workflow_id=workflow_id,
+        )
+
+        repairs = {r["workflow_id"]: r for r in store.list_repairs([workflow_id])}
+        payload = _session_to_dict(session, transcript, repairs)
+
+        assert payload["repair"] == {
+            "workflow_id": workflow_id,
+            "phase": "verifying",
+            "waiting_reason": "running_revision_stale",
+            "approved_version": 1,
+            "evidence": {"pull_requests": [4321]},
+        }
+
+    def test_a_session_outside_a_repair_reports_null(self, tmp_path):
+        from api.routes.agents import _session_to_dict
+        from api.services.agent_worker.session_store import SessionStore
+        from api.services.agent_worker.transcript_store import TranscriptStore
+
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        transcript = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+        session = store.create(task_id="task-plain", routing="local")
+        assert _session_to_dict(session, transcript, {})["repair"] is None
+
+
+class TestPersonaExecutionContract:
+    """Both doctor paths default to Claude Code and never request an API-billed
+    child implicitly."""
+
+    @pytest.mark.parametrize("name", ["doctor.md", "doctor.hermes.md"])
+    def test_persona_defaults_to_claude_code_and_refuses_the_api(self, name):
+        body = (Path("config/personas") / name).read_text(encoding="utf-8")
+        assert "claude_code" in body
+        assert 'model="claude"' in body
+        assert "LIFEOS_REPAIR_RESULT" in body
+
+    @pytest.mark.parametrize("name", ["doctor.md", "doctor.hermes.md"])
+    def test_persona_states_the_single_gate(self, name):
+        body = (Path("config/personas") / name).read_text(encoding="utf-8").lower()
+        assert "one human gate" in body or "single human gate" in body

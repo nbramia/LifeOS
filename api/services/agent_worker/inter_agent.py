@@ -41,6 +41,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from api.services.agent_worker import doctor_repair
 from api.services.agent_worker.hermes_session import HERMES_ROUTING
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
@@ -143,6 +144,19 @@ def _ok(payload: dict | None = None) -> dict:
 
 def _err(message: str, code: str = "error") -> dict:
     return {"ok": False, "error": code, "message": message}
+
+
+def _repair_workflow_for(ctx: "InterAgentContext", caller: Session) -> str | None:
+    """The repair a spawn would execute for: the caller's own workflow, or
+    its root's. Read from the root so an intermediate child cannot launder a
+    dispatch past the repair's approval gate."""
+    if caller.workflow_id:
+        return caller.workflow_id
+    root_id = caller.root_session_id or caller.session_id
+    if root_id == caller.session_id:
+        return None
+    root = ctx.session_store.get_by_session_id(root_id)
+    return root.workflow_id if root else None
 
 
 def _update_status_for_session(
@@ -428,6 +442,25 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
                 code="api_billing_blocked",
             )
 
+    # The doctor's single human gate, enforced at LifeOS's own dispatch
+    # boundary. Spawning a child is how a repair gets implementation work
+    # done, so it requires an approved goal revision. The supervisor's own
+    # session keeps running throughout, which is what leaves read-only
+    # diagnosis available before approval; this gate governs what LifeOS
+    # dispatches, not what a running CLI process is permitted to do.
+    repair_workflow_id = _repair_workflow_for(ctx, caller)
+    if repair_workflow_id:
+        decision = doctor_repair.dispatch_allowed(
+            ctx.session_store.get_repair(repair_workflow_id), "implement",
+        )
+        if not decision.allowed:
+            return _err(
+                f"repair {repair_workflow_id} cannot dispatch implementation "
+                f"work: {decision.reason}. Propose a goal and get it approved "
+                f"before spawning a worker to implement it.",
+                code=decision.reason,
+            )
+
     # Cap: spawn depth.
     new_depth = (caller.spawn_depth or 0) + 1
     if new_depth > ctx.caps.max_spawn_depth:
@@ -538,6 +571,9 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
         model=(caller.model if caller.routing == provisional_routing else None),
         effort=(caller.effort if caller.routing == provisional_routing else None),
         execution_request=asdict(execution_request),
+        # A child executes for the same repair as its lineage, so the repair
+        # record sees every session it owns without a second workflow.
+        workflow_id=repair_workflow_id,
     )
     # The prompt becomes the child's task description (used by the executor's
     # _seed_conversation) so the system prompt + inter-agent guidance run as

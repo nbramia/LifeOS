@@ -186,7 +186,30 @@ def _summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
+def _repair_view(repair: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The durable repair state a client renders for a session.
+
+    Present only for a session that belongs to a doctor repair; every other
+    session carries `repair: null`, so the field is additive for existing
+    clients. Phase and evidence come from the repair record, which is what
+    makes the web and Telegram surfaces show the same state.
+    """
+    if not repair:
+        return None
+    return {
+        "workflow_id": repair.get("workflow_id"),
+        "phase": repair.get("phase"),
+        "waiting_reason": repair.get("waiting_reason"),
+        "approved_version": repair.get("approved_version"),
+        "evidence": repair.get("evidence") or {},
+    }
+
+
+def _session_to_dict(
+    s: Session,
+    transcript: TranscriptStore,
+    repairs: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     try:
         events = transcript.read(s.session_id)
     except Exception as exc:  # noqa: BLE001 — defensive: read should never break the snapshot
@@ -242,6 +265,7 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         # Operator-pinned manual label. When set, the frontend uses it as the
         # node name in preference to short_label and label.
         "custom_label": agent_viz_label_override.get_override(s.session_id),
+        "repair": _repair_view((repairs or {}).get(s.workflow_id or "")),
     }
 
 
@@ -478,7 +502,17 @@ def _build_snapshot() -> dict[str, Any]:
     session_store = _get_session_store()
     transcript_store = _get_transcript_store()
     sessions = session_store.list_sessions(limit=_SNAPSHOT_LIMIT)
-    session_dicts = [_session_to_dict(s, transcript_store) for s in sessions]
+    # One query for every repair the snapshot's sessions reference, so the
+    # durable phase/evidence rides along without a per-session lookup.
+    repairs = {
+        r["workflow_id"]: r
+        for r in session_store.list_repairs(
+            sorted({s.workflow_id for s in sessions if s.workflow_id})
+        )
+    }
+    session_dicts = [
+        _session_to_dict(s, transcript_store, repairs) for s in sessions
+    ]
     # Tag LifeOS sessions with a source discriminator so the frontend can
     # distinguish them from Claude Code sessions in the union below.
     for sd in session_dicts:
