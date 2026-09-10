@@ -23,6 +23,14 @@ from api.services.conversation_store import ConversationStore
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _redirect_agent_output(tmp_path, monkeypatch):
+    """Write completed-task output to a throwaway vault for these tests."""
+    from config.settings import settings as _settings
+
+    monkeypatch.setattr(_settings, "vault_path", tmp_path / "vault", raising=False)
+
+
 @dataclass
 class _StubExecutor:
     outcome: ExecutorOutcome
