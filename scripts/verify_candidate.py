@@ -244,7 +244,37 @@ def make_hermetic_environment(runtime_root: Path, *, workers: int, parallel_brow
         # the immutable snapshot -- writing there would fail the strict
         # snapshot-unmodified check on every browser-marked collection/run.
         "LIFEOS_CHROMA_PATH": str(runtime_root / "chromadb"),
+        "LIFEOS_VAULT_PATH": str(runtime_root / "vault"),
     }
+
+
+
+def link_candidate_data_directory(snapshot_root: Path, runtime_root: Path) -> Path:
+    """Resolve the candidate's whole ``data`` directory to runtime storage.
+
+    Every LifeOS data store places its default under the checkout's ``data``
+    directory -- most anchored at the repo root through ``Path(__file__)``
+    (the deliberate invariant of ``tests/test_data_path_anchoring.py``), a
+    few relative to the process cwd. For a candidate, both of those roots
+    are the immutable snapshot, so any lane touching such a store would fail
+    the strict snapshot-unmodified check, and neither the execution
+    environment nor the working directory can move a repo-root-anchored
+    default. Redirecting the single directory they all share leaves each
+    store exactly where the candidate's own code computes it while the bytes
+    land in verifier-owned storage.
+
+    ``data`` is never snapshot content (``candidate_snapshot`` excludes it),
+    and the strict check walks the snapshot without following directory
+    symlinks, so every other new file, content change, or mode change is
+    still reported.
+    """
+    runtime_data = runtime_root / "data"
+    runtime_data.mkdir(mode=0o700, parents=True, exist_ok=True)
+    link = snapshot_root / "data"
+    if os.path.lexists(link):
+        raise CandidateVerificationError(f"candidate already carries its own data path: {link}")
+    link.symlink_to(runtime_data, target_is_directory=True)
+    return runtime_data
 
 
 def collect_lane_inventory(snapshot_root: Path, receipt_dir: Path, environment: Mapping[str, str]) -> dict:
@@ -693,6 +723,7 @@ def verify_candidate(
             metrics = None
     actual_runtime_root = runtime_root or (inventory_receipt_root or evidence_root) / f"runtime-{snapshot.candidate_id}"
     execution_environment = make_hermetic_environment(actual_runtime_root, workers=workers)
+    link_candidate_data_directory(Path(snapshot.dest_root), actual_runtime_root)
     if environment:
         if set(environment) - {"LIFEOS_TEST_PARALLEL_WORKERS", "PYTHONHASHSEED", "LIFEOS_PARALLEL_BROWSER_FREE"}:
             raise CandidateVerificationError("caller environment is not a safe execution control")
