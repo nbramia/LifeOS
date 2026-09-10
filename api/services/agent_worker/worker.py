@@ -421,6 +421,9 @@ _PICKUP_TAG_SET = frozenset(AGENT_PICKUP_TAGS)
 # #760: best-effort WIP-branch discovery for an interrupted CLI session — a
 # regex over past tool_use transcript events, never a live `git` call.
 _WIP_BRANCH_RE = re.compile(r"git\s+(?:switch\s+-c|checkout\s+-b)\s+([A-Za-z0-9._/-]+)")
+_TASK_NOTES_MAX_CHARS = 6000
+_OPERATOR_NOTES_MAX_CHARS = 2000
+_HANDOFF_MAX_CHARS = 4000
 
 
 class _SynchronousPool:
@@ -1001,8 +1004,13 @@ class Worker:
         out of the answer text and update session.routing accordingly
         before dispatching.
         """
-        answered = self.session_store.list_answered_unprocessed_questions()
+        # Claim rows before reading/acting on them. Reassignment can retire a
+        # follow-up after this list is built; question_claimed() below then
+        # prevents that stale row from mutating the old session/card.
+        answered = self.session_store.claim_answered_unprocessed_questions()
         for q in answered:
+            if not self.session_store.question_claimed(q["id"]):
+                continue
             session_id = q["session_id"]
             task_id = q["task_id"]
             session = self.session_store.get_by_session_id(session_id)
@@ -1085,6 +1093,7 @@ class Worker:
                 except Exception as exc:
                     logger.exception("clarification Hermes resume crashed for %s", task_id)
                     self._mark_failed(session, task, f"clarification resume crashed: {exc}")
+                    self.session_store.release_question_claim(q["id"])
                     continue
                 self.session_store.mark_question_processed(q["id"])
                 self._handle_outcome(session, task, outcome)
@@ -1099,6 +1108,7 @@ class Worker:
                     )
                     # Leave question unprocessed so retry can be attempted.
                     self._mark_failed(session, task, f"clarification resume crashed: {exc}")
+                    self.session_store.release_question_claim(q["id"])
                     continue
                 # Only mark processed once the executor returns cleanly — if
                 # the worker crashes mid-execute, the question stays open and
@@ -1128,6 +1138,7 @@ class Worker:
                         "clarification resume crashed for %s: %s", task_id, exc,
                     )
                     self._mark_failed(session, task, f"clarification resume crashed: {exc}")
+                    self.session_store.release_question_claim(q["id"])
                     continue
                 self.session_store.mark_question_processed(q["id"])
                 self._handle_outcome(session, task, outcome)
@@ -2824,9 +2835,26 @@ class Worker:
             session = self.session_store.get(task_id) or session
         handoff = self._reassignment_context(session) if reassignment else ""
         dispatch_task = dict(task)
-        if handoff and pre.routing in (ROUTE_CLAUDE, ROUTE_HERMES):
+        if handoff:
             notes = (dispatch_task.get("notes") or "").strip()
+            # This copy is what every executor receives, including local and
+            # remote routes. The executor-specific first-prompt builders are
+            # responsible for applying the same bound to the actual prompt.
+            notes = notes[-_OPERATOR_NOTES_MAX_CHARS:]
+            handoff = handoff[-_HANDOFF_MAX_CHARS:]
             dispatch_task["notes"] = f"{notes}\n\n{handoff}" if notes else handoff
+            if pre.routing in (ROUTE_LOCAL, ROUTE_REMOTE):
+                # A rearmed local/remote session already has a system
+                # message, so LocalExecutor would otherwise skip seeding and
+                # never see task dict notes. Persist the handoff as the next
+                # durable user turn; the executor then receives it in the
+                # same conversation history on this first fresh-route turn.
+                self.session_store.append_message(
+                    sid,
+                    "user",
+                    "Reassignment context — verify before relying on it:\n\n"
+                    + dispatch_task["notes"],
+                )
 
         # Sanity gate (#747). Only a *fatal* sane=False fails the task
         # closed — an empty title, a preflight-call error, or a title the
@@ -2875,7 +2903,7 @@ class Worker:
         if pre.routing == ROUTE_LOCAL:
             executor = self._get_local_executor(caller_session_id=session.session_id)
             try:
-                outcome = executor.execute(session, task)
+                outcome = executor.execute(session, dispatch_task)
             except Exception as exc:
                 logger.exception("local executor crashed for %s: %s", task_id, exc)
                 self._mark_failed(session, task, f"executor crashed: {exc}")
@@ -2904,7 +2932,7 @@ class Worker:
                 return
             executor = self._get_remote_executor(caller_session_id=session.session_id)
             try:
-                outcome = executor.execute(session, task)
+                outcome = executor.execute(session, dispatch_task)
             except Exception as exc:
                 logger.exception("remote executor crashed for %s: %s", task_id, exc)
                 self._mark_failed(session, task, f"executor crashed: {exc}")
@@ -2979,10 +3007,12 @@ class Worker:
                 # not feed the JSON fresh-spawn envelope to resume(); pass a
                 # bounded operator direction instead.
                 prompt = "Continue this task using the prior session context."
-                if (task.get("notes") or "").strip():
-                    prompt += f"\n\nLatest task notes:\n{task['notes'].strip()[-2000:]}"
+                if (dispatch_task.get("notes") or "").strip():
+                    prompt += f"\n\nLatest task notes:\n{dispatch_task['notes'].strip()[-_TASK_NOTES_MAX_CHARS:]}"
             else:
-                prompt = title + (f"\n\n{handoff}" if handoff else "")
+                prompt = title
+                if (dispatch_task.get("notes") or "").strip():
+                    prompt += f"\n\nTask notes:\n{dispatch_task['notes'].strip()[-_TASK_NOTES_MAX_CHARS:]}"
             payload = {
                 "prompt": prompt,
                 "working_dir": working_dir,

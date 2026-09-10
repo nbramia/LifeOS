@@ -1458,7 +1458,13 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
 
         old_status = task.status
         old_tags = list(task.tags)
-        old_notes = task.notes
+        action_owned_tags = {
+            agent_board.RUNNING_TAG, agent_board.BLOCKED_TAG,
+            agent_board.COMPLETED_TAG, "agent-failed",
+            "agent-budget-exceeded", agent_board.REASSIGNED_TAG,
+            agent_board.ACCEPTED_TAG, *agent_board.AGENT_EXECUTOR_TAGS,
+        }
+        transition_version: str | None = None
 
         def merge_review_tags(current_tags: list[str]) -> list[str]:
             # Recompute against the CAS retry's latest snapshot. If another
@@ -1477,7 +1483,10 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             if action == "reject":
                 cleaned.append(agent_board.RUNNING_TAG)
                 return cleaned
-            cleaned = [t for t in cleaned if t.lstrip("#").lower() not in agent_board.ASSIGNEE_TAGS]
+            cleaned = [
+                t for t in cleaned
+                if t.lstrip("#").lower() not in agent_board.AGENT_EXECUTOR_TAGS
+            ]
             cleaned.extend([(body.assignee or "").lstrip("#").lower(), agent_board.REASSIGNED_TAG])
             return cleaned
 
@@ -1487,11 +1496,55 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             addition = f"Operator note: {note}"
             return f"{current_notes}\n\n{addition}" if current_notes else addition
 
-        def restore_card() -> None:
+        def restore_card() -> bool:
+            """Undo only this action's lifecycle/assignment/note changes.
+
+            The expected version makes rollback conditional on the exact
+            successful transition. If a worker or operator touched the card
+            meanwhile, report a rollback conflict instead of restoring an old
+            snapshot over their newer notes, tags, status, or claim.
+            """
+            if transition_version is None:
+                return False
+
+            def merge_rollback_tags(current_tags: list[str]) -> list[str]:
+                restored = [
+                    tag for tag in old_tags
+                    if str(tag).lstrip("#").lower() in action_owned_tags
+                ]
+                return [
+                    tag for tag in current_tags
+                    if str(tag).lstrip("#").lower() not in action_owned_tags
+                ] + restored
+
+            def merge_rollback_notes(current_notes: str) -> str:
+                if not note:
+                    return current_notes
+                addition = f"Operator note: {note}"
+                if current_notes == addition:
+                    return ""
+                suffix = f"\n\n{addition}"
+                if current_notes.endswith(suffix):
+                    return current_notes[:-len(suffix)]
+                # A same-version task should contain our exact addition. A
+                # mismatch is a conflict, not permission to clobber notes.
+                raise TaskConflictError("review rollback note conflict")
+
             try:
-                task_manager.update(card_id, status=old_status, tags=old_tags, notes=old_notes)
+                task_manager.update(
+                    card_id,
+                    status=old_status,
+                    _tags_merge=merge_rollback_tags,
+                    _notes_merge=merge_rollback_notes,
+                    _expected_updated_at=transition_version,
+                )
+                return True
+            except TaskConflictError:
+                logger.warning("review action rollback conflict for %s", card_id)
+                return False
             except Exception as restore_exc:  # noqa: BLE001
                 logger.error("review action rollback failed for %s: %s", card_id, restore_exc)
+                return False
 
         # Commit the paired card transition before exposing a pre-answered
         # follow-up row. The worker cannot consume a follow-up for a card that
@@ -1505,6 +1558,7 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             raise HTTPException(status_code=409 if isinstance(exc, TaskConflictError) else 422, detail=str(exc)) from exc
         if updated is None:
             raise HTTPException(status_code=404, detail="card not found")
+        transition_version = updated.updated_at
 
         followup_id: int | None = None
         if action == "reject":
@@ -1513,8 +1567,13 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
                     session.session_id, card_id, note,
                 )
             except Exception as exc:  # noqa: BLE001
-                restore_card()
-                raise HTTPException(status_code=409, detail=f"could not queue review continuation: {type(exc).__name__}") from exc
+                if followup_id is not None:
+                    session_store.delete_pending_question(followup_id)
+                rolled_back = restore_card()
+                detail = f"could not queue review continuation: {type(exc).__name__}"
+                if not rolled_back:
+                    detail += "; rollback conflict — card changed, refresh before retrying"
+                raise HTTPException(status_code=409, detail=detail) from exc
 
         if action == "reassign":
             transcript_store = _get_transcript_store()
@@ -1547,12 +1606,11 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
                 })
                 session_store.retire_completion_followups(session.session_id)
             except Exception as exc:  # noqa: BLE001
-                restore_card()
-                # The session remains terminal until the worker claims it;
-                # explicitly restore it as a guard if a future implementation
-                # rearms before this post-transition bookkeeping.
-                session_store.update_status(card_id, session.status)
-                raise HTTPException(status_code=409, detail=f"could not finalize reassignment: {type(exc).__name__}") from exc
+                rolled_back = restore_card()
+                detail = f"could not finalize reassignment: {type(exc).__name__}"
+                if not rolled_back:
+                    detail += "; rollback conflict — card changed, refresh before retrying"
+                raise HTTPException(status_code=409, detail=detail) from exc
         else:
             context_preserved = True
         _invalidate_board_cache()

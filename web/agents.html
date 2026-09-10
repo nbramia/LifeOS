@@ -1240,7 +1240,10 @@
     color: var(--text-primary);
     font-size: 0.78rem;
     cursor: pointer;
-    touch-action: manipulation;
+    /* Horizontal is reserved for the custom assignment drag. The tray
+       itself remains pan-x for scrolling when the gesture starts on its
+       label/gaps rather than a draggable control. */
+    touch-action: pan-y;
     flex: 0 0 auto;
   }
   .board-assignee-drop:hover,
@@ -1282,8 +1285,9 @@
     padding: 0.5rem 0.6rem;
     font-size: 0.8rem;
     cursor: pointer;
-    /* Native scrolling wins until a long-press turns this into a drag. */
-    touch-action: pan-x pan-y;
+    /* Reserve horizontal movement for the custom drag; vertical movement
+       stays native so the page/lane can scroll. */
+    touch-action: pan-y;
   }
   .board-card:hover { border-color: var(--accent); }
   .board-card.dragging-source { opacity: 0.4; }

@@ -118,6 +118,12 @@ def _user_message_for(task: dict, session_id: str, expected_output: str, budget:
     parts = [CAPABILITIES_PREAMBLE, f"Task: {title}"]
     if context:
         parts.append(f"Context: {context}")
+    notes = (task.get("notes") or "").strip()
+    if notes:
+        # Reassignment notes include a bounded transcript/output handoff;
+        # retain the latest operator direction without allowing an unbounded
+        # vault note to dominate the first remote prompt.
+        parts.append(f"Task notes:\n{notes[-6000:]}")
     parts.append(
         f"today={_today()}; "
         f"lifeos_session_id={session_id}; "

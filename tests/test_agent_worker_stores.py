@@ -66,6 +66,23 @@ def test_session_store_update_status(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_answered_followup_claim_is_atomic_and_reassignment_retires_claim(tmp_path: Path):
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    session = store.create(task_id="t-followup", status=STATUS_COMPLETED)
+    question_id = store.enqueue_web_followup(session.session_id, "t-followup", "continue synthetic work")
+
+    claimed = store.claim_answered_unprocessed_questions()
+    assert [q["id"] for q in claimed] == [question_id]
+    assert store.question_claimed(question_id)
+
+    # This is the race boundary: reassignment retires an already-claimed row,
+    # and a worker holding the stale dict must observe that it no longer owns it.
+    assert store.retire_completion_followups(session.session_id) == 1
+    assert not store.question_claimed(question_id)
+    assert store.claim_answered_unprocessed_questions() == []
+
+
+@pytest.mark.unit
 def test_session_store_list_non_terminal(tmp_path: Path):
     store = SessionStore(db_path=tmp_path / "sessions.db")
     store.create(task_id="t1", status=STATUS_RUNNING)

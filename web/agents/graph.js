@@ -113,8 +113,11 @@ export function initGraph(boardApi) {
     findCard: (boardApi && boardApi.findCard) || null,
     onCardChanged: () => { if (boardApi && boardApi.refresh) boardApi.refresh(); },
     onCardAccepted: () => {
-      panel.close();
-      renderPanelActions(null);
+      // Accept is a selection-changing action. Use the same full close path
+      // as clicking away/closing the panel so the selected node, action row,
+      // panel body, persistent board-link hint, and graph focus all clear
+      // together and remain clear on the next snapshot.
+      closePanel();
     },
     onLabelSaved: (sessionId, customLabel) => {
       const canonical = allSessions.find(x => x.session_id === sessionId);
@@ -144,6 +147,11 @@ export function initGraph(boardApi) {
 
   function closePanel() {
     selectedSessionId = null;
+    // A deep-link/tab activation may have queued a graph focus while the
+    // panel was open. Closing is authoritative: consume that stale intent so
+    // a later snapshot or activation cannot reopen a selection the operator
+    // just dismissed.
+    takeGraphFocus();
     panel.close();
     panelEl.innerHTML = '<div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>';
     applySelectionStyles();

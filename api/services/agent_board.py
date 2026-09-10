@@ -37,6 +37,7 @@ ACCEPTED_TAG = "accepted"
 # member of this set from the latest CAS snapshot.
 PROTECTED_TAGS: frozenset[str] = frozenset({
     "me", "claude", "codex", "hermes", "local", "cloud",
+    "cloud-haiku", "cloud-sonnet",
     RUNNING_TAG, BLOCKED_TAG, COMPLETED_TAG, "agent-failed",
     "agent-budget-exceeded", REASSIGNED_TAG, ACCEPTED_TAG,
 })
@@ -420,7 +421,10 @@ def plan_review_action(
         cleaned.append(RUNNING_TAG)
         return ReviewActionPlan(status="in_progress", tags=cleaned)
 
-    cleaned = [t for t in cleaned if t.lstrip("#").lower() not in ASSIGNEE_TAGS]
+    # Managed Agents consent tags are executor assignments too, even though
+    # they are not board lanes/assignees. A reassignment must remove both
+    # vocabularies so a stale #cloud-haiku cannot outrank the requested target.
+    cleaned = [t for t in cleaned if t.lstrip("#").lower() not in AGENT_EXECUTOR_TAGS]
     cleaned.append(normalized)
     cleaned.append(REASSIGNED_TAG)
     return ReviewActionPlan(status="todo", tags=cleaned)

@@ -27,14 +27,12 @@ def _import_test(module: str, assertions: str) -> None:
     assert result.returncode == 0, result.stderr or result.stdout
 
 
-def test_touch_gesture_requires_hold_and_preserves_native_scroll():
+def test_touch_gesture_reserves_horizontal_drag_and_preserves_native_scroll():
     module = str(Path("web/agents/board_gesture.js"))
     _import_test(
         module,
         """
-        const touch = { pointerType: 'touch', kind: 'card', holdReady: false };
-        if (!m.shouldCancelPointerGesture(touch, 20, 0)) throw new Error('pre-hold touch drag started');
-        touch.holdReady = true;
+        const touch = { pointerType: 'touch', kind: 'card' };
         if (m.shouldCancelPointerGesture(touch, 20, 1)) throw new Error('held horizontal drag cancelled');
         if (!m.shouldCancelPointerGesture(touch, 1, 20)) throw new Error('vertical touch scroll was not cancelled');
         if (m.shouldCancelPointerGesture(touch, 1, 1)) throw new Error('touch slop too small');
@@ -55,6 +53,13 @@ def test_pointer_identity_and_desktop_direction_rules():
         if (!m.shouldCancelPointerGesture({ pointerType: 'mouse', kind: 'card' }, 1, 20)) throw new Error('desktop card scroll behavior changed');
         """,
     )
+
+
+def test_graph_accept_uses_the_full_panel_close_path():
+    source = Path("web/agents/graph.js").read_text(encoding="utf-8")
+    callback = source.split("onCardAccepted:", 1)[1].split("onLabelSaved:", 1)[0]
+    assert "closePanel();" in callback
+    assert "panel.close();" not in callback
 
 
 def test_mixed_card_sort_reverses_direction_with_deterministic_ties():

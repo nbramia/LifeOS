@@ -1591,7 +1591,7 @@ class SessionStore:
                 """UPDATE pending_questions
                    SET processed = 1, timed_out = 1
                  WHERE session_id = ? AND kind = 'followup'
-                   AND processed = 0 AND timed_out = 0""",
+                   AND processed IN (0, 2) AND timed_out = 0""",
                 (session_id,),
             )
         return cur.rowcount
@@ -1678,6 +1678,51 @@ class SessionStore:
                 "WHERE answered_at IS NOT NULL AND processed = 0",
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def claim_answered_unprocessed_questions(self) -> list[dict]:
+        """Atomically reserve answered rows for one worker pass.
+
+        ``processed=2`` is an internal in-flight marker using the existing
+        integer column. Reassignment retires both unclaimed and in-flight
+        follow-ups, and the worker verifies ownership before acting, so a
+        stale in-memory list cannot resume a retired row.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE answered_at IS NOT NULL AND processed = 0 "
+                "ORDER BY id ASC",
+            ).fetchall()
+            claimed: list[dict] = []
+            for row in rows:
+                cur = conn.execute(
+                    "UPDATE pending_questions SET processed = 2 "
+                    "WHERE id = ? AND answered_at IS NOT NULL AND processed = 0",
+                    (row["id"],),
+                )
+                if cur.rowcount:
+                    item = dict(row)
+                    item["processed"] = 2
+                    claimed.append(item)
+        return claimed
+
+    def question_claimed(self, question_id: int) -> bool:
+        """Return whether this worker still owns an answered row claim."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM pending_questions WHERE id = ? AND processed = 2",
+                (int(question_id),),
+            ).fetchone()
+        return row is not None
+
+    def release_question_claim(self, question_id: int) -> None:
+        """Return a claimed row to the retryable unprocessed state."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE pending_questions SET processed = 0 "
+                "WHERE id = ? AND processed = 2",
+                (int(question_id),),
+            )
 
     def mark_question_processed(self, question_id: int) -> None:
         with self._connect() as conn:

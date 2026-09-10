@@ -33,6 +33,16 @@ class _StubExecutor:
         return self.outcome
 
 
+@dataclass
+class _TaskCaptureExecutor:
+    outcome: ExecutorOutcome
+    tasks: list = field(default_factory=list)
+
+    def execute(self, session, task):
+        self.tasks.append(task)
+        return self.outcome
+
+
 def _golden_preflight_reply(routing: str = "local", routing_reason: str = "guess") -> str:
     return json.dumps({
         "budget": {"wall_seconds": 3600, "max_tokens": 100000, "max_dollars": 1.0},
@@ -127,6 +137,29 @@ def test_dispatch_untagged_task_has_no_assignment(tmp_path, monkeypatch):
     assert session.host is None
     assert session.model is None
     assert session.effort is None
+
+
+def test_reassignment_context_reaches_fresh_local_executor_prompt(tmp_path, monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
+    capture = _TaskCaptureExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    worker = _make_worker(tmp_path)
+    worker._local_executor = capture
+    session = worker.session_store.create(task_id="reassigned-1", status="claimed", routing="local")
+    worker.transcript_store.append(session.session_id, "operator_reassigned", {
+        "assignee": "local", "prior_routing": "cloud", "context_preserved": True,
+    })
+    worker.session_store.append_message(session.session_id, "assistant", "Prior synthetic output")
+
+    worker._dispatch({
+        "id": "reassigned-1", "description": "Continue synthetic task",
+        "notes": "Latest synthetic direction", "tags": ["local", "agent-reassigned"],
+    })
+
+    assert len(capture.tasks) == 1
+    notes = capture.tasks[0]["notes"]
+    assert "Latest synthetic direction" in notes
+    assert "Prior synthetic output" in notes
 
 
 def test_hermes_tag_dispatches_through_hermes_executor(tmp_path, monkeypatch):

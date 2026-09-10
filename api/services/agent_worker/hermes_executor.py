@@ -177,6 +177,7 @@ class HermesExecutor:
         invocation's `--append-system-prompt` does."""
         title = (task.get("description") or "").strip()
         notes = (task.get("notes") or "").strip()
+        notes = notes[-6000:]
         if title and notes:
             return f"{title}\n\n{notes}"
         return title or notes

@@ -459,6 +459,20 @@ class TestReviewActions:
         assert session_store.get(task.id).session_id == session.session_id
         assert session_store.get_messages(session.session_id)[0]["content"] == "Prior synthetic result"
 
+    def test_reassign_removes_managed_executor_tag_before_setting_target(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create(
+            "Review managed synthetic output",
+            tags=["cloud-haiku", "agent-completed"], status="done",
+        )
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="claude")
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "codex"},
+        )
+        assert response.status_code == 200, response.text
+        assert task_manager.get(task.id).tags == ["codex", "agent-reassigned"]
+
     def test_review_action_conflict_leaves_card_and_queue_unchanged(self, client, stores, monkeypatch):
         task_manager, _sched, session_store, _transcript = stores
         task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done")
@@ -510,6 +524,34 @@ class TestReviewActions:
         assert restored.status == "done"
         assert restored.tags == ["codex", "agent-completed"]
         assert session_store.list_answered_unprocessed_questions() == []
+
+    def test_reject_rollback_does_not_clobber_a_concurrent_note(self, client, stores, monkeypatch):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Synthetic rollback race", tags=["codex", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+        original_update = task_manager.update
+        transition_seen = False
+
+        def raced_update(task_id, **kwargs):
+            nonlocal transition_seen
+            result = original_update(task_id, **kwargs)
+            if "_tags_merge" in kwargs and not transition_seen:
+                transition_seen = True
+                original_update(task_id, notes="Concurrent synthetic note")
+            return result
+
+        monkeypatch.setattr(task_manager, "update", raced_update)
+        monkeypatch.setattr(
+            session_store, "enqueue_web_followup",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("synthetic queue failure")),
+        )
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry synthetic output."},
+        )
+        assert response.status_code == 409
+        assert "rollback conflict" in response.json()["detail"]
+        assert task_manager.get(task.id).notes == "Concurrent synthetic note"
 
     def test_reassign_retires_old_completion_anchor_and_reports_context_reality(self, client, stores):
         task_manager, _sched, session_store, transcript_store = stores
