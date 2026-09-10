@@ -57,7 +57,8 @@ def pytest_sessionfinish(session, exitstatus):
     )
     if not hermetic:
         return
-    shutil.rmtree(os.path.join(project_root, "data"), ignore_errors=True)
+    for runtime_dir in ("data", "vault", "logs"):
+        shutil.rmtree(os.path.join(project_root, runtime_dir), ignore_errors=True)
 
 
 def wait_for_condition(predicate, timeout: float, interval: float = 0.2):
