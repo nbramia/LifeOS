@@ -112,6 +112,11 @@ class VerificationResult:
     reused: bool
     reason: str
     outcomes: tuple[LaneOutcome, ...]
+    # The lane's full collected node-ID count, for every lane this run
+    # actually requested -- independent of any shard/path/node-id filter --
+    # so a coverage gap is visible from a single shard's own output without
+    # cross-referencing another job's log.
+    lane_totals: Mapping[str, int] = dataclasses.field(default_factory=dict)
 
 
 def _snapshot_modes_ok(snapshot: SnapshotResult) -> tuple[bool, list[str]]:
@@ -295,7 +300,45 @@ def collect_lane_inventory(snapshot_root: Path, receipt_dir: Path, environment: 
     return inventory
 
 
-def _expected(inventory: Mapping, required_lanes: Sequence[str] | None = None, nodeid_paths: Sequence[str] | None = None, nodeids: Sequence[str] | None = None) -> dict[str, tuple[str, ...]]:
+def shard_nodeids(nodeids: Sequence[str], shard_index: int, shard_count: int) -> tuple[str, ...]:
+    """Deterministically partition ``nodeids`` and return slice ``shard_index``.
+
+    Every shard is a contiguous slice of one sorted order, so the same
+    candidate's collected node IDs always partition the same way: the union
+    of every ``shard_index`` in ``range(shard_count)`` reproduces the input
+    set exactly, and no two slices overlap. ``shard_count == 1`` returns the
+    input completely unchanged -- same values, same order -- so a
+    single-shard request is bit-identical to an unsharded selection rather
+    than merely equivalent as a set.
+    """
+    if shard_count < 1:
+        raise CandidateVerificationError("shard count must be at least 1")
+    if not (0 <= shard_index < shard_count):
+        raise CandidateVerificationError("shard index must be within 0..shard_count-1")
+    if shard_count == 1:
+        return tuple(nodeids)
+    ordered = tuple(sorted(nodeids))
+    total = len(ordered)
+    base, remainder = divmod(total, shard_count)
+    start = shard_index * base + min(shard_index, remainder)
+    size = base + (1 if shard_index < remainder else 0)
+    return ordered[start:start + size]
+
+
+def _parse_shard(shard_index: int | None, shard_count: int | None) -> tuple[int, int] | None:
+    """Both or neither; validated before any snapshot or subprocess starts."""
+    if shard_index is None and shard_count is None:
+        return None
+    if shard_index is None or shard_count is None:
+        raise CandidateVerificationError("--shard-index and --shard-count must be given together")
+    if shard_count < 1:
+        raise CandidateVerificationError("--shard-count must be at least 1")
+    if not (0 <= shard_index < shard_count):
+        raise CandidateVerificationError("--shard-index must be within 0..--shard-count-1")
+    return (shard_index, shard_count)
+
+
+def _expected(inventory: Mapping, required_lanes: Sequence[str] | None = None, nodeid_paths: Sequence[str] | None = None, nodeids: Sequence[str] | None = None, shard: tuple[int, int] | None = None) -> dict[str, tuple[str, ...]]:
     lanes = inventory.get("lanes")
     if not isinstance(lanes, Mapping):
         raise CandidateVerificationError("lane inventory lacks lanes")
@@ -321,6 +364,14 @@ def _expected(inventory: Mapping, required_lanes: Sequence[str] | None = None, n
             eligible_nodeids.update(chosen)
             if requested_nodeids is not None:
                 chosen = tuple(nodeid for nodeid in chosen if nodeid in requested_nodeids)
+            if shard is not None and chosen:
+                sliced = shard_nodeids(chosen, *shard)
+                if not sliced:
+                    raise CandidateVerificationError(
+                        f"shard {shard[0]} of {shard[1]} for lane {name!r} selected zero of "
+                        f"{len(chosen)} eligible node IDs"
+                    )
+                chosen = sliced
             if chosen:
                 selected[name] = chosen
     if requested_nodeids is not None:
@@ -605,6 +656,7 @@ def verify_candidate(
     runtime_root: Path | None = None,
     nodeid_paths: Sequence[str] | None = None,
     nodeids: Sequence[str] | None = None,
+    shard: tuple[int, int] | None = None,
     capacity_held_externally: bool = False,
     external_capacity_wait_seconds: float | None = None,
     metrics_run_id: str | None = None,
@@ -646,8 +698,14 @@ def verify_candidate(
             raise CandidateVerificationError("caller environment is not a safe execution control")
         execution_environment.update(environment)
     inventory = collect_lane_inventory(Path(snapshot.dest_root), inventory_receipt_root or evidence_root, execution_environment)
-    expected = _expected(inventory, required_lanes, nodeid_paths, nodeids)
+    expected = _expected(inventory, required_lanes, nodeid_paths, nodeids, shard)
+    # The lane's full collected count, independent of any shard/path/node-id
+    # filter -- recorded so a single shard's own evidence and run log can
+    # show a coverage gap after the fact, without consuming another job's.
+    lane_totals = {name: len(inventory["lanes"][name]["nodeids"]) for name in expected}
     scope = ",".join(sorted(expected))
+    if shard is not None:
+        scope += f"[shard={shard[0]}/{shard[1]}]"
     inputs = build_inputs(snapshot, inventory, base_identity=base_identity, merge_identity=merge_identity, environment={name: execution_environment[name] for name in _HERMETIC_ENVIRONMENT}, scope_identity=scope)
     reusable, reason = store.reusable(inputs, expected)
     # An adapter that inherits arbitrary ambient environment cannot prove that
@@ -672,7 +730,7 @@ def verify_candidate(
             outcomes.append(LaneOutcome(lane, lane_nodeids, item["exit_status"], item["result"], not_applicable=not_applicable))
         outcomes = tuple(outcomes)
         _record_metric(metrics, phase="verification-cache", phase_kind="execution", elapsed_seconds=0, result="success", cache_hit=True, suite=scope, worker_count=workers, evidence_ref=inputs.key[:24])
-        return VerificationResult(snapshot.candidate_id, inputs.key, True, reason, outcomes)
+        return VerificationResult(snapshot.candidate_id, inputs.key, True, reason, outcomes, lane_totals)
     if reason == "prior_infrastructure_failure" and not retry_reason:
         raise CandidateVerificationError("infrastructure retry requires a recorded reason")
 
@@ -711,7 +769,7 @@ def verify_candidate(
                     exit_status=_lane_failure_exit_status(outcome),
                     suite=scope, worker_count=workers, evidence_ref=inputs.key[:24],
                 )
-                return VerificationResult(snapshot.candidate_id, inputs.key, False, "executed_failure", tuple(outcomes))
+                return VerificationResult(snapshot.candidate_id, inputs.key, False, "executed_failure", tuple(outcomes), lane_totals)
         valid, mismatches = _snapshot_modes_ok(snapshot)
         if not valid:
             store.record(
@@ -723,7 +781,7 @@ def verify_candidate(
         store.record(inputs, outcomes, result="success", retry_reason=retry_reason)
         recorded = True
         _record_metric(metrics, phase="verification-execution", phase_kind="execution", elapsed_seconds=time.monotonic() - started, result="success", suite=scope, worker_count=workers, evidence_ref=inputs.key[:24])
-        return VerificationResult(snapshot.candidate_id, inputs.key, False, reason, tuple(outcomes))
+        return VerificationResult(snapshot.candidate_id, inputs.key, False, reason, tuple(outcomes), lane_totals)
     except BaseException as exc:
         # A launcher crash/cancellation is never a reusable absence of data.
         # Preserve any already-observed lane outcomes for an explicit later
@@ -783,6 +841,7 @@ def verify_pytest_candidate(
     lane_log_dir: Path | None = None,
     nodeid_paths: Sequence[str] | None = None,
     nodeids: Sequence[str] | None = None,
+    shard: tuple[int, int] | None = None,
     capacity_held_externally: bool = False,
     process_started: Callable[[int, float], None] | None = None,
     external_capacity_wait_seconds: float | None = None,
@@ -806,6 +865,7 @@ def verify_pytest_candidate(
         capacity=capacity, metrics=metrics, workers=workers,
         hermetic_environment=True, required_lanes=required_lanes,
         runtime_root=runtime_root, nodeid_paths=nodeid_paths, nodeids=nodeids,
+        shard=shard,
         capacity_held_externally=capacity_held_externally,
         external_capacity_wait_seconds=external_capacity_wait_seconds,
         metrics_run_id=metrics_run_id,
@@ -886,6 +946,8 @@ def verify_git_ref(
     capacity: CapacityManager | None = None,
     metrics: MetricsRecorder | None = None,
     lane_log_dir: Path | None = None,
+    shard: tuple[int, int] | None = None,
+    parallel_browser_free: bool = False,
 ) -> VerificationResult:
     """Verify a pushed commit in a temporary detached worktree, never cwd.
 
@@ -930,6 +992,7 @@ def verify_git_ref(
             worktree, snapshot, evidence_root, required_lanes=required_lanes,
             base_identity=base_identity, merge_identity=resolved_sha, workers=workers,
             capacity=capacity, metrics=metrics, lane_log_dir=lane_log_dir,
+            shard=shard, parallel_browser_free=parallel_browser_free,
             capacity_held_externally=True,
             process_started=register_group,
             external_capacity_wait_seconds=capacity_wait_seconds,
@@ -959,6 +1022,14 @@ def _main(argv: Sequence[str]) -> int:
         help="explicit per-run override within the configured canonical host total",
     )
     pushed.add_argument("--lane-log-dir", type=Path)
+    pushed.add_argument("--shard-index", type=int, default=None, help="this run's shard, in 0..--shard-count-1")
+    pushed.add_argument("--shard-count", type=int, default=None, help="total shards --lanes' node IDs are deterministically partitioned into")
+    pushed.add_argument(
+        "--parallel-browser-free", action="store_true",
+        help="explicit opt-in (default off) to run the browser-free lane under xdist with "
+        "--workers as its worker count; browser-free never touches a live server, so this is "
+        "safe, but the default stays serial until measurements justify changing it",
+    )
     local = sub.add_parser("local", help="verify this exact dirty working tree in an isolated snapshot")
     local.add_argument("--source", default=Path.cwd(), type=Path)
     local.add_argument("--evidence-root", type=Path, default=None)
@@ -978,6 +1049,8 @@ def _main(argv: Sequence[str]) -> int:
     local.add_argument("--lane-log-dir", type=Path)
     local.add_argument("--paths", default=None, help="comma-separated exact test-file paths from one collected inventory")
     local.add_argument("--nodeids", default=None, help="comma-separated exact collected node IDs")
+    local.add_argument("--shard-index", type=int, default=None, help="this run's shard, in 0..--shard-count-1")
+    local.add_argument("--shard-count", type=int, default=None, help="total shards --lanes' node IDs are deterministically partitioned into")
     local.add_argument(
         "--run-id", default=os.environ.get("LIFEOS_DEV_METRICS_RUN_ID"),
         help="reuse an external opaque run identity (e.g. LIFEOS_DEV_METRICS_RUN_ID from a "
@@ -994,8 +1067,14 @@ def _main(argv: Sequence[str]) -> int:
     if args.command == "pushed-ref":
         lanes = tuple(filter(None, args.lanes.split(",")))
         try:
+            shard = _parse_shard(args.shard_index, args.shard_count)
             capacity = CapacityManager(max_run_workers=args.capacity_max_run_workers)
-            result = verify_git_ref(args.repository, args.sha, evidence_root, base_identity=args.base, required_lanes=lanes, workers=args.workers, capacity=capacity, lane_log_dir=args.lane_log_dir)
+            result = verify_git_ref(
+                args.repository, args.sha, evidence_root, base_identity=args.base,
+                required_lanes=lanes, workers=args.workers, capacity=capacity,
+                lane_log_dir=args.lane_log_dir, shard=shard,
+                parallel_browser_free=args.parallel_browser_free,
+            )
         except (CapacityError, CandidateVerificationError, EvidenceError, subprocess.CalledProcessError) as exc:
             print(f"candidate verification failed: {exc}", file=sys.stderr)
             return 1
@@ -1004,6 +1083,7 @@ def _main(argv: Sequence[str]) -> int:
         try:
             nodeid_paths = _parse_optional_exact_csv(args.paths, "--paths")
             nodeids = _parse_optional_exact_csv(args.nodeids, "--nodeids")
+            shard = _parse_shard(args.shard_index, args.shard_count)
         except CandidateVerificationError as exc:
             print(f"candidate verification failed: {exc}", file=sys.stderr)
             return 1
@@ -1029,6 +1109,7 @@ def _main(argv: Sequence[str]) -> int:
                 capacity=capacity,
                 nodeid_paths=nodeid_paths,
                 nodeids=nodeids,
+                shard=shard,
                 capacity_held_externally=True,
                 process_started=register_group,
                 external_capacity_wait_seconds=capacity_wait_seconds,
@@ -1047,7 +1128,17 @@ def _main(argv: Sequence[str]) -> int:
             shutil.rmtree(snapshot.parent, ignore_errors=True)
     else:
         return 2
-    payload = {"candidate_id": result.candidate_id, "reused": result.reused, "reason": result.reason, "lanes": [outcome.lane for outcome in result.outcomes]}
+    payload = {
+        "candidate_id": result.candidate_id,
+        "reused": result.reused,
+        "reason": result.reason,
+        "lanes": [outcome.lane for outcome in result.outcomes],
+        # Per lane: the full collected count (independent of this run's
+        # shard) next to the count this run actually selected and ran, so a
+        # coverage gap is visible from this one shard's own run log.
+        "lane_totals": dict(result.lane_totals),
+        "lane_selected_counts": {outcome.lane: len(outcome.nodeids) for outcome in result.outcomes},
+    }
     print(json.dumps(payload, sort_keys=True))
     return 0 if all(outcome.result == "success" and outcome.exit_status == 0 for outcome in result.outcomes) else 1
 
@@ -1075,7 +1166,7 @@ def _supervised_main(argv: Sequence[str]) -> int:
             signal.signal(signum, handler)
 
 
-__all__ = ["CandidateVerificationError", "VerificationResult", "build_inputs", "collect_lane_inventory", "default_evidence_root", "infer_local_base", "make_hermetic_environment", "pytest_lane_executor", "verify_candidate", "verify_pytest_candidate", "verify_git_ref"]
+__all__ = ["CandidateVerificationError", "VerificationResult", "build_inputs", "collect_lane_inventory", "default_evidence_root", "infer_local_base", "make_hermetic_environment", "pytest_lane_executor", "shard_nodeids", "verify_candidate", "verify_pytest_candidate", "verify_git_ref"]
 
 
 if __name__ == "__main__":

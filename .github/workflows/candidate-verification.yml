@@ -51,12 +51,42 @@ permissions:
 
 jobs:
   execute-candidate:
-    name: candidate-execution
+    name: candidate-execution (${{ matrix.label }})
     runs-on: ubuntu-latest
-    # The retained lanes have measured at roughly 38m (fast-unit) + 11m
-    # (browser-free), before dependency and Chromium setup. Keep a bounded
-    # ceiling with enough setup headroom rather than timing out a healthy run.
-    timeout-minutes: 65
+    # Each leg runs a fraction of the retained lanes -- one shard of
+    # fast-unit's node IDs, or the whole parallel-worker browser-free lane
+    # -- at the runner's own worker count, so a per-job ceiling well under
+    # a full-lane run still leaves setup headroom for a healthy run while
+    # turning a genuinely stuck job into a fast, legible failure.
+    timeout-minutes: 20
+    strategy:
+      # A stuck or failing shard must never cancel its siblings: every leg's
+      # own result feeds the same aggregate below (see publish-aggregate),
+      # so cancelling siblings early would only hide which other shards
+      # would also have failed, without changing the published conclusion.
+      fail-fast: false
+      matrix:
+        include:
+          - label: browser-free
+            lane: browser-free
+            shard_index: 0
+            shard_count: 1
+          - label: fast-unit-shard-0
+            lane: fast-unit
+            shard_index: 0
+            shard_count: 4
+          - label: fast-unit-shard-1
+            lane: fast-unit
+            shard_index: 1
+            shard_count: 4
+          - label: fast-unit-shard-2
+            lane: fast-unit
+            shard_index: 2
+            shard_count: 4
+          - label: fast-unit-shard-3
+            lane: fast-unit
+            shard_index: 3
+            shard_count: 4
     permissions:
       contents: read
     env:
@@ -68,7 +98,6 @@ jobs:
       HIP_VISIBLE_DEVICES: ""
       ROCR_VISIBLE_DEVICES: ""
       CUDA_VISIBLE_DEVICES: ""
-      LIFEOS_TEST_PARALLEL_WORKERS: "2"
     steps:
       - name: Checkout the protected runner definition
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -117,15 +146,35 @@ jobs:
         run: |
           test "$(git -C trusted-runner rev-parse HEAD)" = "$TRUSTED_RUNNER_SHA"
           test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
-      - name: Verify the retained fast unit and server-free browser lanes
+      - name: Measure the runner's real width
         run: |
-          python trusted-runner/scripts/verify_candidate.py pushed-ref \
-            --repository "$GITHUB_WORKSPACE/candidate" \
-            --sha "$CANDIDATE_SHA" \
-            --base "$TRUSTED_RUNNER_SHA" \
-            --evidence-root "$RUNNER_TEMP/lifeos-verification-evidence" \
-            --lanes fast-unit,browser-free \
-            --workers 2
+          WORKERS="$(nproc)"
+          echo "runner reports $WORKERS logical processors"
+          free -h || true
+          echo "WORKERS=$WORKERS" >> "$GITHUB_ENV"
+      - name: Verify this leg's assigned lane shard
+        env:
+          LANE: ${{ matrix.lane }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_COUNT: ${{ matrix.shard_count }}
+        run: |
+          echo "lane=$LANE shard=$SHARD_INDEX/$SHARD_COUNT workers=$WORKERS"
+          ARGS=(
+            --repository "$GITHUB_WORKSPACE/candidate"
+            --sha "$CANDIDATE_SHA"
+            --base "$TRUSTED_RUNNER_SHA"
+            --evidence-root "$RUNNER_TEMP/lifeos-verification-evidence"
+            --lanes "$LANE"
+            --shard-index "$SHARD_INDEX"
+            --shard-count "$SHARD_COUNT"
+            --workers "$WORKERS"
+          )
+          if [ "$LANE" = browser-free ]; then
+            # browser-free never touches a live server, so independent
+            # xdist workers are safe here -- see docs/guides/candidate-verification-ci.md.
+            ARGS+=(--parallel-browser-free)
+          fi
+          python trusted-runner/scripts/verify_candidate.py pushed-ref "${ARGS[@]}"
 
   publish-aggregate:
     # This job never checks out, runs, or consumes an artifact from the

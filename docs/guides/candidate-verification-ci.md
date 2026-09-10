@@ -1,30 +1,43 @@
 # Candidate Verification CI
 
 **Status:** Partial
-**Last Updated:** 2026-09-09
+**Last Updated:** 2026-09-10
 **Audience:** Operators
 
 Candidate verification runs on GitHub-hosted ephemeral runners. The publisher
 passes the protected base commit SHA it observed while building the candidate;
-the job separately checks out that exact runner SHA and the exact candidate
-SHA, proves both checkout identities, and disables persisted credentials. It uses only
-`contents: read`, invokes the base revision's verifier against the candidate
-checkout, creates a synthetic runtime home through that verifier, and runs
-the existing fast-unit plus server-free-browser lanes. It installs
-dependencies from the candidate's `requirements.txt` under a CI-only exact
-CPU torch constraint. CI installs that pinned CPU-only torch wheel from the
-CPU index first, then resolves the complete unmodified candidate requirement
-file against the same constraint; a candidate that declares an incompatible
-torch version fails resolution instead of being silently rewritten. It installs Chromium through the
+each execution job separately checks out that exact runner SHA and the exact
+candidate SHA, proves both checkout identities, and disables persisted
+credentials. It uses only `contents: read`, invokes the base revision's
+verifier against the candidate checkout, creates a synthetic runtime home
+through that verifier, and verifies its one assigned lane shard. Execution is
+a single job body run concurrently as several matrix legs -- the whole
+server-free browser lane, and fast-unit split into four disjoint,
+deterministic shards (`scripts/verify_candidate.py`'s `--shard-index` /
+`--shard-count`, backed by its `shard_nodeids` function -- see its docstring
+for the partition guarantee) -- so every leg automatically repeats the
+identical checkout, provenance, install, and identity-proof steps rather
+than risking drift between hand-duplicated job copies. Each leg measures
+its own runner's logical processor count and
+available memory before running tests and uses that processor count as its
+worker count, rather than a hardcoded value. It installs dependencies from
+the candidate's `requirements.txt` under a CI-only exact CPU torch
+constraint. CI installs that pinned CPU-only torch wheel from the CPU index
+first, then resolves the complete unmodified candidate requirement file
+against the same constraint; a candidate that declares an incompatible torch
+version fails resolution instead of being silently rewritten. It installs Chromium through the
 declared Playwright dependency, verifies the installed torch version is the
 expected `+cpu` build with no CUDA or HIP build metadata, and records a
 sorted installed-package fingerprint in the ephemeral runner output.
 
-The `local` runner's `--parallel-browser-free` flag opts the browser-free
-lane into `pytest-xdist` at `--workers`' worker count (`browser-free`
-excludes `requires_server`, so independent workers never share a live
-server). It defaults off, and this CI job does not pass it, so CI's
-browser-free lane stays serial.
+The `local`/`pushed-ref` runner's `--parallel-browser-free` flag opts the
+browser-free lane into `pytest-xdist` at `--workers`' worker count
+(`browser-free` excludes `requires_server`, so independent workers never
+share a live server). It defaults off; the browser-free execution leg is the
+one caller that passes it, so that leg's own worker count (see above) also
+governs its xdist parallelism. The fast-unit shard legs never pass it -- each
+shard already gets its concurrency from running as a separate job, and
+`--workers` there governs `pytest-xdist` within that shard's own subset.
 
 `nbramia/LifeOS` is a User-owned repository, not an organization. GitHub
 merge queue and Enterprise "required workflow" repository rules are both
