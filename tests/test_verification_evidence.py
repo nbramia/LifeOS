@@ -809,6 +809,29 @@ def test_real_pytest_lane_adapter_executes_snapshot_not_callback(tmp_path):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("reason", ["", "   ", " leading", "trailing ", "line\nbreak", "x" * 161])
+def test_pytest_adapter_rejects_malformed_retry_reason(tmp_path, reason):
+    root = _source_repo(tmp_path)
+    with pytest.raises(CandidateVerificationError, match="invalid retry reason"):
+        verify_pytest_candidate(
+            root, tmp_path / "snapshot", tmp_path / "evidence",
+            required_lanes=("fast-unit",), workers=1, retry_reason=reason,
+        )
+
+
+@pytest.mark.unit
+def test_supplied_retry_reason_is_not_recorded_for_first_attempt(tmp_path):
+    root = _source_repo(tmp_path)
+    verify_candidate(
+        root, tmp_path / "snapshot", tmp_path / "evidence", _executor,
+        capacity=CapacityManager.for_test(tmp_path / "capacity", total_workers=1),
+        hermetic_environment=True, retry_reason="available only if this is a retry",
+    )
+    receipt = json.loads(next((tmp_path / "evidence").glob("*.json")).read_text())
+    assert receipt["attempts"][-1]["retry_reason"] is None
+
+
+@pytest.mark.unit
 def test_real_adapter_writes_lane_log_and_receipt_without_nodeids_on_argv(tmp_path):
     """One supervised lane process receives an external exact-ID file."""
     root = _source_repo(tmp_path)
@@ -1114,6 +1137,46 @@ def test_pushed_ref_protocol_executes_detached_candidate_not_dirty_cwd(tmp_path)
     )
     assert not second.reused
     assert first_payload["candidate_id"] != second.candidate_id
+
+
+@pytest.mark.unit
+def test_pushed_ref_cli_retries_interrupted_exact_candidate_with_reason(tmp_path):
+    root = _source_repo(tmp_path)
+    sentinel = tmp_path / "allow-completion"
+    (root / "tests" / "test_synthetic.py").write_text(
+        "import pathlib, pytest, time\n\n"
+        "@pytest.mark.unit\n"
+        f"def test_synthetic():\n    if not pathlib.Path({str(sentinel)!r}).exists(): time.sleep(20)\n"
+    )
+    _git(root, "add", "tests/test_synthetic.py")
+    _git(root, "commit", "-qm", "interruptible candidate")
+    sha = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    evidence = tmp_path / "evidence"
+    command = [
+        sys.executable, str(REPO / "scripts" / "verify_candidate.py"), "pushed-ref",
+        "--repository", str(root), "--sha", sha, "--base", "base", "--workers", "1",
+        "--lanes", "fast-unit", "--evidence-root", str(evidence),
+    ]
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1)
+    process.terminate()
+    assert process.wait(timeout=10) == 128 + signal.SIGTERM
+    assert json.loads(next(evidence.glob("*.json")).read_text())["attempts"][-1]["result"] == "infrastructure_failure"
+
+    sentinel.touch()
+    without_reason = subprocess.run(command, capture_output=True, text=True)
+    assert without_reason.returncode == 1
+    assert "infrastructure retry requires a recorded reason" in without_reason.stderr
+    empty_reason = subprocess.run([*command, "--retry-reason", ""], capture_output=True, text=True)
+    assert empty_reason.returncode == 1
+    assert "invalid retry reason" in empty_reason.stderr
+
+    reason = "pre-push retry after synthetic interrupted exact candidate"
+    retried = subprocess.run([*command, "--retry-reason", reason], capture_output=True, text=True)
+    assert retried.returncode == 0, retried.stderr
+    receipt = json.loads(next(evidence.glob("*.json")).read_text())
+    assert receipt["attempts"][-1]["result"] == "success"
+    assert receipt["attempts"][-1]["retry_reason"] == reason
 
 
 @pytest.mark.unit

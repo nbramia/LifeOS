@@ -205,6 +205,7 @@ def stub_python(tmp_path):
         "    for ((i=0; i<${#args[@]}; i++)); do\n"
         "        if [ \"${args[$i]}\" = \"--lane-log-dir\" ]; then lane_dir=\"${args[$((i+1))]}\"; fi\n"
         "        if [ \"${args[$i]}\" = \"--base\" ] && [ -n \"${STUB_CAPTURE_BASE:-}\" ]; then printf '%s' \"${args[$((i+1))]}\" > \"$STUB_CAPTURE_BASE\"; fi\n"
+        "        if [ \"${args[$i]}\" = \"--retry-reason\" ] && [ -n \"${STUB_CAPTURE_RETRY_REASON:-}\" ]; then printf '%s' \"${args[$((i+1))]}\" > \"$STUB_CAPTURE_RETRY_REASON\"; fi\n"
         "    done\n"
         "    mkdir -p \"$lane_dir\"\n"
         "    unit_rc=\"${STUB_UNIT_EXIT:-0}\"; browser_rc=\"${STUB_BROWSER_EXIT:-0}\"\n"
@@ -303,6 +304,27 @@ def test_new_branch_verification_uses_resolved_merge_base(stub_python, tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     assert captured.read_text() == expected_base
     assert captured.read_text() != "0" * 40
+
+
+@pytest.mark.unit
+def test_hook_supplies_bounded_reason_for_exact_candidate_retry(stub_python, tmp_path):
+    source_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=REPO, text=True,
+    ).strip()
+    captured = tmp_path / "retry-reason"
+    subprocess.run(
+        ["git", "config", "lifeos.prepush.blocking-local-verification", "true"],
+        cwd=REPO, check=True,
+    )
+    result = _run_real_hook(
+        stub_python, tmp_path, local_sha=source_sha,
+        extra_env={"STUB_CAPTURE_RETRY_REASON": str(captured)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert captured.read_text() == (
+        "pre-push retry after an interrupted or infrastructure-failed exact candidate"
+    )
+    assert len(captured.read_text()) <= 160
 
 
 _CASES = [
