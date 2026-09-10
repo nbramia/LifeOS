@@ -157,6 +157,13 @@ export function initBoard() {
     return !!(assignmentHandle && assignmentHandle.isSaving && assignmentHandle.isSaving());
   }
 
+  // A board refresh during an atomic tag save must not rebuild the drawer:
+  // renderDrawer cancels the picker handle, which would discard any later
+  // queued tag edits before their CAS writes run.
+  function tagPickerSaveInFlight() {
+    return !!(tagPickerHandle && tagPickerHandle.isSaving && tagPickerHandle.isSaving());
+  }
+
   // A focused TEXTAREA or text INPUT inside the drawer holds uncommitted
   // keystrokes a `renderDrawer` innerHTML replacement would destroy.
   // `captureFocusedTextField` snapshots its identity (`data-field`), value,
@@ -287,7 +294,8 @@ export function initBoard() {
       f => JSON.stringify(prev[f]) !== JSON.stringify(fresh[f])
     ) || prevPendingId !== freshPendingId || prevSessionStatus !== freshSessionStatus;
     const focused = !!(drawerEl && drawerEl.contains(document.activeElement));
-    if ((fieldsChanged || !sessionUnchanged) && !focused && !assignmentSaveInFlight()) {
+    if ((fieldsChanged || !sessionUnchanged) && !focused
+      && !assignmentSaveInFlight() && !tagPickerSaveInFlight()) {
       renderDrawer(fresh);
       // Only advance the snapshot on the branch that actually rendered —
       // otherwise a frame skipped because the drawer had focus is treated

@@ -403,6 +403,42 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": new_id, "description": new_card["title"]}))
             return
 
+        tag_match = re.search(r"/api/agents/board/cards/([^/]+)/tags$", url)
+        if tag_match and method == "PUT":
+            try:
+                body = json.loads(route.request.post_data or "{}")
+            except ValueError:
+                body = {}
+            # This is the narrow board-tags request, not the legacy task PUT:
+            # apply the endpoint's atomic merge against the latest card state,
+            # then record the exact editable-only payload after the response
+            # has been fulfilled so callers waiting on the intercepted list
+            # observe a completed browser request.
+            task_id = tag_match.group(1)
+            requested = body.get("tags") or []
+            protected = _ASSIGNEE_TAGS | {
+                "cloud-haiku", "cloud-sonnet", "agent-running", "agent-blocked",
+                "agent-completed", "agent-failed", "agent-budget-exceeded",
+                "agent-reassigned", "accepted",
+            }
+            merged = list(requested)
+            for cards in board_state["lanes"].values():
+                for card in cards:
+                    if card["id"] != task_id:
+                        continue
+                    preserved = [
+                        tag for tag in card.get("tags", [])
+                        if str(tag).lstrip("#").lower() in protected
+                    ]
+                    merged = [*preserved, *requested]
+                    card["tags"] = merged
+            route.fulfill(
+                status=200, content_type="application/json",
+                body=json.dumps({"id": task_id, "tags": merged}),
+            )
+            task_puts.append(body)
+            return
+
         task_match = re.search(r"/api/tasks/([^/]+)$", url)
         if task_match and method == "PUT":
             try:
@@ -668,6 +704,12 @@ class TestBoardLoad:
                     pointerType: 'touch', isPrimary: true,
                 });
                 source.dispatchEvent(event('pointerdown', a.left + 20, a.top + 20));
+                // `.board-assignee-drop` reserves the horizontal axis for the
+                // custom drag (`touch-action: pan-y`). A real touch gesture
+                // must cross that axis first; once the drag starts, board.js
+                // captures the pointer and the gesture can travel vertically
+                // to the card without handing control back to page scrolling.
+                source.dispatchEvent(event('pointermove', a.left + 120, a.top + 20));
                 document.dispatchEvent(event('pointermove', b.left + 20, b.top + 20));
                 document.dispatchEvent(event('pointerup', b.left + 20, b.top + 20));
             }"""
@@ -761,16 +803,28 @@ class TestDrawerTagsEdit:
         expect(page.locator('[data-field="tag-options"] [data-select-tag="urgent"]')).to_be_visible()
         page.locator('[data-field="tag-options"] [data-select-tag="urgent"]').click()
         _wait_for(lambda: any("urgent" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert task_puts == [{"tags": ["urgent"]}]
+        # The atomic save re-fetches the board before the next queued picker
+        # action. Wait for that visible board-state convergence rather than
+        # racing the first response's promise continuation.
+        expect(page.locator('[data-card-id="t2"] .board-chip-tag')).to_contain_text("urgent", timeout=5000)
         expect(page.locator(".drawer-tag-chip")).to_contain_text("#urgent")
 
         search.fill("Fresh Tag")
         expect(page.locator(".drawer-tag-option-create")).to_contain_text("#fresh-tag")
         page.locator(".drawer-tag-option-create").click()
         _wait_for(lambda: any("fresh-tag" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert task_puts[1] == {"tags": ["urgent", "fresh-tag"]}
+        expect(page.locator('[data-card-id="t2"] .board-chip-tag')).to_have_count(2, timeout=5000)
         expect(page.locator(".drawer-tag-chip")).to_have_count(2)
-        page.locator('[data-remove-tag="urgent"]').click()
+        expect(page.locator('[data-remove-tag="urgent"]')).to_be_visible()
+        # Deliver the chip's click handler without blurring the search field;
+        # the blur-save path is covered by the free-text tests below.
+        page.locator('[data-remove-tag="urgent"]').dispatch_event("click")
         _wait_for(lambda: any("urgent" not in (p.get("tags") or []) and "fresh-tag" in (p.get("tags") or []) for p in task_puts), page=page)
-        assert all("me" in (p.get("tags") or []) for p in task_puts)
+        assert task_puts[2] == {"tags": ["fresh-tag"]}
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        assert t2["tags"] == ["me", "fresh-tag"]
 
         search.fill("agent-running")
         expect(page.locator(".drawer-tag-option-create")).to_have_count(0)
@@ -779,10 +833,12 @@ class TestDrawerTagsEdit:
         """Round-1 finding 8: the Tags field must not let a vault-comment
         injection or a duplicate assignee token reach the task store. t2 is
         assigned #me — typing an assignee token, a plain word, and an
-        HTML-comment-shaped token must save only the plain word alongside
-        the real assignee tag."""
+        HTML-comment-shaped token must send only the plain word in the
+        editable-tag payload while the endpoint preserves the real assignee
+        tag in the merged card state."""
+        board_state = copy.deepcopy(_board_fixture())
         task_puts = []
-        _open_board(page, agents_base_url, task_puts=task_puts)
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
         page.locator('[data-card-id="t2"]').click()
         tags = page.locator(".drawer-tags")
         expect(tags).to_be_visible()
@@ -790,9 +846,9 @@ class TestDrawerTagsEdit:
         page.locator(".drawer-title").click()  # blur the tags field
         expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
         expect(tags).to_have_value("foo")
-        assert any(
-            sorted(p.get("tags") or []) == ["foo", "me"] for p in task_puts
-        ), task_puts
+        assert task_puts == [{"tags": ["foo"]}], task_puts
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        assert t2["tags"] == ["me", "foo"]
         assert not any("<" in t for p in task_puts for t in (p.get("tags") or []))
         assert not any("codex" in (p.get("tags") or []) for p in task_puts)
 
@@ -3299,15 +3355,18 @@ class TestAgentCardMoveRulesAndCancel:
         by typing it into the free-text Tags field — rejected the same
         way an assignee name already is, on an otherwise-editable
         (unclaimed, `me`-assigned) card."""
+        board_state = copy.deepcopy(_board_fixture())
         task_puts = []
-        _open_board(page, agents_base_url, task_puts=task_puts)
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
         page.locator('[data-card-id="t2"]').click()  # t2: tags=["me"], unclaimed
         tags = page.locator(".drawer-tags")
         tags.fill("agent-running foo")
         page.locator(".drawer-title").click()  # blur the tags field
         expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
         expect(tags).to_have_value("foo")
-        assert any(sorted(p.get("tags") or []) == ["foo", "me"] for p in task_puts), task_puts
+        assert task_puts == [{"tags": ["foo"]}], task_puts
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        assert t2["tags"] == ["me", "foo"]
         assert not any("agent-running" in (p.get("tags") or []) for p in task_puts)
 
     def test_review_card_tags_edit_preserves_agent_completed_tag(self, page: Page, agents_base_url):
@@ -3342,9 +3401,10 @@ class TestAgentCardMoveRulesAndCancel:
         expect(tags).to_have_value("")  # agent-completed never shows as an editable token
         tags.fill("urgent")
         page.locator(".drawer-title").click()  # blur
-        assert any(
-            sorted(p.get("tags") or []) == ["agent-completed", "codex", "urgent"] for p in task_puts
-        ), task_puts
+        _wait_for(lambda: bool(task_puts), page=page)
+        assert task_puts == [{"tags": ["urgent"]}], task_puts
+        t10 = next(card for card in board_state["lanes"]["review"] if card["id"] == "t10")
+        assert t10["tags"] == ["codex", "agent-completed", "urgent"]
 
     def test_dropping_on_scheduled_is_refused_locally_with_zero_requests(self, page: Page, agents_base_url):
         """Scheduled is never a direct drag target — refused client-side
@@ -3497,9 +3557,10 @@ class TestAgentCardMoveRulesAndCancel:
 
         tags.fill("agent-notes notes")  # remove "agent"
         page.locator(".drawer-title").click()  # blur the tags field
-        assert any(
-            sorted(p.get("tags") or []) == ["agent-notes", "me", "notes"] for p in task_puts
-        ), task_puts
+        _wait_for(lambda: bool(task_puts), page=page)
+        assert task_puts == [{"tags": ["agent-notes", "notes"]}], task_puts
+        t13 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t13")
+        assert t13["tags"] == ["me", "agent-notes", "notes"]
         assert not any("agent" in (p.get("tags") or []) for p in task_puts)
 
     def test_kill_disabled_for_a_claude_code_cli_backed_live_session(self, page: Page, agents_base_url):
@@ -3573,7 +3634,10 @@ class TestAgentCardMoveRulesAndCancel:
         expect(tags).to_have_value("notes extra")  # drawer not rebuilt while focused
 
         page.locator(".drawer-title").click()  # blur the tags field
-        assert any("agent-running" in (p.get("tags") or []) for p in task_puts), task_puts
+        _wait_for(lambda: bool(task_puts), page=page)
+        assert task_puts == [{"tags": ["notes", "extra"]}], task_puts
+        t15 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t15")
+        assert t15["tags"] == ["claude", "agent-running", "notes", "extra"]
 
 
 class TestDeleteCard:
