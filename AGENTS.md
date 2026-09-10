@@ -2,7 +2,7 @@
 
 > **Audience:** All AI coding agents (Claude Code, Cursor, Copilot, etc.)
 > **Status:** Complete
-> **Last Updated:** 2026-09-04
+> **Last Updated:** 2026-09-10
 
 LifeOS is a self-hosted personal AI assistant with two halves:
 
@@ -411,11 +411,12 @@ Full standards in [docs/AGENTS.md](docs/AGENTS.md). Key rules:
 
 - **Product specs** describe WHAT (consumer view). Implementation details go in `specs/technical/`.
 - **ADRs are immutable.** To change a decision, create a new ADR that supersedes.
-- **Every doc** must have a Related Documents section with bidirectional links.
+- **Every doc** must have a Related Documents section (linking back and adding a tagline to each link is guidance, not enforced).
 - **No task lists in specs.** Specs describe target state. Tasks go in `docs/plans/` or GitHub issues.
 - **Synthetic data only** in all examples and test fixtures.
 - **Completed plans** must be moved to `docs/plans/archive/`.
 - **Current behavior only, everywhere.** Docs, code comments, docstrings, and test docstrings describe the system as it is — no "before/now", review rounds, findings, or issue/PR numbers cited as history. Git history holds that narrative.
+- **PR descriptions are short summaries.** No verification matrix, evidence section, or risk table required for work outside the named risk triggers — see [Development Lifecycle](docs/specs/standards/development-lifecycle.md#risk-and-review).
 
 ---
 

@@ -53,10 +53,12 @@ jobs:
   execute-candidate:
     name: candidate-execution
     runs-on: ubuntu-latest
-    # The retained lanes have measured at roughly 38m (fast-unit) + 11m
-    # (browser-free), before dependency and Chromium setup. Keep a bounded
-    # ceiling with enough setup headroom rather than timing out a healthy run.
-    timeout-minutes: 45
+    # Both retained lanes run in this one job, and a healthy run has
+    # measured anywhere from roughly half an hour to just under an hour
+    # depending on runner speed. The ceiling exists to fail a genuinely
+    # stuck job, so it sits above the slowest healthy run observed rather
+    # than near the middle of the range.
+    timeout-minutes: 65
     permissions:
       contents: read
     env:

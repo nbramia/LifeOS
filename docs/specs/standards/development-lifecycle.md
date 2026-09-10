@@ -20,35 +20,67 @@ Every change receives the smallest lifecycle that fits its risk:
    candidate under test.
 5. Merge only after required evidence, approvals, and repository checks pass.
 
-Routine work may complete these phases inline or with one proportionate review.
-The lifecycle does not require a delegate for every task, impose a hard PR
-line-count cap, or create a separate documentation specialist for ordinary
-changes.
+Work outside the six risk triggers in [Risk and review](#risk-and-review)
+completes these phases inline, with one proportionate review standing in for
+phase 3 in full. The lifecycle does not require a delegate for every task,
+impose a hard PR line-count cap, or create a separate documentation
+specialist or verification findings loop for that work.
 
 ## Risk and review
 
-Classify risk by the behavior and failure impact, not by file count:
+Classify risk by the behavior and failure impact, not by file count. Six
+triggers require an independent adversarial review — someone other than the
+implementer, reading the diff adversarially against what it claims to do:
+
+- Behavior only observable in the running application
+- Concurrency or resource ownership
+- Schema or public API compatibility
+- Authentication or privacy boundaries
+- Money movement
+- Irreversible data loss
 
 | Work | Minimum review | Verification expectation |
 | --- | --- | --- |
 | Typo or mechanical correction | Brief inline review | Focused check when observable; otherwise document-only result |
 | Small isolated Python bug | One proportionate review | Focused regression test and selected lane evidence |
 | Frontend behavior change | One proportionate review | Browser or executable UI scenario plus selected lane evidence |
+| Behavior only observable in the running application | Independent adversarial review | Executable scenario driving the running application, not module-level tests alone |
 | Concurrency or resource ownership | Independent adversarial review | Deterministic contention/cancellation/ownership evidence |
-| Schema or public API change | Independent adversarial review | Compatibility, migration, and boundary evidence |
-| Substantive review correction | Independent re-review of the changed behavior | Re-run affected focused checks; preserve prior evidence where valid |
+| Schema or public API compatibility | Independent adversarial review | Compatibility, migration, and boundary evidence |
+| Authentication or privacy boundaries | Independent adversarial review | Boundary and authorization evidence |
+| Money movement | Independent adversarial review | Correctness and idempotency evidence for the affected transaction path |
+| Irreversible data loss | Independent adversarial review | Evidence that the destructive path is gated, confirmed, or recoverable |
+| Substantive review correction | Re-review the changed behavior | Re-run affected focused checks; preserve prior evidence where valid |
 | Infrastructure retry | Same review requirement as original work | Record the reason, command, result, and whether the retry is comparable |
 
-Complex work requires an identifiable independent adversarial reviewer. A
-reviewer from the other model family is strongly encouraged, but is not a
-readiness requirement. The reviewer must inspect executable evidence and
-record findings and disposition; a same-family reviewer is valid when the
-review is independent, with no operator exception required. Re-review
-substantive fixes, not formatting-only changes.
+For work outside those six triggers, one proportionate review is the
+complete review requirement. No separate documentation specialist and no
+separate verification findings loop apply to that work — documentation
+relevance and verification evidence are considerations inside the one
+review, not additional gates with their own rounds.
+
+A review reports exactly two kinds of finding: a defect reachable on a path
+a caller or user actually takes, and a missing test for behavior the diff
+claims to deliver. An observation below that bar — a stylistic preference, an
+unproven hypothetical, a rephrasing with no behavior change — is not
+recorded as a finding.
+
+Review converges when a round produces no accepted finding; that is the
+default outcome after the first round. A further round happens only because
+the preceding round produced an accepted finding — a round never exists to
+reconfirm that nothing is wrong. An accepted finding is fixed in the branch
+under review when it is in scope, not deferred to a follow-up pull request
+that pays a fresh gate run and review cycle.
+
+An independent reviewer from the other model family (Claude reviewing OpenAI
+work, or OpenAI reviewing Claude work) is advisory: when available, it
+informs the review; its absence never places readiness in a pending state
+and never requires an operator exception. A same-family independent review
+still satisfies the six triggers above. Re-review substantive fixes, not
+formatting-only changes.
 
 Use specialists only for a concrete risk such as security, architecture,
-concurrency, privacy, schema, or test strategy. Ordinary documentation
-relevance is part of the proportionate review. Unresolved defects block
+concurrency, privacy, schema, or test strategy. Unresolved defects block
 readiness; optional, unrelated work is not a readiness blocker.
 
 ## Verification and evidence
@@ -69,7 +101,10 @@ documentation checks, PR standards checks, and merge preparation may run
 focused commands but do not consume or rerun that authoritative plan. Broad
 gates remain required until an approved enforcement change records a safe
 reuse policy. Missing or mismatched evidence is a readiness failure, not a
-reason to guess or silently rerun a broad suite.
+reason to guess or silently rerun a broad suite. Verification preserves this
+evidence for the exact candidate; it does not run a separate multi-round
+findings loop of its own — anything it surfaces is a finding under [Risk and
+review](#risk-and-review) and is resolved within that one review.
 
 Verification separates queue/waiting, execution, and transfer time. It
 preserves positive and signal-derived exit status, cancellation, interruption,
@@ -108,12 +143,16 @@ The bounded evaluation matrix is:
 | Typo | Routine; inline review; no mandatory delegate |
 | Small Python bug | Routine; focused regression evidence |
 | Frontend behavior | Routine; executable browser/UI evidence |
-| Complex concurrency | Independent adversarial review and deterministic evidence required; cross-family review strongly encouraged |
-| Schema/API change | Independent adversarial review and compatibility evidence required; cross-family review strongly encouraged |
+| Behavior only observable in the running application | Independent adversarial review; executable evidence from the running application |
+| Concurrency or resource ownership | Independent adversarial review and deterministic evidence required |
+| Schema or public API compatibility | Independent adversarial review and compatibility evidence required |
+| Authentication or privacy boundaries | Independent adversarial review and boundary evidence required |
+| Money movement | Independent adversarial review and transaction-path evidence required |
+| Irreversible data loss | Independent adversarial review and recoverability evidence required |
 | Mechanical review correction | Recheck affected behavior; no new specialist unless risk changes |
-| Substantive review correction | Independent re-review of the changed behavior and rerun affected checks |
+| Substantive review correction | Re-review the changed behavior and rerun affected checks |
 | Infrastructure failure | Preserve failure; retry only with an explicit reason |
-| Other-family unavailable | Same-family independent review remains valid; no operator exception required |
+| Other-family reviewer unavailable | A same-family independent review satisfies the trigger; readiness proceeds |
 
 ## Privacy and boundaries
 
@@ -128,6 +167,7 @@ GPU guards, and deployment controls remain owned by their current components.
 ### Specifications
 
 - [Testing Standards](testing-standards.md) — Lane selection and evidence rules
+- [Documentation Strategy](../../AGENTS.md) — Pull-request description expectations that reference this contract's risk triggers
 
 ### Code References
 
