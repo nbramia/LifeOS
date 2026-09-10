@@ -1,7 +1,7 @@
 # Testing Standards
 
 **Status:** Complete
-**Last Updated:** 2026-09-09
+**Last Updated:** 2026-09-10
 **Audience:** All developers and AI agents
 
 Testing patterns and conventions for the LifeOS codebase.
@@ -110,6 +110,29 @@ host materializes a fresh, self-contained repository from the bundle (a
 throwaway `LifeOS Remote Test` identity, no source credentials) before the
 working-tree content — including uncommitted/untracked state — is rsynced
 on top, so `git status`/`auto`'s diff match the source exactly.
+
+## Tests as Evidence
+
+A test is evidence for a change only when it fails without that change.
+Before relying on a test to justify a change, revert the production diff and
+confirm the test fails; a test that still passes with the production change
+reverted is not evidence for it. Review treats a change carrying only such
+tests as missing a test, in the sense the [Development
+Lifecycle](development-lifecycle.md#risk-and-review) finding kinds define.
+
+Tests assert behavior. They never assert the wording of a comment, a
+docstring, a pull-request description, or a documentation sentence — a
+rewritten sentence that preserves meaning must not break a test.
+
+A change's tests pin the behavior it claims to deliver. Enumerating inputs no
+caller can produce is not required coverage, and review does not request it.
+This is a review consideration judged against what the diff claims to do,
+not a line-count ratio between test and production code.
+
+This section changes what a new or reworked test must do to count as
+evidence. It is not authorization to delete an existing test — [When Tests
+Fail After Your Changes](#when-tests-fail-after-your-changes), below, still
+governs that.
 
 ## Remote Testing Workflow
 
