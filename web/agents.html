@@ -977,6 +977,17 @@
     animation: fadeIn 0.2s ease;
   }
   .toast.error { border-color: var(--failed); color: var(--failed); }
+  .toast-action {
+    margin-left: 0.65rem;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    text-decoration: underline;
+    font: inherit;
+    cursor: pointer;
+  }
+  .toast-action:disabled { opacity: 0.6; cursor: wait; }
   .live-dot {
     display: inline-block;
     width: 8px;
@@ -1056,6 +1067,16 @@
     font-size: 0.8rem;
   }
   .board-filters label { display: flex; align-items: center; gap: 0.3rem; cursor: pointer; }
+  #board-filter-clear {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  #board-filter-clear:hover { border-color: var(--accent); }
   #board-new-card {
     margin-left: auto;
     background: var(--accent);
@@ -1314,6 +1335,70 @@
     font-size: 0.8rem;
   }
   .drawer-notes { min-height: 5rem; resize: vertical; }
+  .drawer-tags-picker {
+    position: relative;
+    width: 100%;
+  }
+  .drawer-tag-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    min-height: 1.8rem;
+    margin-bottom: 0.35rem;
+  }
+  .drawer-tag-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.1rem 0.25rem 0.1rem 0.5rem;
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+  }
+  .drawer-tag-chip-remove {
+    width: 1.1rem;
+    height: 1.1rem;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    line-height: 1;
+  }
+  .drawer-tag-chip-remove:hover,
+  .drawer-tag-chip-remove:focus { color: var(--text-primary); background: var(--border); }
+  .drawer-tag-options {
+    position: absolute;
+    z-index: 4;
+    top: 100%;
+    left: 0;
+    right: 0;
+    max-height: 12rem;
+    overflow-y: auto;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+  }
+  .drawer-tag-options[hidden] { display: none; }
+  .drawer-tag-option {
+    display: block;
+    width: 100%;
+    padding: 0.45rem 0.55rem;
+    border: none;
+    background: transparent;
+    color: var(--text-primary);
+    text-align: left;
+    font: inherit;
+    cursor: pointer;
+  }
+  .drawer-tag-option:hover,
+  .drawer-tag-option:focus { background: var(--bg-card); outline: none; }
+  .drawer-tag-option-create { color: var(--accent); font-weight: 600; }
+  .drawer-tags-search:disabled { opacity: 0.55; cursor: default; }
   /* Task-card notes only — height tracks content via JS, capped at
      2/3 of the viewport height; the schedule drawer's message-content
      textarea keeps the plain manual-resize behavior above, untouched. The
@@ -1454,11 +1539,11 @@
     </select>
     <input type="text" id="board-filter-tag" placeholder="tag" />
     <select id="board-filter-sort" title="Sort cards within each lane">
-      <option value="file" selected>file order</option>
+      <option value="file">file order</option>
       <option value="created_asc">created oldest</option>
       <option value="created_desc">created newest</option>
       <option value="modified_asc">modified oldest</option>
-      <option value="modified_desc">modified newest</option>
+      <option value="modified_desc" selected>modified newest</option>
       <option value="assignee_asc">assignee A-Z</option>
     </select>
     <select id="board-filter-recency" title="Recency">

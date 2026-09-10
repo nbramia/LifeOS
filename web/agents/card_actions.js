@@ -34,11 +34,44 @@ export async function openCard(card, onChanged) {
   } catch (err) { showToast(`Open failed: ${err.message}`, true); }
 }
 
-export async function acceptCard(card, onChanged) {
+export async function undoAcceptedCard(cardId, onChanged) {
+  try {
+    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(cardId)}/undo-accept`, { method: 'POST' });
+    if (!r.ok) {
+      const text = await r.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    showToast('Acceptance undone.', false);
+    if (onChanged) await onChanged();
+  } catch (err) {
+    showToast(`Undo failed: ${err.message}`, true);
+    throw err;
+  }
+}
+
+export async function acceptCard(card, onChanged, onAccepted) {
   try {
     const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/accept`, { method: 'POST' });
-    if (!r.ok) throw new Error(await r.text());
-    showToast('Accepted.', false);
+    if (!r.ok) {
+      const text = await r.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    showToast('Accepted.', false, {
+      duration: 3500 * 1.5,
+      actionLabel: 'Undo',
+      actionAriaLabel: 'Undo acceptance',
+      onAction: ({ toast, action }) => {
+        action.textContent = 'Undoing…';
+        return undoAcceptedCard(card.id, onChanged)
+          .then(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); })
+          .catch(() => { action.textContent = 'Undo'; });
+      },
+    });
+    if (onAccepted) onAccepted();
     if (onChanged) await onChanged();
   } catch (err) { showToast(`Accept failed: ${err.message}`, true); }
 }
@@ -208,11 +241,11 @@ export function openDeleteCardModal(card, { findCard, onDeleted } = {}) {
 // that needs to override one action's behaviour (the Board drawer's own
 // Cancel and Delete, which do extra drawer-specific bookkeeping around the
 // generic network call) spreads this and replaces just that key.
-export function cardActionHandlers(card, { findCard, onChanged } = {}) {
+export function cardActionHandlers(card, { findCard, onChanged, onAccepted } = {}) {
   const changed = onChanged || (() => {});
   return {
     open: () => openCard(card, changed),
-    accept: () => acceptCard(card, changed),
+    accept: () => acceptCard(card, changed, onAccepted),
     resolve: () => resolveCard(card, changed),
     cancel: () => cancelCard(card, changed),
     delete: () => openDeleteCardModal(card, { findCard, onDeleted: changed }),

@@ -529,6 +529,12 @@ Move a Review card to Done by adding the `accepted` tag. Idempotent.
 Returns **409** if the card isn't in the Review lane and isn't already
 accepted.
 
+### POST /api/agents/board/cards/{id}/undo-accept
+
+Restore an accepted card to Review by removing its `accepted` tag. The
+transition is server-authoritative and preserves unrelated tags and fields;
+returns **409** when the card is not accepted.
+
 ### POST /api/agents/board/cards/{id}/cancel
 
 Cancel an agent-assigned card — available whether or not the worker has

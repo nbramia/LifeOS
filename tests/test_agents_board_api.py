@@ -1,7 +1,7 @@
 """API tests for the /agents Kanban board (#850).
 
 Covers GET /api/agents/board, PUT .../board/cards/{id}/lane,
-POST .../board/cards/{id}/accept, GET /api/agents/pending-questions,
+POST .../board/cards/{id}/accept and /undo-accept, GET /api/agents/pending-questions,
 POST .../pending-questions/{id}/answer, the Hermes label fix, and the
 Codex (`cx:`) transcript stream dispatch. Uses temp-dir-backed stores via
 monkeypatch so the real vault/data directories are never touched.
@@ -1099,6 +1099,26 @@ class TestAcceptBoardCard:
         updated = task_manager.get(task.id)
         assert updated.status == "todo"
         assert "accepted" not in updated.tags
+
+    def test_undo_accept_restores_review_without_touching_unrelated_tags(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Restore this review",
+            tags=["hermes", "agent-completed", "keep-me", "accepted"],
+            status="done",
+        )
+        r = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        assert r.status_code == 200
+        assert r.json()["lane"] == "review"
+        updated = task_manager.get(task.id)
+        assert updated.status == "done"
+        assert updated.tags == ["hermes", "agent-completed", "keep-me"]
+
+    def test_undo_accept_rejects_unaccepted_card(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Not accepted")
+        r = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        assert r.status_code == 409
 
 
 # ---------------------------------------------------------------------------

@@ -1262,6 +1262,43 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
 
 
+@router.post("/board/cards/{card_id}/undo-accept")
+async def undo_accept_board_card(card_id: str) -> dict[str, Any]:
+    """Restore an accepted Review card to Review by removing ``accepted``.
+
+    The transition is deliberately server-authoritative: the client never
+    patches status or tags directly to manufacture Review. Cards accepted by
+    this API retain ``agent-completed``; an older already-accepted card that
+    lacks it receives that lifecycle marker so the derived lane is still
+    Review. All unrelated tags and fields are left untouched.
+    """
+    from api.services import agent_board
+    from api.services.task_manager import get_task_manager, TaskConflictError
+
+    task_manager = get_task_manager()
+    task = task_manager.get(card_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="card not found")
+
+    accepted = agent_board.ACCEPTED_TAG
+    normalized = {t.lstrip("#").lower() for t in task.tags}
+    if accepted not in normalized:
+        raise HTTPException(status_code=409, detail="card is not accepted")
+
+    new_tags = [t for t in task.tags if t.lstrip("#").lower() != accepted]
+    if agent_board.COMPLETED_TAG not in {t.lstrip("#").lower() for t in new_tags}:
+        new_tags.append(agent_board.COMPLETED_TAG)
+    try:
+        task = task_manager.update(card_id, tags=new_tags)
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail="card not found")
+    _invalidate_board_cache()
+    lane = agent_board.derive_lane(task.status, task.tags)
+    return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
+
+
 @router.post("/board/cards/{card_id}/cancel")
 async def cancel_board_card(card_id: str) -> dict[str, Any]:
     """Cancel an agent-assigned card: kill its live session (and every

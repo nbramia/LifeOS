@@ -11,8 +11,8 @@
 // (see `renderDrawerSession`) to avoid rendering the same session's
 // Kill/Resume/Go To twice.
 //
-// No card reordering within a lane (file order is lane order, per the
-// issue) — drag only ever changes which lane a card is in.
+// Sorting is client-only — drag only ever changes which lane a card is in;
+// no sort choice rewrites the vault's file order.
 
 import {
   TERMINAL, routingLabel, escapeHtml, showToast, SessionPanel,
@@ -36,7 +36,7 @@ const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud'];
 const AGENT_ASSIGNEES = ASSIGNEES.filter(a => a !== 'me');
 
 const SORT_STORAGE_KEY = 'lifeos.agents.board.sort';
-const DEFAULT_SORT = 'file';
+const DEFAULT_SORT = 'modified_desc';
 const SORT_OPTIONS = new Set([
   'file', 'created_asc', 'created_desc', 'modified_asc', 'modified_desc', 'assignee_asc',
 ]);
@@ -100,37 +100,54 @@ function saveSortSelection(value) {
   try { localStorage.setItem(SORT_STORAGE_KEY, value); } catch (_) {}
 }
 
-function cardSortKey(card, mode) {
+function normalizedSortKey(card, mode) {
   if (mode.startsWith('created')) {
     const raw = card.created_at || card.created_date || card.next_fire_at || '';
     const timestamp = raw ? Date.parse(raw) : NaN;
-    return Number.isFinite(timestamp) ? timestamp : null;
+    return {
+      missing: !Number.isFinite(timestamp),
+      value: Number.isFinite(timestamp) ? timestamp : 0,
+    };
   }
   if (mode.startsWith('modified')) {
-    const raw = card.updated_at || card.next_fire_at || '';
+    const raw = card.updated_at || (card.last_run && card.last_run.at) || card.next_fire_at || '';
     const timestamp = raw ? Date.parse(raw) : NaN;
-    return Number.isFinite(timestamp) ? timestamp : null;
+    return {
+      missing: !Number.isFinite(timestamp),
+      value: Number.isFinite(timestamp) ? timestamp : 0,
+    };
   }
   if (mode === 'assignee_asc') {
-    if (card.kind === 'schedule') return '\uffff';
-    return (card.assignee || '\ufffe').toLowerCase();
+    if (card.kind === 'schedule') return { missing: false, value: '\uffff' };
+    return { missing: false, value: (card.assignee || '\ufffe').toLowerCase() };
   }
-  return null;
+  return { missing: false, value: 0 };
+}
+
+function compareSortValues(a, b) {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
 }
 
 function sortCards(cards, mode) {
-  if (!mode || mode === DEFAULT_SORT) return cards;
+  if (!mode || mode === 'file') return cards;
   const descending = mode.endsWith('_desc');
   return cards
-    .map((card, index) => ({ card, index, key: cardSortKey(card, mode) }))
+    .map(card => ({
+      card,
+      key: normalizedSortKey(card, mode),
+      // The id tie-breaker is part of the ordering rather than a stable-sort
+      // fallback, so equal timestamps and missing timestamps reverse exactly
+      // when the direction changes, regardless of file/input order.
+      tie: `${card.kind || ''}:${card.id || ''}`,
+    }))
     .sort((a, b) => {
-      if (a.key == null && b.key == null) return a.index - b.index;
-      if (a.key == null) return 1;
-      if (b.key == null) return -1;
-      const comparison = typeof a.key === 'string'
-        ? a.key.localeCompare(b.key)
-        : a.key - b.key;
-      return comparison === 0 ? a.index - b.index : (descending ? -comparison : comparison);
+      const missingComparison = Number(a.key.missing) - Number(b.key.missing);
+      if (missingComparison) return descending ? -missingComparison : missingComparison;
+      const valueComparison = compareSortValues(a.key.value, b.key.value);
+      if (valueComparison) return descending ? -valueComparison : valueComparison;
+      const tieComparison = compareSortValues(a.tie, b.tie);
+      return descending ? -tieComparison : tieComparison;
     })
     .map(({ card }) => card);
 }
@@ -1173,6 +1190,222 @@ export function initBoard() {
     el.style.height = Math.min(el.scrollHeight + borderY, maxHeight) + 'px';
   }
 
+  const TAG_TOKEN = /^[\w-]+$/;
+  function normalizeEditableTag(raw) {
+    const normalized = String(raw || '')
+      .trim()
+      .replace(/^#+/, '')
+      .replace(/\s+/g, '-')
+      .replace(/[^\w-]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^[-_]+|[-_]+$/g, '')
+      .toLowerCase();
+    if (!normalized || !TAG_TOKEN.test(normalized)
+      || ASSIGNEES.includes(normalized) || LIFECYCLE_TAGS.has(normalized)) return null;
+    return normalized;
+  }
+
+  function uniqueEditableTags(tags) {
+    const seen = new Set();
+    const result = [];
+    for (const tag of tags || []) {
+      const normalized = normalizeEditableTag(tag);
+      if (normalized && !seen.has(normalized)) {
+        seen.add(normalized);
+        result.push(normalized);
+      }
+    }
+    return result;
+  }
+
+  function editableTagsForCard(card) {
+    return uniqueEditableTags((card.tags || []).filter(
+      tag => !ASSIGNEES.includes(String(tag).toLowerCase().replace(/^#/, ''))
+        && !LIFECYCLE_TAGS.has(String(tag).toLowerCase().replace(/^#/, '')),
+    ));
+  }
+
+  function availableEditableTags() {
+    return uniqueEditableTags(allCards().flatMap(card => card.tags || []))
+      .sort((a, b) => compareSortValues(a, b));
+  }
+
+  function sameTags(left, right) {
+    return left.length === right.length && left.every((tag, index) => tag === right[index]);
+  }
+
+  function mountTagPicker(card, initialTags) {
+    const picker = drawerEl.querySelector('[data-field="tags-picker"]');
+    const search = picker && picker.querySelector('[data-field="tags"]');
+    const chips = picker && picker.querySelector('[data-field="tag-chips"]');
+    const options = picker && picker.querySelector('[data-field="tag-options"]');
+    if (!picker || !search || !chips || !options) return;
+
+    let selected = uniqueEditableTags(initialTags);
+    let confirmed = selected.slice();
+    let saveChain = Promise.resolve();
+    let suppressBlur = false;
+    let activeOption = -1;
+    let showingLegacyValue = true;
+
+    function renderChips() {
+      chips.innerHTML = selected.map(tag => `
+        <span class="drawer-tag-chip" data-tag="${escapeHtml(tag)}">
+          <span>#${escapeHtml(tag)}</span>
+          <button type="button" class="drawer-tag-chip-remove" data-remove-tag="${escapeHtml(tag)}"
+                  aria-label="Remove tag ${escapeHtml(tag)}">×</button>
+        </span>
+      `).join('');
+      chips.querySelectorAll('[data-remove-tag]').forEach(button => {
+        button.addEventListener('click', () => removeTag(button.dataset.removeTag));
+      });
+    }
+
+    function renderOptions() {
+      const query = search.value.trim().replace(/^#+/, '').toLowerCase();
+      const applied = new Set(selected);
+      const matches = availableEditableTags().filter(tag => !applied.has(tag)
+        && (!query || tag.includes(query)));
+      const canCreate = !!query && !applied.has(normalizeEditableTag(query))
+        && !availableEditableTags().includes(normalizeEditableTag(query))
+        && !!normalizeEditableTag(query);
+      options.innerHTML = matches.map(tag =>
+        `<button type="button" class="drawer-tag-option" role="option" data-select-tag="${escapeHtml(tag)}">#${escapeHtml(tag)}</button>`
+      ).join('');
+      if (canCreate) {
+        options.innerHTML += `<button type="button" class="drawer-tag-option drawer-tag-option-create" role="option" data-create-tag="${escapeHtml(normalizeEditableTag(query))}">Create new #${escapeHtml(normalizeEditableTag(query))}</button>`;
+      }
+      options.hidden = document.activeElement !== search || (!matches.length && !canCreate);
+      activeOption = -1;
+      options.querySelectorAll('[data-select-tag], [data-create-tag]').forEach(button => {
+        button.addEventListener('mousedown', () => { suppressBlur = true; });
+        button.addEventListener('click', () => {
+          if (button.dataset.createTag) addTag(button.dataset.createTag);
+          else addTag(button.dataset.selectTag);
+          suppressBlur = false;
+          search.focus();
+        });
+      });
+      search.setAttribute('aria-expanded', String(!options.hidden));
+    }
+
+    function queueSave(nextTags) {
+      const requested = uniqueEditableTags(nextTags);
+      selected = requested;
+      renderChips();
+      saveChain = saveChain.then(async () => {
+        const current = findCard(card.id) || card;
+        const protectedTags = (current.tags || []).filter(tag => {
+          const normalized = String(tag).toLowerCase().replace(/^#/, '');
+          return ASSIGNEES.includes(normalized) || LIFECYCLE_TAGS.has(normalized);
+        });
+        try {
+          await putTask(card.id, { tags: [...protectedTags, ...requested] });
+          confirmed = requested.slice();
+          await fetchBoard();
+        } catch (err) {
+          // A later queued edit is still the operator's current intent; only
+          // revert if this failed request is what is currently displayed.
+          if (sameTags(selected, requested)) {
+            selected = confirmed.slice();
+            renderChips();
+          }
+          showToast(`Couldn't save tags: ${err.message}`, true);
+        }
+      });
+    }
+
+    function addTag(raw) {
+      const tag = normalizeEditableTag(raw);
+      if (!tag || selected.includes(tag)) return;
+      search.value = '';
+      queueSave([...selected, tag]);
+      renderOptions();
+    }
+
+    function removeTag(raw) {
+      const tag = normalizeEditableTag(raw);
+      if (!tag) return;
+      queueSave(selected.filter(current => current !== tag));
+      renderOptions();
+      search.focus();
+    }
+
+    function saveLegacyText() {
+      const raw = search.value.trim();
+      // Preserve the old space-separated edit affordance for pasted text and
+      // invalid tokens while keeping a normal one-word search non-mutating.
+      if (!raw) return;
+      if (!/[\s#<>]/.test(raw)) {
+        const normalized = normalizeEditableTag(raw);
+        // A new single token retains the old blur-to-save behavior. Existing
+        // tags remain searches until the operator selects them explicitly.
+        if (normalized && !availableEditableTags().includes(normalized)) {
+          search.value = normalized;
+          queueSave([normalized]);
+        }
+        return;
+      }
+      const parsed = [];
+      const rejected = [];
+      raw.split(/\s+/).forEach(token => {
+        const plain = token.replace(/^#/, '');
+        if (TAG_TOKEN.test(plain) && normalizeEditableTag(plain)) parsed.push(plain);
+        else rejected.push(token);
+      });
+      const normalized = uniqueEditableTags(parsed);
+      if (rejected.length) {
+        showToast(`Ignored invalid tag${rejected.length > 1 ? 's' : ''}: ${rejected.join(', ')}`, true);
+      }
+      search.value = normalized.join(' ');
+      queueSave(normalized);
+    }
+
+    renderChips();
+    // Keep the old space-separated value visible until the search control is
+    // first focused; this makes the migration legible to keyboard users and
+    // preserves pasted-text compatibility without making it the live picker
+    // query once the control is opened.
+    search.value = selected.join(' ');
+    search.addEventListener('focus', () => {
+      if (showingLegacyValue) {
+        showingLegacyValue = false;
+        search.value = '';
+      }
+      renderOptions();
+    });
+    search.addEventListener('input', renderOptions);
+    search.addEventListener('blur', () => {
+      if (suppressBlur) return;
+      saveLegacyText();
+      setTimeout(() => {
+        if (document.activeElement && picker.contains(document.activeElement)) return;
+        options.hidden = true;
+        search.setAttribute('aria-expanded', 'false');
+      }, 0);
+    });
+    search.addEventListener('keydown', (event) => {
+      const optionButtons = [...options.querySelectorAll('[data-select-tag], [data-create-tag]')];
+      if (event.key === 'ArrowDown' && optionButtons.length) {
+        event.preventDefault();
+        activeOption = (activeOption + 1) % optionButtons.length;
+        optionButtons[activeOption].focus();
+      } else if (event.key === 'ArrowUp' && optionButtons.length) {
+        event.preventDefault();
+        activeOption = (activeOption - 1 + optionButtons.length) % optionButtons.length;
+        optionButtons[activeOption].focus();
+      } else if (event.key === 'Enter') {
+        event.preventDefault();
+        const active = optionButtons[activeOption];
+        if (active) active.click();
+        else if (normalizeEditableTag(search.value)) addTag(search.value);
+      } else if (event.key === 'Escape') {
+        options.hidden = true;
+        search.setAttribute('aria-expanded', 'false');
+      }
+    });
+  }
+
   function renderDrawer(card) {
     if (!drawerEl) return;
     assignmentHandle = null;
@@ -1181,9 +1414,7 @@ export function initBoard() {
     // tag as an editable token — both are managed elsewhere (the
     // Assignee select above, and the worker/accept endpoint respectively)
     // and must survive a Tags-field save untouched.
-    const editableTags = (card.tags || []).filter(
-      t => !ASSIGNEES.includes(t.toLowerCase()) && !LIFECYCLE_TAGS.has(t.toLowerCase()),
-    );
+    const editableTags = editableTagsForCard(card);
     const titleValue = isTask ? (card.title || '') : (card.name || '');
     // `card.policy` is the server's own decision — the drawer never
     // re-derives these rules, it just disables-and-explains. A schedule
@@ -1214,8 +1445,14 @@ export function initBoard() {
           <input class="drawer-context" data-field="context" value="${escapeHtml(card.context || '')}" />
         </div>
       </div>
-      <label class="drawer-label">Tags</label>
-      <input class="drawer-tags" data-field="tags" value="${escapeHtml(editableTags.join(' '))}" placeholder="space-separated tags" ${assigneeDisabled ? 'disabled' : ''} />
+      <label class="drawer-label" id="drawer-tags-label-${escapeHtml(card.id)}">Tags</label>
+      <div class="drawer-tags-picker" data-field="tags-picker" role="group" aria-labelledby="drawer-tags-label-${escapeHtml(card.id)}">
+        <div class="drawer-tag-chips" data-field="tag-chips" role="list"></div>
+        <input class="drawer-tags drawer-tags-search" data-field="tags" type="search" role="combobox"
+               aria-autocomplete="list" aria-expanded="false" autocomplete="off"
+               placeholder="Search or add tags…" ${assigneeDisabled ? 'disabled' : ''} />
+        <div class="drawer-tag-options" data-field="tag-options" role="listbox" hidden></div>
+      </div>
       ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="tags-reason">${escapeHtml(assigneePolicy.reason || "This card's tags can't be changed right now.")}</div>` : ''}
       <div class="drawer-assignment" data-field="assignment"></div>
       <div class="drawer-actions" data-field="actions"></div>
@@ -1303,6 +1540,8 @@ export function initBoard() {
     notesEl.addEventListener('input', () => autosizeNotesTextarea(notesEl));
     autosizeNotesTextarea(notesEl);  // size to existing content on open/re-render
 
+    mountTagPicker(card, editableTags);
+
     const assigneeEl = drawerEl.querySelector('[data-field="assignee"]');
     assigneeEl.addEventListener('change', async () => {
       const value = assigneeEl.value;
@@ -1367,45 +1606,6 @@ export function initBoard() {
       if (!value || value === card.context) return;
       try { await putTask(card.id, { context: value }); await fetchBoard(); }
       catch (err) { showToast(`Couldn't save context: ${err.message}`, true); contextEl.value = card.context || ''; }
-    });
-
-    const tagsEl = drawerEl.querySelector('[data-field="tags"]');
-    const VALID_TAG = /^[\w-]+$/;
-    tagsEl.addEventListener('blur', async () => {
-      const tokens = tagsEl.value.split(/\s+/).map(t => t.replace(/^#/, '')).filter(Boolean);
-      // Free text here writes straight to the task store — reject anything
-      // that isn't a plain word/hyphen token (blocks a vault-comment
-      // injection like `<!--id:...-->` stealing another task's id), drop
-      // any assignee-name token (the assignee comes from the select above,
-      // not this field) rather than letting it silently double up as a tag,
-      // and reject a worker lifecycle tag the same way — typing
-      // `agent-running` into a `me` card's Tags field must not be able to
-      // grant it a claim tag the worker never gave it.
-      const parsed = [];
-      const rejected = [];
-      for (const t of tokens) {
-        const lower = t.toLowerCase();
-        if (VALID_TAG.test(t) && !ASSIGNEES.includes(lower) && !LIFECYCLE_TAGS.has(lower)) parsed.push(t);
-        else rejected.push(t);
-      }
-      if (rejected.length) {
-        showToast(`Ignored invalid tag${rejected.length > 1 ? 's' : ''}: ${rejected.join(', ')}`, true);
-      }
-      tagsEl.value = parsed.join(' ');
-      // Read the card's CURRENT assignee/lifecycle tags from the live board
-      // state, not the `card` this handler closed over at render time.
-      // `updateOpenDrawer` skips rebuilding the drawer while this field
-      // holds focus (see above), so a claim written by another process
-      // while the operator is mid-edit here never reaches the `card`
-      // variable at all — re-appending from a stale snapshot would save
-      // exactly the claim tag this box never showed and was never asked to
-      // remove. Falls back to the render-time `card` only if the card has
-      // since disappeared from the board entirely.
-      const current = findCard(card.id) || card;
-      const assigneeTag = current.assignee ? [current.assignee] : [];
-      const lifecycleTags = (current.tags || []).filter(t => LIFECYCLE_TAGS.has(t.toLowerCase()));
-      try { await putTask(card.id, { tags: [...assigneeTag, ...lifecycleTags, ...parsed] }); await fetchBoard(); }
-      catch (err) { showToast(`Couldn't save tags: ${err.message}`, true); tagsEl.value = editableTags.join(' '); }
     });
 
     // The drawer's own Assignee select above is the one assignee writer —
@@ -1716,7 +1916,7 @@ export function initBoard() {
         // starts the same edit; this just gives the drawer's own action
         // row a working button for it too.
         rename: () => { if (panel) panel.startRename(); },
-        ...cardActionHandlers(card, { onChanged: fetchBoard }),
+        ...cardActionHandlers(card, { onChanged: fetchBoard, onAccepted: closeDrawer }),
         cancel: () => cancelCard(card, async () => {
           // Tear the session panel down through its own cleanup path right
           // here, rather than leaving it to whichever render call below

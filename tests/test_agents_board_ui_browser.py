@@ -321,6 +321,20 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": card_id, "lane": "done"}))
             return
 
+        undo_match = re.search(r"/api/agents/board/cards/([^/]+)/undo-accept$", url)
+        if undo_match and method == "POST":
+            card_id = undo_match.group(1)
+            _move_card_in_state(board_state, card_id, "review")
+            for card in board_state["lanes"]["review"]:
+                if card["id"] == card_id:
+                    tags = [t for t in card.get("tags", []) if t != "accepted"]
+                    if "agent-completed" not in tags:
+                        tags.append("agent-completed")
+                    card["tags"] = tags
+                    card["status"] = "done"
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": card_id, "lane": "review"}))
+            return
+
         if re.search(r"/api/agents/models$", url) and method == "GET":
             route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG))
             return
@@ -655,6 +669,31 @@ class TestDrawerNotesEdit:
 
 
 class TestDrawerTagsEdit:
+    def test_tag_picker_search_create_remove_and_protects_system_tags(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["unassigned"][0]["tags"] = ["Urgent"]
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        search = page.locator(".drawer-tags")
+        search.fill("urg")
+        expect(page.locator('[data-field="tag-options"] [data-select-tag="urgent"]')).to_be_visible()
+        page.locator('[data-field="tag-options"] [data-select-tag="urgent"]').click()
+        _wait_for(lambda: any("urgent" in (p.get("tags") or []) for p in task_puts), page=page)
+        expect(page.locator(".drawer-tag-chip")).to_contain_text("#urgent")
+
+        search.fill("Fresh Tag")
+        expect(page.locator(".drawer-tag-option-create")).to_contain_text("#fresh-tag")
+        page.locator(".drawer-tag-option-create").click()
+        _wait_for(lambda: any("fresh-tag" in (p.get("tags") or []) for p in task_puts), page=page)
+        expect(page.locator(".drawer-tag-chip")).to_have_count(2)
+        page.locator('[data-remove-tag="urgent"]').click()
+        _wait_for(lambda: any("urgent" not in (p.get("tags") or []) and "fresh-tag" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert all("me" in (p.get("tags") or []) for p in task_puts)
+
+        search.fill("agent-running")
+        expect(page.locator(".drawer-tag-option-create")).to_have_count(0)
+
     def test_invalid_and_assignee_tokens_are_dropped(self, page: Page, agents_base_url):
         """Round-1 finding 8: the Tags field must not let a vault-comment
         injection or a duplicate assignee token reach the task store. t2 is
@@ -1061,8 +1100,24 @@ class TestFilters:
         expect(page.locator("#board-search")).to_have_value("")
         expect(page.locator("#board-filter-assignee")).to_have_value("all")
         expect(page.locator("#board-filter-tag")).to_have_value("")
-        expect(page.locator("#board-filter-sort")).to_have_value("file")
+        expect(page.locator("#board-filter-sort")).to_have_value("modified_desc")
         expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+
+    def test_modified_sort_is_default_and_chronological_directions_reverse(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"] = [
+            {"kind": "task", "id": "new", "title": "New", "notes": "", "status": "todo", "tags": ["me"], "assignee": "me", "fields": {}, "context": "Inbox", "created_date": "2026-01-03", "updated_at": "2026-01-03T00:00:00+00:00", "session": None, "pending_question": None},
+            {"kind": "task", "id": "same-b", "title": "Same B", "notes": "", "status": "todo", "tags": ["me"], "assignee": "me", "fields": {}, "context": "Inbox", "created_date": "2026-01-02", "updated_at": "2026-01-02T00:00:00+00:00", "session": None, "pending_question": None},
+            {"kind": "task", "id": "same-a", "title": "Same A", "notes": "", "status": "todo", "tags": ["me"], "assignee": "me", "fields": {}, "context": "Inbox", "created_date": "2026-01-02", "updated_at": "2026-01-02T00:00:00+00:00", "session": None, "pending_question": None},
+            {"kind": "task", "id": "missing", "title": "Missing", "notes": "", "status": "todo", "tags": ["me"], "assignee": "me", "fields": {}, "context": "Inbox", "session": None, "pending_question": None},
+        ]
+        _open_board(page, agents_base_url, board_state=board_state)
+        expect(page.locator("#board-filter-sort")).to_have_value("modified_desc")
+        lane = '.board-lane[data-lane="assigned"] .board-card'
+        newest = page.locator(lane).evaluate_all("els => els.map(e => e.dataset.cardId)")
+        page.locator("#board-filter-sort").select_option("modified_asc")
+        oldest = page.locator(lane).evaluate_all("els => els.map(e => e.dataset.cardId)")
+        assert oldest == list(reversed(newest))
 
     def test_sort_by_assignee_orders_lane(self, page: Page, agents_base_url):
         board_state = copy.deepcopy(_board_fixture())
@@ -1105,6 +1160,25 @@ class TestFilters:
         card.locator(".board-card-accept").click()
         expect(page.locator('.board-lane[data-lane="review"] [data-card-id="tr"]')).to_have_count(0)
         assert any(card["id"] == "tr" for card in board_state["lanes"]["done"])
+
+    def test_accept_dismisses_drawer_and_undo_restores_review(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["review"] = [{
+            "kind": "task", "id": "tr", "title": "Ready for review", "notes": "",
+            "status": "done", "tags": ["agent-completed", "hermes", "keep-me"],
+            "assignee": "hermes", "fields": {}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00", "session": None, "pending_question": None,
+        }]
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="tr"]').click()
+        page.locator('[data-action="accept"]').click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+        toast = page.locator(".toast").filter(has_text="Accepted.")
+        expect(toast).to_be_visible()
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        expect(toast.locator(".toast-action")).to_have_css("text-decoration-line", "underline")
+        toast.locator(".toast-action").click()
+        expect(page.locator('.board-lane[data-lane="review"] [data-card-id="tr"]')).to_be_visible(timeout=5000)
 
     def test_assignee_filter_lists_cloud(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)

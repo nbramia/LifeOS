@@ -91,12 +91,35 @@ export function escapeAttr(s) {
   return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
-export function showToast(message, isError) {
+export function showToast(message, isError, options = {}) {
   const t = document.createElement('div');
   t.className = 'toast' + (isError ? ' error' : '');
-  t.textContent = message;
+  const text = document.createElement('span');
+  text.textContent = message;
+  t.appendChild(text);
+  const duration = options.duration || 3500;
+  if (options.actionLabel && typeof options.onAction === 'function') {
+    const action = document.createElement('button');
+    action.type = 'button';
+    action.className = 'toast-action';
+    action.textContent = options.actionLabel;
+    action.setAttribute('aria-label', options.actionAriaLabel || options.actionLabel);
+    action.addEventListener('click', async () => {
+      action.disabled = true;
+      try {
+        await options.onAction({ toast: t, action });
+      } finally {
+        action.disabled = false;
+      }
+    });
+    t.appendChild(action);
+  }
   document.body.appendChild(t);
-  setTimeout(() => { if (t.parentNode) t.parentNode.removeChild(t); }, 3500);
+  setTimeout(() => { if (t.parentNode) t.parentNode.removeChild(t); }, duration);
+  // Callers that need to replace or dismiss a toast can use the returned
+  // element; the timer remains owned by this shared helper.
+  t.dataset.duration = String(duration);
+  return t;
 }
 
 // ---------------------------------------------------------------------
