@@ -290,7 +290,15 @@ if docs_only; then
     exit 0
 fi
 
-plan_only_exit "run"
+blocking_local_verification_enabled() {
+    [ "$(git config --bool --get lifeos.prepush.blocking-local-verification 2>/dev/null || true)" = "true" ]
+}
+
+if blocking_local_verification_enabled; then
+    plan_only_exit "run-blocking-local"
+else
+    plan_only_exit "run-local"
+fi
 
 # Activate virtual environment
 if [ -f "$HOME/.venvs/lifeos/bin/activate" ]; then
@@ -313,7 +321,52 @@ fail() {
 }
 
 echo "Log: $LOG"
-echo -n "Running unit tests... "
+if ! blocking_local_verification_enabled; then
+    echo -n "Running local lint and fixture privacy audit... "
+
+    run_cheap_local_checks() {
+        local changed_file audit_output
+        local -a changed_python=()
+        while IFS= read -r changed_file; do
+            [[ "$changed_file" == *.py ]] && [ -f "$PROJECT_ROOT/$changed_file" ] && changed_python+=("$changed_file")
+        done <<< "$CHANGED_FILES"
+
+        if [ "${#changed_python[@]}" -gt 0 ]; then
+            if ! ruff check --quiet -- "${changed_python[@]}"; then
+                echo "ruff: FAILED" >&2
+                return 1
+            fi
+            echo "ruff: ok (${#changed_python[@]} changed Python file(s))"
+        else
+            echo "ruff: no changed Python files"
+        fi
+
+        if ! audit_output=$(python -m pytest \
+            tests/test_fixtures_no_personal_data.py::test_no_fixture_contains_a_real_sensitive_value \
+            -q -r s 2>&1); then
+            printf '%s\n' "$audit_output"
+            return 1
+        fi
+        printf '%s\n' "$audit_output"
+        if [[ "$audit_output" == *"1 passed"* ]]; then
+            echo "fixture privacy audit: passed"
+        elif [[ "$audit_output" == *"No real .env reachable from this checkout -- nothing to check fixtures against (expected on a fresh clone or CI)."* \
+            && "$audit_output" == *"1 skipped"* ]]; then
+            echo "fixture privacy audit: not applicable (no real .env reachable)"
+        else
+            echo "fixture privacy audit: FAILED (expected one pass or the named no-real-.env not-applicable result)" >&2
+            return 1
+        fi
+    }
+
+    if ! run_cheap_local_checks > "$LOG" 2>&1; then
+        fail
+    fi
+    echo "passed ($(tail -1 "$LOG"))"
+    exit 0
+fi
+
+echo -n "Running blocking local verification... "
 
 # Every non-deletion ref is verified by its exact local SHA in one detached
 # outer candidate. The verifier collects once, owns one capacity lease, then

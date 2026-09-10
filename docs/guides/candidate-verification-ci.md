@@ -189,14 +189,48 @@ python scripts/candidate_ci_setup.py OWNER/REPOSITORY \
 
 It deliberately fails when the configured required check is bound to the
 generic Actions app, to the wildcard (`app_id: -1`), or to no app at all —
-none of those identify a specific, non-candidate-controllable issuer. Enable
+none of those identify a specific, non-candidate-controllable issuer.
 The required check serves as the merge gate when this command succeeds and
 administrator enforcement is enabled.
 
-Until then, retain the local broad pre-push gate. To roll back an already
-enforced replacement, restore that blocking local gate first, then remove
-the required-check requirement; never weaken protection before the local
-gate is back in force.
+Until the audit and hosted enforcement exercise both succeed, retain the
+local broad pre-push gate.
+
+## Local cutover and rollback
+
+Apply the local cutover only after all of these are current: the dedicated
+App is installed, `main` requires `candidate-verification` from App
+`4891159`, administrator enforcement is enabled, the environment policy is
+exactly `main`, and an actual hosted candidate exercise has shown that a
+passing check permits publication while an absent, failed, cancelled, stale,
+or wrong-candidate check blocks it. The operator records the policy proof
+with:
+
+```bash
+python scripts/candidate_ci_setup.py nbramia/LifeOS \
+  --require-app-scoped-gate --check-name candidate-verification \
+  --trusted-app-id 4891159 --require-environment-locked-to-main
+```
+
+After that proof, the tracked pre-push hook keeps a cheap local gate: Ruff
+checks changed Python files and the direct, read-only fixture privacy audit.
+The audit reports either a pass or its named no-real-`.env` not-applicable
+result; any other result blocks the push. Its per-push log remains the local
+evidence record, while the App-bound candidate receipt remains the merge
+evidence; ordinary pushes do not rerun the broad fast-unit/browser lanes.
+
+Before disabling the hosted requirement, first restore the existing blocking
+local verifier in every checkout that may push:
+
+```bash
+./scripts/setup-hooks.sh --restore-blocking-local-verification
+git config --get --bool lifeos.prepush.blocking-local-verification
+```
+
+The second command must print `true`; then make and retain one successful
+blocking local verification before removing the required check. After hosted
+protection is re-established and audited again, remove that local rollback
+setting with `git config --unset-all lifeos.prepush.blocking-local-verification`.
 
 ## Related Documents
 
