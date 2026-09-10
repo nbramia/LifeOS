@@ -116,7 +116,13 @@ class VerificationResult:
 
 def _snapshot_modes_ok(snapshot: SnapshotResult) -> tuple[bool, list[str]]:
     """Use candidate_snapshot's shared byte/mode/runtime mismatch policy."""
-    ok, mismatches = verify_snapshot_unmodified(snapshot)
+    # ``data/`` is excluded when the candidate is built because it contains
+    # runtime databases, indexes, and locks. Tests may legitimately recreate
+    # those files inside their isolated snapshot; they are not candidate
+    # source and must follow the same exclusion on the post-run scan.
+    ok, mismatches = verify_snapshot_unmodified(
+        snapshot, ignore_new_file_globs=("data/**",),
+    )
     return ok, [str(mismatch) for mismatch in mismatches]
 
 

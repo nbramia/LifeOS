@@ -147,6 +147,35 @@ def test_snapshot_mutation_during_execution_records_incomplete_not_success(tmp_p
 
 
 @pytest.mark.unit
+def test_runtime_data_created_during_execution_is_not_source_mutation(tmp_path):
+    root = _source_repo(tmp_path)
+
+    def writing_runtime_data(snapshot: Path, lane: str, nodeids: tuple[str, ...]) -> LaneOutcome:
+        data = snapshot / "data"
+        data.mkdir()
+        for name in ("task_index.json", "imessage.db", "gpu_embed.lock"):
+            (data / name).write_text("isolated runtime state\n")
+        return LaneOutcome(lane, nodeids, 0, "success")
+
+    result = _verify(root, tmp_path, executor=writing_runtime_data)
+
+    assert not result.reused
+    assert result.outcomes[0].result == "success"
+
+
+@pytest.mark.unit
+def test_new_source_file_created_during_execution_remains_source_mutation(tmp_path):
+    root = _source_repo(tmp_path)
+
+    def writing_source(snapshot: Path, lane: str, nodeids: tuple[str, ...]) -> LaneOutcome:
+        (snapshot / "unexpected.py").write_text("VALUE = True\n")
+        return LaneOutcome(lane, nodeids, 0, "success")
+
+    with pytest.raises(CandidateVerificationError, match="unexpected.py.*unexpected new file"):
+        _verify(root, tmp_path, executor=writing_source)
+
+
+@pytest.mark.unit
 def test_snapshot_mutation_with_more_than_twenty_paths_retains_incomplete_receipt(tmp_path):
     root = _source_repo(tmp_path)
 
