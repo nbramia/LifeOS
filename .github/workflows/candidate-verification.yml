@@ -137,8 +137,13 @@ jobs:
           echo "LANES=$LANES" >> "$GITHUB_ENV"
       - name: Verify the retained lanes this candidate's changes can affect
         run: |
-          WORKERS="$(nproc)"
-          echo "runner reports $WORKERS logical processors"
+          # Two workers is the width with a completed-run record on this
+          # runner class: every run at two workers finished, and every run at
+          # the runner's full core count exceeded the ceiling. Record the
+          # runner's shape alongside it so a future change to this number
+          # rests on measurements rather than on the core count alone.
+          WORKERS=2
+          echo "runner reports $(nproc) logical processors; using $WORKERS test workers"
           free -h || true
           python trusted-runner/scripts/verify_candidate.py pushed-ref \
             --repository "$GITHUB_WORKSPACE/candidate" \
@@ -147,7 +152,6 @@ jobs:
             --evidence-root "$RUNNER_TEMP/lifeos-verification-evidence" \
             --lanes "$LANES" \
             --workers "$WORKERS" \
-            --capacity-max-run-workers "$WORKERS" \
             --parallel-browser-free
 
   publish-aggregate:
