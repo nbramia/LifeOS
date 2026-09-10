@@ -29,12 +29,19 @@ from api.services.agent_worker.session_store import (
     STATUS_BUDGET_EXCEEDED,
     STATUS_COMPLETED,
     STATUS_FAILED,
-    STATUS_RUNNING,
     STATUS_YIELDED,
     SessionStore,
 )
 from api.services.agent_worker.tools import ToolRegistry, ToolResult
 from api.services.agent_worker.transcript_store import TranscriptStore
+from api.services.agent_worker.usage_ledger import (
+    MEASURED,
+    UNKNOWN,
+    UsageLedger,
+    UsageObservation,
+    identity_for_session,
+    reservation_id_for_session,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -146,6 +153,15 @@ class ExecutorOutcome:
     final_text: str = ""
     reason: str = ""
     wake_at: int | None = None   # set when status == STATUS_YIELDED (sleep)
+    # Internal lifecycle identity.  These fields are transport metadata only;
+    # Usage ledger and provenance are recorded by the shared accounting path.
+    session_id: str | None = None
+    attempt_id: str | None = None
+    turn_id: str | None = None
+    executor: str | None = None
+    continuation_id: str | None = None
+    usage: dict = field(default_factory=dict)
+    termination_evidence: dict = field(default_factory=dict)
     # Managed-agents-only: MCP servers that failed to initialize during the
     # remote session. Worker uses this to append a footer to the completion
     # summary so the operator knows which connectors are broken.
@@ -504,10 +520,37 @@ class LocalExecutor:
         # selection, or a test that injects it explicitly alongside a fake
         # `llm_client` — never a side effect of settings alone.
         self.is_remote = is_remote
+        self._usage_totals: dict[str, dict[str, float]] = {}
 
     # ------------------------------------------------------------------
     # Entry points
     # ------------------------------------------------------------------
+
+    def _turn_is_current(self, session) -> bool:
+        """Return whether this executor may still write for its turn."""
+        attempt_id = getattr(session, "attempt_id", None)
+        turn_id = getattr(session, "turn_id", None)
+        return bool(
+            attempt_id
+            and self.session_store.is_current_turn(
+                session.task_id, attempt_id, turn_id,
+            )
+            and not self.session_store.is_cancelled(
+                session.task_id, attempt_id, turn_id,
+            )
+        )
+
+    @staticmethod
+    def _cancelled_outcome(session, reason: str = "turn cancelled") -> ExecutorOutcome:
+        return ExecutorOutcome(
+            status=STATUS_FAILED,
+            reason=reason,
+            session_id=session.session_id,
+            attempt_id=session.attempt_id,
+            turn_id=session.turn_id,
+            executor="remote" if getattr(session, "routing", None) == "remote" else "local",
+            termination_evidence={"cancelled": True},
+        )
 
     def execute(self, session, task: dict) -> ExecutorOutcome:
         """Run the agent loop for one session.
@@ -521,9 +564,15 @@ class LocalExecutor:
         - Loops until the model produces a final answer, the budget is hit,
           a tool yields (sleep), or an error.
         """
+        session = self.session_store.begin_executor_turn(
+            session.task_id, "execute", session=session,
+        )
         sid = session.session_id
         budget = session.budget or {}
-        self.session_store.update_status(session.task_id, STATUS_RUNNING)
+        if not self.session_store.mark_executor_turn_running(
+            session.task_id, session.attempt_id, session.turn_id,
+        ):
+            return self._cancelled_outcome(session)
 
         # Working-directory guard — runs before any conversation seeding
         # or LLM call, so a refused directory never reaches the model.
@@ -546,15 +595,25 @@ class LocalExecutor:
             # re-append the answer so the model sees both the original
             # task and the operator's clarification in the right order.
             preexisting = list(existing)
-            self.session_store.clear_messages(sid)
-            self._seed_conversation(session, task, budget)
+            if not self.session_store.clear_messages(
+                sid, attempt_id=session.attempt_id, turn_id=session.turn_id,
+            ):
+                return self._cancelled_outcome(session)
+            if not self._seed_conversation(session, task, budget):
+                return self._cancelled_outcome(session)
             for m in preexisting:
                 role = m.get("role")
                 content = m.get("content", "")
                 if role in ("user", "assistant"):
-                    self.session_store.append_message(sid, role, content)
+                    if self.session_store.append_message(
+                        sid, role, content,
+                        attempt_id=session.attempt_id, turn_id=session.turn_id,
+                    ) is None:
+                        return self._cancelled_outcome(session)
 
         while True:
+            if not self._turn_is_current(session):
+                return self._cancelled_outcome(session)
             # Wall-clock budget check — uses cumulative active seconds, not
             # wall-from-start (so sleeps don't eat into the run budget).
             updated = self.session_store.get(session.task_id)
@@ -596,16 +655,26 @@ class LocalExecutor:
                 logger.exception("local executor LLM call failed: %s", exc)
                 # Charge the time we spent trying so the budget reflects real
                 # work even on failure.
-                self.session_store.record_active_seconds(session.task_id, time.time() - turn_start)
+                self.session_store.record_active_seconds(
+                    session.task_id, time.time() - turn_start,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 return self._finalize_failed(session, f"LLM call failed: {exc}")
+
+            if not self._turn_is_current(session):
+                return self._cancelled_outcome(session)
 
             # Normalize tool_calls to a single shape (OpenAI ↔ Anthropic).
             normalized_calls = _normalize_tool_calls(response.tool_calls)
             truncated_calls = normalized_calls[:MAX_TOOL_CALLS_PER_TURN]
 
-            self._persist_assistant_turn(sid, response, truncated_calls)
+            if not self._persist_assistant_turn(session, response, truncated_calls):
+                return self._cancelled_outcome(session)
             self._record_spend(session, response)
-            self.session_store.record_active_seconds(session.task_id, time.time() - turn_start)
+            self.session_store.record_active_seconds(
+                session.task_id, time.time() - turn_start,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
 
             if not truncated_calls:
                 # Final answer — no more tool calls expected.
@@ -615,6 +684,8 @@ class LocalExecutor:
             yielded_for_children = False
             tool_results: list[dict] = []
             for call in truncated_calls:
+                if not self._turn_is_current(session):
+                    return self._cancelled_outcome(session)
                 name = call["name"]
                 args = call["input"]
                 call_id = call["id"]
@@ -674,7 +745,11 @@ class LocalExecutor:
                         })
 
             # Persist the tool_results as a user-role turn (Anthropic convention).
-            self.session_store.append_message(sid, "user", tool_results)
+            if self.session_store.append_message(
+                sid, "user", tool_results,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            ) is None:
+                return self._cancelled_outcome(session)
 
             if yielded_for_children:
                 # Status is already set by the calling tool — either
@@ -684,7 +759,11 @@ class LocalExecutor:
                 refreshed = self.session_store.get(session.task_id)
                 kind = "yielded_for_children" if refreshed.yield_waiting_for else "yielded_for_user"
                 self.transcript_store.append(sid, kind, {})
-                return ExecutorOutcome(status=STATUS_YIELDED, served_by=self._served_by())
+                return ExecutorOutcome(
+                    status=STATUS_YIELDED, served_by=self._served_by(),
+                    session_id=session.session_id, attempt_id=session.attempt_id,
+                    turn_id=session.turn_id, executor="remote" if self.is_remote else "local",
+                )
 
             if yielded_seconds is not None:
                 return self._finalize_sleeping(session, yielded_seconds)
@@ -693,7 +772,7 @@ class LocalExecutor:
     # Conversation persistence
     # ------------------------------------------------------------------
 
-    def _seed_conversation(self, session, task: dict, budget: dict) -> None:
+    def _seed_conversation(self, session, task: dict, budget: dict) -> bool:
         sid = session.session_id
         system = _system_prompt(
             sid, session.expected_output or "text", budget,
@@ -702,9 +781,16 @@ class LocalExecutor:
         # We store the system message as a "system" role row so future calls
         # can rebuild the conversation; the LLM client API takes system
         # separately so we strip it when calling.
-        self.session_store.append_message(sid, "system", system)
-        self.session_store.append_message(sid, "user", _user_message_for(task))
+        system_index = self.session_store.append_message(
+            sid, "system", system,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        user_index = self.session_store.append_message(
+            sid, "user", _user_message_for(task),
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         self.transcript_store.append(sid, "seed", {"task_id": session.task_id})
+        return system_index is not None and user_index is not None
 
     def _call_llm(self, session_id: str, effort: str | None = None):
         history = self.session_store.get_messages(session_id)
@@ -740,6 +826,15 @@ class LocalExecutor:
         # byte-identical.
         create_kwargs: dict = {}
         from api.services.llm_client import LocalLLMClient
+        session = self.session_store.get_by_session_id(session_id)
+        session_model = None
+        if session and session.execution_spec:
+            session_model = (session.execution_spec.get("model_id") or "").strip() or None
+        if session_model and isinstance(self.llm, LocalLLMClient):
+            # Native local/remote OpenAI-compatible engines honor a per-call
+            # model pin. The immutable execution snapshot is the source of
+            # truth, so retries/resumes use the same pin.
+            create_kwargs["model"] = session_model
         if isinstance(self.llm, LocalLLMClient) and not self.is_remote:
             from api.services.agent_worker.assignment import local_thinking_for_effort
             from config.settings import settings as _settings
@@ -779,7 +874,7 @@ class LocalExecutor:
         # Unreachable — the loop either returns or raises.
         raise last_exc  # type: ignore[misc]
 
-    def _persist_assistant_turn(self, session_id: str, response, normalized_calls: list[dict]) -> None:
+    def _persist_assistant_turn(self, session, response, normalized_calls: list[dict]) -> bool:
         """Persist the assistant turn using the *truncated* normalized call list
         so tool_use and tool_result block counts stay 1:1 in later turns.
         """
@@ -796,10 +891,11 @@ class LocalExecutor:
         usage = getattr(response, "usage", None)
         tokens_in = getattr(usage, "input_tokens", 0) if usage else 0
         tokens_out = getattr(usage, "output_tokens", 0) if usage else 0
-        self.session_store.append_message(
-            session_id, "assistant", content_blocks,
+        return self.session_store.append_message(
+            session.session_id, "assistant", content_blocks,
             tokens_in=tokens_in, tokens_out=tokens_out,
-        )
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        ) is not None
 
     def _record_spend(self, session, response) -> None:
         """Record real spend for one turn.
@@ -843,9 +939,42 @@ class LocalExecutor:
         else:
             dollars = 0.0
             unpriced = True
-        self.session_store.record_spend(
-            session.task_id, tokens_in, tokens_out, dollars, unpriced=unpriced
-        )
+        sid, attempt_id, turn_id = identity_for_session(session)
+        usage_key = f"{sid}:{attempt_id}:{turn_id}"
+        totals = self._usage_totals.setdefault(usage_key, {
+            "input": 0, "output": 0, "cost": 0.0,
+            "cache_creation": 0, "cache_read": 0, "round": 0,
+        })
+        totals["input"] += tokens_in
+        totals["output"] += tokens_out
+        totals["cost"] += dollars
+        totals["cache_creation"] += int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+        totals["cache_read"] += int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+        totals["round"] += 1
+        try:
+            UsageLedger(self.session_store.db_path).record(UsageObservation(
+                session_id=sid, attempt_id=attempt_id, turn_id=turn_id,
+                source="remote_executor" if self.is_remote else "local_executor",
+                input_tokens=int(totals["input"]), output_tokens=int(totals["output"]),
+                cache_creation_tokens=int(totals["cache_creation"]),
+                cache_read_tokens=int(totals["cache_read"]),
+                input_kind=MEASURED, output_kind=MEASURED,
+                cache_creation_kind=MEASURED, cache_read_kind=MEASURED,
+                cost_usd=totals["cost"] if not unpriced else None,
+                cost_kind=UNKNOWN if unpriced else MEASURED,
+                billing_class="metered" if self.is_remote else "local_free",
+                requested_engine="remote" if self.is_remote else "local",
+                requested_model=getattr(session, "model", None) or self.model_name,
+                served_engine="remote" if self.is_remote else "local",
+                served_model=self.model_name,
+                evidence_source="llm_response_usage",
+                source_event_id=f"round:{int(totals['round'])}",
+                event_id=f"local:{usage_key}:{int(totals['round'])}",
+                cumulative=True,
+                reservation_id=reservation_id_for_session(session),
+            ))
+        except Exception:  # noqa: BLE001 — accounting cannot alter execution
+            logger.warning("local usage ledger write failed for %s", session.task_id, exc_info=True)
 
     # ------------------------------------------------------------------
     # Finalizers
@@ -865,7 +994,10 @@ class LocalExecutor:
         for descendant in self.session_store.list_descendants(root_session_id):
             if descendant.status in TERMINAL_STATUSES:
                 continue
-            self.session_store.update_status(descendant.task_id, STATUS_FAILED)
+            self.session_store.update_status(
+                descendant.task_id, STATUS_FAILED,
+                attempt_id=descendant.attempt_id, turn_id=descendant.turn_id,
+            )
             self.transcript_store.append(
                 descendant.session_id, "cascade_killed",
                 {"root": root_session_id, "reason": reason},
@@ -881,7 +1013,14 @@ class LocalExecutor:
         return self.model_name if self.is_remote else ""
 
     def _finalize_completed(self, session, final_text: str) -> ExecutorOutcome:
-        self.session_store.update_status(session.task_id, STATUS_COMPLETED)
+        if not self._turn_is_current(session):
+            return self._cancelled_outcome(session)
+        updated = self.session_store.update_status(
+            session.task_id, STATUS_COMPLETED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        if not updated:
+            return self._cancelled_outcome(session)
         # Persist the body, not just the length. The final text is also sent
         # to Telegram, but the transcript is the only durable record an
         # operator can grep later to see what an agent actually said.
@@ -891,28 +1030,65 @@ class LocalExecutor:
         )
         return ExecutorOutcome(
             status=STATUS_COMPLETED, final_text=final_text or "", served_by=self._served_by(),
+            session_id=session.session_id, attempt_id=session.attempt_id,
+            turn_id=session.turn_id, executor="remote" if self.is_remote else "local",
         )
 
     def _finalize_failed(self, session, reason: str) -> ExecutorOutcome:
-        self.session_store.update_status(session.task_id, STATUS_FAILED)
+        if not self._turn_is_current(session):
+            return self._cancelled_outcome(session, reason)
+        updated = self.session_store.update_status(
+            session.task_id, STATUS_FAILED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        if not updated:
+            return self._cancelled_outcome(session, reason)
         self.transcript_store.append(session.session_id, "failed", {"reason": reason})
-        return ExecutorOutcome(status=STATUS_FAILED, reason=reason, served_by=self._served_by())
+        return ExecutorOutcome(
+            status=STATUS_FAILED, reason=reason, served_by=self._served_by(),
+            session_id=session.session_id, attempt_id=session.attempt_id,
+            turn_id=session.turn_id, executor="remote" if self.is_remote else "local",
+        )
 
     def _finalize_budget_exceeded(self, session, kind: str) -> ExecutorOutcome:
-        self.session_store.update_status(session.task_id, STATUS_BUDGET_EXCEEDED)
+        if not self._turn_is_current(session):
+            return self._cancelled_outcome(session, f"budget exceeded ({kind})")
+        updated = self.session_store.update_status(
+            session.task_id, STATUS_BUDGET_EXCEEDED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        if not updated:
+            return self._cancelled_outcome(session, f"budget exceeded ({kind})")
         self.transcript_store.append(
             session.session_id, "budget_exceeded", {"kind": kind}
         )
         return ExecutorOutcome(
             status=STATUS_BUDGET_EXCEEDED, reason=f"budget exceeded ({kind})",
             served_by=self._served_by(),
+            session_id=session.session_id, attempt_id=session.attempt_id,
+            turn_id=session.turn_id, executor="remote" if self.is_remote else "local",
         )
 
     def _finalize_sleeping(self, session, seconds: int) -> ExecutorOutcome:
+        if not self._turn_is_current(session):
+            return self._cancelled_outcome(session)
         wake_at = int(time.time()) + int(seconds)
-        self.session_store.add_sleep(session.session_id, wake_at=wake_at)
-        self.session_store.update_status(session.task_id, STATUS_YIELDED)
+        if not self.session_store.add_sleep(
+            session.session_id, wake_at=wake_at,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        ):
+            return self._cancelled_outcome(session)
+        updated = self.session_store.update_status(
+            session.task_id, STATUS_YIELDED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        if not updated:
+            return self._cancelled_outcome(session)
         self.transcript_store.append(
             session.session_id, "sleep", {"seconds": int(seconds), "wake_at": wake_at}
         )
-        return ExecutorOutcome(status=STATUS_YIELDED, wake_at=wake_at, served_by=self._served_by())
+        return ExecutorOutcome(
+            status=STATUS_YIELDED, wake_at=wake_at, served_by=self._served_by(),
+            session_id=session.session_id, attempt_id=session.attempt_id,
+            turn_id=session.turn_id, executor="remote" if self.is_remote else "local",
+        )

@@ -473,6 +473,7 @@ class LocalLLMClient:
         self,
         messages: list[dict],
         *,
+        model: str | None = None,
         system: str | list | None = None,
         max_tokens: int = 4096,
         tools: list[dict] | None = None,
@@ -488,7 +489,7 @@ class LocalLLMClient:
         """
         all_messages = self._build_messages_list(messages, system)
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": model or self.model,
             "messages": all_messages,
             "max_tokens": max_tokens,
             "stream": False,

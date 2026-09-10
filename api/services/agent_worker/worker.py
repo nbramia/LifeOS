@@ -22,9 +22,13 @@ import logging
 import os
 import re
 import signal
+import shutil
+import inspect
 import sys
 import threading
 import time
+import uuid
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +40,31 @@ if TYPE_CHECKING:
 
 from api.services.agent_worker.completion_signal import has_positive_completion_signal
 from api.services.agent_worker.assignment import extract_assignment
+from api.services.agent_worker.executor_lifecycle import (
+    CancelResult,
+    ExecutorRegistry,
+    adapter_for,
+    attempt_id_for,
+    normalize_outcome,
+    turn_id_for,
+)
+from api.services.agent_worker.execution import (
+    BillingClass,
+    Budget as ExecutionBudget,
+    CatalogFacts,
+    CatalogState,
+    ExecutionContext,
+    ExecutionFacts,
+    ExecutionLayer,
+    ExecutionRequest,
+    ExecutionSpec,
+    ExecutorFacts,
+    ReadinessState,
+    ResolutionResult,
+    ResolutionStatus,
+    parse_execution_request,
+    resolve_execution,
+)
 from api.services.agent_board import (
     AGENT_ASSIGNEES as _BOARD_AGENT_ASSIGNEES,
     AGENT_PICKUP_TAGS,
@@ -67,10 +96,17 @@ from api.services.agent_worker.session_store import (
 )
 from api.services.agent_worker.managed_executor import _sanitize_title as _managed_sanitize_title
 from api.services.agent_worker.spend_tracker import SpendTracker
+from api.services.agent_worker.usage_ledger import UsageLedger
 from api.services.agent_worker.transcript_store import TranscriptStore
+from api.services.agent_worker.lifecycle import LifecycleEvent, LifecycleProjector
 from api.services.conversation_store import ConversationStore
 from api.services.interaction_store import build_obsidian_link
 from api.services.log_redaction import configure_telegram_log_redaction
+from api.services.runtime_identity import (
+    capture_runtime_identity,
+    heartbeat_runtime_identity,
+    publish_runtime_identity,
+)
 from config.settings import settings
 
 
@@ -329,6 +365,27 @@ def _worker_label(routing: str | None, served_by: str = "") -> str:
     return "Agent worker"
 
 
+def _resume_cli_executor(executor, session, message: str, working_dir: str | None):
+    """Call either CLI resume contract without leaking a compatibility TypeError.
+
+    Older injected/third-party executors implement ``resume(session, message)``
+    while the built-in executors also accept ``working_dir``. Inspecting the
+    bound method keeps the working-directory snapshot for built-ins and avoids
+    catching arbitrary TypeErrors raised from inside a real resume.
+    """
+    try:
+        parameters = inspect.signature(executor.resume).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_working_dir = "working_dir" in parameters or any(
+        item.kind == inspect.Parameter.VAR_KEYWORD
+        for item in parameters.values()
+    )
+    if accepts_working_dir:
+        return executor.resume(session, message, working_dir=working_dir)
+    return executor.resume(session, message)
+
+
 # Friendly names for the engine a child session ran on, used in the escalation
 # flag (#349) so the operator sees where delegated work actually executed.
 _ENGINE_LABELS = {
@@ -448,6 +505,25 @@ class _SynchronousPool:
         pass
 
 
+class _WorkerLifecycleTaskManager:
+    """TaskManager-shaped facade backed by the worker's HTTP client."""
+
+    def __init__(self, worker: "Worker") -> None:
+        self.worker = worker
+
+    def get(self, task_id: str):
+        task = self.worker._fetch_task(task_id)
+        return SimpleNamespace(**task) if task else None
+
+    def update(self, task_id: str, **kwargs):
+        response = self.worker._http.put(
+            f"{self.worker.api_base}/api/tasks/{task_id}", json=kwargs,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return SimpleNamespace(**payload) if payload else None
+
+
 class Worker:
     """Single-process poll loop. One instance per process."""
 
@@ -470,6 +546,7 @@ class Worker:
         codex_executor=None,        # injectable CodexExecutor for tests
         hermes_executor=None,       # injectable HermesExecutor for tests (#851)
         cli_pool=None,              # injectable dispatch pool; tests pass _SynchronousPool
+        execution_facts_provider=None,  # injectable immutable resolver observation
     ) -> None:
         self.api_base = (api_base or os.environ.get("LIFEOS_API_URL", "http://localhost:8000")).rstrip("/")
         self.session_store = session_store or SessionStore()
@@ -481,6 +558,10 @@ class Worker:
         self.spend_tracker = spend_tracker or SpendTracker(
             daily_cap_dollars=settings.agent_daily_cap_dollars,
         )
+        # Admission and executor observations share one SQLite transaction
+        # domain. The legacy SpendTracker remains available for callers, but
+        # this ledger is the atomic gate used by task claims.
+        self.usage_ledger = UsageLedger(self.session_store.db_path)
         self.poll_seconds = poll_seconds if poll_seconds is not None else settings.agent_worker_poll_seconds
         self._stop = False
         # Telegram senders default to no-ops. Tests get isolation for free
@@ -498,6 +579,13 @@ class Worker:
         )
         self._owns_http_client = http_client is None
         self._http = http_client or httpx.Client(timeout=10.0)
+        # All worker-owned terminal status writes pass through this projector
+        # before the session row is updated. The projector's marker is the
+        # durable replay boundary for the HTTP-backed Markdown task store.
+        self.lifecycle_projector = LifecycleProjector(
+            self.session_store, _WorkerLifecycleTaskManager(self),
+        )
+        self.session_store.set_status_projector(self._project_session_status)
         # Human-queue done_when poll (#852) — throttled independently of the
         # main tick interval, which runs far more often (60s) than the
         # default human-queue poll (300s). 0.0 so the very first tick always
@@ -515,9 +603,10 @@ class Worker:
         self._claude_code_executors: dict[str, object] = {}
         self._codex_executor = codex_executor  # lazily instantiated on first /codex task
         self._hermes_executor = hermes_executor  # lazily instantiated on first hermes task (#851)
-        # CLI dispatches (claude_code/codex) are long-running subprocesses — both
-        # spawned children/operator root-spawns AND top-level #agent tasks routed
-        # to a CLI engine (#753) go through this pool via _submit_cli_dispatch.
+        self._execution_facts_provider = execution_facts_provider
+        # CLI dispatches (claude_code/codex) and Hermes HTTP turns can be
+        # long-running — spawned children/operator root-spawns and top-level
+        # #agent tasks go through this bounded pool via their route submitters.
         # Running them off the tick keeps the poll loop free to claim new tasks,
         # dispatch siblings, and keep servicing sleeps/managed-polling/clarification
         # while a session's subprocess runs (up to its budget wall, 4h by default).
@@ -531,7 +620,40 @@ class Worker:
         )
         self._cli_inflight: set[str] = set()
         self._cli_lock = threading.Lock()
+        # Hermes is an HTTP turn, but its upstream may hold a worker tick for
+        # the full read timeout. Keep it off-tick and guard submissions just as
+        # we do for the long-lived CLI drivers.
+        self._hermes_inflight: set[str] = set()
+        self._hermes_lock = threading.Lock()
+        self._executor_registry = ExecutorRegistry(session_store=self.session_store)
         self._warn_deprecated_settings()
+
+    def _project_session_status(
+        self, task_id: str, status: str, *, attempt_id: str | None = None,
+        turn_id: str | None = None, wait_type: str | None = None,
+        wait_reason: str = "",
+    ) -> bool:
+        """Project a session transition to the public task surface."""
+        session = self.session_store.get(task_id)
+        if session is None or session.origin == "operator" or session.parent_session_id:
+            return False
+        task = self._fetch_task(task_id)
+        if task is None:
+            return False
+        event = LifecycleEvent(
+            event_id=LifecycleProjector.event_id(
+                task_id, attempt_id or session.attempt_id, status,
+                suffix=turn_id or "",
+            ),
+            task_id=task_id, session_id=session.session_id,
+            attempt_id=attempt_id or session.attempt_id,
+            target_status=status,
+            expected_version=task.get("updated_at"),
+            wait_type=wait_type,
+            wait_reason=wait_reason,
+            reason=status,
+        )
+        return self.lifecycle_projector.transition(event, task=SimpleNamespace(**task))
 
     @staticmethod
     def _warn_deprecated_settings() -> None:
@@ -576,6 +698,13 @@ class Worker:
 
     def run(self) -> None:
         """Main loop. Runs until `stop()` is called or the process is killed."""
+        # Capture only at the daemon entry point: worker.py is imported by
+        # API/tools/tests too, and those processes are not worker evidence.
+        runtime_identity = capture_runtime_identity("lifeos-agent-worker")
+        try:
+            publish_runtime_identity(runtime_identity)
+        except Exception as exc:  # Evidence is optional; the daemon still runs.
+            logger.warning("could not publish worker runtime identity: %s", exc)
         logger.info(
             "agent worker starting (api=%s, poll=%ss, daily_cap=$%s)",
             self.api_base, self.poll_seconds, self.spend_tracker.daily_cap_dollars,
@@ -585,6 +714,10 @@ class Worker:
         self.resume_pending()
         while not self._stop:
             try:
+                try:
+                    heartbeat_runtime_identity(runtime_identity)
+                except Exception as exc:  # Evidence is optional; never suppress the worker tick.
+                    logger.warning("could not publish worker runtime heartbeat: %s", exc)
                 self.tick()
             except Exception as exc:  # pragma: no cover — loop guard
                 logger.exception("worker tick failed: %s", exc)
@@ -627,6 +760,9 @@ class Worker:
         )
         if recovered_claims:
             logger.info("released %d abandoned answered-question claim(s)", recovered_claims)
+        # Reconcile task projections left between the durable marker and the
+        # HTTP/Markdown write before dispatching any sessions.
+        self.lifecycle_projector.replay_pending()
         pending = self.session_store.list_non_terminal()
         # Sessions the detached-restart primitive deliberately killed. Read once
         # and cleared after the loop so a single marker is honored exactly once.
@@ -653,7 +789,10 @@ class Worker:
                     sid, "resume_self_restart",
                     {"prior_status": session.status},
                 )
-                self.session_store.update_status(session.task_id, STATUS_COMPLETED)
+                self.session_store.update_status(
+                    session.task_id, STATUS_COMPLETED,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 # Mirror the canonical COMPLETED path (see _handle_outcome /
                 # _finalize_terminal): advance the vault checkbox to done ([x])
                 # AND swap the tag — gated on has_vault_task. Operator-spawned
@@ -694,7 +833,10 @@ class Worker:
                             session.managed_agent_session_id, exc,
                         )
             self.transcript_store.append(sid, "resume_failed", {"prior_status": session.status})
-            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            self.session_store.update_status(
+                session.task_id, STATUS_FAILED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             # Spawned children belong to a parent's lineage — they have no
             # backing vault task (`spawn_xxx` task_id is synthetic), so
             # tag/status updates are no-ops, and the operator-facing
@@ -709,7 +851,10 @@ class Worker:
             # tag remains). Engine-only and consent-only cards just drop running.
             handoff = tags_now & (_AGENT_ASSIGNEE_SET | _CONSENT_TAG_SET)
             if AGENT_TAG in tags_now or not handoff:
-                self._swap_tag(session.task_id, RUNNING_TAG, AGENT_TAG)
+                if not self._swap_tag(session.task_id, RUNNING_TAG, AGENT_TAG):
+                    # The lifecycle projector may have replaced the running
+                    # tag with a terminal tag when this rollback runs.
+                    self._swap_tag(session.task_id, FAILED_TAG, AGENT_TAG)
             else:
                 self._remove_tag_if_present(session.task_id, RUNNING_TAG)
             # Rolling back claim — return the vault checkbox to "todo"
@@ -741,6 +886,7 @@ class Worker:
         # task or spends money, so it must not stop just because the
         # worker is paused or near its daily cap (#852 R2).
         self._process_human_queue()
+        self._replay_wait_wakeups()
 
         # Use the configured per-task default budget as the "can I afford to
         # start the cheapest task right now?" estimate. Calling with 0.0 would
@@ -784,8 +930,34 @@ class Worker:
                 existing_session.status not in TERMINAL_STATUSES or not reassigned
             ):
                 continue
-            if not self._claim(task_id):
+            reservation_id = f"admission:{task_id}"
+            claim_id = f"claim:{uuid.uuid4().hex}"
+            if not self.usage_ledger.reserve(
+                task_id,
+                estimate,
+                daily_cap_dollars=self.spend_tracker.daily_cap_dollars,
+                reservation_id=reservation_id,
+                owner_id=claim_id,
+            ):
                 continue
+            # Keep the claim hook's one-argument seam used by integrations and
+            # tests; the per-attempt identity is read by the real _claim.
+            self._active_claim_id = claim_id
+            try:
+                claimed = self._claim(task_id)
+            finally:
+                self._active_claim_id = None
+            if not claimed:
+                # Admission precedes the API claim, so a loser must release
+                # only its own hold. A winner may have adopted the shared
+                # task reservation by the time this loser returns.
+                self.usage_ledger.release_owned(reservation_id, claim_id)
+                continue
+            self.usage_ledger.adopt_reservation(
+                task_id, estimate,
+                daily_cap_dollars=self.spend_tracker.daily_cap_dollars,
+                reservation_id=reservation_id, owner_id=claim_id,
+            )
             self._dispatch(task)
             handled += 1
         return handled
@@ -820,6 +992,7 @@ class Worker:
                     continue
             if task is None:
                 task = {"id": session.task_id, "description": session.task_id}
+            task = self._task_with_execution_snapshot(session, task)
 
             # Build the resume turn — same shape for local and cloud, but
             # cloud also pulls each child's final_text (from the managed_cursor
@@ -827,6 +1000,37 @@ class Worker:
             # parent's fresh session won't have access to the children's
             # transcripts on its own.
             resume_message = self._build_resume_message(session, task, child_sessions)
+
+            # CLI continuations must go through their persisted native IDs;
+            # queueing before reopening preserves pending-message order and
+            # lets the normal off-tick dispatcher invoke `resume()`.
+            if session.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
+                adapter = self._lifecycle_adapter(session)
+                if adapter is None or not adapter.capabilities.resume_after_children:
+                    self._mark_failed(session, task, "unsupported_resume")
+                    continue
+                if not self._executor_registry.begin(session, "resume_after_children"):
+                    continue
+                try:
+                    self.session_store.enqueue_message(
+                        session.session_id, "worker", resume_message,
+                        attempt_id=session.attempt_id, turn_id=session.turn_id,
+                    )
+                    self.session_store.set_yield_waiting_for(
+                        session.task_id, None,
+                        attempt_id=session.attempt_id, turn_id=session.turn_id,
+                    )
+                    self.session_store.update_status(
+                        session.task_id, STATUS_CLAIMED,
+                        attempt_id=session.attempt_id, turn_id=session.turn_id,
+                    )
+                    self.transcript_store.append(session.session_id, "resume_after_children_queued", {
+                        "children": children,
+                        "continuation_id": adapter.route,
+                    })
+                finally:
+                    self._executor_registry.finish(session, "resume_after_children")
+                continue
 
             if session.routing == ROUTE_CLAUDE:
                 ok = self._resume_cloud_parent(session, task, child_sessions, resume_message)
@@ -840,33 +1044,51 @@ class Worker:
                 )
                 continue
 
+            if session.routing == ROUTE_HERMES:
+                adapter = self._lifecycle_adapter(session)
+                if adapter is None or not adapter.capabilities.resume_after_children:
+                    self._mark_failed(session, task, "unsupported_resume")
+                    continue
+                self._submit_hermes_resume(session, task, resume_message, child_sessions)
+                continue
+
             # (#809) A remote-routed parent keeps its conversation history in
             # session_store like local does (it's the same LocalExecutor,
             # just pointed at the remote provider) — no fresh-session
             # restatement needed, unlike the cloud/Managed-Agents branch
             # above. Only the executor construction differs.
-            if session.routing == ROUTE_REMOTE:
-                executor = self._get_remote_executor(caller_session_id=session.session_id)
-            else:
-                executor = self._get_local_executor(caller_session_id=session.session_id)
+            adapter = self._lifecycle_adapter(session)
+            if adapter is None or not adapter.capabilities.resume_after_children:
+                self._mark_failed(session, task, "unsupported_resume")
+                continue
+            if not self._executor_registry.begin(session, "resume_after_children"):
+                continue
             try:
-                # Append the resume message first so the executor sees it on
-                # the next turn; clear yield_waiting_for *after* the executor
-                # returns so a crash leaves the session retryable (still
-                # yielded with the same children list).
-                self.session_store.append_message(session.session_id, "user", resume_message)
-                outcome = executor.execute(session, task)
+                outcome = adapter.resume_after_children(
+                    session, resume_message, child_sessions,
+                )
             except Exception as exc:
                 logger.exception("resume after children crashed for %s: %s",
                                  session.task_id, exc)
                 # Leave yield_waiting_for set so the next tick re-attempts.
-                self._mark_failed(session, task, f"resume crashed: {exc}")
+                current = self.session_store.get(session.task_id)
+                if self._same_lifecycle_snapshot(session, current):
+                    self._mark_failed(session, task, f"resume crashed: {exc}")
                 continue
-            self.session_store.set_yield_waiting_for(session.task_id, None)
+            finally:
+                self._executor_registry.finish(session, "resume_after_children")
+            current = self.session_store.get(session.task_id)
+            if not self._outcome_matches_snapshot(outcome, current):
+                continue
+            self.session_store.set_yield_waiting_for(
+                session.task_id, None,
+                attempt_id=getattr(outcome, "attempt_id", None),
+                turn_id=getattr(outcome, "turn_id", None),
+            )
             self.transcript_store.append(session.session_id, "resume_after_children", {
                 "children": children,
             })
-            self._handle_outcome(session, task, outcome)
+            self._handle_outcome(current, task, outcome)
 
     def _dispatch_spawned_sessions(self) -> None:
         """Pick up sessions created via lifeos_agent_spawn that have no #agent
@@ -885,50 +1107,137 @@ class Worker:
             # origin='operator').
             if not session.parent_session_id and session.origin != "operator":
                 continue
-            # CLI children already handed to the pool: skip BEFORE draining, so a
-            # re-scan in the CLAIMED→RUNNING window doesn't consume (and discard)
-            # the session's pending messages while the running dispatch skips them.
+            if session.execution_request:
+                parsed = parse_execution_request(session.execution_request)
+                if not parsed.ok:
+                    self.session_store.update_status(
+                        session.task_id, STATUS_FAILED,
+                        attempt_id=attempt_id_for(session), turn_id=turn_id_for(session),
+                    )
+                    continue
+                execution_request = parsed.request
+            else:
+                execution_request = ExecutionRequest(executor=session.routing)
+            inherited = ExecutionLayer(
+                executor=session.routing,
+                model_id=session.model,
+                model_executor=session.routing if session.model else None,
+                effort=session.effort,
+                host=session.host,
+                budget=ExecutionBudget(**session.budget) if session.budget else None,
+            )
+            execution = self._resolve_session_execution(
+                session, request=execution_request, assignment=inherited,
+            )
+            if not execution.ok:
+                self.session_store.update_status(
+                    session.task_id, STATUS_FAILED,
+                    attempt_id=attempt_id_for(session), turn_id=turn_id_for(session),
+                )
+                self.transcript_store.append(session.session_id, "execution_resolution_failed", {
+                    "diagnostics": [item.code for item in execution.diagnostics],
+                })
+                continue
+            session = self.session_store.get(session.task_id)
+            # Resolution can switch the route. Check the persisted winner before
+            # consuming the prompt so a second scan cannot drain a CLI turn that
+            # is already queued/running, and a failed resolution leaves the input
+            # available for an operator-directed retry.
             if session.routing in ("claude_code", "codex"):
                 with self._cli_lock:
                     if session.session_id in self._cli_inflight:
                         continue
-            # The first pending message is the prompt from the parent — drain
-            # it so the executor's seeded user turn picks it up.
-            pending = self.session_store.drain_pending_messages(session.session_id)
+            pending = self.session_store.drain_pending_messages(
+                session.session_id,
+                attempt_id=attempt_id_for(session), turn_id=turn_id_for(session),
+            )
             description = pending[0]["content"] if pending else session.session_id
             task = {"id": session.task_id, "description": description}
+            if execution.spec.working_dir:
+                task.update({
+                    "working_dir": execution.spec.working_dir,
+                    "fields": {"working_dir": execution.spec.working_dir},
+                })
             if session.routing == "local":
-                executor = self._get_local_executor(caller_session_id=session.session_id)
                 try:
-                    outcome = executor.execute(session, task)
+                    outcome = self._execute_start(session, task)
                 except Exception as exc:
                     logger.exception("spawned local execute crashed for %s: %s", session.task_id, exc)
-                    self.session_store.update_status(session.task_id, STATUS_FAILED)
+                    self.session_store.update_status(
+                        session.task_id, STATUS_FAILED,
+                        attempt_id=attempt_id_for(session), turn_id=turn_id_for(session),
+                    )
+                    continue
+                self._handle_outcome(session, task, outcome)
+            elif session.routing == "remote":
+                if not settings.remote_llm_configured:
+                    self.session_store.update_status(
+                        session.task_id, STATUS_BLOCKED,
+                        attempt_id=attempt_id_for(session), turn_id=turn_id_for(session),
+                    )
+                    continue
+                try:
+                    outcome = self._execute_start(session, task)
+                except Exception as exc:
+                    logger.exception("spawned remote execute crashed for %s: %s", session.task_id, exc)
+                    self.session_store.update_status(
+                        session.task_id, STATUS_FAILED,
+                        attempt_id=attempt_id_for(session), turn_id=turn_id_for(session),
+                    )
                     continue
                 self._handle_outcome(session, task, outcome)
             elif session.routing == "claude":
                 managed = self._get_managed_executor()
                 if managed is None:
-                    self.session_store.update_status(session.task_id, STATUS_FAILED)
+                    self.session_store.update_status(
+                        session.task_id, STATUS_FAILED,
+                        attempt_id=attempt_id_for(session), turn_id=turn_id_for(session),
+                    )
                     self.transcript_store.append(
                         session.session_id, "spawn_failed_no_managed", {},
                     )
                     continue
                 try:
-                    outcome = managed.start(session, task)
+                    outcome = self._execute_start(session, task)
                 except Exception as exc:
                     logger.exception("spawned managed start crashed for %s: %s", session.task_id, exc)
-                    self.session_store.update_status(session.task_id, STATUS_FAILED)
+                    self.session_store.update_status(
+                        session.task_id, STATUS_FAILED,
+                        attempt_id=attempt_id_for(session), turn_id=turn_id_for(session),
+                    )
                     continue
                 if outcome.status == STATUS_FAILED:
                     self._handle_outcome(session, task, outcome)
                 # On RUNNING, let _poll_managed_sessions handle the rest.
+            elif session.routing == "hermes":
+                self._submit_hermes_dispatch(session, task)
             elif session.routing == "claude_code":
                 # /claude sessions — operator-spawned via claude_code_spawn.spawn_claude_code_session.
                 self._submit_cli_dispatch(session, pending, self._dispatch_claude_code_session)
             elif session.routing == "codex":
                 # /codex sessions — operator-spawned via codex_spawn.spawn_codex_session.
                 self._submit_cli_dispatch(session, pending, self._dispatch_codex_session)
+
+    @staticmethod
+    def _same_lifecycle_snapshot(expected, current) -> bool:
+        """Require an exact attempt/turn match before a queued callback runs."""
+        if current is None:
+            return False
+        return (
+            getattr(expected, "session_id", None) == getattr(current, "session_id", None)
+            and
+            getattr(expected, "attempt_id", None) == getattr(current, "attempt_id", None)
+            and getattr(expected, "turn_id", None) == getattr(current, "turn_id", None)
+        )
+
+    @classmethod
+    def _outcome_matches_snapshot(cls, outcome, current) -> bool:
+        return bool(
+            current is not None
+            and getattr(outcome, "session_id", None) == getattr(current, "session_id", None)
+            and getattr(outcome, "attempt_id", None) == getattr(current, "attempt_id", None)
+            and getattr(outcome, "turn_id", None) == getattr(current, "turn_id", None)
+        )
 
     def _submit_cli_dispatch(self, session, pending, dispatch_fn) -> None:
         """Run a claude_code/codex dispatch (`_dispatch_claude_code_session` or
@@ -955,11 +1264,22 @@ class Worker:
         # from the store, so the snapshot going stale is harmless.
         def _run() -> None:
             try:
-                dispatch_fn(session, pending)
+                current = self.session_store.get(session.task_id)
+                if not self._same_lifecycle_snapshot(session, current):
+                    return
+                if current.status in TERMINAL_STATUSES:
+                    self.transcript_store.append(session.session_id, "queued_dispatch_cancelled", {
+                        "route": session.routing,
+                    })
+                    return
+                dispatch_fn(current, pending)
             except Exception as exc:  # pragma: no cover — defensive
                 logger.exception("async CLI dispatch crashed for %s: %s", session.task_id, exc)
                 try:
-                    self.session_store.update_status(session.task_id, STATUS_FAILED)
+                    self.session_store.update_status(
+                        session.task_id, STATUS_FAILED,
+                        attempt_id=attempt_id_for(session), turn_id=turn_id_for(session),
+                    )
                 except Exception:
                     logger.exception("failed to mark %s failed after dispatch crash", session.task_id)
             finally:
@@ -967,6 +1287,211 @@ class Worker:
                     self._cli_inflight.discard(sid)
 
         self._cli_pool.submit(_run)
+
+    def _submit_hermes_dispatch(self, session, task: dict[str, Any]) -> None:
+        """Run a Hermes HTTP turn outside the worker tick.
+
+        The guard is checked before submission and released only after the
+        outcome is consumed, so a slow upstream cannot be submitted twice by
+        consecutive ticks.  The bounded pool preserves the worker's configured
+        concurrency ceiling.
+        """
+        sid = session.session_id
+        with self._hermes_lock:
+            if sid in self._hermes_inflight:
+                return
+            self._hermes_inflight.add(sid)
+
+        def _run() -> None:
+            try:
+                current = self.session_store.get(session.task_id)
+                if not self._same_lifecycle_snapshot(session, current):
+                    return
+                if current.status in TERMINAL_STATUSES:
+                    return
+                outcome = self._execute_start(current, task)
+                if outcome is None:
+                    return
+                refreshed = self.session_store.get(session.task_id) or session
+                # A late stream completion must not reopen a cancelled/failed
+                # attempt.  _handle_outcome is intentionally called only for
+                # a still-active attempt.
+                if (
+                    getattr(outcome, "attempt_id", None) is None
+                    and not self._same_lifecycle_snapshot(session, refreshed)
+                ):
+                    return
+                same_turn = self._outcome_matches_snapshot(outcome, refreshed)
+                if refreshed.status in TERMINAL_STATUSES and not same_turn:
+                    return
+                else:
+                    self._handle_outcome(refreshed, task, normalize_outcome(outcome, refreshed, route="hermes"))
+            except Exception as exc:
+                logger.exception("hermes executor crashed for %s", session.task_id, exc_info=exc)
+                current = self.session_store.get(session.task_id) or session
+                if current.status not in TERMINAL_STATUSES and self._same_lifecycle_snapshot(session, current):
+                    self._mark_failed(current, task, f"executor crashed: {exc}")
+            finally:
+                with self._hermes_lock:
+                    self._hermes_inflight.discard(sid)
+
+        self._cli_pool.submit(_run)
+
+    def _submit_hermes_resume(
+        self, session, task: dict[str, Any], message: str, child_sessions: list[Any],
+    ) -> None:
+        """Queue a native Hermes continuation without blocking the tick."""
+        sid = session.session_id
+        with self._hermes_lock:
+            if sid in self._hermes_inflight:
+                return
+            self._hermes_inflight.add(sid)
+
+        def _run() -> None:
+            try:
+                current = self.session_store.get(session.task_id)
+                if not self._same_lifecycle_snapshot(session, current):
+                    return
+                if current.status in TERMINAL_STATUSES:
+                    return
+                adapter = self._lifecycle_adapter(session)
+                if adapter is None or not adapter.capabilities.resume_after_children:
+                    self._mark_failed(current, task, "unsupported_resume")
+                    return
+                outcome = adapter.resume_after_children(current, message, child_sessions)
+                if outcome is None:
+                    return
+                current = self.session_store.get(session.task_id) or session
+                same_turn = self._outcome_matches_snapshot(outcome, current)
+                if current.status in TERMINAL_STATUSES and not same_turn:
+                    return
+                if not same_turn:
+                    return
+                self.session_store.set_yield_waiting_for(
+                    session.task_id, None,
+                    attempt_id=getattr(outcome, "attempt_id", None),
+                    turn_id=getattr(outcome, "turn_id", None),
+                )
+                self.transcript_store.append(sid, "resume_after_children", {
+                    "children": [getattr(child, "session_id", "") for child in child_sessions],
+                    "continuation_id": getattr(outcome, "continuation_id", None),
+                })
+                self._handle_outcome(current, task, normalize_outcome(outcome, current, route="hermes"))
+            except Exception as exc:
+                logger.exception("Hermes child resume crashed for %s", session.task_id)
+                current = self.session_store.get(session.task_id) or session
+                if (
+                    current.status not in TERMINAL_STATUSES
+                    and self._same_lifecycle_snapshot(session, current)
+                ):
+                    self._mark_failed(current, task, f"resume crashed: {exc}")
+            finally:
+                with self._hermes_lock:
+                    self._hermes_inflight.discard(sid)
+
+        self._cli_pool.submit(_run)
+
+    def _lifecycle_adapter(self, session):
+        """Resolve the exact route adapter; never fall through to local."""
+        route = session.routing
+        if route == ROUTE_LOCAL:
+            executor = self._get_local_executor(caller_session_id=session.session_id)
+        elif route == ROUTE_REMOTE:
+            executor = self._get_remote_executor(caller_session_id=session.session_id)
+        elif route == ROUTE_CLAUDE:
+            executor = self._get_managed_executor()
+        elif route == ROUTE_HERMES:
+            executor = self._get_hermes_executor()
+        elif route == ROUTE_CLAUDE_CODE:
+            executor = self._get_claude_code_executor(session.bot)
+        elif route == ROUTE_CODEX:
+            executor = self._get_codex_executor()
+        else:
+            return None
+        if executor is None:
+            return None
+        try:
+            adapter = adapter_for(
+                route,
+                executor,
+                session_store=self.session_store,
+                cancel_fn=self._cancel_executor,
+            )
+        except ValueError:
+            return None
+        self._executor_registry.register(route, adapter)
+        return adapter
+
+    def _cancel_executor(self, session, reason: str = "") -> CancelResult:
+        """Terminate the concrete engine owned by this worker process."""
+        route = session.routing
+        if route == ROUTE_HERMES:
+            executor = self._get_hermes_executor()
+            result = executor.cancel(session, reason) if executor is not None else None
+            if isinstance(result, CancelResult):
+                return result
+        elif route == ROUTE_CLAUDE:
+            executor = self._get_managed_executor()
+            remote_id = getattr(session, "managed_agent_session_id", None)
+            if executor is not None and remote_id:
+                executor.driver.kill_session(remote_id, reason=reason)
+        elif route in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
+            from api.services.agent_worker.inter_agent import _kill_local_subprocess
+            _kill_local_subprocess(self.transcript_store, session)
+        # Local/remote have no independently cancellable provider request;
+        # the persisted terminal marker stops a queued or late outcome.
+        return CancelResult(
+            cancelled=True,
+            reason=reason or "cancelled",
+            session_id=session.session_id,
+            attempt_id=getattr(session, "attempt_id", None),
+            turn_id=getattr(session, "turn_id", None),
+            continuation_id=(
+                getattr(session, "managed_agent_session_id", None)
+                or getattr(session, "conversation_id", None)
+                or getattr(session, "claude_code_session_id", None)
+            ),
+        )
+
+    def cancel_session(self, session_or_id, reason: str = "") -> CancelResult:
+        """Cancel one session exactly once through the route registry."""
+        session = (
+            self.session_store.get_by_session_id(session_or_id)
+            if isinstance(session_or_id, str) else session_or_id
+        )
+        if session is None:
+            return CancelResult(cancelled=False, reason="not_found")
+        self._lifecycle_adapter(session)
+        return self._executor_registry.cancel_once(session, reason)
+
+    def _execute_start(self, session, request: dict[str, Any]):
+        """Start one route through the lifecycle adapter.
+
+        The adapter refreshes the persisted post-turn snapshot before it
+        normalizes the outcome. Keeping this helper at the worker boundary
+        prevents one of the many dispatch paths from accidentally passing a
+        stale pre-turn Session into outcome handling.
+        """
+        adapter = self._lifecycle_adapter(session)
+        if adapter is None:
+            raise RuntimeError(f"no executor for route {session.routing}")
+        if not self._executor_registry.begin(session, "start"):
+            return None
+        try:
+            return adapter.start(session, request)
+        finally:
+            self._executor_registry.finish(session, "start")
+
+    def _execute_resume(self, session, message: str, working_dir: str | None = None):
+        adapter = self._lifecycle_adapter(session)
+        if adapter is None:
+            raise RuntimeError(f"no executor for route {session.routing}")
+        if not self._executor_registry.begin(session, "resume"):
+            return None
+        try:
+            return adapter.resume(session, message, working_dir=working_dir)
+        finally:
+            self._executor_registry.finish(session, "resume")
 
     def _poll_managed_sessions(self) -> None:
         """Advance all in-flight Managed Agents sessions one polling step."""
@@ -984,22 +1509,24 @@ class Worker:
                     continue
             if task is None:
                 task = {"id": session.task_id, "description": session.task_id}
-            pre_dollars = session.total_dollars or 0.0
             try:
                 outcome = managed.poll(session)
             except Exception as exc:
                 logger.exception("managed.poll crashed for %s: %s", session.task_id, exc)
-                self._mark_failed(session, task, f"managed poll crashed: {exc}")
+                current = self.session_store.get(session.task_id)
+                if self._same_lifecycle_snapshot(session, current):
+                    self._mark_failed(session, task, f"managed poll crashed: {exc}")
                 continue
-            # Push the per-poll dollar delta into the daily ledger so the
-            # global cap reflects in-flight managed cost, not just claim-time
-            # estimates.
             refreshed = self.session_store.get(session.task_id)
-            delta_dollars = max(0.0, (refreshed.total_dollars or 0.0) - pre_dollars) if refreshed else 0.0
-            if delta_dollars > 0:
-                self.spend_tracker.record(delta_dollars)
+            outcome = normalize_outcome(
+                outcome, refreshed or session, route=ROUTE_CLAUDE,
+            )
+            if not self._same_lifecycle_snapshot(session, refreshed):
+                continue
             if outcome.status != STATUS_RUNNING:
-                self._handle_outcome(session, task, outcome)
+                current = self.session_store.get(session.task_id)
+                if current is not None and self._outcome_matches_snapshot(outcome, current):
+                    self._handle_outcome(current, task, outcome)
 
     def _process_clarification_answers(self) -> None:
         """Resume sessions whose Telegram replies arrived.
@@ -1052,9 +1579,28 @@ class Worker:
                 # Stale — session was deleted? Mark processed so we don't loop.
                 self.session_store.mark_question_processed(q["id"])
                 continue
+            q_attempt = q.get("attempt_id")
+            q_turn = q.get("turn_id")
+            if q_attempt != session.attempt_id or q_turn != session.turn_id:
+                # A reply to an older attempt must not reopen or inject into
+                # the new attempt that reused this task/session id.  Rows
+                # without identity are legacy/unbound and are rejected too:
+                # accepting them would let an answer arrive after a reopen
+                # and attach to the replacement execution.
+                self.session_store.mark_question_processed(q["id"])
+                continue
 
             answer = q["answer"] or ""
             kind = q.get("kind") or "clarification"
+
+            # A Telegram clarification is an operator wait without a linked
+            # human card. Close that exact attempt's wait before resuming so a
+            # later unrelated card resolution cannot wake this session again.
+            if kind in ("clarification", "goal_approval") and q_attempt:
+                for wait in self.session_store.list_open_waits(session_id=session_id):
+                    if wait.get("attempt_id") == q_attempt:
+                        self.session_store.mark_wait_resolved(wait["wait_id"])
+                        self.session_store.discard_wait_wakeup(wait["wait_id"])
 
             if kind == "goal_approval":
                 self._resume_goal(q, session, answer)
@@ -1096,6 +1642,7 @@ class Worker:
                 self.session_store.set_routing_and_budget(
                     task_id, routing=resolved,
                     budget=session.budget, expected_output=session.expected_output,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
                 )
                 self.transcript_store.append(session_id, "routing_resolved", {
                     "from": "ask", "to": resolved,
@@ -1106,7 +1653,10 @@ class Worker:
                     # the enqueued prompt as the task description). The #agent
                     # inline path below would look up a non-existent vault task
                     # and lose the prompt.
-                    self.session_store.update_status(task_id, STATUS_CLAIMED)
+                    self.session_store.update_status(
+                        task_id, STATUS_CLAIMED,
+                        attempt_id=session.attempt_id, turn_id=session.turn_id,
+                    )
                     self.session_store.mark_question_processed(q["id"])
                     self.transcript_store.append(
                         session_id, "operator_routing_resolved", {"to": resolved},
@@ -1118,10 +1668,13 @@ class Worker:
             # Inject the answer as a user message.
             if not self.session_store.question_claimed(q["id"]):
                 continue
-            self.session_store.append_message(
+            if self.session_store.append_message(
                 session_id, "user",
                 f"(user answered via Telegram) {answer}",
-            )
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            ) is None:
+                self.session_store.mark_question_processed(q["id"])
+                continue
             self.transcript_store.append(session_id, "clarification_answered", {
                 "question_id": q["id"],
                 "answer_chars": len(answer),
@@ -1135,18 +1688,47 @@ class Worker:
             if not self.session_store.question_claimed(q["id"]):
                 continue
             self._set_task_status(task_id, "in_progress")
-            self.session_store.update_status(task_id, STATUS_RUNNING)
+            self.session_store.update_status(
+                task_id, STATUS_RUNNING,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
 
             if task is None:
                 # Operator-root sessions have no backing vault task by design.
                 task = {"id": task_id, "description": task_id}
+            if session.execution_spec is None:
+                from api.services.directory_resolver import resolve_working_directory
+
+                resolution = self._resolve_session_execution(
+                    session,
+                    request=ExecutionRequest(executor=session.routing),
+                    assignment=ExecutionLayer(
+                        executor=session.routing,
+                        model_id=session.model,
+                        model_executor=session.routing if session.model else None,
+                        effort=session.effort,
+                        host=session.host,
+                        budget=(ExecutionBudget(**session.budget) if session.budget else None),
+                    ),
+                    workflow=ExecutionLayer(
+                        working_dir=resolve_working_directory(task.get("description") or ""),
+                    ),
+                )
+                if not resolution.ok:
+                    detail = "; ".join(item.message for item in resolution.diagnostics)
+                    self.session_store.mark_question_processed(q["id"])
+                    self._mark_failed(
+                        session, task, f"execution resolution failed: {detail}",
+                    )
+                    continue
+                session = self.session_store.get_by_session_id(session_id)
+            task = self._task_with_execution_snapshot(session, task)
             if session.routing == ROUTE_HERMES:
                 if not self.session_store.question_claimed(q["id"]):
                     continue
-                executor = self._get_hermes_executor()
                 try:
-                    outcome = executor.execute(
-                        session, task, prompt=f"(operator reply) {answer}",
+                    outcome = self._execute_resume(
+                        session, f"(operator reply) {answer}",
                     )
                 except Exception as exc:
                     logger.exception("clarification Hermes resume crashed for %s", task_id)
@@ -1159,9 +1741,8 @@ class Worker:
             if session.routing == "local":
                 if not self.session_store.question_claimed(q["id"]):
                     continue
-                executor = self._get_local_executor(caller_session_id=session_id)
                 try:
-                    outcome = executor.execute(session, task)
+                    outcome = self._execute_start(session, task)
                 except Exception as exc:
                     logger.exception(
                         "clarification resume crashed for %s: %s", task_id, exc,
@@ -1190,11 +1771,10 @@ class Worker:
                         "set LIFEOS_REMOTE_LLM_*",
                     )
                     continue
-                executor = self._get_remote_executor(caller_session_id=session_id)
                 if not self.session_store.question_claimed(q["id"]):
                     continue
                 try:
-                    outcome = executor.execute(session, task)
+                    outcome = self._execute_start(session, task)
                 except Exception as exc:
                     logger.exception(
                         "clarification resume crashed for %s: %s", task_id, exc,
@@ -1216,7 +1796,7 @@ class Worker:
                 try:
                     if not self.session_store.question_claimed(q["id"]):
                         continue
-                    outcome = managed.start(session, task)
+                    outcome = self._execute_start(session, task)
                 except Exception as exc:
                     logger.exception(
                         "clarification resume claude.start crashed for %s: %s", task_id, exc,
@@ -1297,8 +1877,17 @@ class Worker:
             self._set_task_status(task_id, "in_progress")
         if not self.session_store.question_claimed(q["id"]):
             return
-        self.session_store.enqueue_message(sid, "operator", resume_msg)
-        self.session_store.update_status(task_id, STATUS_CLAIMED)
+        current = self.session_store.get(task_id)
+        if current is None or not self._same_lifecycle_snapshot(session, current):
+            return
+        self.session_store.enqueue_message(
+            sid, "operator", resume_msg,
+            attempt_id=current.attempt_id, turn_id=current.turn_id,
+        )
+        self.session_store.update_status(
+            task_id, STATUS_CLAIMED,
+            attempt_id=current.attempt_id, turn_id=current.turn_id,
+        )
         self.session_store.mark_question_processed(q["id"])
 
     def _pending_goal_condition(self, session_id: str) -> str | None:
@@ -1344,6 +1933,12 @@ class Worker:
                 self.session_store.mark_question_processed(q["id"])
                 return
 
+        # Completion-message follow-ups deliberately create a new immutable
+        # attempt.  The old executor may still be unwinding after cancellation;
+        # rotating before any queue/status write fences its late callbacks.
+        if session.status in TERMINAL_STATUSES:
+            session = self.session_store.begin_new_execution(task_id)
+
         # The task may be parked at any terminal tag — completed, failed, or
         # budget-exceeded are all replyable now. Swap whichever is current
         # back to running. Operator root-spawns (#235) have no backing vault
@@ -1365,7 +1960,10 @@ class Worker:
             self._set_task_status(task_id, "in_progress")
         if not self.session_store.question_claimed(q["id"]):
             return
-        self.session_store.update_status(task_id, STATUS_RUNNING)
+        self.session_store.update_status(
+            task_id, STATUS_RUNNING,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         self.transcript_store.append(sid, "followup_received", {
             "question_id": q["id"], "answer_chars": len(answer),
         })
@@ -1373,26 +1971,26 @@ class Worker:
         if task is None:
             # Operator-root sessions have no backing vault task by design.
             task = {"id": task_id, "description": task_id}
+        task = self._task_with_execution_snapshot(session, task)
 
         if session.routing in (ROUTE_LOCAL, ROUTE_REMOTE):
             # Surface-neutral prefix: follow-ups arrive from Telegram replies and
             # the web /chat thread view (#236), so don't hardcode "Telegram".
             if not self.session_store.question_claimed(q["id"]):
                 return
-            self.session_store.append_message(
+            if self.session_store.append_message(
                 sid, "user", f"(operator reply) {answer}",
-            )
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            ) is None:
+                self.session_store.mark_question_processed(q["id"])
+                return
             # (#809) Remote-routed follow-ups resume the same way local ones
             # do — conversation history lives in session_store either way, so
             # only the executor's target LLM client differs.
-            if session.routing == ROUTE_REMOTE:
-                executor = self._get_remote_executor(caller_session_id=sid)
-            else:
-                executor = self._get_local_executor(caller_session_id=sid)
             if not self.session_store.question_claimed(q["id"]):
                 return
             try:
-                outcome = executor.execute(session, task)
+                outcome = self._execute_start(session, task)
             except Exception as exc:
                 logger.exception("followup local resume crashed for %s: %s", task_id, exc)
                 self._mark_failed(session, task, f"followup resume crashed: {exc}")
@@ -1431,8 +2029,14 @@ class Worker:
             # being set, so it knows this is a resume rather than first run.
             if not self.session_store.question_claimed(q["id"]):
                 return
-            self.session_store.enqueue_message(sid, "operator", answer)
-            self.session_store.update_status(task_id, STATUS_CLAIMED)
+            self.session_store.enqueue_message(
+                sid, "operator", answer,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
+            self.session_store.update_status(
+                task_id, STATUS_CLAIMED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             self.session_store.mark_question_processed(q["id"])
             return
 
@@ -1442,8 +2046,14 @@ class Worker:
             # `codex exec resume <id>`.
             if not self.session_store.question_claimed(q["id"]):
                 return
-            self.session_store.enqueue_message(sid, "operator", answer)
-            self.session_store.update_status(task_id, STATUS_CLAIMED)
+            self.session_store.enqueue_message(
+                sid, "operator", answer,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
+            self.session_store.update_status(
+                task_id, STATUS_CLAIMED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             self.session_store.mark_question_processed(q["id"])
             return
 
@@ -1603,6 +2213,70 @@ class Worker:
                 continue
             logger.info("human-queue: resolved %s (%s)", card.get("id"), check_desc)
 
+    def _replay_wait_wakeups(self) -> None:
+        """Consume durable operator wakes in resolution order.
+
+        Resolution is performed by the API process, while execution belongs
+        to this worker. The unresolved marker remains until the task is
+        re-armed and dispatch is handed back to the normal worker path.
+        """
+        for wait in self.session_store.list_resolved_waits():
+            if wait.get("wait_type") != "operator":
+                self.session_store.complete_wait_wakeup(wait["wait_id"])
+                continue
+            # This is the sole wake enqueue path. Keeping it here means a
+            # crash after card resolution but before delivery is recoverable,
+            # while repeated resolver observations cannot enqueue duplicates.
+            self.session_store.enqueue_wait_wakeup(wait["wait_id"])
+            session = self.session_store.get_by_session_id(wait["session_id"])
+            if session is None or session.status in TERMINAL_STATUSES:
+                self.session_store.discard_wait_wakeup(wait["wait_id"])
+                continue
+            if (
+                wait.get("attempt_id") != session.attempt_id
+                or wait.get("turn_id") != session.turn_id
+            ):
+                # A card resolved for an older execution must never wake a
+                # reopened session; consume it without enqueueing a message.
+                self.session_store.discard_wait_wakeup(wait["wait_id"])
+                continue
+            task = self._fetch_task(wait["task_id"])
+            if task is None:
+                continue
+            event_id = LifecycleProjector.event_id(
+                task["id"], session.attempt_id, STATUS_RUNNING,
+                suffix=f"human-queue:{wait['wait_id']}",
+            )
+            event = LifecycleEvent(
+                event_id=event_id,
+                task_id=task["id"],
+                session_id=session.session_id,
+                attempt_id=session.attempt_id,
+                target_status=STATUS_RUNNING,
+                expected_version=task.get("updated_at"),
+                reason=f"Human queue card {wait.get('card_id') or 'resolved'} resolved",
+            )
+            try:
+                projected = self.lifecycle_projector.transition(
+                    event, task=SimpleNamespace(**task),
+                )
+                # A projection can have completed before a worker crash. In
+                # that case transition() is idempotently false, but the
+                # session rearm still needs to be retried before consuming the
+                # wake marker. Conflicts remain pending for reconciliation.
+                if not projected and not self.lifecycle_projector.projection_applied(event_id):
+                    continue
+                if not self.session_store.update_status(
+                    session.task_id, STATUS_CLAIMED,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                ):
+                    continue
+                refreshed_task = self._fetch_task(task["id"]) or task
+                self._dispatch({**refreshed_task, "status": "in_progress"})
+                self.session_store.complete_wait_wakeup(wait["wait_id"])
+            except Exception as exc:
+                logger.warning("human-queue wake replay failed for %s: %s", wait["wait_id"], exc)
+
     def _check_human_queue_done_when(self, done_when: dict) -> tuple[bool, str]:
         """Evaluate one card's `done_when`. Returns `(passed, description)`;
         raises on a malformed check or a request/IO error — the caller
@@ -1678,18 +2352,18 @@ class Worker:
                     continue
             if task is None:
                 task = {"id": session.task_id, "description": ""}
+            task = self._task_with_execution_snapshot(session, task)
             # (#809) A remote-routed session that slept must wake back onto
             # the remote provider, not silently switch to local Gemma — same
             # conversation-history-based resume, different target client.
-            if session.routing == ROUTE_REMOTE:
-                executor = self._get_remote_executor(caller_session_id=session.session_id)
-            else:
-                executor = self._get_local_executor(caller_session_id=session.session_id)
             try:
-                outcome = executor.execute(session, task)
+                outcome = self._execute_start(session, task)
             except Exception as exc:
                 logger.exception("wake execute failed for %s: %s", session_id, exc)
-                self.session_store.update_status(session.task_id, STATUS_FAILED)
+                self.session_store.update_status(
+                    session.task_id, STATUS_FAILED,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
                 self._notify(
                     f"⚠️ {_worker_label(session.routing)}: error while resuming sleeping task "
@@ -1951,6 +2625,9 @@ class Worker:
         })
 
         current = self.session_store.get_by_session_id(sid)
+        if not self._same_lifecycle_snapshot(session, current):
+            return
+        session = current
         resumable = bool(current is not None and current.claude_code_session_id)
 
         parts = [
@@ -1980,7 +2657,10 @@ class Worker:
             )
 
         if resumable:
-            self.session_store.update_status(task_id, STATUS_BLOCKED)
+            self.session_store.update_status(
+                task_id, STATUS_BLOCKED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             sent_ids: list = []
             try:
                 sent_ids = _send_with_id(_with_reply_footer(message)) or []
@@ -1995,6 +2675,8 @@ class Worker:
                     sent_message_ids=sent_ids,
                     kind="followup",
                     bot=bot,
+                    attempt_id=session.attempt_id,
+                    turn_id=session.turn_id,
                 )
                 self.transcript_store.append(sid, "cli_interrupted_prompt_registered", {
                     "message_ids": sent_ids, "wip_branch": wip_branch,
@@ -2007,7 +2689,10 @@ class Worker:
             # failed-with-preserved-context (documented fallback, #760).
             self.transcript_store.append(sid, "cli_interrupted_prompt_undelivered", {})
 
-        self.session_store.update_status(task_id, STATUS_FAILED)
+        self.session_store.update_status(
+            task_id, STATUS_FAILED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         try:
             _send(_with_reply_footer(message, replyable=False))
         except Exception as exc:
@@ -2019,7 +2704,7 @@ class Worker:
     # Claim + dispatch
     # ------------------------------------------------------------------
 
-    def _claim(self, task_id: str) -> bool:
+    def _claim(self, task_id: str, *, claim_id: str | None = None) -> bool:
         """Atomically claim a pickup candidate and record the session.
 
         Legacy `#agent` tasks: swap `#agent` → `#agent-running`.
@@ -2027,6 +2712,7 @@ class Worker:
 
         Returns True iff this worker won the race.
         """
+        claim_id = claim_id or getattr(self, "_active_claim_id", None)
         consumed_queue_tag = self._claim_task(task_id)
         if consumed_queue_tag is None:
             return False
@@ -2056,6 +2742,9 @@ class Worker:
                     status=STATUS_CLAIMED,
                 )
                 claim_kind = "claim"
+            # Scheduled handoffs create the task before a worker session exists;
+            # attach the real session identity as soon as the claim wins.
+            self.session_store.link_occurrence_session(task_id, session.session_id)
             self.transcript_store.append(
                 session.session_id,
                 claim_kind,
@@ -2074,6 +2763,10 @@ class Worker:
                 # appending the audit event or retiring the marker must not
                 # leave the old terminal session looking claimable.
                 self.session_store.restore_session_state(existing)
+            if claim_id is None:
+                self.usage_ledger.release(f"admission:{task_id}")
+            else:
+                self.usage_ledger.release_owned(f"admission:{task_id}", claim_id)
             if consumed_queue_tag:
                 rolled_back = self._swap_tag(task_id, RUNNING_TAG, AGENT_TAG)
             else:
@@ -2295,7 +2988,6 @@ class Worker:
         # this session — the streaming [NOTIFY]/[CLARIFY] (via the executor's
         # callback) and the worker-sent block/completion/failure messages below.
         bot = session.bot
-        claude_code = self._get_claude_code_executor(bot)
         sid = session.session_id
 
         # Only thread `bot` when set so the primary path's send signature is
@@ -2344,7 +3036,10 @@ class Worker:
                 session, STATUS_FAILED,
                 "not re-executed after prior subprocess launch — possible "
                 "duplicate side effects")
-            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            self.session_store.update_status(
+                session.task_id, STATUS_FAILED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             try:
                 _send(_with_reply_footer(
                     "⚠️ A code session: a previous attempt may have already "
@@ -2371,12 +3066,21 @@ class Worker:
                 "text": resume_message, "resume": True,
             })
             try:
-                outcome = claude_code.resume(session, resume_message)
+                spec = (
+                    ExecutionSpec.from_dict(session.execution_spec)
+                    if session.execution_spec else None
+                )
+                outcome = self._execute_resume(
+                    session, resume_message, spec.working_dir if spec else None,
+                )
             except Exception as exc:
                 logger.exception("claude_code resume crashed for %s: %s", session.task_id, exc)
                 self._record_child_failure_reason(
                     session, STATUS_FAILED, f"claude_code resume crashed: {exc}")
-                self.session_store.update_status(session.task_id, STATUS_FAILED)
+                self.session_store.update_status(
+                    session.task_id, STATUS_FAILED,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 return
         else:
             payload = parse_claude_code_spawn_payload(pending[0]["content"]) if pending else {
@@ -2385,7 +3089,10 @@ class Worker:
             task = {
                 "id": session.task_id,
                 "description": payload["prompt"],
-                "working_dir": payload["working_dir"],
+                "working_dir": (
+                    ExecutionSpec.from_dict(session.execution_spec).working_dir
+                    if session.execution_spec else payload["working_dir"]
+                ),
                 "plan_mode": payload["plan_mode"],
                 "chat_id": payload["chat_id"],
             }
@@ -2393,13 +3100,24 @@ class Worker:
                 "text": payload["prompt"], "resume": False,
             })
             try:
-                outcome = claude_code.execute(session, task)
+                outcome = self._execute_start(session, task)
             except Exception as exc:
                 logger.exception("claude_code execute crashed for %s: %s", session.task_id, exc)
                 self._record_child_failure_reason(
                     session, STATUS_FAILED, f"claude_code execute crashed: {exc}")
-                self.session_store.update_status(session.task_id, STATUS_FAILED)
+                self.session_store.update_status(
+                    session.task_id, STATUS_FAILED,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 return
+
+        # The subprocess can finish after cancellation/reopen.  Refresh the
+        # exact post-turn snapshot before any pending-question, task, or
+        # notification effect below.
+        current = self.session_store.get(session.task_id)
+        if not self._outcome_matches_snapshot(outcome, current):
+            return
+        session = current
 
         if outcome.status == STATUS_BLOCKED:
             if outcome.reason == REASON_AWAITING_PLAN_APPROVAL:
@@ -2462,6 +3180,8 @@ class Worker:
                     sent_message_ids=sent_ids,
                     kind=kind,
                     bot=bot,
+                    attempt_id=session.attempt_id,
+                    turn_id=session.turn_id,
                 )
                 self.transcript_store.append(sid, "code_block_prompt_registered", {
                     "reason": outcome.reason, "message_ids": sent_ids,
@@ -2476,7 +3196,10 @@ class Worker:
             self.transcript_store.append(sid, "code_block_prompt_undelivered", {
                 "reason": outcome.reason, "attempts": _BLOCKED_PROMPT_SEND_ATTEMPTS,
             })
-            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            self.session_store.update_status(
+                session.task_id, STATUS_FAILED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             try:
                 _send(_with_reply_footer(
                     "⚠️ A session needs your input, but the question couldn't be "
@@ -2526,6 +3249,8 @@ class Worker:
                         sent_message_ids=sent_ids,
                         kind="followup",
                         bot=bot,
+                        attempt_id=session.attempt_id,
+                        turn_id=session.turn_id,
                     )
                 # #311: also land the final result in the web/voice thread that
                 # spawned this session (no-op for Telegram-origin). Gated the same
@@ -2550,7 +3275,10 @@ class Worker:
                             if self._swap_tag(session.task_id, terminal_tag, RUNNING_TAG):
                                 break
                         self._set_task_status(session.task_id, "in_progress")
-                    self.session_store.update_status(session.task_id, STATUS_CLAIMED)
+                    self.session_store.update_status(
+                        session.task_id, STATUS_CLAIMED,
+                        attempt_id=current.attempt_id, turn_id=current.turn_id,
+                    )
                     self.transcript_store.append(sid, "code_reopened_for_pending_messages", {})
             return
 
@@ -2595,6 +3323,8 @@ class Worker:
                     sent_message_ids=sent_ids,
                     kind="followup",
                     bot=bot,
+                    attempt_id=session.attempt_id,
+                    turn_id=session.turn_id,
                 )
             else:
                 # No registered anchor (unresumable, or id capture failed) —
@@ -2615,7 +3345,10 @@ class Worker:
         # this the row stays non-terminal and _dispatch_spawned_sessions re-picks
         # it every tick → infinite re-dispatch. update_status is idempotent, so
         # this is harmless for vault sessions the executor already finalized.
-        self.session_store.update_status(session.task_id, outcome.status)
+        self.session_store.update_status(
+            session.task_id, outcome.status,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         self._reconcile_vault_terminal(session, outcome.status)
 
     def _send_session_message(self, session, body: str) -> None:
@@ -2650,6 +3383,7 @@ class Worker:
         try:
             self.session_store.add_reply_anchors(
                 session.session_id, session.task_id, sent_ids, bot=bot,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
             )
         except Exception as exc:  # best-effort — a lost anchor only loses
             logger.warning("reply-anchor registration failed for %s: %s",
@@ -2712,7 +3446,6 @@ class Worker:
                 self._fail_closed_task_resume(session, "codex_dispatch")
                 return
 
-        codex = self._get_codex_executor()
         sid = session.session_id
 
         is_resume = bool(session.claude_code_session_id)
@@ -2736,7 +3469,10 @@ class Worker:
                 session, STATUS_FAILED,
                 "not re-executed after prior subprocess launch — possible "
                 "duplicate side effects")
-            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            self.session_store.update_status(
+                session.task_id, STATUS_FAILED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             try:
                 self._telegram_send(
                     "⚠️ A codex session may have already started before it could be "
@@ -2759,12 +3495,21 @@ class Worker:
                 "text": resume_message, "resume": True,
             })
             try:
-                outcome = codex.resume(session, resume_message)
+                spec = (
+                    ExecutionSpec.from_dict(session.execution_spec)
+                    if session.execution_spec else None
+                )
+                outcome = self._execute_resume(
+                    session, resume_message, spec.working_dir if spec else None,
+                )
             except Exception as exc:
                 logger.exception("codex resume crashed for %s: %s", session.task_id, exc)
                 self._record_child_failure_reason(
                     session, STATUS_FAILED, f"codex resume crashed: {exc}")
-                self.session_store.update_status(session.task_id, STATUS_FAILED)
+                self.session_store.update_status(
+                    session.task_id, STATUS_FAILED,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 return
         else:
             payload = parse_codex_spawn_payload(pending[0]["content"]) if pending else {
@@ -2773,20 +3518,31 @@ class Worker:
             task = {
                 "id": session.task_id,
                 "description": payload["prompt"],
-                "working_dir": payload["working_dir"],
+                "working_dir": (
+                    ExecutionSpec.from_dict(session.execution_spec).working_dir
+                    if session.execution_spec else payload["working_dir"]
+                ),
                 "chat_id": payload["chat_id"],
             }
             self.transcript_store.append(sid, "codex_user_prompt", {
                 "text": payload["prompt"], "resume": False,
             })
             try:
-                outcome = codex.execute(session, task)
+                outcome = self._execute_start(session, task)
             except Exception as exc:
                 logger.exception("codex execute crashed for %s: %s", session.task_id, exc)
                 self._record_child_failure_reason(
                     session, STATUS_FAILED, f"codex execute crashed: {exc}")
-                self.session_store.update_status(session.task_id, STATUS_FAILED)
+                self.session_store.update_status(
+                    session.task_id, STATUS_FAILED,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 return
+
+        current = self.session_store.get(session.task_id)
+        if not self._outcome_matches_snapshot(outcome, current):
+            return
+        session = current
 
         if outcome.status == STATUS_COMPLETED:
             # #760: parity with the claude_code gate — a clean exit doesn't
@@ -2820,6 +3576,8 @@ class Worker:
                         sent_message_id=sent_ids[0],
                         sent_message_ids=sent_ids,
                         kind="followup",
+                        attempt_id=session.attempt_id,
+                        turn_id=session.turn_id,
                     )
                 # #311: mirror the final result into the web/voice thread that
                 # spawned this codex session (no-op for Telegram-origin). Codex
@@ -2859,7 +3617,10 @@ class Worker:
         # Persist the terminal status to the session row so an operator/child codex
         # session (no vault row → _reconcile_vault_terminal is a no-op for it) can't
         # linger CLAIMED and be re-dispatched every tick (mirrors #408 / #400).
-        self.session_store.update_status(session.task_id, outcome.status)
+        self.session_store.update_status(
+            session.task_id, outcome.status,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         self._reconcile_vault_terminal(session, outcome.status)
 
     def _get_codex_executor(self):
@@ -2949,6 +3710,129 @@ class Worker:
             + text
         )
 
+    def _execution_facts(self) -> ExecutionFacts:
+        """Snapshot currently configured execution facts without probing models."""
+        from datetime import datetime, timezone
+
+        if self._execution_facts_provider is not None:
+            return self._execution_facts_provider()
+
+        managed_ready = bool(
+            settings.anthropic_api_key
+            and settings.agent_preset_id
+            and settings.agent_environment_id
+        )
+        local_billing = (
+            BillingClass.UNKNOWN
+            if settings.agent_remote_executor and settings.remote_llm_configured
+            else BillingClass.LOCAL_FREE
+        )
+        def command_state(command: str) -> ReadinessState:
+            expanded = os.path.expanduser(command)
+            if os.path.isabs(expanded):
+                return ReadinessState.READY if os.path.isfile(expanded) and os.access(expanded, os.X_OK) else ReadinessState.UNAVAILABLE
+            return ReadinessState.READY if shutil.which(expanded) else ReadinessState.UNAVAILABLE
+
+        from api.services.agent_worker.remote_spawn import api_host_name
+
+        return ExecutionFacts(
+            now=datetime.now(timezone.utc),
+            valid_hosts=tuple(dict.fromkeys((api_host_name(), "api", *settings.agent_hosts))),
+            executors=(
+                ExecutorFacts("local", readiness=(ReadinessState.READY if self._local_executor is not None or settings.local_llm_url else ReadinessState.UNCONFIGURED),
+                              capabilities=("filesystem", "shell", "lifeos_mcp"),
+                              catalog=CatalogFacts(CatalogState.UNKNOWN),
+                              native_model_id=settings.local_llm_model,
+                              billing=local_billing),
+                ExecutorFacts("remote", readiness=(ReadinessState.READY if self._remote_executor is not None or settings.remote_llm_configured else ReadinessState.UNCONFIGURED),
+                              capabilities=("filesystem", "shell", "lifeos_mcp"),
+                              catalog=CatalogFacts(CatalogState.UNKNOWN),
+                              native_model_id=(settings.remote_llm_model if settings.remote_llm_configured else None),
+                              billing=BillingClass.METERED),
+                ExecutorFacts("claude", readiness=(ReadinessState.READY if self._managed_executor is not None or managed_ready else ReadinessState.UNCONFIGURED),
+                              capabilities=("filesystem", "shell", "browser", "lifeos_mcp", "cloud_connectors"),
+                              catalog=CatalogFacts(CatalogState.UNKNOWN), billing=BillingClass.METERED),
+                ExecutorFacts("hermes", readiness=(ReadinessState.READY if self._hermes_executor is not None or settings.hermes_backend_url else ReadinessState.UNCONFIGURED),
+                              catalog=CatalogFacts(CatalogState.UNCONFIGURED), billing=BillingClass.UNKNOWN),
+                ExecutorFacts("claude_code", readiness=(ReadinessState.READY if self._claude_code_executor is not None else command_state(settings.claude_binary)),
+                              capabilities=("filesystem", "shell", "browser", "lifeos_mcp"),
+                              catalog=CatalogFacts(CatalogState.UNKNOWN), billing=BillingClass.SUBSCRIPTION),
+                ExecutorFacts("codex", readiness=(ReadinessState.READY if self._codex_executor is not None else command_state(getattr(settings, "codex_binary", "codex"))),
+                              capabilities=("filesystem", "shell", "lifeos_mcp"),
+                              catalog=CatalogFacts(CatalogState.UNKNOWN), billing=BillingClass.SUBSCRIPTION),
+            ),
+        )
+
+    def _resolve_session_execution(
+        self,
+        session: Session,
+        *,
+        request: ExecutionRequest,
+        assignment: ExecutionLayer | None = None,
+        workflow: ExecutionLayer | None = None,
+    ) -> ResolutionResult:
+        """Resolve once, persist before dispatch, and reuse after restart."""
+        if session.execution_spec:
+            spec = ExecutionSpec.from_dict(session.execution_spec)
+            return ResolutionResult(status=ResolutionStatus.RESOLVED, spec=spec)
+        context = ExecutionContext(
+            session_id=session.session_id,
+            parent_session_id=session.parent_session_id,
+            root_session_id=session.root_session_id or session.session_id,
+            reply_destination=session.bot,
+            persona_id=session.persona_id,
+        )
+        facts = self._execution_facts()
+        override = self.session_store.get_execution_override(
+            session_id=session.session_id,
+            root_session_id=context.root_session_id,
+            now=facts.now,
+        )
+        result = resolve_execution(
+            request,
+            context=context,
+            assignment=assignment,
+            workflow=workflow,
+            installation=ExecutionLayer(
+                executor=(settings.agent_default_route or None),
+            ),
+            facts=facts,
+            temporary_override=override,
+        )
+        if result.ok:
+            from dataclasses import asdict
+            persisted = self.session_store.set_execution_snapshot(
+                session.task_id,
+                request=asdict(request),
+                spec=result.spec.to_dict(),
+            )
+            winner = ExecutionSpec.from_dict(persisted)
+            return ResolutionResult(
+                status=ResolutionStatus.RESOLVED,
+                spec=winner,
+                diagnostics=winner.diagnostics,
+            )
+        return result
+
+    @staticmethod
+    def _task_with_execution_snapshot(
+        session: Session, task: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply the persisted working directory on every execution/resume path."""
+        if not session.execution_spec:
+            return task
+        spec = ExecutionSpec.from_dict(session.execution_spec)
+        if not spec.working_dir:
+            return task
+        return {
+            **task,
+            "working_dir": spec.working_dir,
+            "fields": {
+                **(task.get("fields") or {}),
+                "working_dir": spec.working_dir,
+            },
+        }
+
     def _dispatch(self, task: dict[str, Any]) -> None:
         """Run preflight + route the task to the appropriate executor."""
         task_id = task["id"]
@@ -3028,6 +3912,7 @@ class Worker:
             budget=budget_json,
             expected_output=pre.expected_output,
             preset_class=pre.preset_class,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
         )
         # (#851) Board-assignment fields — model/effort/host, plus
         # assigned_by (bookkeeping only; routing itself already comes from
@@ -3039,6 +3924,7 @@ class Worker:
         assignment = extract_assignment(task.get("fields"))
         self.session_store.set_assignment(
             task_id, host=assignment.host, model=assignment.model, effort=assignment.effort,
+            persona_id=(task.get("fields") or {}).get("persona_id"),
         )
         session = self.session_store.get(task_id)  # refresh
 
@@ -3116,11 +4002,53 @@ class Worker:
             self._mark_blocked(session, task, " ".join(question_parts))
             return
 
+        # Freeze the execution target before the first executor side effect.
+        # Preflight supplies route/budget/working-directory defaults; board
+        # model pins are scoped to that resolved route and cannot leak across
+        # a later explicit engine override.
+        from api.services.directory_resolver import resolve_working_directory
+        execution = self._resolve_session_execution(
+            session,
+            request=ExecutionRequest(),
+            assignment=ExecutionLayer.from_assignment(
+                assignment, executor=pre.routing,
+            ),
+            workflow=pre.execution_layer(
+                # Scheduled handoffs may carry an explicit canonical working
+                # directory in task fields; otherwise retain the legacy
+                # description-based resolver.
+                working_dir=(task.get("fields") or {}).get("working_dir")
+                or resolve_working_directory(title),
+            ),
+        )
+        if not execution.ok:
+            if (
+                execution.status == ResolutionStatus.UNAVAILABLE
+                and pre.routing in {ROUTE_REMOTE, ROUTE_CLAUDE}
+            ):
+                # Preserve the existing operator-facing configured-service
+                # block paths below; neither path performs executor effects.
+                session = self.session_store.get(task_id)
+            else:
+                detail = "; ".join(item.message for item in execution.diagnostics)
+                self._mark_failed(session, task, f"execution resolution failed: {detail}")
+                return
+        else:
+            session = self.session_store.get(task_id)
+            if execution.spec.working_dir:
+                task = {
+                    **task,
+                    "working_dir": execution.spec.working_dir,
+                    "fields": {
+                        **(task.get("fields") or {}),
+                        "working_dir": execution.spec.working_dir,
+                    },
+                }
+
         # Local route: run the executor.
-        if pre.routing == ROUTE_LOCAL:
-            executor = self._get_local_executor(caller_session_id=session.session_id)
+        if session.routing == ROUTE_LOCAL:
             try:
-                outcome = executor.execute(session, dispatch_task)
+                outcome = self._execute_start(session, dispatch_task)
             except Exception as exc:
                 logger.exception("local executor crashed for %s: %s", task_id, exc)
                 self._mark_failed(session, task, f"executor crashed: {exc}")
@@ -3134,11 +4062,14 @@ class Worker:
         # engine; the operator's standing rule is that the Anthropic API is
         # never a hidden fallback, and silently running on local Gemma
         # instead would just as surely defeat what `#cloud` was asked for.
-        if pre.routing == ROUTE_REMOTE:
+        if session.routing == ROUTE_REMOTE:
             if not settings.remote_llm_configured:
                 self._swap_tag(task_id, RUNNING_TAG, BLOCKED_TAG)
                 self._set_task_status(task_id, "blocked")
-                self.session_store.update_status(task_id, STATUS_BLOCKED)
+                self.session_store.update_status(
+                    task_id, STATUS_BLOCKED,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 self.transcript_store.append(sid, "remote_not_configured", {})
                 self._notify(
                     f"⏸ {_worker_label(ROUTE_REMOTE)}: task '{title}' routed to #cloud but the "
@@ -3147,9 +4078,8 @@ class Worker:
                     f"LIFEOS_REMOTE_LLM_API_KEY) in .env, then re-tag with an engine assignee to retry."
                 )
                 return
-            executor = self._get_remote_executor(caller_session_id=session.session_id)
             try:
-                outcome = executor.execute(session, dispatch_task)
+                outcome = self._execute_start(session, dispatch_task)
             except Exception as exc:
                 logger.exception("remote executor crashed for %s: %s", task_id, exc)
                 self._mark_failed(session, task, f"executor crashed: {exc}")
@@ -3158,13 +4088,16 @@ class Worker:
             return
 
         # Claude route: hand off to Managed Agents.
-        if pre.routing == ROUTE_CLAUDE:
+        if session.routing == ROUTE_CLAUDE:
             managed = self._get_managed_executor()
             if managed is None:
                 # Operator hasn't configured Managed Agents (no API key or vault).
                 self._swap_tag(task_id, RUNNING_TAG, BLOCKED_TAG)
                 self._set_task_status(task_id, "blocked")
-                self.session_store.update_status(task_id, STATUS_BLOCKED)
+                self.session_store.update_status(
+                    task_id, STATUS_BLOCKED,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 self.transcript_store.append(sid, "managed_not_configured", {})
                 self._notify(
                     f"⏸ {_worker_label(ROUTE_CLAUDE)}: task '{title}' routed to Claude but "
@@ -3175,7 +4108,7 @@ class Worker:
                 )
                 return
             try:
-                outcome = managed.start(session, dispatch_task)
+                outcome = self._execute_start(session, dispatch_task)
             except Exception as exc:
                 logger.exception("managed.start crashed for %s: %s", task_id, exc)
                 self._mark_failed(session, task, f"managed start crashed: {exc}")
@@ -3186,20 +4119,12 @@ class Worker:
                 self._handle_outcome(session, task, outcome)
             return
 
-        # (#851) Hermes route: open a Hermes conversation with the card's
-        # title/notes as the opening turn. A single HTTP round trip to the
-        # configured backend — short enough (unlike the CLI routes below)
-        # to run inline on the tick thread rather than through the CLI
-        # dispatch pool.
-        if pre.routing == ROUTE_HERMES:
-            hermes = self._get_hermes_executor()
-            try:
-                outcome = hermes.execute(session, dispatch_task)
-            except Exception as exc:
-                logger.exception("hermes executor crashed for %s: %s", task_id, exc)
-                self._mark_failed(session, task, f"executor crashed: {exc}")
-                return
-            self._handle_outcome(session, task, outcome)
+        # Hermes route: open a Hermes conversation off the worker
+        # tick. The upstream read timeout is an inactivity timeout, so a
+        # continuously emitting or blocked stream must not starve unrelated
+        # claims, wakeups, and managed polling.
+        if session.routing == ROUTE_HERMES:
+            self._submit_hermes_dispatch(session, dispatch_task)
             return
 
         # CLI routes (#claude → Claude Code, #codex → Codex). Synthesize the
@@ -3216,9 +4141,8 @@ class Worker:
         # CLI child would. Reuse _submit_cli_dispatch — the same pool +
         # _cli_inflight machinery spawned sessions already use (#299) — so a
         # top-level #agent task gets the identical off-tick treatment.
-        if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
-            from api.services.directory_resolver import resolve_working_directory
-            working_dir = resolve_working_directory(title)
+        if session.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
+            working_dir = execution.spec.working_dir or resolve_working_directory(title)
             if session.claude_code_session_id:
                 # A compatible reassignment keeps the native CLI thread. Do
                 # not feed the JSON fresh-spawn envelope to resume(); pass a
@@ -3238,7 +4162,7 @@ class Worker:
                 "chat_id": None,
             }
             pending = [{"content": json.dumps(payload)}]
-            if pre.routing == ROUTE_CLAUDE_CODE:
+            if session.routing == ROUTE_CLAUDE_CODE:
                 payload["plan_mode"] = False  # /claude expects this key
                 pending[0]["content"] = json.dumps(payload)
                 self._submit_cli_dispatch(session, pending, self._dispatch_claude_code_session)
@@ -3247,15 +4171,75 @@ class Worker:
             return
 
         # Should not reach here — routing was validated in preflight.
-        self._mark_failed(session, task, f"unknown routing: {pre.routing}")
+        self._mark_failed(session, task, f"unknown routing: {session.routing}")
 
     # ------------------------------------------------------------------
     # Outcome handling (shared between fresh dispatch and sleep wake-up)
     # ------------------------------------------------------------------
 
     def _handle_outcome(self, session: Session, task: dict[str, Any], outcome) -> None:
+        current = self.session_store.get(session.task_id)
+        # Compatibility stubs may omit lifecycle ids, but they are only safe
+        # when the callback's captured snapshot is still current.  Real
+        # executors carry explicit ids, allowing a post-turn snapshot to differ
+        # from the pre-turn session passed into this method.
+        if (
+            getattr(outcome, "attempt_id", None) is None
+            and not self._same_lifecycle_snapshot(session, current)
+        ):
+            return
+        outcome = normalize_outcome(outcome, current or session, route=session.routing)
+        if current is None or not self._outcome_matches_snapshot(outcome, current):
+            # A cancelled callback may finish after the same task has been
+            # deliberately reopened.  Its task tags, notifications, and
+            # transcript must not be applied to the new attempt.
+            return
+        session = current
         title = task.get("description", session.task_id)
         sid = session.session_id
+        # Cancellation is a durable exact-turn decision, not merely a
+        # transcript/status hint. Executors may return a clean terminal result
+        # after cancellation races their final provider event; check the fence
+        # before any task mutation, vault write, notification, or follow-up
+        # registration. Reopened attempts have a new identity and do not
+        # inherit this guard.
+        if self.session_store.is_cancelled(
+            session.task_id,
+            getattr(outcome, "attempt_id", None),
+            getattr(outcome, "turn_id", None),
+        ):
+            self.transcript_store.append(sid, "late_terminal_ignored", {
+                "status": getattr(outcome, "status", None),
+                "reason": "attempt cancelled",
+                "attempt_id": getattr(outcome, "attempt_id", None),
+                "turn_id": getattr(outcome, "turn_id", None),
+            })
+            return
+        # A backend can deliver a terminal success after the operator's kill
+        # raced its final event. Cancellation is terminal for this attempt;
+        # never reopen the board task or notify a second completion.
+        if outcome.status == STATUS_COMPLETED:
+            try:
+                prior_events = self.transcript_store.read(sid)
+            except Exception:
+                prior_events = []
+            if any(event.get("kind") in {
+                "killed", "cancel_requested", "cancelled", "session_cancelled",
+            } for event in prior_events):
+                self.transcript_store.append(sid, "late_terminal_ignored", {
+                    "status": outcome.status,
+                    "reason": "attempt cancelled",
+                    "attempt_id": getattr(outcome, "attempt_id", None) or f"legacy:{sid}",
+                })
+                return
+        if outcome.status in TERMINAL_STATUSES:
+            # Terminal callbacks are projected through one durable CAS seam
+            # before the compatibility notification/tag code below runs.
+            self.session_store.update_status(
+                session.task_id, outcome.status,
+                attempt_id=getattr(outcome, "attempt_id", None) or session.attempt_id,
+                turn_id=getattr(outcome, "turn_id", None) or session.turn_id,
+            )
         # Spawned children belong to the parent agent's flow — their
         # terminal state is consumed by `_resume_yielded_for_children`.
         # The operator should only ever see Telegram notifications for
@@ -3296,6 +4280,10 @@ class Worker:
                 and not self._had_side_effect_tool_use(sid)
                 and spent < 0.05
             ):
+                self.session_store.update_status(
+                    session.task_id, STATUS_FAILED,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 if has_vault_task:
                     self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
                     self._set_task_status(session.task_id, "cancelled")
@@ -3779,9 +4767,18 @@ class Worker:
                 "cloud yield-resume requires Managed Agents configured",
             )
             return False
+        # The recreated Managed Agents session is a distinct executor turn in
+        # the same LifeOS attempt; persist its identity before the network
+        # side effect so usage transport can key the turn deterministically.
+        session = self.session_store.begin_executor_turn(
+            session.task_id, "resume_after_children", session=session,
+        )
         # Reset cursor + drop the old remote id so the new session starts
         # fresh on Anthropic's side.
-        self.session_store.reset_managed_cursor(session.task_id)
+        self.session_store.reset_managed_cursor(
+            session.task_id,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         try:
             new_remote_id = managed.driver.create_session(
                 agent_id=managed.agent_id,
@@ -3808,8 +4805,14 @@ class Worker:
                 session, task, f"cloud yield-resume create_session failed: {type(exc).__name__}",
             )
             return False
-        self.session_store.set_managed_session_id(session.task_id, new_remote_id)
-        self.session_store.update_status(session.task_id, STATUS_RUNNING)
+        self.session_store.set_managed_session_id(
+            session.task_id, new_remote_id,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        self.session_store.update_status(
+            session.task_id, STATUS_RUNNING,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         self.transcript_store.append(session.session_id, "managed_resume_created", {
             "remote_id": new_remote_id,
             "child_count": len(child_sessions),
@@ -3956,7 +4959,11 @@ class Worker:
 
     def _mark_failed(self, session: Session, task: dict[str, Any], reason: str) -> None:
         title = task.get("description", session.task_id)
-        self.session_store.update_status(session.task_id, STATUS_FAILED)
+        self.usage_ledger.release(f"admission:{session.task_id}")
+        self.session_store.update_status(
+            session.task_id, STATUS_FAILED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         self.transcript_store.append(session.session_id, "failed", {"reason": reason})
         # Spawned children flow back through `_resume_yielded_for_children`;
         # don't poke the vault tag system and don't ping Telegram (see
@@ -3969,9 +4976,37 @@ class Worker:
 
     def _mark_blocked(self, session: Session, task: dict[str, Any], question: str) -> None:
         title = task.get("description", session.task_id)
+        # No executor admission remains active while awaiting operator input.
+        self.usage_ledger.release(f"admission:{session.task_id}")
+        # Keep the machine wait distinct from the Human queue card model. A
+        # Telegram clarification is an operator wait but has no human-card id;
+        # explicit linked cards are recorded by LifecycleProjector/queue paths.
+        if session.attempt_id:
+            try:
+                self.lifecycle_projector.record_wait(LifecycleEvent(
+                    event_id=LifecycleProjector.event_id(
+                        session.task_id, session.attempt_id, STATUS_BLOCKED,
+                        suffix=session.turn_id or "operator",
+                    ),
+                    task_id=session.task_id,
+                    session_id=session.session_id,
+                    attempt_id=session.attempt_id,
+                    target_status=STATUS_BLOCKED,
+                    wait_type="operator",
+                    wait_reason=question,
+                    reason=question,
+                ))
+            except Exception as exc:
+                logger.warning("record operator wait failed for %s: %s", session.task_id, exc)
+        self.session_store.update_status(
+            session.task_id, STATUS_BLOCKED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+            wait_type="operator", wait_reason=question,
+        )
+        # The projector owns the durable task transition; these calls retain
+        # the historical best-effort compatibility path if the API is down.
         self._swap_tag(session.task_id, RUNNING_TAG, BLOCKED_TAG)
         self._set_task_status(session.task_id, "blocked")
-        self.session_store.update_status(session.task_id, STATUS_BLOCKED)
         self.transcript_store.append(session.session_id, "blocked", {"question": question})
 
         # If the blocked session has a running remote Managed Agents session,

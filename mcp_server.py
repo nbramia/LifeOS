@@ -14,6 +14,7 @@ Register with Claude Code:
 import json
 import sys
 import httpx
+import hmac
 import logging
 import os
 from pathlib import Path
@@ -373,14 +374,27 @@ CURATED_ENDPOINTS = {
     },
 }
 
+# Contract count for the source catalog. The live fallback catalog is 59
+# curated tools plus 9 lifeos_agent_* tools = 68.
+CURATED_TOOL_COUNT = 59
+
 
 class LifeOSMCPServer:
     """MCP Server that dynamically discovers LifeOS API endpoints."""
 
-    def __init__(self):
+    def __init__(self, *, trusted_session_id: str | None = None):
         self.client = httpx.Client(timeout=30.0)
         self.openapi_spec: dict | None = None
         self.tools: list[dict] = []
+        # Stdio MCP children inherit this value from the worker subprocess;
+        # unlike a tool argument it cannot be selected by the model. HTTP
+        # transport binds its bearer secret after app construction and uses a
+        # proof over the requested session id when no process-local identity
+        # exists (the shared managed-agent case).
+        self._trusted_session_id = (
+            trusted_session_id or os.environ.get("LIFEOS_AGENT_SESSION_ID") or ""
+        ).strip()
+        self._mcp_transport_secret = ""
         # Per-session tool-result cache (#139 §4). Bypassed when the caller
         # doesn't supply a session id (which is the common case for local-CLI
         # tool calls; cache hits matter most on managed-agent HTTP calls).
@@ -438,12 +452,18 @@ class LifeOSMCPServer:
             props = dict(input_schema.get("properties", {}))
             props["caller_session_id"] = {
                 "type": "string",
-                "description": "Your own session_id — included in your system prompt.",
+                "description": "Your own session_id — checked against the trusted transport identity.",
+            }
+            props["caller_proof"] = {
+                "type": "string",
+                "description": "Transport proof binding caller_session_id to this MCP connection.",
             }
             input_schema["properties"] = props
             required = list(input_schema.get("required", []))
             if "caller_session_id" not in required:
                 required = ["caller_session_id"] + required
+            if "caller_proof" not in required:
+                required = ["caller_proof"] + required
             input_schema["required"] = required
             tool["input_schema"] = input_schema
             # MCP schema field name in this server is "inputSchema" — match
@@ -489,7 +509,13 @@ class LifeOSMCPServer:
                 continue
 
             method = config["method"].lower()
-            endpoint_spec = paths.get(spec_path, {}).get(method, {})
+            path_item = paths.get(spec_path, {})
+            endpoint_spec = path_item.get(method)
+            if not isinstance(endpoint_spec, dict):
+                logger.debug(
+                    f"Operation {method.upper()} {actual_path} not found in OpenAPI spec"
+                )
+                continue
 
             input_schema = self._build_input_schema(endpoint_spec, schemas, method, actual_path)
             self._add_turn_header_arg(input_schema, config)
@@ -1123,13 +1149,30 @@ class LifeOSMCPServer:
     def _handle_inter_agent(self, tool_name: str, arguments: dict) -> dict:
         """Dispatch a lifeos_agent_* call through the worker's session store.
 
-        The remote caller passes `caller_session_id` explicitly (per the
-        system prompt). We build a fresh InterAgentContext per call and run
-        the tool — no shared mutable state.
+        The caller may carry a session id as routing metadata, but authority is
+        derived from the process-bound stdio identity or an HMAC proof tied to
+        the authenticated HTTP transport secret. A bare caller-provided id is
+        never sufficient to impersonate another session.
         """
         caller_session_id = (arguments.pop("caller_session_id", None) or "").strip()
         if not caller_session_id:
             return {"error": "caller_session_id is required for inter-agent tools"}
+        caller_proof = (arguments.pop("caller_proof", None) or "").strip()
+        trusted_session_id = self._trusted_session_id
+        if trusted_session_id:
+            if caller_session_id != trusted_session_id:
+                return {"error": "caller_session_id does not match trusted MCP identity"}
+        else:
+            secret = self._mcp_transport_secret
+            if not secret:
+                return {"error": "trusted MCP caller identity is unavailable"}
+            try:
+                from api.services.agent_worker.inter_agent import caller_proof_for_session
+                expected = caller_proof_for_session(caller_session_id, secret)
+            except Exception:
+                expected = ""
+            if not expected or not hmac.compare_digest(caller_proof, expected):
+                return {"error": "invalid MCP caller proof"}
         try:
             from api.services.agent_worker.inter_agent import (
                 Caps,
@@ -2134,6 +2177,11 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str):
             "HTTP transport requires a bearer token "
             "(set LIFEOS_MCP_BEARER_TOKEN in the environment)"
         )
+
+    # The bearer token authenticates the MCP transport. Keep it on the server
+    # instance only long enough to verify per-call caller proofs; it is never
+    # forwarded to the inter-agent dispatcher or persisted.
+    server._mcp_transport_secret = bearer_token
 
     import hmac
 

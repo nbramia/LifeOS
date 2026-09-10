@@ -78,6 +78,20 @@ class TestRegistry:
         assert "journal" in [p.id for p in settings.list_http_personas()]
         assert [b.name for b in settings.telegram_bots] == ["journal"]
 
+    def test_tokenless_definition_resolves_without_listener(self, tmp_path, monkeypatch):
+        reg = tmp_path / "bots.json"
+        reg.write_text(json.dumps([
+            {"name": "journal", "token_env": "TG_JOURNAL", "persona_file": str(_PERSONA_PATH)},
+        ]))
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.delenv("TG_JOURNAL", raising=False)
+        from config.settings import settings
+
+        assert settings.resolve_persona("journal")
+        assert settings.persona_voice("journal") == ()
+        assert settings.persona_orchestrates("journal") is False
+        assert settings.telegram_bots == []
+
     def test_pure_chat_advertises_no_capabilities(self, tmp_path, monkeypatch):
         reg = tmp_path / "bots.json"
         reg.write_text(json.dumps([

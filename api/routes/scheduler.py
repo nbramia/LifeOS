@@ -12,7 +12,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from api.services.scheduler_store import (
@@ -48,6 +48,11 @@ class CreateScheduleRequest(BaseModel):
                                              "registry (config/telegram_bots.json) or 'primary'; empty = primary")
     enabled: bool = Field(default=True)
     timezone: str = Field(default_factory=lambda: settings.timezone, description="IANA timezone for the schedule")
+    persona_id: Optional[str] = None
+    model_id: Optional[str] = None
+    effort: Optional[str] = None
+    host: Optional[str] = None
+    working_dir: Optional[str] = None
 
 
 class UpdateScheduleRequest(BaseModel):
@@ -62,6 +67,11 @@ class UpdateScheduleRequest(BaseModel):
     bot: Optional[str] = None
     enabled: Optional[bool] = None
     timezone: Optional[str] = None
+    persona_id: Optional[str] = None
+    model_id: Optional[str] = None
+    effort: Optional[str] = None
+    host: Optional[str] = None
+    working_dir: Optional[str] = None
 
 
 class ScheduleResponse(BaseModel):
@@ -81,6 +91,11 @@ class ScheduleResponse(BaseModel):
     next_trigger_at: Optional[str]
     last_status: str
     timezone: str
+    persona_id: str = ""
+    model_id: str = ""
+    effort: str = ""
+    host: str = ""
+    working_dir: str = ""
 
     @classmethod
     def from_entry(cls, e: ScheduleEntry) -> "ScheduleResponse":
@@ -101,6 +116,11 @@ class ScheduleResponse(BaseModel):
             next_trigger_at=e.next_trigger_at,
             last_status=e.last_status,
             timezone=e.timezone or settings.timezone,
+            persona_id=e.persona_id,
+            model_id=e.model_id,
+            effort=e.effort,
+            host=e.host,
+            working_dir=e.working_dir,
         )
 
 
@@ -245,6 +265,11 @@ async def create_schedule(request: CreateScheduleRequest):
         bot=request.bot,
         enabled=request.enabled,
         timezone=request.timezone,
+        persona_id=request.persona_id or "",
+        model_id=request.model_id or "",
+        effort=request.effort or "",
+        host=request.host or "",
+        working_dir=request.working_dir or "",
     )
     return ScheduleResponse.from_entry(entry)
 
@@ -318,7 +343,11 @@ async def delete_schedule(schedule_id: str):
 
 
 @router.post("/{schedule_id}/trigger")
-async def trigger_schedule(schedule_id: str):
+async def trigger_schedule(
+    schedule_id: str,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    request_key: Optional[str] = Header(default=None, alias="X-Request-Key"),
+):
     """Manually fire a schedule immediately. For a ``once`` schedule this
     consumes it exactly like an unattended fire would: ``mark_triggered``
     disables it and clears its next fire, so it stops firing on its own
@@ -328,5 +357,7 @@ async def trigger_schedule(schedule_id: str):
     if not entry:
         raise HTTPException(status_code=404, detail="Schedule not found")
 
-    await get_scheduler()._fire_entry(entry)
+    await get_scheduler()._fire_entry(
+        entry, manual=True, request_key=request_key or idempotency_key,
+    )
     return {"status": "triggered", "id": schedule_id}

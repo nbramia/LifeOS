@@ -61,6 +61,17 @@ Engineering view of the agent worker — the stand-alone process that consumes e
 
 The worker is a stand-alone Python process (`python -m api.services.agent_worker.worker`) managed by a systemd unit. It does **not** import the FastAPI app — all task operations go through `/api/tasks` HTTP. This keeps the worker trivially restartable and lets the API layer own task-list locking.
 
+### Runtime identity
+
+At process import, the worker captures one immutable full git revision, a
+unique startup id, its PID, source root, and whether the source tree was clean.
+The capture is never recomputed from checkout state while the worker is
+running. It publishes a private local identity record under
+the local user cache under `~/.cache/lifeos/runtime-identities/`; each poll-loop heartbeat updates only that record's
+heartbeat timestamp. Deployment evidence may therefore distinguish a worker
+that is alive on an older revision from the API process, and missing, dirty, or
+unavailable identity is not a successful deployment result.
+
 ---
 
 ## Component layout
@@ -75,10 +86,11 @@ All code lives in `api/services/agent_worker/`:
 | `managed_executor.py` | Lifecycle wrapper around a Managed Agents session — `start()` → `poll()` → `_finalize_remote()` |
 | `managed_driver.py` | HTTP wrapper for `api.anthropic.com/v1/sessions` + events endpoint + session-state fan-out |
 | `session_store.py` | SQLite schema + accessors (sessions, daily_spend, sleeps, pending_messages, pending_questions, managed_cursor) |
+| `usage_ledger.py` | SessionStore-backed usage observations, provenance, idempotency, reservations, and replay into the legacy usage projection |
 | `spend_tracker.py` | Daily $-cap ledger; pause semantics when cap ≤ 0 |
 | `transcript_store.py` | Append-only JSONL per `session_id` at `data/agent_transcripts/` |
 | `tools.py` | `STANDARD_TOOLS` (Read/Write/Edit/Bash/Glob/Grep/WebFetch/WebSearch/sleep) + `ToolRegistry` combining standard + inter-agent + MCP tools |
-| `inter_agent.py` | `lifeos_agent_*` family — spawn, send, check, yield_until, kill, transcript_read, sessions_list, user_ask |
+| `inter_agent.py` | `lifeos_agent_*` family — spawn, send, check, yield_until, kill, transcript_read, sessions_list, user_ask, execution_override; MCP caller proofs bind remote calls to one session |
 | `pricing.py` | Per-model $/token table; `MANAGED_SESSION_HOUR_OVERHEAD = $0.08` |
 | `router.py` | Thin local-vs-claude dispatch helper |
 
@@ -117,7 +129,7 @@ One row per agent session (1:1 with a claimed task, or a root-spawned operator s
 | `preset_class` | Tool-filtering preset applied to a Managed Agents session at start. |
 | `origin` | NULL or `"agent"` = claimed from an engine-assigned vault task; `"operator"` = root-spawned on demand with no backing task. |
 | `claude_code_session_id` | Claude Code (or Codex) CLI session/thread id, for `routing="claude_code"`/`"codex"` — the column is reused for both; `routing` disambiguates which CLI it belongs to. |
-| `claude_code_model` | Claude tier for `routing="claude_code"` (`haiku`/`sonnet`/`opus`); NULL falls back to the CLI's own default (`opus`). |
+| `claude_code_model` | Legacy Claude tier for `routing="claude_code"` (`haiku`/`sonnet`/`opus`); NULL omits `--model` and leaves the CLI's configured/native default authoritative. |
 | `bot` | Telegram bot that owns this session's notices; NULL = primary bot (#348). |
 | `unpriced` | Sticky flag: set once any turn was priced against a model `pricing.py` doesn't recognize, so a reader can tell "$0.00 total" apart from "some turns couldn't be priced" (#669). |
 | `host` | Board-assigned host name from `settings.agent_hosts` (#851); NULL/`""` = this API host. Read by the `claude_code`/`codex` executors to decide whether to spawn locally or wrap the argv in `ssh`. |
@@ -125,8 +137,16 @@ One row per agent session (1:1 with a claimed task, or a root-spawned operator s
 | `conversation_id` | Hermes conversation id (#851, `routing="hermes"` only) — set by `HermesExecutor` once the turn's `conversation_id` SSE event arrives, and what a card's `session.open_url` points `/chat?conversation=` at. |
 | `remote_pgid` | Process-group id a remote-spawned subprocess echoed back on its first stdout line (#851) — see [Host registry and ssh spawn](#host-registry-and-ssh-spawn-851). Used by the operator kill endpoint to reach the process over ssh; NULL for a local session. |
 | `hermes_model` | The model Hermes itself reported for this session's MOST RECENT turn (`routing="hermes"` only) — set by `HermesExecutor.execute` (`SessionStore.set_hermes_model`) from that turn's own `_HermesTurnPersister.reported_model`, on both the completion and failure exit paths. NULL until one of this session's own turns reports a model in a well-formed `usage` event; a turn without one leaves it NULL and the badge plain `Hermes`. Distinct from `model` above (the board's operator-chosen picker value, which `HermesExecutor` never reads or writes) and from `api/services/model_readout.py`'s process-wide "last observed" Hermes reading, which serves `/api/health`'s model readout and the board's `GET /api/agents/models` picker catalog (see [Model catalog](#model-catalog-851)) and never this badge — no other writer touches this column, so it can't be overwritten by an unrelated session's or surface's turn. Feeds `/agents`'s per-session `Hermes · <model>` badge; see [agent-viz.md](agent-viz.md#lifeos-agent-ingest). |
+| `execution_request_json` | Strict canonical client choices (`executor`, `model_id`, `effort`, `host`, `working_dir`, budget, and constraints). Trusted lineage/persona/reply identity and derived provider/runtime/billing fields are not writable. |
+| `execution_spec_json` | Immutable resolver snapshot persisted before dispatch. Retries and resumes reuse it instead of recomputing changed defaults. |
 
 Indexed on `status`, `parent_session_id`, `root_session_id`, and (partial index) `status = 'yielded'`.
+
+### Execution resolution
+
+`execution.py` resolves one target in this order: explicit canonical request, a matching temporary session/lineage override, task assignment, workflow/preflight defaults, installation default, then an executor-native model default. Model pins carry an executor scope and never cross an engine change. A loaded or valid-empty catalog can reject a pin; unknown, unavailable, and unconfigured catalog states remain distinct and cannot erase a same-engine pin. Readiness and host validation fail closed, constraints are intersected before dispatch, and provider/runtime/billing are derived only from observed executor facts.
+
+`SessionStore.set_execution_snapshot()` is compare-and-set: concurrent resolvers all receive the persisted winner. `begin_new_execution()` can clear a snapshot only after a terminal session, while ordinary restart/retry/resume paths deserialize the existing spec. The `execution_overrides` table stores at most one override per session or lineage root; expiry changes only later resolutions. `lifeos_agent_execution_override` is the reachable MCP surface: session identity is derived from the caller, and only a root may alter its lineage override, so clients cannot forge parent/root scope.
 
 ### `pending_messages`
 
@@ -167,6 +187,16 @@ The daily $-cap ledger `spend_tracker.py` reads and increments.
 |---|---|
 | `date` (PK) | Calendar date, as text. |
 | `total_dollars` | Total spend booked against that date. |
+
+### Usage ledger tables
+
+`usage_observations` is append-only audit input keyed by an observation event;
+`usage_ledger` is the current aggregate keyed by
+`session_id`/`attempt_id`/`turn_id`; `usage_reservations` holds active bounded
+estimates separately from billed dollars; and `usage_projection_state` records
+replay progress into the legacy `usage.db` projection. These tables are
+created additively by `usage_ledger.py`, so lifecycle owners can add their
+identity columns without changing the ledger's authority or dedupe rules.
 
 ### `messages`
 
@@ -421,12 +451,12 @@ The board's own effort vocabulary is exactly `low | medium | high | max`. Each e
 
 Local Gemma's thinking toggle is a per-SESSION override (`local_executor.py`'s `_call_llm(session_id, effort=...)`), not a mutation of the global `settings.local_agent_enable_thinking` — concurrent sessions with different assigned efforts would otherwise race each other over one process-wide flag. It only ever reaches a real `LocalLLMClient` on the local (not #809 remote-forced) route, mirroring `run_agent_loop`'s identical `isinstance(...) and not force_remote` gate — the remote OpenAI-compatible provider doesn't understand llama-server's `chat_template_kwargs` switch.
 
-### Host registry and ssh spawn (#851)
+### Host registry and ssh spawn
 
 `LIFEOS_AGENT_HOSTS` (`{name: ssh_target}`, e.g. `{"laptop": "user@laptop.example"}`) maps a board-facing host name to an ssh target. The board's host picker (`GET /api/agents/hosts`) reads this same registry — see [Host catalog](#host-catalog) below. `remote_spawn.py` is the shared mechanism:
 
 - `resolve_host_target(host, api_host_name)` — empty/unset `host`, or a match on this API's own hostname, means local (returns `None`, the existing `spawn_fn` seam runs unchanged). Anything else must be a registry key or `resolve_host_target` raises `HostResolutionError` — the executor fails the task closed (`#agent-failed`, reason naming the host) **without ever calling `spawn_fn`**.
-- `build_remote_argv(argv, target, unset_env_names)` — wraps the exact local argv into `ssh -o BatchMode=yes -o ConnectTimeout=<setting> <target> -- <remote command>`. The remote command unsets every credential name `_clean_env` strips locally (mirrored via `env_names_matching_prefixes`, applied to the remote command's `env -u` prefix instead of the local Popen `env=` kwarg), then wraps the whole thing in `setsid bash -c 'echo "PGID:$$"; exec "$@"' _ …` so the remote process group id is captured as the very first stdout line. The executor strips that line (`read_remote_pgid_line`) before the normal event-stream parsing begins, and persists it via `SessionStore.set_remote_pgid`.
+- `build_remote_argv(argv, target, unset_env_names, session_id)` — wraps the exact local argv into `ssh -o BatchMode=yes -o ConnectTimeout=<setting> <target> -- <remote command>`. The remote command unsets every credential name `_clean_env` strips locally (mirrored via `env_names_matching_prefixes`, applied to the remote command's `env -u` prefix instead of the local Popen `env=` kwarg), explicitly sets `LIFEOS_AGENT_SESSION_ID=<session_id>`, then wraps the whole thing in `setsid bash -c 'echo "PGID:$$"; exec "$@"' _ …` so the remote process group id is captured as the first stdout line. SSH does not forward arbitrary environment variables; the explicit assignment lets the remote CLI's stdio MCP child inherit the process-bound trusted identity accepted by inter-agent calls. The executor strips that line (`read_remote_pgid_line`) before normal event-stream parsing and persists it via `SessionStore.set_remote_pgid`.
 - The Popen call site itself is untouched by any of this — only `cmd` (built beforehand) and the local `_clean_env()`-sourced `env=` differ between the local and remote branches, which is what keeps the injection seam (`spawn_fn`/`binary_resolver`) a pure test seam rather than something remote spawn has to special-case.
 - Reading that `PGID:` line back is bounded on its own clock (`remote_spawn.read_line_with_deadline`, `settings.agent_ssh_connect_timeout + 5` seconds), separate from and ahead of each executor's usual wall-clock watchdog — `ssh -o ConnectTimeout` only bounds the TCP handshake, not a stall during auth or a host that accepts the connection but never answers. A timeout here fails the task with `host <name> did not answer within <n>s`, distinct from the ordinary execution-timeout failure.
 - Kill: `POST /sessions/{id}/kill` on a session whose `host` is set runs `ssh <target> kill -- -<pgid>` through an injectable runner (`remote_spawn.kill_remote_process_group`) instead of the local `os.killpg` — see `inter_agent.py`'s `_kill_remote_subprocess`. An unregistered host degrades to a DB-only kill, the same way a missing local pid event does.
@@ -446,7 +476,7 @@ Two more 409s beyond the Assigned-state/tag/already-running checks: `_OPENING_GR
 
 ### Model catalog (#851)
 
-`GET /api/agents/models` (`model_catalog.py`) returns `{engines: {claude, codex, local, hermes}, refreshed_at, stale}`, each engine's list merged with `pricing.PRICING`. Sources: Anthropic via the SDK's own `models.list()` (never a hand-maintained table — that's exactly what went stale in `pricing.py` before #655/#656); Codex via its own `~/.codex/models_cache.json`, falling back to a live OpenAI models list only when `LIFEOS_OPENAI_API_KEY` is set; local via the running llama-server's `/v1/models` (`model_readout._probe_live_model`); Hermes via the last observed turn's model (`model_readout.get_hermes_models`) — never probed, since Hermes can serve a different model per turn. Cached for `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` (default 24h); a refresh failure (any single engine's fetch raising) falls back to the last successful catalog with `stale: true` rather than 500ing the picker.
+`GET /api/agents/models` (`model_catalog.py`) retains the compatibility response `{engines: {claude, codex, local, hermes}, refreshed_at, stale}`, with each engine's list merged with `pricing.PRICING`. Its additive `engine_states` map reports independent discovery states (`loaded`, `empty-valid`, `unavailable`, `unconfigured`, or `unknown`), `models`, observation and last-success timestamps, staleness, safe reason codes (including `staleness_reason`), and an explicit unknown quota state; the separate top-level `readiness` map reports route state (`configured`, `ready`, `unavailable`, or `unknown`), source, and timestamp. Sources remain bounded: Anthropic uses the SDK's model-list endpoint when configured with a short client timeout; Codex uses its local CLI cache and may use the existing OpenAI model-list fallback only when an API key is configured; local uses the running llama-server's `/v1/models`; Hermes uses the last observed turn (`model_readout.get_hermes_models`) and is never probed. A configured subscription CLI can therefore be route-ready while discovery remains unknown when its local cache and optional API key are absent. Refreshes are isolated per engine: a failed or uncertain engine preserves its last-good model list and is marked stale with its reason, while other engines continue refreshing. `ModelCatalog.facts()` / `facts_from_catalog()` exposes a small policy-neutral projection for execution consumers, including distinct `claude_code` and `remote` route facts that have no model discovery source; it reports facts only and does not select or fall back between engines.
 
 ### Host catalog
 
@@ -494,7 +524,7 @@ Local agents can spawn child sessions and coordinate via the `lifeos_agent_*` to
 
 | Tool | Purpose |
 |---|---|
-| `lifeos_agent_spawn` | Create a new agent session (local or claude). Returns `session_id`. Optional `tier` (`haiku`/`sonnet`/`opus`) picks the Claude Code child's CLI model — see [Delegation tier + single-message (#349)](#delegation-tier--single-message-349). |
+| `lifeos_agent_spawn` | Create a child on `local`, `remote`, `claude`, `hermes`, `claude_code`, or `codex`. Legacy `model=<executor>` and Claude-Code `tier` remain valid; the strict `execution` object carries canonical route/model/effort/location/budget choices. Omitting the route inherits an active bounded override or the caller route. |
 | `lifeos_agent_send` | Post a message to a child session's queue. Also a lifecycle transition: a direct parent sending to its own COMPLETED `claude_code`/`codex` child with a persisted CLI session id **reopens** it — the message is enqueued as the child's next turn *before* the status flips back to `claimed` (so a dispatch tick can never claim an empty resume prompt), and the spawned-session dispatcher resumes the CLI session via `-r` with full prior context. All other terminal sends still reject. |
 | `lifeos_agent_check` | Poll a child's current state. |
 | `lifeos_agent_yield_until` | Pause the caller until specific children reach terminal state — preferred over polling (no idle billing). |
@@ -502,6 +532,7 @@ Local agents can spawn child sessions and coordinate via the `lifeos_agent_*` to
 | `lifeos_agent_transcript_read` | Read another session's transcript. |
 | `lifeos_agent_sessions_list` | List active + recent sessions. |
 | `lifeos_agent_user_ask` | Pause and ask the operator a clarifying question via Telegram (reply-threaded). |
+| `lifeos_agent_execution_override` | Set or clear a temporary override for future resolution in the caller's session, or (root callers only) its lineage. Already-resolved snapshots do not change. |
 
 Security: lineage checks ensure a session can only message / kill / yield-on its own descendants (rooted at `root_session_id`).
 
@@ -547,12 +578,73 @@ Deliberately out of scope for #760: the CLI system prompt's canonical-checkout d
 
 When an agent delegates to a `claude_code` child, two behaviors keep the cost down and the operator's inbox clean:
 
-- **Tier.** `lifeos_agent_spawn`'s optional `tier` (`haiku` / `sonnet` / `opus`, default `opus`) is persisted on the child's `sessions.claude_code_model` column (additive migration; NULL → CLI default) and threaded into `_build_command` as `--model`, so the worker can run a simple lookup on Haiku instead of Opus. Ignored for non-`claude_code` engines.
+- **Tier.** `lifeos_agent_spawn`'s optional legacy `tier` (`haiku` / `sonnet` / `opus`) is persisted on the child's `sessions.claude_code_model` column (additive migration) and threaded into `_build_command` as `--model`. When omitted, the column stays NULL and the CLI's configured default is used without a `--model` flag. The legacy field is ignored for non-`claude_code` engines.
 - **One operator message.** A spawned child (`parent_session_id` set) stays silent to the operator: `ClaudeCodeExecutor` suppresses live `[NOTIFY]`/heartbeat streaming and instead folds the notify bodies into `final_text` (`_effective_final_text`), and `_dispatch_claude_code_session` skips the terminal Telegram send for children. The child's `final_text` is persisted in its `claude_code_completed` transcript event, where the parent reads it via `_child_final_text` — so the parent's single completion message carries the child's findings. That message is flagged by `_escalation_note` with the engine + tier, e.g. `⤴️ Escalated to Claude Code (haiku)`. Operator `/claude` sessions (no parent) stream and send as before. The `codex` dispatch path applies the same child gate (#429): a codex child's completion neither sends to the operator nor registers a followup anchor, and its `final_text` is persisted in the `codex_completed` event where `_child_final_text` reads it. Failure/budget notices are child-gated too on both CLI paths (#431) — the parent's resume turn carries the child's terminal status header, plus a `reason:` line read from the child's `child_failed_internal` / `child_budget_exceeded_internal` transcript event (#433; written by `_handle_outcome` for local/managed children and by the CLI dispatch tails).
 
 ---
 
+## Executor lifecycle contract
+
+The worker routes lifecycle operations through the internal executor registry
+(`api/services/agent_worker/executor_lifecycle.py`). Each route adapter declares
+`start`, `resume`, `resume_after_children`, and `cancel` capabilities; an
+unknown or older route returns the stable `unsupported_resume` result before
+`yield_waiting_for` or `STATUS_YIELDED` is written. There is no LocalExecutor
+fallback for a route that cannot continue natively.
+
+Every normalized outcome carries the LifeOS session/attempt identity, route,
+persisted continuation identity, transport-only usage, and termination evidence.
+Completed status is accepted only when the executor's terminal evidence is
+valid; Hermes specifically requires a `done` event, non-empty content, and no
+error. Session/attempt identity and usage fields are transport data; ledger and
+served-model provenance remains owned by the usage ledger.
+
+`SessionStore` persists an immutable `attempt_id` and attempt number for each
+deliberate execution, plus a new immutable `turn_id` for every executor start
+or native continuation. The current ids are mirrored on `sessions`; additive
+`execution_attempts` and `execution_turns` tables retain prior retries and
+turns so late events and usage observations cannot be re-keyed onto a newer
+attempt. Legacy rows are backfilled when their first executor turn begins.
+
+Child waits preserve each engine's continuation: local and remote append to the
+existing conversation, Managed Agents recreates a remote session with the same
+LifeOS lineage, Claude Code/Codex resume their persisted CLI IDs, and Hermes
+resumes the same persona/conversation. CLI and Hermes work is submitted through
+bounded off-tick dispatch with an in-flight guard. Hermes also enforces its
+configured read-idle timeout plus a separate absolute wall deadline bounded by
+the session budget; a late result after cancellation/terminal state is recorded
+as ignored and cannot reopen the attempt.
+
 ## Budget enforcement
+
+### Usage and provenance ledger
+
+`api/services/agent_worker/usage_ledger.py` is the canonical accounting
+authority for worker executions. It stores additive `usage_observations` and
+the current `usage_ledger` projection in the same SQLite database as
+`SessionStore`; it does not change executor selection or catalog/readiness
+facts. A row is addressed by the stable execution tuple
+`(session_id, attempt_id, turn_id)`. `attempt_id` and `turn_id` are owned by
+the executor lifecycle; provider event ids are only delivery keys and never
+replace that tuple.
+
+Every quantity carries `measured`, `estimated`, or `unknown` evidence. Billing
+is one of `subscription`, `metered`, `local_free`, or `unknown`. Subscription
+CLI usage (Codex and Claude Code) remains visible as an API-equivalent estimate
+but does not enter metered billed totals. Hermes bridge labels remain requested
+identity unless an executor supplies authoritative served evidence; unknown
+served engine/model/provider fields stay unknown rather than inheriting a
+configured request. Repeated observations are no-ops, cumulative snapshots
+become deltas, and an explicit measured correction can replace an earlier
+unknown/estimated observation without double counting. `usage_reservations`
+holds bounded unknown/estimated admission amounts separately from billed
+`daily_spend`; a non-positive daily cap pauses every route, including local and
+subscription routes.
+
+`UsageLedger.replay_projection()` updates the additive fields on the existing
+`UsageStore` database by stable usage key. The two SQLite files are not treated
+as one transaction: the session ledger is authoritative, and the projection is
+safe to replay after a crash.
 
 Four overlapping layers, executed in this order:
 

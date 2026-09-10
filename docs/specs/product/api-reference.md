@@ -791,7 +791,8 @@ Card kill/resume/focus/registration endpoints are documented in [agent-viz.md §
 
 ### GET /api/agents/models
 
-Per-engine model catalog for the board's assignment pickers: `{engines: {claude: [...], codex: [...], local: [...], hermes: [...]}, refreshed_at, stale}`, each entry `{id, label, pricing}`. Cached for `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` (default 24h); `stale: true` means the last successful refresh, not this one, is being served.
+Per-engine model catalog for the board's assignment pickers. The compatibility
+fields remain `{engines: {claude: [...], codex: [...], local: [...], hermes: [...]}, refreshed_at, stale}`, with each entry `{id, label, pricing}`. The additive `engine_states` map reports each engine's `models`, `state` (`loaded`, `empty-valid`, `unavailable`, `unconfigured`, or `unknown`), `observed_at`, `last_success_at`, `stale`, `reason_code`, `staleness_reason`, a `readiness` object, and `quota.state` (currently `unknown` unless an existing source provides evidence). The separate top-level `readiness` map reports route state (`configured`, `ready`, `unavailable`, or `unknown`), source, and observation timestamp; model discovery does not decide routing. Cached for `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` (default 24h); a partial refresh preserves each affected engine's last-good model list and marks that engine stale rather than failing the whole response. A subscription CLI may be ready while model discovery is `unknown` when its local cache and optional API key are absent.
 
 ### GET /api/agents/hosts
 

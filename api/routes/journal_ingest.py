@@ -155,11 +155,21 @@ async def journal_ring_ingest(request: Request):
         logger.info(f"Journal ring ingest: duplicate delivery from device {fields.device_id}, not reprocessed")
         return {"status": "duplicate"}
 
+    # Persona definitions are credential-free for HTTP/voice surfaces, but
+    # this ring endpoint deliberately mirrors the Telegram journal listener:
+    # keep its existing 503 until the journal bot is actually ready to run.
+    if not any(bot.name == _JOURNAL_PERSONA_ID for bot in settings.telegram_bots):
+        raise HTTPException(
+            status_code=503,
+            detail="journal persona is not configured (TELEGRAM_JOURNAL_BOT_TOKEN unset)",
+        )
+
     persona_preamble = settings.resolve_persona(_JOURNAL_PERSONA_ID)
     if persona_preamble is None:
-        # The journal bot's token isn't configured (settings.list_http_personas()
-        # would omit it) — nothing to route into. Fail closed rather than
-        # silently falling back to an unprimed chat turn.
+        # The registry entry or persona file is unavailable. Token readiness
+        # was checked independently above because HTTP persona discovery is
+        # intentionally credential-free. Fail closed rather than silently
+        # falling back to an unprimed chat turn.
         raise HTTPException(
             status_code=503,
             detail="journal persona is not configured (TELEGRAM_JOURNAL_BOT_TOKEN unset)",

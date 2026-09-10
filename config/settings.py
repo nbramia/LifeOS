@@ -40,6 +40,24 @@ _BOT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
 
 @dataclass(frozen=True)
+class PersonaDefinition:
+    """Credential-free identity and prompt metadata for one persona.
+
+    A definition is usable by HTTP and voice surfaces without implying that a
+    Telegram listener can run.  Telegram credentials and routing metadata stay
+    on the separate :class:`TelegramBotConfig` runtime projection below.
+    """
+    id: str
+    label: str = ""
+    persona: str = ""
+    orchestrates: bool = False
+    voice: tuple[str, ...] = ()
+    # Reserved persona metadata: parsed for compatibility, but still inert.
+    model: str = ""
+    persona_file: str = ""
+
+
+@dataclass(frozen=True)
 class TelegramBotConfig:
     """A single Telegram bot surface: its token, authorized chat, and persona.
 
@@ -80,6 +98,16 @@ class TelegramBotConfig:
     # surface-variant file (see `_surface_variant_body`) without re-reading
     # the registry. Empty when the bot has no persona_file, matching `persona`.
     persona_file: str = ""
+
+
+@dataclass(frozen=True)
+class _PersonaRegistryRecord:
+    """Parsed registry row before projecting it to a Telegram bot."""
+    definition: PersonaDefinition
+    token: str
+    token_env: str
+    chat_id: str
+    backend: str
 
 
 def _parse_persona(text: str, name: str = "") -> "tuple[str, tuple[str, ...], str]":
@@ -1488,28 +1516,15 @@ class Settings(BaseSettings):
         format. Callers that start Telegram listeners want this one, since a
         listener without a token is meaningless.
         """
-        return self._load_registry_bots(require_token=True)
+        return self._load_registry_bots()
 
-    def _load_registry_bots(self, require_token: bool = True) -> list["TelegramBotConfig"]:
-        """Specialized bots from the registry file.
+    def _load_registry_records(self, require_token: bool = False) -> list["_PersonaRegistryRecord"]:
+        """Load registry definitions and optional Telegram runtime metadata.
 
-        ``require_token=True`` (the default, used by Telegram listeners) drops
-        entries whose token env var is unset. ``require_token=False`` keeps
-        them, for surfaces that do not use Telegram at all — the web /chat UI
-        and voice list personas via :meth:`list_http_personas`, and requiring a
-        Telegram bot token to see a persona there was a coupling bug: it forced
-        creating a bot you never intend to message just to use a persona in the
-        browser.
-
-        Each registry entry names an env var holding the bot's token; entries
-        whose token is unset are skipped (logged) so a fresh clone with no extra
-        tokens simply runs the primary bot. Persona text is loaded from the
-        entry's ``persona_file``. ``chat_id_env`` is optional and defaults to the
-        primary ``TELEGRAM_CHAT_ID`` (in Telegram DMs the chat id is your user
-        id, identical across bots). ``backend`` (#684) is optional and defaults
-        to ``"hermes"``; an entry may set it to ``"lifeos"`` to opt a specific
-        bot out of Hermes permanently. An unrecognized value falls back to
-        ``"hermes"`` with a warning, same pattern as an invalid bot name.
+        The registry file remains the single editable authority and the local
+        override still replaces the tracked template. ``require_token`` is
+        used only to build the Telegram runtime projection; HTTP and voice
+        callers consume the same records without that readiness gate.
         """
         source = _telegram_bots_source()
         if source is None:
@@ -1529,23 +1544,17 @@ class Settings(BaseSettings):
         env_file = self.model_config.get("env_file", ".env")
         env: dict = {**dotenv_values(env_file), **os.environ}
 
-        bots: list[TelegramBotConfig] = []
-        seen: set[str] = set()
+        records: list[_PersonaRegistryRecord] = []
         for entry in entries:
             name = (entry.get("name") or "").strip().lower()
             if not name or not _BOT_NAME_RE.match(name):
                 logger.warning(f"Skipping Telegram bot with invalid name: {entry.get('name')!r}")
                 continue
-            if name in ("primary",) or name in seen:
+            if name in ("primary",):
                 logger.warning(f"Skipping duplicate/reserved Telegram bot name: {name!r}")
                 continue
-            token = (env.get(entry.get("token_env", "")) or "").strip()
-            if not token and require_token:
-                logger.info(
-                    f"Telegram bot '{name}' skipped: env var "
-                    f"{entry.get('token_env')!r} is unset"
-                )
-                continue
+            token_env = entry.get("token_env", "")
+            token = (env.get(token_env) or "").strip()
             chat_id = (env.get(entry.get("chat_id_env", "")) or "").strip() or self.telegram_chat_id
             persona, voice, model = "", (), ""
             persona_file = entry.get("persona_file")
@@ -1562,14 +1571,88 @@ class Settings(BaseSettings):
                     "defaulting to 'hermes'"
                 )
                 backend = "hermes"
-            seen.add(name)
-            bots.append(TelegramBotConfig(
-                name=name, token=token, chat_id=chat_id, persona=persona, label=label,
-                orchestrates=bool(entry.get("orchestrates", False)),
-                voice=voice, model=model, persona_file=persona_file or "",
+            records.append(_PersonaRegistryRecord(
+                definition=PersonaDefinition(
+                    id=name,
+                    label=label,
+                    persona=persona,
+                    orchestrates=bool(entry.get("orchestrates", False)),
+                    voice=voice,
+                    model=model,
+                    persona_file=persona_file or "",
+                ),
+                token=token,
+                token_env=token_env,
+                chat_id=chat_id,
                 backend=backend,
             ))
-        return bots
+
+        # Select one registry row before applying the Telegram credential gate.
+        # The first valid row remains authoritative, preserving the registry's
+        # existing order semantics while ensuring credential-free persona
+        # projections and token-gated listeners cannot resolve conflicting
+        # duplicate ids differently.
+        selected: list[_PersonaRegistryRecord] = []
+        seen: set[str] = set()
+        for record in records:
+            name = record.definition.id
+            if name in seen:
+                logger.warning(f"Skipping duplicate/reserved Telegram bot name: {name!r}")
+                continue
+            seen.add(name)
+            selected.append(record)
+
+        if not require_token:
+            return selected
+        usable: list[_PersonaRegistryRecord] = []
+        for record in selected:
+            if not record.token:
+                logger.info(
+                    f"Telegram bot '{record.definition.id}' skipped: env var "
+                    f"{record.token_env!r} is unset"
+                )
+                continue
+            usable.append(record)
+        return usable
+
+    def _load_registry_bots(self) -> list["TelegramBotConfig"]:
+        """Project usable registry records into Telegram bot configs."""
+        return [
+            TelegramBotConfig(
+                name=record.definition.id,
+                token=record.token,
+                chat_id=record.chat_id,
+                persona=record.definition.persona,
+                label=record.definition.label,
+                orchestrates=record.definition.orchestrates,
+                backend=record.backend,
+                voice=record.definition.voice,
+                model=record.definition.model,
+                persona_file=record.definition.persona_file,
+            )
+            for record in self._load_registry_records(require_token=True)
+        ]
+
+    @property
+    def persona_definitions(self) -> list["PersonaDefinition"]:
+        """Credential-free persona identities from the primary and registry.
+
+        A missing Telegram token does not remove a definition; it only keeps
+        the corresponding runtime bot out of :attr:`telegram_bots`.
+        """
+        primary, voice, model = _load_primary_persona()
+        definitions = [PersonaDefinition(
+            id="primary",
+            label="Primary",
+            persona=primary,
+            voice=voice,
+            model=model,
+            persona_file=str(_PRIMARY_PERSONA_FILE),
+        )]
+        definitions.extend(
+            record.definition for record in self._load_registry_records(require_token=False)
+        )
+        return definitions
 
     def list_http_personas(self) -> list["PersonaInfo"]:
         """Chat personas visible to HTTP clients (web, voice/whisper-relay).
@@ -1588,20 +1671,16 @@ class Settings(BaseSettings):
         derived from ``capabilities``, which happen to be identical for
         ``primary`` and an orchestrating bot like ``doctor`` (#643).
         """
-        personas = [PersonaInfo(
-            id="primary",
-            label="Primary",
-            capabilities=list(ORCHESTRATOR_PERSONA_CAPABILITIES),
-            orchestrates=self.persona_orchestrates("primary"),
-        )]
-        for bot in self._load_registry_bots(require_token=False):
+        personas = []
+        for definition in self.persona_definitions:
             personas.append(PersonaInfo(
-                id=bot.name,
-                label=bot.label or bot.name.capitalize(),
+                id=definition.id,
+                label=definition.label or definition.id.capitalize(),
                 capabilities=(
-                    list(ORCHESTRATOR_PERSONA_CAPABILITIES) if bot.orchestrates else []
+                    list(ORCHESTRATOR_PERSONA_CAPABILITIES)
+                    if definition.id == "primary" or definition.orchestrates else []
                 ),
-                orchestrates=self.persona_orchestrates(bot.name),
+                orchestrates=definition.orchestrates,
             ))
         return personas
 
@@ -1622,11 +1701,14 @@ class Settings(BaseSettings):
         with no variant for the requested surface also gets exactly today's
         body, so this is additive until a variant file exists.
         """
-        if persona_id == "primary":
-            return _load_primary_persona(surface)[0]
-        for bot in self.telegram_bots:
-            if bot.name == persona_id:
-                return _surface_variant_body(bot.persona_file, bot.persona, surface, persona_id)
+        for definition in self.persona_definitions:
+            if definition.id == persona_id:
+                return _surface_variant_body(
+                    definition.persona_file,
+                    definition.persona,
+                    surface,
+                    persona_id,
+                )
         return None
 
     def persona_voice(self, persona_id: str) -> "tuple[str, ...]":
@@ -1635,11 +1717,9 @@ class Settings(BaseSettings):
         Appended to the system prompt on voice turns (the `modality` flag on
         /api/ask/stream). Same registry source as resolve_persona.
         """
-        if persona_id == "primary":
-            return _load_primary_persona()[1]
-        for bot in self.telegram_bots:
-            if bot.name == persona_id:
-                return bot.voice
+        for definition in self.persona_definitions:
+            if definition.id == persona_id:
+                return definition.voice
         return ()
 
     def personal_context(self, persona_id: str) -> str:
@@ -1676,7 +1756,10 @@ class Settings(BaseSettings):
         inline. The primary persona is NOT an orchestrator (it uses the inline
         loop + claude_intent handoff for code tasks).
         """
-        return any(b.name == persona_id and b.orchestrates for b in self.telegram_bots)
+        return any(
+            definition.id == persona_id and definition.orchestrates
+            for definition in self.persona_definitions
+        )
 
     @property
     def photos_db_path(self) -> str:

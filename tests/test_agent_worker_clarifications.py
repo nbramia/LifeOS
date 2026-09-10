@@ -274,6 +274,39 @@ def test_stale_answered_question_doesnt_redeposit(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_answer_for_reopened_attempt_is_rejected(tmp_path: Path):
+    """A question keeps the asking attempt/turn and cannot reopen a retry."""
+    api = FakeApi([])
+    executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
+    session = w.session_store.create(task_id="reopen-task", routing="local", status=STATUS_BLOCKED)
+    turn = w.session_store.begin_executor_turn("reopen-task", "clarify", session=session)
+    w.session_store.update_status(
+        "reopen-task", STATUS_BLOCKED,
+        attempt_id=turn.attempt_id, turn_id=turn.turn_id,
+    )
+    question_id = w.session_store.create_pending_question(
+        session_id=turn.session_id, task_id=turn.task_id,
+        question="Which synthetic file?", sent_message_id=7001,
+    )
+    question = w.session_store.get_question_by_message_id(7001)
+    assert question_id and question["attempt_id"] == turn.attempt_id
+    assert question["turn_id"] == turn.turn_id
+    assert w.session_store.deposit_answer(7001, "the first file")
+
+    w.session_store.update_status(
+        "reopen-task", STATUS_COMPLETED,
+        attempt_id=turn.attempt_id, turn_id=turn.turn_id,
+    )
+    reopened = w.session_store.begin_new_execution("reopen-task")
+    w._process_clarification_answers()
+
+    assert reopened.attempt_id != turn.attempt_id
+    assert executor.calls == []
+    assert w.session_store.get_question_by_message_id(7001)["processed"] == 1
+
+
+@pytest.mark.unit
 def test_routing_ask_local_reply_routes_to_local_executor(tmp_path: Path):
     """Routing-ask resume: user reply 'local' must run the local executor.
 
@@ -313,6 +346,7 @@ def test_routing_ask_local_reply_routes_to_local_executor(tmp_path: Path):
     assert executor.calls, "local executor should have been invoked"
     refreshed = w.session_store.get(blocked.task_id)
     assert refreshed.routing == "local"
+    assert refreshed.execution_spec["executor"] == "local"
 
 
 @pytest.mark.unit

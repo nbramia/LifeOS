@@ -340,6 +340,19 @@ persistence, no schema change. See the
 [Human Queue guide](../../guides/human-queue.md) for the tool/endpoint
 contract and the `done_when` reference.
 
+## Shared lifecycle projection
+
+`api/services/agent_worker/lifecycle.py` coordinates execution transitions
+without replacing either authority. SessionStore records immutable
+attempt/turn identity, typed waits, and a pending projection marker before
+the projector applies an id-addressed `TaskManager.update`; the marker is
+acknowledged only after the Markdown write succeeds. A stale `updated_at`
+version leaves the marker conflicted and preserves the operator's edit for a
+fresh retry. Provider and dependency waits keep the task in `in_progress` and
+carry a `wait_reason` badge; operator waits use the existing blocked/Human
+Queue behavior. Repeated events are keyed by `event_id` and are no-ops after
+acknowledgement.
+
 ## Related Documents
 
 ### Specifications

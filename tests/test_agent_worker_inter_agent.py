@@ -20,6 +20,7 @@ from api.services.agent_worker.inter_agent import (
     teardown_session,
 )
 from api.services.agent_worker.session_store import (
+    STATUS_BLOCKED,
     STATUS_CLAIMED,
     STATUS_COMPLETED,
     STATUS_FAILED,
@@ -104,6 +105,26 @@ def test_spawn_rejects_invalid_model(ctx):
 
 
 @pytest.mark.unit
+def test_spawn_rejects_canonical_field_executor_cannot_honor(ctx):
+    result = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "x",
+        "execution": {"executor": "hermes", "effort": "max"},
+    })
+    assert not result["ok"]
+    assert result["error"] == "unsupported_execution_field"
+
+
+@pytest.mark.unit
+def test_spawn_rejects_legacy_tier_with_canonical_model_id(ctx):
+    result = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "x", "model": "claude_code", "tier": "sonnet",
+        "execution": {"executor": "claude_code", "model_id": "claude-synthetic"},
+    })
+    assert not result["ok"]
+    assert result["error"] == "execution_conflict"
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("model", ["claude_code", "codex"])
 def test_spawn_cli_child_for_capability_fallback(ctx, store, parent, model):
     """An agent can delegate to a CLI engine (claude_code/codex) — the child is
@@ -137,7 +158,7 @@ def test_spawn_claude_code_tier_persisted(ctx, store, tier):
 
 @pytest.mark.unit
 def test_spawn_claude_code_default_tier_is_none(ctx, store):
-    """No tier → claude_code_model NULL → the executor falls back to opus."""
+    """No tier leaves the CLI model unset, preserving its configured default."""
     result = dispatch(ctx, "lifeos_agent_spawn", {
         "prompt": "hard reasoning task", "model": "claude_code",
     })
@@ -244,6 +265,206 @@ def test_spawn_budget_cannot_exceed_parent_remaining(ctx, store, parent):
     assert result["error"] == "budget_exceeded"
 
 
+@pytest.mark.unit
+def test_spawn_canonical_execution_persists_exact_child_request(ctx, store):
+    result = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "synthetic child",
+        "execution": {
+            "executor": "codex",
+            "model_id": "gpt-synthetic",
+            "effort": "high",
+            "budget": {"wall_seconds": 600, "max_tokens": 1_000},
+        },
+    })
+    assert result["ok"]
+    child = store.get_by_session_id(result["child_session_id"])
+    assert child.routing == "codex"
+    assert child.execution_request == {
+        "executor": "codex",
+        "model_id": "gpt-synthetic",
+        "effort": "high",
+        "host": None,
+        "working_dir": None,
+        "budget": {"wall_seconds": 600, "max_tokens": 1_000, "max_dollars": 10.0},
+        "constraints": {
+            "allowed_executors": [],
+            "required_capabilities": [],
+            "allowed_billing": [],
+        },
+    }
+
+
+@pytest.mark.unit
+def test_legacy_engine_can_scope_a_canonical_model_id(ctx, store):
+    result = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "synthetic child", "model": "codex",
+        "execution": {"model_id": "gpt-synthetic"},
+    })
+    assert result["ok"]
+    child = store.get_by_session_id(result["child_session_id"])
+    assert child.execution_request["executor"] == "codex"
+    assert child.execution_request["model_id"] == "gpt-synthetic"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("field,value", [
+    ("wall_seconds", 3601), ("max_tokens", 100_001),
+])
+def test_spawn_canonical_budget_is_lineage_clamped(ctx, field, value):
+    result = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "synthetic child",
+        "execution": {"executor": "codex", "budget": {field: value}},
+    })
+    assert not result["ok"]
+    assert result["error"] == "budget_exceeded"
+
+
+@pytest.mark.unit
+def test_spawn_canonical_cli_dollar_budget_cannot_bypass_parent(ctx):
+    """Subscription routing does not bypass the canonical lineage ceiling."""
+    result = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "synthetic child",
+        "execution": {
+            "executor": "codex",
+            "budget": {"max_dollars": 20.0},
+        },
+    })
+    assert result["error"] == "budget_exceeded"
+
+
+@pytest.mark.unit
+def test_execution_override_is_reachable_and_scope_identity_is_derived(ctx, store, parent):
+    result = dispatch(ctx, "lifeos_agent_execution_override", {
+        "operation": "set",
+        "scope": "lineage",
+        "execution": {"executor": "codex", "effort": "high"},
+        "expires_at": "2099-01-01T00:00:00+00:00",
+    })
+    assert result["ok"]
+    assert result["override"]["scope_id"] == parent.session_id
+    restored = store.get_execution_override(
+        session_id=parent.session_id,
+        root_session_id=parent.session_id,
+    )
+    assert restored.executor == "codex"
+    cleared = dispatch(ctx, "lifeos_agent_execution_override", {
+        "operation": "clear", "scope": "lineage",
+    })
+    assert cleared == {"ok": True, "cleared": True, "scope": "lineage"}
+    assert store.get_execution_override(
+        session_id=parent.session_id,
+        root_session_id=parent.session_id,
+    ) is None
+
+
+@pytest.mark.unit
+def test_lineage_override_routes_a_future_child_without_becoming_its_fallback(
+    ctx, store, parent,
+):
+    from datetime import datetime, timezone
+
+    from api.services.agent_worker.execution import (
+        BillingClass,
+        CatalogFacts,
+        CatalogState,
+        ExecutionContext,
+        ExecutionFacts,
+        ExecutionLayer,
+        ExecutorFacts,
+        ReadinessState,
+        parse_execution_request,
+        resolve_execution,
+    )
+
+    assert dispatch(ctx, "lifeos_agent_execution_override", {
+        "operation": "set", "scope": "lineage",
+        "execution": {"executor": "codex", "effort": "high"},
+        "expires_at": "2099-01-01T00:00:00+00:00",
+    })["ok"]
+    spawned = dispatch(ctx, "lifeos_agent_spawn", {"prompt": "synthetic child"})
+    assert spawned["ok"]
+    child = store.get_by_session_id(spawned["child_session_id"])
+    assert child.routing == parent.routing
+    request = parse_execution_request(child.execution_request).request
+    assert request.executor is None
+    override = store.get_execution_override(
+        session_id=child.session_id, root_session_id=child.root_session_id,
+    )
+    resolution = resolve_execution(
+        request,
+        context=ExecutionContext(
+            session_id=child.session_id,
+            parent_session_id=child.parent_session_id,
+            root_session_id=child.root_session_id,
+        ),
+        assignment=ExecutionLayer(executor=child.routing),
+        facts=ExecutionFacts(
+            now=datetime.now(timezone.utc),
+            executors=(ExecutorFacts(
+                "codex", readiness=ReadinessState.READY,
+                catalog=CatalogFacts(CatalogState.UNKNOWN),
+                billing=BillingClass.SUBSCRIPTION,
+            ),),
+        ),
+        temporary_override=override,
+    )
+    assert resolution.ok
+    assert (resolution.spec.executor, resolution.spec.effort) == ("codex", "high")
+
+
+@pytest.mark.unit
+def test_explicit_child_route_wins_lineage_override(ctx, store):
+    assert dispatch(ctx, "lifeos_agent_execution_override", {
+        "operation": "set", "scope": "lineage",
+        "execution": {"executor": "codex"},
+        "expires_at": "2099-01-01T00:00:00+00:00",
+    })["ok"]
+    spawned = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "synthetic child", "model": "local",
+    })
+    assert spawned["ok"]
+    child = store.get_by_session_id(spawned["child_session_id"])
+    assert child.routing == "local"
+    assert child.execution_request["executor"] == "local"
+
+
+@pytest.mark.unit
+def test_override_rejects_fields_selected_executor_cannot_honor(ctx):
+    result = dispatch(ctx, "lifeos_agent_execution_override", {
+        "operation": "set", "scope": "session",
+        "execution": {"executor": "hermes", "effort": "high"},
+    })
+    assert not result["ok"]
+    assert result["error"] == "unsupported_execution_field"
+
+
+@pytest.mark.unit
+def test_override_rejects_route_dependent_field_without_executor(ctx):
+    result = dispatch(ctx, "lifeos_agent_execution_override", {
+        "operation": "set", "scope": "session",
+        "execution": {"effort": "high"},
+    })
+    assert not result["ok"]
+    assert result["error"] == "invalid_execution"
+
+
+@pytest.mark.unit
+def test_child_cannot_mutate_lineage_override(store, transcript, parent):
+    child = store.create(
+        task_id="child", status=STATUS_RUNNING, routing="local",
+        parent_session_id=parent.session_id,
+        root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+    child_ctx = InterAgentContext(store, transcript, child.session_id, Caps())
+    result = dispatch(child_ctx, "lifeos_agent_execution_override", {
+        "operation": "set", "scope": "lineage",
+        "execution": {"executor": "codex"},
+    })
+    assert not result["ok"]
+    assert result["error"] == "forbidden"
+
+
 # ---------------------------------------------------------------------------
 # send / check
 # ---------------------------------------------------------------------------
@@ -336,6 +557,55 @@ def test_send_reopen_message_enqueued_before_status_flip(ctx, store, parent, mon
     })
     assert result["ok"]
     assert calls.index("enqueue") < calls.index("status")
+
+
+@pytest.mark.unit
+def test_send_reopen_cancellation_race_cannot_resurrect_claimed(ctx, store, parent, monkeypatch):
+    """A cancellation between reopen and the status write wins durably."""
+    child = _seed_completed_cli_child(store, parent)
+    original_update = store.update_status
+
+    def cancel_before_claim(task_id, status, **kwargs):
+        if status == STATUS_CLAIMED:
+            assert store.mark_cancelled(
+                task_id,
+                attempt_id=kwargs["attempt_id"],
+                turn_id=kwargs["turn_id"],
+                reason="synthetic race",
+            )
+        return original_update(task_id, status, **kwargs)
+
+    monkeypatch.setattr(store, "update_status", cancel_before_claim)
+    result = dispatch(ctx, "lifeos_agent_send", {
+        "session_id": child.session_id, "message": "answer",
+    })
+
+    assert result == {
+        "ok": False,
+        "error": "cancelled",
+        "message": f"session {child.session_id} is no longer active",
+    }
+    assert store.get_by_session_id(child.session_id).status == STATUS_FAILED
+
+
+@pytest.mark.unit
+def test_send_reopen_old_cancellation_fence_does_not_block_new_attempt(ctx, store, parent):
+    """A deliberate reopen gets a fresh identity after an old cancellation."""
+    child = _seed_completed_cli_child(store, parent)
+    old = store.get_by_session_id(child.session_id)
+    assert store.mark_cancelled(
+        child.task_id, attempt_id=old.attempt_id, turn_id=old.turn_id,
+        reason="old attempt cancelled",
+    )
+
+    result = dispatch(ctx, "lifeos_agent_send", {
+        "session_id": child.session_id, "message": "answer",
+    })
+
+    assert result["ok"]
+    reopened = store.get_by_session_id(child.session_id)
+    assert reopened.status == STATUS_CLAIMED
+    assert reopened.attempt_id != old.attempt_id
 
 
 @pytest.mark.unit
@@ -435,6 +705,72 @@ def test_yield_until_marks_caller_yielded(ctx, store, parent):
     refreshed = store.get(parent.task_id)
     assert refreshed.status == STATUS_YIELDED
     assert refreshed.yield_waiting_for == [child.session_id]
+
+
+@pytest.mark.unit
+def test_yield_until_cancellation_race_cannot_resurrect_yielded(ctx, store, parent, monkeypatch):
+    """Cancellation between the wait-list and status writes remains FAILED."""
+    child = store.create(
+        task_id="c", status=STATUS_RUNNING, routing="local",
+        parent_session_id=parent.session_id,
+        root_session_id=parent.session_id,
+    )
+    turn = store.begin_executor_turn(parent.task_id, "execute", session=parent)
+    original_set_waiting = store.set_yield_waiting_for
+
+    def cancel_before_waiting(task_id, children, **kwargs):
+        assert store.mark_cancelled(
+            task_id,
+            attempt_id=kwargs["attempt_id"],
+            turn_id=kwargs["turn_id"],
+            reason="synthetic race",
+        )
+        return original_set_waiting(task_id, children, **kwargs)
+
+    monkeypatch.setattr(store, "set_yield_waiting_for", cancel_before_waiting)
+    result = dispatch(ctx, "lifeos_agent_yield_until", {
+        "children": [child.session_id], "reason": "waiting for child",
+    })
+
+    assert result["ok"] is False
+    assert result["error"] == "cancelled"
+    assert store.get(parent.task_id).status == STATUS_FAILED
+    assert store.get(parent.task_id).attempt_id == turn.attempt_id
+
+
+@pytest.mark.unit
+def test_user_ask_cancellation_race_cannot_resurrect_blocked(store, transcript, parent, monkeypatch):
+    """A late blocked write cannot overwrite a cancellation fence."""
+    class _FakeWorker:
+        def ask_user_via_telegram(self, **_kwargs):
+            return 123
+
+    turn = store.begin_executor_turn(parent.task_id, "execute", session=parent)
+    caller = store.get(parent.task_id)
+    original_update = store.update_status
+
+    def cancel_before_block(task_id, status, **kwargs):
+        if status == STATUS_BLOCKED:
+            assert store.mark_cancelled(
+                task_id,
+                attempt_id=kwargs["attempt_id"],
+                turn_id=kwargs["turn_id"],
+                reason="synthetic race",
+            )
+        return original_update(task_id, status, **kwargs)
+
+    monkeypatch.setattr(store, "update_status", cancel_before_block)
+    ask_ctx = InterAgentContext(
+        store, transcript, caller.session_id, Caps(), worker_handle=_FakeWorker(),
+    )
+    result = dispatch(ask_ctx, "lifeos_agent_user_ask", {
+        "question": "Should I continue?",
+    })
+
+    assert result["ok"] is False
+    assert result["error"] == "cancelled"
+    assert store.get(parent.task_id).status == STATUS_FAILED
+    assert store.get(parent.task_id).attempt_id == turn.attempt_id
 
 
 @pytest.mark.unit
@@ -1019,12 +1355,11 @@ def test_spawn_cli_child_allowed_from_hermes_root(store, transcript):
 
 
 @pytest.mark.unit
-def test_hermes_routing_is_not_a_valid_spawn_model():
-    """`NON_API_BILLED_ROOT_ROUTINGS` is deliberately a separate set from
-    `CLI_ROUTINGS` / `SPAWN_MODELS` (#640) — adding Hermes to the spend
-    guard must not also make "hermes" a valid `model=` value for spawn()
-    (there's no executor that would ever dispatch such a child)."""
-    assert "hermes" not in inter_agent.SPAWN_MODELS
+def test_hermes_routing_is_a_canonical_spawn_destination():
+    """The worker has a Hermes child-dispatch branch, while Hermes remains
+    independently classified as non-API-billed for lineage safety."""
+    assert "hermes" in inter_agent.SPAWN_MODELS
+    assert "hermes" in inter_agent.NON_API_BILLED_ROOT_ROUTINGS
     assert "hermes" not in inter_agent.CLI_ROUTINGS
     assert "hermes" in inter_agent.NON_API_BILLED_ROOT_ROUTINGS
 

@@ -126,6 +126,7 @@ def build_remote_argv(
     *,
     target: str,
     unset_env_names: list[str],
+    session_id: str | None = None,
     connect_timeout: Optional[int] = None,
 ) -> list[str]:
     """Wrap a local CLI invocation into an ssh call to `target`.
@@ -134,7 +135,11 @@ def build_remote_argv(
       1. Unsets every name in `unset_env_names` (mirrors the executor's own
          `_clean_env`, so a remote session can't inherit the operator's
          Anthropic/Claude credentials any more than a local one can).
-      2. Runs under `setsid` inside a tiny `bash -c` wrapper that echoes
+      2. Sets `LIFEOS_AGENT_SESSION_ID` when `session_id` is supplied. SSH does
+         not forward arbitrary environment variables, so this explicit
+         assignment is required for the CLI's stdio MCP child to inherit the
+         process-bound trusted identity accepted by inter-agent calls.
+      3. Runs under `setsid` inside a tiny `bash -c` wrapper that echoes
          `PGID:<pid>` as its very first stdout line — `$$` inside a fresh
          `setsid` shell is both the pid and the process-group id — before
          `exec`-ing the real argv, so the group leader replaces the wrapper
@@ -146,7 +151,12 @@ def build_remote_argv(
     unset_flags: list[str] = []
     for name in unset_env_names:
         unset_flags.extend(["-u", name])
-    inner = shlex.join(["env", *unset_flags, *argv])
+    env_assignments = []
+    if session_id:
+        # Keep the whole assignment as one argv token before shlex.join so a
+        # synthetic or otherwise unusual id cannot become shell syntax.
+        env_assignments.append(f"LIFEOS_AGENT_SESSION_ID={session_id}")
+    inner = shlex.join(["env", *unset_flags, *env_assignments, *argv])
     remote_command = f"setsid bash -c 'echo \"{PGID_LINE_PREFIX}$$\"; exec \"$@\"' _ {inner}"
     return [
         "ssh",

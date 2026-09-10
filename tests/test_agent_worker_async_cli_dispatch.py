@@ -15,7 +15,13 @@ import httpx
 import pytest
 
 from api.services.agent_worker.local_executor import ExecutorOutcome
-from api.services.agent_worker.session_store import STATUS_COMPLETED, SessionStore
+from api.services.agent_worker.session_store import (
+    STATUS_CLAIMED,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_RUNNING,
+    SessionStore,
+)
 from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.agent_worker.worker import Worker
@@ -138,3 +144,77 @@ def test_local_child_still_runs_inline(tmp_path: Path):
 
     assert pool.submitted == []        # local never touches the CLI pool
     assert stub.calls == [("cli-child", "do work")]  # ran inline
+
+
+def test_queued_cli_dispatch_is_cancelled_before_engine_start(tmp_path: Path):
+    stub = _StubCliExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done."))
+    pool = _CapturingPool()
+    w = _worker(tmp_path, pool, claude_code_executor=stub)
+    session = _seed_spawned_child(w.session_store, "claude_code")
+    w._dispatch_spawned_sessions()
+    w.session_store.update_status(session.task_id, STATUS_FAILED)
+
+    pool.run_all()
+
+    assert stub.calls == []
+    assert any(e["kind"] == "queued_dispatch_cancelled" for e in w.transcript_store.read(session.session_id))
+
+
+def test_old_queued_cli_dispatch_cannot_run_after_reopen(tmp_path: Path):
+    """A cancelled queued callback is fenced when the same task is reopened."""
+    stub = _StubCliExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="old"))
+    pool = _CapturingPool()
+    w = _worker(tmp_path, pool, claude_code_executor=stub)
+    session = _seed_spawned_child(w.session_store, "claude_code")
+    w._dispatch_spawned_sessions()
+
+    w.session_store.update_status(
+        session.task_id, STATUS_FAILED,
+        attempt_id=session.attempt_id,
+    )
+    reopened = w.session_store.begin_new_execution(session.task_id)
+    w.session_store.enqueue_message(
+        reopened.session_id, "operator", "new attempt",
+        attempt_id=reopened.attempt_id,
+    )
+    w.session_store.update_status(
+        reopened.task_id, STATUS_CLAIMED,
+        attempt_id=reopened.attempt_id,
+    )
+
+    pool.run_all()
+
+    assert stub.calls == []
+    assert w.session_store.get(reopened.task_id).attempt_id == reopened.attempt_id
+    pending = w.session_store.drain_pending_messages(reopened.session_id)
+    assert len(pending) == 1
+    assert pending[0]["sender_id"] == "operator"
+    assert pending[0]["content"] == "new attempt"
+
+
+def test_old_late_outcome_cannot_complete_reopened_task(tmp_path: Path):
+    """Outcome handling ignores a result carrying the previous turn ids."""
+    pool = _CapturingPool()
+    w = _worker(tmp_path, pool)
+    session = w.session_store.create(
+        task_id="late", status=STATUS_RUNNING, routing="local",
+    )
+    w.session_store.update_status(
+        session.task_id, STATUS_FAILED,
+        attempt_id=session.attempt_id,
+    )
+    reopened = w.session_store.begin_new_execution(session.task_id)
+    w._handle_outcome(
+        session,
+        {"id": "late", "description": "synthetic"},
+        ExecutorOutcome(
+            status=STATUS_COMPLETED,
+            final_text="old result",
+            session_id=session.session_id,
+            attempt_id=session.attempt_id,
+            turn_id=session.turn_id,
+        ),
+    )
+    # The old completion is fenced entirely; the reopened attempt remains
+    # available for its own queued work.
+    assert w.session_store.get(reopened.task_id).status == STATUS_CLAIMED

@@ -1,17 +1,14 @@
-"""
-Tests for the workout MCP surface (#603).
+"""Tests for the workout MCP surface.
 
 The fitness persona's core instruction — log first, report after, never ask
-for confirmation before logging — was previously uncarryable through the MCP
-surface: `manage_workouts` had no exposed equivalent under any name. This
-covers the new `POST /api/fitness/workouts` endpoint and its curated MCP
-tool `lifeos_workout_manage`:
+for confirmation before logging — is available through the curated MCP tool
+`lifeos_workout_manage`, which maps to `POST /api/fitness/workouts`:
 
 1. The tool is registered and discoverable on the MCP surface.
 2. A workout logged through the MCP/REST path lands in the exact same
    FitnessStore a natively-logged one does (asserting the stored row, not
-   just a success response — the failure mode at issue is a false "Logged").
-3. No other curated tool or persona's tool availability changed.
+   just a success response).
+3. No other curated tool or persona's tool availability changes.
 """
 import importlib.util
 from pathlib import Path
@@ -93,6 +90,22 @@ class TestMCPRegistration:
         assert "action" in schema["properties"]
         assert schema.get("required") == ["action"]
 
+    def test_tool_not_registered_when_curated_operation_is_absent(self):
+        """A path item without the curated operation cannot register its tool."""
+        from copy import deepcopy
+        from api.main import app
+
+        openapi_spec = deepcopy(app.openapi())
+        openapi_spec["paths"]["/api/fitness/workouts"].pop("post")
+
+        module = _load_mcp_module()
+        with patch.object(module.LifeOSMCPServer, "_load_openapi_spec", lambda self: None):
+            server = module.LifeOSMCPServer()
+        server.openapi_spec = openapi_spec
+        server._build_tools_from_spec()
+
+        assert not any(t["name"] == "lifeos_workout_manage" for t in server.tools)
+
     def test_format_response_passes_result_through_as_plain_text(self):
         """The formatter should echo the tool's own confirmation/error string
         rather than re-wrapping it as JSON, matching what the native
@@ -144,9 +157,7 @@ class TestSharedStore:
     def test_log_without_sets_is_a_real_error_not_a_false_confirmation(self, env):
         """No path may report a workout as logged without a write. An empty
         `sets` must come back as a 4xx, not a structurally-successful 200
-        with an 'Error: ...' string buried in the body (#603 review MAJOR —
-        a 200 there is legible only to a caller that reads the prose, which
-        is exactly the false-confirmation shape this issue exists to close)."""
+        with an 'Error: ...' string buried in the body."""
         client, store = env
         resp = client.post("/api/fitness/workouts", json={"action": "log", "sets": []})
         assert 400 <= resp.status_code < 500
@@ -175,6 +186,17 @@ class TestSharedStore:
         assert resp.status_code == 200
         assert "Readiness snapshot" in resp.json()["result"]
 
+    def test_set_profile_action_reachable_and_persists_in_synthetic_store(self, env):
+        client, store = env
+
+        resp = client.post(
+            "/api/fitness/workouts",
+            json={"action": "set_profile", "key": "goals", "value": "run a synthetic 5K"},
+        )
+
+        assert resp.status_code == 200
+        assert store.get_profile() == {"goals": "run a synthetic 5K"}
+
 
 # ---------------------------------------------------------------------------
 # 3. Nothing else moved
@@ -182,28 +204,19 @@ class TestSharedStore:
 
 class TestNoUnrelatedChange:
     def test_curated_endpoint_count(self):
-        """Pins the new total (59 = the pre-existing 56 [55 + this one] plus
-        the 3 Human-queue tools added by #852) so a future change to this
-        count is a deliberate, reviewed edit."""
+        """The curated catalog contains the expected number of tools."""
         module = _load_mcp_module()
         assert len(module.CURATED_ENDPOINTS) == 59
 
     def test_other_tools_unaffected(self):
         module = _load_mcp_module()
         names = {c["name"] for c in module.CURATED_ENDPOINTS.values()}
-        # Spot-check a sample from unrelated categories — none of this PR's
-        # changes should have touched their registration.
+        # Spot-check tools from unrelated categories.
         for expected in ("lifeos_task_create", "lifeos_calendar_upcoming", "lifeos_monarch_accounts"):
             assert expected in names
 
     def test_agentic_loop_tool_count_unchanged(self):
-        """manage_workouts already existed in the native agentic-loop tool
-        set (#320) — this PR only adds an MCP-side route to it, so the
-        agentic-loop tool count must not move.
-
-        Pinned total: 22 = the pre-existing 21 + `manage_human_queue`,
-        added by #852. A future change to this count should be deliberate
-        and reviewed, same as the CURATED_ENDPOINTS count above."""
+        """The native agentic-loop tool catalog contains the expected tools."""
         from api.services.agent_tools import TOOL_DEFINITIONS
         assert len(TOOL_DEFINITIONS) == 22
 
@@ -213,14 +226,11 @@ class TestNoUnrelatedChange:
 # ---------------------------------------------------------------------------
 
 class TestSchemaTypeAccuracy:
-    """#603 review (MAJOR): FastAPI/Pydantic v2 renders every Optional field
+    """FastAPI/Pydantic v2 renders every Optional field
     as `anyOf: [<real schema>, {"type": "null"}]` with no top-level `type`.
-    The old generator read only the top-level `type` and silently defaulted
-    to "string", so `sets` (a JSON array of objects) and `limit` (an integer)
-    were both advertised to MCP clients as `"type": "string"`. A schema-
-    following external client could not construct the array a workout log
-    needs — the capability looked present on the tool list and was actually
-    unusable, which alone defeats the point of this issue."""
+    The generated MCP schema preserves the actual types for `sets` (a JSON
+    array of objects) and `limit` (an integer), allowing schema-following
+    clients to construct valid workout requests."""
 
     def test_sets_reports_array_with_items(self):
         server = _server_built_from_live_spec()
@@ -257,12 +267,12 @@ class TestSchemaTypeAccuracy:
 # ---------------------------------------------------------------------------
 
 class TestNoPersonaLeakInDescription:
-    """#603 review (MAJOR): `ToolRegistry` exposes the full curated catalog
+    """`ToolRegistry` exposes the full curated catalog
     to every persona, so a persona-specific instruction ("log first, never
     ask for confirmation") baked into this tool's *description* would change
     behavior for every non-fitness persona too. That instruction already
     lives in config/personas/fitness.md, where it applies to the right
-    surface — the MCP description must stay capability-only."""
+    surface, so the MCP description stays capability-only."""
 
     def test_description_has_no_confirmation_instruction(self):
         module = _load_mcp_module()

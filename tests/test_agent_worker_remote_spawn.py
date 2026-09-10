@@ -2,6 +2,8 @@
 resolution, ssh argv construction, and the injectable remote kill runner."""
 from __future__ import annotations
 
+import shlex
+
 import pytest
 
 from api.services.agent_worker.remote_spawn import (
@@ -57,6 +59,40 @@ def test_build_remote_argv_shape(monkeypatch):
     assert "env -u ANTHROPIC_API_KEY -u CLAUDECODE" in remote_command
     assert "'hello there'" in remote_command  # shlex-quoted, spaces preserved
     assert remote_command.startswith("setsid bash -c")
+
+
+def test_build_remote_argv_carries_stdio_session_identity_without_credentials():
+    """SSH does not forward arbitrary env, so the remote CLI must receive
+    the process-bound stdio MCP identity in its explicit `env` command."""
+    argv = build_remote_argv(
+        ["claude", "-p", "synthetic prompt"],
+        target="user@laptop.example",
+        unset_env_names=sorted(CANONICAL_CREDENTIAL_ENV_NAMES),
+        session_id="sess-synthetic-123",
+    )
+    remote_command = argv[-1]
+    assert "LIFEOS_AGENT_SESSION_ID=sess-synthetic-123" in remote_command
+    assert "-u ANTHROPIC_API_KEY" in remote_command
+    assert "-u OPENAI_API_KEY" in remote_command
+    assert "LIFEOS_AGENT_SESSION_ID=sess-synthetic-123" not in " ".join(
+        f"-u {name}" for name in CANONICAL_CREDENTIAL_ENV_NAMES
+    )
+
+
+def test_build_remote_argv_shell_quotes_session_identity():
+    """The identity is one env assignment token even when an id needs quoting."""
+    argv = build_remote_argv(
+        ["codex", "exec", "synthetic"],
+        target="user@laptop.example",
+        unset_env_names=[],
+        session_id="sess with 'shell' chars",
+    )
+    remote_command = argv[-1]
+    expected_inner = shlex.join([
+        "env", "LIFEOS_AGENT_SESSION_ID=sess with 'shell' chars",
+        "codex", "exec", "synthetic",
+    ])
+    assert remote_command.endswith(expected_inner)
 
 
 def test_read_remote_pgid_line():

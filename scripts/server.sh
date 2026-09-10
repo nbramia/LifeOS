@@ -2,7 +2,7 @@
 # LifeOS Server Management Script
 # Designed for reliable server management from Claude or command line
 #
-# Usage: ./scripts/server.sh [start|stop|restart|status|wait|preflight|classify-change|verify-deployed|restart-worker-detached|test-instance]
+# Usage: ./scripts/server.sh [start|stop|restart|status|wait|preflight|classify-change|verify-deployed|verify-runtime-evidence|restart-worker-detached|test-instance]
 #
 # Commands:
 #   start                    - Kill any existing processes, start server, wait for health check
@@ -13,6 +13,7 @@
 #   preflight                - Check prerequisites before first start
 #   classify-change          - Print whether a diff needs a worker or api-only restart (#401)
 #   verify-deployed          - Exit 0 only if the checkout is a real work tree on the expected SHA (#419)
+#   verify-runtime-evidence - Emit structured startup-bound deployment evidence
 #   restart-worker-detached  - Detached restart of lifeos-agent-worker for the doctor (#401)
 #   test-instance ACTION     - Private, isolated candidate instance for tests:
 #                              run|verify|stop — see scripts/test_instance.py --help. `run` is
@@ -408,6 +409,89 @@ verify_deployed() {
     esac
 }
 
+# verify-runtime-evidence --restart-evidence <path>
+#   [--services lifeos-api[,lifeos-agent-worker]] [--worker-evidence <path>]
+##
+# Build a machine-attributed deployment result from startup identity records,
+# the scoped /health response, and a restart-wrapper result.  This is a
+# stronger, additive producer for doctor consumers; verify-deployed above is
+# intentionally unchanged for legacy callers.  The Python producer rejects
+# checkout-only or user-supplied success claims and exits non-zero unless every
+# requested service proves the expected immutable revision is running.
+verify_runtime_evidence() {
+    local identity_dir="${LIFEOS_RUNTIME_IDENTITY_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/lifeos/runtime-identities}"
+    local expected_revision
+    if ! expected_revision=$(git -C "$PROJECT_DIR" rev-parse --verify HEAD 2>/dev/null); then
+        log_error "verify-runtime-evidence: cannot resolve checkout HEAD"
+        return 1
+    fi
+    # source-root and expected-revision are wrapper-owned bindings.  Reject
+    # attempts to append duplicate flags: argparse would otherwise let the
+    # last user-supplied value silently override the trusted values below.
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --source-root|--source-root=*|--expected-revision|--expected-revision=*)
+                log_error "verify-runtime-evidence: source-root and expected-revision are wrapper-bound"
+                return 2
+                ;;
+        esac
+    done
+    exec "$VENV_PYTHON" -m api.services.runtime_identity verify \
+        --source-root "$PROJECT_DIR" \
+        --expected-revision "$expected_revision" \
+        --identity-dir "$identity_dir" \
+        --api-url "$HEALTH_URL" \
+        "$@"
+}
+
+# Record the restart outcome produced by this wrapper.  The evidence verifier
+# treats this file as an input only when its provenance and result are exact;
+# an operator/model cannot turn a claimed success boolean into deployment proof.
+latest_runtime_identity() {
+    local identity_dir="$1"
+    local candidate=""
+    local latest=""
+    for candidate in "$identity_dir"/lifeos-api-*.json; do
+        [ -f "$candidate" ] || continue
+        if [ -z "$latest" ] || [ "$candidate" -nt "$latest" ]; then
+            latest="$candidate"
+        fi
+    done
+    printf '%s' "$latest"
+}
+
+record_runtime_restart() {
+    local service="${1:-lifeos-api}"
+    local result="${2:-failure}"
+    local previous_identity="${3:-}"
+    local health_status="${4:-}"
+    local identity_dir="${LIFEOS_RUNTIME_IDENTITY_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/lifeos/runtime-identities}"
+    local output="$identity_dir/restart-$service.json"
+    local identity=""
+    if [ "$service" = "lifeos-api" ]; then
+        identity="$(latest_runtime_identity "$identity_dir")"
+    else
+        for candidate in "$identity_dir"/"$service"-*.json; do
+            [ -f "$candidate" ] || continue
+            identity="$candidate"
+            break
+        done
+    fi
+    local args=(record-restart --service "$service" --result "$result" --output "$output")
+    if [ -n "$identity" ]; then
+        args+=(--identity "$identity")
+    fi
+    if [ -n "$previous_identity" ]; then
+        args+=(--previous-identity "$previous_identity")
+    fi
+    if [ -n "$health_status" ]; then
+        args+=(--health-status "$health_status")
+    fi
+    "$VENV_PYTHON" -m api.services.runtime_identity "${args[@]}" \
+        || log_warn "could not record runtime restart outcome"
+}
+
 # restart-worker-detached [--session ID] [--notify TEXT] [--bot NAME]
 #
 # Restart lifeos-agent-worker such that any pending final notice is delivered
@@ -418,8 +502,9 @@ verify_deployed() {
 #      "Shipped" message even if the streamed [NOTIFY] raced the SIGTERM.
 #   2. Write the self-restart marker (names --session) so resume_pending()
 #      finalizes that session quietly instead of firing the rollback notice.
-#   3. Restart the worker in a DETACHED process (systemd-run; nohup+setsid
-#      fallback) that outlives the dying session and actually performs the bounce.
+#   3. Start an independent watcher, then restart the worker in a DETACHED
+#      process (systemd-run on Linux, launchd on macOS, nohup+setsid fallback)
+#      that outlives the dying session and actually performs the bounce.
 restart_worker_detached() {
     local session_id="" notify_text="" bot=""
     while [ $# -gt 0 ]; do
@@ -451,27 +536,79 @@ PYEOF
             || log_warn "could not write self-restart marker (continuing to restart)"
     fi
 
-    # 3. Restart the worker in a detached process that outlives this session.
+# 3. Start the watcher before requesting the restart.  The caller is normally
+#    the worker itself, so anything started after the restart request can be
+#    killed before it records the new process identity.
+    # The watcher waits for a new startup identity and active unit before it
+    # writes restart-lifeos-agent-worker.json.  The command therefore produces
+    # evidence of an observed worker, rather than evidence of a restart request.
+    local identity_dir="${LIFEOS_RUNTIME_IDENTITY_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/lifeos/runtime-identities}"
+    local previous_identity=""
+    for candidate in "$identity_dir"/lifeos-agent-worker-*.json; do
+        [ -f "$candidate" ] || continue
+        if [ -z "$previous_identity" ] || [ "$candidate" -nt "$previous_identity" ]; then
+            previous_identity="$candidate"
+        fi
+    done
+    local worker_output="$identity_dir/restart-lifeos-agent-worker.json"
     log_info "Triggering detached restart of $WORKER_UNIT..."
-    if command -v systemd-run &>/dev/null; then
+    local watcher_args=("$VENV_PYTHON" -m api.services.runtime_identity wait-and-record
+        --service lifeos-agent-worker --unit "$WORKER_UNIT"
+        --identity-dir "$identity_dir" --output "$worker_output")
+    if [ -n "$previous_identity" ]; then
+        watcher_args+=(--previous-identity "$previous_identity")
+    fi
+    if [ "$(uname)" = "Darwin" ] && command -v launchctl &>/dev/null; then
+        # launchctl submit gives both the watcher and the restart their own
+        # launchd jobs, independent of the worker job being unloaded.  Keep
+        # the clean unload-then-load sequence; kickstart is known to wedge
+        # this service on macOS (see docs/guides/operations.md).
+        local launchd_label="com.lifeos.agent-worker"
+        local watcher_label="com.lifeos.agent-worker-restart-watch-$$"
+        local restart_label="com.lifeos.agent-worker-restart-$$"
+        watcher_args+=(--manager launchd --launchd-label "$launchd_label")
+        if ! launchctl submit -l "$watcher_label" -- "${watcher_args[@]}" \
+            >/dev/null 2>>"$PROJECT_DIR/logs/worker-restart.log"; then
+            log_error "launchd watcher submission failed"
+            record_runtime_restart lifeos-agent-worker failure "$previous_identity" failed
+            return 1
+        fi
+        local worker_plist="${LIFEOS_AGENT_WORKER_PLIST:-$HOME/Library/LaunchAgents/com.lifeos.agent-worker.plist}"
+        local restart_script="launchctl unload $(printf '%q' "$worker_plist") >/dev/null 2>>$(printf '%q' "$PROJECT_DIR/logs/worker-restart.log") || true; launchctl load $(printf '%q' "$worker_plist") >>$(printf '%q' "$PROJECT_DIR/logs/worker-restart.log") 2>&1"
+        if ! launchctl submit -l "$restart_label" -- /bin/bash -c "$restart_script" \
+            >/dev/null 2>>"$PROJECT_DIR/logs/worker-restart.log"; then
+            log_error "launchd worker restart submission failed"
+            record_runtime_restart lifeos-agent-worker failure "$previous_identity" failed
+            return 1
+        fi
+    elif command -v systemd-run &>/dev/null; then
         # Transient unit in its own cgroup — fully decoupled from the caller, so
         # the SIGTERM the worker is about to receive can't kill the restarter.
-        sudo systemd-run --unit="lifeos-worker-restart-$$" --collect \
-            systemctl restart "$WORKER_UNIT" \
-            || log_error "systemd-run restart failed"
+        local watcher_unit="lifeos-worker-restart-watch-$$"
+        if ! sudo systemd-run --unit="$watcher_unit" --collect --no-block \
+            "${watcher_args[@]}"; then
+            log_error "systemd-run watcher submission failed"
+            record_runtime_restart lifeos-agent-worker failure "$previous_identity" failed
+            return 1
+        fi
+        if ! sudo systemd-run --unit="lifeos-worker-restart-$$" --collect --no-block \
+            systemctl restart "$WORKER_UNIT"; then
+            log_error "systemd-run restart failed"
+            record_runtime_restart lifeos-agent-worker failure "$previous_identity" failed
+            return 1
+        fi
     else
-        # Fallback for non-systemd hosts (no systemd-run). setsid+nohup detach
-        # into a new session that survives the worker's process-group teardown
-        # and SIGHUP — but, unlike the systemd-run path, this does NOT move the
-        # restarter into its own cgroup, so a cgroup-level kill of the worker
-        # could still reach it. This branch only runs where `systemctl restart`
-        # itself wouldn't apply anyway, so it's a best-effort degraded path, not
-        # an equivalent guarantee.
+        # Fallback for non-systemd/non-launchd hosts (no service manager).
+        # Start the watcher first; setsid+nohup only protects against a shell
+        # SIGHUP, not a cgroup-level kill, so this remains best effort.
+        setsid nohup "${watcher_args[@]}" \
+            >> "$PROJECT_DIR/logs/worker-restart.log" 2>&1 &
+        disown 2>/dev/null || true
         setsid nohup sudo systemctl restart "$WORKER_UNIT" \
             >> "$PROJECT_DIR/logs/worker-restart.log" 2>&1 &
         disown 2>/dev/null || true
     fi
-    log_info "Detached worker restart triggered."
+    log_info "Detached worker restart triggered; evidence will be written to $worker_output after the new worker starts."
 }
 
 # Main
@@ -501,10 +638,21 @@ case "${1:-status}" in
         log_info "Restarting server..."
         if is_systemd_managed; then
             log_info "Delegating to systemd..."
-            sctl restart lifeos-api
-            wait_for_healthy
+            previous_identity="$(latest_runtime_identity "${LIFEOS_RUNTIME_IDENTITY_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/lifeos/runtime-identities}")"
+            if sctl restart lifeos-api && wait_for_healthy; then
+                record_runtime_restart lifeos-api success "$previous_identity" healthy
+            else
+                record_runtime_restart lifeos-api failure "$previous_identity" failed
+                exit 1
+            fi
         else
-            start_server
+            previous_identity="$(latest_runtime_identity "${LIFEOS_RUNTIME_IDENTITY_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/lifeos/runtime-identities}")"
+            if start_server; then
+                record_runtime_restart lifeos-api success "$previous_identity" healthy
+            else
+                record_runtime_restart lifeos-api failure "$previous_identity" failed
+                exit 1
+            fi
         fi
         ;;
     foreground)
@@ -525,6 +673,10 @@ case "${1:-status}" in
     verify-deployed)
         verify_deployed "${2:-}"
         ;;
+    verify-runtime-evidence)
+        shift
+        verify_runtime_evidence "$@"
+        ;;
     restart-worker-detached)
         shift
         restart_worker_detached "$@"
@@ -542,7 +694,7 @@ case "${1:-status}" in
     *)
         echo "LifeOS Server Management"
         echo ""
-        echo "Usage: $0 {start|stop|restart|status|wait [timeout]|foreground|preflight|classify-change [range]|verify-deployed [sha]|restart-worker-detached [opts]|test-instance <run|verify|stop> [opts]}"
+        echo "Usage: $0 {start|stop|restart|status|wait [timeout]|foreground|preflight|classify-change [range]|verify-deployed [sha]|verify-runtime-evidence [opts]|restart-worker-detached [opts]|test-instance <run|verify|stop> [opts]}"
         echo ""
         echo "Commands:"
         echo "  start                    - Start server (kills existing, waits for healthy)"
@@ -556,6 +708,7 @@ case "${1:-status}" in
         echo "                             (default range HEAD~1..HEAD; e.g. 'main..HEAD')"
         echo "  verify-deployed [sha]    - Exit 0 only if the checkout is a real work tree on"
         echo "                             <sha> (default origin/main); else exit 1 (#419)"
+        echo "  verify-runtime-evidence - Emit startup-bound structured deployment evidence"
         echo "  restart-worker-detached  - Detached restart of $WORKER_UNIT for the doctor"
         echo "                             [--session ID] [--notify TEXT] [--bot NAME]"
         echo "  test-instance ACTION     - Isolated candidate instance for tests:"

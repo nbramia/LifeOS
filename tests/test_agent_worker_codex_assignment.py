@@ -176,7 +176,10 @@ def test_remote_host_wraps_argv_in_ssh_and_captures_pgid(tmp_path, monkeypatch):
     assert "user@studio.example" in cmd
     remote_command = cmd[-1]
     assert "env -u" in remote_command
+    assert f"LIFEOS_AGENT_SESSION_ID={session.session_id}" in remote_command
     assert "setsid bash -c" in remote_command
+    assert spawn_calls[0][1]["env"]["LIFEOS_AGENT_SESSION_ID"] == session.session_id
+    assert "ANTHROPIC_API_KEY" not in spawn_calls[0][1]["env"]
 
     refreshed = store.get("t1")
     assert refreshed.remote_pgid == 1212

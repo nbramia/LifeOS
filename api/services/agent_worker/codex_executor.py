@@ -55,6 +55,7 @@ from api.services.agent_worker.session_store import (
     SessionStore,
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
+from api.services.agent_worker.usage_ledger import UsageLedger
 from api.services.codex.session_ingest import _cost_from_usage
 from config.settings import settings
 
@@ -134,12 +135,9 @@ class _RunState:
     thread can mutate it without capture surprises.
     """
     session_id: Optional[str] = None  # CLI's thread id, captured at thread.started
-    # Codex's --json stream doesn't include the model id in any event, so we
-    # default to gpt-5.5 (the current top OpenAI model since 2026-04 and the
-    # codex CLI's recommended default). This only affects cost rollups —
-    # token counts are accurate regardless. Override on the state directly
-    # if the operator pins a different model via `-m` or config.toml.
-    model: str = "gpt-5.5"
+    # Codex's --json stream does not prove the served model. This is the
+    # requested assignment only; served identity stays unknown in the ledger.
+    model: Optional[str] = None
     final_text: str = ""
     cost_usd: float = 0.0
     tool_call_count: int = 0
@@ -190,12 +188,31 @@ class CodexExecutor:
     # Public API
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _with_identity(session, outcome: ExecutorOutcome) -> ExecutorOutcome:
+        from dataclasses import replace
+        return replace(
+            outcome,
+            session_id=getattr(outcome, "session_id", None) or session.session_id,
+            attempt_id=getattr(outcome, "attempt_id", None) or session.attempt_id,
+            turn_id=getattr(outcome, "turn_id", None) or session.turn_id,
+            executor="codex",
+            continuation_id=(
+                getattr(outcome, "continuation_id", None)
+                or session.claude_code_session_id
+            ),
+        )
+
     def execute(self, session, task: dict) -> ExecutorOutcome:
         """Drive a fresh /codex session."""
         prompt = (task.get("description") or "").strip()
         if not prompt:
             self.transcript_store.append(session.session_id, "codex_no_prompt", {})
             return ExecutorOutcome(status=STATUS_FAILED, reason="empty prompt")
+
+        session = self.session_store.begin_executor_turn(
+            session.task_id, "execute", session=session,
+        )
 
         working_dir = task.get("working_dir") or os.getcwd()
         # Warn (once per process) if Codex can't reach the lifeos MCP server —
@@ -210,12 +227,12 @@ class CodexExecutor:
         # this from the first prompt.
         delegation = _delegation_header(session.session_id)
         full_prompt = f"{delegation}\n{CAPABILITIES_PREAMBLE}\n{prompt}"
-        return self._run(
+        return self._with_identity(session, self._run(
             session=session,
             prompt=full_prompt,
             working_dir=working_dir,
             resume_session_id=None,
-        )
+        ))
 
     def resume(self, session, message: str, working_dir: Optional[str] = None) -> ExecutorOutcome:
         """Resume a previously-completed /codex session via
@@ -228,13 +245,16 @@ class CodexExecutor:
                 session.session_id, "codex_resume_no_session_id", {},
             )
             return ExecutorOutcome(status=STATUS_FAILED, reason="no codex_session_id on record")
+        session = self.session_store.begin_executor_turn(
+            session.task_id, "resume", session=session,
+        )
         wd = working_dir or os.getcwd()
-        return self._run(
+        return self._with_identity(session, self._run(
             session=session,
             prompt=message,
             working_dir=wd,
             resume_session_id=resume_id,
-        )
+        ))
 
     # ------------------------------------------------------------------
     # Internal lifecycle
@@ -307,7 +327,7 @@ class CodexExecutor:
             )
 
     @staticmethod
-    def _clean_env() -> dict:
+    def _clean_env(session_id: str | None = None) -> dict:
         """Strip CODEX_* env vars so the subprocess doesn't inherit the
         operator's interactive Codex context — keep CODEX_HOME so auth
         (`~/.codex/auth.json`) is preserved.
@@ -319,11 +339,14 @@ class CodexExecutor:
         dollar cap for being subscription-billed.
         """
         keep = _CODEX_ENV_KEEP
-        return {
+        env = {
             k: v for k, v in os.environ.items()
             if (not k.startswith("CODEX_") or k in keep)
             and not k.startswith(_ALTERNATE_AUTH_ENV_PREFIXES)
         }
+        if session_id:
+            env["LIFEOS_AGENT_SESSION_ID"] = session_id
+        return env
 
     @staticmethod
     def _remote_unset_env_names() -> list[str]:
@@ -376,6 +399,7 @@ class CodexExecutor:
                 cmd,
                 target=target,
                 unset_env_names=self._remote_unset_env_names(),
+                session_id=sid,
             )
 
         self.transcript_store.append(sid, "codex_spawn", {
@@ -392,7 +416,7 @@ class CodexExecutor:
                 stderr=subprocess.PIPE,
                 cwd=working_dir,
                 text=True,
-                env=self._clean_env(),
+                env=self._clean_env(sid),
                 # #379: own process-group leader so the operator kill can
                 # `os.killpg(pgid, ...)` codex + its children without touching
                 # the worker process. Mirrors ClaudeCodeExecutor. For a remote
@@ -405,7 +429,10 @@ class CodexExecutor:
             self._cleanup_tempfile(last_msg_path)
             return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_BINARY_NOT_FOUND)
 
-        self.session_store.update_status(session.task_id, STATUS_RUNNING)
+        self.session_store.update_status(
+            session.task_id, STATUS_RUNNING,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
 
         if is_remote:
             # (#851) Strip the remote wrapper's `PGID:<n>` first stdout line
@@ -432,7 +459,10 @@ class CodexExecutor:
                     self.transcript_store.append(sid, "codex_remote_unresponsive", {
                         "host": host, "deadline_seconds": deadline,
                     })
-                    self.session_store.update_status(session.task_id, STATUS_FAILED)
+                    self.session_store.update_status(
+                        session.task_id, STATUS_FAILED,
+                        attempt_id=session.attempt_id, turn_id=session.turn_id,
+                    )
                     self._cleanup_tempfile(last_msg_path)
                     return ExecutorOutcome(
                         status=STATUS_FAILED,
@@ -440,7 +470,10 @@ class CodexExecutor:
                     )
                 pgid = read_remote_pgid_line(first_line)
             if pgid is not None:
-                self.session_store.set_remote_pgid(session.task_id, pgid)
+                self.session_store.set_remote_pgid(
+                    session.task_id, pgid,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 self.transcript_store.append(sid, "codex_pid", {
                     "pid": proc.pid, "pgid": pgid, "remote": True, "host": host,
                 })
@@ -454,7 +487,10 @@ class CodexExecutor:
                 pgid = proc.pid
             self.transcript_store.append(sid, "codex_pid", {"pid": proc.pid, "pgid": pgid})
 
-        state = _RunState()
+        requested_model = getattr(session, "model", None)
+        if not requested_model:
+            requested_model = (getattr(session, "execution_spec", None) or {}).get("model_id")
+        state = _RunState(model=requested_model)
         timed_out = threading.Event()
         stop_heartbeat = threading.Event()
 
@@ -493,6 +529,7 @@ class CodexExecutor:
         # final_text must read as empty (no blank "output:" block in a parent's
         # resume turn, no anchor-less operator send).
         state.final_text = state.final_text.strip()
+        self._record_usage(session, state)
 
         # #379: operator-kill silent guard (parity with ClaudeCodeExecutor). If
         # the row is already FAILED *and the subprocess did not exit cleanly*, the
@@ -508,12 +545,22 @@ class CodexExecutor:
         # from being mis-tagged REASON_KILLED if a cascade races the FAILED flip:
         # it falls through to the COMPLETED path below.
         current = self.session_store.get(session.task_id)
+        if self.session_store.is_cancelled(
+            session.task_id, session.attempt_id, session.turn_id,
+        ):
+            self.transcript_store.append(sid, "codex_killed", {
+                "returncode": proc.returncode, "reason": "cancelled",
+            })
+            return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED)
         if current is not None and current.status == STATUS_FAILED and proc.returncode != 0:
             self.transcript_store.append(sid, "codex_killed", {"returncode": proc.returncode})
             return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED)
 
         if timed_out.is_set():
-            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            self.session_store.update_status(
+                session.task_id, STATUS_FAILED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             self.transcript_store.append(sid, "codex_timeout", {
                 "timeout_seconds": self._timeout,
             })
@@ -521,7 +568,19 @@ class CodexExecutor:
 
         if proc.returncode == 0 or state.terminal:
             exit_meta = self._exit_metadata(proc, timed_out, state)
-            self.session_store.update_status(session.task_id, STATUS_COMPLETED)
+            completed = self.session_store.update_status(
+                session.task_id, STATUS_COMPLETED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
+            if not completed:
+                if self.session_store.is_cancelled(
+                    session.task_id, session.attempt_id, session.turn_id,
+                ):
+                    self.transcript_store.append(sid, "codex_killed", {
+                        "returncode": proc.returncode, "reason": "cancelled",
+                    })
+                    return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED)
+                return ExecutorOutcome(status=STATUS_RUNNING, reason="stale CLI turn")
             self.transcript_store.append(sid, "codex_completed", {
                 "cost_usd": state.cost_usd,
                 "model": state.model,
@@ -550,7 +609,10 @@ class CodexExecutor:
             stderr_tail = (proc.stderr.read() if proc.stderr else "") or ""
         except Exception:
             pass
-        self.session_store.update_status(session.task_id, STATUS_FAILED)
+        self.session_store.update_status(
+            session.task_id, STATUS_FAILED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         self.transcript_store.append(sid, "codex_failed", {
             "returncode": proc.returncode,
             "stderr_tail": stderr_tail[-500:],
@@ -623,7 +685,10 @@ class CodexExecutor:
                 state.session_id = thread_id
                 # Persist immediately so a worker crash leaves enough state
                 # to resume via `codex exec resume <id>`.
-                self.session_store.set_claude_code_session_id(session.task_id, thread_id)
+                self.session_store.set_claude_code_session_id(
+                    session.task_id, thread_id,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 self.transcript_store.append(sid, "codex_init", {
                     "codex_session_id": thread_id,
                 })
@@ -680,6 +745,26 @@ class CodexExecutor:
         if etype in ("session.completed", "exec.completed"):
             state.terminal = True
             return
+
+    def _record_usage(self, session, state: _RunState) -> None:
+        """Record subscription usage without inventing a served model."""
+        usage = state.last_usage or {}
+        if not usage:
+            return
+        try:
+            ledger = UsageLedger(self.session_store.db_path)
+            ledger.record_cli_usage(
+                session,
+                source="codex_executor",
+                input_tokens=int(usage.get("input_tokens", 0) or 0),
+                output_tokens=int(usage.get("output_tokens", 0) or 0),
+                cached_input_tokens=int(usage.get("cached_input_tokens", 0) or 0),
+                estimated_cost_usd=state.cost_usd if state.model else None,
+                source_event_id=state.session_id,
+                event_id=f"codex:{session.session_id}:{state.session_id or 'unknown'}",
+            )
+        except Exception:  # noqa: BLE001 — accounting cannot alter executor outcome
+            logger.warning("codex usage ledger write failed for %s", session.task_id, exc_info=True)
 
     # ------------------------------------------------------------------
     # Watchdog + heartbeat

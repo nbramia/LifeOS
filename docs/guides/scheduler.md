@@ -34,6 +34,13 @@ source of truth; `data/scheduler_index.json` is a rebuildable cache.
 - **`#executor` tag** — for `action:: agent`, the executor: `#local`, `#cloud`, `#cloud-haiku`, or `#cloud-sonnet`.
 - **`[bot:: <name>]`** — which Telegram bot delivers the notification (see below); omitted means the primary bot.
 
+Agent schedules may also carry optional execution fields such as
+`[persona_id:: journal]`, `[model_id:: synthetic-model]`, `[effort:: high]`,
+`[host:: workstation]`, and `[working_dir:: /srv/project]`. They are explicit
+handoff context and round-trip through Markdown; omitted fields retain the
+worker's legacy defaults. `bot` remains delivery-only and does not select an
+execution persona or provider.
+
 Editing a line in Obsidian (changing the cron, toggling the checkbox) is picked
 up within ~2s by the file watcher. Markdown edits are **not** validated — a
 `[bot:: <name>]` typed here is accepted as-is, and the fire-time routing warning
@@ -111,6 +118,13 @@ note like any other engine-assigned task.
 ```markdown
 - [ ] Weekly Review [cron:: 0 9 * * 6] [action:: agent] #cloud <!-- id:d4e5f6 -->
 ```
+
+Each agent fire has a deterministic occurrence key `(schedule_id,
+scheduled_for)` persisted in the shared SessionStore before the scheduler
+advances the trigger. The task stores that key in its existing inline fields,
+so a crash after the Markdown write or a stale scheduler lease finds the same
+task and run linkage. A manual trigger uses a distinct request key; this
+guards handoff creation only and does not claim exactly-once external effects.
 
 ## Creating Schedules
 

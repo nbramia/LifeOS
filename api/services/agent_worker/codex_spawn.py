@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import asdict
 
 from config.settings import settings
 
 from .session_store import STATUS_CLAIMED, SessionStore, new_session_id
+from .execution import ExecutionRequest
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,8 @@ def spawn_codex_session(
     *,
     working_dir: str | None = None,
     chat_id: str | None = None,
+    persona_id: str | None = None,
+    execution_request: ExecutionRequest | None = None,
 ) -> dict:
     """Create a parentless ``routing='codex'`` session.
 
@@ -58,6 +62,9 @@ def spawn_codex_session(
         "chat_id": chat_id,
     }
     session_store.enqueue_message(session_id, "operator", json.dumps(payload))
+    canonical = execution_request or ExecutionRequest(
+        executor="codex", working_dir=working_dir,
+    )
     session = session_store.create(
         task_id=task_id,
         session_id=session_id,
@@ -67,6 +74,8 @@ def spawn_codex_session(
         expected_output="text",
         parent_session_id=None,
         origin="operator",
+        execution_request=asdict(canonical),
+        persona_id=persona_id,
     )
 
     logger.info(
