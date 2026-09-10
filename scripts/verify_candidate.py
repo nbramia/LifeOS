@@ -54,23 +54,36 @@ def default_evidence_root() -> Path:
 
 
 def infer_local_base(repository: Path) -> str | None:
-    """This checkout's current upstream tip, used as the default base
-    identity for a local run when the caller does not name one explicitly.
+    """The default base identity for a local run when the caller does not
+    name one explicitly: this checkout's upstream tip when a tracking branch
+    exists, otherwise the resolved merge-base with ``origin/main`` -- the
+    same provenance scripts/pre-push itself computes for a brand-new
+    branch's first push (see its ``MERGE_BASE`` fallback). That is the
+    common pre-commit -> first-push path: a fresh feature branch has no
+    upstream yet, but pre-push still requires (and this must match) the
+    real resolved merge-base, never a guess.
 
-    Returns ``None`` when there is no configured upstream (a fresh clone
-    with no tracking branch) -- such a checkout is genuinely base-independent
-    rather than silently exempt from base-sensitivity: ``EvidenceStore``
-    only reuses a ``None``-based receipt for another ``None`` request. A
-    concrete inferred base means a later reuse attempt against a moved
-    upstream (e.g. a pushed-ref check once main has advanced) fails closed
-    instead of silently following the move.
+    Returns ``None`` only when neither is resolvable (e.g. no ``origin``
+    remote at all) -- such a checkout is genuinely base-independent rather
+    than silently exempt from base-sensitivity: ``EvidenceStore`` only
+    reuses a ``None``-based receipt for another ``None`` request. A concrete
+    inferred base means a later reuse attempt against a moved upstream/main
+    (e.g. a pushed-ref check once main has advanced) fails closed instead of
+    silently following the move.
     """
-    result = subprocess.run(
+    upstream = subprocess.run(
         ["git", "-C", str(repository), "rev-parse", "@{upstream}"],
         capture_output=True, text=True,
     )
-    sha = result.stdout.strip()
-    return sha if result.returncode == 0 and sha else None
+    sha = upstream.stdout.strip()
+    if upstream.returncode == 0 and sha:
+        return sha
+    merge_base = subprocess.run(
+        ["git", "-C", str(repository), "merge-base", "HEAD", "origin/main"],
+        capture_output=True, text=True,
+    )
+    merge_sha = merge_base.stdout.strip()
+    return merge_sha if merge_base.returncode == 0 and merge_sha else None
 
 
 _HERMETIC_ENVIRONMENT = {
@@ -945,9 +958,10 @@ def _main(argv: Sequence[str]) -> int:
     local.add_argument("--evidence-root", type=Path, default=None)
     local.add_argument(
         "--base", default=None,
-        help="optional explicit base identity to record/require for this run "
-        "(e.g. the current upstream tip); omitted by default since a local "
-        "run is not yet attributed to any push target",
+        help="explicit base identity to record/require for this run, overriding "
+        "inference. When omitted, inferred as this checkout's upstream tip, or "
+        "(no upstream yet, e.g. a fresh branch's first push) the resolved "
+        "merge-base with origin/main; None only when neither resolves",
     )
     local.add_argument("--lanes", default="fast-unit,browser-free")
     local.add_argument("--workers", default=1, type=int)

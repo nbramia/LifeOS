@@ -472,6 +472,62 @@ def test_local_cli_infers_upstream_base_and_pushed_ref_reuses_it(tmp_path):
 
 
 @pytest.mark.unit
+def test_local_cli_infers_merge_base_on_a_fresh_branch_first_push(tmp_path):
+    """#978: the common pre-commit -> first-push path is a brand-new feature
+    branch with no upstream tracking yet. ``local`` must fall back to the
+    resolved merge-base with origin/main (matching scripts/pre-push's own
+    new-branch ``MERGE_BASE`` provenance, lines 71-83) rather than leaving
+    the capture unattributed, so a first-push ``pushed-ref`` check naming
+    that same merge-base actually reuses it."""
+    root = _source_repo(tmp_path)
+    remote = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    _git(root, "remote", "add", "origin", str(remote))
+    _git(root, "push", "-q", "origin", "HEAD:main")  # no -u: no upstream tracking configured
+    _git(root, "checkout", "-qb", "feature")
+    assert subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "@{upstream}"], capture_output=True,
+    ).returncode != 0  # sanity: this branch genuinely has no upstream yet
+
+    (root / "app.py").write_text("VALUE = 'fresh branch first push'\n")
+    evidence = tmp_path / "evidence"
+    local_logs = tmp_path / "local-lanes"
+    local = subprocess.run(
+        [
+            sys.executable, str(REPO / "scripts" / "verify_candidate.py"), "local",
+            "--source", str(root), "--evidence-root", str(evidence),
+            "--lanes", "fast-unit", "--workers", "1", "--lane-log-dir", str(local_logs),
+        ],
+        text=True, capture_output=True,
+    )
+    assert local.returncode == 0, local.stdout + local.stderr
+    assert json.loads(local.stdout.splitlines()[-1])["reused"] is False
+
+    # What pre-push itself would compute for this exact new-branch first push.
+    merge_base = subprocess.check_output(
+        ["git", "-C", str(root), "merge-base", "HEAD", "origin/main"], text=True,
+    ).strip()
+
+    _git(root, "add", "app.py")
+    _git(root, "commit", "-qm", "fresh branch first push")
+    pushed_sha = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+
+    pushed_logs = tmp_path / "pushed-lanes"
+    pushed = subprocess.run(
+        [
+            sys.executable, str(REPO / "scripts" / "verify_candidate.py"), "pushed-ref",
+            "--repository", str(root), "--sha", pushed_sha, "--base", merge_base,
+            "--evidence-root", str(evidence),
+            "--lanes", "fast-unit", "--workers", "1", "--lane-log-dir", str(pushed_logs),
+        ],
+        text=True, capture_output=True,
+    )
+    assert pushed.returncode == 0, pushed.stdout + pushed.stderr
+    assert json.loads(pushed.stdout.splitlines()[-1])["reused"] is True
+    assert json.loads((pushed_logs / "fast-unit.json").read_text())["status"] == "reused"
+
+
+@pytest.mark.unit
 def test_failed_attempt_is_retained_and_infrastructure_retry_is_reason_recorded(tmp_path):
     inputs = VerificationInputs(*( "a" * 64 for _ in range(5)))
     store = EvidenceStore(tmp_path / "evidence")
