@@ -1260,6 +1260,18 @@ export function initBoard() {
     tagPickerHandle = null;
   }
 
+  // Confirmation modals must not cancel the picker merely because they were
+  // opened: Cancel leaves the drawer alive, and a failed confirmed mutation
+  // must leave the Tags field usable. The handle itself is rearmed after a
+  // failed write so any edits made after the failure still serialize normally.
+  function pauseTagPickerWrites() {
+    if (tagPickerHandle && tagPickerHandle.cancel) tagPickerHandle.cancel();
+  }
+
+  function rearmTagPickerWrites() {
+    if (tagPickerHandle && tagPickerHandle.rearm) tagPickerHandle.rearm();
+  }
+
   function runCardAction(action) {
     cancelTagPickerWrites();
     return action();
@@ -1628,6 +1640,7 @@ export function initBoard() {
     });
     const handle = {
       cancel: () => { cancelled = true; },
+      rearm: () => { cancelled = false; },
       isSaving: () => !cancelled && pendingSaves > 0,
       whenIdle: () => saveChain,
     };
@@ -2136,9 +2149,19 @@ export function initBoard() {
   function renderDrawerActions(card) {
     const actionsEl = drawerEl.querySelector('[data-field="actions"]');
     if (!actionsEl) return;
-    const cardHandlers = cardActionHandlers(card, { onChanged: fetchBoard, onAccepted: closeDrawer });
+    const cardHandlers = cardActionHandlers(card, {
+      onChanged: fetchBoard,
+      onAccepted: closeDrawer,
+      onMutationConfirmed: pauseTagPickerWrites,
+      onMutationFailed: rearmTagPickerWrites,
+    });
+    const modalActions = new Set(['reject', 'reassign', 'delete']);
     const guardedCardHandlers = Object.fromEntries(
-      Object.entries(cardHandlers).map(([name, handler]) => [name, (...args) => runCardAction(() => handler(...args))]),
+      Object.entries(cardHandlers).map(([name, handler]) => [name, (...args) => (
+        modalActions.has(name)
+          ? handler(...args)
+          : runCardAction(() => handler(...args))
+      )]),
     );
     renderActionRow(actionsEl, {
       session: card.session || null,
@@ -2170,10 +2193,12 @@ export function initBoard() {
           const fresh = findCard(card.id);
           if (fresh) { renderDrawer(fresh); openCardSnapshot = fresh; }
         })),
-        delete: () => runCardAction(() => openDeleteCardModal(card, {
+        delete: () => openDeleteCardModal(card, {
           findCard,
+          onMutationConfirmed: pauseTagPickerWrites,
+          onMutationFailed: rearmTagPickerWrites,
           onDeleted: async () => { closeDrawer(); await fetchBoard(); },
-        })),
+        }),
       },
     });
   }

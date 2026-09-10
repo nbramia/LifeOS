@@ -96,7 +96,10 @@ export async function acceptCard(card, onChanged, onAccepted) {
  * Reject a completed review with operator context, or reassign it while
  * retaining the prior session transcript as the next run's context.
  */
-export function openReviewActionModal(card, action, onChanged) {
+export function openReviewActionModal(card, action, onChanged, {
+  onMutationConfirmed,
+  onMutationFailed,
+} = {}) {
   const isReject = action === 'reject';
   const title = isReject ? 'Reject review' : 'Reassign review';
   const assignees = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud'];
@@ -144,6 +147,7 @@ export function openReviewActionModal(card, action, onChanged) {
     const payload = { action, note };
     if (!isReject) payload.assignee = backdrop.querySelector('#review-assignee').value;
     try {
+      if (onMutationConfirmed) onMutationConfirmed();
       const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/review-action`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
       });
@@ -157,6 +161,7 @@ export function openReviewActionModal(card, action, onChanged) {
       cleanup();
       if (onChanged) await onChanged(await r.json());
     } catch (err) {
+      if (onMutationFailed) onMutationFailed();
       showToast(`${isReject ? 'Reject' : 'Reassign'} failed: ${err.message}`, true);
       btn.disabled = false;
       btn.textContent = isReject ? 'Reject' : 'Reassign';
@@ -219,7 +224,12 @@ export async function cancelCard(card, onChanged) {
 // CLI-backed live session is deleted without a kill attempt, since the
 // operator has to close that pane by hand. A scheduled card never carries a
 // session, so it always deletes straight through.
-export function openDeleteCardModal(card, { findCard, onDeleted } = {}) {
+export function openDeleteCardModal(card, {
+  findCard,
+  onDeleted,
+  onMutationConfirmed,
+  onMutationFailed,
+} = {}) {
   const resolveCard_ = (id) => (findCard ? findCard(id) : card);
   const isTask = card.kind === 'task';
   const label = isTask ? (card.title || card.id) : (card.name || card.id);
@@ -286,6 +296,7 @@ export function openDeleteCardModal(card, { findCard, onDeleted } = {}) {
     confirmBtn.disabled = true;
     confirmBtn.textContent = 'Deleting…';
     try {
+      if (onMutationConfirmed) onMutationConfirmed();
       if (freshNeedsKill) {
         const kr = await fetch(`/api/agents/sessions/${encodeURIComponent(fresh.session.session_id)}/kill`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),
@@ -317,6 +328,7 @@ export function openDeleteCardModal(card, { findCard, onDeleted } = {}) {
       showToast('Deleted.', false);
       if (onDeleted) await onDeleted();
     } catch (err) {
+      if (onMutationFailed) onMutationFailed();
       showToast(`Delete failed: ${err.message}`, true);
       pending = false;
       confirmBtn.disabled = false;
@@ -329,15 +341,24 @@ export function openDeleteCardModal(card, { findCard, onDeleted } = {}) {
 // that needs to override one action's behaviour (the Board drawer's own
 // Cancel and Delete, which do extra drawer-specific bookkeeping around the
 // generic network call) spreads this and replaces just that key.
-export function cardActionHandlers(card, { findCard, onChanged, onAccepted } = {}) {
+export function cardActionHandlers(card, {
+  findCard, onChanged, onAccepted,
+  onMutationConfirmed, onMutationFailed,
+} = {}) {
   const changed = onChanged || (() => {});
   return {
     open: () => openCard(card, changed),
     accept: () => acceptCard(card, changed, onAccepted),
-    reject: () => openReviewActionModal(card, 'reject', changed),
-    reassign: () => openReviewActionModal(card, 'reassign', changed),
+    reject: () => openReviewActionModal(card, 'reject', changed, {
+      onMutationConfirmed, onMutationFailed,
+    }),
+    reassign: () => openReviewActionModal(card, 'reassign', changed, {
+      onMutationConfirmed, onMutationFailed,
+    }),
     resolve: () => resolveCard(card, changed),
     cancel: () => cancelCard(card, changed),
-    delete: () => openDeleteCardModal(card, { findCard, onDeleted: changed }),
+    delete: () => openDeleteCardModal(card, {
+      findCard, onDeleted: changed, onMutationConfirmed, onMutationFailed,
+    }),
   };
 }

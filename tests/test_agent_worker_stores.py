@@ -83,6 +83,28 @@ def test_answered_followup_claim_is_atomic_and_reassignment_retires_claim(tmp_pa
 
 
 @pytest.mark.unit
+def test_answered_question_claim_recovers_after_restart_or_stale_lease(tmp_path: Path):
+    """A processed=2 row is a recoverable lease, not a permanently consumed answer."""
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    session = store.create(task_id="t-recover", status=STATUS_COMPLETED)
+    question_id = store.enqueue_web_followup(session.session_id, "t-recover", "retry synthetic work")
+
+    assert [q["id"] for q in store.claim_answered_unprocessed_questions()] == [question_id]
+    assert store.recover_question_claims(max_age_seconds=None, limit=10) == 1
+    assert [q["id"] for q in store.claim_answered_unprocessed_questions()] == [question_id]
+
+    # Existing answered_at is the bounded tick lease clock; an old answer can
+    # be released without adding a claim timestamp column.
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE pending_questions SET answered_at = answered_at - 3600 WHERE id = ?",
+            (question_id,),
+        )
+    assert store.recover_question_claims(max_age_seconds=60, limit=10) == 1
+    assert [q["id"] for q in store.claim_answered_unprocessed_questions()] == [question_id]
+
+
+@pytest.mark.unit
 def test_session_store_list_non_terminal(tmp_path: Path):
     store = SessionStore(db_path=tmp_path / "sessions.db")
     store.create(task_id="t1", status=STATUS_RUNNING)

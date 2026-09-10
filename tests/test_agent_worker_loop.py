@@ -782,6 +782,69 @@ def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_managed_resume_start_crash_releases_answer_claim(tmp_path: Path):
+    """A Managed start exception must not strand the processed=2 lease."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "resume synthetic review", "status": "blocked",
+         "tags": [BLOCKED_TAG, "cloud-sonnet"]},
+    ])
+    w = _make_worker(
+        tmp_path, api, preflight_caller=_golden_preflight(routing="claude"),
+        local_executor=_StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED)),
+    )
+    session = w.session_store.create(task_id="t1", status=STATUS_BLOCKED, routing="claude")
+    qid = w.session_store.create_pending_question(
+        session_id=session.session_id, task_id="t1", question="Continue?", sent_message_id=77,
+    )
+    w.session_store.deposit_answer(77, "yes")
+
+    class _ExplodingManaged:
+        driver = object()
+
+        def start(self, session, task):
+            raise RuntimeError("synthetic managed startup crash")
+
+    w._managed_executor = _ExplodingManaged()
+    w._process_clarification_answers()
+
+    with w.session_store._connect() as conn:
+        row = conn.execute("SELECT processed FROM pending_questions WHERE id = ?", (qid,)).fetchone()
+    assert row["processed"] == 0
+
+
+@pytest.mark.unit
+def test_reassigned_answer_claim_fails_closed_before_executor(tmp_path: Path, monkeypatch):
+    """A row retired after claim cannot reopen the old task or execute it."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "stale synthetic followup", "status": "done",
+         "tags": [COMPLETED_TAG, "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(
+        tmp_path, api, preflight_caller=_golden_preflight(routing="local"),
+        local_executor=executor,
+    )
+    session = w.session_store.create(task_id="t1", status=STATUS_COMPLETED, routing="local")
+    qid = w.session_store.enqueue_web_followup(session.session_id, "t1", "yes")
+    claim = w.session_store.claim_answered_unprocessed_questions
+
+    def claim_then_retire():
+        rows = claim()
+        if rows:
+            w.session_store.retire_completion_followups(session.session_id)
+        return rows
+
+    monkeypatch.setattr(w.session_store, "claim_answered_unprocessed_questions", claim_then_retire)
+    w._process_clarification_answers()
+
+    assert executor.calls == []
+    assert w.session_store.get("t1").status == STATUS_COMPLETED
+    with w.session_store._connect() as conn:
+        row = conn.execute("SELECT processed FROM pending_questions WHERE id = ?", (qid,)).fetchone()
+    assert row["processed"] == 1
+
+
+@pytest.mark.unit
 def test_completion_summary_uses_transcript_pointer_when_final_text_empty(tmp_path: Path):
     """When the agent idles without producing an `agent.message` (sometimes
     happens after a tool call on tight budgets), Telegram surfaces a

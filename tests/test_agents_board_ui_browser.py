@@ -188,6 +188,24 @@ def _remove_card_from_state(board_state: dict, card_id: str) -> None:
                 return
 
 
+def _stub_derive_lane(card: dict) -> str:
+    """Small faithful projection of agent_board.derive_lane for tag writes.
+
+    The browser harness is not a second unit-test suite for lane policy, but
+    an atomic tag response must still move a card when an editable tag such as
+    ``human`` changes its derived lane.
+    """
+    tags = {str(tag).lstrip("#").lower() for tag in card.get("tags", [])}
+    status = str(card.get("status", "todo")).lower()
+    if "human" in tags or status == "blocked":
+        return "human_queue"
+    if status == "done" and "agent-completed" in tags and "accepted" not in tags:
+        return "review"
+    if status in {"done", "cancelled"}:
+        return "done"
+    return "assigned" if tags & _ASSIGNEE_TAGS else "unassigned"
+
+
 def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: list, lane_status_code: list,
                   schedule_puts: list, board_stream_frames: list, stream_gate: "threading.Event | None" = None,
                   lane_response: "list | None" = None, open_calls: "list | None" = None,
@@ -421,20 +439,41 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                 "agent-completed", "agent-failed", "agent-budget-exceeded",
                 "agent-reassigned", "accepted",
             }
+            card = next(
+                (candidate for cards in board_state["lanes"].values() for candidate in cards
+                 if candidate["id"] == task_id),
+                None,
+            )
+            if card is None:
+                route.fulfill(
+                    status=404, content_type="application/json",
+                    body=json.dumps({"detail": "card not found"}),
+                )
+                return
+            requested_protected = [
+                tag for tag in requested
+                if str(tag).lstrip("#").lower() in protected
+            ]
+            if requested_protected:
+                route.fulfill(
+                    status=409, content_type="application/json",
+                    body=json.dumps({
+                        "detail": "assignee and lifecycle tags are managed by the board actions",
+                    }),
+                )
+                return
             merged = list(requested)
-            for cards in board_state["lanes"].values():
-                for card in cards:
-                    if card["id"] != task_id:
-                        continue
-                    preserved = [
-                        tag for tag in card.get("tags", [])
-                        if str(tag).lstrip("#").lower() in protected
-                    ]
-                    merged = [*preserved, *requested]
-                    card["tags"] = merged
+            preserved = [
+                tag for tag in card.get("tags", [])
+                if str(tag).lstrip("#").lower() in protected
+            ]
+            merged = [*preserved, *requested]
+            card["tags"] = merged
+            landed = _stub_derive_lane(card)
+            _move_card_in_state(board_state, task_id, landed)
             route.fulfill(
                 status=200, content_type="application/json",
-                body=json.dumps({"id": task_id, "tags": merged}),
+                body=json.dumps({"id": task_id, "lane": landed, "status": card["status"], "tags": merged}),
             )
             task_puts.append(body)
             return
@@ -851,6 +890,64 @@ class TestDrawerTagsEdit:
         assert t2["tags"] == ["me", "foo"]
         assert not any("<" in t for p in task_puts for t in (p.get("tags") or []))
         assert not any("codex" in (p.get("tags") or []) for p in task_puts)
+
+    def test_atomic_tag_save_relocates_card_from_editable_human_tag(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        tags = page.locator(".drawer-tags")
+        tags.fill("human")
+        page.locator('[data-field="tag-options"] [data-select-tag="human"]').click()
+        page.locator(".drawer-title").click()
+        _wait_for(lambda: task_puts == [{"tags": ["human"]}], page=page)
+        expect(page.locator('.board-lane[data-lane="human_queue"] [data-card-id="t2"]')).to_be_visible()
+        assert next(card for card in board_state["lanes"]["human_queue"] if card["id"] == "t2")["tags"] == [
+            "me", "human",
+        ]
+
+    def test_cancelled_review_modals_do_not_disable_atomic_tag_saves(
+        self, page: Page, agents_base_url,
+    ):
+        """Opening and cancelling each review/delete modal leaves the drawer's
+        tag picker live; the atomic route still persists the next edit."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["review"].append({
+            "kind": "task", "id": "t-review", "title": "Review synthetic result",
+            "notes": "", "status": "done", "tags": ["codex", "agent-completed"],
+            "assignee": "codex", "fields": {}, "context": "Ops",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "sess-review", "status": "completed", "source": "local",
+                "routing": "local", "started_at": 1000, "last_activity_at": 1000,
+            }, "pending_question": None,
+        })
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t-review"]').click()
+        tags = page.locator(".drawer-tags")
+
+        for action, cancel_selector, tag in (
+            ("reject", "#review-action-cancel", "after-reject"),
+            ("reassign", "#review-action-cancel", "after-reassign"),
+            ("delete", "#delete-cancel", "after-delete"),
+        ):
+            page.locator(f'[data-action="{action}"]').click()
+            expect(page.locator(".modal")).to_be_visible()
+            page.locator(cancel_selector).click()
+            expect(page.locator(".modal")).to_have_count(0)
+            tags.fill(tag)
+            page.locator(".drawer-title").click()  # blur commits the atomic edit
+            _wait_for(
+                lambda tag=tag: any(tag in (payload.get("tags") or []) for payload in task_puts),
+                page=page,
+            )
+
+        assert [payload["tags"] for payload in task_puts] == [
+            ["after-reject"], ["after-reassign"], ["after-delete"],
+        ]
+        review = next(card for card in board_state["lanes"]["review"] if card["id"] == "t-review")
+        assert review["tags"] == ["codex", "agent-completed", "after-delete"]
 
 
 class TestDrawerAssigneeRevert:

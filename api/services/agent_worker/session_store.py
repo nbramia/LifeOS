@@ -1706,6 +1706,42 @@ class SessionStore:
                     claimed.append(item)
         return claimed
 
+    def recover_question_claims(
+        self, *, max_age_seconds: int | None = None, limit: int = 100,
+    ) -> int:
+        """Return abandoned ``processed=2`` answer rows to the retry queue.
+
+        ``processed=2`` is deliberately kept as the lease state so this
+        recovery needs no schema change. On worker startup every in-flight
+        claim belongs to the abandoned process and is safe to release. During
+        normal ticks callers pass a bounded age based on the existing
+        ``answered_at`` timestamp; a long-running resume is therefore given a
+        lease window while a killed worker becomes retryable on a later tick.
+        """
+        limit = max(1, int(limit))
+        params: list[int] = []
+        age_clause = ""
+        if max_age_seconds is not None:
+            cutoff = _now() - max(0, int(max_age_seconds))
+            age_clause = " AND answered_at <= ?"
+            params.append(cutoff)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM pending_questions "
+                "WHERE answered_at IS NOT NULL AND processed = 2"
+                + age_clause + " ORDER BY id ASC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+            recovered = 0
+            for row in rows:
+                cur = conn.execute(
+                    "UPDATE pending_questions SET processed = 0 "
+                    "WHERE id = ? AND processed = 2",
+                    (row["id"],),
+                )
+                recovered += cur.rowcount
+        return recovered
+
     def question_claimed(self, question_id: int) -> bool:
         """Return whether this worker still owns an answered row claim."""
         with self._connect() as conn:
@@ -1715,21 +1751,24 @@ class SessionStore:
             ).fetchone()
         return row is not None
 
-    def release_question_claim(self, question_id: int) -> None:
+    def release_question_claim(self, question_id: int) -> bool:
         """Return a claimed row to the retryable unprocessed state."""
         with self._connect() as conn:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE pending_questions SET processed = 0 "
                 "WHERE id = ? AND processed = 2",
                 (int(question_id),),
             )
+        return cur.rowcount > 0
 
-    def mark_question_processed(self, question_id: int) -> None:
+    def mark_question_processed(self, question_id: int) -> bool:
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE pending_questions SET processed = 1 WHERE id = ?",
+            cur = conn.execute(
+                "UPDATE pending_questions SET processed = 1 "
+                "WHERE id = ? AND processed = 2",
                 (int(question_id),),
             )
+        return cur.rowcount > 0
 
     def list_timed_out_questions(self, before_ts: int) -> list[dict]:
         """Open questions sent before `before_ts` that haven't been answered
