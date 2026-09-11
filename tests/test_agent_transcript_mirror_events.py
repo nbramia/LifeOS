@@ -182,8 +182,13 @@ def test_events_endpoint_returns_mirrored_transcript_for_remote_session(client, 
 # ---------------------------------------------------------------------------
 
 
-def test_stream_endpoint_returns_mirrored_transcript_for_remote_session(client, stores, mirror_root):
+def test_stream_endpoint_returns_mirrored_transcript_for_remote_session(client, stores, mirror_root, monkeypatch):
     _write_cc_transcript(mirror_root / "laptop" / "claude_code" / "-home-user-proj" / "sess-e5.jsonl")
+
+    # Breaking out of the loop below does not end the response: closing the
+    # stream waits for the generator, which runs until its idle close. Pin
+    # that to a short interval so this test costs a second, not five minutes.
+    monkeypatch.setattr(agents_route, "_CLI_STREAM_IDLE_CLOSE_SECONDS", 1.0)
 
     lines: list[str] = []
     with client.stream("GET", "/api/agents/sessions/cc:sess-e5/stream?backfill=5") as r:
