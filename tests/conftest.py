@@ -535,6 +535,84 @@ def _isolate_integration_persistent_stores(request, tmp_path, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_default_crm_db_path(request, tmp_path, monkeypatch):
+    """Redirect a default-constructed ``RelationshipStore``'s database path
+    to a path owned by this test.
+
+    ``RelationshipStore.__init__`` falls back to ``get_crm_db_path()`` when
+    no ``db_path`` is given, and ``_init_db()`` connects to that path
+    (creating the file) before issuing ``CREATE TABLE IF NOT EXISTS`` -- a
+    concurrent process connecting to the same file inside that window sees
+    an empty database and raises
+    ``sqlite3.OperationalError: no such table: relationships``. Every test
+    that skips this fixture resolves the same shared path, since
+    ``get_crm_db_path()`` derives from ``settings.chroma_path``. Rebinding
+    ``db_paths``'s own ``settings`` name covers every caller of
+    ``get_crm_db_path()`` -- relationships, source entities, tone analysis,
+    person facts -- because they all read it through that one function,
+    while stores that reach ``settings.chroma_path`` through their own
+    module (usage tracking, conversations, the keyword index) keep the
+    real setting. Tests marked ``slow`` or ``integration`` carry their own
+    redirection above and are left alone here.
+    """
+    if request.node.get_closest_marker("slow") is not None:
+        yield
+        return
+    if request.node.get_closest_marker("integration") is not None:
+        yield
+        return
+
+    from types import SimpleNamespace
+
+    from api.utils import db_paths
+
+    monkeypatch.setattr(
+        db_paths, "settings", SimpleNamespace(chroma_path=tmp_path / "chromadb")
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_default_task_manager_paths(request, tmp_path, monkeypatch):
+    """Redirect ``get_task_manager()``'s default singleton to a vault and
+    index path owned by this test.
+
+    ``TaskManager.__init__`` loads/creates its index file and rewrites
+    ``vault/LifeOS/Tasks/Dashboard.md`` unconditionally, and
+    ``get_task_manager()`` is the only call site that constructs one with
+    every argument defaulted -- reachable, for example, from
+    ``agent_system_prompt._get_existing_tags()`` while building a chat
+    system prompt. Rebinding ``task_manager``'s own ``settings`` name and
+    index constant gives that default construction an owned vault and index
+    path without touching ``settings.vault_path``, which directory
+    resolution and other subsystems read directly. ``get_task_manager``
+    itself is left intact, so a test that injects its own manager by
+    setting the ``_task_manager`` singleton still has that manager served
+    to the code under test. Tests marked ``slow`` or ``integration`` carry
+    their own redirection above and are left alone here.
+    """
+    if request.node.get_closest_marker("slow") is not None:
+        yield
+        return
+    if request.node.get_closest_marker("integration") is not None:
+        yield
+        return
+
+    from types import SimpleNamespace
+
+    import api.services.task_manager as task_manager_mod
+
+    monkeypatch.setattr(
+        task_manager_mod, "settings", SimpleNamespace(vault_path=tmp_path / "vault")
+    )
+    monkeypatch.setattr(
+        task_manager_mod, "DEFAULT_INDEX_PATH", tmp_path / "task_index.json"
+    )
+    monkeypatch.setattr(task_manager_mod, "_task_manager", None)
+    yield
+
+
 # Collection names `VectorStore` actually writes to on a real install:
 # `VectorStore`'s own class default (also what `get_vector_store()`'s
 # process-wide singleton resolves to) plus every non-vault indexer's own
