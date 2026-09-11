@@ -17,6 +17,7 @@ description on dispatch), mirroring how spawned children are seeded.
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 
 from config.settings import settings
 
@@ -27,6 +28,7 @@ from .session_store import (
     SessionStore,
     new_session_id,
 )
+from .execution import ExecutionRequest
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,7 @@ def create_operator_session(
     explicit_routing: str | None = None,
     preflight_caller=None,
     budget: dict | None = None,
+    execution_request: ExecutionRequest | None = None,
 ) -> dict:
     """Create a parentless operator-spawned session.
 
@@ -91,6 +94,9 @@ def create_operator_session(
     # The prompt becomes the dispatched session's task description (drained by
     # _dispatch_spawned_sessions) so the executor seeds the real task.
     session_store.enqueue_message(session_id, "operator", prompt)
+    canonical = execution_request or ExecutionRequest(
+        executor=None if routing == ROUTE_ASK else routing,
+    )
     session = session_store.create(
         task_id=task_id,
         session_id=session_id,
@@ -100,6 +106,7 @@ def create_operator_session(
         expected_output="text",
         parent_session_id=None,
         origin="operator",
+        execution_request=asdict(canonical),
     )
 
     logger.info(

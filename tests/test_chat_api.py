@@ -106,6 +106,30 @@ class TestAskStreamEndpoint:
         assert '"type": "content"' not in body
         mock_classify.assert_not_called()
 
+    def test_stream_canonical_codex_hands_off_and_rejects_legacy_conflict(self, client):
+        response = client.post("/api/ask/stream", json={
+            "question": "synthetic task", "execution": {"executor": "codex"},
+        })
+        assert response.status_code == 200
+        assert '"engine": "codex"' in response.text
+        conflict = client.post("/api/ask/stream", json={
+            "question": "synthetic task", "model_override": "claude_code",
+            "execution": {"executor": "codex"},
+        })
+        assert conflict.status_code == 409
+
+    def test_stream_rejects_inline_model_backend_cannot_switch(self, client, monkeypatch):
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "llm_backend", "local", raising=False)
+        monkeypatch.setattr(settings, "local_llm_model", "gemma-synthetic", raising=False)
+        response = client.post("/api/ask/stream", json={
+            "question": "synthetic task",
+            "execution": {"executor": "native_inline", "model_id": "other-model"},
+        })
+        assert response.status_code == 422
+        assert response.json()["detail"]["code"] == "execution_unresolved"
+
 
 class TestBackendTaggingField:
     """AskStreamRequest.backend (#596): tags a newly created conversation's
@@ -339,6 +363,87 @@ class TestHandoffEndpoint:
     def test_handoff_rejects_empty_task(self, client):
         r = client.post("/api/chat/handoff", json={"engine": "codex", "task": "   "})
         assert r.status_code == 400
+
+    def test_handoff_rejects_unknown_reply_conversation(self, client):
+        with patch("api.routes.chat.get_store") as get_store:
+            get_store.return_value.get_conversation.return_value = None
+            response = client.post("/api/chat/handoff", json={
+                "engine": "codex", "task": "synthetic task",
+                "conversation_id": "forged-conversation",
+            })
+        assert response.status_code == 404
+
+    def test_handoff_does_not_steal_active_reply_scope(self, client):
+        from types import SimpleNamespace
+
+        linked = SimpleNamespace(agent_session_id="sess-active")
+        active = SimpleNamespace(status="running")
+        with patch("api.routes.chat.get_store") as get_store, \
+             patch("api.services.agent_worker.session_store.SessionStore") as session_store:
+            get_store.return_value.get_conversation.return_value = linked
+            session_store.return_value.get_by_session_id.return_value = active
+            response = client.post("/api/chat/handoff", json={
+                "engine": "codex", "task": "synthetic task",
+                "conversation_id": "conv-active",
+            })
+        assert response.status_code == 409
+
+    def test_handoff_passes_strict_canonical_execution(self, client):
+        with patch(
+            "api.services.agent_worker.codex_spawn.spawn_codex_session",
+            return_value={"ok": True, "session_id": "sess-canonical"},
+        ) as spawn:
+            response = client.post("/api/chat/handoff", json={
+                "engine": "codex", "task": "synthetic task",
+                "execution": {"executor": "codex", "model_id": "gpt-synthetic", "effort": "high"},
+            })
+        assert response.status_code == 200
+        canonical = spawn.call_args.kwargs["execution_request"]
+        assert (canonical.executor, canonical.model_id, canonical.effort) == (
+            "codex", "gpt-synthetic", "high",
+        )
+
+    def test_handoff_legacy_engine_scopes_canonical_model_id(self, client):
+        with patch(
+            "api.services.agent_worker.codex_spawn.spawn_codex_session",
+            return_value={"ok": True, "session_id": "sess-canonical"},
+        ) as spawn:
+            response = client.post("/api/chat/handoff", json={
+                "engine": "codex", "task": "synthetic task",
+                "execution": {"model_id": "gpt-synthetic"},
+            })
+        assert response.status_code == 200
+        canonical = spawn.call_args.kwargs["execution_request"]
+        assert (canonical.executor, canonical.model_id) == ("codex", "gpt-synthetic")
+
+    def test_handoff_flat_execution_context_reaches_spawn(self, client):
+        with patch(
+            "api.services.agent_worker.codex_spawn.spawn_codex_session",
+            return_value={"ok": True, "session_id": "sess-flat"},
+        ) as spawn:
+            response = client.post("/api/chat/handoff", json={
+                "engine": "codex", "task": "synthetic task",
+                "persona_id": "primary", "model_id": "gpt-synthetic",
+                "effort": "high", "host": "server", "working_dir": "/tmp/synthetic",
+            })
+        assert response.status_code == 200
+        canonical = spawn.call_args.kwargs["execution_request"]
+        assert (canonical.model_id, canonical.effort, canonical.host, canonical.working_dir) == (
+            "gpt-synthetic", "high", "server", "/tmp/synthetic",
+        )
+        assert spawn.call_args.kwargs["persona_id"] == "primary"
+
+    def test_handoff_rejects_execution_conflict_and_trusted_fields(self, client):
+        conflict = client.post("/api/chat/handoff", json={
+            "engine": "codex", "task": "x",
+            "execution": {"executor": "claude_code"},
+        })
+        trusted = client.post("/api/chat/handoff", json={
+            "engine": "codex", "task": "x",
+            "execution": {"executor": "codex", "root_session_id": "forged"},
+        })
+        assert conflict.status_code == 409
+        assert trusted.status_code == 422
 
     def test_handoff_surfaces_spawn_failure(self, client):
         with patch(

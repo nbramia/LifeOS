@@ -52,6 +52,8 @@ def _payload(**overrides):
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
+    from config.settings import TelegramBotConfig
+
     store = JournalIngestStore(db_path=str(tmp_path / "journal_ingest.db"))
     monkeypatch.setattr(journal_ingest_store, "_store_instance", store)
     journal_ingest._conversations.clear()
@@ -62,6 +64,17 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         type(journal_ingest.settings), "resolve_persona",
         lambda self, persona_id, surface=None: "JOURNAL PERSONA PREAMBLE" if persona_id == "journal" else None,
+    )
+    # The endpoint intentionally checks Telegram listener readiness separately
+    # from credential-free persona resolution; make the normal fixture's
+    # synthetic listener explicitly ready, then let the 503 regression test
+    # replace this projection with an empty list.
+    monkeypatch.setattr(
+        type(journal_ingest.settings), "_load_registry_bots",
+        lambda self: [TelegramBotConfig(
+            name="journal", token="synthetic-token", chat_id="synthetic-chat",
+            persona="JOURNAL PERSONA PREAMBLE",
+        )],
     )
 
     calls = []
@@ -83,6 +96,24 @@ def _auth():
 
 
 class TestAuth:
+    def test_unready_telegram_journal_stays_503_with_credential_free_persona(
+        self, env,
+    ):
+        """Credential-free identity resolution must not open Telegram ingest."""
+        client, _, calls, monkeypatch = env
+
+        # The endpoint's Telegram readiness guard is deliberately independent
+        # from resolve_persona(), which serves HTTP/voice without tokens.
+        monkeypatch.setattr(
+            type(journal_ingest.settings), "_load_registry_bots",
+            lambda self: [],
+        )
+
+        resp = client.post("/api/journal/ingest", json=_payload(), headers=_auth())
+
+        assert resp.status_code == 503
+        assert calls == []
+
     def test_disabled_without_token(self, env):
         client, _, calls, monkeypatch = env
         monkeypatch.setattr(journal_ingest.settings, "journal_ingest_token", "")

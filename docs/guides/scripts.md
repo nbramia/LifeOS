@@ -1,7 +1,7 @@
 # Scripts Reference
 
 > **Status:** Complete
-> **Last Updated:** 2026-09-09
+> **Last Updated:** 2026-09-10
 > **Audience:** Operators
 
 Reference for the operator-facing scripts under `scripts/`, with usage examples. One-off CRM entity-repair scripts (`merge_people.py`, `split_person.py`, `fix_*`, etc.), git hooks, and Claude Code worktree/session-diagnostic helpers aren't covered here — they're self-documenting via `--help` or their own docstring.
@@ -22,7 +22,22 @@ Manage the LifeOS API server.
 ./scripts/server.sh wait       # Wait for server to become healthy
 ./scripts/server.sh preflight  # Check prerequisites before first start
 ./scripts/server.sh foreground # Start server in foreground (for systemd)
+./scripts/server.sh verify-runtime-evidence \
+  --expected-revision <full-commit-sha> \
+  --restart-evidence ~/.cache/lifeos/runtime-identities/restart-lifeos-api.json
 ```
+
+`verify-runtime-evidence` emits JSON and exits zero only when the requested
+full revision is present in startup-bound runtime identities under the local
+user cache, the machine-produced restart record succeeded, scoped health is
+observed, and the recorded prior running revision resolves to a usable
+rollback reference. Add `--services lifeos-api,lifeos-agent-worker` when a
+change includes the worker; the worker identity must include a live startup
+identity and heartbeat, so a healthy API cannot stand in for a stale or
+unavailable worker. The verifier supports API-only, worker-only, and combined
+records. Unknown, dirty, malformed, stale, or mismatched identities and
+missing evidence are reported as a non-zero result. `verify-deployed [sha]`
+checks checkout HEAD only and is not a running-process proof.
 
 **Important**: Always use this script. Never run `uvicorn` directly.
 
@@ -123,6 +138,11 @@ python scripts/verify_candidate.py local --source . --evidence-root /safe/eviden
   --lanes fast-unit,browser-free --workers 8 --capacity-max-run-workers 8 \
   --parallel-browser-free
 ```
+
+The verifier's stdout is one authoritative JSON receipt with an explicit
+`result` (`success` or `failure`) and an `evidence_key` linking it to the
+lane-attributable receipt under `--evidence-root`; pytest output is retained
+privately during execution and never prefixes that document.
 
 This is a reservation control, not proof that eight workers are safe. Retain
 the CPU-only environment safeguards, source/evidence identity, detached owner,

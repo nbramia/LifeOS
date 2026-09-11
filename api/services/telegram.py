@@ -1390,9 +1390,7 @@ class TelegramBotListener:
         update is enough to prevent further dispatch and surface
         'cancelled' in /agents.
         """
-        from api.services.agent_worker.session_store import (
-            STATUS_FAILED, TERMINAL_STATUSES, SessionStore,
-        )
+        from api.services.agent_worker.session_store import TERMINAL_STATUSES, SessionStore
         store = SessionStore()
         active = [
             s for s in store.list_sessions(routing="claude_code", limit=20)
@@ -1402,7 +1400,12 @@ class TelegramBotListener:
             await send_message_async("No active Claude Code session.", chat_id=chat_id)
             return
         for s in active:
-            store.update_status(s.task_id, STATUS_FAILED)
+            store.mark_cancelled(
+                s.task_id,
+                attempt_id=s.attempt_id,
+                turn_id=s.turn_id,
+                reason="operator requested cancellation",
+            )
         await send_message_async(
             f"Marked {len(active)} Claude Code session(s) cancelled.",
             chat_id=chat_id,
@@ -1461,9 +1464,7 @@ class TelegramBotListener:
         """Mark non-terminal routing='codex' sessions as FAILED — same
         contract as /claude_cancel (status flip, not a real subprocess kill).
         """
-        from api.services.agent_worker.session_store import (
-            STATUS_FAILED, TERMINAL_STATUSES, SessionStore,
-        )
+        from api.services.agent_worker.session_store import TERMINAL_STATUSES, SessionStore
         store = SessionStore()
         active = [
             s for s in store.list_sessions(routing="codex", limit=20)
@@ -1473,7 +1474,12 @@ class TelegramBotListener:
             await send_message_async("No active Codex session.", chat_id=chat_id)
             return
         for s in active:
-            store.update_status(s.task_id, STATUS_FAILED)
+            store.mark_cancelled(
+                s.task_id,
+                attempt_id=s.attempt_id,
+                turn_id=s.turn_id,
+                reason="operator requested cancellation",
+            )
         await send_message_async(
             f"Marked {len(active)} Codex session(s) cancelled.",
             chat_id=chat_id,

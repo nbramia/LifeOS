@@ -2,17 +2,17 @@
 
 Each persona is a markdown file: an optional YAML **frontmatter** block (machine-read config) followed by the **prose body** (the personality the model reads). The bot registry (`config/telegram_bots.json`) maps a bot `name` → its `persona_file`; this file owns *how the persona behaves*, the registry owns *routing* (token, chat, `orchestrates`). Frontmatter never duplicates registry fields.
 
-The loader (`settings._parse_persona`, used by `settings.telegram_bots`) strips the frontmatter and returns the **body only** as the system-prompt preamble — so the YAML never leaks into the prompt. The body is used **verbatim** (no `str.format`), so a persona may safely contain literal `{...}` examples (e.g. `fitness.md`).
+The loader (`settings._parse_persona`, used by the credential-free `settings.persona_definitions` view) strips the frontmatter and returns the **body only** as the system-prompt preamble — so the YAML never leaks into the prompt. The body is used **verbatim** (no `str.format`), so a persona may safely contain literal `{...}` examples (e.g. `fitness.md`). `settings.telegram_bots` is a separate token-gated runtime projection for listeners and outbound Telegram sends; a missing token does not hide a persona from HTTP or voice surfaces.
 
 ## Frontmatter (YAML, optional)
 
 | Field | Meaning |
 |---|---|
 | `id` | Should equal the bot `name` in `telegram_bots.json` (a mismatch logs a warning). |
-| `model` | **Reserved** — an optional per-persona model preference, parsed and stored on `TelegramBotConfig` but not yet read by any code path (the orchestrator resolves its model from `LIFEOS_ANTHROPIC_MODEL` + per-turn escalation). Setting it is currently a no-op. |
+| `model` | **Reserved** — an optional per-persona model preference, parsed and stored on the persona definition and Telegram projection but not yet read by any code path (the orchestrator resolves its model from `LIFEOS_ANTHROPIC_MODEL` + per-turn escalation). Setting it is currently a no-op. |
 | `voice` | A list of behaviour rules applied **only on voice (spoken) turns**; ignored for text. |
 
-The frontmatter holds **only what code acts on** — never real names, vault paths, or other personal values (the project's open-source rule; `/persona-check` enforces it). The schema leaves room to add hard tool allow-lists later (a `tools:` field) without restructuring.
+The frontmatter holds **only what code acts on** — never real names, vault paths, or other personal values (the project's open-source rule; `/persona-check` enforces it). Tool availability is not declared by persona frontmatter; capability projections, when enabled, come from registered and permitted runtime tools.
 
 A file with no leading `---` block loads whole — frontmatter is purely additive. A file that *starts* with a `---…---` block is always parsed as frontmatter (standard YAML-frontmatter semantics), so don't open a persona body with a raw `---` horizontal rule. A malformed frontmatter block doesn't crash loading — the loader logs a warning and falls back to using the raw file as the preamble.
 
@@ -36,7 +36,7 @@ The frontmatter is parsed and stripped; the body becomes the system-prompt pream
 - `voice` rules are applied on voice (spoken) turns and ignored on text turns.
 - `model` is **reserved** — stored but not read by any code path yet (see the field table above).
 
-Beyond the registry personas, `primary.md` carries the primary persona's personality, and a resolved **personal-context block** (partner / therapists / inner circle / folders, drawn from existing config — never hardcoded here) is composed for personas that need it. The schema's main open extension point is a hard tool allow-list (`tools:`), which is not parsed yet.
+Beyond the registry personas, `primary.md` carries the primary persona's personality, and a resolved **personal-context block** (partner / therapists / inner circle / folders, drawn from existing config — never hardcoded here) is composed for personas that need it. Telegram credentials and listener readiness remain runtime concerns rather than persona identity.
 
 ## Surface-specific variants
 

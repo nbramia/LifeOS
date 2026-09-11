@@ -8,6 +8,7 @@ at `/chat?conversation=<id>`. Stubs the backend entirely — no network call.
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 
 import httpx
@@ -25,6 +26,7 @@ from api.services.agent_worker.session_store import (
     SessionStore,
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
+from api.services.agent_worker.usage_ledger import UsageLedger
 from api.services.conversation_store import ConversationStore
 from api.services.usage_store import UsageStore
 
@@ -34,6 +36,19 @@ pytestmark = pytest.mark.unit
 
 def _sse(events: list[dict]) -> bytes:
     return b"".join(b"data: " + json.dumps(e).encode() + b"\n\n" for e in events)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_task_store(tmp_path, monkeypatch):
+    """Keep Hermes turn-context task reads in synthetic per-test stores."""
+    from api.services.task_manager import TaskManager
+    import api.services.task_manager as task_manager_mod
+
+    store = TaskManager(
+        vault_path=tmp_path / "vault",
+        index_path=tmp_path / "task_index.json",
+    )
+    monkeypatch.setattr(task_manager_mod, "_task_manager", store)
 
 
 class _FakeResponse:
@@ -144,6 +159,28 @@ def test_happy_path_completes_and_records_conversation_id(tmp_path, monkeypatch)
     # Envelope + bearer token present.
     assert captured["url"].endswith("/api/ask/stream")
     assert captured["headers"]["Authorization"] == "Bearer test-token"
+
+
+def test_board_turn_has_one_canonical_usage_observation_and_projection(tmp_path, monkeypatch):
+    body = _sse([
+        {"type": "conversation_id", "conversation_id": "conv-canonical"},
+        {"type": "content", "content": "answer"},
+        {"type": "usage", "model": "gpt-5.5", "input_tokens": 10, "output_tokens": 5, "cost_usd": 0.002},
+        {"type": "done"},
+    ])
+    executor, store, session, _ = _build(tmp_path, monkeypatch, body=body)
+    assert executor.execute(session, {"description": "question"}).status == STATUS_COMPLETED
+
+    with sqlite3.connect(store.db_path) as conn:
+        observation_count = conn.execute(
+            "SELECT COUNT(*) FROM usage_observations"
+        ).fetchone()[0]
+    assert observation_count == 1
+    usage = UsageStore(db_path=str(tmp_path / "usage.db"))
+    assert usage.get_usage_stats()["request_count"] == 1
+    UsageLedger(store.db_path).replay_projection(usage)
+    assert usage.get_usage_stats()["request_count"] == 1
+    assert usage.get_conversation_usage("conv-canonical")["input_tokens"] == 10
 
 
 def test_prompt_combines_title_and_notes(tmp_path, monkeypatch):

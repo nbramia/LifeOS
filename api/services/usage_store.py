@@ -25,6 +25,13 @@ class UsageRecord:
     output_tokens: int
     cost_usd: float
     conversation_id: Optional[str] = None
+    usage_key: Optional[str] = None
+    requested_engine: Optional[str] = None
+    requested_model: Optional[str] = None
+    served_engine: Optional[str] = None
+    served_model: Optional[str] = None
+    billing_class: str = "unknown"
+    evidence_source: str = "unknown"
 
 
 class UsageStore:
@@ -56,7 +63,14 @@ class UsageStore:
                     output_tokens INTEGER NOT NULL,
                     cost_usd REAL NOT NULL,
                     conversation_id TEXT,
-                    unpriced INTEGER NOT NULL DEFAULT 0
+                    unpriced INTEGER NOT NULL DEFAULT 0,
+                    usage_key TEXT,
+                    requested_engine TEXT,
+                    requested_model TEXT,
+                    served_engine TEXT,
+                    served_model TEXT,
+                    billing_class TEXT NOT NULL DEFAULT 'unknown',
+                    evidence_source TEXT NOT NULL DEFAULT 'unknown'
                 )
             """)
             conn.execute("""
@@ -79,6 +93,23 @@ class UsageStore:
                 conn.execute("ALTER TABLE usage ADD COLUMN unpriced INTEGER NOT NULL DEFAULT 0")
             except sqlite3.OperationalError:
                 pass  # column already exists (fresh db, or a prior run already migrated it)
+            for definition in (
+                "usage_key TEXT",
+                "requested_engine TEXT",
+                "requested_model TEXT",
+                "served_engine TEXT",
+                "served_model TEXT",
+                "billing_class TEXT NOT NULL DEFAULT 'unknown'",
+                "evidence_source TEXT NOT NULL DEFAULT 'unknown'",
+            ):
+                try:
+                    conn.execute(f"ALTER TABLE usage ADD COLUMN {definition}")
+                except sqlite3.OperationalError:
+                    pass
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_usage_key ON usage(usage_key) "
+                "WHERE usage_key IS NOT NULL"
+            )
             conn.commit()
 
     # Cutover note (#661, 2026-08-23): every native `/chat` turn recorded
@@ -100,6 +131,13 @@ class UsageStore:
         cost_usd: float,
         conversation_id: str = None,
         unpriced: bool = False,
+        usage_key: str = None,
+        requested_engine: str = None,
+        requested_model: str = None,
+        served_engine: str = None,
+        served_model: str = None,
+        billing_class: str = "unknown",
+        evidence_source: str = "unknown",
     ) -> int:
         """
         Record a usage entry.
@@ -143,15 +181,80 @@ class UsageStore:
         now = datetime.now().isoformat()
 
         with sqlite3.connect(self.db_path) as conn:
+            if usage_key:
+                # The unique usage-key index is the idempotency gate.  Begin
+                # the write transaction before INSERT OR IGNORE so two
+                # overlapping retries cannot both observe a missing key and
+                # materialize separate unkeyed rows before binding it.
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO usage (
+                        timestamp, model, input_tokens, output_tokens, cost_usd,
+                        conversation_id, unpriced, usage_key, requested_engine,
+                        requested_model, served_engine, served_model, billing_class,
+                        evidence_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (now, model, input_tokens, output_tokens, cost_usd, conversation_id,
+                     int(unpriced), usage_key, requested_engine, requested_model,
+                     served_engine, served_model, billing_class, evidence_source),
+                )
+                # Replay projection may correct the canonical totals, so keep
+                # the keyed row current while the same write lock is held.
+                conn.execute(
+                    """UPDATE usage SET timestamp=?, model=?, input_tokens=?, output_tokens=?,
+                       cost_usd=?, conversation_id=?, unpriced=?, requested_engine=?,
+                       requested_model=?, served_engine=?, served_model=?, billing_class=?,
+                       evidence_source=? WHERE usage_key=?""",
+                    (now, model, input_tokens, output_tokens, cost_usd, conversation_id,
+                     int(unpriced), requested_engine, requested_model, served_engine,
+                     served_model, billing_class, evidence_source, usage_key),
+                )
+                record_id = conn.execute(
+                    "SELECT id FROM usage WHERE usage_key = ?", (usage_key,)
+                ).fetchone()[0]
+                conn.commit()
+                return int(record_id)
+
             cursor = conn.execute(
                 """
-                INSERT INTO usage (timestamp, model, input_tokens, output_tokens, cost_usd, conversation_id, unpriced)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO usage (timestamp, model, input_tokens, output_tokens, cost_usd,
+                    conversation_id, unpriced, usage_key, requested_engine, requested_model,
+                    served_engine, served_model, billing_class, evidence_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (now, model, input_tokens, output_tokens, cost_usd, conversation_id, int(unpriced))
+                (now, model, input_tokens, output_tokens, cost_usd, conversation_id,
+                 int(unpriced), usage_key, requested_engine, requested_model, served_engine,
+                 served_model, billing_class, evidence_source),
             )
             conn.commit()
             return cursor.lastrowid
+
+    def bind_usage_key(self, record_id: int, usage_key: str) -> None:
+        """Attach a canonical ledger key to an already-written legacy row."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE usage SET usage_key=? WHERE id=? AND usage_key IS NULL",
+                (usage_key, record_id),
+            )
+            conn.commit()
+
+    def has_usage_key(self, usage_key: str) -> bool:
+        """Whether a canonical projection already materialized this key."""
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute(
+                "SELECT 1 FROM usage WHERE usage_key=? LIMIT 1", (usage_key,)
+            ).fetchone() is not None
+
+    def conversation_id_for_usage_key(self, usage_key: str) -> str | None:
+        """Return the legacy conversation binding for a projected usage key."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT conversation_id FROM usage WHERE usage_key=? LIMIT 1",
+                (usage_key,),
+            ).fetchone()
+        return row[0] if row else None
 
     def get_conversation_usage(self, conversation_id: Optional[str]) -> dict:
         """

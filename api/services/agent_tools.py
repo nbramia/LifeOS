@@ -580,6 +580,11 @@ TOOL_DEFINITIONS = [
                     "type": "boolean",
                     "description": "Enable (true) or pause (false) the schedule (for update).",
                 },
+                "persona_id": {"type": "string", "description": "Persona used for this schedule's agent prompt."},
+                "model_id": {"type": "string", "description": "Explicit executor model id."},
+                "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]},
+                "host": {"type": "string", "description": "Configured execution host."},
+                "working_dir": {"type": "string", "description": "Validated execution working directory."},
             },
             "required": ["action"],
         },
@@ -2398,6 +2403,11 @@ def _schedule_create(inp: dict) -> str:
         message_type=inp.get("message_type", "static" if action == "notify" else action),
         message_content=inp.get("message_content", ""),
         executor=inp.get("executor", ""),
+        persona_id=inp.get("persona_id", ""),
+        model_id=inp.get("model_id", ""),
+        effort=inp.get("effort", ""),
+        host=inp.get("host", ""),
+        working_dir=inp.get("working_dir", ""),
     )
     label = f"{action} (#{entry.executor})" if action == "agent" and entry.executor else action
     return (f"Schedule created: \"{entry.name}\" (id: {entry.id}, action: {label}, "
@@ -2428,7 +2438,8 @@ def _schedule_update(inp: dict) -> str:
     # schedule's own action is passed as `schedule_action`, not `action`.
     fields = {
         key: inp[key]
-        for key in ("name", "schedule_type", "schedule_value", "message_content", "executor", "enabled")
+        for key in ("name", "schedule_type", "schedule_value", "message_content", "executor", "enabled",
+                    "persona_id", "model_id", "effort", "host", "working_dir")
         if inp.get(key) is not None
     }
     if inp.get("schedule_action") is not None:
@@ -3141,21 +3152,23 @@ def _workout_readiness(inp: dict) -> str:
     return "\n".join(lines)
 
 
+_WORKOUT_ACTION_HANDLERS = {
+    "log": _workout_log,
+    "update": _workout_update,
+    "list": _workout_list,
+    "history": _workout_history,
+    "summary": _workout_summary,
+    "log_metric": _workout_log_metric,
+    "metrics": _workout_metrics,
+    "get_profile": _workout_get_profile,
+    "set_profile": _workout_set_profile,
+    "readiness": _workout_readiness,
+}
+
+
 def _tool_manage_workouts(inp: dict) -> str:
     action = inp.get("action")
-    handlers = {
-        "log": _workout_log,
-        "update": _workout_update,
-        "list": _workout_list,
-        "history": _workout_history,
-        "summary": _workout_summary,
-        "log_metric": _workout_log_metric,
-        "metrics": _workout_metrics,
-        "get_profile": _workout_get_profile,
-        "set_profile": _workout_set_profile,
-        "readiness": _workout_readiness,
-    }
-    handler = handlers.get(action)
+    handler = _WORKOUT_ACTION_HANDLERS.get(action)
     if not handler:
         return f"Error: Unknown manage_workouts action '{action}'"
     result = handler(inp)

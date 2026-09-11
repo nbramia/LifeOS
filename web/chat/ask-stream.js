@@ -209,7 +209,7 @@ export async function sendMessage() {
           // `claude_code` model pick is itself the handoff opt-in, so it
           // bypasses the persona gate; inferred intents still require a
           // handoff-capable persona.
-          if (personaSupportsHandoff() || config.model === 'claude_code') {
+          if (personaSupportsHandoff() || config.model === 'claude_code' || data.execution) {
             const engine = data.engine || 'claude_code';
             const label = engine === 'codex' ? 'Codex' : 'Claude Code';
             fullContent = '🤝 Handing off to ' + label + '…';
@@ -227,6 +227,7 @@ export async function sendMessage() {
                 engine: engine,
                 task: data.task || '',
                 conversation_id: handoffConversationId,
+                ...(data.execution ? { execution: data.execution } : {}),
               }),
             }).then(r => r.json()).then(d => {
               fullContent = (d && d.message)

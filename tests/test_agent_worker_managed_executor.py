@@ -6,6 +6,7 @@ state machine transitions — without depending on the API surface.
 """
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ import pytest
 from api.services.agent_worker.managed_driver import ManagedSessionState
 from api.services.agent_worker.managed_executor import ManagedExecutor
 from api.services.agent_worker.session_store import (
+    STATUS_CLAIMED,
     STATUS_BUDGET_EXCEEDED,
     STATUS_COMPLETED,
     STATUS_FAILED,
@@ -20,6 +22,7 @@ from api.services.agent_worker.session_store import (
     SessionStore,
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
+from api.services.agent_worker.usage_ledger import UsageLedger
 
 
 AGENT_ID = "agent_test"
@@ -345,6 +348,38 @@ def test_poll_uses_since_cursor_on_subsequent_calls(stores):
     assert driver.poll_calls == [("sess_remote", None), ("sess_remote", "evt_1")]
 
 
+@pytest.mark.unit
+def test_stale_poll_cannot_write_reopened_attempt(stores):
+    """A poll from a cancelled attempt cannot move cursor, text, counters, or status."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    old = store.begin_executor_turn("t1", "start", session=store.get("t1"))
+    store.update_status("t1", STATUS_FAILED, attempt_id=old.attempt_id, turn_id=old.turn_id)
+    reopened = store.begin_new_execution("t1")
+    store.update_status("t1", STATUS_CLAIMED, attempt_id=reopened.attempt_id)
+
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="idle", last_event_id="old_evt",
+            new_events=[{"id": "old_evt", "type": "agent.message"}],
+            total_input_tokens=100, total_output_tokens=50,
+            final_text="old final",
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.poll(old)
+
+    current = store.get("t1")
+    assert outcome.status == STATUS_RUNNING
+    assert current.attempt_id == reopened.attempt_id
+    assert current.status == STATUS_CLAIMED
+    assert current.total_input_tokens == 0
+    assert current.total_output_tokens == 0
+    assert store.get_managed_last_event_id("t1") is None
+    assert store.get_managed_final_text("t1") is None
+    assert not any(e["kind"] == "managed_completed" for e in transcript.read(session.session_id))
+
+
 # ---------------------------------------------------------------------------
 # poll() — terminal states
 # ---------------------------------------------------------------------------
@@ -458,6 +493,48 @@ def test_poll_finalizes_completed(stores):
     assert outcome.final_text == "The answer is 42."
     assert store.get("t1").status == STATUS_COMPLETED
 
+    turn_id = session.turn_id or f"legacy:{session.session_id}:turn"
+    usage_key = f"{session.session_id}:{session.attempt_id}:{turn_id}"
+    usage = UsageLedger(store.db_path).get(usage_key)
+    assert usage["requested_engine"] == "claude"
+    assert usage["requested_model"] == "claude-sonnet-4-6"
+    assert usage["served_engine"] is None
+    assert usage["served_model"] is None
+
+
+@pytest.mark.unit
+def test_managed_cancellation_wins_before_terminal_backfill_completion(stores):
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="completed",
+            last_event_id="evt_done",
+            new_events=[{"id": "evt_done", "type": "session.status_idle", "payload": {}}],
+            total_input_tokens=2, total_output_tokens=1,
+            final_text="late managed result",
+        ),
+    ])
+    original_update = store.update_status
+
+    def cancel_before_success(task_id, status, **kwargs):
+        if status == STATUS_COMPLETED:
+            assert store.mark_cancelled(
+                task_id,
+                attempt_id=kwargs["attempt_id"],
+                turn_id=kwargs["turn_id"],
+                reason="operator requested",
+            )
+        return original_update(task_id, status, **kwargs)
+
+    store.update_status = cancel_before_success
+    outcome = _make_executor(store, transcript, driver).poll(session)
+
+    assert outcome.status == STATUS_FAILED
+    assert store.get("t1").status == STATUS_FAILED
+    assert not any(e["kind"] == "managed_completed" for e in transcript.read(session.session_id))
+
 
 @pytest.mark.unit
 def test_poll_propagates_init_failed_mcps_to_outcome(stores):
@@ -549,6 +626,69 @@ def test_poll_carries_final_text_forward_across_cursor_batches(stores):
     out2 = executor.poll(session)
     assert out2.status == STATUS_COMPLETED
     assert out2.final_text == "The carried-forward answer."
+
+
+@pytest.mark.unit
+def test_resumed_turn_books_only_new_provider_cumulative_usage(stores):
+    """Managed provider totals span turns; a new local turn gets only the
+    provider delta and remains monotonic when the provider total advances."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="completed", last_event_id="evt_1",
+            new_events=[], total_input_tokens=10, total_output_tokens=2,
+        ),
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_2",
+            new_events=[], total_input_tokens=15, total_output_tokens=3,
+        ),
+        ManagedSessionState(
+            session_id="sess_remote", status="completed", last_event_id="evt_3",
+            new_events=[], total_input_tokens=20, total_output_tokens=4,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+    executor.poll(session)
+    first = store.get("t1")
+    assert (first.total_input_tokens, first.total_output_tokens) == (10, 2)
+
+    resumed = store.begin_new_execution("t1")
+    store.update_status("t1", STATUS_RUNNING, attempt_id=resumed.attempt_id, turn_id=None)
+    # Follow-up turns on the existing remote provider session retain its id.
+    resumed = store.get("t1")
+    executor.poll(resumed)
+    executor.poll(store.get("t1"))
+    final = store.get("t1")
+    assert (final.total_input_tokens, final.total_output_tokens) == (20, 4)
+
+    with sqlite3.connect(store.db_path) as conn:
+        rows = conn.execute(
+            "SELECT input_tokens, output_tokens FROM usage_ledger ORDER BY first_observed_at"
+        ).fetchall()
+    assert rows == [(10, 2), (10, 2)]
+
+
+@pytest.mark.unit
+def test_managed_cursor_reset_preserves_session_hour_overhead(stores):
+    store, session, _ = stores
+    current = store.begin_executor_turn("t1", "start", session=session)
+    store.set_accrued_session_hour_dollars(
+        "t1", 0.0375, attempt_id=current.attempt_id, turn_id=current.turn_id,
+    )
+    store.set_managed_last_event_id(
+        "t1", "old-event", attempt_id=current.attempt_id, turn_id=current.turn_id,
+    )
+    assert store.reset_managed_cursor(
+        "t1", attempt_id=current.attempt_id, turn_id=current.turn_id,
+    )
+    assert store.get_accrued_session_hour_dollars(
+        "t1", attempt_id=current.attempt_id, turn_id=current.turn_id,
+    ) == pytest.approx(0.0375)
+    assert store.get_managed_last_event_id(
+        "t1", attempt_id=current.attempt_id, turn_id=current.turn_id,
+    ) is None
 
 
 @pytest.mark.unit

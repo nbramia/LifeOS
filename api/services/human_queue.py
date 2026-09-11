@@ -244,7 +244,46 @@ def resolve_card(id_or_key: str, note: Optional[str] = None) -> Optional[Task]:
 
     resolution = f"Resolved: {note}" if note else "Resolved."
     new_notes = f"{card.notes}\n\n{resolution}" if card.notes else resolution
-    return get_task_manager().update(card.id, status="done", notes=new_notes)
+    resolved = get_task_manager().update(card.id, status="done", notes=new_notes)
+    if resolved is not None:
+        _wake_linked_waits(card.id)
+    return resolved
+
+
+def _wake_linked_waits(card_id: str) -> None:
+    """Wake each eligible attempt linked to a resolved human card once.
+
+    This is intentionally best-effort and internal: an unlinked card remains
+    fire-and-forget, while a transient SQLite/task write failure is retried by
+    the next resolver/worker observation rather than changing card semantics.
+    """
+    from api.services.agent_worker.session_store import (
+        SessionStore, TERMINAL_STATUSES, WAIT_OPERATOR,
+    )
+
+    sessions = SessionStore()
+    for wait in sessions.list_open_waits(card_id=card_id):
+        if wait.get("wait_type") != WAIT_OPERATOR:
+            # Provider/dependency waits are machine-owned and must never be
+            # woken by an operator card resolution.
+            continue
+        try:
+            dependencies = json.loads(wait.get("dependencies_json") or "[]")
+        except (TypeError, ValueError):
+            dependencies = []
+        # Keep the wait open until every linked card/dependency is resolved;
+        # otherwise resolving the remaining cards could never discover it.
+        if not sessions.dependencies_satisfied(dependencies):
+            continue
+        if not sessions.mark_wait_resolved(wait["wait_id"]):
+            continue
+        session = sessions.get(wait["task_id"])
+        if session is None or session.status in TERMINAL_STATUSES:
+            continue
+        # The worker owns the wake projection. Leaving wake_enqueued false lets
+        # it enqueue and replay this row after a crash between resolve and
+        # delivery; task/session writes therefore share its lifecycle CAS seam
+        # instead of racing direct Markdown/session mutations here.
 
 
 def _age_hours(task: Task, now: Optional[datetime] = None) -> Optional[float]:

@@ -41,6 +41,7 @@ from api.services.agent_worker.session_store import (
     SessionStore,
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
+from api.services.agent_worker.usage_ledger import UsageLedger
 from config.settings import settings
 
 
@@ -369,6 +370,21 @@ class ClaudeCodeExecutor:
     # Public API
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _with_identity(session, outcome: ExecutorOutcome) -> ExecutorOutcome:
+        from dataclasses import replace
+        return replace(
+            outcome,
+            session_id=getattr(outcome, "session_id", None) or session.session_id,
+            attempt_id=getattr(outcome, "attempt_id", None) or session.attempt_id,
+            turn_id=getattr(outcome, "turn_id", None) or session.turn_id,
+            executor="claude_code",
+            continuation_id=(
+                getattr(outcome, "continuation_id", None)
+                or session.claude_code_session_id
+            ),
+        )
+
     def execute(self, session, task: dict) -> ExecutorOutcome:
         """Drive a fresh /claude session.
 
@@ -381,18 +397,22 @@ class ClaudeCodeExecutor:
             self.transcript_store.append(session.session_id, "claude_code_no_prompt", {})
             return ExecutorOutcome(status=STATUS_FAILED, reason="empty prompt")
 
+        session = self.session_store.begin_executor_turn(
+            session.task_id, "execute", session=session,
+        )
+
         plan_mode = bool(task.get("plan_mode"))
         if plan_mode:
             prompt = _PLAN_PREFIX + prompt
 
         working_dir = task.get("working_dir") or os.getcwd()
-        return self._run(
+        return self._with_identity(session, self._run(
             session=session,
             prompt=prompt,
             working_dir=working_dir,
             resume_session_id=None,
             plan_mode=plan_mode,
-        )
+        ))
 
     def resume(self, session, message: str, working_dir: Optional[str] = None) -> ExecutorOutcome:
         """Resume a previously-completed /claude session by passing
@@ -407,14 +427,17 @@ class ClaudeCodeExecutor:
                 session.session_id, "claude_code_resume_no_session_id", {},
             )
             return ExecutorOutcome(status=STATUS_FAILED, reason="no claude_code_session_id on record")
+        session = self.session_store.begin_executor_turn(
+            session.task_id, "resume", session=session,
+        )
         wd = working_dir or os.getcwd()
-        return self._run(
+        return self._with_identity(session, self._run(
             session=session,
             prompt=message,
             working_dir=wd,
             resume_session_id=resume_id,
             plan_mode=False,
-        )
+        ))
 
     # ------------------------------------------------------------------
     # Internal lifecycle
@@ -425,7 +448,7 @@ class ClaudeCodeExecutor:
         prompt: str,
         resume_session_id: Optional[str],
         session_id: str = "",
-        model: str = "opus",
+        model: Optional[str] = None,
         is_child: bool = False,
         effort: Optional[str] = None,
     ) -> list[str]:
@@ -439,7 +462,6 @@ class ClaudeCodeExecutor:
             "-p", prompt,
             "--output-format", "stream-json",
             "--verbose",
-            "--model", model,
             "--max-turns", str(settings.claude_max_turns),
             "--dangerously-skip-permissions",
             "--chrome",
@@ -461,6 +483,8 @@ class ClaudeCodeExecutor:
                 ),
             ),
         ]
+        if model:
+            cmd.extend(["--model", model])
         if resume_session_id:
             cmd.extend(["-r", resume_session_id])
         # (#851) Board-assigned effort, mapped to the CLI's own vocabulary.
@@ -472,7 +496,7 @@ class ClaudeCodeExecutor:
         return cmd
 
     @staticmethod
-    def _clean_env() -> dict:
+    def _clean_env(session_id: str | None = None) -> dict:
         """The subprocess environment, with every alternate auth source removed.
 
         Two problems, one mechanism. ``CLAUDE*`` would leak the operator's
@@ -489,10 +513,15 @@ class ClaudeCodeExecutor:
         flag that means "use the subscription". The only way to guarantee a
         session cannot bill the API is to leave it no credential to find.
         """
-        return {
+        env = {
             k: v for k, v in os.environ.items()
             if not k.startswith(_ALTERNATE_AUTH_ENV_PREFIXES)
         }
+        if session_id:
+            # mcp_server.py derives stdio caller identity from this process-
+            # bound value; the model cannot choose another session id.
+            env["LIFEOS_AGENT_SESSION_ID"] = session_id
+        return env
 
     @staticmethod
     def _remote_unset_env_names() -> list[str]:
@@ -537,7 +566,7 @@ class ClaudeCodeExecutor:
             # `worker._dispatch`) — it must win over `claude_code_model`,
             # which only exists for the child-spawn escalation tier
             # (#349/#578) and was never populated by a board assignment.
-            model=getattr(session, "model", None) or session.claude_code_model or "opus",
+            model=getattr(session, "model", None) or session.claude_code_model,
             is_child=bool(session.parent_session_id),
             effort=getattr(session, "effort", None),
         )
@@ -558,6 +587,7 @@ class ClaudeCodeExecutor:
                 cmd,
                 target=target,
                 unset_env_names=self._remote_unset_env_names(),
+                session_id=sid,
             )
 
         self.transcript_store.append(sid, "claude_code_spawn", {
@@ -575,7 +605,7 @@ class ClaudeCodeExecutor:
                 stderr=subprocess.PIPE,
                 cwd=working_dir,
                 text=True,
-                env=self._clean_env(),
+                env=self._clean_env(sid),
                 # #379: own session/process-group leader so the operator kill can
                 # `os.killpg(pgid, ...)` the CLI + every child it spawns WITHOUT
                 # touching this worker process (which shares the worker's group).
@@ -594,7 +624,10 @@ class ClaudeCodeExecutor:
         # Worker may have created the session in CLAIMED state. Move it to
         # RUNNING for the duration of the subprocess so an /agents-page
         # observer sees the correct status.
-        self.session_store.update_status(session.task_id, STATUS_RUNNING)
+        self.session_store.update_status(
+            session.task_id, STATUS_RUNNING,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
 
         if is_remote:
             # (#851) The remote wrapper echoes `PGID:<n>` as its very first
@@ -632,14 +665,20 @@ class ClaudeCodeExecutor:
                     self.transcript_store.append(sid, "claude_code_remote_unresponsive", {
                         "host": host, "deadline_seconds": deadline,
                     })
-                    self.session_store.update_status(session.task_id, STATUS_FAILED)
+                    self.session_store.update_status(
+                        session.task_id, STATUS_FAILED,
+                        attempt_id=session.attempt_id, turn_id=session.turn_id,
+                    )
                     return ExecutorOutcome(
                         status=STATUS_FAILED,
                         reason=f"host {host} did not answer within {deadline}s",
                     )
                 pgid = read_remote_pgid_line(first_line)
             if pgid is not None:
-                self.session_store.set_remote_pgid(session.task_id, pgid)
+                self.session_store.set_remote_pgid(
+                    session.task_id, pgid,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 self.transcript_store.append(sid, "claude_code_pid", {
                     "pid": proc.pid, "pgid": pgid, "remote": True, "host": host,
                 })
@@ -685,6 +724,7 @@ class ClaudeCodeExecutor:
         finally:
             watchdog.cancel()
             stop_heartbeat.set()
+        self._record_usage(session, state)
 
         # #379: the kill endpoint flips status to FAILED and signals our
         # subprocess. If the row is already FAILED *and the subprocess did not
@@ -702,19 +742,32 @@ class ClaudeCodeExecutor:
         # COMPLETED path so its final_text is persisted (a parent reads it via
         # _child_final_text), even if a cascade raced the FAILED flip in.
         current = self.session_store.get(session.task_id)
+        if self.session_store.is_cancelled(
+            session.task_id, session.attempt_id, session.turn_id,
+        ):
+            self.transcript_store.append(sid, "claude_code_killed", {
+                "returncode": proc.returncode, "reason": "cancelled",
+            })
+            return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED)
         if current is not None and current.status == STATUS_FAILED and proc.returncode != 0:
             self.transcript_store.append(sid, "claude_code_killed", {"returncode": proc.returncode})
             return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED)
 
         if timed_out.is_set():
-            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            self.session_store.update_status(
+                session.task_id, STATUS_FAILED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             self.transcript_store.append(sid, "claude_code_timeout", {
                 "timeout_seconds": self._timeout,
             })
             return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_TIMEOUT)
 
         if state.awaiting_clarification:
-            self.session_store.update_status(session.task_id, STATUS_BLOCKED)
+            self.session_store.update_status(
+                session.task_id, STATUS_BLOCKED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             self.transcript_store.append(sid, "claude_code_awaiting_clarification", {
                 "question_chars": len(state.pending_clarification),
             })
@@ -725,7 +778,10 @@ class ClaudeCodeExecutor:
             )
 
         if state.awaiting_goal:
-            self.session_store.update_status(session.task_id, STATUS_BLOCKED)
+            self.session_store.update_status(
+                session.task_id, STATUS_BLOCKED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             self.transcript_store.append(sid, "claude_code_awaiting_goal_approval", {
                 "condition": state.pending_goal, "condition_chars": len(state.pending_goal),
             })
@@ -736,7 +792,10 @@ class ClaudeCodeExecutor:
             )
 
         if state.awaiting_approval:
-            self.session_store.update_status(session.task_id, STATUS_BLOCKED)
+            self.session_store.update_status(
+                session.task_id, STATUS_BLOCKED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             self.transcript_store.append(sid, "claude_code_awaiting_plan_approval", {
                 "plan_chars": len(state.plan_text),
             })
@@ -749,7 +808,19 @@ class ClaudeCodeExecutor:
         if proc.returncode == 0 or state.terminal:
             final_text = self._effective_final_text(state)
             exit_meta = self._exit_metadata(proc, timed_out, state)
-            self.session_store.update_status(session.task_id, STATUS_COMPLETED)
+            completed = self.session_store.update_status(
+                session.task_id, STATUS_COMPLETED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
+            if not completed:
+                if self.session_store.is_cancelled(
+                    session.task_id, session.attempt_id, session.turn_id,
+                ):
+                    self.transcript_store.append(sid, "claude_code_killed", {
+                        "returncode": proc.returncode, "reason": "cancelled",
+                    })
+                    return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED)
+                return ExecutorOutcome(status=STATUS_RUNNING, reason="stale CLI turn")
             self.transcript_store.append(sid, "claude_code_completed", {
                 "cost_usd": state.cost_usd,
                 "notifications_sent": state.notifications_sent,
@@ -776,7 +847,10 @@ class ClaudeCodeExecutor:
             stderr_tail = (proc.stderr.read() if proc.stderr else "") or ""
         except Exception:
             pass
-        self.session_store.update_status(session.task_id, STATUS_FAILED)
+        self.session_store.update_status(
+            session.task_id, STATUS_FAILED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         self.transcript_store.append(sid, "claude_code_failed", {
             "returncode": proc.returncode,
             "stderr_tail": stderr_tail[-500:],
@@ -796,6 +870,22 @@ class ClaudeCodeExecutor:
             status=STATUS_FAILED,
             reason=reason,
         )
+
+    def _record_usage(self, session, state: _RunState) -> None:
+        """Record subscription-backed CLI cost as an estimate, never metered spend."""
+        try:
+            ledger = UsageLedger(self.session_store.db_path)
+            ledger.record_cli_usage(
+                session,
+                source="claude_code_executor",
+                input_tokens=0,
+                output_tokens=0,
+                estimated_cost_usd=state.cost_usd if state.cost_usd > 0 else None,
+                source_event_id=state.session_id,
+                event_id=f"claude_code:{session.session_id}:{state.session_id or 'unknown'}",
+            )
+        except Exception:  # noqa: BLE001 — accounting cannot alter executor outcome
+            logger.warning("Claude Code usage ledger write failed for %s", session.task_id, exc_info=True)
 
     # ------------------------------------------------------------------
     # Stream parsing
@@ -832,7 +922,10 @@ class ClaudeCodeExecutor:
                 state.session_id = cli_session_id
                 # Persist immediately so a worker crash mid-session still
                 # leaves enough state to resume via `-r <claude_code_session_id>`.
-                self.session_store.set_claude_code_session_id(session.task_id, cli_session_id)
+                self.session_store.set_claude_code_session_id(
+                    session.task_id, cli_session_id,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
                 self.transcript_store.append(sid, "claude_code_init", {
                     "claude_code_session_id": cli_session_id,
                 })
@@ -958,7 +1051,10 @@ class ClaudeCodeExecutor:
         cli_session_id = event.get("session_id") or state.session_id
         if cli_session_id and cli_session_id != state.session_id:
             state.session_id = cli_session_id
-            self.session_store.set_claude_code_session_id(session.task_id, cli_session_id)
+            self.session_store.set_claude_code_session_id(
+                session.task_id, cli_session_id,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
 
         # Track cost for /agents reporting, but DON'T cap it — the Claude Code
         # route is subscription-billed, so there's no marginal per-task cost to

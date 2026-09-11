@@ -817,6 +817,40 @@ class TestActionDispatch:
         assert fake_tm.create.call_args.kwargs["tags"] == ["agent"]
 
     @pytest.mark.asyncio
+    async def test_manual_agent_request_key_is_idempotent(self, scheduler):
+        entry = scheduler.store.create(
+            name="Manual", schedule_type="cron", schedule_value="0 9 * * *",
+            action="agent", executor="local", message_content="do it",
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="manual-task")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry, manual=True, request_key="req-1")
+            await scheduler._fire_entry(entry, manual=True, request_key="req-1")
+        fake_tm.create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dispatched_occurrence_reconciles_and_advances_schedule(self, scheduler):
+        """Recovery of a linked handoff must not return before mark_triggered."""
+        entry = scheduler.store.create(
+            name="Recover once", schedule_type="once",
+            schedule_value="2999-01-01T09:00:00",
+            action="agent", executor="local", message_content="recover me",
+        )
+        scheduled_for = entry.next_trigger_at or entry.schedule_value
+        key = scheduler.session_store.occurrence_key_for(entry.id, scheduled_for)
+        scheduler.session_store.ensure_occurrence(entry.id, scheduled_for, occurrence_key=key)
+        scheduler.session_store.link_occurrence(key, task_id="recovered-task")
+
+        await scheduler._fire_entry(entry)
+
+        refreshed = scheduler.store.get(entry.id)
+        assert refreshed.enabled is False
+        assert refreshed.next_trigger_at is None
+        assert refreshed.last_status == "handed-off"
+        assert "recovered-task" in refreshed.last_result
+
+    @pytest.mark.asyncio
     async def test_run_history_surfaced_in_dashboard(self, scheduler):
         entry = scheduler.store.create(
             name="Briefing", schedule_type="cron", schedule_value="0 9 * * *",

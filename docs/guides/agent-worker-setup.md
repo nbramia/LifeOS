@@ -261,9 +261,13 @@ system: |-
   `lifeos_agent_yield_until` (pause until children finish — preferred
   over polling, no idle billing), `lifeos_agent_kill` (terminate),
   `lifeos_agent_transcript_read`, `lifeos_agent_sessions_list`,
-  `lifeos_agent_user_ask`. Every one of these tools requires
-  `caller_session_id` — pass the `lifeos_session_id` value from the
-  task brief above verbatim, on every inter-agent call.
+  `lifeos_agent_user_ask`, `lifeos_agent_execution_override` (temporary
+  future-resolution route/model/effort/host selection). Every one of these tools requires
+  `caller_session_id` and `caller_proof` — pass the `lifeos_session_id` and
+  `lifeos_session_proof` values from the task brief above verbatim, on every
+  inter-agent call. Stdio MCP derives the identity from its worker process;
+  HTTP MCP verifies the proof against the authenticated transport secret, so
+  a bare caller-supplied session id cannot impersonate another session.
   </inter_agent>
 
   <thinking>
@@ -533,7 +537,11 @@ credential names (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
 `OPENAI_API_KEY`, and a few others) regardless of what this API host's own
 environment contains, but names beyond that list exported by a registered
 host's own non-interactive shell are not stripped — keep provider
-credentials out of a registered host's shell startup files.
+credentials out of a registered host's shell startup files. It explicitly
+sets the trusted `LIFEOS_AGENT_SESSION_ID` on the remote CLI command because
+SSH does not forward arbitrary environment variables; the CLI's stdio MCP
+child inherits that process-bound identity for inter-agent calls. No API
+credential or MCP bearer secret is forwarded as part of this identity.
 
 **Connect timeout.** `LIFEOS_AGENT_SSH_CONNECT_TIMEOUT` (default 10
 seconds) bounds how long ssh may spend establishing the connection before

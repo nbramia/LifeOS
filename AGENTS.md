@@ -232,7 +232,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | `api/services/perf_trace.py` | Request-level performance tracing (spans, SQLite) |
 | `api/routes/perf.py` | Performance trace query API |
 | `api/services/agent_worker/` | Autonomous worker for engine-assigned tasks (local Gemma or cloud Claude via Managed Agents) |
-| `mcp_server.py` | MCP server — stdio for Claude Code + HTTP transport for Managed Agents (67 tools: 59 from `CURATED_ENDPOINTS` plus 8 `lifeos_agent_*` tools registered separately by `_register_inter_agent_tools()` from `INTER_AGENT_TOOL_SCHEMAS`) |
+| `mcp_server.py` | MCP server — stdio for Claude Code + HTTP transport for Managed Agents (68 tools: 59 from `CURATED_ENDPOINTS` plus 9 `lifeos_agent_*` tools registered separately by `_register_inter_agent_tools()` from `INTER_AGENT_TOOL_SCHEMAS`) |
 | `tests/test_perf_benchmark.py` | Benchmark suite for query performance and quality |
 
 | Script | Purpose |

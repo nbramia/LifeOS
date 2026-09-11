@@ -45,6 +45,7 @@ Hermes rather than run one.
 """
 
 import hmac
+import hashlib
 import json
 import logging
 import re
@@ -69,7 +70,14 @@ from api.services.conversation_titler import schedule_retitle
 from api.services.hermes_persona_thread_store import get_persona_thread_store
 from api.services.journal_capture import JOURNAL_PERSONA_ID
 from api.services.model_readout import record_hermes_chat_turn_model
+from api.services.persona_capabilities import project_persona_tool_capabilities
 from api.services.usage_store import get_usage_store
+from api.services.agent_worker.usage_ledger import (
+    MEASURED,
+    UNKNOWN,
+    UsageLedger,
+    UsageObservation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +87,39 @@ logger = logging.getLogger(__name__)
 # costs nothing and the native path's own ids (uuid4, 36 chars) are nowhere
 # near it.
 _MAX_CONVERSATION_ID_LEN = 200
+
+
+def _stable_proxy_turn_id(
+    *,
+    question: str,
+    client_turn_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+) -> str:
+    """Derive one proxy identity for one logical client turn.
+
+    Hermes retries construct a fresh persister, so a per-persister UUID would
+    turn a replay into a second canonical usage key. The client turn key is
+    the preferred identity; conversation/question and any supplied attempt
+    context keep the fallback deterministic while keeping distinct logical
+    turns separate. Values are hashed because this identity is also persisted
+    in the canonical ledger and must not expose arbitrary request text.
+    """
+    context = {
+        "client_turn_id": client_turn_id,
+        "conversation_id": conversation_id,
+        "attempt_id": attempt_id,
+        "turn_id": turn_id,
+    }
+    # Once the caller supplied an id, that opaque id is the logical turn
+    # identity. A retry may differ in incidental payload fields while still
+    # being the same turn. Without one, retain the question as the best
+    # available distinction between two turns in one conversation.
+    if client_turn_id is None:
+        context["question"] = question
+    raw = json.dumps(context, sort_keys=True, separators=(",", ":"))
+    return f"proxy-turn:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
 
 
 def _coerce_token_count(value: object) -> Optional[int]:
@@ -185,6 +226,10 @@ def _resolve_lifeos_context(
     # that doesn't know this key ignores it exactly as it would any other
     # unrecognized field.
     turn["caller_session_id"] = _resolve_caller_session_id(conversation_id, persona_id)
+    tool_capabilities = [
+        capability.as_envelope()
+        for capability in project_persona_tool_capabilities(persona_id)
+    ]
 
     return {
         "schema_version": 1,
@@ -211,6 +256,11 @@ def _resolve_lifeos_context(
             # writing — `nbramia/hermes#57` makes that informational instead.
             # THIS MERGE IS GATED ON hermes#57 shipping and deploying first.
             "orchestrates": settings.persona_orchestrates(persona_id),
+            # Additive at schema_version 1. This is a stable capability
+            # projection for the resolved persona, not listener readiness and
+            # not a prompt-derived permission grant. An absent list means
+            # that no capabilities are claimed.
+            "tool_capabilities": tool_capabilities,
         },
         # A sibling of `persona`, never merged into it (#591) — `persona` is
         # stable across a conversation and cacheable; `turn` changes every
@@ -391,16 +441,22 @@ class _HermesTurnPersister:
     upstream connection itself ending before a `done` event ever arrived
     (Hermes crashed, was killed, or the connection dropped mid-turn) — this
     class can't tell that apart from an ordinary network hiccup on its own,
-    so it tracks only whether `done` was observed and lets `finalize()`
-    decide: seen it, persist verbatim (as always); never saw it, append
-    `TRUNCATION_MARKER` and mark `routing.truncated` — the same visible
-    signal the native path gives a cancelled/errored turn, via the same
-    `truncation_routing()` helper.
+    so it tracks whether `done` was observed and whether Hermes reported an
+    error, then lets `finalize()` decide: a clean done persists verbatim (as
+    always); a missing done or reported error appends `TRUNCATION_MARKER`
+    and marks `routing.truncated` — the same visible signal the native path
+    gives a cancelled/errored turn, via the same `truncation_routing()`
+    helper.
     """
 
     _FRAME_SEP = b"\n\n"
 
-    def __init__(self, *, question: str, persona_id: str):
+    def __init__(
+        self, *, question: str, persona_id: str, write_guard=None,
+        persist_usage: bool = True, client_turn_id: Optional[str] = None,
+        request_conversation_id: Optional[str] = None,
+        attempt_id: Optional[str] = None, turn_id: Optional[str] = None,
+    ):
         self._question = question
         self._persona_id = persona_id
         self._buf = b""
@@ -418,6 +474,9 @@ class _HermesTurnPersister:
         # a genuine truncation, distinct from #592's disconnect-truncation
         # (which #611 eliminated for this class).
         self._done_seen = False
+        # Whether Hermes reported a stream error. Keep this in the shared
+        # persister so callers do not duplicate SSE protocol parsing.
+        self._error_seen = False
         # #611: the ChatTurn this persister's turn is registered under, once
         # `_proxy.py`'s detached pump has one to hand it (bind_turn() is
         # called right after construction, before any observe()). Kept so
@@ -427,6 +486,23 @@ class _HermesTurnPersister:
         # brand-new conversation, just triggered by an observed frame here
         # instead of a locally-created row.
         self._turn = None
+        # Worker-owned turns pass an attempt/turn guard so a late stream from
+        # an older attempt cannot append into a newer conversation.  The
+        # browser proxy does not need one and keeps the legacy None behavior.
+        self._write_guard = write_guard
+        # Board turns have a SessionStore-owned usage identity and let
+        # HermesExecutor perform the sole canonical write. Browser proxy turns
+        # derive one identity from the logical request context, so a retry
+        # with the same client_turn_id cannot create a second usage key.
+        self._persist_usage = persist_usage
+        self._request_conversation_id = request_conversation_id
+        self._proxy_turn_id = _stable_proxy_turn_id(
+            question=question,
+            client_turn_id=client_turn_id,
+            conversation_id=request_conversation_id,
+            attempt_id=attempt_id,
+            turn_id=turn_id,
+        )
 
     @property
     def conversation_id(self) -> Optional[str]:
@@ -451,6 +527,11 @@ class _HermesTurnPersister:
         see the class docstring's #611 paragraph. Read by `HermesExecutor`
         (#851) to tell a normal completion apart from a truncated one."""
         return self._done_seen
+
+    @property
+    def error_seen(self) -> bool:
+        """Whether an ``error`` event was observed on this turn."""
+        return self._error_seen
 
     @property
     def reported_model(self) -> Optional[str]:
@@ -543,12 +624,17 @@ class _HermesTurnPersister:
                         get_turn_registry().bind(self._turn, conv_id)
         elif etype == "content":
             content = event.get("content")
-            if isinstance(content, str):
+            # A terminal done closes the turn. Ignore a late content frame so
+            # it cannot turn a done-without-content failure into success.
+            if isinstance(content, str) and not self._done_seen:
                 self._content_parts.append(content)
         elif etype == "done":
             # #611: the backend's own signal that this turn ran to a normal
             # completion -- see the class docstring's #611 paragraph.
             self._done_seen = True
+        elif etype == "error":
+            # The error is fatal even if a backend emits a later done marker.
+            self._error_seen = True
         elif etype == "usage" and not self._usage_captured:
             # Not "seen once" like conversation_id above: a malformed usage
             # event (below) leaves `_usage_captured` False, so a later
@@ -598,6 +684,15 @@ class _HermesTurnPersister:
         turn with no `conversation_id`/content still records usage if a
         `usage` event arrived, and vice versa — neither gates the other.
         """
+        if self._write_guard is not None:
+            try:
+                if not self._write_guard():
+                    logger.info("hermes turn persistence: ignoring late attempt write")
+                    return
+            except Exception:
+                logger.warning("hermes turn persistence: identity check failed", exc_info=True)
+                return
+
         if self._conversation_id is not None and self._content_parts:
             conv_id = self._conversation_id
             content = "".join(self._content_parts)
@@ -608,7 +703,7 @@ class _HermesTurnPersister:
             # turn, so a genuinely truncated Hermes reply is never presented
             # as if it were whole.
             routing = None
-            if not self._done_seen:
+            if not self._done_seen or self._error_seen:
                 content += TRUNCATION_MARKER
                 routing = truncation_routing("stream_error")
             try:
@@ -630,15 +725,62 @@ class _HermesTurnPersister:
                     # unless this is exactly the 2nd user message.
                     schedule_retitle(conv_id)
 
-        if self._usage_captured:
+        if self._usage_captured and self._persist_usage:
+            # Hermes proxy turns predate worker Session rows, so use a stable
+            # conversation/turn identity here. The legacy row below is bound
+            # to the same usage_key, allowing the production projection to
+            # upsert rather than double-count this turn.
+            identity_seed = self._conversation_id or self._question
+            identity_suffix = hashlib.sha256(identity_seed.encode("utf-8")).hexdigest()[:24]
+            # Preserve the upstream conversation id when available so the
+            # legacy projection continues to answer conversation-scoped
+            # readouts under the public id.
+            canonical_session_id = (
+                self._request_conversation_id
+                or self._conversation_id
+                or f"hermes-proxy:{identity_suffix}"
+            )
+            canonical_attempt_id = "proxy-attempt"
+            canonical_turn_id = self._proxy_turn_id
+            canonical_key = f"{canonical_session_id}:{canonical_attempt_id}:{canonical_turn_id}"
             try:
-                get_usage_store().record_usage(
+                UsageLedger().record(UsageObservation(
+                    session_id=canonical_session_id,
+                    attempt_id=canonical_attempt_id,
+                    turn_id=canonical_turn_id,
+                    source="hermes_proxy",
+                    input_tokens=self._usage_input_tokens,
+                    output_tokens=self._usage_output_tokens,
+                    input_kind=MEASURED,
+                    output_kind=MEASURED,
+                    cost_usd=None if self._usage_unpriced else self._usage_cost_usd,
+                    cost_kind=UNKNOWN if self._usage_unpriced else MEASURED,
+                    billing_class="unknown" if self._usage_unpriced else "metered",
+                    requested_engine="hermes",
+                    requested_model=self._usage_model,
+                    evidence_source="hermes_usage_event",
+                    event_id=f"hermes-proxy:{canonical_key}",
+                ))
+            except Exception:
+                logger.warning("hermes canonical usage persistence failed", exc_info=True)
+            try:
+                usage_store = get_usage_store()
+                # The usage key is supplied to the store at INSERT time.  The
+                # store's unique index and transactional insert-or-ignore path
+                # make overlapping retries one idempotent legacy projection;
+                # never split this into has -> record -> bind check-and-act.
+                usage_store.record_usage(
                     model=self._usage_model,
                     input_tokens=self._usage_input_tokens,
                     output_tokens=self._usage_output_tokens,
                     cost_usd=self._usage_cost_usd,
                     conversation_id=self._conversation_id,
                     unpriced=self._usage_unpriced,
+                    usage_key=canonical_key,
+                    requested_engine="hermes",
+                    requested_model=self._usage_model,
+                    billing_class="unknown" if self._usage_unpriced else "metered",
+                    evidence_source="hermes_usage_event",
                 )
             except Exception:
                 logger.warning("hermes turn persistence: failed to record usage", exc_info=True)
@@ -663,7 +805,20 @@ def _make_persister(raw_body: bytes) -> Optional[_HermesTurnPersister]:
     persona_id = data.get("persona_id")
     if not isinstance(persona_id, str) or not persona_id:
         persona_id = "primary"
-    return _HermesTurnPersister(question=question, persona_id=persona_id)
+    client_turn_id = data.get("client_turn_id")
+    request_conversation_id = data.get("conversation_id")
+    attempt_id = data.get("attempt_id") or data.get("attempt")
+    turn_id = data.get("turn_id")
+    return _HermesTurnPersister(
+        question=question,
+        persona_id=persona_id,
+        client_turn_id=client_turn_id if isinstance(client_turn_id, str) else None,
+        request_conversation_id=(
+            request_conversation_id if isinstance(request_conversation_id, str) else None
+        ),
+        attempt_id=attempt_id if isinstance(attempt_id, str) else None,
+        turn_id=turn_id if isinstance(turn_id, str) else None,
+    )
 
 
 router = make_backend_router(

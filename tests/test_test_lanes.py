@@ -159,6 +159,8 @@ def test_plugin_executes_exact_nodeids_from_external_file(tmp_path):
 @pytest.mark.parametrize("xdist", [False, True])
 def test_plugin_records_selected_setup_skips_once_in_serial_and_xdist(tmp_path, xdist):
     """A setup skip is terminal for that ID even though it has no call report."""
+    if xdist:
+        pytest.importorskip("xdist")
     cases = tmp_path / "cases"
     cases.mkdir()
     (cases / "pyproject.toml").write_text("[tool.pytest.ini_options]\nmarkers = ['unit']\n")
@@ -313,8 +315,9 @@ def test_all_dispatch_runs_nonempty_lane_and_skips_intentionally_empty_lanes(tmp
     )
     result = _all_dispatch(copied, temporary)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert '"lanes": ["fast-unit"]' in result.stdout
-    assert "1 passed" in result.stdout
+    payload = json.loads(next(line for line in result.stdout.splitlines() if line.startswith("{")))
+    assert payload["lanes"] == ["fast-unit"]
+    assert payload["result"] == "success"
     assert not list(temporary.glob("tmp.*"))
 
 
@@ -327,7 +330,8 @@ def test_all_dispatch_preserves_lane_failure_after_cleaning_inventory(tmp_path):
     )
     result = _all_dispatch(copied, temporary)
     assert result.returncode != 0
-    assert "test_fast_only" in result.stdout
+    payload = json.loads(next(line for line in result.stdout.splitlines() if line.startswith("{")))
+    assert payload["result"] == "failure"
     assert not list(temporary.glob("tmp.*"))
 
 

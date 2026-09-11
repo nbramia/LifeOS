@@ -531,8 +531,9 @@ def pytest_lane_executor(
                 receipt.unlink()
             output_log = lane_log_dir / f"{lane}.log"
         else:
-            receipt = runtime_root / f"execution-{uuid.uuid4().hex}.json"
-            output_log = None
+            execution_id = uuid.uuid4().hex
+            receipt = runtime_root / f"execution-{execution_id}.json"
+            output_log = runtime_root / f"execution-{execution_id}.log"
         command = [sys.executable, "-m", "pytest", "tests", "-q", "--tb=short", "--durations=25", "--durations-min=1.0", "--ignore=tests/archive", "-p", "no:cacheprovider", "-p", "scripts.test_lane_plugin", "--lifeos-lane-nodeids", str(nodeid_file), "--lifeos-lane-execution", str(receipt), "-m", marker(BY_NAME[lane])]
         if lane == "browser-free" and parallel_browser_free and workers > 1:
             # Explicit opt-in only -- default false, so an ordinary caller's
@@ -1130,7 +1131,16 @@ def _main(argv: Sequence[str]) -> int:
         return 2
     payload = {
         "candidate_id": result.candidate_id,
+        "evidence_key": result.evidence_key,
         "reused": result.reused,
+        "result": (
+            "success"
+            if result.outcomes and all(
+                outcome.result == "success" and outcome.exit_status == 0
+                for outcome in result.outcomes
+            )
+            else "failure"
+        ),
         "reason": result.reason,
         "lanes": [outcome.lane for outcome in result.outcomes],
         # Per lane: the full collected count (independent of this run's

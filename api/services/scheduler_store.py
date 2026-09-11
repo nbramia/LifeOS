@@ -84,6 +84,14 @@ class ScheduleEntry:
     last_status: str = ""  # outcome of the most recent fire (sent/suppressed/handed-off/failed)
     last_result: str = ""  # short snippet of the most recent fire's result
     operation_key: str = ""  # durable external-source operation identity
+    # Optional canonical execution context.  These are internal schedule
+    # fields that round-trip through Markdown; omitted values preserve legacy
+    # routing/defaults and bot remains delivery-only.
+    persona_id: str = ""
+    model_id: str = ""
+    effort: str = ""
+    host: str = ""
+    working_dir: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -228,6 +236,10 @@ def _format_entry_line(entry: ScheduleEntry) -> str:
         parts.append(f"[last:: {entry.last_triggered_at}]")
     if entry.operation_key:
         parts.append(f"[operation_key:: {entry.operation_key}]")
+    for key in ("persona_id", "model_id", "effort", "host", "working_dir"):
+        value = getattr(entry, key, "")
+        if value:
+            parts.append(f"[{key}:: {value}]")
     parts.append(f"<!-- id:{entry.id} -->")
     return " ".join(parts)
 
@@ -279,6 +291,11 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
         last_triggered_at=fields.get("last") or None,
         timezone=fields.get("tz", ""),
         operation_key=fields.get("operation_key", ""),
+        persona_id=fields.get("persona_id", ""),
+        model_id=fields.get("model_id", ""),
+        effort=fields.get("effort", ""),
+        host=fields.get("host", ""),
+        working_dir=fields.get("working_dir", ""),
     )
 
 
@@ -836,8 +853,14 @@ class SchedulerScheduler:
     BACKOFF_CAP = 60  # seconds
     HEALTHY_RESET_SECONDS = 600  # 10 minutes
 
-    def __init__(self, store: SchedulerStore):
+    def __init__(self, store: SchedulerStore, session_store=None):
         self.store = store
+        # Kept injectable so scheduler tests can use an isolated SQLite file;
+        # production shares the worker's SessionStore database.
+        if session_store is None:
+            from api.services.agent_worker.session_store import SessionStore
+            session_store = SessionStore()
+        self.session_store = session_store
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._crash_count = 0
@@ -996,7 +1019,10 @@ class SchedulerScheduler:
             logger.debug(f"Pre-meeting check failed, running pipeline: {e}")
             return False
 
-    async def _fire_entry(self, entry: ScheduleEntry):
+    async def _fire_entry(
+        self, entry: ScheduleEntry, *, manual: bool = False,
+        request_key: str | None = None,
+    ):
         """Execute a single schedule, dispatching on ``entry.action``.
 
         Actions:
@@ -1016,8 +1042,67 @@ class SchedulerScheduler:
         label = entry.id if entry.operation_key else entry.name
         logger.info(f"Firing schedule: {label} ({entry.id}, action={entry.action})")
 
-        # Advance next_trigger_at BEFORE generating/sending to prevent
-        # duplicate fires on server restart or scheduler re-entry.
+        # Agent handoffs have a durable occurrence boundary.  Persist/claim it
+        # before advancing the schedule so a crash at any point can reconcile
+        # the same task by key instead of creating a second one.
+        if entry.action == "agent":
+            import uuid as _uuid
+            if manual:
+                # Retries carrying the same HTTP Idempotency-Key resolve to
+                # one durable occurrence; direct/internal calls without a
+                # key intentionally represent a fresh manual request.
+                scheduled_for = f"manual:{request_key or _uuid.uuid4().hex}"
+            else:
+                scheduled_for = entry.next_trigger_at or entry.schedule_value
+            occurrence_key = self.session_store.occurrence_key_for(entry.id, scheduled_for)
+            existing = self.session_store.ensure_occurrence(
+                entry.id, scheduled_for, occurrence_key=occurrence_key,
+            )
+            # A crash can happen after the occurrence is durably linked but
+            # before the schedule definition was advanced. Recovery must
+            # reconcile that handoff and advance the schedule; returning here
+            # would leave a once schedule firing forever.
+            if existing.state == "dispatched" and existing.task_id:
+                self.store.mark_triggered(entry.id)
+                self.store.record_run(
+                    entry.id, "handed-off",
+                    f"task {existing.task_id} (reconciled occurrence)",
+                )
+                return
+            owner = f"scheduler:{_uuid.uuid4().hex}"
+            occurrence = self.session_store.claim_occurrence(occurrence_key, owner)
+            if occurrence is None:
+                # Another scheduler owns this request (or already dispatched
+                # it). It must not create a second task or advance the entry.
+                logger.info("Schedule occurrence %s already claimed; no-op", occurrence_key)
+                return
+            if occurrence.state == "dispatched" and occurrence.task_id:
+                handoff = f"task {occurrence.task_id} (reconciled occurrence)"
+            else:
+                handoff = self._hand_off_to_agent(
+                    entry, occurrence_key=occurrence_key,
+                )
+                task_id = handoff.split("task ", 1)[-1].split(" ", 1)[0]
+                if not self.session_store.link_occurrence(
+                    occurrence_key, task_id=task_id, owner=owner,
+                    lease_generation=occurrence.lease_generation, session_id=None,
+                ):
+                    # This claimant lost its durable fence after task
+                    # creation. A recovery claimant owns the occurrence now;
+                    # it will find the same operation-key task and reconcile
+                    # it without advancing the schedule twice.
+                    logger.info("Schedule occurrence %s claim expired before link", occurrence_key)
+                    return
+            self.store.mark_triggered(entry.id)
+            if entry.operation_key:
+                logger.info("Schedule %s: handed off to agent worker", entry.id)
+            else:
+                logger.info(f"Schedule {entry.name}: handed off to agent worker — {handoff}")
+            self.store.record_run(entry.id, "handed-off", handoff)
+            return
+
+        # Non-agent actions retain the historical advance-before-delivery
+        # behavior; occurrence idempotency is specifically for task handoff.
         self.store.mark_triggered(entry.id)
 
         if entry.action == "prompt" and self._should_skip_pre_meeting(entry):
@@ -1026,15 +1111,6 @@ class SchedulerScheduler:
 
         start = _time.monotonic()
         try:
-            if entry.action == "agent":
-                handoff = self._hand_off_to_agent(entry)
-                if entry.operation_key:
-                    logger.info("Schedule %s: handed off to agent worker", entry.id)
-                else:
-                    logger.info(f"Schedule {entry.name}: handed off to agent worker — {handoff}")
-                self.store.record_run(entry.id, "handed-off", handoff)
-                return
-
             message, exec_log = await self._generate_message(entry)
             elapsed = _time.monotonic() - start
 
@@ -1091,7 +1167,7 @@ class SchedulerScheduler:
     # Back-compat alias: the HTTP trigger route and older tests call _fire_reminder.
     _fire_reminder = _fire_entry
 
-    def _hand_off_to_agent(self, entry: ScheduleEntry) -> str:
+    def _hand_off_to_agent(self, entry: ScheduleEntry, *, occurrence_key: str | None = None) -> str:
         """Write an engine-assigned task so the agent worker runs the prompt.
 
         The schedule's executor tag (``local`` / ``cloud`` / ``cloud-haiku`` /
@@ -1111,9 +1187,51 @@ class SchedulerScheduler:
         tags: list[str] = [executor] if executor else ["agent"]
         if entry.schedule_type == "cron":
             tags.append(f"sched-{entry.id}")
-        task = get_task_manager().create(
+        manager = get_task_manager()
+        # Reconcile a crash after the Markdown rename but before the SQLite
+        # link by searching the authoritative task files for the key.
+        if occurrence_key:
+            operation_fields = {"occurrence_key": occurrence_key, **{
+                key: getattr(entry, key) for key in
+                ("persona_id", "model_id", "effort", "host", "working_dir")
+                if getattr(entry, key, "")
+            }}
+            operation_result = None
+            operation_creator = getattr(manager, "create_or_find_by_operation", None)
+            if callable(operation_creator):
+                operation_result = operation_creator(
+                    occurrence_key,
+                    description=entry.message_content or entry.name,
+                    tags=tags,
+                    fields=operation_fields,
+                )
+            if isinstance(operation_result, tuple) and len(operation_result) == 2:
+                task, _created = operation_result
+            else:
+                # Keep compatibility with narrow test/injected task-manager
+                # doubles that predate the durable operation primitive.
+                task = manager.create(
+                    description=entry.message_content or entry.name,
+                    tags=tags,
+                    fields=operation_fields,
+                    _log_content=False,
+                )
+            return f"task {task.id} (reconciled occurrence)"
+        fields = {"occurrence_key": occurrence_key} if occurrence_key else {}
+        if entry.persona_id:
+            fields["persona_id"] = entry.persona_id
+        if entry.model_id:
+            fields["model"] = entry.model_id
+        if entry.effort:
+            fields["effort"] = entry.effort
+        if entry.host:
+            fields["host"] = entry.host
+        if entry.working_dir:
+            fields["working_dir"] = entry.working_dir
+        task = manager.create(
             description=entry.message_content or entry.name,
             tags=tags,
+            fields=fields,
             _log_content=not bool(entry.operation_key),
         )
         return f"task {task.id} (tags: {', '.join('#' + t for t in tags)})"

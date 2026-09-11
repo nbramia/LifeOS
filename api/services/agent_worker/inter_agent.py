@@ -4,8 +4,9 @@ These tools let an in-flight agent session spawn, message, and coordinate with
 other agent sessions — turning the worker into a multi-agent supervisor. The
 core primitives are:
 
-  - **spawn**: create a child session (Claude or local) with budget drawn from
-    the caller's lineage budget. Returns immediately with a `child_session_id`.
+  - **spawn**: create a child session on a canonical worker executor with budget
+    drawn from the caller's lineage budget. Returns immediately with a
+    `child_session_id`.
   - **send**: append a user-role message to a peer/child session. For yielded
     sessions, the message is queued for the next resume. Sending to your own
     completed CLI child reopens it (the message becomes its next turn, resumed
@@ -30,7 +31,10 @@ Security model: no-sandbox per AGENTS.md. The MCP-side wrapping passes
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
+import math
 import os
 import signal
 import time
@@ -42,7 +46,6 @@ from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_CLAIMED,
     STATUS_COMPLETED,
-    STATUS_FAILED,
     STATUS_YIELDED,
     TERMINAL_STATUSES,
     Session,
@@ -55,13 +58,27 @@ from api.services.agent_worker.transcript_store import TranscriptStore
 logger = logging.getLogger(__name__)
 
 
+def caller_proof_for_session(session_id: str, secret: str) -> str:
+    """Create the transport proof binding an MCP call to one worker session.
+
+    The session id is useful routing metadata, but is not itself authority:
+    remote MCP callers must also present this HMAC proof. The secret is the
+    already-authenticated MCP transport secret and is never persisted.
+    """
+    if not isinstance(session_id, str) or not session_id.strip() or not secret:
+        return ""
+    return hmac.new(
+        secret.encode("utf-8"), session_id.strip().encode("utf-8"), hashlib.sha256,
+    ).hexdigest()
+
+
 # Engines an in-flight agent may spawn a child on. `claude`/`local` are the
 # in-process routes (Managed Agents API / Gemma); `claude_code`/`codex` are the
 # CLI routes, used for capability fallback (browser/GUI, native computer use).
 # CLI routes are subscription-billed, so they skip the per-token dollar ceiling
 # and reuse the managed concurrency cap.
 CLI_ROUTINGS = ("claude_code", "codex")
-SPAWN_MODELS = ("claude", "local", *CLI_ROUTINGS)
+SPAWN_MODELS = ("claude", "local", "remote", "hermes", *CLI_ROUTINGS)
 
 # Root routings that must never be allowed to spawn an API-billed
 # (`model="claude"`) child — see the `model == "claude"` guard in `spawn()`
@@ -128,6 +145,28 @@ def _err(message: str, code: str = "error") -> dict:
     return {"ok": False, "error": code, "message": message}
 
 
+def _update_status_for_session(
+    session_store: SessionStore, session: Session, status: str,
+) -> bool:
+    """Write status only for this exact lifecycle attempt/turn.
+
+    The store keeps the identity arguments optional for old callers and rows,
+    but inter-agent mutations always pass the snapshot they read.  The store's
+    durable cancellation fence then makes a late yield/block write a no-op.
+    """
+    result = session_store.update_status(
+        session.task_id,
+        status,
+        attempt_id=getattr(session, "attempt_id", None),
+        turn_id=getattr(session, "turn_id", None),
+    )
+    # SessionStore returns a bool on lifecycle-aware deployments. Treat a
+    # legacy store's ``None`` return as success so old adapters retain their
+    # historical behavior; only an explicit False means the fence rejected
+    # this exact snapshot.
+    return result is not False
+
+
 # ---------------------------------------------------------------------------
 # Tool definitions (Anthropic format) — shared by local and managed agents.
 # ---------------------------------------------------------------------------
@@ -144,31 +183,53 @@ _CALLER_PROP = {
     "description": "Your own session_id, copied verbatim from the "
                    "`lifeos_session_id=` field in your task brief.",
 }
+_CALLER_PROOF_PROP = {
+    "type": "string",
+    "description": "Transport proof binding caller_session_id to this MCP connection.",
+}
 
 
 def _with_caller(props: dict, required: list[str]) -> dict:
     """Inject `caller_session_id` into a tool schema."""
-    new_props = {"caller_session_id": _CALLER_PROP, **props}
+    new_props = {
+        "caller_session_id": _CALLER_PROP,
+        "caller_proof": _CALLER_PROOF_PROP,
+        **props,
+    }
     return {
         "type": "object",
         "properties": new_props,
-        "required": ["caller_session_id"] + list(required),
+        "required": ["caller_session_id", "caller_proof"] + list(required),
     }
 
 
 INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "lifeos_agent_spawn",
-        "description": "Spawn a child agent session that runs in parallel. Returns immediately with a `child_session_id` you can monitor with `lifeos_agent_check` or wait on with `lifeos_agent_yield_until`. Budget is drawn from your remaining lineage budget. Use `claude_code` to delegate work that needs a real browser / GUI automation — its `--chrome` browser works headless, unlike Codex's (whose computer use is a desktop-app-only feature, unavailable here). For `claude_code` children, pick `tier` by task difficulty: `haiku` for simple lookups / quick web research, `sonnet` for moderate work, `opus` (default) for hard reasoning.",
+        "description": "Spawn a child agent session that runs in parallel. Returns immediately with a `child_session_id` you can monitor with `lifeos_agent_check` or wait on with `lifeos_agent_yield_until`. Budget is drawn from your remaining lineage budget. Omit the route to inherit an active scoped override (or the caller route). Use `claude_code` to delegate work that needs a real browser / GUI automation — its `--chrome` browser works headless, unlike Codex's (whose computer use is a desktop-app-only feature, unavailable here). For legacy `model=claude_code` children, `tier` selects a Claude tier; when omitted, the CLI configured default is used.",
         "input_schema": _with_caller({
             "prompt": {"type": "string", "description": "Task description for the child agent"},
-            "model": {"type": "string", "enum": ["claude", "local", "claude_code", "codex"], "description": "Which executor to run the child on. claude=Managed Agents (cloud API), local=Gemma, claude_code=Claude Code CLI (has a working --chrome browser), codex=Codex CLI (code/general tasks; no browser in headless mode)."},
-            "tier": {"type": "string", "enum": ["haiku", "sonnet", "opus"], "description": "For model=claude_code only: which Claude tier the child CLI runs. Use 'haiku' for simple lookups/quick research, 'sonnet' for moderate tasks, 'opus' (default) for hard reasoning. Ignored for other engines."},
+            "model": {"type": "string", "enum": ["claude", "local", "remote", "hermes", "claude_code", "codex"], "description": "Legacy executor selector; canonical callers may instead supply execution.executor."},
+            "tier": {"type": "string", "enum": ["haiku", "sonnet", "opus"], "description": "Legacy model=claude_code only: which Claude tier the child CLI runs. When omitted, the CLI configured default is used. Ignored for other engines."},
             "max_dollars": {"type": "number", "description": "Optional per-child dollar budget"},
             "max_tokens": {"type": "integer", "description": "Optional per-child token budget"},
             "wall_seconds": {"type": "integer", "description": "Optional per-child wall-clock budget"},
             "expected_output": {"type": "string", "enum": ["text", "file", "external_action", "structured"]},
-        }, required=["prompt", "model"]),
+            "execution": {
+                "type": "object",
+                "description": "Canonical execution choices; provider/runtime and lineage are server-derived.",
+                "properties": {
+                    "executor": {"type": "string", "enum": ["local", "remote", "claude", "hermes", "claude_code", "codex"]},
+                    "model_id": {"type": "string"},
+                    "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]},
+                    "host": {"type": "string"},
+                    "working_dir": {"type": "string"},
+                    "budget": {"type": "object"},
+                    "constraints": {"type": "object"},
+                },
+                "additionalProperties": False,
+            },
+        }, required=["prompt"]),
     },
     {
         "name": "lifeos_agent_send",
@@ -214,7 +275,7 @@ INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": "List recent agent sessions, optionally filtered by status / routing / parent.",
         "input_schema": _with_caller({
             "status": {"type": "string"},
-            "routing": {"type": "string", "enum": ["claude", "local", "claude_code", "codex"]},
+            "routing": {"type": "string", "enum": ["claude", "local", "remote", "hermes", "claude_code", "codex"]},
             "parent_session_id": {"type": "string"},
             "limit": {"type": "integer"},
         }, required=[]),
@@ -225,6 +286,35 @@ INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "input_schema": _with_caller({
             "question": {"type": "string", "description": "The question to ask the operator. Keep it short and specific."},
         }, required=["question"]),
+    },
+    {
+        "name": "lifeos_agent_execution_override",
+        "description": (
+            "Set or clear a temporary execution override for future resolution. "
+            "Session scope affects only your session; lineage scope is root-only "
+            "and affects future resolutions in that lineage. Already-resolved "
+            "execution snapshots never change."
+        ),
+        "input_schema": _with_caller({
+            "operation": {"type": "string", "enum": ["set", "clear"]},
+            "scope": {"type": "string", "enum": ["session", "lineage"]},
+            "execution": {
+                "type": "object",
+                "description": "Route/model/effort/host/working-directory values to inherit.",
+                "properties": {
+                    "executor": {"type": "string", "enum": ["local", "remote", "claude", "hermes", "claude_code", "codex"]},
+                    "model_id": {"type": "string"},
+                    "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]},
+                    "host": {"type": "string"},
+                    "working_dir": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+            "expires_at": {
+                "type": "string",
+                "description": "Optional ISO-8601 expiry; applies only to future resolutions.",
+            },
+        }, required=["operation", "scope"]),
     },
 ]
 
@@ -240,10 +330,55 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
     prompt = (args.get("prompt") or "").strip()
     if not prompt:
         return _err("prompt is required", code="invalid_arg")
-    model = args.get("model")
+    from dataclasses import asdict, replace
+    from api.services.agent_worker.execution import (
+        Budget as ExecutionBudget,
+        ExecutionRequest,
+        parse_execution_request,
+        unsupported_explicit_fields,
+    )
+
+    canonical_raw = args.get("execution")
+    legacy_model = args.get("model")
+    if canonical_raw is not None:
+        parse_payload = canonical_raw
+        if (
+            isinstance(canonical_raw, dict)
+            and legacy_model
+            and "executor" not in canonical_raw
+        ):
+            parse_payload = {**canonical_raw, "executor": legacy_model}
+        parsed = parse_execution_request(parse_payload)
+        if not parsed.ok:
+            return _err(
+                "; ".join(item.message for item in parsed.diagnostics),
+                code="invalid_execution",
+            )
+        execution_request = parsed.request
+    else:
+        execution_request = ExecutionRequest(
+            executor=legacy_model if legacy_model in SPAWN_MODELS else None,
+        )
+
+    caller = ctx.session_store.get_by_session_id(ctx.caller_session_id)
+    if caller is None:
+        return _err(f"caller session {ctx.caller_session_id} not found", code="no_caller")
+    inherited_override = ctx.session_store.get_execution_override(
+        session_id=caller.session_id,
+        root_session_id=caller.root_session_id or caller.session_id,
+    )
+    # An omitted child route is the reachable consumer for a bounded temporary
+    # override. The session row keeps the caller route as its fallback so an
+    # override that expires before resolution does not become permanent.
+    model = (
+        legacy_model
+        or execution_request.executor
+        or (inherited_override.executor if inherited_override else None)
+        or caller.routing
+    )
     if model not in SPAWN_MODELS:
         return _err(
-            "model must be one of 'claude', 'local', 'claude_code', 'codex'",
+            "model or execution.executor must name a supported executor",
             code="invalid_arg",
         )
     # Optional Claude tier for claude_code children (#349). Ignored for other
@@ -254,11 +389,22 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
             "tier must be one of 'haiku', 'sonnet', 'opus'",
             code="invalid_arg",
         )
-    claude_code_model = tier if model == "claude_code" else None
+    claude_code_model = tier if legacy_model == "claude_code" else None
 
-    caller = ctx.session_store.get_by_session_id(ctx.caller_session_id)
-    if caller is None:
-        return _err(f"caller session {ctx.caller_session_id} not found", code="no_caller")
+    if canonical_raw is not None:
+        if execution_request.executor and execution_request.executor != model:
+            return _err("model engine conflicts with execution.executor", code="execution_conflict")
+        if execution_request.model_id and tier:
+            return _err("tier conflicts with execution.model_id", code="execution_conflict")
+        unsupported = unsupported_explicit_fields(execution_request, model)
+        if unsupported:
+            return _err(
+                "; ".join(item.message for item in unsupported),
+                code="unsupported_execution_field",
+            )
+    provisional_routing = (
+        model if legacy_model or execution_request.executor else caller.routing
+    )
 
     # A subscription-billed lineage must not be able to open an API-billed side
     # door. `model="claude"` runs the child on Managed Agents — the Anthropic
@@ -269,15 +415,15 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
     # above a fact rather than an assumption — the sibling half is the
     # executor's env strip (ClaudeCodeExecutor._clean_env), which denies the CLI
     # itself any API credential.
-    if model == "claude":
+    if model in {"claude", "remote"}:
         root_session = ctx.session_store.get_by_session_id(
             caller.root_session_id or caller.session_id
         ) or caller
         if root_session.routing in NON_API_BILLED_ROOT_ROUTINGS:
             return _err(
                 f"this lineage is subscription-billed (root session routing="
-                f"{root_session.routing}); model='claude' would bill the "
-                f"Anthropic API. Use model='claude_code' (with tier=) for a "
+                f"{root_session.routing}); model='{model}' is metered. "
+                f"Use model='claude_code' (with tier=) for a "
                 f"Claude child, or 'local' for the on-box model.",
                 code="api_billing_blocked",
             )
@@ -322,27 +468,47 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
                 code="cap_concurrency_managed",
             )
 
-    # Budget: child's max_dollars cannot exceed parent's remaining. CLI routes
-    # are subscription-billed (no per-token draw), so they skip the ceiling —
-    # mirrors the worker's cost-gate skip for claude_code/codex.
+    # Resolve canonical/legacy budget once, then enforce every child ceiling.
     parent_budget = caller.budget or {}
     spent = caller.total_dollars or 0.0
     parent_remaining = (parent_budget.get("max_dollars", 0.0) or 0.0) - spent
-    if model in CLI_ROUTINGS:
-        requested_dollars = max(0.0, float(args.get("max_dollars") or parent_remaining or 0.0))
-    else:
-        requested_dollars = float(args.get("max_dollars") or parent_remaining)
-        if requested_dollars > parent_remaining + 1e-6:
-            return _err(
-                f"requested ${requested_dollars:.2f} exceeds parent remaining ${parent_remaining:.2f}",
-                code="budget_exceeded",
-            )
-
+    if execution_request.budget is not None and any(
+        args.get(name) is not None for name in ("max_dollars", "max_tokens", "wall_seconds")
+    ):
+        return _err("legacy budget fields conflict with execution.budget", code="execution_conflict")
+    requested = execution_request.budget or ExecutionBudget(
+        wall_seconds=args.get("wall_seconds"), max_tokens=args.get("max_tokens"),
+        max_dollars=args.get("max_dollars"),
+    )
+    parent_wall = int(parent_budget.get("wall_seconds", 14400))
+    parent_tokens = int(parent_budget.get("max_tokens", 500_000))
+    wall = parent_wall if requested.wall_seconds is None else requested.wall_seconds
+    tokens = parent_tokens if requested.max_tokens is None else requested.max_tokens
+    dollars = parent_remaining if requested.max_dollars is None else requested.max_dollars
+    if (
+        isinstance(wall, bool) or not isinstance(wall, int) or wall < 0
+        or isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0
+        or isinstance(dollars, bool) or not isinstance(dollars, (int, float))
+        or not math.isfinite(float(dollars)) or dollars < 0
+    ):
+        return _err("child budget values must be finite and non-negative", code="invalid_budget")
+    if wall > parent_wall or tokens > parent_tokens:
+        return _err("child token/wall budget exceeds parent budget", code="budget_exceeded")
+    # Subscription-backed CLI children still inherit the parent's canonical
+    # ceiling. A route's billing class may affect pricing, but it must never
+    # become a budget-bypass side door for a canonical request.
+    if dollars > parent_remaining + 1e-6:
+        return _err(
+            f"requested ${dollars:.2f} exceeds parent remaining ${parent_remaining:.2f}",
+            code="budget_exceeded",
+        )
     child_budget = {
-        "wall_seconds": int(args.get("wall_seconds") or parent_budget.get("wall_seconds", 14400)),
-        "max_tokens": int(args.get("max_tokens") or parent_budget.get("max_tokens", 500_000)),
-        "max_dollars": float(requested_dollars),
+        "wall_seconds": wall, "max_tokens": tokens,
+        "max_dollars": float(dollars),
     }
+    execution_request = replace(
+        execution_request, budget=ExecutionBudget(**child_budget),
+    )
     expected_output = args.get("expected_output") or "text"
 
     # Create the session. We use a synthetic task_id since spawned sessions
@@ -353,7 +519,7 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
         task_id=child_task_id,
         session_id=child_session_id,
         status=STATUS_CLAIMED,
-        routing=model,
+        routing=provisional_routing,
         budget=child_budget,
         expected_output=expected_output,
         parent_session_id=caller.session_id,
@@ -369,6 +535,9 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
         # and for every pre-existing (pre-#684) Hermes/CLI root, so this is
         # additive — a lineage that never had bot ownership still doesn't.
         bot=caller.bot,
+        model=(caller.model if caller.routing == provisional_routing else None),
+        effort=(caller.effort if caller.routing == provisional_routing else None),
+        execution_request=asdict(execution_request),
     )
     # The prompt becomes the child's task description (used by the executor's
     # _seed_conversation) so the system prompt + inter-agent guidance run as
@@ -394,6 +563,90 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
         "task_id": child_task_id,
         "budget": child_budget,
     })
+
+
+def execution_override(ctx: InterAgentContext, args: dict) -> dict:
+    """Set or clear an override whose identity comes only from the caller."""
+    from datetime import datetime, timezone
+
+    from api.services.agent_worker.execution import (
+        TemporaryOverride,
+        parse_execution_request,
+        unsupported_explicit_fields,
+    )
+
+    caller = ctx.session_store.get_by_session_id(ctx.caller_session_id)
+    if caller is None:
+        return _err(f"caller session {ctx.caller_session_id} not found", code="no_caller")
+    operation = args.get("operation")
+    scope = args.get("scope")
+    if operation not in {"set", "clear"} or scope not in {"session", "lineage"}:
+        return _err("operation and scope are required", code="invalid_arg")
+
+    root_id = caller.root_session_id or caller.session_id
+    if scope == "lineage" and caller.session_id != root_id:
+        return _err("only the lineage root can change a lineage override", code="forbidden")
+    scope_id = caller.session_id if scope == "session" else root_id
+    if operation == "clear":
+        if args.get("execution") is not None or args.get("expires_at") is not None:
+            return _err("clear does not accept execution or expires_at", code="invalid_arg")
+        ctx.session_store.clear_execution_override(scope=scope, scope_id=scope_id)
+        return _ok({"cleared": True, "scope": scope})
+
+    raw = args.get("execution")
+    if raw is None:
+        return _err("execution is required for operation=set", code="invalid_arg")
+    parsed = parse_execution_request(raw)
+    if not parsed.ok:
+        return _err(
+            "; ".join(item.message for item in parsed.diagnostics),
+            code="invalid_execution",
+        )
+    request = parsed.request
+    if request.budget is not None or request.constraints != request.constraints.__class__():
+        return _err(
+            "temporary overrides support executor, model_id, effort, host, and working_dir only",
+            code="unsupported_execution_field",
+        )
+    route_dependent = (request.model_id, request.effort, request.host, request.working_dir)
+    if request.executor is None and any(value is not None for value in route_dependent):
+        return _err(
+            "temporary override fields require execution.executor",
+            code="invalid_execution",
+        )
+    if request.executor is None:
+        return _err("temporary override must set at least one field", code="invalid_execution")
+    unsupported = unsupported_explicit_fields(request)
+    if unsupported:
+        return _err(
+            "; ".join(item.message for item in unsupported),
+            code="unsupported_execution_field",
+        )
+    expires_at = None
+    if args.get("expires_at") is not None:
+        try:
+            expires_at = datetime.fromisoformat(str(args["expires_at"]))
+            if expires_at.tzinfo is None:
+                raise ValueError("timezone required")
+        except (TypeError, ValueError):
+            return _err("expires_at must be a timezone-aware ISO-8601 timestamp", code="invalid_arg")
+    now = datetime.now(timezone.utc)
+    override = TemporaryOverride(
+        scope=scope,
+        scope_id=scope_id,
+        created_at=now,
+        executor=request.executor,
+        model_id=request.model_id,
+        effort=request.effort,
+        host=request.host,
+        working_dir=request.working_dir,
+        expires_at=expires_at,
+    )
+    try:
+        ctx.session_store.set_execution_override(override)
+    except (TypeError, ValueError) as exc:
+        return _err(str(exc), code="invalid_arg")
+    return _ok({"override": override.to_dict()})
 
 
 def send(ctx: InterAgentContext, args: dict) -> dict:
@@ -437,17 +690,47 @@ def send(ctx: InterAgentContext, args: dict) -> dict:
             code="forbidden",
         )
 
+    # A reopen is a new immutable execution attempt.  Rotate the attempt
+    # before enqueueing so a queued callback from the cancelled attempt can
+    # never consume this message or publish its late result into the new one.
+    if reopen:
+        try:
+            target = ctx.session_store.begin_new_execution(target.task_id)
+        except ValueError:
+            # The terminal snapshot was superseded while this call was in
+            # flight (most commonly by cancellation). Do not turn that race
+            # into a successful reopen.
+            current = ctx.session_store.get_by_session_id(target_id)
+            return _err(
+                f"session {target_id} is no longer reopenable "
+                f"({current.status if current else 'missing'})",
+                code="terminal",
+            )
+
     # Always queue. For an actively-running local session, the executor picks
     # up pending messages at the start of each turn. For a yielded session,
     # delivery happens on resume.
-    msg_id = ctx.session_store.enqueue_message(target_id, ctx.caller_session_id, message)
+    msg_id = ctx.session_store.enqueue_message(
+        target_id, ctx.caller_session_id, message,
+        attempt_id=target.attempt_id, turn_id=target.turn_id,
+    )
+    if not msg_id:
+        return _err(
+            f"session {target_id} is no longer active",
+            code="cancelled",
+        )
+    if reopen:
+        # Flip AFTER the enqueue so the dispatch tick can never claim the
+        # child before its resume message exists (an empty resume prompt).
+        if not _update_status_for_session(ctx.session_store, target, STATUS_CLAIMED):
+            return _err(
+                f"session {target_id} is no longer active",
+                code="cancelled",
+            )
     ctx.transcript_store.append(target_id, "inter_agent_send", {
         "from": ctx.caller_session_id, "chars": len(message),
     })
     if reopen:
-        # Flip AFTER the enqueue so the dispatch tick can never claim the
-        # child before its resume message exists (an empty resume prompt).
-        ctx.session_store.update_status(target.task_id, STATUS_CLAIMED)
         ctx.transcript_store.append(target_id, "inter_agent_send_reopen", {
             "from": ctx.caller_session_id,
             "claude_code_session_id": target.claude_code_session_id,
@@ -487,6 +770,17 @@ def yield_until(ctx: InterAgentContext, args: dict) -> dict:
     if caller is None:
         return _err(f"caller session {ctx.caller_session_id} not found", code="no_caller")
 
+    # Validate the native continuation before mutating either the wait list or
+    # status.  An old/unknown backend must fail closed instead of leaving the
+    # caller permanently yielded for a worker path that can only fall through
+    # to LocalExecutor (which is forbidden for child waits).
+    from api.services.agent_worker.executor_lifecycle import route_supports_resume_after_children
+    if not route_supports_resume_after_children(caller.routing):
+        return _err(
+            "executor cannot resume after children",
+            code="unsupported_resume",
+        )
+
     # Verify all listed children exist and are descendants of caller's lineage
     # (so an agent can't yield on someone else's family).
     children_sessions = ctx.session_store.list_by_session_ids(children)
@@ -499,8 +793,21 @@ def yield_until(ctx: InterAgentContext, args: dict) -> dict:
     if foreign:
         return _err(f"children {foreign} are not in your lineage", code="forbidden")
 
-    ctx.session_store.set_yield_waiting_for(caller.task_id, children)
-    ctx.session_store.update_status(caller.task_id, STATUS_YIELDED)
+    if ctx.session_store.set_yield_waiting_for(
+        caller.task_id,
+        children,
+        attempt_id=getattr(caller, "attempt_id", None),
+        turn_id=getattr(caller, "turn_id", None),
+    ) is False:
+        return _err(
+            f"session {caller.session_id} is no longer active",
+            code="cancelled",
+        )
+    if not _update_status_for_session(ctx.session_store, caller, STATUS_YIELDED):
+        return _err(
+            f"session {caller.session_id} is no longer active",
+            code="cancelled",
+        )
     ctx.transcript_store.append(caller.session_id, "yield", {
         "children": children, "reason": args.get("reason", ""),
     })
@@ -729,26 +1036,45 @@ def teardown_session(
     surface partial-success in its response.
     """
     managed_failure: str | None = None
-    if target.managed_agent_session_id and managed_driver is not None:
-        try:
-            managed_driver.kill_session(
-                target.managed_agent_session_id,
-                reason=transcript_payload.get("reason", ""),
-            )
-        except Exception as exc:  # noqa: BLE001 — degrade to local-only on remote failure
-            managed_failure = str(exc)
-            logger.warning(
-                "kill_session %s failed: %s",
-                target.managed_agent_session_id, exc,
-            )
-    session_store.update_status(target.task_id, STATUS_FAILED)
+    from api.services.agent_worker.executor_lifecycle import (
+        CancelResult, ExecutorCapabilities, ExecutorRegistry,
+    )
+
+    def cancel_route(session, reason):
+        nonlocal managed_failure
+        if session.managed_agent_session_id and managed_driver is not None:
+            try:
+                managed_driver.kill_session(session.managed_agent_session_id, reason=reason)
+            except Exception as exc:  # noqa: BLE001 — local teardown still proceeds
+                managed_failure = str(exc)
+                logger.warning("kill_session %s failed: %s", session.managed_agent_session_id, exc)
+        _kill_local_subprocess(transcript_store, session, remote_kill_runner=remote_kill_runner)
+        return CancelResult(
+            cancelled=True, reason=reason or "cancelled", session_id=session.session_id,
+            attempt_id=getattr(session, "attempt_id", None), turn_id=getattr(session, "turn_id", None),
+        )
+
+    # Operator/API teardown and in-process agent kill share the exact same
+    # once-only registry guard. The persisted failed marker is also what the
+    # worker-side Hermes cancellation watcher uses to close a blocked stream.
+    registry = ExecutorRegistry(session_store=session_store)
+    registry.register(
+        target.routing or "",
+        type("_TeardownAdapter", (), {
+            "route": target.routing or "",
+            "capabilities": ExecutorCapabilities(cancel=True),
+            "cancel": staticmethod(cancel_route),
+        })(),
+    )
+    result = registry.cancel_once(target, transcript_payload.get("reason", ""))
+    if not result.cancelled and not result.idempotent:
+        logger.warning("cancel registry rejected %s: %s", target.session_id, result.reason)
     transcript_store.append(target.session_id, transcript_kind, transcript_payload)
     # #379: flipping the DB to FAILED is what the executor's silent-guard keys on,
     # so the row is updated *before* we signal the subprocess. The status flip
     # alone doesn't stop the OS process (the worker's `claude -p` keeps running
     # until the next poll) — this reaps it promptly so an operator kill actually
     # stops compute within seconds.
-    _kill_local_subprocess(transcript_store, target, remote_kill_runner=remote_kill_runner)
     return {"managed_failure": managed_failure}
 
 
@@ -769,18 +1095,28 @@ def kill(ctx: InterAgentContext, args: dict) -> dict:
     if target.status in TERMINAL_STATUSES:
         return _ok({"killed": False, "reason": f"already {target.status}"})
 
-    teardown_session(
-        ctx.session_store,
-        ctx.transcript_store,
-        target,
-        transcript_kind="killed",
-        transcript_payload={
+    if ctx.worker_handle is not None and hasattr(ctx.worker_handle, "cancel_session"):
+        result = ctx.worker_handle.cancel_session(target, args.get("reason", ""))
+        if not result.cancelled and not result.idempotent:
+            return _err(result.reason or "cancel failed", code="cancel_failed")
+        ctx.transcript_store.append(target_id, "killed", {
             "by": caller.session_id,
             "reason": args.get("reason", ""),
             "managed_remote": target.managed_agent_session_id,
-        },
-        managed_driver=ctx.managed_driver,
-    )
+        })
+    else:
+        teardown_session(
+            ctx.session_store,
+            ctx.transcript_store,
+            target,
+            transcript_kind="killed",
+            transcript_payload={
+                "by": caller.session_id,
+                "reason": args.get("reason", ""),
+                "managed_remote": target.managed_agent_session_id,
+            },
+            managed_driver=ctx.managed_driver,
+        )
     return _ok({"killed": True})
 
 
@@ -853,7 +1189,11 @@ def user_ask(ctx: InterAgentContext, args: dict) -> dict:
         )
 
     # Mark the caller blocked so the worker stops driving its loop.
-    ctx.session_store.update_status(caller.task_id, STATUS_BLOCKED)
+    if not _update_status_for_session(ctx.session_store, caller, STATUS_BLOCKED):
+        return _err(
+            f"session {caller.session_id} is no longer active",
+            code="cancelled",
+        )
     ctx.transcript_store.append(caller.session_id, "user_ask", {
         "sent_message_id": sent_id, "question_chars": len(question),
     })
@@ -869,6 +1209,7 @@ DISPATCH_TABLE = {
     "lifeos_agent_transcript_read": transcript_read,
     "lifeos_agent_sessions_list": sessions_list,
     "lifeos_agent_user_ask": user_ask,
+    "lifeos_agent_execution_override": execution_override,
 }
 
 

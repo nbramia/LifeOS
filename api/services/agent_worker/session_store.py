@@ -46,6 +46,22 @@ TERMINAL_STATUSES = frozenset({
     STATUS_BUDGET_EXCEEDED,
 })
 
+# Shared lifecycle vocabulary.  These are intentionally internal storage
+# values: the public task status/checkbox vocabulary remains unchanged.
+WAIT_OPERATOR = "operator"
+WAIT_PROVIDER = "provider"
+WAIT_DEPENDENCY = "dependency"
+WAIT_TYPES = frozenset({WAIT_OPERATOR, WAIT_PROVIDER, WAIT_DEPENDENCY})
+
+OCCURRENCE_PENDING = "pending"
+OCCURRENCE_CLAIMED = "claimed"
+OCCURRENCE_DISPATCHED = "dispatched"
+OCCURRENCE_FAILED = "failed"
+OCCURRENCE_STATES = frozenset({
+    OCCURRENCE_PENDING, OCCURRENCE_CLAIMED, OCCURRENCE_DISPATCHED,
+    OCCURRENCE_FAILED,
+})
+
 
 @dataclass
 class Session:
@@ -97,8 +113,8 @@ class Session:
     claude_code_session_id: str | None = None
     # Claude tier the Claude Code CLI runs for routing="claude_code" sessions
     # ("haiku" / "sonnet" / "opus"). Set by lifeos_agent_spawn's `tier` arg so
-    # the worker can escalate simple delegated work to a cheaper model. NULL
-    # falls back to the CLI default ("opus").
+    # the worker can choose a tier explicitly. NULL omits --model and leaves
+    # the configured/native Claude CLI default authoritative.
     claude_code_model: str | None = None
     # Telegram bot identity that owns this session's operator-facing messages.
     # NULL = primary bot (the default for every legacy / non-doctor session).
@@ -140,6 +156,34 @@ class Session:
     # `_model_label_for_routing`, which reads this column instead for a
     # per-session badge).
     hermes_model: str | None = None
+    # Canonical execution inputs and the immutable pre-dispatch snapshot.
+    # The snapshot is reused on retry/resume rather than re-reading defaults.
+    execution_request: dict | None = None
+    execution_spec: dict | None = None
+    # Lifecycle identity.  A session may be deliberately reopened for a new
+    # attempt; attempts and executor turns retain their own immutable ids.
+    attempt_id: str | None = None
+    attempt_number: int = 0
+    turn_id: str | None = None
+    turn_number: int = 0
+    persona_id: str | None = None
+
+
+@dataclass(frozen=True)
+class Occurrence:
+    """Durable schedule-fire identity and handoff claim state."""
+
+    occurrence_key: str
+    schedule_id: str
+    scheduled_for: str
+    state: str = OCCURRENCE_PENDING
+    task_id: str | None = None
+    session_id: str | None = None
+    lease_generation: int = 0
+    lease_owner: str | None = None
+    lease_expires_at: int | None = None
+    created_at: int = 0
+    updated_at: int = 0
 
 
 # Engine -> storage id prefix for the `cli_sessions` table (#849). Matches
@@ -212,7 +256,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     preset_class              TEXT,
     origin                    TEXT,  -- NULL/"agent" = #agent task; "operator" = root-spawned (#235)
     claude_code_session_id    TEXT,  -- Claude Code (or Codex) CLI session UUID for routing="claude_code"/"codex"
-    claude_code_model         TEXT,  -- Claude tier for routing="claude_code" (haiku/sonnet/opus); NULL = CLI default (opus)
+    claude_code_model         TEXT,  -- Claude tier for routing="claude_code"; NULL = omit --model
     bot                       TEXT,  -- Telegram bot that owns this session's notices; NULL = primary (#348)
     unpriced                  INTEGER NOT NULL DEFAULT 0,  -- sticky: any record_spend call priced an unknown model (#669)
     host                      TEXT,  -- board-assigned host name (#851); NULL/"" = the API host
@@ -220,12 +264,130 @@ CREATE TABLE IF NOT EXISTS sessions (
     effort                    TEXT,  -- board-assigned effort level (#851): low|medium|high|max
     conversation_id           TEXT,  -- Hermes conversation id (#851, routing='hermes' only)
     remote_pgid               INTEGER,  -- process-group id echoed by a remote-spawned subprocess (#851)
-    hermes_model              TEXT  -- model Hermes itself reported for this session's own turn (#892); NULL = no turn yet
+    hermes_model              TEXT,  -- model Hermes itself reported for this session's own turn (#892); NULL = no turn yet
+    execution_request_json    TEXT,
+    execution_spec_json       TEXT,
+    attempt_id                TEXT,
+    attempt_number             INTEGER NOT NULL DEFAULT 0,
+    turn_id                    TEXT,
+    turn_number                INTEGER NOT NULL DEFAULT 0,
+    persona_id                 TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_root ON sessions(root_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_yield ON sessions(status) WHERE status = 'yielded';
+
+-- Immutable execution-attempt and executor-turn history.  The current ids
+-- are mirrored on sessions for cheap reads; these tables retain prior retry
+-- and resume identities for idempotent usage transport.
+CREATE TABLE IF NOT EXISTS execution_attempts (
+    session_id     TEXT NOT NULL,
+    attempt_id     TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    created_at     INTEGER NOT NULL,
+    PRIMARY KEY (session_id, attempt_id),
+    UNIQUE (session_id, attempt_number)
+);
+CREATE TABLE IF NOT EXISTS execution_turns (
+    session_id     TEXT NOT NULL,
+    attempt_id     TEXT NOT NULL,
+    turn_id        TEXT NOT NULL,
+    turn_number    INTEGER NOT NULL,
+    operation      TEXT NOT NULL,
+    started_at     INTEGER NOT NULL,
+    PRIMARY KEY (session_id, attempt_id, turn_id),
+    UNIQUE (session_id, attempt_id, turn_number)
+);
+CREATE INDEX IF NOT EXISTS idx_execution_turns_attempt
+    ON execution_turns(session_id, attempt_id, turn_number);
+
+-- Scheduler fires are separate from schedule definition/history.  The
+-- occurrence key is deterministic and is the recovery/idempotency boundary
+-- between Markdown and SQLite.
+CREATE TABLE IF NOT EXISTS schedule_occurrences (
+    occurrence_key    TEXT PRIMARY KEY,
+    schedule_id       TEXT NOT NULL,
+    scheduled_for     TEXT NOT NULL,
+    state             TEXT NOT NULL,
+    task_id           TEXT,
+    session_id        TEXT,
+    lease_generation  INTEGER NOT NULL DEFAULT 0,
+    lease_owner       TEXT,
+    lease_expires_at  INTEGER,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_schedule_occurrences_schedule
+    ON schedule_occurrences(schedule_id, scheduled_for);
+CREATE INDEX IF NOT EXISTS idx_schedule_occurrences_recovery
+    ON schedule_occurrences(state, lease_expires_at);
+
+-- Machine/operator/dependency waits and explicit human-card links.  A wait is
+-- tied to an immutable execution attempt, so a stale resolution cannot wake a
+-- replacement attempt.
+CREATE TABLE IF NOT EXISTS lifecycle_waits (
+    wait_id          TEXT PRIMARY KEY,
+    task_id          TEXT NOT NULL,
+    session_id       TEXT NOT NULL,
+    attempt_id       TEXT NOT NULL,
+    wait_type        TEXT NOT NULL,
+    reason           TEXT NOT NULL DEFAULT '',
+    card_id          TEXT,
+    dependencies_json TEXT,
+    state            TEXT NOT NULL DEFAULT 'open',
+    created_at       INTEGER NOT NULL,
+    resolved_at      INTEGER,
+    wake_enqueued    INTEGER NOT NULL DEFAULT 0,
+    wake_consumed    INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(session_id, attempt_id, wait_type)
+);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_waits_card
+    ON lifecycle_waits(card_id, state);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_waits_ready
+    ON lifecycle_waits(state, wait_type, wake_enqueued);
+
+-- Cross-store projection marker.  The row is inserted before a Markdown
+-- update and acknowledged only after the TaskManager write succeeds.
+CREATE TABLE IF NOT EXISTS lifecycle_projections (
+    event_id          TEXT PRIMARY KEY,
+    task_id           TEXT NOT NULL,
+    session_id        TEXT,
+    attempt_id        TEXT,
+    expected_version  TEXT,
+    target_status     TEXT NOT NULL,
+    payload_json      TEXT NOT NULL,
+    state             TEXT NOT NULL DEFAULT 'pending',
+    error             TEXT,
+    created_at        INTEGER NOT NULL,
+    applied_at        INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_projections_pending
+    ON lifecycle_projections(state, created_at);
+
+-- Exact cancellation fences.  A FAILED status alone is not enough to tell a
+-- cancellation apart from an ordinary failure (the latter may race a clean
+-- executor return and retain the historical success behavior).  The guard is
+-- scoped to the immutable attempt/turn identity so a reopened execution is
+-- never affected by an old cancellation.
+CREATE TABLE IF NOT EXISTS cancellation_guards (
+    session_id TEXT NOT NULL,
+    task_id    TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    turn_id    TEXT NOT NULL DEFAULT '',
+    reason     TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, attempt_id, turn_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cancellation_guards_task
+    ON cancellation_guards(task_id, attempt_id, turn_id);
+
+CREATE TABLE IF NOT EXISTS execution_overrides (
+    scope       TEXT NOT NULL CHECK(scope IN ('session', 'lineage')),
+    scope_id    TEXT NOT NULL,
+    override_json TEXT NOT NULL,
+    PRIMARY KEY (scope, scope_id)
+);
 
 -- Inter-agent messages queued for delivery to a peer/child/parent session.
 -- Used by `lifeos_agent_send` for sessions that aren't actively running.
@@ -276,7 +438,9 @@ CREATE TABLE IF NOT EXISTS pending_questions (
     -- Telegram bot that sent this question. NULL = primary. Reply matching is
     -- scoped by bot so a doctor-bot reply can't collide with a primary-bot
     -- question that happens to share a numeric message id (#348).
-    bot               TEXT
+    bot               TEXT,
+    attempt_id        TEXT,
+    turn_id           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_pq_message_id ON pending_questions(sent_message_id);
 CREATE INDEX IF NOT EXISTS idx_pq_open ON pending_questions(answered_at, processed, timed_out);
@@ -334,7 +498,11 @@ CREATE TABLE IF NOT EXISTS managed_cursor (
     -- on each tool_use and resets to 0 on each agent.message.
     tool_loop_signature              TEXT,
     tool_loop_count                  INTEGER NOT NULL DEFAULT 0,
-    tool_calls_since_message         INTEGER NOT NULL DEFAULT 0
+    tool_calls_since_message         INTEGER NOT NULL DEFAULT 0,
+    -- Provider totals are cumulative across Managed turns. Keep the
+    -- provider/session high-water mark and the current turn baseline so a
+    -- resumed turn books only its own delta.
+    usage_snapshot_json              TEXT
 );
 
 -- Cross-machine Claude Code / Codex CLI sessions (#849). One row per
@@ -371,6 +539,14 @@ def new_session_id() -> str:
     return f"sess_{uuid.uuid4().hex[:16]}"
 
 
+def new_attempt_id() -> str:
+    return f"attempt_{uuid.uuid4().hex[:20]}"
+
+
+def new_turn_id() -> str:
+    return f"turn_{uuid.uuid4().hex[:20]}"
+
+
 class SessionStore:
     """Thin SQLite wrapper. Each method opens a short-lived connection so the
     store is safe to use from multiple threads or processes — SQLite's own
@@ -378,6 +554,7 @@ class SessionStore:
 
     def __init__(self, db_path: Path | str = DEFAULT_DB_PATH):
         self.db_path = Path(db_path)
+        self._status_projector = None
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -418,6 +595,10 @@ class SessionStore:
             # reply matching to the sending bot. Legacy rows stay NULL = primary.
             if "bot" not in pq_cols:
                 conn.execute("ALTER TABLE pending_questions ADD COLUMN bot TEXT")
+            if "attempt_id" not in pq_cols:
+                conn.execute("ALTER TABLE pending_questions ADD COLUMN attempt_id TEXT")
+            if "turn_id" not in pq_cols:
+                conn.execute("ALTER TABLE pending_questions ADD COLUMN turn_id TEXT")
             # Idempotent migration for the prompt-cache token buckets on
             # `sessions`. Old rows stay at zero — we don't backfill historical
             # sessions, the raw event payloads in transcripts still have the
@@ -458,7 +639,7 @@ class SessionStore:
                         "WHERE claude_code_session_id IS NULL AND code_session_id IS NOT NULL"
                     )
             # Idempotent migration for the per-session Claude Code tier (#349).
-            # Old rows stay NULL → the CLI default ("opus").
+            # Old rows stay NULL → omit --model and use the CLI default.
             if "claude_code_model" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN claude_code_model TEXT")
             # Idempotent migration for the sticky `unpriced` flag (#669). Old
@@ -506,6 +687,8 @@ class SessionStore:
                     "ALTER TABLE managed_cursor ADD COLUMN tool_calls_since_message "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            if "usage_snapshot_json" not in mc_cols:
+                conn.execute("ALTER TABLE managed_cursor ADD COLUMN usage_snapshot_json TEXT")
             # Idempotent migration block for card assignment (#851): host,
             # model, effort, conversation_id, remote_pgid. Old rows stay
             # NULL — "no assignment recorded" for a pre-#851 session.
@@ -526,6 +709,58 @@ class SessionStore:
             # one.
             if "hermes_model" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN hermes_model TEXT")
+            if "execution_request_json" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN execution_request_json TEXT")
+            if "execution_spec_json" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN execution_spec_json TEXT")
+            # Lifecycle identity is additive and nullable for legacy rows.
+            # ``ensure_attempt`` backfills an id on first dispatch, while
+            # keeping old sessions readable before they run again.
+            if "attempt_id" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN attempt_id TEXT")
+            if "attempt_number" not in sess_cols:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 0"
+                )
+            if "turn_id" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN turn_id TEXT")
+            if "turn_number" not in sess_cols:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN turn_number INTEGER NOT NULL DEFAULT 0"
+                )
+            if "persona_id" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN persona_id TEXT")
+            wait_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lifecycle_waits)")}
+            if "wake_consumed" not in wait_cols:
+                conn.execute(
+                    "ALTER TABLE lifecycle_waits ADD COLUMN wake_consumed INTEGER NOT NULL DEFAULT 0"
+                )
+            # Older databases may have been opened before the lifecycle table
+            # was included in _SCHEMA; create it idempotently here as well.
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS execution_attempts (
+                    session_id TEXT NOT NULL,
+                    attempt_id TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (session_id, attempt_id),
+                    UNIQUE (session_id, attempt_number)
+                );
+                CREATE TABLE IF NOT EXISTS execution_turns (
+                    session_id TEXT NOT NULL,
+                    attempt_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    turn_number INTEGER NOT NULL,
+                    operation TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    PRIMARY KEY (session_id, attempt_id, turn_id),
+                    UNIQUE (session_id, attempt_id, turn_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_execution_turns_attempt
+                    ON execution_turns(session_id, attempt_id, turn_number);
+                """
+            )
 
     # ------------------------------------------------------------------
     # Session CRUD
@@ -548,6 +783,9 @@ class SessionStore:
         host: str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        execution_request: dict | None = None,
+        execution_spec: dict | None = None,
+        persona_id: str | None = None,
     ) -> Session:
         """Insert a new session row. Raises sqlite3.IntegrityError if `task_id`
         already has a row — the caller should treat that as a lost-race signal.
@@ -565,6 +803,7 @@ class SessionStore:
         ("no assignment" — the routing/executor default applies).
         """
         sid = session_id or new_session_id()
+        attempt_id = new_attempt_id()
         root_sid = root_session_id or sid
         now = _now()
         with self._connect() as conn:
@@ -575,8 +814,9 @@ class SessionStore:
                     started_at, last_activity_at,
                     expected_output, parent_session_id,
                     root_session_id, spawn_depth, origin, claude_code_model, bot,
-                    host, model, effort
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    host, model, effort, execution_request_json, execution_spec_json,
+                    attempt_id, attempt_number, turn_id, turn_number, persona_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id, sid, status, routing,
@@ -585,7 +825,15 @@ class SessionStore:
                     expected_output, parent_session_id,
                     root_sid, spawn_depth, origin, claude_code_model, bot,
                     host, model, effort,
+                    json.dumps(execution_request) if execution_request is not None else None,
+                    json.dumps(execution_spec) if execution_spec is not None else None,
+                    attempt_id, 1, None, 0, persona_id,
                 ),
+            )
+            conn.execute(
+                "INSERT INTO execution_attempts(session_id, attempt_id, attempt_number, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (sid, attempt_id, 1, now),
             )
         return Session(
             task_id=task_id,
@@ -605,6 +853,13 @@ class SessionStore:
             host=host,
             model=model,
             effort=effort,
+            execution_request=execution_request,
+            execution_spec=execution_spec,
+            attempt_id=attempt_id,
+            attempt_number=1,
+            turn_id=None,
+            turn_number=0,
+            persona_id=persona_id,
         )
 
     def get(self, task_id: str) -> Session | None:
@@ -621,16 +876,677 @@ class SessionStore:
             ).fetchone()
         return self._row_to_session(row) if row else None
 
-    def update_status(self, task_id: str, status: str) -> None:
+    # ------------------------------------------------------------------
+    # Schedule occurrence ledger
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def occurrence_key_for(schedule_id: str, scheduled_for: str) -> str:
+        """Return the stable key for one scheduled fire."""
+        if not schedule_id or not scheduled_for:
+            raise ValueError("schedule_id and scheduled_for are required")
+        return f"{schedule_id}:{scheduled_for}"
+
+    def ensure_occurrence(
+        self, schedule_id: str, scheduled_for: str,
+        *, occurrence_key: str | None = None,
+    ) -> Occurrence:
+        key = occurrence_key or self.occurrence_key_for(schedule_id, scheduled_for)
+        now = _now()
         with self._connect() as conn:
             conn.execute(
-                """
-                UPDATE sessions
-                SET status = ?, last_activity_at = ?
-                WHERE task_id = ?
-                """,
-                (status, _now(), task_id),
+                "INSERT OR IGNORE INTO schedule_occurrences "
+                "(occurrence_key, schedule_id, scheduled_for, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (key, schedule_id, scheduled_for, OCCURRENCE_PENDING, now, now),
             )
+            row = conn.execute(
+                "SELECT * FROM schedule_occurrences WHERE occurrence_key = ?", (key,)
+            ).fetchone()
+        return self._row_to_occurrence(row)
+
+    def get_occurrence(self, occurrence_key: str) -> Occurrence | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM schedule_occurrences WHERE occurrence_key = ?",
+                (occurrence_key,),
+            ).fetchone()
+        return self._row_to_occurrence(row) if row else None
+
+    def claim_occurrence(
+        self, occurrence_key: str, owner: str, *, lease_seconds: int = 120,
+    ) -> Occurrence | None:
+        """Atomically claim a pending/expired occurrence.
+
+        A loser receives ``None``. Returning an existing claimed row made it
+        impossible for callers to distinguish a winner from a concurrent
+        loser, allowing both schedulers to create a task before either linked
+        it.
+        """
+        if not owner:
+            raise ValueError("occurrence claim owner is required")
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM schedule_occurrences WHERE occurrence_key = ?",
+                (occurrence_key,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            claimable = row["state"] == OCCURRENCE_PENDING or (
+                row["state"] == OCCURRENCE_CLAIMED
+                and (row["lease_expires_at"] or 0) <= now
+            )
+            if claimable:
+                generation = int(row["lease_generation"] or 0) + 1
+                conn.execute(
+                    "UPDATE schedule_occurrences SET state = ?, lease_generation = ?, "
+                    "lease_owner = ?, lease_expires_at = ?, updated_at = ? "
+                    "WHERE occurrence_key = ?",
+                    (OCCURRENCE_CLAIMED, generation, owner,
+                     now + max(1, int(lease_seconds)), now, occurrence_key),
+                )
+                row = conn.execute(
+                    "SELECT * FROM schedule_occurrences WHERE occurrence_key = ?",
+                    (occurrence_key,),
+                ).fetchone()
+            else:
+                row = None
+            conn.commit()
+        return self._row_to_occurrence(row) if row is not None else None
+
+    def renew_occurrence(
+        self, occurrence_key: str, *, owner: str, lease_generation: int,
+        lease_seconds: int = 120,
+    ) -> bool:
+        """Extend one claim without allowing an older generation to revive it."""
+        if not owner or lease_generation <= 0:
+            return False
+        now = _now()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE schedule_occurrences SET lease_expires_at = ?, updated_at = ? "
+                "WHERE occurrence_key = ? AND state = ? AND lease_owner = ? "
+                "AND lease_generation = ? AND lease_expires_at > ?",
+                (now + max(1, int(lease_seconds)), now, occurrence_key,
+                 OCCURRENCE_CLAIMED, owner, int(lease_generation), now),
+            )
+        return cur.rowcount == 1
+
+    def link_occurrence(
+        self, occurrence_key: str, *, task_id: str, session_id: str | None = None,
+        owner: str | None = None, lease_generation: int | None = None,
+        state: str = OCCURRENCE_DISPATCHED,
+    ) -> bool:
+        if state not in OCCURRENCE_STATES:
+            raise ValueError(f"invalid occurrence state: {state}")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            where = "occurrence_key = ?"
+            params: list[object] = [occurrence_key]
+            if owner is not None:
+                where += " AND lease_owner = ?"
+                params.append(owner)
+            if lease_generation is not None:
+                where += " AND lease_generation = ? AND lease_expires_at > ?"
+                params.extend((int(lease_generation), _now()))
+            cur = conn.execute(
+                f"UPDATE schedule_occurrences SET task_id = COALESCE(task_id, ?), "
+                f"session_id = COALESCE(session_id, ?), state = ?, lease_owner = NULL, "
+                f"lease_expires_at = NULL, updated_at = ? WHERE {where}",
+                (task_id, session_id, state, _now(), *params),
+            )
+            conn.commit()
+        return cur.rowcount == 1
+
+    def link_occurrence_session(self, task_id: str, session_id: str) -> bool:
+        """Attach the real worker session identity after task claim."""
+        if not task_id or not session_id:
+            return False
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE schedule_occurrences SET session_id = COALESCE(session_id, ?), "
+                "updated_at = ? WHERE task_id = ?",
+                (session_id, _now(), task_id),
+            )
+        return cur.rowcount == 1
+
+    def list_recoverable_occurrences(self) -> list[Occurrence]:
+        now = _now()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM schedule_occurrences WHERE state IN (?, ?) "
+                "AND (state = ? OR lease_expires_at IS NULL OR lease_expires_at <= ?) "
+                "ORDER BY created_at ASC",
+                (OCCURRENCE_PENDING, OCCURRENCE_CLAIMED, OCCURRENCE_PENDING, now),
+            ).fetchall()
+        return [self._row_to_occurrence(row) for row in rows]
+
+    @staticmethod
+    def _row_to_occurrence(row: sqlite3.Row) -> Occurrence:
+        return Occurrence(
+            occurrence_key=row["occurrence_key"], schedule_id=row["schedule_id"],
+            scheduled_for=row["scheduled_for"], state=row["state"],
+            task_id=row["task_id"], session_id=row["session_id"],
+            lease_generation=int(row["lease_generation"] or 0),
+            lease_owner=row["lease_owner"], lease_expires_at=row["lease_expires_at"],
+            created_at=int(row["created_at"] or 0), updated_at=int(row["updated_at"] or 0),
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle projection markers and typed waits
+    # ------------------------------------------------------------------
+
+    def begin_projection(self, event_id: str, *, task_id: str, session_id: str | None,
+                         attempt_id: str | None, expected_version: str | None,
+                         target_status: str, payload: dict) -> bool:
+        """Record a projection before touching Markdown.
+
+        Returns False for an already-applied event, making repeated executor
+        callbacks harmless. Pending/conflicted rows return True for retry.
+        """
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT state FROM lifecycle_projections WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO lifecycle_projections "
+                    "(event_id, task_id, session_id, attempt_id, expected_version, "
+                    "target_status, payload_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                    (event_id, task_id, session_id, attempt_id, expected_version,
+                     target_status, json.dumps(payload), now),
+                )
+                conn.commit()
+                return True
+            conn.commit()
+            return row["state"] != "applied"
+
+    def acknowledge_projection(self, event_id: str, *, error: str | None = None) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE lifecycle_projections SET state = ?, error = ?, applied_at = ? "
+                "WHERE event_id = ? AND state != 'applied'",
+                ("applied" if error is None else "conflicted", error,
+                 _now() if error is None else None, event_id),
+            )
+        return cur.rowcount == 1
+
+    def list_pending_projections(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM lifecycle_projections WHERE state != 'applied' ORDER BY created_at"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def projection_applied(self, event_id: str) -> bool:
+        """Return whether a lifecycle marker crossed its durable CAS boundary."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM lifecycle_projections WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        return bool(row and row["state"] == "applied")
+
+    def record_wait(
+        self, *, task_id: str, session_id: str, attempt_id: str,
+        wait_type: str, reason: str = "", card_id: str | None = None,
+        dependencies: list[str] | None = None, wait_id: str | None = None,
+    ) -> str:
+        if wait_type not in WAIT_TYPES:
+            raise ValueError(f"invalid wait type: {wait_type}")
+        wait_id = wait_id or uuid.uuid4().hex
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO lifecycle_waits "
+                "(wait_id, task_id, session_id, attempt_id, wait_type, reason, card_id, dependencies_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id, attempt_id, wait_type) DO UPDATE SET "
+                "reason=excluded.reason, card_id=COALESCE(excluded.card_id, lifecycle_waits.card_id), "
+                "dependencies_json=excluded.dependencies_json",
+                (wait_id, task_id, session_id, attempt_id, wait_type, reason, card_id,
+                 json.dumps(dependencies or []), now),
+            )
+        return wait_id
+
+    def list_open_waits(self, *, card_id: str | None = None,
+                        session_id: str | None = None) -> list[dict]:
+        clauses = ["state = 'open'"]
+        params: list[object] = []
+        if card_id is not None:
+            clauses.append("card_id = ?")
+            params.append(card_id)
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM lifecycle_waits WHERE " + " AND ".join(clauses) +
+                " ORDER BY created_at", tuple(params),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def enqueue_wait_wakeup(self, wait_id: str) -> bool:
+        """Durably enqueue one resolved operator wait for worker replay.
+
+        The queue marker and message are committed together. A crash after
+        this method returns leaves both the message and the unconsumed wait,
+        allowing startup recovery to finish the board/status projection.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            wait = conn.execute(
+                "SELECT * FROM lifecycle_waits WHERE wait_id = ?", (wait_id,)
+            ).fetchone()
+            if wait is None or wait["state"] != "resolved" or wait["wait_type"] != WAIT_OPERATOR:
+                conn.rollback()
+                return False
+            if wait["wake_enqueued"]:
+                conn.commit()
+                return False
+            conn.execute(
+                "INSERT INTO pending_messages(session_id, sender_id, content, created_at) "
+                "VALUES (?, 'human_queue', ?, ?)",
+                (wait["session_id"], f"Human queue wakeup:{wait_id}", _now()),
+            )
+            conn.execute(
+                "UPDATE lifecycle_waits SET wake_enqueued = 1 WHERE wait_id = ?",
+                (wait_id,),
+            )
+            conn.commit()
+            return True
+
+    def mark_wait_resolved(self, wait_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE lifecycle_waits SET state = 'resolved', resolved_at = ? "
+                "WHERE wait_id = ? AND state = 'open'", (_now(), wait_id),
+            )
+        return cur.rowcount == 1
+
+    def claim_wait_wakeup(self, wait_id: str) -> bool:
+        """At-most-once wakeup claim; duplicate card resolution is a no-op."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE lifecycle_waits SET wake_enqueued = 1 WHERE wait_id = ? "
+                "AND state = 'resolved' AND wake_enqueued = 0", (wait_id,),
+            )
+        return cur.rowcount == 1
+
+    def dependencies_satisfied(self, dependencies: list[str] | None) -> bool:
+        """Return whether all explicit wait/card dependencies are resolved."""
+        deps = [str(value) for value in (dependencies or []) if value]
+        if not deps:
+            return True
+        with self._connect() as conn:
+            for dependency in deps:
+                row = conn.execute(
+                    "SELECT 1 FROM lifecycle_waits WHERE state = 'open' AND "
+                    "(wait_id = ? OR card_id = ?) LIMIT 1",
+                    (dependency, dependency),
+                ).fetchone()
+                if row is not None:
+                    return False
+        return True
+
+    def list_resolved_waits(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM lifecycle_waits WHERE state = 'resolved' "
+                "AND wake_consumed = 0 ORDER BY resolved_at, created_at",
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def complete_wait_wakeup(self, wait_id: str) -> bool:
+        """Acknowledge a wake only after task and session projection succeeds."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE lifecycle_waits SET wake_consumed = 1 "
+                "WHERE wait_id = ? AND state = 'resolved' AND wake_enqueued = 1",
+                (wait_id,),
+            )
+        return cur.rowcount == 1
+
+    def discard_wait_wakeup(self, wait_id: str) -> bool:
+        """Consume a stale or non-dispatchable wait without creating a wake message."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE lifecycle_waits SET wake_enqueued = 1, wake_consumed = 1 "
+                "WHERE wait_id = ? AND state = 'resolved' AND wake_consumed = 0",
+                (wait_id,),
+            )
+        return cur.rowcount == 1
+
+    def begin_executor_turn(
+        self, task_id: str, operation: str, *, session: Session | None = None,
+    ) -> Session:
+        """Atomically persist the next executor turn and return its snapshot.
+
+        This is called immediately before an engine side effect.  A resume is
+        a new turn in the same attempt; ``begin_new_execution`` creates a new
+        attempt when the operator deliberately reopens a terminal session.
+        """
+        if not operation:
+            raise ValueError("executor turn operation is required")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM sessions WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(task_id)
+                if session is not None and (
+                    row["attempt_id"] != getattr(session, "attempt_id", None)
+                    or row["turn_id"] != getattr(session, "turn_id", None)
+                ):
+                    raise RuntimeError("stale session attempt/turn")
+                if row["status"] in TERMINAL_STATUSES:
+                    raise RuntimeError("terminal session cannot begin executor turn")
+                sid = row["session_id"]
+                attempt_id = row["attempt_id"] or new_attempt_id()
+                attempt_number = int(row["attempt_number"] or 0)
+                if attempt_number <= 0:
+                    attempt_number = conn.execute(
+                        "SELECT COALESCE(MAX(attempt_number), 0) FROM execution_attempts "
+                        "WHERE session_id = ?", (sid,)
+                    ).fetchone()[0] + 1
+                conn.execute(
+                    "INSERT OR IGNORE INTO execution_attempts "
+                    "(session_id, attempt_id, attempt_number, created_at) VALUES (?, ?, ?, ?)",
+                    (sid, attempt_id, attempt_number, _now()),
+                )
+                turn_number = conn.execute(
+                    "SELECT COALESCE(MAX(turn_number), 0) + 1 FROM execution_turns "
+                    "WHERE session_id = ? AND attempt_id = ?",
+                    (sid, attempt_id),
+                ).fetchone()[0]
+                turn_id = new_turn_id()
+                now = _now()
+                conn.execute(
+                    "UPDATE sessions SET attempt_id = ?, attempt_number = ?, "
+                    "turn_id = ?, turn_number = ?, last_activity_at = ? WHERE task_id = ?",
+                    (attempt_id, attempt_number, turn_id, turn_number, now, task_id),
+                )
+                conn.execute(
+                    "INSERT INTO execution_turns "
+                    "(session_id, attempt_id, turn_id, turn_number, operation, started_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (sid, attempt_id, turn_id, turn_number, operation, now),
+                )
+                row = conn.execute(
+                    "SELECT * FROM sessions WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        result = self._row_to_session(row)
+        # Callers occasionally carry an intentionally enriched in-memory
+        # snapshot (for example a synthetic host assignment in tests) that
+        # has not yet been persisted. Preserve that context while the
+        # lifecycle ids always come from the atomic row update above.
+        if session is not None:
+            for name in (
+                "routing", "budget", "expected_output", "parent_session_id",
+                "managed_agent_session_id", "preset_class", "root_session_id",
+                "spawn_depth", "yield_waiting_for", "origin",
+                "claude_code_session_id", "claude_code_model", "bot", "host",
+                "model", "effort", "conversation_id", "remote_pgid",
+                "hermes_model", "execution_request", "execution_spec",
+                "persona_id",
+            ):
+                value = getattr(session, name, None)
+                if value is not None:
+                    setattr(result, name, value)
+        return result
+
+    def mark_executor_turn_running(
+        self, task_id: str, attempt_id: str, turn_id: str,
+    ) -> bool:
+        """Atomically start one allocated executor turn.
+
+        Turn allocation and the engine side effect are deliberately separate:
+        cancellation can arrive in between them.  Only a still-live turn may
+        cross into ``running``; a failed/cancelled attempt therefore cannot be
+        resurrected by a late executor callback.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE sessions SET status = ?, last_activity_at = ? "
+                "WHERE task_id = ? AND attempt_id = ? AND turn_id = ? "
+                "AND status IN (?, ?, ?)",
+                (
+                    STATUS_RUNNING, _now(), task_id, attempt_id, turn_id,
+                    STATUS_CLAIMED, STATUS_RUNNING, STATUS_YIELDED,
+                ),
+            )
+        return cur.rowcount == 1
+
+    def update_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        attempt_id: str | None = None,
+        turn_id: str | None = None,
+        wait_type: str | None = None,
+        wait_reason: str = "",
+    ) -> bool:
+        """Persist status, optionally only for the current execution turn.
+
+        Executor callbacks can finish after a newer attempt has started.  A
+        task-id-only update from that old callback must not overwrite the new
+        attempt's state, so identity-bearing callers get an atomic compare.
+        The bool return is intentionally additive; legacy callers can ignore
+        it while new lifecycle code can distinguish an ignored late write.
+        """
+        where = ["task_id = ?"]
+        params: list[object] = [task_id]
+        if attempt_id is not None:
+            where.append("attempt_id = ?")
+            params.append(attempt_id)
+        if turn_id is not None:
+            where.append("turn_id = ?")
+            params.append(turn_id)
+        # A cancellation is a terminal decision for this exact execution.
+        # Keep FAILED writes idempotent (the cancellation path itself writes
+        # FAILED), while every other status must observe the durable fence.
+        # Without this guard, a late inter-agent YIELDED/BLOCKED write could
+        # resurrect a turn that cancellation already fenced as FAILED.
+        if status != STATUS_FAILED:
+            where.append(
+                "NOT EXISTS ("
+                "SELECT 1 FROM cancellation_guards g "
+                "WHERE g.session_id = sessions.session_id "
+                "AND g.attempt_id = sessions.attempt_id "
+                "AND g.turn_id = COALESCE(sessions.turn_id, '')"
+                ")"
+            )
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE sessions SET status = ?, last_activity_at = ? "
+                f"WHERE {' AND '.join(where)}",
+                (status, _now(), *params),
+            )
+        applied = cur.rowcount == 1
+        projector = self._status_projector
+        if applied and projector is not None and status in TERMINAL_STATUSES | {STATUS_BLOCKED}:
+            projector(
+                task_id, status, attempt_id=attempt_id, turn_id=turn_id,
+                wait_type=wait_type, wait_reason=wait_reason,
+            )
+        return applied
+
+    def set_status_projector(self, callback) -> None:
+        """Install the process-local callback for worker status projection."""
+        self._status_projector = callback
+
+    def mark_cancelled(
+        self,
+        task_id: str,
+        *,
+        attempt_id: str,
+        turn_id: str | None = None,
+        reason: str = "",
+    ) -> bool:
+        """Atomically fence one exact execution turn as cancelled.
+
+        Cancellation is persisted separately from ``FAILED`` because an
+        ordinary failure may legitimately race a clean executor return.  A
+        caller must provide the immutable attempt id; ``turn_id`` is optional
+        only for a queued pre-turn cancellation.  The status flip and guard
+        insert share one transaction, so a late executor can never observe
+        one without the other.
+        """
+        if not attempt_id:
+            return False
+        turn_key = turn_id or ""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT session_id, attempt_id, turn_id, status "
+                    "FROM sessions WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if row is None or row["attempt_id"] != attempt_id:
+                    conn.rollback()
+                    return False
+                if turn_id is None and row["turn_id"] is not None:
+                    conn.rollback()
+                    return False
+                if turn_id is not None and row["turn_id"] != turn_id:
+                    conn.rollback()
+                    return False
+                conn.execute(
+                    "INSERT OR IGNORE INTO cancellation_guards "
+                    "(session_id, task_id, attempt_id, turn_id, reason, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (row["session_id"], task_id, attempt_id, turn_key, reason, _now()),
+                )
+                conn.execute(
+                    "UPDATE sessions SET status = ?, last_activity_at = ? "
+                    "WHERE task_id = ? AND attempt_id = ? "
+                    "AND ((? IS NULL AND turn_id IS NULL) OR turn_id = ?) "
+                    "AND status NOT IN (?, ?, ?)",
+                    (
+                        STATUS_FAILED, _now(), task_id, attempt_id,
+                        turn_id, turn_id, *TERMINAL_STATUSES,
+                    ),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
+
+    def is_cancelled(
+        self,
+        task_id: str,
+        attempt_id: str | None,
+        turn_id: str | None,
+    ) -> bool:
+        """Return whether the exact current attempt/turn was cancelled."""
+        if not attempt_id:
+            return False
+        turn_key = turn_id or ""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM cancellation_guards g "
+                "JOIN sessions s ON s.session_id = g.session_id "
+                "WHERE g.task_id = ? AND g.attempt_id = ? AND g.turn_id = ? "
+                "AND s.attempt_id = ? AND (s.turn_id = ? OR (? = '' AND s.turn_id IS NULL))",
+                (task_id, attempt_id, turn_key, attempt_id, turn_id, turn_key),
+            ).fetchone()
+        return row is not None
+
+    def is_current_turn(
+        self, task_id: str, attempt_id: str | None, turn_id: str | None,
+    ) -> bool:
+        """Return whether a callback still owns the persisted attempt/turn.
+
+        ``turn_id`` is intentionally allowed to be ``None`` here.  Queued
+        dispatches capture a session before the executor allocates its first
+        turn, and must still reject that snapshot after a reopen/new attempt.
+        """
+        if not attempt_id:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT attempt_id, turn_id FROM sessions WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return bool(
+            row
+            and row["attempt_id"] == attempt_id
+            and row["turn_id"] == turn_id
+        )
+
+    def _identity_matches(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        attempt_id: str | None,
+        turn_id: str | None,
+    ) -> bool:
+        """Check an optional identity against the row on an existing writer.
+
+        Identity-bearing writes use this while holding the connection's write
+        transaction.  A caller that only knows an attempt can guard the
+        attempt; a caller with both immutable ids guards the exact turn.
+        """
+        if attempt_id is None and turn_id is None:
+            return True
+        row = conn.execute(
+            "SELECT attempt_id, turn_id FROM sessions WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if attempt_id is not None and row["attempt_id"] != attempt_id:
+            return False
+        return turn_id is None or row["turn_id"] == turn_id
+
+    def _guarded_update(
+        self,
+        task_id: str,
+        sql: str,
+        values: tuple[object, ...],
+        *,
+        attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
+        """Run one session/cursor write only while its identity is current."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if not self._identity_matches(conn, task_id, attempt_id, turn_id):
+                    conn.rollback()
+                    return False
+                if attempt_id is not None:
+                    cancelled = conn.execute(
+                        "SELECT 1 FROM cancellation_guards g "
+                        "JOIN sessions s ON s.session_id = g.session_id "
+                        "WHERE s.task_id = ? AND g.attempt_id = s.attempt_id "
+                        "AND g.turn_id = COALESCE(s.turn_id, '')",
+                        (task_id,),
+                    ).fetchone()
+                    if cancelled:
+                        conn.rollback()
+                        return False
+                conn.execute(sql, (*values, task_id))
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
 
     def list_by_status(self, status: str) -> list[Session]:
         with self._connect() as conn:
@@ -662,21 +1578,29 @@ class SessionStore:
             ).fetchall()
         return [self._row_to_session(r) for r in rows]
 
-    def set_claude_code_session_id(self, task_id: str, claude_code_session_id: str) -> None:
+    def set_claude_code_session_id(
+        self, task_id: str, claude_code_session_id: str, *,
+        attempt_id: str | None = None, turn_id: str | None = None,
+    ) -> bool:
         """Persist the CLI's session UUID for a routing='claude_code' or
         routing='codex' session. Called by ClaudeCodeExecutor / CodexExecutor
         as soon as the subprocess emits its init event, so resume after a
         worker restart can pass `-r <uuid>` (or `codex resume <uuid>`).
         """
+        where = ["task_id = ?"]
+        params: list[object] = [task_id]
+        if attempt_id is not None:
+            where.append("attempt_id = ?")
+            params.append(attempt_id)
+        if turn_id is not None:
+            where.append("turn_id = ?")
+            params.append(turn_id)
         with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE sessions
-                SET claude_code_session_id = ?, last_activity_at = ?
-                WHERE task_id = ?
-                """,
-                (claude_code_session_id, _now(), task_id),
+            cur = conn.execute(
+                f"UPDATE sessions SET claude_code_session_id = ?, last_activity_at = ? WHERE {' AND '.join(where)}",
+                (claude_code_session_id, _now(), *params),
             )
+        return cur.rowcount == 1
 
     def set_routing_and_budget(
         self,
@@ -685,25 +1609,29 @@ class SessionStore:
         budget: dict | None,
         expected_output: str | None = None,
         preset_class: str | None = None,
-    ) -> None:
+        *,
+        attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
         """Update routing, budget, expected_output, and preset_class after preflight."""
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE sessions
-                SET routing = ?, budget_json = ?, expected_output = ?,
-                    preset_class = ?, last_activity_at = ?
-                WHERE task_id = ?
-                """,
-                (
-                    routing,
-                    json.dumps(budget) if budget else None,
-                    expected_output,
-                    preset_class,
-                    _now(),
-                    task_id,
-                ),
-            )
+        return self._guarded_update(
+            task_id,
+            """
+            UPDATE sessions
+            SET routing = ?, budget_json = ?, expected_output = ?,
+                preset_class = ?, last_activity_at = ?
+            WHERE task_id = ?
+            """,
+            (
+                routing,
+                json.dumps(budget) if budget else None,
+                expected_output,
+                preset_class,
+                _now(),
+            ),
+            attempt_id=attempt_id,
+            turn_id=turn_id,
+        )
 
     def record_spend(
         self,
@@ -714,7 +1642,10 @@ class SessionStore:
         cache_creation_tokens: int = 0,
         cache_read_tokens: int = 0,
         unpriced: bool = False,
-    ) -> None:
+        *,
+        attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
         """Add to a session's cumulative token + dollar counters.
 
         Cache buckets default to zero so the local executor (which only
@@ -730,9 +1661,9 @@ class SessionStore:
         that conservative estimate is intentional, not a bug. Sticky: once
         True for a session, later priced calls don't clear it.
         """
-        with self._connect() as conn:
-            conn.execute(
-                """
+        return self._guarded_update(
+            task_id,
+            """
                 UPDATE sessions
                 SET total_input_tokens          = total_input_tokens          + ?,
                     total_output_tokens         = total_output_tokens         + ?,
@@ -743,17 +1674,18 @@ class SessionStore:
                     last_activity_at            = ?
                 WHERE task_id = ?
                 """,
-                (
-                    tokens_in,
-                    tokens_out,
-                    cache_creation_tokens,
-                    cache_read_tokens,
-                    dollars,
-                    int(unpriced),
-                    _now(),
-                    task_id,
-                ),
-            )
+            (
+                tokens_in,
+                tokens_out,
+                cache_creation_tokens,
+                cache_read_tokens,
+                dollars,
+                int(unpriced),
+                _now(),
+            ),
+            attempt_id=attempt_id,
+            turn_id=turn_id,
+        )
 
     def set_assignment(
         self,
@@ -762,6 +1694,7 @@ class SessionStore:
         host: str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        persona_id: str | None = None,
     ) -> None:
         """Record the board-assignment fields (#851) onto a session row.
         Called once at dispatch time, right after routing/budget are set,
@@ -771,23 +1704,175 @@ class SessionStore:
             conn.execute(
                 """
                 UPDATE sessions
-                SET host = ?, model = ?, effort = ?, last_activity_at = ?
+                SET host = ?, model = ?, effort = ?, persona_id = ?, last_activity_at = ?
                 WHERE task_id = ?
                 """,
-                (host, model, effort, _now(), task_id),
+                (host, model, effort, persona_id, _now(), task_id),
             )
 
-    def set_conversation_id(self, task_id: str, conversation_id: str) -> None:
-        """Attach a Hermes conversation id (#851, routing='hermes') to a
-        session — mirrors `set_managed_session_id`."""
+    def set_execution_snapshot(
+        self, task_id: str, *, request: dict | None, spec: dict
+    ) -> dict:
+        """Persist the canonical request and resolved spec atomically.
+
+        Dispatchers call this once before any executor side effect. A retry or
+        restart reads the stored spec and never recomputes changed defaults.
+        """
         with self._connect() as conn:
             conn.execute(
-                "UPDATE sessions SET conversation_id = ?, last_activity_at = ? "
-                "WHERE task_id = ?",
-                (conversation_id, _now(), task_id),
+                "UPDATE sessions SET execution_request_json = ?, "
+                "execution_spec_json = ?, routing = ?, host = ?, model = ?, "
+                "effort = ?, budget_json = ?, last_activity_at = ? "
+                "WHERE task_id = ? AND execution_spec_json IS NULL",
+                (
+                    json.dumps(request) if request is not None else None,
+                    json.dumps(spec),
+                    spec["executor"],
+                    spec.get("host"),
+                    spec.get("model_id"),
+                    spec.get("effort"),
+                    json.dumps(spec.get("budget")) if spec.get("budget") else None,
+                    _now(),
+                    task_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT execution_spec_json FROM sessions WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(task_id)
+        # A concurrent resolver may win; every caller must dispatch the same
+        # persisted winner, never its stale in-memory candidate.
+        return json.loads(row["execution_spec_json"])
+
+    def begin_new_execution(
+        self, task_id: str, *, request: dict | None = None
+    ) -> Session:
+        """Clear a terminal execution snapshot for a deliberate new turn.
+
+        This is intentionally not a generic overwrite operation. Active
+        retries/resumes retain their snapshot; only a terminal session can be
+        reopened as a distinct execution.
+        """
+        placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT session_id, status FROM sessions WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if row is None or row["status"] not in TERMINAL_STATUSES:
+                    raise ValueError("only a terminal session can begin a new execution")
+                sid = row["session_id"]
+                next_number = conn.execute(
+                    "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM execution_attempts "
+                    "WHERE session_id = ?", (sid,),
+                ).fetchone()[0]
+                attempt_id = new_attempt_id()
+                now = _now()
+                conn.execute(
+                    f"UPDATE sessions SET status = ?, execution_request_json = ?, "
+                    f"execution_spec_json = NULL, attempt_id = ?, attempt_number = ?, "
+                    f"turn_id = NULL, turn_number = 0, last_activity_at = ? "
+                    f"WHERE task_id = ? AND status IN ({placeholders})",
+                    (
+                        STATUS_CLAIMED,
+                        json.dumps(request) if request is not None else None,
+                        attempt_id, next_number, now, task_id, *TERMINAL_STATUSES,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO execution_attempts "
+                    "(session_id, attempt_id, attempt_number, created_at) VALUES (?, ?, ?, ?)",
+                    (sid, attempt_id, next_number, now),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        refreshed = self.get(task_id)
+        if refreshed is None:  # pragma: no cover - row was just updated
+            raise KeyError(task_id)
+        return refreshed
+
+    def set_execution_override(self, override: "object") -> None:
+        """Upsert one bounded session/lineage override without global state."""
+        payload = override.to_dict()
+        if payload.get("scope") not in {"session", "lineage"} or not payload.get("scope_id"):
+            raise ValueError("override requires a bounded session or lineage scope")
+        if override.expires_at is not None and override.expires_at <= override.created_at:
+            raise ValueError("override expiry must be after creation")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO execution_overrides(scope, scope_id, override_json) "
+                "VALUES (?, ?, ?) ON CONFLICT(scope, scope_id) DO UPDATE SET "
+                "override_json = excluded.override_json",
+                (payload["scope"], payload["scope_id"], json.dumps(payload)),
             )
 
-    def set_hermes_model(self, task_id: str, model: str) -> None:
+    def get_execution_override(
+        self, *, session_id: str, root_session_id: str | None,
+        now: "object | None" = None,
+    ) -> "object | None":
+        """Return the most specific persisted override for future resolution."""
+        from datetime import datetime, timezone
+
+        from api.services.agent_worker.execution import TemporaryOverride
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT override_json FROM execution_overrides "
+                "WHERE (scope = 'session' AND scope_id = ?) "
+                "OR (scope = 'lineage' AND scope_id = ?) "
+                "ORDER BY CASE scope WHEN 'session' THEN 0 ELSE 1 END",
+                (session_id, root_session_id or session_id),
+            ).fetchall()
+        now = now or datetime.now(timezone.utc)
+        for row in rows:
+            override = TemporaryOverride.from_dict(json.loads(row[0]))
+            try:
+                if override.expires_at is None or override.expires_at > now:
+                    return override
+            except TypeError:
+                continue
+        return None
+
+    def clear_execution_override(self, *, scope: str, scope_id: str) -> None:
+        if scope not in {"session", "lineage"}:
+            raise ValueError("scope must be session or lineage")
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM execution_overrides WHERE scope = ? AND scope_id = ?",
+                (scope, scope_id),
+            )
+
+    def set_conversation_id(
+        self, task_id: str, conversation_id: str, *,
+        attempt_id: str | None = None, turn_id: str | None = None,
+    ) -> bool:
+        """Attach a Hermes conversation id (#851, routing='hermes') to a
+        session — mirrors `set_managed_session_id`."""
+        where = ["task_id = ?"]
+        params: list[object] = [task_id]
+        if attempt_id is not None:
+            where.append("attempt_id = ?")
+            params.append(attempt_id)
+        if turn_id is not None:
+            where.append("turn_id = ?")
+            params.append(turn_id)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE sessions SET conversation_id = ?, last_activity_at = ? WHERE {' AND '.join(where)}",
+                (conversation_id, _now(), *params),
+            )
+        return cur.rowcount == 1
+
+    def set_hermes_model(
+        self, task_id: str, model: str, *,
+        attempt_id: str | None = None, turn_id: str | None = None,
+    ) -> bool:
         """Record the model Hermes itself reported for a turn THIS session
         ran — mirrors `set_conversation_id` exactly. Called only by
         `HermesExecutor.execute` for the session it just executed, which is
@@ -807,67 +1892,136 @@ class SessionStore:
         if isinstance(model, str):
             model = model.strip()
         if not model:
-            return
+            return False
+        where = ["task_id = ?"]
+        params: list[object] = [task_id]
+        if attempt_id is not None:
+            where.append("attempt_id = ?")
+            params.append(attempt_id)
+        if turn_id is not None:
+            where.append("turn_id = ?")
+            params.append(turn_id)
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE sessions SET hermes_model = ?, last_activity_at = ? "
-                "WHERE task_id = ?",
-                (model, _now(), task_id),
+            cur = conn.execute(
+                f"UPDATE sessions SET hermes_model = ?, last_activity_at = ? WHERE {' AND '.join(where)}",
+                (model, _now(), *params),
             )
+        return cur.rowcount == 1
 
-    def set_remote_pgid(self, task_id: str, pgid: int) -> None:
+    def set_remote_pgid(
+        self, task_id: str, pgid: int, *,
+        attempt_id: str | None = None, turn_id: str | None = None,
+    ) -> bool:
         """Record the process-group id a remote-spawned subprocess echoed
         back on its first stdout line (#851) — read by the operator kill
         endpoint to reach it over ssh (see `remote_spawn.py`)."""
+        where = ["task_id = ?"]
+        params: list[object] = [task_id]
+        if attempt_id is not None:
+            where.append("attempt_id = ?")
+            params.append(attempt_id)
+        if turn_id is not None:
+            where.append("turn_id = ?")
+            params.append(turn_id)
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE sessions SET remote_pgid = ?, last_activity_at = ? "
-                "WHERE task_id = ?",
-                (pgid, _now(), task_id),
+            cur = conn.execute(
+                f"UPDATE sessions SET remote_pgid = ?, last_activity_at = ? WHERE {' AND '.join(where)}",
+                (pgid, _now(), *params),
             )
+        return cur.rowcount == 1
 
-    def set_managed_session_id(self, task_id: str, managed_id: str) -> None:
+    def set_managed_session_id(
+        self, task_id: str, managed_id: str, *,
+        attempt_id: str | None = None, turn_id: str | None = None,
+    ) -> bool:
         """Attach a remote Managed Agents session_id to a local session."""
+        where = ["task_id = ?"]
+        params: list[object] = [task_id]
+        if attempt_id is not None:
+            where.append("attempt_id = ?")
+            params.append(attempt_id)
+        if turn_id is not None:
+            where.append("turn_id = ?")
+            params.append(turn_id)
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE sessions SET managed_agent_session_id = ?, last_activity_at = ? "
-                "WHERE task_id = ?",
-                (managed_id, _now(), task_id),
+            cur = conn.execute(
+                f"UPDATE sessions SET managed_agent_session_id = ?, last_activity_at = ? WHERE {' AND '.join(where)}",
+                (managed_id, _now(), *params),
             )
+        return cur.rowcount == 1
 
-    def reset_managed_cursor(self, task_id: str) -> None:
-        """Drop any managed-cursor state for a task before a fresh session.
+    def reset_managed_cursor(
+        self, task_id: str, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
+        """Reset provider cursor state for a task before a fresh session.
 
         Without this, deleting a session row and re-claiming the same task_id
         (e.g., operator re-arming a task after manual cleanup) would leak the
         prior session's `last_event_id` into the new session's poll cursor —
         triggering a 400 on the events endpoint because the new session has
-        never seen that id.
+        never seen that id. Keep accrued session-hour dollars: they belong to
+        the LifeOS session lifetime, not to one provider cursor.
         """
         with self._connect() as conn:
-            conn.execute("DELETE FROM managed_cursor WHERE task_id = ?", (task_id,))
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if not self._identity_matches(conn, task_id, attempt_id, turn_id):
+                    conn.rollback()
+                    return False
+                conn.execute(
+                    "UPDATE managed_cursor SET last_event_id = NULL, final_text = NULL, "
+                    "tool_loop_signature = NULL, tool_loop_count = 0, "
+                    "tool_calls_since_message = 0, usage_snapshot_json = NULL "
+                    "WHERE task_id = ?",
+                    (task_id,),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
 
-    def add_session_hour_overhead(self, task_id: str, dollars: float) -> None:
+    def add_session_hour_overhead(
+        self, task_id: str, dollars: float, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
         """Add Managed Agents session-hour overhead to the dollar counter."""
         if dollars <= 0:
-            return
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE sessions SET total_dollars = total_dollars + ?, last_activity_at = ? "
-                "WHERE task_id = ?",
-                (float(dollars), _now(), task_id),
-            )
+            return False
+        return self._guarded_update(
+            task_id,
+            "UPDATE sessions SET total_dollars = total_dollars + ?, last_activity_at = ? "
+            "WHERE task_id = ?",
+            (float(dollars), _now()),
+            attempt_id=attempt_id,
+            turn_id=turn_id,
+        )
 
     # Managed Agents cursor (defined in _SCHEMA so no schema-on-write needed).
-    def set_managed_last_event_id(self, task_id: str, event_id: str) -> None:
+    def set_managed_last_event_id(
+        self, task_id: str, event_id: str, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._identity_matches(conn, task_id, attempt_id, turn_id):
+                conn.rollback()
+                return False
             conn.execute(
                 "INSERT INTO managed_cursor (task_id, last_event_id) VALUES (?, ?) "
                 "ON CONFLICT(task_id) DO UPDATE SET last_event_id = excluded.last_event_id",
                 (task_id, event_id),
             )
+            conn.commit()
+            return True
 
-    def get_managed_last_event_id(self, task_id: str) -> str | None:
+    def get_managed_last_event_id(
+        self, task_id: str, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> str | None:
+        if attempt_id is not None and not self.is_current_turn(task_id, attempt_id, turn_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT last_event_id FROM managed_cursor WHERE task_id = ?",
@@ -875,12 +2029,17 @@ class SessionStore:
             ).fetchone()
         return row["last_event_id"] if row else None
 
-    def get_accrued_session_hour_dollars(self, task_id: str) -> float:
+    def get_accrued_session_hour_dollars(
+        self, task_id: str, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> float:
         """Dollars already booked into total_dollars for session-hour overhead.
 
         Used by the managed executor to compute the incremental session-hour
         delta to add on each poll, avoiding double-counting.
         """
+        if attempt_id is not None and not self.is_current_turn(task_id, attempt_id, turn_id):
+            return 0.0
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT accrued_session_hour_dollars FROM managed_cursor WHERE task_id = ?",
@@ -888,16 +2047,66 @@ class SessionStore:
             ).fetchone()
         return float(row[0]) if row else 0.0
 
-    def set_accrued_session_hour_dollars(self, task_id: str, dollars: float) -> None:
+    def set_accrued_session_hour_dollars(
+        self, task_id: str, dollars: float, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._identity_matches(conn, task_id, attempt_id, turn_id):
+                conn.rollback()
+                return False
             conn.execute(
                 "INSERT INTO managed_cursor (task_id, accrued_session_hour_dollars) "
                 "VALUES (?, ?) "
                 "ON CONFLICT(task_id) DO UPDATE SET accrued_session_hour_dollars = excluded.accrued_session_hour_dollars",
                 (task_id, float(dollars)),
             )
+            conn.commit()
+            return True
 
-    def set_managed_final_text(self, task_id: str, final_text: str) -> None:
+    def get_managed_usage_snapshot(
+        self, task_id: str, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> dict:
+        """Return the provider-scoped cumulative usage cursor for a turn."""
+        if attempt_id is not None and not self.is_current_turn(task_id, attempt_id, turn_id):
+            return {}
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT usage_snapshot_json FROM managed_cursor WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        if not row or not row[0]:
+            return {}
+        try:
+            value = json.loads(row[0])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def set_managed_usage_snapshot(
+        self, task_id: str, snapshot: dict, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
+        """Persist one provider high-water mark and current-turn baseline."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._identity_matches(conn, task_id, attempt_id, turn_id):
+                conn.rollback()
+                return False
+            conn.execute(
+                "INSERT INTO managed_cursor (task_id, usage_snapshot_json) VALUES (?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET usage_snapshot_json = excluded.usage_snapshot_json",
+                (task_id, json.dumps(snapshot, separators=(",", ":"))),
+            )
+            conn.commit()
+            return True
+
+    def set_managed_final_text(
+        self, task_id: str, final_text: str, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
         """Cache the latest agent.message text seen on this managed session.
 
         Called from the executor's poll loop whenever the driver returns a
@@ -908,13 +2117,24 @@ class SessionStore:
         guarantees the finalize step always has the agent's last message.
         """
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._identity_matches(conn, task_id, attempt_id, turn_id):
+                conn.rollback()
+                return False
             conn.execute(
                 "INSERT INTO managed_cursor (task_id, final_text) VALUES (?, ?) "
                 "ON CONFLICT(task_id) DO UPDATE SET final_text = excluded.final_text",
                 (task_id, final_text),
             )
+            conn.commit()
+            return True
 
-    def get_managed_final_text(self, task_id: str) -> str | None:
+    def get_managed_final_text(
+        self, task_id: str, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> str | None:
+        if attempt_id is not None and not self.is_current_turn(task_id, attempt_id, turn_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT final_text FROM managed_cursor WHERE task_id = ?",
@@ -928,13 +2148,18 @@ class SessionStore:
     # Runaway detection state (#139 Section 5)
     # ------------------------------------------------------------------
 
-    def get_runaway_state(self, task_id: str) -> dict:
+    def get_runaway_state(
+        self, task_id: str, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> dict:
         """Return the persisted runaway counters for `task_id`.
 
         Defaults to a clean state (signature=None, both counts 0) when no
         managed_cursor row exists yet. Callers that have never seen events
         for this session can treat the result as a virgin starting point.
         """
+        if attempt_id is not None and not self.is_current_turn(task_id, attempt_id, turn_id):
+            return {"tool_loop_signature": None, "tool_loop_count": 0, "tool_calls_since_message": 0}
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT tool_loop_signature, tool_loop_count, tool_calls_since_message "
@@ -960,10 +2185,16 @@ class SessionStore:
         tool_loop_signature: str | None,
         tool_loop_count: int,
         tool_calls_since_message: int,
-    ) -> None:
+        attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
         """Persist runaway counters. Upsert into managed_cursor so a fresh
         session (no prior cursor row) gets a row with the counters set."""
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._identity_matches(conn, task_id, attempt_id, turn_id):
+                conn.rollback()
+                return False
             conn.execute(
                 """
                 INSERT INTO managed_cursor (
@@ -978,8 +2209,13 @@ class SessionStore:
                 """,
                 (task_id, tool_loop_signature, tool_loop_count, tool_calls_since_message),
             )
+            conn.commit()
+            return True
 
-    def record_active_seconds(self, task_id: str, seconds: float) -> None:
+    def record_active_seconds(
+        self, task_id: str, seconds: float, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
         """Add to a session's cumulative active-execution seconds.
 
         Active seconds exclude sleep time — this is the duration of LLM calls
@@ -988,13 +2224,15 @@ class SessionStore:
         total_active_seconds ≈ 300, not 28800.
         """
         if seconds <= 0:
-            return
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE sessions SET total_active_seconds = total_active_seconds + ?, "
-                "last_activity_at = ? WHERE task_id = ?",
-                (float(seconds), _now(), task_id),
-            )
+            return False
+        return self._guarded_update(
+            task_id,
+            "UPDATE sessions SET total_active_seconds = total_active_seconds + ?, "
+            "last_activity_at = ? WHERE task_id = ?",
+            (float(seconds), _now()),
+            attempt_id=attempt_id,
+            turn_id=turn_id,
+        )
 
     # ------------------------------------------------------------------
     # Messages (local-path conversation log)
@@ -1007,7 +2245,10 @@ class SessionStore:
         content: dict | list | str,
         tokens_in: int = 0,
         tokens_out: int = 0,
-    ) -> int:
+        *,
+        attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> int | None:
         """Append one message; return its 0-based turn_index.
 
         Uses a single INSERT that computes the next turn_index inside the
@@ -1015,6 +2256,30 @@ class SessionStore:
         (Issue E) can't pick the same index — SQLite serializes the write.
         """
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if attempt_id is not None:
+                row = conn.execute(
+                    "SELECT task_id, attempt_id, turn_id FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None or row["attempt_id"] != attempt_id or (
+                    turn_id is not None and row["turn_id"] != turn_id
+                ):
+                    conn.rollback()
+                    return None
+                # A cancelled turn remains the same persisted attempt/turn
+                # until it is reopened.  Reject writes from an executor that
+                # is still unwinding after cancellation, even when the task
+                # has not yet been reopened.
+                effective_turn_id = turn_id if turn_id is not None else row["turn_id"]
+                cancelled = conn.execute(
+                    "SELECT 1 FROM cancellation_guards "
+                    "WHERE session_id = ? AND attempt_id = ? AND turn_id = ?",
+                    (session_id, attempt_id, effective_turn_id or ""),
+                ).fetchone()
+                if cancelled:
+                    conn.rollback()
+                    return None
             conn.execute(
                 """
                 INSERT INTO messages (
@@ -1034,6 +2299,7 @@ class SessionStore:
                 "SELECT MAX(turn_index) AS i FROM messages WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
+            conn.commit()
         return int(row["i"])
 
     def get_messages(self, session_id: str) -> list[dict]:
@@ -1046,7 +2312,10 @@ class SessionStore:
             ).fetchall()
         return [{"role": r["role"], "content": json.loads(r["content_json"])} for r in rows]
 
-    def clear_messages(self, session_id: str) -> None:
+    def clear_messages(
+        self, session_id: str, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
         """Remove all stored messages for a session.
 
         Used by the local executor when resuming a session that was blocked
@@ -1057,20 +2326,69 @@ class SessionStore:
         order.
         """
         with self._connect() as conn:
-            conn.execute(
-                "DELETE FROM messages WHERE session_id = ?", (session_id,),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            if attempt_id is not None:
+                row = conn.execute(
+                    "SELECT task_id, attempt_id, turn_id FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None or row["attempt_id"] != attempt_id or (
+                    turn_id is not None and row["turn_id"] != turn_id
+                ):
+                    conn.rollback()
+                    return False
+                effective_turn_id = turn_id if turn_id is not None else row["turn_id"]
+                cancelled = conn.execute(
+                    "SELECT 1 FROM cancellation_guards "
+                    "WHERE session_id = ? AND attempt_id = ? AND turn_id = ?",
+                    (session_id, attempt_id, effective_turn_id or ""),
+                ).fetchone()
+                if cancelled:
+                    conn.rollback()
+                    return False
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.commit()
+        return True
 
     # ------------------------------------------------------------------
     # Sleeps (yield / wake)
     # ------------------------------------------------------------------
 
-    def add_sleep(self, session_id: str, wake_at: int) -> None:
+    def add_sleep(
+        self, session_id: str, wake_at: int, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
         with self._connect() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO sleeps (session_id, wake_at) VALUES (?, ?)",
-                (session_id, int(wake_at)),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if attempt_id is not None:
+                    row = conn.execute(
+                        "SELECT task_id, attempt_id, turn_id FROM sessions WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    if row is None or row["attempt_id"] != attempt_id or (
+                        turn_id is not None and row["turn_id"] != turn_id
+                    ):
+                        conn.rollback()
+                        return False
+                    effective_turn_id = turn_id if turn_id is not None else row["turn_id"]
+                    cancelled = conn.execute(
+                        "SELECT 1 FROM cancellation_guards "
+                        "WHERE session_id = ? AND attempt_id = ? AND turn_id = ?",
+                        (session_id, attempt_id, effective_turn_id or ""),
+                    ).fetchone()
+                    if cancelled:
+                        conn.rollback()
+                        return False
+                conn.execute(
+                    "INSERT OR REPLACE INTO sleeps (session_id, wake_at) VALUES (?, ?)",
+                    (session_id, int(wake_at)),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return True
 
     def remove_sleep(self, session_id: str) -> None:
         with self._connect() as conn:
@@ -1151,13 +2469,18 @@ class SessionStore:
             ).fetchall()
         return [self._row_to_session(r) for r in rows]
 
-    def set_yield_waiting_for(self, task_id: str, children: list[str] | None) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE sessions SET yield_waiting_for = ?, last_activity_at = ? "
-                "WHERE task_id = ?",
-                (json.dumps(children) if children else None, _now(), task_id),
-            )
+    def set_yield_waiting_for(
+        self, task_id: str, children: list[str] | None, *,
+        attempt_id: str | None = None, turn_id: str | None = None,
+    ) -> bool:
+        return self._guarded_update(
+            task_id,
+            "UPDATE sessions SET yield_waiting_for = ?, last_activity_at = ? "
+            "WHERE task_id = ?",
+            (json.dumps(children) if children else None, _now()),
+            attempt_id=attempt_id,
+            turn_id=turn_id,
+        )
 
     def list_sessions(
         self,
@@ -1191,8 +2514,32 @@ class SessionStore:
     # Pending messages (Issue E send-to-yielded)
     # ------------------------------------------------------------------
 
-    def enqueue_message(self, session_id: str, sender_id: str, content: str) -> int:
+    def enqueue_message(
+        self, session_id: str, sender_id: str, content: str, *,
+        attempt_id: str | None = None, turn_id: str | None = None,
+    ) -> int:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if attempt_id is not None:
+                row = conn.execute(
+                    "SELECT task_id FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None or not self._identity_matches(
+                    conn, row["task_id"], attempt_id, turn_id,
+                ):
+                    conn.rollback()
+                    return 0
+                cancelled = conn.execute(
+                    "SELECT 1 FROM cancellation_guards g "
+                    "JOIN sessions s ON s.session_id = g.session_id "
+                    "WHERE s.task_id = ? AND g.attempt_id = s.attempt_id "
+                    "AND g.turn_id = COALESCE(s.turn_id, '')",
+                    (row["task_id"],),
+                ).fetchone()
+                if cancelled:
+                    conn.rollback()
+                    return 0
             cur = conn.execute(
                 "INSERT INTO pending_messages (session_id, sender_id, content, created_at) "
                 "VALUES (?, ?, ?, ?)",
@@ -1200,9 +2547,21 @@ class SessionStore:
             )
         return cur.lastrowid
 
-    def drain_pending_messages(self, session_id: str) -> list[dict]:
+    def drain_pending_messages(
+        self, session_id: str, *, attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> list[dict]:
         """Return + mark-delivered all pending messages for `session_id`."""
         with self._connect() as conn:
+            if attempt_id is not None:
+                row = conn.execute(
+                    "SELECT task_id FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None or not self._identity_matches(
+                    conn, row["task_id"], attempt_id, turn_id,
+                ):
+                    return []
             rows = conn.execute(
                 "SELECT id, sender_id, content, created_at FROM pending_messages "
                 "WHERE session_id = ? AND delivered = 0 ORDER BY id ASC",
@@ -1231,6 +2590,8 @@ class SessionStore:
         kind: str = "clarification",
         sent_message_ids: list[int] | None = None,
         bot: str | None = None,
+        attempt_id: str | None = None,
+        turn_id: str | None = None,
     ) -> int:
         """Record a pending question / follow-up keyed by Telegram message id.
 
@@ -1242,16 +2603,37 @@ class SessionStore:
         """
         ids = sent_message_ids or [int(sent_message_id)]
         with self._connect() as conn:
+            row = conn.execute(
+                "SELECT task_id, attempt_id, turn_id FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is not None:
+                if row["task_id"] != task_id:
+                    return 0
+                # Questions are immutable observations of the execution that
+                # asked them. Fill omitted ids from the current row so every
+                # new question is fenced against a later reopen; callers may
+                # still explicitly provide ids when registering an older
+                # captured event.
+                attempt_id = row["attempt_id"] if attempt_id is None else attempt_id
+                turn_id = row["turn_id"] if turn_id is None else turn_id
+                if not self._identity_matches(conn, row["task_id"], attempt_id, turn_id):
+                    return 0
+            elif attempt_id is not None or turn_id is not None:
+                # An identity-bearing question cannot be attached to a
+                # missing session; retain the old unbound-row compatibility
+                # only for legacy callers that supplied no identity.
+                return 0
             cur = conn.execute(
                 """
                 INSERT INTO pending_questions (
                     session_id, task_id, question, sent_message_id, sent_at,
-                    kind, sent_message_ids, bot
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    kind, sent_message_ids, bot, attempt_id, turn_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id, task_id, question, int(sent_message_id), _now(),
-                    kind, json.dumps([int(i) for i in ids]), bot,
+                    kind, json.dumps([int(i) for i in ids]), bot, attempt_id, turn_id,
                 ),
             )
         return cur.lastrowid
@@ -1262,6 +2644,8 @@ class SessionStore:
         task_id: str,
         message_ids: list[int],
         bot: str | None = None,
+        attempt_id: str | None = None,
+        turn_id: str | None = None,
     ) -> None:
         """Register operator-facing message ids as reply anchors for a session.
 
@@ -1278,6 +2662,10 @@ class SessionStore:
             return
         ids = [int(i) for i in message_ids]
         with self._connect() as conn:
+            if attempt_id is not None and not self._identity_matches(
+                conn, task_id, attempt_id, turn_id,
+            ):
+                return
             row = conn.execute(
                 "SELECT id, sent_message_ids FROM pending_questions "
                 "WHERE session_id = ? AND kind = 'status_anchor' LIMIT 1",
@@ -1288,11 +2676,11 @@ class SessionStore:
                     """
                     INSERT INTO pending_questions (
                         session_id, task_id, question, sent_message_id, sent_at,
-                        kind, sent_message_ids, bot
-                    ) VALUES (?, ?, ?, ?, ?, 'status_anchor', ?, ?)
+                        kind, sent_message_ids, bot, attempt_id, turn_id
+                    ) VALUES (?, ?, ?, ?, ?, 'status_anchor', ?, ?, ?, ?)
                     """,
                     (session_id, task_id, "(session reply anchors)", ids[0],
-                     _now(), json.dumps(ids), bot),
+                    _now(), json.dumps(ids), bot, attempt_id, turn_id),
                 )
             else:
                 existing = json.loads(row["sent_message_ids"] or "[]")
@@ -1888,4 +3276,21 @@ class SessionStore:
             conversation_id=(row["conversation_id"] if "conversation_id" in row.keys() else None),
             remote_pgid=(row["remote_pgid"] if "remote_pgid" in row.keys() else None),
             hermes_model=(row["hermes_model"] if "hermes_model" in row.keys() else None),
+            execution_request=(
+                json.loads(row["execution_request_json"])
+                if "execution_request_json" in row.keys() and row["execution_request_json"]
+                else None
+            ),
+            execution_spec=(
+                json.loads(row["execution_spec_json"])
+                if "execution_spec_json" in row.keys() and row["execution_spec_json"]
+                else None
+            ),
+            attempt_id=(row["attempt_id"] if "attempt_id" in row.keys() else None),
+            attempt_number=(
+                row["attempt_number"] if "attempt_number" in row.keys() else 0
+            ),
+            turn_id=(row["turn_id"] if "turn_id" in row.keys() else None),
+            turn_number=(row["turn_number"] if "turn_number" in row.keys() else 0),
+            persona_id=(row["persona_id"] if "persona_id" in row.keys() else None),
         )

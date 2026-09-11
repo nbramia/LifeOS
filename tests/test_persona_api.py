@@ -32,6 +32,19 @@ def _registry(tmp_path, entries):
     return reg
 
 
+@pytest.fixture(autouse=True)
+def _isolated_task_store(tmp_path, monkeypatch):
+    """Keep turn-context task reads and any task writes in synthetic paths."""
+    from api.services.task_manager import TaskManager
+    import api.services.task_manager as task_manager_mod
+
+    store = TaskManager(
+        vault_path=tmp_path / "vault",
+        index_path=tmp_path / "task_index.json",
+    )
+    monkeypatch.setattr(task_manager_mod, "_task_manager", store)
+
+
 # ---------------------------------------------------------------------------
 # settings.list_http_personas
 # ---------------------------------------------------------------------------
@@ -77,11 +90,118 @@ class TestListHttpPersonas:
         from config.settings import settings
 
         # HTTP surfaces: both personas available.
-        assert [p.id for p in settings.list_http_personas()] == [
+        http_without_token = settings.list_http_personas()
+        assert [p.id for p in http_without_token] == [
             "primary", "fitness", "therapist",
         ]
         # Telegram listeners: only the one that can actually run.
         assert [b.name for b in settings.telegram_bots] == ["fitness"]
+        monkeypatch.setenv("TG_THER", "tok")
+        assert settings.list_http_personas() == http_without_token
+        assert [b.name for b in settings.telegram_bots] == ["fitness", "therapist"]
+
+    def test_duplicate_ids_select_one_identity_before_telegram_token_filter(
+        self, tmp_path, monkeypatch,
+    ):
+        """Duplicate registry ids have one authoritative identity everywhere.
+
+        The first valid row wins even when it is tokenless; HTTP/voice
+        discovery and resolution must not use one duplicate while Telegram
+        selects another row after credential filtering.
+        """
+        first_file = tmp_path / "first.md"
+        first_file.write_text("FIRST PERSONA BODY")
+        second_file = tmp_path / "second.md"
+        second_file.write_text("SECOND PERSONA BODY")
+        reg = _registry(tmp_path, [
+            {"name": "fitness", "label": "First", "token_env": "TG_FIRST", "persona_file": str(first_file)},
+            {"name": "FITNESS", "label": "Second", "token_env": "TG_SECOND", "persona_file": str(second_file)},
+        ])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.delenv("TG_FIRST", raising=False)
+        monkeypatch.setenv("TG_SECOND", "second-token")
+        from config.settings import settings
+
+        definition = next(item for item in settings.persona_definitions if item.id == "fitness")
+        listed = next(item for item in settings.list_http_personas() if item.id == "fitness")
+
+        assert definition.label == "First"
+        assert definition.persona == "FIRST PERSONA BODY"
+        assert listed.label == "First"
+        assert settings.resolve_persona("fitness") == "FIRST PERSONA BODY"
+        # The selected first row is tokenless, so the conflicting second row
+        # cannot become a Telegram projection merely because it has a token.
+        assert settings.telegram_bots == []
+
+    def test_tokenless_definition_resolves_voice_and_orchestration(self, tmp_path, monkeypatch):
+        persona_file = tmp_path / "doctor.md"
+        persona_file.write_text(
+            "---\n"
+            "id: doctor\n"
+            "model: reserved-model\n"
+            "voice:\n"
+            "  - keep it brief\n"
+            "---\n\n"
+            "DOCTOR BODY"
+        )
+        reg = _registry(tmp_path, [
+            {
+                "name": "doctor",
+                "token_env": "TG_DOC",
+                "persona_file": str(persona_file),
+                "orchestrates": True,
+            },
+        ])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.delenv("TG_DOC", raising=False)
+        from config.settings import settings
+
+        definition = next(d for d in settings.persona_definitions if d.id == "doctor")
+        assert definition.persona == "DOCTOR BODY"
+        assert definition.voice == ("keep it brief",)
+        assert definition.model == "reserved-model"
+        assert not hasattr(definition, "token")
+        assert settings.resolve_persona("doctor") == "DOCTOR BODY"
+        assert settings.persona_voice("doctor") == ("keep it brief",)
+        assert settings.persona_orchestrates("doctor") is True
+        assert settings.telegram_bots == []
+
+    def test_tokenless_persona_id_native_api_uses_definition(self, client, tmp_path, monkeypatch):
+        persona_file = tmp_path / "fitness.md"
+        persona_file.write_text(
+            "---\nvoice:\n  - concise\n---\n\nFITNESS BODY"
+        )
+        reg = _registry(tmp_path, [
+            {"name": "fitness", "token_env": "TG_FIT", "persona_file": str(persona_file)},
+        ])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.delenv("TG_FIT", raising=False)
+
+        import api.services.agent_loop as agent_loop_mod
+        captured: dict = {}
+
+        async def fake_loop(**kwargs):
+            captured.update(kwargs)
+            yield {"type": "result", "result": SimpleNamespace(
+                total_input_tokens=0, total_output_tokens=0, total_cost_usd=0.0,
+                model="synthetic", tool_calls_log=[], full_text="ok",
+            )}
+
+        async def fake_classify(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(agent_loop_mod, "run_agent_loop", fake_loop)
+        monkeypatch.setattr("api.routes.chat.classify_action_intent", fake_classify)
+        response = client.post(
+            "/api/ask/stream",
+            json={"question": "synthetic question", "persona_id": "fitness", "modality": "voice"},
+        )
+
+        assert response.status_code == 200
+        assert captured["persona"] == "FITNESS BODY"
+        assert captured["voice_rules"] == ("concise",)
+        from config.settings import settings
+        assert [bot.name for bot in settings.telegram_bots] == []
 
     def test_local_override_replaces_template(self, tmp_path, monkeypatch):
         """An untracked local registry wins over the tracked template.
@@ -219,6 +339,33 @@ class TestResolvePersona:
         # Same preamble the fitness Telegram bot uses (single registry source).
         assert settings.resolve_persona("fitness") == "FIT PERSONA"
         assert settings.resolve_persona("fitness") == settings.telegram_bots[0].persona
+
+    def test_raw_reverse_lookup_excludes_primary_and_retains_tokenless_specialized(
+        self, tmp_path, monkeypatch,
+    ):
+        persona_file = tmp_path / "synthetic.md"
+        persona_file.write_text("SYNTHETIC SPECIALIZED BODY")
+        reg = _registry(tmp_path, [{
+            "name": "synthetic",
+            "token_env": "SYNTHETIC_PERSONA_TOKEN_UNUSED",
+            "persona_file": str(persona_file),
+        }])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.delenv("SYNTHETIC_PERSONA_TOKEN_UNUSED", raising=False)
+        from api.routes.chat import resolve_effective_persona_id
+        from config.settings import settings
+        from fastapi import HTTPException
+
+        assert resolve_effective_persona_id(
+            None, settings.resolve_persona("primary"),
+        ) is None
+        assert resolve_effective_persona_id(
+            None, "SYNTHETIC SPECIALIZED BODY",
+        ) == "synthetic"
+        assert resolve_effective_persona_id(None, "UNKNOWN RAW BODY") is None
+        with pytest.raises(HTTPException) as exc_info:
+            resolve_effective_persona_id("primary", "RAW BODY")
+        assert exc_info.value.status_code == 400
 
 
 # ---------------------------------------------------------------------------

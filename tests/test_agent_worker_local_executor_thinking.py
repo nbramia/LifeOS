@@ -79,6 +79,30 @@ def test_remote_forced_route_never_receives_enable_thinking(tmp_path, monkeypatc
     assert "enable_thinking" not in calls[-1]
 
 
+@pytest.mark.parametrize("route,remote", [("local", False), ("remote", True)])
+def test_execution_snapshot_model_pin_reaches_native_client(tmp_path, monkeypatch, route, remote):
+    """An immutable native execution pin is sent on the completion request."""
+    executor, store, session, calls = _build_executor(
+        tmp_path, monkeypatch, effort=None, remote=remote,
+    )
+    store.set_execution_snapshot(
+        session.task_id,
+        request={"executor": route, "model_id": "synthetic-pinned-model"},
+        spec={
+            "executor": route, "provider": route, "runtime": "in_process",
+            "model_id": "synthetic-pinned-model", "effort": None, "host": None,
+            "working_dir": None, "persona_id": None, "parent_session_id": None,
+            "root_session_id": session.session_id, "reply_destination": None,
+            "budget": None,
+            "constraints": {"allowed_executors": [], "required_capabilities": [], "allowed_billing": []},
+            "billing": "metered" if remote else "local_free",
+            "resolved_at": "2026-09-10T00:00:00+00:00",
+        },
+    )
+    executor._call_llm(session.session_id)
+    assert calls[-1]["model"] == "synthetic-pinned-model"
+
+
 def test_non_local_llm_client_fake_never_receives_enable_thinking(tmp_path):
     """A test-injected fake whose create() doesn't accept enable_thinking
     must not be called with it — this is what keeps every pre-#851

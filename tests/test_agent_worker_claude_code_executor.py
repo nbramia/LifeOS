@@ -51,6 +51,13 @@ class _FakeStdout:
         self._lines = [json.dumps(e) + "\n" for e in events]
         self._idx = 0
 
+    def readline(self) -> str:
+        if self._idx >= len(self._lines):
+            return ""
+        line = self._lines[self._idx]
+        self._idx += 1
+        return line
+
     def __iter__(self):
         return self
 
@@ -104,11 +111,17 @@ class _FakeProc:
         self.killed = True
 
 
-def _spawn_with(events, returncode: int = 0, stderr: str = "", pid: int = 4242, on_wait=None):
+def _spawn_with(
+    events, returncode: int = 0, stderr: str = "", pid: int = 4242,
+    on_wait=None, prefix_lines: Iterable[str] = (),
+):
     """Build a `spawn_fn` callable that returns a fresh _FakeProc per call."""
 
     def _spawn_fn(*_args, **_kwargs):
-        return _FakeProc(events, returncode=returncode, stderr=stderr, pid=pid, on_wait=on_wait)
+        proc = _FakeProc(events, returncode=returncode, stderr=stderr, pid=pid, on_wait=on_wait)
+        if prefix_lines:
+            proc.stdout._lines = [*prefix_lines, *proc.stdout._lines]
+        return proc
 
     return _spawn_fn
 
@@ -527,7 +540,7 @@ def test_build_command_uses_session_model_tier(tmp_path: Path):
     assert cmd[cmd.index("--model") + 1] == "haiku"
 
 
-def test_build_command_defaults_to_opus(tmp_path: Path):
+def test_build_command_omits_unset_model_for_cli_default(tmp_path: Path):
     captured: dict = {}
 
     def _spawn_capture(cmd, **kwargs):
@@ -541,7 +554,7 @@ def test_build_command_defaults_to_opus(tmp_path: Path):
     session = _seed_session(store)  # operator session, no tier set
     executor.execute(session, {"description": "anything"})
     cmd = captured["cmd"]
-    assert cmd[cmd.index("--model") + 1] == "opus"
+    assert "--model" not in cmd
 
 
 def _captured_system_prompt(tmp_path: Path, session_factory) -> str:
@@ -1135,6 +1148,38 @@ def test_operator_kill_mid_run_exits_silently(tmp_path: Path):
     assert "claude_code_completed" not in kinds
 
 
+def test_cancelled_clean_cli_return_cannot_publish_completion(tmp_path: Path):
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-cancelled"},
+        {"type": "result", "session_id": "cli-cancelled", "result": "late result"},
+    ]
+    executor, store, transcripts = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events),
+    )
+    session = _seed_session(store, task_id="cli-cancelled")
+    original_update = store.update_status
+
+    def cancel_before_success(task_id, status, **kwargs):
+        if status == STATUS_COMPLETED:
+            assert store.mark_cancelled(
+                task_id,
+                attempt_id=kwargs["attempt_id"],
+                turn_id=kwargs["turn_id"],
+                reason="operator requested",
+            )
+        return original_update(task_id, status, **kwargs)
+
+    store.update_status = cancel_before_success
+    outcome = executor.execute(session, {"description": "late CLI result"})
+
+    assert outcome.status == STATUS_FAILED
+    assert store.get(session.task_id).status == STATUS_FAILED
+    assert not any(
+        event["kind"] == "claude_code_completed"
+        for event in _read_transcript(transcripts, session.session_id)
+    )
+
+
 def test_clean_completion_wins_over_raced_failed_flip(tmp_path: Path):
     """#379 cascade-race guard: the row can be flipped to FAILED mid-run by a
     second legitimate writer (LocalExecutor._cascade_kill_lineage on a
@@ -1241,3 +1286,37 @@ def test_spawned_subprocess_gets_no_api_credential(monkeypatch, tmp_path: Path):
 
     assert outcome.status == STATUS_COMPLETED
     assert "ANTHROPIC_API_KEY" not in captured["env"]
+    assert captured["env"]["LIFEOS_AGENT_SESSION_ID"] == session.session_id
+
+
+def test_remote_spawn_carries_stdio_identity_and_clean_environment(monkeypatch, tmp_path: Path):
+    """The remote SSH command must explicitly set the session identity:
+    SSH does not forward arbitrary env vars, while the remote CLI's stdio MCP
+    child derives its trusted identity from this process-bound value."""
+    from config.settings import settings
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-synthetic")
+    monkeypatch.setattr(settings, "agent_hosts", {"studio": "user@studio.example"}, raising=False)
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-remote-1"},
+        {"type": "result", "session_id": "cli-remote-1", "result": "remote done."},
+    ]
+    captured: dict = {}
+
+    def _capturing_spawn(*args, **kwargs):
+        captured["cmd"] = args[0]
+        captured["env"] = kwargs["env"]
+        return _spawn_with(events, prefix_lines=["PGID:4242\n"])(*args, **kwargs)
+
+    executor, store, _ = _build_executor(tmp_path, spawn_fn=_capturing_spawn)
+    session = _seed_session(store)
+    session.host = "studio"
+
+    outcome = executor.execute(session, {"description": "remote task"})
+
+    assert outcome.status == STATUS_COMPLETED
+    assert captured["env"]["LIFEOS_AGENT_SESSION_ID"] == session.session_id
+    assert "ANTHROPIC_API_KEY" not in captured["env"]
+    remote_command = captured["cmd"][-1]
+    assert f"LIFEOS_AGENT_SESSION_ID={session.session_id}" in remote_command
+    assert "-u ANTHROPIC_API_KEY" in remote_command

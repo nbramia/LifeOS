@@ -284,6 +284,16 @@ def _stub_bin(dir_: Path, name: str, body: str) -> None:
     p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IRWXU)
 
 
+def _isolated_server_script(tmp_path: Path) -> Path:
+    project = tmp_path / "project"
+    (project / "scripts").mkdir(parents=True)
+    (project / "logs").mkdir()
+    script = project / "scripts" / "server.sh"
+    script.write_text(SERVER_SH.read_text(encoding="utf-8"), encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
 @pytest.mark.unit
 def test_restart_worker_detached_sends_notice_before_restart(tmp_path: Path):
     """The final notice must be flushed BEFORE the restart is triggered, so the
@@ -324,7 +334,7 @@ exec "$@"
     env["HOME"] = str(tmp_path)
 
     result = subprocess.run(
-        ["bash", str(SERVER_SH), "restart-worker-detached",
+        ["bash", str(_isolated_server_script(tmp_path)), "restart-worker-detached",
          "--session", "sid-1", "--notify", "Shipped PR #999"],
         env=env, capture_output=True, text=True, timeout=30,
     )
@@ -334,6 +344,75 @@ exec "$@"
     assert "notify" in steps and "restart" in steps, steps
     assert steps.index("notify") < steps.index("restart"), steps
     assert "mark" in steps and steps.index("mark") < steps.index("restart"), steps
+
+
+@pytest.mark.unit
+def test_restart_worker_detached_starts_watcher_before_restart(tmp_path: Path):
+    """The machine-evidence watcher must be submitted before the worker
+    restart, because the worker can kill its caller as soon as the restart is
+    accepted."""
+    project = tmp_path / "project"
+    (project / "scripts").mkdir(parents=True)
+    (project / "logs").mkdir()
+    server_copy = project / "scripts" / "server.sh"
+    server_copy.write_text(SERVER_SH.read_text(encoding="utf-8"), encoding="utf-8")
+    server_copy.chmod(0o755)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    order = tmp_path / "order.log"
+    _stub_bin(bindir, "fake-python", f'echo "python:$*" >> "{order}"\nexit 0\n')
+    _stub_bin(bindir, "systemctl", f'echo restart >> "{order}"\nexit 0\n')
+    _stub_bin(bindir, "sudo", 'exec "$@"\n')
+    _stub_bin(bindir, "systemd-run", f'''\
+while [[ "$1" == --* ]]; do shift; done
+if [ "$1" = "systemctl" ]; then echo restart >> "{order}"; exit 0; fi
+echo watcher:$* >> "{order}"
+exit 0
+''')
+    venv = tmp_path / ".venvs" / "lifeos" / "bin"
+    venv.mkdir(parents=True)
+    (venv / "python").symlink_to(bindir / "fake-python")
+    env = {**os.environ, "HOME": str(tmp_path), "PATH": f"{bindir}:{os.environ['PATH']}", "LIFEOS_RUNTIME_IDENTITY_DIR": str(tmp_path / "identities")}
+    result = subprocess.run(
+        [str(server_copy), "restart-worker-detached"], env=env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    steps = order.read_text().splitlines()
+    assert any(line.startswith("watcher:") for line in steps), steps
+    assert steps.index(next(line for line in steps if line.startswith("watcher:"))) < steps.index("restart"), steps
+
+
+@pytest.mark.unit
+def test_restart_worker_detached_uses_launchd_on_macos(tmp_path: Path):
+    """The macOS path submits independent launchd jobs and never calls
+    systemctl."""
+    project = tmp_path / "project"
+    (project / "scripts").mkdir(parents=True)
+    (project / "logs").mkdir()
+    server_copy = project / "scripts" / "server.sh"
+    server_copy.write_text(SERVER_SH.read_text(encoding="utf-8"), encoding="utf-8")
+    server_copy.chmod(0o755)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    order = tmp_path / "order.log"
+    _stub_bin(bindir, "uname", "echo Darwin\n")
+    _stub_bin(bindir, "launchctl", f'echo "launchctl:$*" >> "{order}"\nexit 0\n')
+    _stub_bin(bindir, "fake-python", 'exit 0\n')
+    venv = tmp_path / ".venvs" / "lifeos" / "bin"
+    venv.mkdir(parents=True)
+    (venv / "python").symlink_to(bindir / "fake-python")
+    env = {**os.environ, "HOME": str(tmp_path), "PATH": f"{bindir}:{os.environ['PATH']}", "LIFEOS_RUNTIME_IDENTITY_DIR": str(tmp_path / "identities")}
+    result = subprocess.run(
+        [str(server_copy), "restart-worker-detached"], env=env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    steps = order.read_text().splitlines()
+    assert steps[0].startswith("launchctl:submit -l com.lifeos.agent-worker-restart-watch-"), steps
+    assert "--manager launchd" in steps[0] and "--launchd-label com.lifeos.agent-worker" in steps[0], steps
+    assert any("com.lifeos.agent-worker-restart-" in line for line in steps[1:]), steps
+    assert not any("systemctl" in line for line in steps), steps
 
 
 @pytest.mark.unit

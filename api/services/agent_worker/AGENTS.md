@@ -13,7 +13,9 @@ External long-running worker that picks up engine-assigned tasks (`#claude` / `#
 | File | Responsibility |
 |------|---------------|
 | `worker.py` | Main poll loop, claim/dispatch, startup resume, signal-safe stop, follow-up reply round-tripping |
-| `session_store.py` | SQLite-backed `sessions` + `pending_questions` + `pending_messages` + `daily_spend` tables; `Session` dataclass |
+| `session_store.py` | SQLite-backed sessions, canonical execution snapshots/overrides, pending questions/messages, and daily-spend state; `Session` dataclass |
+| `execution.py` | Pure strict canonical request parser and deterministic resolver; frozen `ExecutionSpec`, compatibility aliases, provenance, constraints, and injected readiness/catalog facts |
+| `executor_lifecycle.py` | Internal route registry/adapters, capability checks, normalized terminal outcomes, and idempotent cancellation guards; no public RPC schema |
 | `transcript_store.py` | Append-only JSONL per `session_id` at `data/agent_transcripts/` |
 | `spend_tracker.py` | Daily $-cap ledger (inclusive ceiling; cap ≤ 0 pauses claims) |
 | `preflight.py` | Haiku preflight call: budget, routing (`local` / `claude` / `ask`), ambiguity, sanity |
@@ -26,7 +28,7 @@ External long-running worker that picks up engine-assigned tasks (`#claude` / `#
 | `codex_executor.py` | Codex CLI driver (subprocess spawn, `--json` stream parse, `-o` final-message capture) for `routing='codex'` sessions. Prepends `CAPABILITIES_PREAMBLE` on the opening turn; suppresses intermediate-message streaming so only heartbeats + the final result reach Telegram |
 | `codex_spawn.py` | Helper that creates a parentless `routing='codex'`, `origin='operator'` session row for a fresh `/codex` task |
 | `operator_spawn.py` | Same pattern for non-code operator-initiated agent spawns from Telegram or `/chat` |
-| `inter_agent.py` | Tool surface that lets agents spawn / message / yield-until peers in the same lineage. `lifeos_agent_spawn` accepts `claude`/`local`/`claude_code`/`codex` — the CLI routes enable cross-engine capability fallback (e.g. delegate browser work to a `claude_code` child) |
+| `inter_agent.py` | Tool surface that lets agents spawn / message / yield-until peers in the same lineage. `lifeos_agent_spawn` supports all worker routes through legacy selectors or a strict canonical `execution` object; scoped temporary overrides affect future child resolution only |
 | `codex_skill_sync.py` | Converts engine-agnostic `.claude/skills/` into Codex's `SKILL.md` format; installed into `~/.codex/skills/` by `scripts/install_codex_skills.py` |
 | `tools.py`, `tool_filter.py`, `tool_result_cache.py` | LifeOS-MCP tool catalog, per-preset filtering, repeat-call de-duplication. Read/Write/Edit/Bash accept an optional `base_dir` (#925) — a path escaping it via `..` or a symlink is rejected |
 | `pricing.py` | Per-model token rates + session-hour overhead for cost accounting |
@@ -41,6 +43,7 @@ The `sessions.routing` column drives dispatch. Values come from preflight (for e
 | `local` | `LocalExecutor` | Preflight or `#local` tag |
 | `remote` | `LocalExecutor` | Preflight or bare `#cloud` tag (configured remote provider, e.g. Fireworks) |
 | `claude` | `ManagedExecutor` | Preflight or `#cloud-haiku`/`#cloud-sonnet` tag (Anthropic API, per-token) |
+| `hermes` | `HermesExecutor` | Preflight, `#hermes` tag, or child spawn |
 | `claude_code` | `ClaudeCodeExecutor` | `claude_code_spawn.spawn_claude_code_session()` (`/claude`) or `#claude` tag (Claude Code CLI, subscription-billed) |
 | `codex` | `CodexExecutor` | `codex_spawn.spawn_codex_session()` (`/codex`) or `#codex` tag (Codex CLI, subscription-billed) |
 | `ask` | — | Preflight couldn't decide; worker blocks the session and asks the operator |
