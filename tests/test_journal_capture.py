@@ -147,10 +147,10 @@ def _bullets(text: str) -> list[str]:
 class TestCaptureService:
     def test_first_fragment_writes_frontmatter_and_bullet(self, vault):
         result = capture_fragment(_FRAGMENT, now=datetime(2026, 8, 23, 9, 14))
-        assert result.path == "Personal/Log/2026-08-23.md"
+        assert result.path == "LifeOS/Log/Journal/2026-08-23.md"
         assert result.created is True
 
-        written = (vault / "Personal" / "Log" / "2026-08-23.md").read_text()
+        written = (vault / "LifeOS" / "Log" / "Journal" / "2026-08-23.md").read_text()
         assert written == (
             "---\ntype: log\ndate: 2026-08-23\n---\n"
             f"- 09:14 · {_FRAGMENT}\n"
@@ -161,7 +161,7 @@ class TestCaptureService:
         second = capture_fragment(_FRAGMENT_2, now=datetime(2026, 8, 23, 14, 37))
         assert second.created is False
 
-        written = (vault / "Personal" / "Log" / "2026-08-23.md").read_text()
+        written = (vault / "LifeOS" / "Log" / "Journal" / "2026-08-23.md").read_text()
         assert written.count("type: log") == 1
         assert written.count("---") == 2
         assert _bullets(written) == [
@@ -172,28 +172,28 @@ class TestCaptureService:
     def test_fragment_is_verbatim_not_tidied(self, vault):
         messy = "  gate  should   fail closed #eng — really  "
         capture_fragment(messy, now=datetime(2026, 8, 23, 9, 14))
-        written = _bullets((vault / "Personal" / "Log" / "2026-08-23.md").read_text())
+        written = _bullets((vault / "LifeOS" / "Log" / "Journal" / "2026-08-23.md").read_text())
         # Stripped at the ends (it has to sit on a bullet) but otherwise
         # untouched: inner spacing, punctuation, and the hashtag all survive.
         assert written == ["- 09:14 · gate  should   fail closed #eng — really"]
 
     def test_multiline_fragment_becomes_one_bullet(self, vault):
         capture_fragment("first line\n\n  second line", now=datetime(2026, 8, 23, 9, 14))
-        written = (vault / "Personal" / "Log" / "2026-08-23.md").read_text()
+        written = (vault / "LifeOS" / "Log" / "Journal" / "2026-08-23.md").read_text()
         assert _bullets(written) == ["- 09:14 · first line second line"]
         assert len(_bullets(written)) == 1
 
     def test_day_rolls_over_to_a_new_file(self, vault):
         capture_fragment(_FRAGMENT, now=datetime(2026, 8, 23, 23, 58))
         capture_fragment(_FRAGMENT_2, now=datetime(2026, 8, 24, 0, 3))
-        log_dir = vault / "Personal" / "Log"
+        log_dir = vault / "LifeOS" / "Log" / "Journal"
         assert sorted(p.name for p in log_dir.iterdir()) == ["2026-08-23.md", "2026-08-24.md"]
         assert (log_dir / "2026-08-24.md").read_text().startswith(
             "---\ntype: log\ndate: 2026-08-24\n---\n"
         )
 
     def test_appends_cleanly_to_a_file_missing_its_trailing_newline(self, vault):
-        day = vault / "Personal" / "Log"
+        day = vault / "LifeOS" / "Log" / "Journal"
         day.mkdir(parents=True)
         # A hand-edited file ending mid-line, last character multi-byte — the
         # tail probe must not glue the new bullet on or fail to decode.
@@ -211,19 +211,19 @@ class TestCaptureService:
     def test_empty_fragment_refused_and_writes_nothing(self, vault):
         with pytest.raises(JournalCaptureError):
             capture_fragment("   ")
-        assert not (vault / "Personal" / "Log").exists()
+        assert not (vault / "LifeOS" / "Log" / "Journal").exists()
 
     def test_write_failure_raises_rather_than_reporting_success(self, vault):
         # The day dir exists as a *file*, so opening the day file fails.
-        (vault / "Personal").mkdir()
-        (vault / "Personal" / "Log").write_text("not a directory")
+        (vault / "LifeOS" / "Log").mkdir(parents=True)
+        (vault / "LifeOS" / "Log" / "Journal").write_text("not a directory")
         with pytest.raises(JournalCaptureError):
             capture_fragment(_FRAGMENT)
 
     def test_error_never_quotes_the_fragment(self, vault):
         secret = "an obviously synthetic private thought"
-        (vault / "Personal").mkdir()
-        (vault / "Personal" / "Log").write_text("not a directory")
+        (vault / "LifeOS" / "Log").mkdir(parents=True)
+        (vault / "LifeOS" / "Log" / "Journal").write_text("not a directory")
         with pytest.raises(JournalCaptureError) as excinfo:
             capture_fragment(secret)
         assert secret not in str(excinfo.value)
@@ -255,7 +255,7 @@ class TestCaptureService:
                 range(12),
             ))
 
-        written = (vault / "Personal" / "Log" / "2026-08-23.md").read_text()
+        written = (vault / "LifeOS" / "Log" / "Journal" / "2026-08-23.md").read_text()
         assert written.startswith("---\ntype: log\ndate: 2026-08-23\n---\n")
         assert written.count("type: log") == 1
         assert sum(1 for r in results if r.created) == 1
@@ -271,14 +271,106 @@ class TestCaptureService:
 
 
 # ---------------------------------------------------------------------------
+# One-time migration of leftover Personal/Log/ day files
+# ---------------------------------------------------------------------------
+
+def _write_legacy_day_file(vault: Path, name: str, content: str) -> Path:
+    legacy_dir = vault / "Personal" / "Log"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    path = legacy_dir / name
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+class TestLegacyMigration:
+    def test_todays_legacy_file_is_moved_not_copied_before_appending(self, vault):
+        legacy = _write_legacy_day_file(
+            vault, "2026-08-23.md",
+            "---\ntype: log\ndate: 2026-08-23\n---\n- 08:00 · earlier synthetic thought\n",
+        )
+        result = capture_fragment(_FRAGMENT, now=datetime(2026, 8, 23, 9, 14))
+
+        assert result.created is False  # the day already had content, just elsewhere
+        assert not legacy.exists()
+        written = (vault / "LifeOS" / "Log" / "Journal" / "2026-08-23.md").read_text()
+        assert _bullets(written) == [
+            "- 08:00 · earlier synthetic thought",
+            f"- 09:14 · {_FRAGMENT}",
+        ]
+        # Frontmatter carried over verbatim from the legacy file — written once.
+        assert written.count("type: log") == 1
+
+    def test_other_leftover_day_files_are_migrated_alongside_todays(self, vault):
+        _write_legacy_day_file(
+            vault, "2026-08-20.md",
+            "---\ntype: log\ndate: 2026-08-20\n---\n- 07:00 · an older synthetic note\n",
+        )
+        capture_fragment(_FRAGMENT, now=datetime(2026, 8, 23, 9, 14))
+
+        migrated = (vault / "LifeOS" / "Log" / "Journal" / "2026-08-20.md")
+        assert migrated.exists()
+        assert "an older synthetic note" in migrated.read_text()
+        assert not (vault / "Personal" / "Log" / "2026-08-20.md").exists()
+
+    def test_migration_never_clobbers_an_existing_destination_with_content(self, vault):
+        new_dir = vault / "LifeOS" / "Log" / "Journal"
+        new_dir.mkdir(parents=True)
+        (new_dir / "2026-08-20.md").write_text("already-migrated content\n")
+        _write_legacy_day_file(vault, "2026-08-20.md", "stale legacy content that must not win\n")
+
+        capture_fragment(_FRAGMENT, now=datetime(2026, 8, 23, 9, 14))
+
+        # The pre-existing destination content is untouched...
+        assert (new_dir / "2026-08-20.md").read_text() == "already-migrated content\n"
+        # ...and the legacy duplicate is left in place rather than silently
+        # discarded (never clobbered, never lost).
+        assert (vault / "Personal" / "Log" / "2026-08-20.md").exists()
+
+    def test_no_legacy_file_behaves_exactly_as_a_fresh_install(self, vault):
+        result = capture_fragment(_FRAGMENT, now=datetime(2026, 8, 23, 9, 14))
+        assert result.created is True
+        assert not (vault / "Personal").exists()
+
+    def test_concurrent_first_captures_of_the_day_migrate_legacy_content_exactly_once(self, vault):
+        """Two fragments racing on the first capture of a day that already has
+        a legacy file: the migrated content and both bullets must all survive,
+        with no duplicate day file left under the legacy directory."""
+        import concurrent.futures
+
+        _write_legacy_day_file(
+            vault, "2026-08-23.md",
+            "---\ntype: log\ndate: 2026-08-23\n---\n- 08:00 · earlier synthetic thought\n",
+        )
+        now = datetime(2026, 8, 23, 9, 14)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(
+                lambda frag: capture_fragment(frag, now=now),
+                [_FRAGMENT, _FRAGMENT_2],
+            ))
+
+        assert not (vault / "Personal" / "Log" / "2026-08-23.md").exists()
+        written = (vault / "LifeOS" / "Log" / "Journal" / "2026-08-23.md").read_text()
+        assert written.count("type: log") == 1
+        bullets = [b.split(" · ", 1)[1] for b in _bullets(written)]
+        assert bullets[0] == "earlier synthetic thought"
+        assert sorted(bullets[1:]) == sorted([_FRAGMENT, _FRAGMENT_2])
+        # Exactly one of the two captures observed itself starting the file
+        # from empty; since it was really migrated content, neither did.
+        assert all(r.created is False for r in results)
+
+
+# ---------------------------------------------------------------------------
 # Reserved subtree — Personal/Journal/ stays gsheet_sync's
 # ---------------------------------------------------------------------------
 
 class TestReservedJournalDir:
-    def test_capture_only_ever_writes_under_personal_log(self, vault):
+    def test_capture_only_ever_writes_under_lifeos_log_journal(self, vault):
         capture_fragment(_FRAGMENT, now=datetime(2026, 8, 23, 9, 14))
+        assert not (vault / "Personal").exists()
         assert not (vault / "Personal" / "Journal").exists()
-        assert [p.name for p in (vault / "Personal").iterdir()] == ["Log"]
+        # Sibling of the Pebble producer's own subdirectory — capture must
+        # never touch LifeOS/Log/Pebble/.
+        assert [p.name for p in (vault / "LifeOS" / "Log").iterdir()] == ["Journal"]
 
     def test_vault_write_route_still_rejects_the_reserved_prefix(self, vault, monkeypatch):
         # Since #769 the reservation only applies with the journal persona
@@ -362,7 +454,7 @@ class TestCaptureThroughChatPipeline:
 
     async def test_non_journal_persona_captures_nothing(self, vault, journal_persona, fake_model):
         events = await _run_turn(question="what did I do last week?")
-        assert not (vault / "Personal").exists()
+        assert not (vault / "LifeOS").exists()
         assert not any(e.get("type") == "journal_capture" for e in events)
 
     async def test_capture_failure_is_a_clean_error_and_no_stream(
@@ -371,7 +463,7 @@ class TestCaptureThroughChatPipeline:
         from fastapi import HTTPException
 
         def boom(text, *, now=None):
-            raise JournalCaptureError("could not write Personal/Log/2026-08-23.md")
+            raise JournalCaptureError("could not write LifeOS/Log/Journal/2026-08-23.md")
 
         monkeypatch.setattr(chat, "capture_fragment", boom)
 
@@ -380,7 +472,7 @@ class TestCaptureThroughChatPipeline:
         assert excinfo.value.status_code == 500
         # The reply a user sees must not quote what they said.
         assert _FRAGMENT not in excinfo.value.detail
-        assert not (vault / "Personal").exists()
+        assert not (vault / "LifeOS").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +560,7 @@ class TestIngestEndToEnd:
         with mock.patch.object(chat, "capture_fragment", boom):
             resp = client.post("/api/journal/ingest", json=payload, headers=_auth())
             assert resp.status_code != 200
-            assert not (vault / "Personal").exists()
+            assert not (vault / "LifeOS").exists()
 
         # The key was NOT burned: the genuine retry now lands.
         resp = client.post("/api/journal/ingest", json=payload, headers=_auth())

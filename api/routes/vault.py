@@ -19,7 +19,7 @@ carry `row_hash`/`synced_at` plus the scalars (`mood`/`stress`/`sleep`/
 there would be silently clobbered by the next sync and would corrupt those
 analytics, so it is blocked here rather than left to caller discipline (e.g.
 a persona's prompt instructions). Free-form fragment capture belongs in
-`Personal/Log/` instead — see `config/personas/journal.md`.
+`LifeOS/Log/Journal/` instead — see `config/personas/journal.md`.
 
 The reservation only makes sense where the generated file it protects can
 exist, so it is gated on whether either of the two independent config
@@ -139,7 +139,7 @@ async def vault_write(request: VaultWriteRequest) -> VaultWriteResponse:
         raise HTTPException(
             400,
             "path must not target Personal/Journal/ (reserved for the generated "
-            "daily journal; capture free-form notes under Personal/Log/ instead)",
+            "daily journal; capture free-form notes under LifeOS/Log/Journal/ instead)",
         )
 
     vault_root = settings.vault_path.resolve()

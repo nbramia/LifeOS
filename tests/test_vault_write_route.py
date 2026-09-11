@@ -207,7 +207,7 @@ def test_rejects_writes_into_reserved_journal_dir(app_and_vault, bad_path, monke
     assert r.status_code == 400, r.text
     assert r.json()["detail"] == (
         "path must not target Personal/Journal/ (reserved for the generated "
-        "daily journal; capture free-form notes under Personal/Log/ instead)"
+        "daily journal; capture free-form notes under LifeOS/Log/Journal/ instead)"
     )
     assert not (vault / "Personal" / "Journal").exists()
 

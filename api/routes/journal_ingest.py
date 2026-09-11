@@ -8,8 +8,8 @@ NOT reimplement capture: `_ingest_fragment` below calls the exact same chat
 pipeline entry point (`api.services.telegram.chat_via_api`, with the journal
 persona's preamble) that the journal Telegram bot uses for a typed fragment,
 so a spoken fragment gets identical treatment — same log file, same task/
-schedule thresholds, same ask-when-unsure behavior. Since #674 that pipeline
-writes the fragment to `Personal/Log/YYYY-MM-DD.md` deterministically, in code,
+schedule thresholds, same ask-when-unsure behavior. That pipeline writes the
+fragment to `LifeOS/Log/Journal/YYYY-MM-DD.md` deterministically, in code,
 and reports back that it did; this endpoint requires that confirmation before
 it calls a delivery captured.
 

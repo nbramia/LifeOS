@@ -33,7 +33,7 @@ A valid request is handed to **the exact same chat pipeline call** the
 `journal` Telegram bot makes for a typed message (`api.services.telegram.
 chat_via_api`, primed with the journal persona's preamble). It is not a
 separate implementation of capture — same log file
-(`Personal/Log/YYYY-MM-DD.md`), same task/schedule extraction thresholds,
+(`LifeOS/Log/Journal/YYYY-MM-DD.md`), same task/schedule extraction thresholds,
 same ask-when-unsure behavior described in
 [`config/personas/journal.md`](../../config/personas/journal.md).
 
@@ -140,7 +140,7 @@ curl -X POST http://localhost:8000/api/journal/ingest \
   -d '{"text": "idea about the deploy gate", "device_id": "test-device", "timestamp": "2026-08-23T14:37:00Z"}'
 ```
 
-Check `Personal/Log/<today>.md` in the vault for the new bullet.
+Check `LifeOS/Log/Journal/<today>.md` in the vault for the new bullet.
 
 ## Related Documents
 

@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass, field
 from typing import AsyncGenerator
 from api.services.agent_system_prompt import build_system_prompt
-from api.services.agent_tools import TOOL_DEFINITIONS, TOOL_STATUS_MESSAGES, execute_tool_parallel, begin_email_send_turn
+from api.services.agent_tools import TOOL_STATUS_MESSAGES, execute_tool_parallel, begin_email_send_turn, tools_for_persona
 from api.services.synthesizer import build_message_content
 from api.services.perf_trace import trace_span
 from api.services.llm_client import get_local_llm, openai_tool_calls_to_anthropic, LLMUsage, LocalLLMClient
@@ -501,6 +501,8 @@ async def run_agent_loop(
     personal_context: str = "",
     force_local: bool = False,
     force_remote: bool = False,
+    persona_id: str = "",
+    user_message: str = "",
 ) -> AsyncGenerator[dict, None]:
     """
     Async generator that runs the agentic chat loop.
@@ -530,6 +532,16 @@ async def run_agent_loop(
             settings.remote_llm_*. Usage is priced from the configured rates
             (or marked unpriced if none are set) instead of the free-local
             assumption the rest of this module makes.
+        persona_id: The resolved persona for this turn (e.g. "journal").
+            Narrows the advertised tool catalog and, on a tool call, is
+            passed through to `execute_tool_parallel` so it can enforce the
+            journal persona's filing-only boundary. Empty for every other
+            persona, which see the full catalog unmodified.
+        user_message: The user's own raw message this turn, unmodified by
+            follow-up expansion. Passed through to tool execution so a
+            journal-turn `manage_tasks` create can keep only the tags and
+            fields the operator actually typed, stripping ones the model
+            invented.
 
     Yields:
         Dicts with "type" key: "turn_state" (first event, #615 -- a live
@@ -677,7 +689,8 @@ async def run_agent_loop(
     # Pass tool definitions through with their cache_control marker intact so
     # Anthropic caches the large, stable tool schema across turns and rounds.
     # The local backend strips cache_control itself in _anthropic_tools_to_openai.
-    tools = TOOL_DEFINITIONS
+    # Narrowed for the journal persona — see tools_for_persona.
+    tools = tools_for_persona(persona_id)
 
     for round_num in range(1, max_tool_rounds + 1):
         print(f"[agent] Round {round_num}/{max_tool_rounds} starting")
@@ -804,7 +817,9 @@ async def run_agent_loop(
             name = block.name
             logger.info(f"Executing tool: {name} with input: {block.input}")
             with trace_span(f"tool_{name}"):
-                tool_result_str = await execute_tool_parallel(name, block.input)
+                tool_result_str = await execute_tool_parallel(
+                    name, block.input, persona_id=persona_id, user_message=user_message,
+                )
             is_error = tool_result_str.startswith("Error:")
             result.tool_calls_log.append({
                 "tool": name,
