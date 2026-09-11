@@ -62,6 +62,69 @@ OCCURRENCE_STATES = frozenset({
     OCCURRENCE_FAILED,
 })
 
+# ----------------------------------------------------------------------
+# Doctor repair workflow vocabulary.
+#
+# A repair is one self-repair run: a durable record keyed by `workflow_id`
+# carrying the current phase, the approved goal revision, the approved target
+# scope, and the structured evidence collected for that revision. Sessions
+# link to it through `sessions.workflow_id`; the goal revisions themselves
+# live in `goal_proposals`.
+# ----------------------------------------------------------------------
+REPAIR_SCHEMA_VERSION = 1
+
+REPAIR_DIAGNOSIS = "diagnosis"
+REPAIR_AWAITING_APPROVAL = "awaiting_approval"
+REPAIR_IMPLEMENTING = "implementing"
+REPAIR_REVIEWING = "reviewing"
+REPAIR_MERGING = "merging"
+REPAIR_DEPLOYING = "deploying"
+REPAIR_VERIFYING = "verifying"
+REPAIR_SHIPPED = "shipped"
+REPAIR_FAILED = "failed"
+REPAIR_DECLINED = "declined"
+REPAIR_CANCELLED = "cancelled"
+
+# Phases before the single human gate has been passed. A LifeOS-owned
+# implementation / merge / deploy / restart dispatch is refused in these.
+REPAIR_PREAPPROVAL_PHASES = frozenset({REPAIR_DIAGNOSIS, REPAIR_AWAITING_APPROVAL})
+REPAIR_TERMINAL_PHASES = frozenset({
+    REPAIR_SHIPPED, REPAIR_FAILED, REPAIR_DECLINED, REPAIR_CANCELLED,
+})
+# Terminal phases a new goal revision cannot reopen: the operator closed the
+# repair deliberately. A `shipped` or `failed` repair stays open to follow-up
+# work, which is how a delivered repair takes on its next revision.
+REPAIR_CLOSED_TO_GOALS = frozenset({REPAIR_CANCELLED, REPAIR_DECLINED})
+REPAIR_PHASES = frozenset({
+    REPAIR_DIAGNOSIS, REPAIR_AWAITING_APPROVAL, REPAIR_IMPLEMENTING,
+    REPAIR_REVIEWING, REPAIR_MERGING, REPAIR_DEPLOYING, REPAIR_VERIFYING,
+    *REPAIR_TERMINAL_PHASES,
+})
+
+# The persona whose sessions are self-repair runs. A session carrying it —
+# as `persona_id` or as the `bot` its notices route through — owns a repair
+# record from the moment it is created; every other session, including an
+# ordinary `#agent` task that happens to emit a `[GOAL]`, owns none and is
+# never gated. The policy built over the record lives in `doctor_repair`,
+# which imports from this module; the predicate lives here so `create()` can
+# apply it without a circular import.
+DOCTOR_PERSONA_ID = "doctor"
+
+
+def is_doctor_session(persona_id: str | None, bot: str | None) -> bool:
+    """Whether a session belongs to the doctor, and so to a repair run."""
+    return DOCTOR_PERSONA_ID in {persona_id, bot}
+
+PROPOSAL_PROPOSED = "proposed"
+PROPOSAL_APPROVED = "approved"
+PROPOSAL_SUPERSEDED = "superseded"
+PROPOSAL_DECLINED = "declined"
+
+# Separator framing one event id inside `doctor_repairs.seen_events`. A unit
+# separator can't occur in an id, so `instr()` on the framed token is an exact
+# membership test and the whole check fits in one conditional UPDATE.
+_EVENT_SEP = "\x1f"
+
 
 @dataclass
 class Session:
@@ -167,6 +230,9 @@ class Session:
     turn_id: str | None = None
     turn_number: int = 0
     persona_id: str | None = None
+    # Doctor repair this session executes for. NULL for every session outside
+    # a repair workflow, which is the default for ordinary #agent tasks.
+    workflow_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -271,7 +337,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     attempt_number             INTEGER NOT NULL DEFAULT 0,
     turn_id                    TEXT,
     turn_number                INTEGER NOT NULL DEFAULT 0,
-    persona_id                 TEXT
+    persona_id                 TEXT,
+    workflow_id                TEXT   -- doctor repair this session executes for; NULL = not a repair session
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -445,6 +512,45 @@ CREATE TABLE IF NOT EXISTS pending_questions (
 CREATE INDEX IF NOT EXISTS idx_pq_message_id ON pending_questions(sent_message_id);
 CREATE INDEX IF NOT EXISTS idx_pq_open ON pending_questions(answered_at, processed, timed_out);
 
+-- One durable record per doctor repair run. Current workflow state is read
+-- from this row, never replayed from prose or transcript markers. `evidence`
+-- is the JSON bundle of structured results collected for the approved goal
+-- revision; `seen_events` frames the ids of results already applied so a
+-- redelivered completion wakes at most one continuation.
+CREATE TABLE IF NOT EXISTS doctor_repairs (
+    workflow_id          TEXT PRIMARY KEY,
+    schema_version       INTEGER NOT NULL,
+    phase                TEXT NOT NULL,
+    waiting_reason       TEXT,
+    approved_proposal_id TEXT,
+    approved_version     INTEGER,
+    target_scope         TEXT,   -- JSON: repository + outcome the approval covers
+    evidence             TEXT,   -- JSON: structured results for the approved revision
+    seen_events          TEXT,
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL
+);
+
+-- Versioned goal proposals for a repair. `version` is monotonic per workflow;
+-- `condition` is the canonical success condition; `resume_action` carries the
+-- exact payload the executor is resumed with once the version is approved.
+CREATE TABLE IF NOT EXISTS goal_proposals (
+    proposal_id         TEXT PRIMARY KEY,
+    workflow_id         TEXT NOT NULL,
+    version             INTEGER NOT NULL,
+    condition           TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    resume_action       TEXT,   -- JSON
+    pending_question_id INTEGER,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    UNIQUE (workflow_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_goal_proposals_workflow
+    ON goal_proposals(workflow_id, version);
+CREATE INDEX IF NOT EXISTS idx_goal_proposals_question
+    ON goal_proposals(pending_question_id);
+
 CREATE TABLE IF NOT EXISTS daily_spend (
     date           TEXT PRIMARY KEY,
     total_dollars  REAL NOT NULL DEFAULT 0.0
@@ -545,6 +651,14 @@ def new_attempt_id() -> str:
 
 def new_turn_id() -> str:
     return f"turn_{uuid.uuid4().hex[:20]}"
+
+
+def new_workflow_id() -> str:
+    return f"repair_{uuid.uuid4().hex[:16]}"
+
+
+def new_proposal_id() -> str:
+    return f"goal_{uuid.uuid4().hex[:16]}"
 
 
 class SessionStore:
@@ -736,6 +850,16 @@ class SessionStore:
                 )
             if "persona_id" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN persona_id TEXT")
+            # Links an execution session to the doctor repair it runs for.
+            # Legacy rows stay NULL — "not part of a repair workflow". The
+            # index lives here rather than in _SCHEMA so a database predating
+            # the column has it added before the index is built.
+            if "workflow_id" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN workflow_id TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_workflow "
+                "ON sessions(workflow_id)"
+            )
             wait_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lifecycle_waits)")}
             if "wake_consumed" not in wait_cols:
                 conn.execute(
@@ -800,6 +924,7 @@ class SessionStore:
         execution_request: dict | None = None,
         execution_spec: dict | None = None,
         persona_id: str | None = None,
+        workflow_id: str | None = None,
     ) -> Session:
         """Insert a new session row. Raises sqlite3.IntegrityError if `task_id`
         already has a row — the caller should treat that as a lost-race signal.
@@ -820,6 +945,17 @@ class SessionStore:
         attempt_id = new_attempt_id()
         root_sid = root_session_id or sid
         now = _now()
+        # A doctor session is a self-repair run, so its root owns a repair
+        # record from creation and the single human gate covers the whole
+        # run, including the diagnosis window. Every session-creating route
+        # passes through here, so attaching it at this one point leaves no
+        # route — native spawn, codex spawn, Hermes anchor — outside the
+        # gate. A child inherits its root's workflow explicitly and so never
+        # opens a second one.
+        if workflow_id is None and parent_session_id is None and is_doctor_session(
+            persona_id, bot,
+        ):
+            workflow_id = self.create_repair()["workflow_id"]
         with self._connect() as conn:
             conn.execute(
                 """
@@ -829,8 +965,9 @@ class SessionStore:
                     expected_output, parent_session_id,
                     root_session_id, spawn_depth, origin, claude_code_model, bot,
                     host, model, effort, execution_request_json, execution_spec_json,
-                    attempt_id, attempt_number, turn_id, turn_number, persona_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    attempt_id, attempt_number, turn_id, turn_number, persona_id,
+                    workflow_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id, sid, status, routing,
@@ -841,7 +978,7 @@ class SessionStore:
                     host, model, effort,
                     json.dumps(execution_request) if execution_request is not None else None,
                     json.dumps(execution_spec) if execution_spec is not None else None,
-                    attempt_id, 1, None, 0, persona_id,
+                    attempt_id, 1, None, 0, persona_id, workflow_id,
                 ),
             )
             conn.execute(
@@ -874,6 +1011,7 @@ class SessionStore:
             turn_id=None,
             turn_number=0,
             persona_id=persona_id,
+            workflow_id=workflow_id,
         )
 
     def get(self, task_id: str) -> Session | None:
@@ -1426,8 +1564,8 @@ class SessionStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT session_id, attempt_id, turn_id, status "
-                    "FROM sessions WHERE task_id = ?",
+                    "SELECT session_id, attempt_id, turn_id, status, "
+                    "parent_session_id, workflow_id FROM sessions WHERE task_id = ?",
                     (task_id,),
                 ).fetchone()
                 if row is None or row["attempt_id"] != attempt_id:
@@ -1455,6 +1593,21 @@ class SessionStore:
                         turn_id, turn_id, *TERMINAL_STATUSES,
                     ),
                 )
+                # Cancelling a repair's root session cancels the repair, in
+                # the same transaction as the status flip. A child session is
+                # one step of the repair, not the repair, so its cancellation
+                # leaves the workflow alive.
+                if row["workflow_id"] and row["parent_session_id"] is None:
+                    marks = ",".join("?" * len(REPAIR_TERMINAL_PHASES))
+                    conn.execute(
+                        "UPDATE doctor_repairs SET phase = ?, waiting_reason = ?, "
+                        "updated_at = ? WHERE workflow_id = ? "
+                        f"AND phase NOT IN ({marks})",
+                        (
+                            REPAIR_CANCELLED, reason or "session_cancelled", _now(),
+                            row["workflow_id"], *sorted(REPAIR_TERMINAL_PHASES),
+                        ),
+                    )
                 conn.commit()
                 return True
             except Exception:
@@ -3215,6 +3368,410 @@ class SessionStore:
             )
 
     # ------------------------------------------------------------------
+    # Doctor repair record and versioned goal proposals
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _row_to_repair(row: sqlite3.Row) -> dict:
+        return {
+            "workflow_id": row["workflow_id"],
+            "schema_version": row["schema_version"],
+            "phase": row["phase"],
+            "waiting_reason": row["waiting_reason"],
+            "approved_proposal_id": row["approved_proposal_id"],
+            "approved_version": row["approved_version"],
+            "target_scope": json.loads(row["target_scope"]) if row["target_scope"] else None,
+            "evidence": json.loads(row["evidence"]) if row["evidence"] else {},
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _row_to_proposal(row: sqlite3.Row) -> dict:
+        return {
+            "proposal_id": row["proposal_id"],
+            "workflow_id": row["workflow_id"],
+            "version": row["version"],
+            "condition": row["condition"],
+            "status": row["status"],
+            "resume_action": (
+                json.loads(row["resume_action"]) if row["resume_action"] else None
+            ),
+            "pending_question_id": row["pending_question_id"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def create_repair(
+        self,
+        *,
+        workflow_id: str | None = None,
+        phase: str = REPAIR_DIAGNOSIS,
+        waiting_reason: str | None = None,
+        target_scope: dict | None = None,
+    ) -> dict:
+        """Open a repair record. Returns the stored row."""
+        if phase not in REPAIR_PHASES:
+            raise ValueError(f"unknown repair phase: {phase}")
+        wid = workflow_id or new_workflow_id()
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO doctor_repairs (
+                    workflow_id, schema_version, phase, waiting_reason,
+                    target_scope, evidence, seen_events, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    wid, REPAIR_SCHEMA_VERSION, phase, waiting_reason,
+                    json.dumps(target_scope) if target_scope else None,
+                    "{}", "", now, now,
+                ),
+            )
+        return self.get_repair(wid)
+
+    def get_repair(self, workflow_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM doctor_repairs WHERE workflow_id = ?", (workflow_id,),
+            ).fetchone()
+        return self._row_to_repair(row) if row else None
+
+    def list_repairs(self, workflow_ids: list[str] | None = None) -> list[dict]:
+        """Repairs, optionally restricted to a set of ids. The snapshot reads
+        every repair its sessions reference in one query rather than per row."""
+        with self._connect() as conn:
+            if workflow_ids is None:
+                rows = conn.execute("SELECT * FROM doctor_repairs").fetchall()
+            elif not workflow_ids:
+                return []
+            else:
+                marks = ",".join("?" * len(workflow_ids))
+                rows = conn.execute(
+                    f"SELECT * FROM doctor_repairs WHERE workflow_id IN ({marks})",
+                    tuple(workflow_ids),
+                ).fetchall()
+        return [self._row_to_repair(r) for r in rows]
+
+    def link_session_to_repair(self, task_id: str, workflow_id: str) -> bool:
+        """Attach a session to a repair. Idempotent; refuses to re-point a
+        session already bound to a different workflow, so a resumed supervisor
+        cannot silently adopt another repair's session."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE sessions SET workflow_id = ? WHERE task_id = ? "
+                "AND (workflow_id IS NULL OR workflow_id = ?)",
+                (workflow_id, task_id, workflow_id),
+            )
+        return cur.rowcount == 1
+
+    def list_repair_sessions(self, workflow_id: str) -> list[Session]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sessions WHERE workflow_id = ? ORDER BY started_at ASC",
+                (workflow_id,),
+            ).fetchall()
+        return [self._row_to_session(r) for r in rows]
+
+    def propose_goal(
+        self,
+        workflow_id: str,
+        *,
+        condition: str,
+        resume_action: dict | None = None,
+        pending_question_id: int | None = None,
+    ) -> dict | None:
+        """Record the next goal revision for a repair.
+
+        One transaction supersedes any still-`proposed` revision and inserts
+        the next monotonic version, so a refinement can never leave two
+        approvable revisions open. The repair moves to `awaiting_approval`,
+        which is also how a repair that already delivered takes on follow-up
+        work: the next goal is a new revision awaiting its own approval.
+        Returns the new proposal, or None for an unknown repair or one the
+        operator closed: a cancelled or declined repair stays closed, so the
+        doctor's propose-until-approved loop cannot reopen a refusal by
+        re-emitting its goal.
+        """
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                repair = conn.execute(
+                    "SELECT phase FROM doctor_repairs WHERE workflow_id = ?",
+                    (workflow_id,),
+                ).fetchone()
+                if repair is None or repair["phase"] in REPAIR_CLOSED_TO_GOALS:
+                    conn.rollback()
+                    return None
+                conn.execute(
+                    "UPDATE goal_proposals SET status = ?, updated_at = ? "
+                    "WHERE workflow_id = ? AND status = ?",
+                    (PROPOSAL_SUPERSEDED, now, workflow_id, PROPOSAL_PROPOSED),
+                )
+                top = conn.execute(
+                    "SELECT MAX(version) AS v FROM goal_proposals WHERE workflow_id = ?",
+                    (workflow_id,),
+                ).fetchone()
+                version = int(top["v"] or 0) + 1
+                proposal_id = new_proposal_id()
+                conn.execute(
+                    """
+                    INSERT INTO goal_proposals (
+                        proposal_id, workflow_id, version, condition, status,
+                        resume_action, pending_question_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        proposal_id, workflow_id, version, condition,
+                        PROPOSAL_PROPOSED,
+                        json.dumps(resume_action) if resume_action else None,
+                        pending_question_id, now, now,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE doctor_repairs SET phase = ?, waiting_reason = ?, "
+                    "updated_at = ? WHERE workflow_id = ?",
+                    (REPAIR_AWAITING_APPROVAL, "goal_approval", now, workflow_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return self.get_proposal(proposal_id)
+
+    def get_proposal(self, proposal_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM goal_proposals WHERE proposal_id = ?", (proposal_id,),
+            ).fetchone()
+        return self._row_to_proposal(row) if row else None
+
+    def get_proposal_by_question_id(self, question_id: int) -> dict | None:
+        """The proposal a pending question gates. One question gates at most
+        one revision, which is what makes a reply target an exact version."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM goal_proposals WHERE pending_question_id = ? "
+                "ORDER BY version DESC LIMIT 1",
+                (int(question_id),),
+            ).fetchone()
+        return self._row_to_proposal(row) if row else None
+
+    def list_proposals(self, workflow_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM goal_proposals WHERE workflow_id = ? ORDER BY version ASC",
+                (workflow_id,),
+            ).fetchall()
+        return [self._row_to_proposal(r) for r in rows]
+
+    def approve_goal(self, proposal_id: str) -> dict | None:
+        """Approve exactly one proposed revision, once.
+
+        The conditional UPDATE is the whole idempotency guarantee: a duplicate
+        reply, or a reply targeting a superseded revision, matches no row and
+        returns None, so no resume action is enqueued and no child session is
+        spawned. A reply that lands after the repair reached a terminal phase
+        returns None too, with the revision left `proposed`: the approval is
+        refused outright rather than burned onto a repair that records no
+        approval. On success the repair records the approved revision, clears
+        the evidence collected for the previous one — evidence proves the
+        revision it was gathered for and nothing else — and moves to
+        `implementing`.
+        """
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                proposal_row = conn.execute(
+                    "SELECT workflow_id, version, status FROM goal_proposals "
+                    "WHERE proposal_id = ?",
+                    (proposal_id,),
+                ).fetchone()
+                if proposal_row is None or proposal_row["status"] != PROPOSAL_PROPOSED:
+                    conn.rollback()
+                    return None
+                repair = conn.execute(
+                    "SELECT phase FROM doctor_repairs WHERE workflow_id = ?",
+                    (proposal_row["workflow_id"],),
+                ).fetchone()
+                if repair is None or repair["phase"] in REPAIR_TERMINAL_PHASES:
+                    conn.rollback()
+                    return None
+                conn.execute(
+                    "UPDATE goal_proposals SET status = ?, updated_at = ? "
+                    "WHERE proposal_id = ?",
+                    (PROPOSAL_APPROVED, now, proposal_id),
+                )
+                conn.execute(
+                    "UPDATE doctor_repairs SET phase = ?, waiting_reason = NULL, "
+                    "approved_proposal_id = ?, approved_version = ?, "
+                    "evidence = '{}', updated_at = ? WHERE workflow_id = ?",
+                    (
+                        REPAIR_IMPLEMENTING, proposal_id, proposal_row["version"],
+                        now, proposal_row["workflow_id"],
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return self.get_proposal(proposal_id)
+
+    def supersede_goal(self, proposal_id: str) -> dict | None:
+        """Retire a proposed revision because the operator asked for changes.
+
+        Applied the moment the refinement reply lands, so a later stale reply
+        to the same revision cannot approve it. The next version is created
+        when the doctor emits its reworked goal. A reply that lands after the
+        repair reached a terminal phase returns None and changes nothing.
+        """
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                proposal_row = conn.execute(
+                    "SELECT workflow_id, status FROM goal_proposals "
+                    "WHERE proposal_id = ?",
+                    (proposal_id,),
+                ).fetchone()
+                if proposal_row is None or proposal_row["status"] != PROPOSAL_PROPOSED:
+                    conn.rollback()
+                    return None
+                repair = conn.execute(
+                    "SELECT phase FROM doctor_repairs WHERE workflow_id = ?",
+                    (proposal_row["workflow_id"],),
+                ).fetchone()
+                if repair is None or repair["phase"] in REPAIR_TERMINAL_PHASES:
+                    conn.rollback()
+                    return None
+                conn.execute(
+                    "UPDATE goal_proposals SET status = ?, updated_at = ? "
+                    "WHERE proposal_id = ?",
+                    (PROPOSAL_SUPERSEDED, now, proposal_id),
+                )
+                conn.execute(
+                    "UPDATE doctor_repairs SET phase = ?, waiting_reason = ?, "
+                    "updated_at = ? WHERE workflow_id = ? AND phase = ?",
+                    (
+                        REPAIR_DIAGNOSIS, "goal_refinement", now,
+                        proposal_row["workflow_id"], REPAIR_AWAITING_APPROVAL,
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return self.get_proposal(proposal_id)
+
+    def decline_goal(self, proposal_id: str) -> dict | None:
+        """Decline a proposed revision. A declined goal launches nothing.
+
+        The repair goes terminal, so the gate refuses every dispatch for it
+        from here on. A decline that lands after the repair already reached a
+        terminal phase returns None and changes nothing.
+        """
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                proposal_row = conn.execute(
+                    "SELECT workflow_id, status FROM goal_proposals "
+                    "WHERE proposal_id = ?",
+                    (proposal_id,),
+                ).fetchone()
+                if proposal_row is None or proposal_row["status"] != PROPOSAL_PROPOSED:
+                    conn.rollback()
+                    return None
+                repair = conn.execute(
+                    "SELECT phase FROM doctor_repairs WHERE workflow_id = ?",
+                    (proposal_row["workflow_id"],),
+                ).fetchone()
+                if repair is None or repair["phase"] in REPAIR_TERMINAL_PHASES:
+                    conn.rollback()
+                    return None
+                conn.execute(
+                    "UPDATE goal_proposals SET status = ?, updated_at = ? "
+                    "WHERE proposal_id = ?",
+                    (PROPOSAL_DECLINED, now, proposal_id),
+                )
+                conn.execute(
+                    "UPDATE doctor_repairs SET phase = ?, waiting_reason = ?, "
+                    "updated_at = ? WHERE workflow_id = ?",
+                    (
+                        REPAIR_DECLINED, "goal_declined", now,
+                        proposal_row["workflow_id"],
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return self.get_proposal(proposal_id)
+
+    def set_repair_phase(
+        self,
+        workflow_id: str,
+        phase: str,
+        *,
+        waiting_reason: str | None = None,
+        evidence: dict | None = None,
+        allow_terminal: bool = False,
+    ) -> bool:
+        """Move a repair to `phase`, optionally replacing its evidence bundle.
+
+        A repair that already reached a terminal phase stays there unless the
+        caller explicitly opts in, so a late worker result cannot revive a
+        cancelled repair.
+        """
+        if phase not in REPAIR_PHASES:
+            raise ValueError(f"unknown repair phase: {phase}")
+        sets = ["phase = ?", "waiting_reason = ?", "updated_at = ?"]
+        params: list = [phase, waiting_reason, _now()]
+        if evidence is not None:
+            sets.append("evidence = ?")
+            params.append(json.dumps(evidence))
+        where = "WHERE workflow_id = ?"
+        params.append(workflow_id)
+        if not allow_terminal:
+            marks = ",".join("?" * len(REPAIR_TERMINAL_PHASES))
+            where += f" AND phase NOT IN ({marks})"
+            params.extend(sorted(REPAIR_TERMINAL_PHASES))
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE doctor_repairs SET {', '.join(sets)} {where}", params,
+            )
+        return cur.rowcount == 1
+
+    def cancel_repair(self, workflow_id: str, reason: str = "cancelled") -> bool:
+        """Terminate a repair. Non-terminal repairs only — a shipped repair is
+        not retroactively cancelled."""
+        return self.set_repair_phase(
+            workflow_id, REPAIR_CANCELLED, waiting_reason=reason,
+        )
+
+    def claim_repair_event(self, workflow_id: str, event_id: str) -> bool:
+        """Reserve one delivery of `event_id` for this repair.
+
+        True exactly once per (workflow, event) pair: the membership test and
+        the append share one conditional UPDATE, so a redelivered progress or
+        completion event wakes at most one continuation.
+        """
+        if not event_id:
+            return False
+        token = f"{_EVENT_SEP}{event_id}{_EVENT_SEP}"
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE doctor_repairs "
+                "SET seen_events = COALESCE(seen_events, '') || ?, updated_at = ? "
+                "WHERE workflow_id = ? AND instr(COALESCE(seen_events, ''), ?) = 0",
+                (token, _now(), workflow_id, token),
+            )
+        return cur.rowcount == 1
+
+    # ------------------------------------------------------------------
     # Cross-machine CLI sessions (#849)
     # ------------------------------------------------------------------
 
@@ -3496,4 +4053,5 @@ class SessionStore:
             turn_id=(row["turn_id"] if "turn_id" in row.keys() else None),
             turn_number=(row["turn_number"] if "turn_number" in row.keys() else 0),
             persona_id=(row["persona_id"] if "persona_id" in row.keys() else None),
+            workflow_id=(row["workflow_id"] if "workflow_id" in row.keys() else None),
         )

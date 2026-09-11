@@ -44,6 +44,16 @@ Once you install the [Human queue](human-queue.md) instruction paragraph in the 
 
 **Transport.** By default the doctor Telegram bot's turns answer through the Hermes text backend (`LIFEOS_HERMES_BACKEND_URL`) — see [client-surfaces.md](../specs/technical/client-surfaces.md#telegram-bot-backends-684). If Hermes is unset or unreachable for a turn, the bot falls back to the native pipeline (a genuine Claude Code spawn) and says so in-channel, once. Neither path needs anything extra from you here — this only matters if you're debugging why a repair session is or isn't conversational.
 
+## The repair record
+
+Every repair is one durable record, not a conversation the bot re-reads. It holds the current phase, the approved goal revision, the sessions working on it, and the evidence collected so far. Both surfaces read and update that one record, so a restarted worker, a Telegram reply, and the web thread all see the same state.
+
+- **A repair opens with the session.** Messaging the doctor opens a repair in the `diagnosis` phase, before any goal is proposed, on both the Hermes and native paths. Only the doctor's sessions get one — an ordinary `#agent` task never does.
+- **Goals are numbered revisions.** Each `[GOAL]` the doctor proposes becomes the next version. Approving one applies to exactly the revision you answered and is consumed once: a duplicate "yes", or one that lands on a revision you already asked to change, starts nothing. Asking for changes retires that revision, so the doctor re-proposes rather than quietly keeping the old wording. A bare "leave it" or "no" declines it outright and closes the repair.
+- **Approval is what opens the gate.** Until a revision is approved, LifeOS refuses to spawn a worker for that repair at all, whatever the worker would be asked to do; investigation continues through the doctor's own MCP tools. This is a gate on what LifeOS dispatches, not a sandbox over the shell a running session already has — merging, deploying, and restarting are work the supervisor does inside its own session.
+- **Phases come from structured results.** The repair advances on the machine-readable result its worker reports on the turn that ends its session — the PRs, the review outcome, the candidate verifier's own printed result, the merged commit, the deployment verifier's output, and the revert handle. A repair reads `shipped` only when the revision running in the processes is the merged commit and the restart and health check both passed. A merge whose deploy failed is a deployment failure; prose saying "shipped" changes nothing.
+- **Where to see it.** The `/agents` snapshot carries a `repair` object on each of a repair's sessions — see [client-surfaces.md](../specs/technical/client-surfaces.md).
+
 ## Autonomy and safety
 
 - **One gate.** Full-auto from your goal approval through merge; `/implement`'s built-in adversarial review is the quality bar.
@@ -73,3 +83,5 @@ The doctor's machinery is generic. To add another orchestration surface, add an 
 - [`config/personas/doctor.md`](../../config/personas/doctor.md) — **The authoritative orchestration contract** the session runs; this guide is its operator-facing summary.
 - [`api/services/telegram.py`](../../api/services/telegram.py) — Listener routing + bot-scoped reply hooks.
 - [`api/services/agent_worker/worker.py`](../../api/services/agent_worker/worker.py) — Bot-bound notification routing for Claude Code sessions.
+- [`api/services/agent_worker/doctor_repair.py`](../../api/services/agent_worker/doctor_repair.py) — The approval gate, phase ladder, and what evidence proves a repair shipped.
+- [`api/services/agent_worker/session_store.py`](../../api/services/agent_worker/session_store.py) — The `doctor_repairs` and `goal_proposals` records.

@@ -74,6 +74,12 @@ def spawn_claude_code_session(
     notices (NULL = primary). An orchestration bot like the doctor passes its
     name so the worker routes [NOTIFY]/[CLARIFY]/completion back to that bot.
 
+    ``persona_id``/``bot`` are what make a doctor spawn a self-repair run:
+    `SessionStore.create` opens the repair record for a doctor session, so the
+    record exists from `diagnosis` onward and the single human gate refuses an
+    implementation dispatch during the read-only diagnosis window rather than
+    only once a goal is proposed.
+
     Returns ``{"ok": True, "session_id", "task_id"}`` on success, or
     ``{"ok": False, "error"}`` when ``prompt`` is empty.
 

@@ -314,3 +314,38 @@ def test_removed_hook_row_reverts_to_inferred_status_inside_ttl(client, stores, 
     assert row2["status_inferred"] is True
     assert row2["status"] == "running"
     assert row2["host"] == "this-api-host"
+
+
+@pytest.mark.unit
+def test_every_row_source_carries_the_repair_field(client, stores, monkeypatch):
+    """`repair` is part of the snapshot row contract (client-surfaces.md), so
+    it is on every row whatever built it — a LifeOS session row, a merged
+    transcript+event CLI row, and a synthetic remote row alike. Only the
+    LifeOS row can carry a value; the others carry null."""
+    session_store, _ = stores
+    monkeypatch.setattr(agents_route, "_claude_code_snapshot",
+                        lambda: ([_fake_cc_transcript_row()], []))
+    session_store.record_cli_session_event(
+        engine="claude_code", event="user_prompt_submit",
+        session_id="merge-target", host="this-api-host",
+        cwd="/home/x", prompt="do the thing",
+    )
+    session_store.record_cli_session_event(
+        engine="codex", event="session_start",
+        session_id="remote-only", host="a-different-laptop",
+        cwd="/home/laptop/proj",
+    )
+    lifeos = session_store.create(
+        task_id="task-repair-row", routing="claude_code",
+        origin="operator", bot="doctor",
+    )
+
+    r = client.get("/api/agents/snapshot")
+    assert r.status_code == 200
+    rows = {s["session_id"]: s for s in r.json()["sessions"]}
+    for sid in ("cc:merge-target", "cx:remote-only", lifeos.session_id):
+        assert sid in rows, sid
+        assert "repair" in rows[sid], sid
+    assert rows["cc:merge-target"]["repair"] is None
+    assert rows["cx:remote-only"]["repair"] is None
+    assert rows[lifeos.session_id]["repair"]["phase"] == "diagnosis"

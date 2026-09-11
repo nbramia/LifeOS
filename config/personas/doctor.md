@@ -15,6 +15,8 @@ The user only sees messages you wrap in `[NOTIFY]` (statements), `[CLARIFY]` (qu
 `[GOAL] File an issue for the calendar week-boundary bug, ship a tested fix as a PR merged to main, restart the server, and confirm — reverting cleanly if anything fails review.`
 This **is** the single human gate. The user approves it (locking the goal) or replies with changes (you re-propose a new `[GOAL]`). Stop and wait.
 
+Each `[GOAL]` you emit becomes a numbered revision of this repair, recorded durably. Approval applies to exactly the revision the user answered, is consumed once, and is what opens the gate: until a revision is approved, LifeOS refuses to spawn a worker to implement this repair, while read-only investigation stays available throughout. A refinement retires the revision it answered, so re-propose rather than assuming the old wording still stands. Declining a goal — a bare "leave it", "no", "drop it" — closes the repair, and nothing more is dispatched for it.
+
 **3. On approval — execute the goal autonomously, end to end.** Once the goal is locked you drive it without further approval. Pick the **ceremony by goal size** (see below), but the invariants are absolute regardless of size.
 
 **4. On "leave it" (the user declines the goal):** file the issue anyway if useful, `[NOTIFY] Left it as issue #<n> for later.`, and stop.
@@ -39,6 +41,19 @@ First **file the work as GitHub issue(s)** via `/draft-issue` (capture the numbe
 **After the final merge to `main`:** bring the canonical checkout to the merged code — `git -C ~/Code/LifeOS checkout main && git -C ~/Code/LifeOS pull` — then **verify the deploy actually landed** before anything else: `./scripts/server.sh verify-deployed` (checks the checkout is a real work tree whose HEAD matches `origin/main`; pass an explicit `<merged-sha>` to pin it). If it exits non-zero, the pull silently failed (e.g. a bare/misconfigured checkout) and the running code is **still the old version** — do **not** report "Shipped". Instead `[NOTIFY]` the failure with the rollback handle (e.g. `⚠️ Merged #<n> but the server is still on <old-sha> — deploy failed: <reason>. Code is NOT live; needs a manual pull/fix. Revert with: gh pr revert <n>`) and stop. Only once it passes: clean up any remaining worktree/branch, then restart (see Restarting below).
 
 **Confirm with the rollback handle:** `[NOTIFY] Shipped: PR #<n> merged to main, server restarted. Issue #<i> closed. Revert with: gh pr revert <n>`
+
+## Reporting the structured result
+
+Your prose is for the operator; the repair record advances only on a machine-readable result. The record is read from the turn that **ends** the session, so put the result on your final turn — a line on a turn that pauses for a reply is not read. End that turn with one `LIFEOS_REPAIR_RESULT:` line — the JSON object on the same line, nothing after it:
+
+```
+LIFEOS_REPAIR_RESULT:{"goal_version":1,"pull_requests":[1234],"review":{"outcome":"approved"},"verification":<the JSON scripts/verify_candidate.py printed>,"merge":{"pr":1234,"merged_commit":"<merged-sha>"},"deployment":<the JSON that ./scripts/server.sh verify-runtime-evidence printed>,"revert_handle":"gh pr revert 1234"}
+```
+
+- `goal_version` is the approved goal revision you are executing. A result reporting any other revision is discarded.
+- `verification` is the candidate verifier's own printed JSON, relayed verbatim — it is pinned to the candidate it ran over (`candidate_id`), not to a commit. Never hand-assemble it or add fields it did not print. `review.outcome` is `/implement`'s adversarial-review outcome; a review comment you authored is not verification.
+- `deployment` is the deployment verifier's JSON verbatim. It carries the checkout revision, the revisions the processes are actually running, the restart result, and the health check. A repair reaches `shipped` only when all of those agree with the merged commit — a merge whose deployment failed is a deployment failure, and saying "shipped" in prose changes nothing.
+- Report whatever is real so far; omit what has not happened, and never fill a field with a placeholder.
 
 ## Invariants (these never bend, regardless of goal size)
 

@@ -733,3 +733,219 @@ def test_focus_returns_410_and_clears_mapping_when_activate_fails(
     assert "no such pane" in r.json()["detail"]
     # Stale mapping is cleared so the next Resume can write a fresh one.
     assert wezterm_store.get("cc:session-x") is None
+
+
+# ---------------------------------------------------------------------------
+# Goal-approval resume: the Telegram threaded reply and the session-keyed
+# `POST /api/conversations/{id}/answer` path deposit into the same durable
+# proposal transition, with bot/session ownership preserved.
+# ---------------------------------------------------------------------------
+
+SYNTHETIC_GOAL = "merge the parser fix and verify the service health check"
+
+
+def _resume_worker(tmp_path: Path):
+    """A Worker over tmp-path stores, with Telegram sends captured."""
+    import httpx as _httpx
+    from api.services.agent_worker.session_store import SessionStore
+    from api.services.agent_worker.spend_tracker import SpendTracker
+    from api.services.agent_worker.transcript_store import TranscriptStore
+    from api.services.agent_worker.worker import Worker, _SynchronousPool
+
+    transport = _httpx.MockTransport(lambda _req: _httpx.Response(200, json={"tasks": []}))
+    return Worker(
+        api_base="http://api",
+        session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        spend_tracker=SpendTracker(
+            db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0,
+        ),
+        poll_seconds=0.01,
+        telegram_send=lambda text, chat_id=None, bot=None: True,
+        telegram_send_with_id=lambda text, chat_id=None, bot=None: [7001],
+        http_client=_httpx.Client(transport=transport, base_url="http://api"),
+        cli_pool=_SynchronousPool(),
+    )
+
+
+def _seed_goal_gate(w, *, task_id, message_id, bot="doctor"):
+    """A BLOCKED doctor session awaiting approval of one goal revision."""
+    from api.services.agent_worker.session_store import STATUS_BLOCKED
+
+    session = w.session_store.create(
+        task_id=task_id, routing="claude_code", origin="operator",
+        bot=bot, status=STATUS_BLOCKED,
+    )
+    w.session_store.set_claude_code_session_id(session.task_id, f"cli-{task_id}")
+    question_id = w.session_store.create_pending_question(
+        session_id=session.session_id,
+        task_id=session.task_id,
+        question=(
+            f"{SYNTHETIC_GOAL}\n\nReply to this message with 'yes' to lock this "
+            "goal and start, or with changes to refine it."
+        ),
+        sent_message_id=message_id,
+        sent_message_ids=[message_id],
+        kind="goal_approval",
+        bot=bot,
+    )
+    w._record_goal_proposal(session, SYNTHETIC_GOAL, question_id)
+    return session, question_id
+
+
+@pytest.mark.unit
+class TestGoalApprovalSurfacesConverge:
+    def test_telegram_reply_locks_the_targeted_revision(self, tmp_path):
+        from api.services.agent_worker.session_store import (
+            PROPOSAL_APPROVED, REPAIR_IMPLEMENTING,
+        )
+
+        w = _resume_worker(tmp_path)
+        session, question_id = _seed_goal_gate(
+            w, task_id="task-tg-goal", message_id=7100,
+        )
+        proposal = w.session_store.get_proposal_by_question_id(question_id)
+
+        assert w.session_store.deposit_answer(7100, "yes", bot="doctor") is True
+        w._process_clarification_answers()
+
+        assert w.session_store.get_proposal(proposal["proposal_id"])["status"] == (
+            PROPOSAL_APPROVED
+        )
+        assert [m["content"] for m in
+                w.session_store.drain_pending_messages(session.session_id)] == [
+            f"/goal {SYNTHETIC_GOAL}"
+        ]
+        repair = w.session_store.get_repair(
+            w.session_store.get(session.task_id).workflow_id,
+        )
+        assert repair["phase"] == REPAIR_IMPLEMENTING
+        assert repair["approved_version"] == 1
+
+    def test_conversation_answer_endpoint_reaches_the_same_transition(
+        self, client, tmp_path, monkeypatch,
+    ):
+        """Web/voice deposits through the session-keyed endpoint and the
+        worker consumes it through the one goal-approval path."""
+        from datetime import datetime
+        from unittest.mock import patch
+
+        from api.services.conversation_store import Conversation
+        from api.services.agent_worker.session_store import (
+            PROPOSAL_APPROVED, REPAIR_IMPLEMENTING,
+        )
+
+        w = _resume_worker(tmp_path)
+        session, question_id = _seed_goal_gate(
+            w, task_id="task-web-goal", message_id=7200,
+        )
+        proposal = w.session_store.get_proposal_by_question_id(question_id)
+
+        now = datetime.now()
+        conv = Conversation(
+            id="conv-goal", title="Doctor", created_at=now, updated_at=now,
+            message_count=1, persona_id="doctor",
+            agent_session_id=session.session_id,
+        )
+        conv_store = MagicMock()
+        conv_store.get_conversation.return_value = conv
+
+        with patch("api.routes.conversations.get_store", return_value=conv_store), \
+             patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=w.session_store):
+            response = client.post(
+                "/api/conversations/conv-goal/answer", json={"answer": "yes"},
+            )
+        assert response.status_code == 200
+
+        w._process_clarification_answers()
+
+        assert w.session_store.get_proposal(proposal["proposal_id"])["status"] == (
+            PROPOSAL_APPROVED
+        )
+        assert [m["content"] for m in
+                w.session_store.drain_pending_messages(session.session_id)] == [
+            f"/goal {SYNTHETIC_GOAL}"
+        ]
+        repair = w.session_store.get_repair(
+            w.session_store.get(session.task_id).workflow_id,
+        )
+        assert repair["phase"] == REPAIR_IMPLEMENTING
+
+    def test_a_primary_bot_reply_cannot_answer_a_doctor_gate(self, tmp_path):
+        """Reply matching stays scoped to the bot that asked, so a primary-bot
+        reply sharing a message id never consumes the doctor's revision."""
+        from api.services.agent_worker.session_store import PROPOSAL_PROPOSED
+
+        w = _resume_worker(tmp_path)
+        _, question_id = _seed_goal_gate(w, task_id="task-scope-goal", message_id=7300)
+        proposal = w.session_store.get_proposal_by_question_id(question_id)
+
+        assert w.session_store.deposit_answer(7300, "yes", bot="primary") is False
+        w._process_clarification_answers()
+        assert w.session_store.get_proposal(proposal["proposal_id"])["status"] == (
+            PROPOSAL_PROPOSED
+        )
+
+    def test_an_answer_for_one_session_never_reaches_another(self, tmp_path):
+        """The session-keyed deposit addresses exactly one session's gate."""
+        from api.services.agent_worker.session_store import (
+            PROPOSAL_APPROVED, PROPOSAL_PROPOSED,
+        )
+
+        w = _resume_worker(tmp_path)
+        first, first_qid = _seed_goal_gate(w, task_id="task-a-goal", message_id=7400)
+        _, second_qid = _seed_goal_gate(w, task_id="task-b-goal", message_id=7500)
+
+        assert w.session_store.deposit_answer_by_session_id(
+            first.session_id, "yes",
+        ) is True
+        w._process_clarification_answers()
+
+        assert w.session_store.get_proposal(
+            w.session_store.get_proposal_by_question_id(first_qid)["proposal_id"],
+        )["status"] == PROPOSAL_APPROVED
+        assert w.session_store.get_proposal(
+            w.session_store.get_proposal_by_question_id(second_qid)["proposal_id"],
+        )["status"] == PROPOSAL_PROPOSED
+
+    def test_an_approval_pending_without_a_revision_is_adopted_and_honored(
+        self, tmp_path,
+    ):
+        """A goal-approval question registered with no recorded revision adopts
+        one from its own prompt text, so a pending approval still resumes."""
+        from api.services.agent_worker.session_store import (
+            PROPOSAL_APPROVED, STATUS_BLOCKED,
+        )
+
+        w = _resume_worker(tmp_path)
+        session = w.session_store.create(
+            task_id="task-legacy-goal", routing="claude_code", origin="operator",
+            bot="doctor", status=STATUS_BLOCKED,
+        )
+        w.session_store.set_claude_code_session_id(session.task_id, "cli-legacy")
+        question_id = w.session_store.create_pending_question(
+            session_id=session.session_id,
+            task_id=session.task_id,
+            question=(
+                f"{SYNTHETIC_GOAL}\n\nReply to this message with 'yes' to lock "
+                "this goal and start, or with changes to refine it."
+            ),
+            sent_message_id=7600,
+            sent_message_ids=[7600],
+            kind="goal_approval",
+            bot="doctor",
+        )
+        assert w.session_store.get_proposal_by_question_id(question_id) is None
+
+        # The original reply anchor still works.
+        assert w.session_store.deposit_answer(7600, "yes", bot="doctor") is True
+        w._process_clarification_answers()
+
+        adopted = w.session_store.get_proposal_by_question_id(question_id)
+        assert adopted["condition"] == SYNTHETIC_GOAL
+        assert adopted["status"] == PROPOSAL_APPROVED
+        assert [m["content"] for m in
+                w.session_store.drain_pending_messages(session.session_id)] == [
+            f"/goal {SYNTHETIC_GOAL}"
+        ]
