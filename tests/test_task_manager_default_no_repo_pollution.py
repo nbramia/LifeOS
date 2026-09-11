@@ -25,9 +25,33 @@ _REAL_TASK_INDEX = REPO_ROOT / "data" / "task_index.json"
 _REAL_DASHBOARD = REPO_ROOT / "vault" / "LifeOS" / "Tasks" / "Dashboard.md"
 
 
+def test_default_task_manager_paths_are_isolated_from_the_real_checkout(tmp_path_factory):
+    """``get_task_manager()``'s default singleton must resolve its vault and
+    index paths away from the real checkout, regardless of whether
+    ``data/task_index.json``/``vault/LifeOS/Tasks/Dashboard.md`` happen to
+    already exist there. An existence check alone (see the sibling test
+    below) has no failure mode on a checkout where those files are already
+    present -- this pins the actual ownership property instead."""
+    from config.settings import Settings
+    from api.services.task_manager import get_task_manager
+
+    real_default_vault_path = Path(Settings().vault_path)
+    real_default_index_path = REPO_ROOT / "data" / "task_index.json"
+
+    manager = get_task_manager()
+
+    assert manager.vault_path != real_default_vault_path
+    assert manager.index_path != real_default_index_path
+    basetemp = tmp_path_factory.getbasetemp()
+    assert manager.vault_path.is_relative_to(basetemp)
+    assert manager.index_path.is_relative_to(basetemp)
+
+
 def test_building_existing_tags_block_does_not_touch_the_real_checkout():
     """Exercising the same call path ``run_agent_loop`` uses to build a
-    system prompt must not create task-store files in the real checkout."""
+    system prompt must not create task-store files in the real checkout.
+    Adds value on a checkout that starts clean; see the state-independent
+    test above for the property that holds regardless of ambient state."""
     from api.services import agent_system_prompt
 
     index_existed_before = _REAL_TASK_INDEX.exists()
