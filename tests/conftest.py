@@ -613,6 +613,43 @@ def _isolate_default_task_manager_paths(request, tmp_path, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_default_person_entity_store_path(request, tmp_path, monkeypatch):
+    """Redirect a default-constructed ``PersonEntityStore``'s database path
+    to a path owned by this test.
+
+    ``PersonEntityStore.CRM_DB_PATH`` is a ``Path(__file__)``-derived class
+    attribute, not something resolved through ``settings`` -- every xdist
+    worker that skips this fixture resolves the same repo-root file.
+    ``__init__`` falls back to it when no ``db_path`` is given, and
+    ``_init_db()`` connects to that path (creating the file) before issuing
+    ``CREATE TABLE IF NOT EXISTS`` -- a concurrent worker connecting to the
+    same file inside that window sees an empty database and raises
+    ``sqlite3.OperationalError: no such table: person_entities``. Patch the
+    class attribute directly and reset the ``_entity_store`` singleton so
+    the next default construction picks up the new path.
+    ``get_person_entity_store`` itself is left intact, so a test that
+    injects its own store by setting the ``_entity_store`` singleton still
+    has that store served to the code under test. Tests marked ``slow`` or
+    ``integration`` carry their own redirection above and are left alone
+    here.
+    """
+    if request.node.get_closest_marker("slow") is not None:
+        yield
+        return
+    if request.node.get_closest_marker("integration") is not None:
+        yield
+        return
+
+    import api.services.person_entity as person_entity_mod
+
+    monkeypatch.setattr(
+        person_entity_mod.PersonEntityStore, "CRM_DB_PATH", tmp_path / "crm.db"
+    )
+    monkeypatch.setattr(person_entity_mod, "_entity_store", None)
+    yield
+
+
 # Collection names `VectorStore` actually writes to on a real install:
 # `VectorStore`'s own class default (also what `get_vector_store()`'s
 # process-wide singleton resolves to) plus every non-vault indexer's own
