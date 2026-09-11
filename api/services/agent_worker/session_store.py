@@ -94,7 +94,7 @@ REPAIR_TERMINAL_PHASES = frozenset({
 # Terminal phases a new goal revision cannot reopen: the operator closed the
 # repair deliberately. A `shipped` or `failed` repair stays open to follow-up
 # work, which is how a delivered repair takes on its next revision.
-_REPAIR_CLOSED_TO_GOALS = frozenset({REPAIR_CANCELLED, REPAIR_DECLINED})
+REPAIR_CLOSED_TO_GOALS = frozenset({REPAIR_CANCELLED, REPAIR_DECLINED})
 REPAIR_PHASES = frozenset({
     REPAIR_DIAGNOSIS, REPAIR_AWAITING_APPROVAL, REPAIR_IMPLEMENTING,
     REPAIR_REVIEWING, REPAIR_MERGING, REPAIR_DEPLOYING, REPAIR_VERIFYING,
@@ -3502,7 +3502,7 @@ class SessionStore:
                     "SELECT phase FROM doctor_repairs WHERE workflow_id = ?",
                     (workflow_id,),
                 ).fetchone()
-                if repair is None or repair["phase"] in _REPAIR_CLOSED_TO_GOALS:
+                if repair is None or repair["phase"] in REPAIR_CLOSED_TO_GOALS:
                     conn.rollback()
                     return None
                 conn.execute(

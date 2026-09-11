@@ -84,6 +84,7 @@ from api.services.agent_worker.preflight import (
     run_preflight,
 )
 from api.services.agent_worker.session_store import (
+    REPAIR_CLOSED_TO_GOALS,
     STATUS_BLOCKED,
     STATUS_BUDGET_EXCEEDED,
     STATUS_CLAIMED,
@@ -1844,6 +1845,34 @@ class Worker:
                     "managed clarification resume not yet supported",
                 )
 
+    def _repair_lineage_root(self, session: Session) -> Session:
+        """The session whose repair record a session's lineage hangs off.
+
+        A child inherits its root's workflow, so the root is where a repair is
+        linked and where the persona that owns it is read from. A session with
+        no parent, or whose root row is gone, is its own root.
+        """
+        if not session.parent_session_id:
+            return session
+        root_id = session.root_session_id or session.parent_session_id
+        return self.session_store.get_by_session_id(root_id) or session
+
+    def _owned_repair(self, session: Session) -> tuple[bool, dict | None]:
+        """Whether a session belongs to a repair, and that repair's record.
+
+        Read-only: unlike `_ensure_repair` this opens nothing, because a
+        reply-handling path must never create a repair as a side effect of
+        asking whether one exists. A doctor session belongs to a repair even
+        before a record is linked to it, so ownership is the workflow id
+        resolved across the lineage or the root being the doctor — which is
+        why the record itself can be None on an owning session.
+        """
+        root = self._repair_lineage_root(session)
+        workflow_id = session.workflow_id or root.workflow_id
+        if workflow_id:
+            return True, self.session_store.get_repair(workflow_id)
+        return doctor_repair.is_doctor_session(root.persona_id, root.bot), None
+
     def _ensure_repair(self, session: Session) -> str | None:
         """The repair workflow a session belongs to, or None.
 
@@ -1857,10 +1886,7 @@ class Worker:
         """
         if session.workflow_id:
             return session.workflow_id
-        root = session
-        if session.parent_session_id:
-            root_id = session.root_session_id or session.parent_session_id
-            root = self.session_store.get_by_session_id(root_id) or session
+        root = self._repair_lineage_root(session)
         workflow_id = root.workflow_id
         if not workflow_id:
             if not doctor_repair.is_doctor_session(root.persona_id, root.bot):
@@ -1979,14 +2005,22 @@ class Worker:
         resumable = live is not None and live.status == STATUS_BLOCKED
         if not resumable:
             self.session_store.mark_question_processed(q["id"])
+        self._send_goal_notice(notice, session)
+        return notice if resumable else None
+
+    def _send_goal_notice(self, notice: str, session: Session) -> None:
+        """Tell the operator a goal reply started nothing.
+
+        The message they replied to was their only gate, so the news reaches
+        them on the bot they answered from. A send failure must not strand the
+        row that is still being resolved."""
         try:
             if session.bot:
                 self._telegram_send(notice, bot=session.bot)
             else:
                 self._telegram_send(notice)
-        except Exception:  # noqa: BLE001 — a send failure must not strand the row
+        except Exception:  # noqa: BLE001
             logger.warning("goal reply notice send failed", exc_info=True)
-        return notice if resumable else None
 
     def _resume_goal(self, q: dict, session: Session, answer: str) -> None:
         """Operator replied to a proposed [GOAL].
@@ -2016,20 +2050,37 @@ class Worker:
         declining = _is_declining(answer)
         affirmative = not declining and _is_affirmative(answer)
         if proposal is None:
-            # No revision to lock: either this session keeps no repair record
-            # — an ordinary task that emitted the generic `[GOAL]` tag — or
-            # nothing recoverable was ever proposed. The first case still
-            # locks the condition the executor recorded, since the approval
-            # is the only gate the operator has and a reprompt would just
-            # reproduce this same state.
+            # No revision to lock. A session that owns no repair — an ordinary
+            # task that emitted the generic `[GOAL]` tag — still locks the
+            # condition its executor recorded, since the approval is the only
+            # gate the operator has and a reprompt would just reproduce this
+            # same state. A session that owns one is here because its repair
+            # recorded no revision: a repair the operator closed refuses
+            # further goals, and an approval may not revive it, so it starts
+            # nothing and the operator is told where their reply landed.
+            # Any other owning session simply has nothing recoverable to
+            # lock and is asked to re-emit.
             condition = self._proposed_goal_condition(q, session)
-            if affirmative and condition:
+            owns_repair, repair = self._owned_repair(session)
+            closed = (repair or {}).get("phase") in REPAIR_CLOSED_TO_GOALS
+            if affirmative and condition and not owns_repair:
                 resume_msg = doctor_repair.resume_message(
                     doctor_repair.goal_resume_action(condition),
                 )
                 self.transcript_store.append(sid, "claude_code_goal_locked", {
                     "condition_chars": len(condition),
                 })
+            elif affirmative and closed:
+                resume_msg = (
+                    "Approval received, but this repair recorded no goal "
+                    f"revision to lock — it is {repair['phase']}. Nothing was "
+                    "started."
+                )
+                self.transcript_store.append(sid, "claude_code_goal_lock_failed", {
+                    "reason": "repair_refused_revision",
+                    "phase": repair["phase"],
+                })
+                self._send_goal_notice(resume_msg, session)
             elif affirmative:
                 resume_msg = (
                     "Approval received, but no goal revision is on record to "

@@ -1209,6 +1209,84 @@ class TestGoalApproval:
         assert "claude_code_goal_locked" not in kinds
         assert notices and notices[-1][1] == "doctor"
 
+    def _close_by_decline(self, w, session):
+        """Close the repair the way the operator does: decline the revision
+        the outstanding goal question gates."""
+        assert w.session_store.deposit_answer(9100, "leave it", bot="doctor") is True
+        w._process_clarification_answers()
+
+    def _close_by_cancel(self, w, session):
+        """Close the repair the other way: an out-of-band cancel that lands
+        while the goal question is still outstanding."""
+        w.session_store.cancel_repair(session.workflow_id, "operator kill")
+
+    @pytest.mark.parametrize("closer, phase", [
+        ("_close_by_decline", "declined"),
+        ("_close_by_cancel", "cancelled"),
+    ])
+    def test_an_approval_of_a_goal_a_closed_repair_refused_starts_nothing(
+        self, tmp_path, closer, phase,
+    ):
+        """The doctor re-proposes after its repair was closed, so the store
+        records no revision for the new question. Approving it must start no
+        work: the supervisor runs unsandboxed, so locking the condition here
+        would launch the goal the operator refused. The reply is retired with
+        the news instead, and the operator hears where it landed."""
+        from api.services.agent_worker import doctor_repair
+        from api.services.agent_worker.session_store import STATUS_BLOCKED
+
+        notices: list[tuple] = []
+        w = self._make_worker(tmp_path, self._goal_blocked_stub())
+        w._telegram_send = lambda text, chat_id=None, bot=None: (
+            notices.append((text, bot)) or True
+        )
+        condition = "merge the parser fix and restart the service"
+        session, _ = self._seed_blocked_goal_session(w, condition=condition)
+        workflow_id = w.session_store.get_by_session_id(session.session_id).workflow_id
+
+        getattr(self, closer)(w, w.session_store.get_by_session_id(session.session_id))
+        assert w.session_store.get_repair(workflow_id)["phase"] == phase
+        w.session_store.drain_pending_messages(session.session_id)
+
+        # The doctor emits another [GOAL]; the store refuses the revision.
+        w.session_store.update_status(session.task_id, STATUS_BLOCKED)
+        w.transcript_store.append(
+            session.session_id, "claude_code_awaiting_goal_approval",
+            {"condition": condition, "condition_chars": len(condition)},
+        )
+        qid = w.session_store.create_pending_question(
+            session_id=session.session_id,
+            task_id=session.task_id,
+            question="Reply 'yes' to lock this goal and start, or send changes to refine it.",
+            sent_message_id=9101,
+            sent_message_ids=[9101],
+            kind="goal_approval",
+            bot="doctor",
+        )
+        w._record_goal_proposal(
+            w.session_store.get_by_session_id(session.session_id), condition, qid,
+        )
+        assert w.session_store.get_proposal_by_question_id(qid) is None
+
+        assert w.session_store.deposit_answer(9101, "yes", bot="doctor") is True
+        w._process_clarification_answers()
+
+        resumed = [m["content"] for m in
+                   w.session_store.drain_pending_messages(session.session_id)]
+        assert not any(m.startswith("/goal") for m in resumed)
+        assert resumed == [notices[-1][0]]
+        assert phase in resumed[0]
+        kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
+        assert "claude_code_goal_locked" not in kinds
+        lock_failed = [e for e in w.transcript_store.read(session.session_id)
+                       if e["kind"] == "claude_code_goal_lock_failed"]
+        assert lock_failed[-1]["payload"]["reason"] == "repair_refused_revision"
+        repair = w.session_store.get_repair(workflow_id)
+        assert repair["phase"] == phase
+        assert repair["approved_proposal_id"] is None
+        assert doctor_repair.dispatch_allowed(repair, "implement").allowed is False
+        assert notices and notices[-1][1] == "doctor"
+
 
 class TestRepairSpawnGate:
     """`lifeos_agent_spawn` is how a repair dispatches implementation work, so
