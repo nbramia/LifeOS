@@ -4163,3 +4163,233 @@ class TestDeleteCard:
         expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
         assert kill_calls == []
         assert task_deletes == ["t21"]
+
+
+def _drag_to(page: Page, source_selector: str, target_selector: str):
+    """Pointer-drag one element onto another.
+
+    The first move is horizontal. `shouldCancelPointerGesture`
+    (web/agents/board_gesture.js) hands a gesture whose opening movement is
+    more vertical than horizontal back to the browser as a scroll, so a drag
+    has to be established on the horizontal axis before it can travel to a
+    target that sits below the source — the same opening move the existing
+    tray drag test uses.
+    """
+    source = page.locator(source_selector)
+    target = page.locator(target_selector)
+    src = source.bounding_box()
+    dst = target.bounding_box()
+    page.mouse.move(src["x"] + src["width"] / 2, src["y"] + src["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(src["x"] + src["width"] / 2 + 60, src["y"] + src["height"] / 2, steps=4)
+    page.mouse.move(dst["x"] + dst["width"] / 2, dst["y"] + dst["height"] / 2, steps=10)
+    page.mouse.move(dst["x"] + dst["width"] / 2, dst["y"] + dst["height"] / 2, steps=1)
+    page.mouse.up()
+
+
+class TestAssignmentTray:
+    """The bottom tray's selection state, its two drag directions, and the
+    confirmation-with-undo every assignment path shares."""
+
+    def test_drag_assign_clears_a_pending_tray_selection(self, page: Page, agents_base_url):
+        """Tapping assignee A arms it. Assigning by dragging assignee B onto a
+        card must disarm A too — otherwise A stays highlighted and the next
+        card tap silently assigns to it.
+        """
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator('.board-assignee-drop[data-assignee="claude"]').click()
+        expect(page.locator('.board-assignee-drop[data-assignee="claude"]')).to_have_class(re.compile(r"selected"))
+
+        _drag_to(page, '.board-assignee-drop[data-assignee="codex"]', '[data-card-id="t1"]')
+        _wait_for(lambda: any(c.get("assignee") == "codex" for c in lane_calls), page)
+
+        expect(page.locator('.board-assignee-drop[data-assignee="claude"]')).not_to_have_class(re.compile(r"selected"))
+        expect(page.locator(".board-assignee-drop.selected")).to_have_count(0)
+
+        # The stale selection is really gone, not merely unstyled: a card tap
+        # opens the drawer rather than assigning.
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator("#board-drawer")).to_be_visible()
+        assert not any(c.get("assignee") == "claude" for c in lane_calls), lane_calls
+
+    def test_selecting_a_second_assignee_leaves_only_that_one_armed(self, page: Page, agents_base_url):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator('.board-assignee-drop[data-assignee="claude"]').click()
+        page.locator('.board-assignee-drop[data-assignee="codex"]').click()
+        expect(page.locator(".board-assignee-drop.selected")).to_have_count(1)
+        expect(page.locator('.board-assignee-drop[data-assignee="codex"]')).to_have_class(re.compile(r"selected"))
+
+        page.locator('[data-card-id="t1"]').click()
+        _wait_for(lambda: bool(lane_calls), page)
+        assert lane_calls[-1]["assignee"] == "codex", lane_calls
+
+    def test_assignment_confirms_with_a_toast_whose_undo_restores_the_card(
+        self, page: Page, agents_base_url,
+    ):
+        """Every assignment path reports through one confirm-with-undo toast.
+        Undo returns the card to the lane and assignee it had beforehand.
+        """
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator('.board-assignee-drop[data-assignee="claude"]').click()
+        page.locator('[data-card-id="t1"]').click()
+        _wait_for(lambda: bool(lane_calls), page)
+
+        toast = page.locator(".toast")
+        expect(toast).to_contain_text("Investigate outage")
+        expect(toast).to_contain_text("claude")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+
+        toast.locator(".toast-action").click()
+        _wait_for(lambda: len(lane_calls) >= 2, page)
+        # t1 started unassigned in the unassigned lane; undo restores exactly
+        # that rather than leaving it assigned.
+        assert lane_calls[0] == {"lane": "assigned", "assignee": "claude"}, lane_calls
+        assert lane_calls[1]["lane"] == "unassigned", lane_calls
+        assert not lane_calls[1].get("assignee"), lane_calls
+
+    def test_card_dragged_onto_an_assignee_button_assigns_it(self, page: Page, agents_base_url):
+        """The reverse of the existing assignee-onto-card drag. Both directions
+        reach the same assignment path, so both confirm the same way.
+        """
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        _drag_to(page, '[data-card-id="t1"]', '.board-assignee-drop[data-assignee="hermes"]')
+        _wait_for(lambda: bool(lane_calls), page)
+        assert lane_calls[0] == {"lane": "assigned", "assignee": "hermes"}, lane_calls
+        expect(page.locator(".toast")).to_contain_text("hermes")
+        expect(page.locator(".toast .toast-action")).to_have_text("Undo")
+
+    def test_dragging_a_card_over_an_assignee_button_marks_it_a_live_target(
+        self, page: Page, agents_base_url,
+    ):
+        """The button has to read as droppable mid-drag, the same way a lane
+        does — otherwise the tray looks inert in this direction.
+        """
+        _open_board(page, agents_base_url)
+        card = page.locator('[data-card-id="t1"]')
+        button = page.locator('.board-assignee-drop[data-assignee="claude"]')
+        src = card.bounding_box()
+        dst = button.bounding_box()
+        page.mouse.move(src["x"] + src["width"] / 2, src["y"] + src["height"] / 2)
+        page.mouse.down()
+        page.mouse.move(src["x"] + src["width"] / 2 + 60, src["y"] + src["height"] / 2, steps=4)
+        page.mouse.move(dst["x"] + dst["width"] / 2, dst["y"] + dst["height"] / 2, steps=10)
+        expect(button).to_have_class(re.compile(r"drop-allowed"))
+        expect(page.locator("#board-drop-status")).to_contain_text("claude")
+        page.mouse.up()
+
+    def test_assignee_buttons_share_the_tray_width_instead_of_hugging_labels(
+        self, page: Page, agents_base_url,
+    ):
+        """The buttons are drop targets for both drag directions, so they take
+        two thirds of the tray and split it evenly rather than sizing to their
+        text.
+        """
+        _open_board(page, agents_base_url)
+        metrics = page.evaluate(
+            """() => {
+                const tray = document.getElementById('board-drop-tray');
+                const row = document.getElementById('board-assignee-drops');
+                const widths = Array.from(row.querySelectorAll('.board-assignee-drop'))
+                    .map(el => el.getBoundingClientRect().width);
+                return {
+                    trayWidth: tray.getBoundingClientRect().width,
+                    rowWidth: row.getBoundingClientRect().width,
+                    widths,
+                };
+            }"""
+        )
+        assert len(metrics["widths"]) >= 2
+        # Evenly split: every button within a pixel of the widest.
+        assert max(metrics["widths"]) - min(metrics["widths"]) < 1.5, metrics
+        share = metrics["rowWidth"] / metrics["trayWidth"]
+        assert 0.5 < share <= 0.67, metrics
+
+    def test_assignee_row_spans_the_full_width_on_a_phone(self, page: Page, agents_base_url):
+        page.set_viewport_size({"width": 390, "height": 844})
+        _open_board(page, agents_base_url)
+        metrics = page.evaluate(
+            """() => {
+                const tray = document.getElementById('board-drop-tray');
+                const row = document.getElementById('board-assignee-drops');
+                return {
+                    trayWidth: tray.getBoundingClientRect().width,
+                    rowWidth: row.getBoundingClientRect().width,
+                    status: document.getElementById('board-drop-status').getBoundingClientRect().width,
+                };
+            }"""
+        )
+        # Full width bar the tray's own horizontal padding.
+        assert metrics["rowWidth"] > metrics["trayWidth"] * 0.85, metrics
+
+
+class TestDrawerMetadata:
+    """The drawer's read-only block — the dates and fields the card already
+    reports but never rendered."""
+
+    def test_drawer_shows_created_updated_and_completion_dates(self, page: Page, agents_base_url):
+        board = _board_fixture()
+        done = board["lanes"]["done"][0]
+        done["created_date"] = "2026-02-03"
+        done["updated_at"] = "2026-02-09T14:30:00+00:00"
+        done["done_date"] = "2026-02-09"
+        _open_board(page, agents_base_url, board_state=board)
+        _check_only_lanes(page, {"done"})
+        page.locator('[data-card-id="t5"]').click()
+        meta = page.locator('#board-drawer [data-field="meta"]')
+        expect(meta).to_be_visible()
+        expect(meta).to_contain_text("Created")
+        expect(meta).to_contain_text("Updated")
+        expect(meta).to_contain_text("Completed")
+        # The exact stored value stays reachable even though the label is short.
+        expect(meta.locator('[title="2026-02-09"]')).to_have_count(1)
+
+    def test_drawer_omits_dates_the_card_does_not_carry(self, page: Page, agents_base_url):
+        """A missing date renders no row at all — never an empty value or a
+        placeholder.
+        """
+        board = _board_fixture()
+        board["lanes"]["unassigned"][0]["created_date"] = "2026-02-03"
+        _open_board(page, agents_base_url, board_state=board)
+        page.locator('[data-card-id="t1"]').click()
+        meta = page.locator('#board-drawer [data-field="meta"]')
+        expect(meta).to_contain_text("Created")
+        expect(meta).not_to_contain_text("Completed")
+        expect(meta).not_to_contain_text("Cancelled")
+        expect(meta).not_to_contain_text("Due")
+
+    def test_drawer_shows_a_cancelled_cards_cancellation_date(self, page: Page, agents_base_url):
+        board = _board_fixture()
+        board["lanes"]["done"][1]["cancelled_date"] = "2026-02-07"
+        _open_board(page, agents_base_url, board_state=board)
+        _check_only_lanes(page, {"done"})
+        # Cancelled cards sit behind their own filter inside a shown Done lane.
+        page.locator("#board-filter-done").check()
+        page.locator('[data-card-id="t6"]').click()
+        meta = page.locator('#board-drawer [data-field="meta"]')
+        expect(meta).to_contain_text("Cancelled")
+        expect(meta).not_to_contain_text("Completed")
+
+    def test_drawer_surfaces_assignment_fields_and_the_card_id(self, page: Page, agents_base_url):
+        board = _board_fixture()
+        board["lanes"]["assigned"][1]["fields"] = {"model": "claude-opus-5", "effort": "high"}
+        _open_board(page, agents_base_url, board_state=board)
+        page.locator('[data-card-id="t7"]').click()
+        meta = page.locator('#board-drawer [data-field="meta"]')
+        expect(meta).to_contain_text("claude-opus-5")
+        expect(meta).to_contain_text("high")
+        expect(meta.locator(".drawer-meta-id")).to_have_text("t7")
+
+    def test_drawer_renders_as_sections(self, page: Page, agents_base_url):
+        """The drawer reads as bands rather than one flat run of controls, and
+        every existing hook survives the regrouping.
+        """
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator("#board-drawer .drawer-section")).to_have_count(4)
+        for field in ("title", "notes", "context", "tags", "actions", "session-panel"):
+            expect(page.locator(f'#board-drawer [data-field="{field}"]')).to_have_count(1)
+        expect(page.locator("#board-drawer .drawer-assignee")).to_have_count(1)

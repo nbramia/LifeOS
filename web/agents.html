@@ -1224,9 +1224,16 @@
     touch-action: pan-x;
   }
   .board-drop-tray-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  /* The assignee row is also the drop target for both drag directions, so
+     it takes two thirds of the tray and splits that evenly between its
+     buttons rather than hugging its labels — a label-width target is hard
+     to hit with a dragged card, most of all on a phone. The remaining
+     third leaves room for the tray label, the conditional Done target, and
+     the drop status line. */
   #board-assignee-drops {
     display: flex;
-    flex: 0 0 auto;
+    flex: 1 1 auto;
+    max-width: 66%;
     gap: 0.5rem;
   }
   .board-assignee-drop,
@@ -1246,6 +1253,9 @@
     touch-action: pan-y;
     flex: 0 0 auto;
   }
+  /* After the shared sizing rule above, which would otherwise reset this
+     back to content width. */
+  #board-assignee-drops .board-assignee-drop { flex: 1 1 0; }
   .board-assignee-drop:hover,
   .board-assignee-drop.selected,
   .board-done-drop:hover { border-color: var(--accent); }
@@ -1473,6 +1483,27 @@
      disagree, so a mismatch here silently makes the JS branch dead. */
   .drawer-notes-autosize { overflow-y: auto; resize: none; max-height: 66.667vh; }
   .drawer-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+  /* The drawer reads as bands — what the card reports, what the operator
+     edits, what they can do to it, and its session — rather than one flat
+     run of controls. */
+  .drawer-section { padding: 0.75rem 0; border-bottom: 1px solid var(--border); }
+  .drawer-section:last-child { border-bottom: none; }
+  .drawer-section-actions { padding-bottom: 0.5rem; }
+  .drawer-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 1.1rem;
+    padding-top: 0.5rem;
+  }
+  .drawer-meta-item { display: flex; align-items: baseline; gap: 0.35rem; min-width: 0; }
+  .drawer-meta-label {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+  }
+  .drawer-meta-value { font-size: 0.78rem; color: var(--text-primary); }
+  .drawer-meta-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem; }
   /* Visible reason text next to a picker or action the board's own
      policy has disabled — disable-and-explain, never hide. A distinct
      element/style from .assignment-error below: this is a normal
@@ -1555,8 +1586,12 @@
     .board-filters { padding: 0.45rem 0.65rem; gap: 0.4rem; }
     #board-lanes { padding: 0.5rem 0.65rem; gap: 0.5rem; }
     .board-lane { min-width: min(84vw, 280px); }
-    .board-drop-tray { overflow-x: auto; padding: 0.45rem 0.65rem; min-height: 66px; }
-    .board-drop-status { flex: 0 0 10rem; }
+    /* The tray wraps at phone width so the assignee row gets the full
+       width for itself instead of competing with the label and status
+       line on one overflowing line. */
+    .board-drop-tray { flex-wrap: wrap; padding: 0.45rem 0.65rem; min-height: 66px; }
+    #board-assignee-drops { flex: 1 0 100%; max-width: 100%; order: 1; }
+    .board-drop-status { flex: 1 1 100%; margin-left: 0; order: 2; }
   }
 </style>
 </head>
