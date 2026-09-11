@@ -4393,3 +4393,80 @@ class TestDrawerMetadata:
         for field in ("title", "notes", "context", "tags", "actions", "session-panel"):
             expect(page.locator(f'#board-drawer [data-field="{field}"]')).to_have_count(1)
         expect(page.locator("#board-drawer .drawer-assignee")).to_have_count(1)
+
+
+class TestMutationUndo:
+    """The confirm-with-undo pattern across the board mutations that can be
+    reversed, and the honest refusal on the one that cannot."""
+
+    def test_lane_drag_confirms_with_an_undo_that_restores_the_prior_lane(
+        self, page: Page, agents_base_url,
+    ):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        _drag_card(page, "t1", "in_progress")
+        _wait_for(lambda: bool(lane_calls), page)
+        toast = page.locator(".toast")
+        expect(toast).to_contain_text("Investigate outage")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+
+        toast.locator(".toast-action").click()
+        _wait_for(lambda: len(lane_calls) >= 2, page)
+        assert lane_calls[-1]["lane"] == "unassigned", lane_calls
+        expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_be_visible()
+
+    def test_mark_done_confirms_with_an_undo_that_returns_the_card(
+        self, page: Page, agents_base_url,
+    ):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator('[data-card-id="t4"]').click()
+        page.locator('#board-drawer [data-action="resolve"]').click()
+        _wait_for(lambda: bool(lane_calls), page)
+        assert lane_calls[0] == {"lane": "done"}, lane_calls
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+        _wait_for(lambda: len(lane_calls) >= 2, page)
+        assert lane_calls[-1] == {"lane": "human_queue"}, lane_calls
+
+    def test_cancel_says_it_cannot_be_undone_instead_of_offering_a_dead_link(
+        self, page: Page, agents_base_url,
+    ):
+        """Cancel tears down the session subtree, so there is nothing to put
+        back. The toast has to say that rather than carry an Undo that would
+        only restore a status over a stopped agent.
+        """
+        board = _board_fixture()
+        board["lanes"]["assigned"][1]["policy"] = {
+            "cancel": {"allowed": True, "reason": None},
+            "assignee": {"allowed": True, "reason": None},
+            "lanes": {},
+        }
+        cancel_calls = []
+        _open_board(page, agents_base_url, board_state=board, cancel_calls=cancel_calls)
+        page.locator('[data-card-id="t7"]').click()
+        page.locator('#board-drawer [data-action="cancel"]').click()
+        _wait_for(lambda: bool(cancel_calls), page)
+        toast = page.locator(".toast")
+        expect(toast).to_contain_text("can't be undone")
+        expect(toast.locator(".toast-action")).to_have_count(0)
+
+    def test_a_card_landing_elsewhere_reports_that_once_without_an_undo(
+        self, page: Page, agents_base_url,
+    ):
+        """A card the server puts somewhere other than the requested lane gets
+        exactly one toast — the one naming where it really went. A second
+        confirmation would contradict it, and its Undo would offer to reverse
+        a move that never happened.
+        """
+        lane_calls = []
+        _open_board(
+            page, agents_base_url, lane_calls=lane_calls,
+            lane_response=["human_queue"],
+        )
+        _drag_card(page, "t4", "assigned")
+        expect(page.locator(".toast")).to_have_count(1, timeout=5000)
+        expect(page.locator(".toast")).to_contain_text("landed in Human queue")
+        expect(page.locator(".toast .toast-action")).to_have_count(0)

@@ -18,7 +18,7 @@
 import { nodeLabel, isRawIdValue, routingLabel, engineOf, ENGINE_SHAPES } from './graph_encoding.js';
 import {
   TERMINAL, sourceLabelFor, showResumeFor, isSubagentSession, escapeHtml, escapeAttr, showToast,
-  renderActionRow,
+  showUndoableToast, renderActionRow,
 } from './session_actions.js';
 import { cardActionHandlers } from './card_actions.js';
 
@@ -29,6 +29,7 @@ import { cardActionHandlers } from './card_actions.js';
 // cycle, since this module imports from both).
 export {
   routingLabel, TERMINAL, sourceLabelFor, showResumeFor, isSubagentSession, escapeHtml, escapeAttr, showToast,
+  showUndoableToast,
 };
 
 export const STATUS_COLORS = {

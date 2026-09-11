@@ -122,6 +122,25 @@ export function showToast(message, isError, options = {}) {
   return t;
 }
 
+// A confirmation the operator can take back. `undo` returns a promise; a
+// rejection restores the button rather than leaving the toast claiming a
+// reversal that never happened — the caller's own write path already
+// reports the server's reason.
+export function showUndoableToast(message, undo) {
+  return showToast(message, false, {
+    duration: 8000,
+    actionLabel: 'Undo',
+    actionAriaLabel: `Undo: ${message}`,
+    onAction: ({ toast, action }) => {
+      action.textContent = 'Undoing…';
+      return Promise.resolve()
+        .then(undo)
+        .then(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); })
+        .catch(() => { action.textContent = 'Undo'; });
+    },
+  });
+}
+
 // ---------------------------------------------------------------------
 // Decision — the ordered, canonical action set. Both surfaces render
 // exactly this order: Open, Rename, Go To, Resume, Kill, Answer, Accept,

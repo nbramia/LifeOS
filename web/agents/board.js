@@ -15,7 +15,7 @@
 // no sort choice rewrites the vault's file order.
 
 import {
-  TERMINAL, routingLabel, escapeHtml, escapeAttr, showToast, SessionPanel,
+  TERMINAL, routingLabel, escapeHtml, escapeAttr, showToast, showUndoableToast, SessionPanel,
 } from './panel.js';
 import { renderActionRow } from './session_actions.js';
 import { descendantsOf } from './graph_encoding.js';
@@ -486,8 +486,9 @@ export function initBoard() {
     // assignee select. The server remains authoritative for claimed cards
     // and for cards whose derived lane cannot change with the tag update.
     moveCard(card.id, 'assigned', assignee)
-      .then(() => {
+      .then((data) => {
         setDropStatus(`Assigned to ${assignee}.`);
+        if (data && data.lane && data.lane !== 'assigned') return;
         showUndoableToast(`Assigned "${title}" to ${assignee}.`, () => (
           moveCard(card.id, priorLane, priorAssignee || undefined)
         ));
@@ -503,24 +504,6 @@ export function initBoard() {
 
   function assignAssigneeToCard(cardId, assignee) {
     assignCardTo(findCard(cardId), assignee);
-  }
-
-  // A confirmation the operator can take back. `undo` returns a promise;
-  // its rejection is reported rather than leaving the toast claiming a
-  // reversal that never happened — `moveCard` already toasts the server's
-  // own reason, so the label just has to stop pretending it is working.
-  function showUndoableToast(message, undo) {
-    showToast(message, false, {
-      duration: 8000,
-      actionLabel: 'Undo',
-      actionAriaLabel: `Undo: ${message}`,
-      onAction: ({ toast, action }) => {
-        action.textContent = 'Undoing…';
-        return undo()
-          .then(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); })
-          .catch(() => { action.textContent = 'Undo'; });
-      },
-    });
   }
 
   function clearAssigneeSelection() {
@@ -1074,9 +1057,24 @@ export function initBoard() {
       // an assignee, which the lane endpoint keeps when passed explicitly.
       assignee = card.assignee || 'me';
     }
+    // Captured before the write so Undo restores where the card actually
+    // was, not wherever the board has drifted to by the time it is clicked.
+    const priorLane = card.lane;
+    const priorAssignee = card.assignee || null;
+    const title = card.title || card.id;
     // moveCard already toasts and re-renders on failure — nothing more to
-    // do here, just avoid an unhandled rejection now that it re-throws.
-    moveCard(cardId, targetLane, assignee).catch(() => {});
+    // do there, just avoid an unhandled rejection given that it re-throws.
+    moveCard(cardId, targetLane, assignee)
+      .then((data) => {
+        // A card the server landed somewhere other than the requested lane
+        // already has `moveCard`'s own toast naming where it really went.
+        // A second toast claiming the requested move would contradict it.
+        if (data && data.lane && data.lane !== targetLane) return;
+        showUndoableToast(`Moved "${title}" to ${laneLabel(targetLane)}.`, () => (
+          moveCard(cardId, priorLane, priorAssignee || undefined)
+        ));
+      })
+      .catch(() => {});
   }
 
   function laneLabel(laneId) {

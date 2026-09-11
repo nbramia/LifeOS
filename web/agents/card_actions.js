@@ -12,7 +12,7 @@
 // and the operator confirming — defaults to the card captured when the
 // button was clicked, when a caller has no live lookup of its own).
 
-import { TERMINAL, sourceLabelFor, escapeHtml, showToast } from './session_actions.js';
+import { TERMINAL, sourceLabelFor, escapeHtml, showToast, showUndoableToast } from './session_actions.js';
 import { LANES } from './lanes.js';
 import { refreshAfterFailure } from './action_refresh.js';
 
@@ -196,6 +196,24 @@ export async function resolveCard(card, onChanged) {
     // back" on its own.
     if (data && data.lane && data.lane !== 'done') {
       showToast(`Card landed in ${laneLabelFor(data.lane)}, not Done.`, false);
+    } else {
+      const priorLane = card.lane;
+      showUndoableToast(`Marked "${card.title || card.id}" done.`, () => (
+        fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/lane`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ lane: priorLane }),
+        }).then(async (undoResponse) => {
+          if (!undoResponse.ok) {
+            const text = await undoResponse.text();
+            let msg = text;
+            try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+            showToast(`Couldn't undo: ${msg || `HTTP ${undoResponse.status}`}`, true);
+            throw new Error(msg);
+          }
+          if (onChanged) await onChanged(await undoResponse.json());
+        })
+      ));
     }
     if (onChanged) await onChanged(data);
   } catch (err) { showToast(`Couldn't resolve card: ${err.message}`, true); }
@@ -218,7 +236,10 @@ export async function cancelCard(card, onChanged) {
     if (untorn.length) {
       showToast(`Cancelled, but couldn't stop: ${untorn.map(f => f.reason || f.session_id).join('; ')}`, true);
     } else {
-      showToast('Cancelled.', false);
+      // Cancel tears down the card's session subtree, so there is nothing
+      // an Undo could put back — say that rather than offering a link that
+      // would only restore the card's status over a stopped agent.
+      showToast("Cancelled. This can't be undone.", false);
     }
     if (onChanged) await onChanged(data);
   } catch (err) { showToast(`Cancel failed: ${err.message}`, true); }
