@@ -535,6 +535,68 @@ def _isolate_integration_persistent_stores(request, tmp_path, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_default_crm_db_path(request, tmp_path, monkeypatch):
+    """Give this test its own default CRM db path instead of the shared one.
+
+    ``get_crm_db_path()`` (used by ``RelationshipStore``, ``SourceEntityStore``,
+    and anything else that constructs one of those stores without an explicit
+    ``db_path``) resolves from ``settings.chroma_path``, whose default is the
+    *relative* ``./data/chromadb`` -- resolved against the pytest process's
+    cwd. Every xdist worker shares that cwd, so two workers that both
+    construct a default-path store race ``RelationshipStore._init_db()``'s
+    connect-then-``CREATE TABLE IF NOT EXISTS`` window on the same file: the
+    second worker's first query can see an empty database and raise
+    ``no such table: relationships`` (#952).
+    ``_isolate_slow_crm_schema``/``_isolate_integration_persistent_stores``
+    above already redirect this for their own markers; this covers the
+    remaining default case with an owned path instead of serializing workers
+    or restructuring ``_init_db``.
+    """
+    if request.node.get_closest_marker("slow") is not None:
+        yield
+        return
+    if request.node.get_closest_marker("integration") is not None:
+        yield
+        return
+
+    from api.utils import db_paths
+
+    monkeypatch.setattr(db_paths.settings, "chroma_path", tmp_path / "chromadb")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_default_task_manager_paths(request, tmp_path, monkeypatch):
+    """Give ``get_task_manager()``'s default singleton isolated paths.
+
+    ``TaskManager.__init__`` unconditionally loads/creates its index file and
+    (re)writes ``vault/LifeOS/Tasks/Dashboard.md`` the moment it constructs --
+    there is no lazy "only touch disk when asked" path. The only call site
+    that constructs one with every argument defaulted is ``get_task_manager()``
+    itself, reached without an explicit override by code such as
+    ``agent_system_prompt._get_existing_tags()`` while building a chat system
+    prompt. Without this, a plain local pytest run (not routed through
+    ``verify_candidate.py``'s candidate-data symlink) creates
+    ``data/task_index.json`` and ``vault/LifeOS/Tasks/Dashboard.md`` in the
+    real checkout (#1012).
+    """
+    if request.node.get_closest_marker("slow") is not None:
+        yield
+        return
+    if request.node.get_closest_marker("integration") is not None:
+        yield
+        return
+
+    import api.services.task_manager as task_manager_mod
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "vault_path", tmp_path / "vault")
+    monkeypatch.setattr(task_manager_mod, "DEFAULT_INDEX_PATH", tmp_path / "task_index.json")
+    monkeypatch.setattr(task_manager_mod, "_task_manager", None)
+    yield
+
+
 # Collection names `VectorStore` actually writes to on a real install:
 # `VectorStore`'s own class default (also what `get_vector_store()`'s
 # process-wide singleton resolves to) plus every non-vault indexer's own
