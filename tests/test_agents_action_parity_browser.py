@@ -178,7 +178,24 @@ class TestDecideActions:
         _load_actions_module(page, web_base_url)
         card = {"kind": "task", "lane": "review", "assignee": "claude", "pending_question": None}
         out = _decide(page, None, card)
-        assert _ids(out) == ["accept", "delete"], out
+        assert _ids(out) == ["accept", "reject", "reassign", "delete"], out
+
+    def test_review_without_session_disables_reject_and_explains_why(self, page: Page, web_base_url):
+        """A Review card with no linked session still shows both feedback
+        actions. Reject is disabled and says why — hiding it leaves the
+        drawer's own Notes field (no submit button, saves to the card) as the
+        only text box on a card the operator is trying to send feedback from.
+        Reassign needs no prior session and stays live.
+        """
+        _load_actions_module(page, web_base_url)
+        card = {"kind": "task", "lane": "review", "assignee": "cloud", "pending_question": None}
+        out = _decide(page, None, card)
+        reject = next(d for d in out if d["id"] == "reject")
+        assert reject["enabled"] is False
+        assert "no prior agent session" in reject["reason"]
+        reassign = next(d for d in out if d["id"] == "reassign")
+        assert reassign["enabled"] is True
+        assert reassign["reason"] is None
 
     def test_review_with_prior_session_offers_reject_and_reassign(self, page: Page, web_base_url):
         _load_actions_module(page, web_base_url)

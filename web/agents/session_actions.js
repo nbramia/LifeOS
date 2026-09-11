@@ -191,13 +191,18 @@ export function decideActions(session, card) {
   // Accept — a card sitting in Review. Card-only.
   if (c && c.lane === 'review') {
     out.push({ id: 'accept', label: 'Accept', enabled: true, reason: null, danger: false });
-    // Reject/reassign require a prior session whose context can be resumed.
-    // A card-only snapshot without one keeps the existing Accept path but
-    // never invents a resume target.
-    if (s) {
-      out.push({ id: 'reject', label: 'Reject', enabled: true, reason: null, danger: false });
-      out.push({ id: 'reassign', label: 'Reassign', enabled: true, reason: null, danger: false });
-    }
+    // Reject resumes the prior session with the operator's note, so it needs
+    // one; Reassign only needs a target assignee and carries whatever
+    // prior-run context exists, so it stands on its own. Both stay on the row
+    // either way — a Review card with no session reports why Reject is
+    // unavailable, the same disabled-and-explained treatment Kill and Cancel
+    // give their own refusals, rather than leaving the card's own Notes field
+    // looking like the place to type feedback.
+    out.push({
+      id: 'reject', label: 'Reject', enabled: !!s, danger: false,
+      reason: s ? null : 'no prior agent session to resume with your note',
+    });
+    out.push({ id: 'reassign', label: 'Reassign', enabled: true, reason: null, danger: false });
   }
 
   // Mark Done — a manually-filed Human queue card with no pending question

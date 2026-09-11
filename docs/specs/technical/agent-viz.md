@@ -170,13 +170,15 @@ The issue's target is "reflects an external vault edit within ~3 seconds," and t
 
 ### Frontend module split
 
-Review cards with a linked prior session render shared **Accept**, **Reject**,
-and **Reassign** actions. Reject requires a note and resumes the existing
-session through the follow-up queue; Reassign validates the selected assignee,
-returns the card to Assigned, and preserves the prior session's messages and
-transcript for the next worker claim. Human queue completion is labeled
-**Mark Done** in the action row while retaining the existing Done-lane
-semantics.
+Review cards render shared **Accept**, **Reject**, and **Reassign** actions.
+Reject requires a note and resumes the existing session through the follow-up
+queue, so it needs a linked prior session — without one it renders disabled
+with that reason rather than being dropped from the row. Reassign validates the
+selected assignee and returns the card to Assigned whether or not a prior
+session exists; when one does, it preserves that session's messages and
+transcript for the next worker claim and reports `context_preserved`
+accordingly. Human queue completion is labeled **Mark Done** in the action row
+while retaining the existing Done-lane semantics.
 
 `web/agents.html` is a shell (CSS + tab markup) around eight ES modules under `web/agents/`, served the same way `web/chat/`'s module split is — `<script type="module">` tags resolving against the existing `/static` mount, no bundler:
 
