@@ -391,7 +391,14 @@ def test_hermes_blocked_fake_stream_honors_absolute_deadline(tmp_path, monkeypat
     started = time.monotonic()
     outcome = executor.execute(session, {"description": "synthetic blocked turn"})
     elapsed = time.monotonic() - started
-    assert elapsed < 0.5
+    # The bound separates the two deadlines this test tells apart: the
+    # session's 0.03s wall budget and the 3600s read-idle timeout the
+    # blocked reader would otherwise sit on. Any figure between them
+    # proves the executor stopped on the budget, so this one is set far
+    # enough above 0.03 to absorb scheduler delay on a loaded parallel
+    # run -- a bound a few hundred milliseconds wide measures the host,
+    # not the executor.
+    assert elapsed < 10, f"executor took {elapsed:.2f}s; budget was 0.03s"
     assert outcome.status == STATUS_FAILED
     assert "absolute turn deadline" in outcome.reason
     assert outcome.termination_evidence["absolute_deadline"] is True
