@@ -459,6 +459,51 @@ class TestReviewActions:
         assert session_store.get(task.id).session_id == session.session_id
         assert session_store.get_messages(session.session_id)[0]["content"] == "Prior synthetic result"
 
+    def test_reassign_without_a_prior_session_moves_the_card_and_reports_no_context(
+        self, client, stores,
+    ):
+        """A Review card whose session was never recorded (or has since been
+        pruned) still reassigns. Refusing it strands the card in Review with
+        no way to hand the work to anyone else.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create(
+            "Review synthetic output", tags=["cloud", "agent-completed"], status="done",
+        )
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude", "note": "Start from scratch."},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["lane"] == "assigned"
+        assert body["context_preserved"] is False
+        updated = task_manager.get(task.id)
+        assert updated.status == "todo"
+        assert updated.tags == ["claude", "agent-reassigned"]
+        assert "Start from scratch." in (updated.notes or "")
+
+    def test_reject_without_a_prior_session_is_refused_and_leaves_the_card_alone(
+        self, client, stores,
+    ):
+        """Reject resumes the prior session — with none to resume, it must
+        refuse rather than move the card to In progress with nothing running.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create(
+            "Review synthetic output", tags=["cloud", "agent-completed"], status="done",
+        )
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Please redo the synthetic case."},
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"] == "the prior agent session cannot be resumed"
+        unchanged = task_manager.get(task.id)
+        assert unchanged.status == "done"
+        assert unchanged.tags == ["cloud", "agent-completed"]
+        assert not (unchanged.notes or "")
+
     def test_reassign_removes_managed_executor_tag_before_setting_target(self, client, stores):
         task_manager, _sched, session_store, _transcript = stores
         task = task_manager.create(

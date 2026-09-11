@@ -1483,9 +1483,13 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             raise HTTPException(status_code=status_code, detail=detail)
 
         session = session_store.get(card_id)
-        if session is None:
+        # Reject continues the prior session, so it needs one. Reassign only
+        # needs a target assignee — a card whose session was never recorded
+        # (or has since been pruned) still reassigns, and reports
+        # `context_preserved: false` rather than being refused outright.
+        if session is None and action == "reject":
             raise HTTPException(status_code=409, detail="the prior agent session cannot be resumed")
-        if session.status not in TERMINAL_STATUSES:
+        if session is not None and session.status not in TERMINAL_STATUSES:
             raise HTTPException(status_code=409, detail="the prior agent session is still running")
         if action == "reject" and session.routing == "hermes" and not session.conversation_id:
             raise HTTPException(
@@ -1612,7 +1616,11 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
                     detail += "; rollback conflict — card changed, refresh before retrying"
                 raise HTTPException(status_code=409, detail=detail) from exc
 
-        if action == "reassign":
+        if action == "reassign" and session is None:
+            # No prior run to anchor to: the card moves, and the caller is
+            # told plainly that nothing came with it.
+            context_preserved = False
+        elif action == "reassign":
             transcript_store = _get_transcript_store()
             target_assignee = (body.assignee or "").lstrip("#").lower()
             native_handle_usable = bool(
