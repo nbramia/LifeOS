@@ -30,6 +30,13 @@ from api.services.agent_worker.session_store import (
     REPAIR_VERIFYING,
 )
 
+# Re-exported. The predicate lives in `session_store` so `create()` can open a
+# doctor session's repair record without importing this module, while callers
+# reach it through the module that owns the rest of the repair vocabulary.
+from api.services.agent_worker.session_store import (
+    is_doctor_session as is_doctor_session,
+)
+
 # One machine-readable line a repair worker emits to report structured
 # results, matching the repository's existing `SYNC_STATS:{json}` convention.
 # Prose describing success carries no marker and therefore advances nothing.
@@ -42,13 +49,6 @@ _RESULT_LINE = re.compile(rf"^\s*{re.escape(RESULT_MARKER)}\s*(\{{.*\}})\s*$", r
 # record has yet to be opened can adopt a revision without its transcript.
 _INSTRUCTION_LEAD_IN = "Reply to this message with"
 
-# The persona whose sessions are self-repair runs. A session carrying it —
-# as `persona_id` or as the `bot` its notices route through — owns a repair
-# record from the moment it is created; every other session, including an
-# ordinary `#agent` task that happens to emit a `[GOAL]`, owns none and is
-# never gated here.
-DOCTOR_PERSONA_ID = "doctor"
-
 # LifeOS-owned dispatches that the single human gate covers. Spawning a worker
 # to implement the goal is the one such dispatch LifeOS makes on a repair's
 # behalf: merging, deploying, and restarting are shell work the supervisor
@@ -56,11 +56,6 @@ DOCTOR_PERSONA_ID = "doctor"
 # Anything else — investigating, diagnosing, proposing a goal — is read-only
 # orchestration and stays available before approval.
 GATED_ACTIONS = frozenset({"implement"})
-
-
-def is_doctor_session(persona_id: str | None, bot: str | None) -> bool:
-    """Whether a session belongs to the doctor, and so to a repair run."""
-    return DOCTOR_PERSONA_ID in {persona_id, bot}
 
 
 @dataclass(frozen=True)

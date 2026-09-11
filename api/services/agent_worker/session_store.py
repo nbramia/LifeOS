@@ -91,11 +91,29 @@ REPAIR_PREAPPROVAL_PHASES = frozenset({REPAIR_DIAGNOSIS, REPAIR_AWAITING_APPROVA
 REPAIR_TERMINAL_PHASES = frozenset({
     REPAIR_SHIPPED, REPAIR_FAILED, REPAIR_DECLINED, REPAIR_CANCELLED,
 })
+# Terminal phases a new goal revision cannot reopen: the operator closed the
+# repair deliberately. A `shipped` or `failed` repair stays open to follow-up
+# work, which is how a delivered repair takes on its next revision.
+_REPAIR_CLOSED_TO_GOALS = frozenset({REPAIR_CANCELLED, REPAIR_DECLINED})
 REPAIR_PHASES = frozenset({
     REPAIR_DIAGNOSIS, REPAIR_AWAITING_APPROVAL, REPAIR_IMPLEMENTING,
     REPAIR_REVIEWING, REPAIR_MERGING, REPAIR_DEPLOYING, REPAIR_VERIFYING,
     *REPAIR_TERMINAL_PHASES,
 })
+
+# The persona whose sessions are self-repair runs. A session carrying it —
+# as `persona_id` or as the `bot` its notices route through — owns a repair
+# record from the moment it is created; every other session, including an
+# ordinary `#agent` task that happens to emit a `[GOAL]`, owns none and is
+# never gated. The policy built over the record lives in `doctor_repair`,
+# which imports from this module; the predicate lives here so `create()` can
+# apply it without a circular import.
+DOCTOR_PERSONA_ID = "doctor"
+
+
+def is_doctor_session(persona_id: str | None, bot: str | None) -> bool:
+    """Whether a session belongs to the doctor, and so to a repair run."""
+    return DOCTOR_PERSONA_ID in {persona_id, bot}
 
 PROPOSAL_PROPOSED = "proposed"
 PROPOSAL_APPROVED = "approved"
@@ -927,6 +945,17 @@ class SessionStore:
         attempt_id = new_attempt_id()
         root_sid = root_session_id or sid
         now = _now()
+        # A doctor session is a self-repair run, so its root owns a repair
+        # record from creation and the single human gate covers the whole
+        # run, including the diagnosis window. Every session-creating route
+        # passes through here, so attaching it at this one point leaves no
+        # route — native spawn, codex spawn, Hermes anchor — outside the
+        # gate. A child inherits its root's workflow explicitly and so never
+        # opens a second one.
+        if workflow_id is None and parent_session_id is None and is_doctor_session(
+            persona_id, bot,
+        ):
+            workflow_id = self.create_repair()["workflow_id"]
         with self._connect() as conn:
             conn.execute(
                 """
@@ -3460,8 +3489,10 @@ class SessionStore:
         approvable revisions open. The repair moves to `awaiting_approval`,
         which is also how a repair that already delivered takes on follow-up
         work: the next goal is a new revision awaiting its own approval.
-        Returns the new proposal, or None for an unknown or cancelled repair —
-        cancellation is the one terminal state a new goal cannot reopen.
+        Returns the new proposal, or None for an unknown repair or one the
+        operator closed: a cancelled or declined repair stays closed, so the
+        doctor's propose-until-approved loop cannot reopen a refusal by
+        re-emitting its goal.
         """
         now = _now()
         with self._connect() as conn:
@@ -3471,7 +3502,7 @@ class SessionStore:
                     "SELECT phase FROM doctor_repairs WHERE workflow_id = ?",
                     (workflow_id,),
                 ).fetchone()
-                if repair is None or repair["phase"] == REPAIR_CANCELLED:
+                if repair is None or repair["phase"] in _REPAIR_CLOSED_TO_GOALS:
                     conn.rollback()
                     return None
                 conn.execute(

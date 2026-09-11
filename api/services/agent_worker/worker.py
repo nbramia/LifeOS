@@ -1914,32 +1914,51 @@ class Worker:
         existing = self.session_store.get_proposal_by_question_id(q["id"])
         if existing is not None:
             return existing
-        condition = doctor_repair.condition_from_question(q.get("question") or "")
-        if not condition:
-            condition = self._recorded_goal_condition(session.session_id)
+        condition = self._proposed_goal_condition(q, session)
         if not condition:
             return None
         self._record_goal_proposal(session, condition, q["id"])
         return self.session_store.get_proposal_by_question_id(q["id"])
 
+    def _proposed_goal_condition(self, q: dict, session: Session) -> str | None:
+        """The condition an open goal question is asking the operator to lock.
+
+        Read from the prompt the question was registered with, falling back to
+        the condition the executor recorded when it proposed. Recoverable
+        whether or not the session keeps a repair record, so an approval can
+        be honoured either way.
+        """
+        condition = doctor_repair.condition_from_question(q.get("question") or "")
+        if not condition:
+            condition = self._recorded_goal_condition(session.session_id)
+        return condition or None
+
     def _recorded_goal_condition(self, session_id: str) -> str | None:
         """The condition the executor recorded with its latest goal proposal.
-        Read only while adopting a pending approval into a repair record."""
+        The fallback when the question's own prompt text carries no
+        recoverable boundary between the goal body and the reply mechanics."""
         condition = None
         for event in self.transcript_store.read(session_id):
             if event.get("kind") == "claude_code_awaiting_goal_approval":
                 condition = (event.get("payload") or {}).get("condition")
         return condition
 
-    def _goal_reply_not_applied(self, q: dict, session: Session, proposal: dict) -> None:
+    def _goal_reply_not_applied(self, q: dict, session: Session, proposal: dict) -> str | None:
         """Retire a goal reply that its revision could not accept.
 
         Reached when the revision has left `proposed` state — a duplicate or
         stale reply — or when the repair itself is terminal, which is the case
-        the operator cannot see from the message they replied to. The
-        reply enqueues nothing and spawns nothing; the question is retired so
-        the tick does not re-read the same answer forever, and the operator is
-        told, because this message was the only gate they had.
+        the operator cannot see from the message they replied to. Nothing is
+        spawned, and the operator is told, because this message was the only
+        gate they had.
+
+        Returns the notice to hand back to a session still blocked on this
+        question: its anchor is consumed, and the dispatch tick drains only
+        claimed rows, so without a resume the run would sit blocked forever.
+        Returns None for a session that is not blocked — a terminal one has
+        nothing to resume, and one already claimed or running was resumed by
+        the reply this one duplicates — and retires the question so the tick
+        does not re-read the same answer.
         """
         current = self.session_store.get_proposal(proposal["proposal_id"]) or {}
         repair = self.session_store.get_repair(proposal["workflow_id"]) or {}
@@ -1951,12 +1970,15 @@ class Worker:
                 "phase": repair.get("phase"),
             },
         )
-        self.session_store.mark_question_processed(q["id"])
         notice = (
             f"That goal (revision {proposal['version']}) is no longer awaiting "
             f"your answer — the repair is {repair.get('phase') or 'closed'}. "
             f"Nothing was started."
         )
+        live = self.session_store.get(session.task_id)
+        resumable = live is not None and live.status == STATUS_BLOCKED
+        if not resumable:
+            self.session_store.mark_question_processed(q["id"])
         try:
             if session.bot:
                 self._telegram_send(notice, bot=session.bot)
@@ -1964,6 +1986,7 @@ class Worker:
                 self._telegram_send(notice)
         except Exception:  # noqa: BLE001 — a send failure must not strand the row
             logger.warning("goal reply notice send failed", exc_info=True)
+        return notice if resumable else None
 
     def _resume_goal(self, q: dict, session: Session, answer: str) -> None:
         """Operator replied to a proposed [GOAL].
@@ -1993,7 +2016,21 @@ class Worker:
         declining = _is_declining(answer)
         affirmative = not declining and _is_affirmative(answer)
         if proposal is None:
-            if affirmative:
+            # No revision to lock: either this session keeps no repair record
+            # — an ordinary task that emitted the generic `[GOAL]` tag — or
+            # nothing recoverable was ever proposed. The first case still
+            # locks the condition the executor recorded, since the approval
+            # is the only gate the operator has and a reprompt would just
+            # reproduce this same state.
+            condition = self._proposed_goal_condition(q, session)
+            if affirmative and condition:
+                resume_msg = doctor_repair.resume_message(
+                    doctor_repair.goal_resume_action(condition),
+                )
+                self.transcript_store.append(sid, "claude_code_goal_locked", {
+                    "condition_chars": len(condition),
+                })
+            elif affirmative:
                 resume_msg = (
                     "Approval received, but no goal revision is on record to "
                     "lock. Please re-emit the [GOAL] you proposed."
@@ -2009,48 +2046,54 @@ class Worker:
         elif affirmative:
             approved = self.session_store.approve_goal(proposal["proposal_id"])
             if approved is None:
-                self._goal_reply_not_applied(q, session, proposal)
-                return
-            resume_msg = doctor_repair.resume_message(approved.get("resume_action"))
-            if not resume_msg:
-                resume_msg = (
-                    "Approval received, but this goal revision carries no "
-                    "resume action. Please re-emit the [GOAL] you proposed."
-                )
-                self.transcript_store.append(sid, "claude_code_goal_lock_failed", {
-                    "reason": "no_resume_action",
-                    "proposal_id": approved["proposal_id"],
-                })
+                resume_msg = self._goal_reply_not_applied(q, session, proposal)
+                if resume_msg is None:
+                    return
             else:
-                self.transcript_store.append(sid, "claude_code_goal_locked", {
-                    "proposal_id": approved["proposal_id"],
-                    "version": approved["version"],
-                    "condition_chars": len(approved["condition"]),
-                })
+                resume_msg = doctor_repair.resume_message(approved.get("resume_action"))
+                if not resume_msg:
+                    resume_msg = (
+                        "Approval received, but this goal revision carries no "
+                        "resume action. Please re-emit the [GOAL] you proposed."
+                    )
+                    self.transcript_store.append(sid, "claude_code_goal_lock_failed", {
+                        "reason": "no_resume_action",
+                        "proposal_id": approved["proposal_id"],
+                    })
+                else:
+                    self.transcript_store.append(sid, "claude_code_goal_locked", {
+                        "proposal_id": approved["proposal_id"],
+                        "version": approved["version"],
+                        "condition_chars": len(approved["condition"]),
+                    })
         elif declining:
             declined = self.session_store.decline_goal(proposal["proposal_id"])
             if declined is None:
-                self._goal_reply_not_applied(q, session, proposal)
-                return
-            # The repair is terminal from here: nothing more is dispatched for
-            # it. The answer still goes back so the doctor can file the work
-            # as an issue for later and stop.
-            resume_msg = answer
-            self.transcript_store.append(sid, "doctor_goal_declined", {
-                "proposal_id": proposal["proposal_id"],
-                "version": proposal["version"],
-            })
+                resume_msg = self._goal_reply_not_applied(q, session, proposal)
+                if resume_msg is None:
+                    return
+            else:
+                # The repair is terminal from here: nothing more is dispatched
+                # for it. The answer still goes back so the doctor can file the
+                # work as an issue for later and stop.
+                resume_msg = answer
+                self.transcript_store.append(sid, "doctor_goal_declined", {
+                    "proposal_id": proposal["proposal_id"],
+                    "version": proposal["version"],
+                })
         else:
             superseded = self.session_store.supersede_goal(proposal["proposal_id"])
             if superseded is None:
-                self._goal_reply_not_applied(q, session, proposal)
-                return
-            resume_msg = answer  # refinement — doctor re-proposes
-            self.transcript_store.append(sid, "claude_code_goal_refine", {
-                "proposal_id": proposal["proposal_id"],
-                "version": proposal["version"],
-                "answer_chars": len(answer),
-            })
+                resume_msg = self._goal_reply_not_applied(q, session, proposal)
+                if resume_msg is None:
+                    return
+            else:
+                resume_msg = answer  # refinement — doctor re-proposes
+                self.transcript_store.append(sid, "claude_code_goal_refine", {
+                    "proposal_id": proposal["proposal_id"],
+                    "version": proposal["version"],
+                    "answer_chars": len(answer),
+                })
         # Operator root-spawns (#235) have no backing vault task, so skip the
         # tag/status mutations (they would 404).
         if session.origin != "operator":

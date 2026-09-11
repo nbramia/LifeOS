@@ -856,7 +856,7 @@ async def test_spawned_child_inherits_bot_from_hermes_caller(proxy_client, agent
     worker's own status/blocked notices to the primary bot's channel and
     make the doctor listener's threaded-reply resume, scoped to `bot=
     "doctor"`, unable to find them)."""
-    from api.services.agent_worker import inter_agent
+    from api.services.agent_worker import doctor_repair, inter_agent
     from api.services.agent_worker.transcript_store import TranscriptStore
 
     persona_file = tmp_path / "doctor.md"
@@ -873,7 +873,18 @@ async def test_spawned_child_inherits_bot_from_hermes_caller(proxy_client, agent
     )
     assert resp.status_code == 200
     caller_session_id = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
-    assert agent_session_store.get_by_session_id(caller_session_id).bot == "doctor"
+    anchor = agent_session_store.get_by_session_id(caller_session_id)
+    assert anchor.bot == "doctor"
+
+    # A doctor anchor is a repair run, so a worker spawn needs an approved
+    # goal revision first (see `doctor_repair.dispatch_allowed`).
+    condition = "the sync timer fires on schedule"
+    proposal = agent_session_store.propose_goal(
+        anchor.workflow_id,
+        condition=condition,
+        resume_action=doctor_repair.goal_resume_action(condition),
+    )
+    agent_session_store.approve_goal(proposal["proposal_id"])
 
     ctx = inter_agent.InterAgentContext(
         session_store=agent_session_store,

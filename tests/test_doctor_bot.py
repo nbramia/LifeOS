@@ -1140,10 +1140,41 @@ class TestGoalApproval:
             proposal["workflow_id"],
         )["phase"] == REPAIR_DIAGNOSIS
 
+    def test_a_reply_refused_by_a_shipped_repair_leaves_no_blocked_session(self, tmp_path):
+        """The repair ships while a later revision's question is still open —
+        the child of the approved revision landed its result. The reply that
+        follows starts nothing, and the doctor it was gating is released
+        instead of sitting blocked on an anchor nothing will answer."""
+        from api.services.agent_worker.session_store import (
+            PROPOSAL_PROPOSED, REPAIR_SHIPPED, STATUS_CLAIMED,
+        )
+
+        w = self._make_worker(tmp_path, self._goal_blocked_stub())
+        session, qid = self._seed_blocked_goal_session(
+            w, condition="merge the parser fix and verify the service health check",
+        )
+        proposal = w.session_store.get_proposal_by_question_id(qid)
+        w.session_store.set_repair_phase(proposal["workflow_id"], REPAIR_SHIPPED)
+
+        assert w.session_store.deposit_answer(9100, "yes", bot="doctor") is True
+        w._process_clarification_answers()
+
+        assert w.session_store.get_proposal(proposal["proposal_id"])["status"] == (
+            PROPOSAL_PROPOSED
+        )
+        resumed = [m["content"] for m in
+                   w.session_store.drain_pending_messages(session.session_id)]
+        assert len(resumed) == 1
+        assert "shipped" in resumed[0]
+        assert not resumed[0].startswith("/goal")
+        assert w.session_store.get(session.task_id).status == STATUS_CLAIMED
+        assert w.session_store.get_open_question_by_message_id(9100) is None
+
     def test_an_approval_after_a_cancel_approves_nothing(self, tmp_path):
         """A cancel lands while the goal question is still outstanding. The
-        approval reply that follows leaves the revision unconsumed, enqueues
-        no resume action, and tells the operator rather than going silent."""
+        approval reply that follows leaves the revision unconsumed and starts
+        nothing; the operator is told, and the doctor — still blocked on an
+        anchor that is now consumed — is resumed with the same news."""
         from api.services.agent_worker.session_store import (
             PROPOSAL_PROPOSED, REPAIR_CANCELLED,
         )
@@ -1168,7 +1199,11 @@ class TestGoalApproval:
         repair = w.session_store.get_repair(proposal["workflow_id"])
         assert repair["phase"] == REPAIR_CANCELLED
         assert repair["approved_proposal_id"] is None
-        assert w.session_store.drain_pending_messages(session.session_id) == []
+        # The news, not a resume action: nothing that would start work.
+        resumed = [m["content"] for m in
+                   w.session_store.drain_pending_messages(session.session_id)]
+        assert resumed == [notices[-1][0]]
+        assert not any(m.startswith("/goal") for m in resumed)
         kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
         assert "doctor_goal_reply_ignored" in kinds
         assert "claude_code_goal_locked" not in kinds
@@ -1316,7 +1351,8 @@ class TestRepairSpawnGate:
 
     def test_an_ordinary_agent_task_that_proposes_a_goal_is_not_gated(self, tmp_path):
         """An ordinary session emitting the generic `[GOAL]` tag keeps the
-        spawn it has: no repair is opened for it, so no gate applies."""
+        spawn it has and the approval it asked for: no repair is opened for
+        it, so no gate applies and its operator's yes still locks the goal."""
         from api.services.agent_worker import inter_agent
         from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
         from api.services.agent_worker.session_store import SessionStore
@@ -1342,6 +1378,13 @@ class TestRepairSpawnGate:
         })
         assert result["ok"] is True, result
         assert store.get_by_session_id(result["child_session_id"]).workflow_id is None
+
+        # Approving that gate locks the condition the executor proposed —
+        # a session with no repair record is not stranded in a reprompt loop.
+        assert w.session_store.deposit_answer(msg_id, "yes") is True
+        w._process_clarification_answers()
+        pending = w.session_store.drain_pending_messages(caller.session_id)
+        assert [p["content"] for p in pending] == ["/goal all tests pass"]
 
     def test_a_repair_child_cannot_launder_a_dispatch_past_the_gate(self, tmp_path):
         """A grandchild spawn reads the repair from the lineage root, so an
@@ -1496,6 +1539,59 @@ class TestRepairResultsAdvancePhases:
 
         kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
         assert "code_handled_completion" in kinds
+        assert w.session_store.get_repair(workflow_id)["phase"] == REPAIR_SHIPPED
+
+    def test_a_terminal_codex_turn_advances_the_repair(self, tmp_path):
+        """A repair's implementation worker can be codex-routed, so the codex
+        terminal path folds the result in exactly as the claude_code one
+        does."""
+        from dataclasses import dataclass
+
+        from api.services.agent_worker import doctor_repair
+        from api.services.agent_worker.codex_spawn import spawn_codex_session
+        from api.services.agent_worker.local_executor import ExecutorOutcome
+        from api.services.agent_worker.session_store import (
+            REPAIR_SHIPPED, STATUS_COMPLETED,
+        )
+
+        @dataclass
+        class _Completes:
+            outcome: ExecutorOutcome
+
+            def execute(self, session, task):
+                return self.outcome
+
+            def resume(self, session, message, working_dir=None):
+                return self.outcome
+
+        final_text = (
+            "Merged the parser fix as "
+            "https://github.com/example/synthetic/pull/4321 and verified the "
+            "service health check. Revert with: gh pr revert 4321.\n"
+            + self._result_text()
+        )
+        w = TestGoalApproval()._make_worker(tmp_path, None)
+        w._codex_executor = _Completes(ExecutorOutcome(
+            status=STATUS_COMPLETED, final_text=final_text,
+        ))
+        spawned = spawn_codex_session(
+            w.session_store, "implement the parser fix", chat_id="123",
+            persona_id="doctor",
+        )
+        session = w.session_store.get_by_session_id(spawned["session_id"])
+        workflow_id = session.workflow_id
+        assert workflow_id
+        condition = "merge the parser fix and verify the service health check"
+        proposal = w.session_store.propose_goal(
+            workflow_id, condition=condition,
+            resume_action=doctor_repair.goal_resume_action(condition),
+        )
+        w.session_store.approve_goal(proposal["proposal_id"])
+
+        w._dispatch_spawned_sessions()
+
+        kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
+        assert "codex_handled_completion" in kinds
         assert w.session_store.get_repair(workflow_id)["phase"] == REPAIR_SHIPPED
 
     def test_a_result_on_a_turn_that_pauses_advances_nothing(self, tmp_path):

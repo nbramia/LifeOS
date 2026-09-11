@@ -389,9 +389,6 @@ def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
         "host": cli.host,
         "branch": cli.branch,
         "prompt_preview": cli.prompt_preview,
-        # A CLI session on another machine has no LifeOS session row and so no
-        # repair, but the field is on every snapshot row regardless.
-        "repair": None,
     }
 
 
@@ -688,10 +685,10 @@ def _build_snapshot() -> dict[str, Any]:
         sd["custom_label"] = agent_viz_label_override.get_override(cli.session_id)
         session_dicts.append(sd)
 
-    # Board lane + pending-question + card-join fields, additive — applied
-    # last, uniformly, to every row regardless of source (local, cc/cx,
-    # mirrored, or synthetic-remote), so a row built by any branch above
-    # still ends up with all of them set.
+    # Board lane + pending-question + card-join + repair fields, additive —
+    # applied last, uniformly, to every row regardless of source (local,
+    # cc/cx, mirrored, or synthetic-remote), so a row built by any branch
+    # above still ends up with all of them set.
     try:
         open_question_by_session = {
             q["session_id"]: q for q in session_store.list_open_questions()
@@ -709,6 +706,9 @@ def _build_snapshot() -> dict[str, Any]:
         # legend key off it for every node, so an unlinked session's lane is
         # never null even though its card-join fields below are.
         sd["lane"] = _lane_for_session_dict(sd, tasks_by_id)
+        # Only a LifeOS session row can belong to a repair; a CLI-derived or
+        # mirrored row carries the field as null so the shape is uniform.
+        sd.setdefault("repair", None)
         pq = open_question_by_session.get(sd.get("session_id"))
         sd["pending_question"] = _pending_question_view(pq) if pq else None
         task = tasks_by_id.get(sd.get("task_id")) if sd.get("task_id") else None

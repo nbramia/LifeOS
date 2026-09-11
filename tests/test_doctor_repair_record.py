@@ -136,6 +136,13 @@ class TestProposalVersioning:
         assert repair["approved_proposal_id"] is None
         assert store.get_proposal(proposal["proposal_id"])["status"] == PROPOSAL_DECLINED
         assert store.approve_goal(proposal["proposal_id"]) is None
+        # The doctor's loop is propose-until-approved, so a refusal has to
+        # survive its next [GOAL]: a declined repair accepts no new revision.
+        assert store.propose_goal(
+            workflow_id, condition=REFINED_GOAL,
+            resume_action=doctor_repair.goal_resume_action(REFINED_GOAL),
+        ) is None
+        assert store.get_repair(workflow_id)["phase"] == REPAIR_DECLINED
 
     def test_a_delivered_repair_takes_follow_up_work_as_a_new_revision(self, store):
         workflow_id, first = _propose(store)
