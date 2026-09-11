@@ -38,6 +38,13 @@ def _telegram_bots_source() -> "Path | None":
 _PRIMARY_PERSONA_FILE = Path("config/personas/primary.md")
 _BOT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
+# Anchor path defaults to the repo root rather than the process's working
+# directory (#1038): nineteen call sites derive a data-store path from
+# `Path(settings.chroma_path).parent`, so an unanchored default resolved
+# incorrectly for any caller whose cwd isn't the repo root. `settings.py`
+# lives at `config/settings.py`, so its grandparent is the repo root.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
 
 @dataclass(frozen=True)
 class PersonaDefinition:
@@ -210,11 +217,11 @@ class Settings(BaseSettings):
 
     # Paths (use LIFEOS_ prefix)
     vault_path: Path = Field(
-        default=Path("./vault"),
+        default=_REPO_ROOT / "vault",
         alias="LIFEOS_VAULT_PATH"
     )
     chroma_path: Path = Field(
-        default=Path("./data/chromadb"),
+        default=_REPO_ROOT / "data" / "chromadb",
         alias="LIFEOS_CHROMA_PATH"
     )
     chroma_url: str = Field(
