@@ -157,7 +157,23 @@ jobs:
             --lanes "$LANES" \
             --workers "$WORKERS" \
             --capacity-max-run-workers "$WORKERS" \
+            --lane-log-dir "$RUNNER_TEMP/lifeos-lane-logs" \
             --parallel-browser-free
+
+      # The step above prints only its summary JSON; pytest's own output goes
+      # to the lane log. Without this a failing lane names no test, so the
+      # log is retained on failure and nowhere else — a passing lane's log
+      # has no reader. This is candidate-produced diagnostic output: the
+      # status publisher below never reads it, and nothing consumes it as
+      # authorization.
+      - name: Retain the lane log from a failed verification
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lane-logs-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/lifeos-lane-logs
+          if-no-files-found: warn
+          retention-days: 14
 
   publish-aggregate:
     # This job never checks out, runs, or consumes an artifact from the
