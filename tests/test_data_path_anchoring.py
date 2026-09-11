@@ -13,13 +13,14 @@ these modules. That also sidesteps this suite's autouse isolation fixtures
 (e.g. ``_isolate_telegram_state_file``), which would otherwise mask the
 in-process class attribute under a fixture-chosen tmp path.
 
-#1038 covers the same bug class for ``config.settings.Settings``'s
-``vault_path``/``chroma_path`` defaults: nineteen call sites derive a
-data-store path from ``Path(settings.chroma_path).parent`` at call time, so
-anchoring the *default* (rather than each derived helper) fixes all of them
-at once. ``get_crm_db_path()``, ``get_conversation_db_path()``, and
+``config.settings.Settings``'s ``vault_path``/``chroma_path`` defaults anchor
+to the repo root the same way, so the nineteen call sites that derive a
+data-store path from ``Path(settings.chroma_path).parent`` at call time
+resolve correctly from any working directory — anchoring the *default*
+(rather than each derived helper) fixes all of them at once.
+``get_crm_db_path()``, ``get_conversation_db_path()``, and
 ``get_bm25_db_path()`` below are a representative sample of those derived
-helpers, exercised the same foreign-cwd way as the #645 cases above.
+helpers, exercised the same foreign-cwd way as the cases above.
 """
 import os
 import subprocess

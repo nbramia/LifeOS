@@ -38,11 +38,11 @@ def _telegram_bots_source() -> "Path | None":
 _PRIMARY_PERSONA_FILE = Path("config/personas/primary.md")
 _BOT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
-# Anchor path defaults to the repo root rather than the process's working
-# directory (#1038): nineteen call sites derive a data-store path from
-# `Path(settings.chroma_path).parent`, so an unanchored default resolved
-# incorrectly for any caller whose cwd isn't the repo root. `settings.py`
-# lives at `config/settings.py`, so its grandparent is the repo root.
+# Anchors path defaults to the repo root rather than the process's working
+# directory, so the call sites that derive a data-store path from
+# `Path(settings.chroma_path).parent` resolve correctly regardless of the
+# caller's cwd. `settings.py` lives at `config/settings.py`, so its
+# grandparent is the repo root.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
