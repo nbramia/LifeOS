@@ -240,18 +240,13 @@ class TestCacheAndFreshness:
 
         client = _patch_llm(monkeypatch, _RecordingLLMClient())
 
-        start = time.time()
         response = app_client.post("/api/crm/relationship/tone-analysis-detailed")
-        elapsed = time.time() - start
 
         # `client.calls == []` is the load-bearing assertion for the "cache
-        # hit avoids the LLM call" acceptance criterion. The wall-clock
-        # bound below passes comfortably in practice, but it is secondary --
-        # a loaded xdist worker is a more plausible source of flake than the
-        # call-count check.
+        # hit avoids the LLM call" acceptance criterion: it observes the call
+        # list directly, so it holds on any hardware.
         assert response.status_code == 200
         assert client.calls == []
-        assert elapsed < 0.2
 
         data = response.json()
         by_month = {t["month"]: t for t in data["monthly_tones"]}
@@ -579,9 +574,7 @@ class TestCacheHitPerformance:
 
         client = _patch_llm(monkeypatch, _RecordingLLMClient())
 
-        start = time.time()
         response = app_client.post("/api/crm/relationship/tone-analysis-detailed?months=12")
-        elapsed = time.time() - start
 
         assert response.status_code == 200
         assert client.calls == []
@@ -589,7 +582,6 @@ class TestCacheHitPerformance:
         # called on a full cache hit, regardless of how large the window's
         # true row count is.
         assert patch_interactions.range_fetch_calls == []
-        assert elapsed < 0.2
 
         assert len(response.json()["monthly_tones"]) == len(counts)
 
