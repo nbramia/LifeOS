@@ -413,6 +413,31 @@ class TestGetBoard:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
+class TestCardLifecycleDates:
+    def test_task_card_carries_the_lifecycle_dates_the_drawer_renders(self, client, stores):
+        """The drawer's metadata block reads these off the card. A card that
+        never reached a terminal state carries nulls rather than omitting the
+        keys, so the client can branch on value instead of presence.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        open_task = task_manager.create("Synthetic open card", tags=["me"])
+        done_task = task_manager.create("Synthetic finished card", tags=["me"])
+        task_manager.complete(done_task.id)
+
+        lanes = client.get("/api/agents/board").json()["lanes"]
+        cards = {c["id"]: c for lane in lanes.values() for c in lane if c.get("kind") == "task"}
+
+        opened = cards[open_task.id]
+        assert opened["created_date"] == open_task.created_date
+        assert opened["done_date"] is None
+        assert opened["cancelled_date"] is None
+
+        finished = cards[done_task.id]
+        assert finished["done_date"], finished
+        assert finished["updated_at"]
+
+
+@pytest.mark.unit
 class TestReviewActions:
     def test_reject_requires_note_and_queues_context(self, client, stores):
         task_manager, _sched, session_store, _transcript = stores

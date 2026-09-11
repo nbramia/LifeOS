@@ -15,7 +15,7 @@
 // no sort choice rewrites the vault's file order.
 
 import {
-  TERMINAL, routingLabel, escapeHtml, showToast, SessionPanel,
+  TERMINAL, routingLabel, escapeHtml, escapeAttr, showToast, showUndoableToast, SessionPanel,
 } from './panel.js';
 import { renderActionRow } from './session_actions.js';
 import { descendantsOf } from './graph_encoding.js';
@@ -463,40 +463,53 @@ export function initBoard() {
     return { allowed: true, reason: '' };
   }
 
-  function assignSelectedAssignee(card) {
-    if (!selectedAssignee || !card || card.kind !== 'task') return false;
-    const assignee = selectedAssignee;
-    selectedAssignee = null;
-    renderAssigneeDrops();
-    const reason = assignmentPolicyReason(card);
-    if (reason) {
-      setDropStatus(reason, true);
-      showToast(reason, true);
-      return true;
-    }
-    setDropStatus(`Assigning ${assignee}…`);
-    moveCard(card.id, 'assigned', assignee)
-      .then(() => setDropStatus(`Assigned to ${assignee}.`))
-      .catch(() => setDropStatus('Assignment refused.', true));
-    return true;
-  }
-
-  function assignAssigneeToCard(cardId, assignee) {
-    const card = findCard(cardId);
+  // Every way to assign a card — tapping an assignee then a card, dragging
+  // an assignee onto a card, dragging a card onto an assignee — lands here,
+  // so none of them can clear the tray selection, report, or offer undo
+  // differently from the others.
+  function assignCardTo(card, assignee) {
     if (!card || card.kind !== 'task') return;
+    clearAssigneeSelection();
     const reason = assignmentPolicyReason(card);
     if (reason) {
       setDropStatus(reason, true);
       showToast(reason, true);
       return;
     }
+    // Captured before the write so Undo restores where the card actually
+    // was, not wherever the board has drifted to by the time it is clicked.
+    const priorLane = card.lane;
+    const priorAssignee = card.assignee || null;
+    const title = card.title || card.id;
     setDropStatus(`Assigning ${assignee}…`);
     // Keep this on the same lane endpoint and request shape as the drawer's
     // assignee select. The server remains authoritative for claimed cards
     // and for cards whose derived lane cannot change with the tag update.
     moveCard(card.id, 'assigned', assignee)
-      .then(() => setDropStatus(`Assigned to ${assignee}.`))
+      .then((data) => {
+        setDropStatus(`Assigned to ${assignee}.`);
+        if (data && data.lane && data.lane !== 'assigned') return;
+        showUndoableToast(`Assigned "${title}" to ${assignee}.`, () => (
+          moveCard(card.id, priorLane, priorAssignee || undefined)
+        ));
+      })
       .catch(() => setDropStatus('Assignment refused.', true));
+  }
+
+  function assignSelectedAssignee(card) {
+    if (!selectedAssignee || !card || card.kind !== 'task') return false;
+    assignCardTo(card, selectedAssignee);
+    return true;
+  }
+
+  function assignAssigneeToCard(cardId, assignee) {
+    assignCardTo(findCard(cardId), assignee);
+  }
+
+  function clearAssigneeSelection() {
+    if (!selectedAssignee) return;
+    selectedAssignee = null;
+    renderAssigneeDrops();
   }
 
   function renderAssigneeDrops() {
@@ -923,17 +936,31 @@ export function initBoard() {
     clearDragTarget();
     const under = document.elementFromPoint(e.clientX, e.clientY);
     if (dragState.kind === 'card') {
-      const target = under?.closest('.board-lane, #board-done-drop');
-      if (target) {
+      const target = under?.closest('.board-lane, #board-done-drop, .board-assignee-drop');
+      // An assignee button is a drop target in both directions — dragging a
+      // card onto one assigns it, exactly as dragging the button onto the
+      // card does — so it is decided against the same assignment policy
+      // rather than the lane policy the lanes and Done target use.
+      if (target && target.classList.contains('board-assignee-drop')) {
+        const assignee = target.dataset.assignee;
+        const reason = assignmentPolicyReason(dragState.card);
+        target.classList.add(reason ? 'drop-refused' : 'drop-allowed');
+        dragState.targetLane = null;
+        dragState.targetAssignee = reason ? null : assignee;
+        dragState.targetEl = target;
+        setDropStatus(reason || `Drop to assign ${assignee}.`, !!reason);
+      } else if (target) {
         const targetLane = target.id === 'board-done-drop' ? 'done' : target.dataset.lane;
         const decision = canDropCard(dragState.card, targetLane);
         target.classList.add(decision.allowed ? 'drop-allowed' : 'drop-refused');
         if (target.classList.contains('board-lane')) target.classList.add('drag-over');
         dragState.targetLane = targetLane;
+        dragState.targetAssignee = null;
         dragState.targetEl = target;
         setDropStatus(decision.allowed ? `Drop in ${laneLabel(targetLane)}.` : decision.reason, !decision.allowed);
       } else {
         dragState.targetLane = null;
+        dragState.targetAssignee = null;
         dragState.targetEl = null;
         setDropStatus('');
       }
@@ -965,7 +992,10 @@ export function initBoard() {
         // A drag that ends in the source lane (or outside a lane) is still
         // a drag, not a request to open the drawer through its trailing tap.
         setClickSuppression('card', state.card.id);
-        if (state.targetLane && state.targetLane !== state.card.lane) {
+        if (state.targetAssignee) {
+          setClickSuppression('tray', `assignee:${state.targetAssignee}`);
+          assignCardTo(state.card, state.targetAssignee);
+        } else if (state.targetLane && state.targetLane !== state.card.lane) {
           onCardDropped(state.card.id, state.targetLane);
         }
       } else {
@@ -1027,9 +1057,24 @@ export function initBoard() {
       // an assignee, which the lane endpoint keeps when passed explicitly.
       assignee = card.assignee || 'me';
     }
+    // Captured before the write so Undo restores where the card actually
+    // was, not wherever the board has drifted to by the time it is clicked.
+    const priorLane = card.lane;
+    const priorAssignee = card.assignee || null;
+    const title = card.title || card.id;
     // moveCard already toasts and re-renders on failure — nothing more to
-    // do here, just avoid an unhandled rejection now that it re-throws.
-    moveCard(cardId, targetLane, assignee).catch(() => {});
+    // do there, just avoid an unhandled rejection given that it re-throws.
+    moveCard(cardId, targetLane, assignee)
+      .then((data) => {
+        // A card the server landed somewhere other than the requested lane
+        // already has `moveCard`'s own toast naming where it really went.
+        // A second toast claiming the requested move would contradict it.
+        if (data && data.lane && data.lane !== targetLane) return;
+        showUndoableToast(`Moved "${title}" to ${laneLabel(targetLane)}.`, () => (
+          moveCard(cardId, priorLane, priorAssignee || undefined)
+        ));
+      })
+      .catch(() => {});
   }
 
   function laneLabel(laneId) {
@@ -1655,6 +1700,70 @@ export function initBoard() {
     return handle;
   }
 
+  // Dates arrive as either a bare YYYY-MM-DD (`created_date`, `done_date`,
+  // `cancelled_date`, `due_date`) or a full ISO timestamp (`updated_at`).
+  // Both render as a short local date; the title attribute keeps the exact
+  // value for anyone who needs it.
+  function formatCardDate(value) {
+    if (!value) return null;
+    const iso = String(value);
+    const parsed = new Date(/^\d{4}-\d{2}-\d{2}$/.test(iso) ? `${iso}T00:00:00` : iso);
+    if (Number.isNaN(parsed.getTime())) return { label: iso, exact: iso };
+    return {
+      label: parsed.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }),
+      exact: iso,
+    };
+  }
+
+  // The read-only block: what the card reports about itself, as opposed to
+  // the fields above it that the operator edits. A date the card doesn't
+  // carry is omitted rather than rendered empty.
+  function cardMetaHtml(card) {
+    const rows = [
+      ['Created', card.created_date],
+      ['Updated', card.updated_at],
+      ['Due', card.due_date],
+      ['Completed', card.done_date],
+      ['Cancelled', card.cancelled_date],
+    ];
+    const items = [];
+    for (const [label, raw] of rows) {
+      const formatted = formatCardDate(raw);
+      if (!formatted) continue;
+      items.push(`
+        <div class="drawer-meta-item">
+          <span class="drawer-meta-label">${label}</span>
+          <span class="drawer-meta-value" title="${escapeAttr(formatted.exact)}">${escapeHtml(formatted.label)}</span>
+        </div>
+      `);
+    }
+    if (card.status) {
+      items.push(`
+        <div class="drawer-meta-item">
+          <span class="drawer-meta-label">Status</span>
+          <span class="drawer-meta-value">${escapeHtml(card.status)}</span>
+        </div>
+      `);
+    }
+    for (const key of ['model', 'effort', 'host']) {
+      const value = card.fields && card.fields[key];
+      if (!value) continue;
+      items.push(`
+        <div class="drawer-meta-item">
+          <span class="drawer-meta-label">${key}</span>
+          <span class="drawer-meta-value">${escapeHtml(value)}</span>
+        </div>
+      `);
+    }
+    items.push(`
+      <div class="drawer-meta-item">
+        <span class="drawer-meta-label">ID</span>
+        <span class="drawer-meta-value drawer-meta-id">${escapeHtml(card.id)}</span>
+      </div>
+    `);
+    return items.join('');
+  }
+
   function renderDrawer(card) {
     if (!drawerEl) return;
     cancelTagPickerWrites();
@@ -1679,6 +1788,8 @@ export function initBoard() {
         <input class="drawer-title" data-field="title" value="${escapeHtml(titleValue)}" />
       </div>
       ${isTask ? `
+      <div class="drawer-section drawer-meta" data-field="meta">${cardMetaHtml(card)}</div>
+      <div class="drawer-section">
       <label class="drawer-label">Notes</label>
       <textarea class="drawer-notes drawer-notes-autosize" data-field="notes" placeholder="Notes…">${escapeHtml(card.notes || '')}</textarea>
       <div class="drawer-row">
@@ -1705,8 +1816,11 @@ export function initBoard() {
       </div>
       ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="tags-reason">${escapeHtml(assigneePolicy.reason || "This card's tags can't be changed right now.")}</div>` : ''}
       <div class="drawer-assignment" data-field="assignment"></div>
-      <div class="drawer-actions" data-field="actions"></div>
-      <div class="drawer-session" data-field="session-panel"></div>
+      </div>
+      <div class="drawer-section drawer-section-actions">
+        <div class="drawer-actions" data-field="actions"></div>
+      </div>
+      <div class="drawer-section"><div class="drawer-session" data-field="session-panel"></div></div>
       ` : `
       <label class="drawer-label">Message</label>
       <textarea class="drawer-notes" data-field="message-content" placeholder="Message…">${escapeHtml(card.message_content || '')}</textarea>

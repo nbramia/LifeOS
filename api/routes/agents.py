@@ -1079,6 +1079,13 @@ def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
         "context": task.context,
         "created_date": task.created_date,
         "updated_at": task.updated_at,
+        # Lifecycle dates the vault line already carries. Which one is
+        # meaningful depends on where the card ended up, so all of them are
+        # sent and the drawer renders whichever exist.
+        "done_date": task.done_date,
+        "cancelled_date": task.cancelled_date,
+        "due_date": task.due_date,
+        "priority": task.priority,
         "session": session,
         "pending_question": _pending_question_view(pq) if pq else None,
         "policy": _card_policy(task, session_store),
