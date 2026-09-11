@@ -31,6 +31,23 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _env_without_data_path_overrides() -> dict:
+    """A copy of the current environment with `LIFEOS_CHROMA_PATH` and
+    `LIFEOS_VAULT_PATH` removed.
+
+    These tests are about the *default* `settings.chroma_path`/`vault_path`
+    resolve to, so the subprocess must not inherit an operator (or test
+    runner) override of either — `scripts/verify_candidate.py` sets both to
+    a runtime-scoped path on every lane run, which would otherwise make
+    every case here resolve against that runtime root instead of the repo
+    root and fail for the wrong reason.
+    """
+    env = os.environ.copy()
+    env.pop("LIFEOS_CHROMA_PATH", None)
+    env.pop("LIFEOS_VAULT_PATH", None)
+    return env
+
+
 def _resolve_in_foreign_cwd(foreign_cwd: Path, import_stmt: str, expr: str) -> str:
     """Run `expr` in a fresh subprocess whose cwd is `foreign_cwd` and whose
     sys.path is seeded with the repo root, and return its printed result."""
@@ -41,6 +58,7 @@ def _resolve_in_foreign_cwd(foreign_cwd: Path, import_stmt: str, expr: str) -> s
         capture_output=True,
         text=True,
         timeout=30,
+        env=_env_without_data_path_overrides(),
     )
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
@@ -233,6 +251,7 @@ def test_usage_store_db_path_resolves_to_repo_root_from_foreign_cwd(tmp_path):
         capture_output=True,
         text=True,
         timeout=30,
+        env=_env_without_data_path_overrides(),
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == str(REPO_ROOT / "data" / "usage.db")
@@ -251,7 +270,7 @@ def _run_get_crm_db_path(foreign_cwd: Path, chroma_path_env: str) -> str:
         capture_output=True,
         text=True,
         timeout=30,
-        env={**os.environ, "LIFEOS_CHROMA_PATH": chroma_path_env},
+        env={**_env_without_data_path_overrides(), "LIFEOS_CHROMA_PATH": chroma_path_env},
     )
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
