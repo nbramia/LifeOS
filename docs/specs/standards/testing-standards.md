@@ -230,6 +230,16 @@ Shared fixtures are in `tests/conftest.py`. Key fixtures:
 | `mock_settings` | function | Patched `config.settings.settings` with temp paths |
 | `server_available` | session | Checks if API server is running |
 | `reset_singletons_after_test` | function (autouse) | Resets service singletons to prevent test pollution |
+| `require_db` | function | Establishes the `interactions` schema, then skips when the database is locked |
+| `require_populated_db` | function | Adds `require_db`'s gate, then skips when the runtime databases hold no records |
+
+A module establishes every prerequisite it can establish for itself, so its
+outcomes are the same whether it runs alone or beside the whole lane. A
+conditional skip is reserved for a precondition the module genuinely cannot
+create: a running server holding the database lock, or the absence of a
+developer's own indexed records. Depending on a prerequisite that a different
+module happens to create makes the module's outcomes a function of which other
+modules the run selected, which no partition of the suite can reproduce.
 
 Test-specific fixtures use `tmp_path` for isolated file system state:
 

@@ -4,8 +4,9 @@ CRM Data Integrity Tests - P9.1
 These tests verify that data flows correctly from sources to CRM display.
 They use real production data and should pass when the CRM is working correctly.
 
-NOTE: These tests require direct database access and will be skipped if
-the server is running (database locked). Stop the server to run these tests.
+NOTE: These tests read a developer's own indexed records directly, so they are
+skipped when the runtime databases are empty and when a running server holds
+the database lock. Stop the server to run these tests.
 
 IMPORTANT: These tests are designed for the developer's production environment.
 When setting up LifeOS for the first time, you'll need to configure TEST_CONTACT_EMAIL
@@ -17,10 +18,12 @@ from api.services.person_entity import get_person_entity_store
 from api.services.interaction_store import get_interaction_store
 
 
-# All classes in this file require database access to real production data
-# (#682: `require_db` only skips a *locked* db, not an empty one, so this
-# also needs `integration` to actually leave the unit/push gate).
-pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("require_db")]
+# All classes in this file verify the correctness of a developer's own indexed
+# data, so they need records rather than a schema: `require_populated_db`
+# establishes the schema, skips a locked database, and skips an empty one.
+# `integration` keeps them out of the unit lane and the push gate, which run
+# against a candidate that has no such records.
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("require_populated_db")]
 
 # Test contact configuration - set these environment variables for data integrity tests
 # These should be a person you communicate with frequently

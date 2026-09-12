@@ -328,6 +328,89 @@ def server_available(candidate_base_url):
     return bool(candidate_base_url)
 
 
+def establish_interaction_schema() -> None:
+    """Create the ``interactions`` table the ``db_available`` probe reads.
+
+    ``get_interaction_db_path()`` resolves inside the candidate's own data
+    directory, which holds no schema until something constructs the default
+    ``InteractionStore``. A module that needs the table establishes it here
+    so its outcomes do not depend on which other modules the run selected;
+    ``CREATE TABLE IF NOT EXISTS`` makes the call a no-op against a database
+    that already has it.
+
+    Every failure is swallowed on purpose. The genuine preconditions this
+    cannot satisfy -- a running server holding the write lock, an
+    unresolvable path -- belong to ``db_available``'s probe and must reach
+    ``require_db``'s skip rather than error the fixture that called this.
+    """
+    try:
+        from api.services.interaction_store import InteractionStore, get_interaction_db_path
+
+        InteractionStore(db_path=get_interaction_db_path(), strict=False)
+    except Exception:
+        pass
+
+
+def interaction_db_readable() -> bool:
+    """Report whether the ``interactions`` table can be read right now."""
+    import sqlite3
+    try:
+        from api.services.interaction_store import get_interaction_db_path
+        db_path = get_interaction_db_path()
+        conn = sqlite3.connect(db_path, timeout=1.0)
+        # Try to execute a simple query to check for lock
+        conn.execute("SELECT 1 FROM interactions LIMIT 1")
+        conn.close()
+        return True
+    except sqlite3.OperationalError:
+        return False
+    except Exception:
+        return False
+
+
+def runtime_databases_populated() -> bool:
+    """Report whether the runtime databases hold records to verify.
+
+    Tests that check the correctness of a developer's own indexed data need
+    records, not merely a schema. Each database is opened read-only so a
+    probe never creates or migrates one.
+    """
+    import sqlite3
+    try:
+        from api.services.interaction_store import get_interaction_db_path
+        from api.services.person_entity import PersonEntityStore
+
+        probes = (
+            (get_interaction_db_path(), "interactions"),
+            (str(PersonEntityStore.CRM_DB_PATH), "person_entities"),
+        )
+    except Exception:
+        return False
+    for db_path, table in probes:
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            try:
+                if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is None:
+                    return False
+            finally:
+                conn.close()
+        except Exception:
+            return False
+    return True
+
+
+@pytest.fixture(scope="module")
+def interaction_schema():
+    """Establish this module's own ``interactions``-table prerequisite.
+
+    Module-scoped so it is set up before the function-scoped probe that
+    reads the table. ``_isolate_integration_persistent_stores`` leaves the
+    default store path alone for every ``require_db`` user, so the path this
+    resolves once per module is the one each of that module's tests sees.
+    """
+    establish_interaction_schema()
+
+
 @pytest.fixture
 def db_available():
     """
@@ -348,26 +431,21 @@ def db_available():
     requested one, so a function-scoped probe here observes the same
     redirected path the test body itself will use.
     """
-    import sqlite3
-    try:
-        from api.services.interaction_store import get_interaction_db_path
-        db_path = get_interaction_db_path()
-        conn = sqlite3.connect(db_path, timeout=1.0)
-        # Try to execute a simple query to check for lock
-        conn.execute("SELECT 1 FROM interactions LIMIT 1")
-        conn.close()
-        return True
-    except sqlite3.OperationalError:
-        return False
-    except Exception:
-        return False
+    return interaction_db_readable()
 
 
 @pytest.fixture(autouse=False)
-def require_db(db_available):
+def require_db(interaction_schema, db_available):
     """Skip test if database is not available (e.g., locked by running server)."""
     if not db_available:
         pytest.skip("Database is locked (server may be running). Stop server to run these tests.")
+
+
+@pytest.fixture
+def require_populated_db(require_db):
+    """Skip test if the runtime databases hold no records to verify."""
+    if not runtime_databases_populated():
+        pytest.skip("Runtime databases hold no records. These tests verify an indexed install.")
 
 
 @pytest.fixture(scope="session")
