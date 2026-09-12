@@ -18,6 +18,22 @@ REPO = Path(__file__).resolve().parent.parent
 BOUNDED_EXEC = REPO / "scripts" / "_bounded_exec.py"
 
 
+def _no_background_git_maintenance(repo: Path) -> None:
+    """Keep every git command in a throwaway repo fully synchronous.
+
+    A writing command such as `git commit` starts auto maintenance, which
+    detaches and keeps operating on the repository after the command that
+    started it has exited — its own lock file lives directly in
+    `.git/objects`, and the gc task it may run rewrites that directory. A
+    test that removes or rebuilds `.git` the instant a commit returns is
+    then racing a process it never started, so these repositories opt out
+    for their whole lifetime instead.
+    """
+    subprocess.run(["git", "config", "maintenance.auto", "false"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "gc.auto", "0"], cwd=repo, check=True)
+
+
+
 def _synthetic_remote_checkout(
     tmp_path: Path, *, failing: bool = False, initial_branch: str | None = None,
 ) -> Path:
@@ -42,6 +58,7 @@ def _synthetic_remote_checkout(
     if initial_branch is not None:
         init_args.append(f"--initial-branch={initial_branch}")
     subprocess.run(init_args, cwd=checkout, check=True)
+    _no_background_git_maintenance(checkout)
     subprocess.run(["git", "config", "user.name", "Synthetic Remote"], cwd=checkout, check=True)
     subprocess.run(["git", "config", "user.email", "remote@example.invalid"], cwd=checkout, check=True)
     subprocess.run(["git", "add", "."], cwd=checkout, check=True)
@@ -114,6 +131,7 @@ def _synthetic_main_repo(tmp_path: Path) -> Path:
         "import pytest\n@pytest.mark.unit\ndef test_remote_candidate(): assert True\n"
     )
     subprocess.run(["git", "init", "-q"], cwd=main, check=True)
+    _no_background_git_maintenance(main)
     # Identifying source-host identity: must never appear on the transferred
     # side — proves no git config/credential export, not just no .git copy.
     subprocess.run(["git", "config", "user.name", "Source Host Identity"], cwd=main, check=True)
@@ -723,6 +741,7 @@ def test_bundle_metadata_field_parsing_preserves_empty_detached_branch_field():
         repo = tmp_path / "repo"
         repo.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        _no_background_git_maintenance(repo)
         subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
         subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
         (repo / "a.txt").write_text("a\n")

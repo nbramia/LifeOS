@@ -371,14 +371,27 @@ def test_hermes_blocked_fake_stream_honors_absolute_deadline(tmp_path, monkeypat
 
     class Client:
         closed = False
+        # Stamped by the factory below and by close(), bracketing exactly the
+        # interval the absolute deadline governs.
+        opened_at: float | None = None
+        closed_at: float | None = None
 
         def stream(self, *_args, **_kwargs):
             return Stream()
 
         def close(self):
+            if self.closed_at is None:
+                self.closed_at = time.monotonic()
             self.closed = True
 
     client = Client()
+
+    def open_client():
+        # The executor derives its deadline from the wall budget and then
+        # immediately asks for a client, so this is the deadline's own origin.
+        client.opened_at = time.monotonic()
+        return client
+
     sessions = SessionStore(db_path=tmp_path / "sessions.db")
     session = sessions.create(
         "hermes-deadline", routing="hermes", budget={"wall_seconds": 0.03},
@@ -386,19 +399,21 @@ def test_hermes_blocked_fake_stream_honors_absolute_deadline(tmp_path, monkeypat
     executor = HermesExecutor(
         session_store=sessions,
         transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
-        http_client_factory=lambda: client,
+        http_client_factory=open_client,
     )
-    started = time.monotonic()
     outcome = executor.execute(session, {"description": "synthetic blocked turn"})
-    elapsed = time.monotonic() - started
-    # The bound separates the two deadlines this test tells apart: the
-    # session's 0.03s wall budget and the 3600s read-idle timeout the
-    # blocked reader would otherwise sit on. Any figure between them
-    # proves the executor stopped on the budget, so this one is set far
-    # enough above 0.03 to absorb scheduler delay on a loaded parallel
-    # run -- a bound a few hundred milliseconds wide measures the host,
-    # not the executor.
-    assert elapsed < 10, f"executor took {elapsed:.2f}s; budget was 0.03s"
+    # Enforcement is a real timed wait, so "stopped on the 0.03s wall budget
+    # rather than the 3600s read-idle timeout" is a claim about elapsed time.
+    # What keeps it off the host's speed is which interval is measured: from
+    # the deadline's own origin to the moment the blocked reader was stopped,
+    # excluding the conversation-store, envelope, and transcript work that
+    # surrounds it and that a contended host stretches without touching the
+    # deadline at all. Anything between the two candidate bounds proves which
+    # one the executor used; this one leaves the budget two orders of
+    # magnitude of scheduler slack and stays three below the timeout.
+    assert client.closed_at is not None, "the executor never stopped the blocked reader"
+    governed = client.closed_at - client.opened_at
+    assert governed < 2, f"stopping the blocked reader took {governed:.2f}s; budget was 0.03s"
     assert outcome.status == STATUS_FAILED
     assert "absolute turn deadline" in outcome.reason
     assert outcome.termination_evidence["absolute_deadline"] is True
