@@ -3407,10 +3407,6 @@
     "#609: PUT .../facts/{id} for a missing fact is a 404, never a",
     "#682)."
   ],
-  "tests/test_crm_data_integrity.py": [
-    "# (#682: `require_db` only skips a *locked* db, not an empty one, so this",
-    "#682: `require_db` only skips a *locked* db, not an empty one, so this"
-  ],
   "tests/test_data_path_anchoring.py": [
     "Regression tests for #645: seven data-store defaults resolved against the",
     "cwd exactly as before. Credentials path, so covered explicitly per #645."
@@ -3980,10 +3976,8 @@
     "say-so (#584): it parks at `ask` and waits for the operator to choose."
   ],
   "tests/test_p91_data_integrity.py": [
-    "# (#682: `require_db` only skips a *locked* db, not an empty one, so this",
     "# which matched any extracted name sharing that letter (#551) \u2014 were",
-    "#551) \u2014 were",
-    "#682: `require_db` only skips a *locked* db, not an empty one, so this"
+    "#551) \u2014 were"
   ],
   "tests/test_pending_question_ui_browser.py": [
     "# #311: whether the spawned session is still running. The client",

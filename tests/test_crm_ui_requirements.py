@@ -146,12 +146,13 @@ class TestZeroInteractionFilter:
 
 
 @pytest.mark.integration
-@pytest.mark.usefixtures("require_db")
+@pytest.mark.usefixtures("require_populated_db")
 class TestStatsMatchDatabase:
     """Tests that PersonEntity stats match the interaction database.
 
-    NOTE: These tests require direct database access and will be skipped if
-    the server is running (database locked). Stop the server to run these tests.
+    NOTE: These tests compare a developer's own indexed records, so they are
+    skipped when the runtime databases are empty or when a running server
+    holds the database lock. Stop the server to run these tests.
     """
 
     def test_top_person_stats_accurate(self):
