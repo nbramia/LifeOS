@@ -1001,6 +1001,7 @@ def test_pre_transfer_failures_never_touch_the_remote(tmp_path, setup, expected_
     elif setup == "no_commits":
         shutil.rmtree(checkout / ".git")
         subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+        _no_background_git_maintenance(checkout)
 
     fake_bin = _fake_transport_bin(tmp_path)
     home = tmp_path / "home"
