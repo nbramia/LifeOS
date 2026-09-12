@@ -71,23 +71,20 @@ of a partitioned run:
   --lane-log-dir /path/to/lane-logs
 ```
 
-### What still blocks running the gate in parts
+### What running the gate in parts still waits on
 
-The hosted gate runs one execution job, not a matrix, because the `fast-unit`
-lane is not yet safe to partition at all. At least one module —
-`tests/test_briefings_service.py` — takes `require_db`'s conditional skip for
-five of its seven tests when it runs without whichever other module first
-creates the runtime `interactions` table, which it does even when that module
-is the only one selected. A whole-lane run happens to win that ordering; a
-four-part run of the same candidate does not, and the part owning that module
-correctly fails with five skips against the whole lane's one.
+The hosted gate runs one execution job, not a matrix. Partitioning a lane is
+safe only where every module in it establishes its own prerequisites. A
+cross-module prerequisite — a module whose tests pass only because some other
+module created runtime state first — is one no partition of whole modules can
+satisfy, and it shows up as a conditional skip that a part takes and a whole
+lane does not. A module that reads the runtime `interactions` database creates
+that table through `require_db`, so it reports the same outcomes selected alone
+as it does beside the whole lane.
 
-That is a cross-module prerequisite, which no partition of whole modules can
-satisfy: such a module has to establish its own store. Until every module in
-the lane is self-sufficient, enabling a matrix would fail the gate for every
-candidate. Prove coverage equivalence — an unpartitioned run and a partitioned
-run of the same candidate reporting the same skip count — before changing the
-topology.
+Confirm that property for a lane before changing its topology: run an
+unpartitioned verification of one candidate and a partitioned verification of
+the same candidate, and require the total skip count to be identical.
 
 Note also that a workflow change cannot verify itself: `pull_request_target`
 and `workflow_dispatch` both resolve the workflow definition from the base
