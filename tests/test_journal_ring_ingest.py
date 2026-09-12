@@ -36,7 +36,7 @@ def _captured_result(conversation_id="conv-1"):
         "conversation_id": conversation_id,
         "claude_intent": False,
         "task": None,
-        "journal_capture": {"path": "Personal/Log/2026-08-23.md", "created": True},
+        "journal_capture": {"path": "LifeOS/Log/Journal/2026-08-23.md", "created": True},
     }
 
 

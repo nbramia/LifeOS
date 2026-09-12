@@ -207,7 +207,7 @@ def test_rejects_writes_into_reserved_journal_dir(app_and_vault, bad_path, monke
     assert r.status_code == 400, r.text
     assert r.json()["detail"] == (
         "path must not target Personal/Journal/ (reserved for the generated "
-        "daily journal; capture free-form notes under Personal/Log/ instead)"
+        "daily journal; capture free-form notes under LifeOS/Log/Journal/ instead)"
     )
     assert not (vault / "Personal" / "Journal").exists()
 
@@ -222,9 +222,10 @@ def test_rejects_reserved_journal_dir_regardless_of_mode(app_and_vault, monkeypa
 
 
 def test_allows_writes_into_sibling_personal_log_dir(app_and_vault, monkeypatch):
-    # Personal/Log/ (the journal persona's capture target) is unaffected —
-    # only the Personal/Journal/ subtree itself is reserved. True regardless
-    # of whether the journal persona is enabled; enable it here to exercise
+    # Personal/Log/ (an ordinary sibling directory, not the journal persona's
+    # capture target — that's LifeOS/Log/Journal/) is unaffected — only the
+    # Personal/Journal/ subtree itself is reserved. True regardless of
+    # whether the journal persona is enabled; enable it here to exercise
     # the stricter (default/maintainer) state.
     _enable_journal_persona(monkeypatch)
     c, vault = app_and_vault

@@ -7,15 +7,33 @@ tool-use schema. execute_tool() dispatches by name and returns a string result.
 import asyncio
 import contextvars
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 from api.services.google_auth import resolve_account, get_configured_accounts
+from api.services.journal_capture import JOURNAL_PERSONA_ID
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# Tools excluded from the journal persona's advertised catalog:
+# journal is a filing surface, not an orchestrator, so it never sees the
+# tools that would let it act directly on the operator's calendar, inbox,
+# memory, or workout log, or file a human-queue card on their behalf.
+JOURNAL_EXCLUDED_TOOLS = frozenset({
+    "create_calendar_event",
+    "update_calendar_event",
+    "delete_calendar_event",
+    "create_email_draft",
+    "send_email_draft",
+    "save_memory",
+    "manage_workouts",
+    "manage_human_queue",
+    "manage_reminders",
+})
 
 # ---------------------------------------------------------------------------
 # Email send gate (draft → confirm → send)
@@ -580,6 +598,14 @@ TOOL_DEFINITIONS = [
                     "type": "boolean",
                     "description": "Enable (true) or pause (false) the schedule (for update).",
                 },
+                "bot": {
+                    "type": "string",
+                    "description": (
+                        "Telegram bot to notify from — a name from the registry "
+                        "(config/telegram_bots.json) or 'primary'; empty = primary."
+                    ),
+                },
+                "timezone": {"type": "string", "description": "IANA timezone for the schedule (defaults to the install timezone)."},
                 "persona_id": {"type": "string", "description": "Persona used for this schedule's agent prompt."},
                 "model_id": {"type": "string", "description": "Explicit executor model id."},
                 "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]},
@@ -930,6 +956,27 @@ TOOL_DEFINITIONS = [
 TOOL_DEFINITIONS[-1]["cache_control"] = {"type": "ephemeral"}
 
 
+def tools_for_persona(persona_id: str) -> list[dict]:
+    """Tool defs to advertise to the model this turn.
+
+    Every persona except `journal` gets the full catalog. Journal is a
+    filing surface, not an orchestrator, so `JOURNAL_EXCLUDED_TOOLS` is
+    dropped from what it can even see — narrower than a prompt instruction
+    not to use them, and enforced again at execution time by
+    `_journal_tool_gate` below in case the model names one anyway.
+    """
+    if persona_id != JOURNAL_PERSONA_ID:
+        return TOOL_DEFINITIONS
+    filtered = [t for t in TOOL_DEFINITIONS if t["name"] not in JOURNAL_EXCLUDED_TOOLS]
+    # The cache breakpoint above may have been carried by an excluded tool
+    # (it currently sits on the last definition in the full list) — move it
+    # onto the new last entry via a shallow copy, rather than mutating the
+    # shared TOOL_DEFINITIONS dict this list borrows its other entries from.
+    if filtered and "cache_control" not in filtered[-1]:
+        filtered[-1] = {**filtered[-1], "cache_control": {"type": "ephemeral"}}
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Tool execution
 # ---------------------------------------------------------------------------
@@ -964,9 +1011,107 @@ async def execute_tool(name: str, tool_input: dict) -> str:
 _SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_human_queue", "manage_reminders", "manage_schedules", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
 
 
-async def execute_tool_parallel(name: str, tool_input: dict) -> str:
+_MESSAGE_TAG_RE = re.compile(r"#[\w-]+")
+
+
+def _field_attested(key: str, value: str, low_message: str) -> bool:
+    """A field is attested by an explicit `key:value` annotation (the
+    operator's own writing convention, e.g. `key:callmom`) or by the value
+    appearing inside quotes — never by the value merely occurring somewhere
+    in the message's prose, which would attest ordinary words that happen to
+    match an operator field name (e.g. "opus" in "the opus recording")."""
+    key_l, value_l = key.lower(), value.lower()
+    pair = re.search(
+        rf"(?<![\w:]){re.escape(key_l)}\s*:\s*{re.escape(value_l)}(?![\w:])",
+        low_message,
+    )
+    if pair:
+        return True
+    return bool(re.search(rf'["\']{re.escape(value_l)}["\']', low_message))
+
+
+def _journal_filter_task_create_input(tool_input: dict, user_message: str) -> dict:
+    """Strip any tag or operator field on a journal-turn `manage_tasks` create
+    that the model invented rather than copied from the user's own message:
+    journal never assigns or orchestrates, so an item it files stays
+    unassigned unless the operator explicitly wrote the tag or field value
+    themselves. A tag is attested only if its literal `#tag` text appears as
+    one of the message's own tags (not merely as a substring of a longer
+    tag); a field is attested per `_field_attested` above.
+    """
+    message = user_message or ""
+    low = message.lower()
+    message_tags = {t.lower() for t in _MESSAGE_TAG_RE.findall(message)}
+    filtered = dict(tool_input)
+    tags = filtered.get("tags")
+    if tags:
+        filtered["tags"] = [
+            t for t in tags if f"#{str(t).lstrip('#').lower()}" in message_tags
+        ]
+    fields = filtered.get("fields")
+    if fields:
+        filtered["fields"] = {
+            k: v for k, v in fields.items()
+            if v is not None and str(v).strip() and _field_attested(k, str(v), low)
+        }
+    return filtered
+
+
+def _journal_tool_gate(name: str, tool_input: dict, user_message: str) -> tuple[Optional[dict], Optional[str]]:
+    """Enforce the journal persona's filing-only boundary at execution time —
+    defense in depth behind `tools_for_persona`'s advertised-tool filter, in
+    case the model names an excluded tool or a disallowed action
+    on one it does have (`manage_tasks`/`manage_schedules` stay advertised
+    for create/list). A `manage_schedules` create that doesn't name a `bot`
+    is defaulted to the journal bot when one is configured, so a journal
+    notify-schedule pings the journal surface rather than the primary bot.
+    Returns `(allowed_input, None)` to proceed with the (possibly filtered)
+    input, or `(None, error_message)` to refuse the call without ever
+    reaching the handler.
+    """
+    if name in JOURNAL_EXCLUDED_TOOLS:
+        return None, f"Error: '{name}' is not available on the journal persona."
+    if name == "manage_tasks":
+        action = tool_input.get("action")
+        if action in ("complete", "update"):
+            return None, (
+                f"Error: manage_tasks action '{action}' is not available on "
+                "the journal persona — journal files work, it does not "
+                "complete or edit existing tasks."
+            )
+        if action == "create":
+            return _journal_filter_task_create_input(tool_input, user_message), None
+    if name == "manage_schedules":
+        action = tool_input.get("action")
+        if action not in ("create", "list"):
+            return None, (
+                f"Error: manage_schedules action '{action}' is not available on "
+                "the journal persona — journal files work, it does not "
+                "update or delete existing schedules."
+            )
+        schedule_action = tool_input.get("schedule_action")
+        if schedule_action not in (None, "", "notify"):
+            return None, (
+                "Error: manage_schedules only supports schedule_action='notify' "
+                "on the journal persona; journal never orchestrates prompt, "
+                "endpoint, or agent schedules."
+            )
+        if action == "create" and not tool_input.get("bot"):
+            from api.services.telegram import valid_bot_names
+            if JOURNAL_PERSONA_ID in valid_bot_names():
+                tool_input = {**tool_input, "bot": JOURNAL_PERSONA_ID}
+    return tool_input, None
+
+
+async def execute_tool_parallel(
+    name: str, tool_input: dict, *, persona_id: str = "", user_message: str = "",
+) -> str:
     """Like execute_tool but runs sync handlers in a thread to avoid blocking the event loop."""
     try:
+        if persona_id == JOURNAL_PERSONA_ID:
+            tool_input, gate_error = _journal_tool_gate(name, tool_input, user_message)
+            if gate_error:
+                return gate_error
         handler = _TOOL_HANDLERS.get(name)
         if not handler:
             return f"Error: Unknown tool '{name}'"
@@ -2403,6 +2548,8 @@ def _schedule_create(inp: dict) -> str:
         message_type=inp.get("message_type", "static" if action == "notify" else action),
         message_content=inp.get("message_content", ""),
         executor=inp.get("executor", ""),
+        bot=inp.get("bot", ""),
+        timezone=inp.get("timezone", ""),
         persona_id=inp.get("persona_id", ""),
         model_id=inp.get("model_id", ""),
         effort=inp.get("effort", ""),
@@ -2439,7 +2586,7 @@ def _schedule_update(inp: dict) -> str:
     fields = {
         key: inp[key]
         for key in ("name", "schedule_type", "schedule_value", "message_content", "executor", "enabled",
-                    "persona_id", "model_id", "effort", "host", "working_dir")
+                    "bot", "timezone", "persona_id", "model_id", "effort", "host", "working_dir")
         if inp.get(key) is not None
     }
     if inp.get("schedule_action") is not None:

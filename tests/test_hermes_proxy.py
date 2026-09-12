@@ -2841,8 +2841,8 @@ async def test_capture_failure_fails_the_request_and_never_reaches_hermes(
     # Same "day dir exists as a file" trick tests/test_journal_capture.py's
     # equivalent native-path test (test_capture_failure_is_a_clean_error_and_
     # no_stream) uses to force a real write failure out of capture_fragment().
-    (journal_vault / "Personal").mkdir()
-    (journal_vault / "Personal" / "Log").write_text("not a directory")
+    (journal_vault / "LifeOS" / "Log").mkdir(parents=True)
+    (journal_vault / "LifeOS" / "Log" / "Journal").write_text("not a directory")
 
     resp = await proxy_client.post(
         "/api/hermes/ask/stream",

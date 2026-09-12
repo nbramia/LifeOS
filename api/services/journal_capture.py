@@ -1,16 +1,13 @@
 """
-Deterministic capture of journal fragments into `Personal/Log/YYYY-MM-DD.md` (#674).
+Deterministic capture of journal fragments into `LifeOS/Log/Journal/YYYY-MM-DD.md`.
 
-The `journal` persona (#659) used to be told to append the fragment itself via
-`lifeos_vault_write`. That tool exists only in the MCP catalog, not in the
-native agentic loop's `TOOL_DEFINITIONS`, so the model could not call it — it
-emitted the bullet as chat prose instead and every fragment was silently lost
-while the reply looked like a successful capture.
-
-Capture is therefore done here, in code, before the model is involved at all:
-the fragment survives whether or not the model does anything useful, and the
-model is left only the *interpretation* job (does this fragment warrant a task
-or a schedule? does it need one clarifying question?).
+The `journal` persona has no tool that can perform this write:
+`lifeos_vault_write` exists only in the MCP catalog, not in the native
+agentic loop's `TOOL_DEFINITIONS`. Capture is therefore done here, in code,
+before the model is involved at all — the fragment survives whether or not
+the model does anything useful, and the model is left only the
+*interpretation* job (does this fragment warrant a task or a schedule? does
+it need one clarifying question?).
 
 Privacy: the fragment text is never logged and never appears in a raised
 error. Only the vault-relative path of the day file is ever recorded.
@@ -35,8 +32,10 @@ JOURNAL_PERSONA_ID = "journal"
 
 # Fixed capture target. Not caller-supplied and not configurable: it is what
 # keeps this write path from being able to reach `Personal/Journal/`, the
-# gsheet_sync-generated subtree that `api/routes/vault.py` reserves.
-_LOG_DIR_PARTS = ("Personal", "Log")
+# gsheet_sync-generated subtree that `api/routes/vault.py` reserves. A
+# subdirectory of `LifeOS/Log/` rather than the container itself, so this
+# never mixes into `LifeOS/Log/Pebble/`, which the Pebble producer owns.
+_LOG_DIR_PARTS = ("LifeOS", "Log", "Journal")
 
 # Collapse a multi-line fragment onto the single line a bullet needs. Only
 # newlines (and the whitespace hugging them) are touched — the fragment is
@@ -56,13 +55,13 @@ class JournalCaptureError(RuntimeError):
 class CaptureResult:
     """Proof that a fragment reached disk. Returned only after fsync."""
 
-    path: str  # vault-relative, e.g. "Personal/Log/2026-08-24.md"
+    path: str  # vault-relative, e.g. "LifeOS/Log/Journal/2026-08-24.md"
     created: bool  # True if this fragment started the day's file
 
 
 def log_path_for(day: date) -> str:
     """Vault-relative path of a day's capture log."""
-    return f"{_LOG_DIR_PARTS[0]}/{_LOG_DIR_PARTS[1]}/{day.isoformat()}.md"
+    return "/".join((*_LOG_DIR_PARTS, f"{day.isoformat()}.md"))
 
 
 def _frontmatter(day: date) -> str:
@@ -101,8 +100,10 @@ def capture_fragment(text: str, *, now: Optional[datetime] = None) -> CaptureRes
     # fire if _LOG_DIR_PARTS itself is ever changed to something unsafe — but a
     # write path that quietly relocates is exactly the failure this issue is
     # about, so it is checked rather than assumed.
-    if target.parent != (vault_root / _LOG_DIR_PARTS[0] / _LOG_DIR_PARTS[1]):
-        raise JournalCaptureError("journal capture target resolved outside Personal/Log/")
+    if target.parent != vault_root.joinpath(*_LOG_DIR_PARTS):
+        raise JournalCaptureError(
+            f"journal capture target resolved outside {'/'.join(_LOG_DIR_PARTS)}/"
+        )
 
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
