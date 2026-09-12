@@ -8,11 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from scripts.test_lane_registry import LANES, classify, marker
+from scripts.test_lane_registry import LANES, classify, marker, scope_of
 from scripts.verification_evidence import PRIVACY_AUDIT_NODEID
 
 _REPORTS: dict[str, str] = {}
 _NOT_APPLICABLE_CANDIDATES: dict[str, str] = {}
+_SCOPE_SECONDS: dict[str, float] = {}
 _KEYBOARD_INTERRUPTED = False
 
 
@@ -54,6 +55,7 @@ def pytest_configure(config):
     _configure_output(config, "lifeos_lane_execution", "_lifeos_lane_execution")
     _REPORTS.clear()
     _NOT_APPLICABLE_CANDIDATES.clear()
+    _SCOPE_SECONDS.clear()
     _KEYBOARD_INTERRUPTED = False
 
 
@@ -99,6 +101,14 @@ def pytest_keyboard_interrupt(excinfo):
 
 
 def pytest_runtest_logreport(report):
+    # Every phase counts toward a module's cost, because a module's whole
+    # setup/call/teardown time is what a part actually pays for taking it.
+    # xdist forwards its workers' reports to the controller, so this sum is
+    # the lane's total serial work regardless of the width it ran at.
+    duration = getattr(report, "duration", None)
+    if isinstance(duration, (int, float)):
+        scope = scope_of(report.nodeid)
+        _SCOPE_SECONDS[scope] = _SCOPE_SECONDS.get(scope, 0.0) + float(duration)
     if report.outcome == "skipped" and report.nodeid == PRIVACY_AUDIT_NODEID:
         longrepr = report.longrepr
         reason = longrepr[2] if isinstance(longrepr, tuple) and len(longrepr) == 3 else str(longrepr)
@@ -184,4 +194,10 @@ def pytest_sessionfinish(session, exitstatus):
             "reports": dict(sorted(reports.items())),
             "not_applicable_candidates": dict(sorted(_NOT_APPLICABLE_CANDIDATES.items())),
             "collected_count": len(session.items),
+            # Measured cost per module scope, the unit the verifier assigns
+            # to parts. Observational: it feeds balance, never a pass/fail
+            # determination.
+            "scope_durations": {
+                scope: round(seconds, 3) for scope, seconds in sorted(_SCOPE_SECONDS.items())
+            },
         })

@@ -19,6 +19,16 @@ BY_NAME = {lane["name"]: lane for lane in LANES}
 EXECUTION_ORDER = ("fast-unit", "slow", "browser-free", "browser-server", "server", "integration")
 
 
+def scope_of(nodeid: str) -> str:
+    """The module a collected node ID belongs to.
+
+    The partition unit shared by the lane plugin's duration receipt and the
+    verifier's part assignment: everything before the first ``::``, so a
+    module's tests -- classes included -- are one indivisible unit.
+    """
+    return nodeid.split("::", 1)[0]
+
+
 def marker(lane: dict) -> str:
     return " and ".join((*lane["required"], *(f"not {name}" for name in lane["excluded"])))
 
