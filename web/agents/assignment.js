@@ -194,7 +194,7 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   container.innerHTML = `
     <div class="assignment-row" data-row="engine">
       <label class="assignment-label">Engine</label>
-      <select class="assignment-engine" data-field="assignee" ${fieldsDisabled ? 'disabled' : ''}>
+      <select class="assignment-engine" data-field="engine" ${fieldsDisabled ? 'disabled' : ''}>
         <option value="">unassigned</option>
         ${ENGINES.map(e => `<option value="${e}" ${currentEngine === e ? 'selected' : ''}>${e}</option>`).join('')}
       </select>
@@ -221,7 +221,7 @@ export function renderAssignmentPickers(container, card, opts = {}) {
     <div class="assignment-error" data-field="error" hidden></div>
   `;
 
-  const engineEl = container.querySelector('[data-field="assignee"]');
+  const engineEl = container.querySelector('[data-field="engine"]');
   const modelRow = container.querySelector('[data-row="model"]');
   const modelEl = container.querySelector('[data-field="model"]');
   const effortRow = container.querySelector('[data-row="effort"]');

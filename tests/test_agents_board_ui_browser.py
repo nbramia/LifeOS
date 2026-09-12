@@ -4470,3 +4470,180 @@ class TestMutationUndo:
         expect(page.locator(".toast")).to_have_count(1, timeout=5000)
         expect(page.locator(".toast")).to_contain_text("landed in Human queue")
         expect(page.locator(".toast .toast-action")).to_have_count(0)
+
+
+class TestStaleRefreshGuard:
+    """`fetchBoard` reports whether it actually refreshed, so a caller that
+    chains work on cannot paint from a board it failed to fetch."""
+
+    def test_a_failed_refresh_does_not_repaint_the_drawer_from_stale_data(
+        self, page: Page, agents_base_url,
+    ):
+        """The issue's own repro: hold an effort save, change the assignee,
+        let the fields PUT commit, and fail the follow-up board GETs. The
+        deferred rebuild must not paint the pre-save snapshot over the
+        committed value, and must leave the drawer's snapshot unadvanced so a
+        later good frame can still converge it.
+        """
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-sonnet-5"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        effort_select.select_option("high")
+        expect(effort_select).to_have_value("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        # Every board refresh from here on fails, registered before the
+        # assignee change so no successful refresh can land in the window and
+        # make the assertion below pass for the wrong reason.
+        board_gets = {"n": 0}
+
+        def failing_board(route):
+            board_gets["n"] += 1
+            route.fulfill(status=500, content_type="application/json", body='{"detail": "boom"}')
+
+        page.route(re.compile(r"/api/agents/board$"), failing_board)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        # The effort save commits, arming the deferred rebuild against a board
+        # it cannot read.
+        release(0)
+        _wait_for(lambda: board_gets["n"] >= 1, page=page)
+        page.wait_for_timeout(300)  # the rebuild would land here if unguarded
+
+        # The committed value is still on screen — the unguarded rebuild
+        # painted the pre-save snapshot here, resetting effort to its default
+        # even though the save had committed.
+        expect(page.locator(".drawer-assignment [data-field='effort']")).to_have_value("high")
+
+    def test_the_deferred_rebuild_holds_off_when_its_own_refresh_fails(
+        self, page: Page, agents_base_url,
+    ):
+        """The rebuild that waits for an in-flight picker save re-fetches the
+        board before painting. That fetch failing must stop the paint: the
+        committed picker value stays on screen instead of being reset to the
+        pre-save snapshot's default.
+        """
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-sonnet-5"}
+        task_puts: list = []
+        lane_calls: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        # Count board GETs, and fail only the ones after a chosen point, so
+        # the held save can settle normally (its own follow-up GET succeeds)
+        # and only the deferred rebuild's own fetch is the one that fails.
+        gets = {"n": 0, "fail_from": None}
+
+        def counting_board(route):
+            gets["n"] += 1
+            if gets["fail_from"] is not None and gets["n"] >= gets["fail_from"]:
+                route.fulfill(status=500, content_type="application/json", body='{"detail": "boom"}')
+                return
+            route.fallback()
+
+        page.route(re.compile(r"/api/agents/board$"), counting_board)
+
+        page.locator('[data-card-id="t7"]').click()
+        effort_select = page.locator(".drawer-assignment [data-field='effort']")
+        effort_select.select_option("high")
+        expect(effort_select).to_have_value("high")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        page.locator(".drawer-assignee").evaluate(
+            "el => { el.focus(); el.value = 'codex'; "
+            "el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+
+        # The save's own follow-up GET lands; the deferred rebuild's does not.
+        gets["fail_from"] = gets["n"] + 2
+        release(0)
+        _wait_for(lambda: gets["n"] >= gets["fail_from"], page=page)
+        page.wait_for_timeout(300)  # the paint would land here if unguarded
+
+        expect(page.locator(".drawer-assignment [data-field='effort']")).to_have_value("high")
+
+    def test_a_frame_whose_only_change_is_a_picker_value_rebuilds_the_drawer(
+        self, page: Page, agents_base_url,
+    ):
+        """`fields` participates in the drawer diff. Without it a frame whose
+        only change is a picker value reads as "nothing changed", so a drawer
+        showing a stale picker has no later frame that can converge it.
+        """
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-sonnet-5"}
+        board_stream_frames: list[str] = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t7"]').click()
+        expect(page.locator('#board-drawer [data-field="meta"]')).to_contain_text("claude-sonnet-5")
+        # Focus must sit outside the drawer, or updateOpenDrawer withholds the
+        # repaint for a reason unrelated to the diff under test. The drawer
+        # backdrop swallows clicks elsewhere, so blur directly.
+        page.evaluate("() => document.activeElement && document.activeElement.blur()")
+
+        for card in board_state["lanes"]["assigned"]:
+            if card["id"] == "t7":
+                card["fields"] = {"model": "claude-opus-5"}
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        expect(page.locator('#board-drawer [data-field="meta"]')).to_contain_text(
+            "claude-opus-5", timeout=5000,
+        )
+
+
+class TestDrawerFieldHooks:
+    """Every control in the drawer is addressable on its own."""
+
+    def test_no_two_drawer_controls_share_a_data_field_hook(self, page: Page, agents_base_url):
+        """A collision binds a handler to whichever control happens to render
+        first — a wrong write to the vault with nothing failing at the point
+        the mistake is made.
+        """
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t7"]').click()
+        expect(page.locator("#board-drawer .assignment-engine")).to_have_count(1)
+        duplicates = page.evaluate(
+            """() => {
+                const seen = {};
+                for (const el of document.querySelectorAll('#board-drawer [data-field]')) {
+                    seen[el.dataset.field] = (seen[el.dataset.field] || 0) + 1;
+                }
+                return Object.entries(seen).filter(([, n]) => n > 1);
+            }"""
+        )
+        assert duplicates == [], duplicates
+
+    def test_the_drawer_assignee_select_is_the_one_bound_to_the_lane_write(
+        self, page: Page, agents_base_url,
+    ):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator('[data-card-id="t7"]').click()
+        page.locator("#board-drawer .drawer-assignee").select_option("hermes")
+        _wait_for(lambda: bool(lane_calls), page)
+        assert lane_calls[0] == {"lane": "assigned", "assignee": "hermes"}, lane_calls
+

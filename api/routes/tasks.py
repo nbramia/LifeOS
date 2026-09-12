@@ -718,8 +718,31 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
                 if error is not None:
                     raise HTTPException(status_code=error[0], detail=error[1])
 
+    # The guard above clears a board-marked field change against a read taken
+    # before the write. Re-check it against the snapshot the write lands on,
+    # under the store's own lock, so a card the worker claims in that window
+    # cannot take the planned write. Requests without the marker never reach
+    # this and pay for no extra work.
+    from api.services.agent_board import CardDecisionChanged as _CardDecisionChanged
+
+    precondition = None
+    if board_marked_field_change:
+        from api.services import agent_board
+
+        def precondition(current) -> None:  # noqa: F811 — only defined on the guarded path
+            fresh_error = agent_board.evaluate_card_action(
+                current.status, current.tags, "field_edit",
+                has_live_session=_get_session_store().has_live_session(
+                    task_id, status=current.status, tags=current.tags,
+                ),
+            )
+            if fresh_error is not None:
+                raise agent_board.CardDecisionChanged(fresh_error)
+
     try:
-        task = manager.update(task_id, **updates)
+        task = manager.update(task_id, _precondition=precondition, **updates)
+    except _CardDecisionChanged as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:

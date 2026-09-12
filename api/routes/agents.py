@@ -1274,15 +1274,45 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
         status_code, detail = plan.error
         raise HTTPException(status_code=status_code, detail=detail)
 
+    # The plan above comes from a read taken before the write. Re-plan against
+    # the snapshot the write actually lands on, under the store's own lock: a
+    # card that is worker-owned by then would otherwise take a plan that strips
+    # the assignee tag off a live card, the exact desync these rules exist to
+    # prevent. A concurrent change the decision does not read re-plans to the
+    # same answer and proceeds, with its own tags carried into the write.
+    def replan(current) -> "agent_board.LaneMovePlan":
+        fresh = agent_board.plan_lane_move(
+            current.status, current.tags, body.lane, body.assignee,
+            has_live_session=session_store.has_live_session(
+                card_id, status=current.status, tags=current.tags,
+            ),
+        )
+        if fresh.error is not None:
+            raise agent_board.CardDecisionChanged(fresh.error)
+        return fresh
+
     write_kwargs: dict[str, Any] = {}
     if plan.status is not None:
         write_kwargs["status"] = plan.status
     if plan.tags is not None:
-        write_kwargs["tags"] = plan.tags
+        # Recomputed per CAS attempt so the tags written are the ones the
+        # re-validated decision produced, not the stale read's.
+        write_kwargs["_tags_merge"] = lambda current_tags: (
+            replan_result["plan"].tags
+            if replan_result.get("plan") is not None and replan_result["plan"].tags is not None
+            else current_tags
+        )
 
     if write_kwargs:
+        replan_result: dict[str, Any] = {}
         try:
-            task = task_manager.update(card_id, **write_kwargs)
+            task = task_manager.update(
+                card_id,
+                _precondition=lambda current: replan_result.__setitem__("plan", replan(current)),
+                **write_kwargs,
+            )
+        except agent_board.CardDecisionChanged as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         except TaskConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
@@ -1794,8 +1824,22 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
     strip = {agent_board.RUNNING_TAG, agent_board.BLOCKED_TAG, agent_board.HUMAN_TAG}
     new_tags = [t for t in task.tags if t.lstrip("#").lower() not in strip]
 
+    def cancel_still_allowed(current) -> None:
+        fresh_error = agent_board.evaluate_card_action(
+            current.status, current.tags, "cancel",
+            has_live_session=session_store.has_live_session(
+                card_id, status=current.status, tags=current.tags,
+            ),
+        )
+        if fresh_error is not None:
+            raise agent_board.CardDecisionChanged(fresh_error)
+
     try:
-        task = task_manager.update(card_id, status="cancelled", tags=new_tags)
+        task = task_manager.update(
+            card_id, status="cancelled", tags=new_tags, _precondition=cancel_still_allowed,
+        )
+    except agent_board.CardDecisionChanged as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     except TaskConflictError as exc:
         # The session (if any) is already torn down at this point — only
         # the task write conflicted. Say so and invite a retry, rather

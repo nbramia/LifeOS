@@ -9,6 +9,7 @@ monkeypatch so the real vault/data directories are never touched.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
 from pathlib import Path
@@ -1694,3 +1695,139 @@ class TestHermesLabelAndCodexStream:
         assert '"kind": "system_session_meta"' in body
         assert '"kind": "assistant_message"' in body
         assert "hello from a synthetic codex rollout" in body
+
+
+@pytest.mark.unit
+class TestGuardedWriteRevalidation:
+    """A decision computed against an earlier read must never be applied to a
+    state it was not computed for. The re-check runs inside the store's own
+    CAS, against the exact snapshot being written.
+    """
+
+    def test_lane_move_is_refused_when_the_worker_claims_the_card_first(
+        self, client, stores,
+    ):
+        """The route reads an unclaimed card, plans an allowed move, and the
+        worker claims it before the write lands. The stale plan would strip
+        the assignee tag off a card that is now live.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create("Synthetic claimed race", tags=["claude"], status="todo")
+
+        original_get = task_manager.get
+        claimed = {"done": False}
+
+        def claim_between_read_and_write(task_id):
+            found = original_get(task_id)
+            if task_id != task.id or found is None:
+                return found
+            unclaimed = copy.deepcopy(found)
+            if not claimed["done"]:
+                claimed["done"] = True
+                # The worker claims it in the store; the route keeps the
+                # unclaimed snapshot it already read and plans against that.
+                task_manager.update(task_id, tags=["claude", "agent-running"], status="in_progress")
+            return unclaimed
+
+        task_manager.get = claim_between_read_and_write
+        try:
+            response = client.put(
+                f"/api/agents/board/cards/{task.id}/lane", json={"lane": "unassigned"},
+            )
+        finally:
+            task_manager.get = original_get
+        assert response.status_code == 409, response.text
+        assert "worker" in response.json()["detail"] or "agent" in response.json()["detail"]
+        after = task_manager.get(task.id)
+        assert "claude" in after.tags, after.tags
+        assert "agent-running" in after.tags, after.tags
+
+    def test_lane_move_still_succeeds_when_nothing_the_decision_depends_on_changed(
+        self, client, stores,
+    ):
+        """A concurrent edit the decision does not read must not manufacture a
+        refusal — the re-check is decision-level, not a version pin.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create("Synthetic unclaimed", tags=["me"], status="todo")
+
+        original_get = task_manager.get
+        edited = {"done": False}
+
+        def notes_edit_between_read_and_write(task_id):
+            found = original_get(task_id)
+            if task_id == task.id and found is not None and not edited["done"]:
+                edited["done"] = True
+                task_manager.update(task_id, notes="A concurrent synthetic note")
+            return found
+
+        task_manager.get = notes_edit_between_read_and_write
+        try:
+            response = client.put(
+                f"/api/agents/board/cards/{task.id}/lane",
+                json={"lane": "assigned", "assignee": "codex"},
+            )
+        finally:
+            task_manager.get = original_get
+        assert response.status_code == 200, response.text
+        after = task_manager.get(task.id)
+        assert after.tags == ["codex"]
+        assert "A concurrent synthetic note" in (after.notes or "")
+
+    def test_lane_move_writes_the_tags_the_revalidated_decision_produced(
+        self, client, stores,
+    ):
+        """A user tag added between the read and the write survives: the write
+        carries the re-planned tags, not the stale read's.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create("Synthetic tag race", tags=["me"], status="todo")
+
+        original_get = task_manager.get
+        added = {"done": False}
+
+        def tag_added_between_read_and_write(task_id):
+            found = original_get(task_id)
+            if task_id == task.id and found is not None and not added["done"]:
+                added["done"] = True
+                task_manager.update(task_id, tags=["me", "urgent"])
+            return found
+
+        task_manager.get = tag_added_between_read_and_write
+        try:
+            response = client.put(
+                f"/api/agents/board/cards/{task.id}/lane",
+                json={"lane": "assigned", "assignee": "codex"},
+            )
+        finally:
+            task_manager.get = original_get
+        assert response.status_code == 200, response.text
+        after = task_manager.get(task.id)
+        assert "urgent" in after.tags, after.tags
+        assert "codex" in after.tags
+        assert "me" not in after.tags
+
+    def test_cancel_is_refused_when_the_card_finishes_first(self, client, stores):
+        """Cancel cleared against an unfinished read must not be applied to a
+        card that reached a finished state in the meantime.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create("Synthetic cancel race", tags=["claude"], status="todo")
+
+        original_get = task_manager.get
+        finished = {"done": False}
+
+        def finish_between_read_and_write(task_id):
+            found = original_get(task_id)
+            if task_id == task.id and found is not None and not finished["done"]:
+                finished["done"] = True
+                task_manager.update(task_id, status="done")
+            return found
+
+        task_manager.get = finish_between_read_and_write
+        try:
+            response = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        finally:
+            task_manager.get = original_get
+        assert response.status_code == 409, response.text
+        assert task_manager.get(task.id).status == "done"
