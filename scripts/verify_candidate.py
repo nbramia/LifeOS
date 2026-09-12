@@ -38,11 +38,15 @@ from scripts.verification_evidence import (
     PRIVACY_AUDIT_NOT_APPLICABLE_REASON, VerificationInputs,
     fingerprint_named_files, safe_environment_fingerprint,
 )
-from scripts.test_lane_registry import BY_NAME, EXECUTION_ORDER, marker
+from scripts.test_lane_registry import BY_NAME, EXECUTION_ORDER, marker, scope_of
 
 
 RUNNER_INPUTS = ("scripts/test.sh", "scripts/test-lanes.sh", "scripts/test_lane_registry.py", "scripts/test_lane_plugin.py", "scripts/verify_candidate.py", "scripts/verification_evidence.py", "pyproject.toml")
 DEPENDENCY_INPUTS = ("requirements.txt",)
+# The recorded per-module cost the part assignment balances against, beside
+# this script so a partitioned run reads the runner's record rather than the
+# candidate's.
+SCOPE_DURATION_RECORD = "lane_scope_durations.json"
 
 
 def default_evidence_root() -> Path:
@@ -398,7 +402,134 @@ def _parse_shard(shard_index: int | None, shard_count: int | None) -> tuple[int,
     return (shard_index, shard_count)
 
 
-def _expected(inventory: Mapping, required_lanes: Sequence[str] | None = None, nodeid_paths: Sequence[str] | None = None, nodeids: Sequence[str] | None = None, shard: tuple[int, int] | None = None) -> dict[str, tuple[str, ...]]:
+def load_scope_durations(path: Path | None = None) -> dict[str, float]:
+    """The recorded per-module cost the part assignment balances against.
+
+    Read from the *runner's* own directory, not the candidate's, so every
+    part of one partitioned candidate assigns from byte-identical input: the
+    parts only agree on a total, disjoint partition because they all derive
+    it from the same collected inventory and the same record. An absent,
+    unreadable, or malformed record yields an empty mapping -- the partition
+    then falls back to estimating from test counts, which is correct but
+    less balanced, so a first run before anything is recorded still runs
+    every test exactly once.
+    """
+    record = path or Path(__file__).with_name(SCOPE_DURATION_RECORD)
+    try:
+        loaded = json.loads(record.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(loaded, Mapping):
+        return {}
+    return {
+        scope: float(seconds)
+        for scope, seconds in loaded.items()
+        if isinstance(scope, str) and isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds >= 0
+    }
+
+
+def merge_scope_durations(receipts: Sequence[Path]) -> dict[str, float]:
+    """Sum the measured per-scope seconds every named lane-execution receipt
+    reports, so one record covers a whole run however many lanes or parts it
+    was spread over."""
+    merged: dict[str, float] = {}
+    for receipt in receipts:
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        durations = payload.get("scope_durations")
+        if not isinstance(durations, Mapping):
+            raise CandidateVerificationError(f"lane receipt records no scope durations: {receipt}")
+        for scope, seconds in durations.items():
+            if not isinstance(scope, str) or not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
+                raise CandidateVerificationError(f"lane receipt has a malformed scope duration: {receipt}")
+            merged[scope] = round(merged.get(scope, 0.0) + float(seconds), 3)
+    if not merged:
+        raise CandidateVerificationError("no lane receipt recorded any scope duration")
+    return dict(sorted(merged.items()))
+
+
+def partition_lane_scopes(
+    lane_nodeids: Mapping[str, Sequence[str]],
+    part_index: int,
+    part_count: int,
+    durations: Mapping[str, float] | None = None,
+) -> dict[str, tuple[str, ...]]:
+    """Assign whole module scopes to ``part_count`` parts; return one part.
+
+    A part is a set of complete module scopes, never a fraction of one, so
+    no test is separated from state its own module established elsewhere. A
+    test that is separated takes a conditional skip, and the verifier's
+    completeness rule requires every requested node ID to report ``passed``,
+    so such a split fails the lane however green each piece looks on its
+    own. Scopes are assigned across every requested lane at once, so a
+    module whose tests span two lanes still lands wholly in one part.
+
+    The assignment is longest-processing-time-first: scopes descend by
+    recorded cost (ties broken by name) and each goes to the part carrying
+    the least so far (ties broken by the lowest part index). Every input is
+    ordered, so repeated collection of the same candidate produces the same
+    assignment. A scope with no recorded duration is estimated at the
+    recorded mean seconds per test times its own test count, which
+    degenerates to balancing by test count when nothing is recorded at all.
+    """
+    if part_count < 1:
+        raise CandidateVerificationError("part count must be at least 1")
+    if not (0 <= part_index < part_count):
+        raise CandidateVerificationError("part index must be within 0..part_count-1")
+    if part_count == 1:
+        return {lane: tuple(nodeids) for lane, nodeids in lane_nodeids.items()}
+    recorded = durations or {}
+    by_scope: dict[str, dict[str, list[str]]] = {}
+    for lane, nodeids in lane_nodeids.items():
+        for nodeid in nodeids:
+            by_scope.setdefault(scope_of(nodeid), {}).setdefault(lane, []).append(nodeid)
+    if not by_scope:
+        raise CandidateVerificationError("unexpected zero-scope selection")
+    counts = {scope: sum(len(ids) for ids in lanes.values()) for scope, lanes in by_scope.items()}
+    known = [scope for scope in by_scope if scope in recorded]
+    known_seconds = sum(recorded[scope] for scope in known)
+    known_tests = sum(counts[scope] for scope in known)
+    per_test = (known_seconds / known_tests) if known_tests and known_seconds > 0 else 1.0
+    weights = {
+        scope: recorded[scope] if scope in recorded else per_test * counts[scope]
+        for scope in by_scope
+    }
+    loads = [0.0] * part_count
+    assigned: dict[str, tuple[str, ...]] = {}
+    for scope in sorted(by_scope, key=lambda name: (-weights[name], name)):
+        target = min(range(part_count), key=lambda index: (loads[index], index))
+        loads[target] += weights[scope]
+        if target != part_index:
+            continue
+        for lane, nodeids in by_scope[scope].items():
+            assigned[lane] = assigned.get(lane, ()) + tuple(nodeids)
+    if not assigned:
+        raise CandidateVerificationError(
+            f"part {part_index} of {part_count} selected zero of {len(by_scope)} module scopes"
+        )
+    # Lanes keep the inventory's own sorted node-ID order, and only the lanes
+    # this part actually owns appear -- a lane a part owns nothing of is
+    # omitted rather than reported as an empty run.
+    return {
+        lane: tuple(sorted(assigned[lane]))
+        for lane in lane_nodeids
+        if lane in assigned
+    }
+
+
+def _parse_part(part_index: int | None, part_count: int | None) -> tuple[int, int] | None:
+    """Both or neither; validated before any snapshot or subprocess starts."""
+    if part_index is None and part_count is None:
+        return None
+    if part_index is None or part_count is None:
+        raise CandidateVerificationError("--part-index and --part-count must be given together")
+    if part_count < 1:
+        raise CandidateVerificationError("--part-count must be at least 1")
+    if not (0 <= part_index < part_count):
+        raise CandidateVerificationError("--part-index must be within 0..--part-count-1")
+    return (part_index, part_count)
+
+
+def _expected(inventory: Mapping, required_lanes: Sequence[str] | None = None, nodeid_paths: Sequence[str] | None = None, nodeids: Sequence[str] | None = None, shard: tuple[int, int] | None = None, part: tuple[int, int] | None = None, scope_durations: Mapping[str, float] | None = None) -> dict[str, tuple[str, ...]]:
     lanes = inventory.get("lanes")
     if not isinstance(lanes, Mapping):
         raise CandidateVerificationError("lane inventory lacks lanes")
@@ -434,6 +565,14 @@ def _expected(inventory: Mapping, required_lanes: Sequence[str] | None = None, n
                 chosen = sliced
             if chosen:
                 selected[name] = chosen
+    if part is not None and selected:
+        # Applied across every requested lane at once, after each lane's own
+        # filters, so one module's tests stay in one part even when they span
+        # two lanes.
+        selected = partition_lane_scopes(
+            selected, *part,
+            durations=scope_durations if scope_durations is not None else load_scope_durations(),
+        )
     if requested_nodeids is not None:
         missing = requested_nodeids - eligible_nodeids
         if missing:
@@ -718,6 +857,7 @@ def verify_candidate(
     nodeid_paths: Sequence[str] | None = None,
     nodeids: Sequence[str] | None = None,
     shard: tuple[int, int] | None = None,
+    part: tuple[int, int] | None = None,
     capacity_held_externally: bool = False,
     external_capacity_wait_seconds: float | None = None,
     metrics_run_id: str | None = None,
@@ -767,14 +907,23 @@ def verify_candidate(
             raise CandidateVerificationError("caller environment is not a safe execution control")
         execution_environment.update(environment)
     inventory = collect_lane_inventory(Path(snapshot.dest_root), inventory_receipt_root or evidence_root, execution_environment)
-    expected = _expected(inventory, required_lanes, nodeid_paths, nodeids, shard)
-    # The lane's full collected count, independent of any shard/path/node-id
-    # filter -- recorded so a single shard's own evidence and run log can
-    # show a coverage gap after the fact, without consuming another job's.
-    lane_totals = {name: len(inventory["lanes"][name]["nodeids"]) for name in expected}
+    expected = _expected(inventory, required_lanes, nodeid_paths, nodeids, shard, part)
+    # Every requested lane's full collected count, independent of any
+    # shard/part/path/node-id filter -- recorded so a single part's own
+    # evidence and run log show a coverage gap after the fact, without
+    # consuming another job's. A lane this part owns none of still appears
+    # here, so its absence from ``lane_selected_counts`` is visible.
+    requested = tuple(required_lanes) if required_lanes is not None else tuple(EXECUTION_ORDER)
+    lane_totals = {
+        name: len(inventory["lanes"][name]["nodeids"])
+        for name in requested
+        if inventory["lanes"][name]["nodeids"]
+    }
     scope = ",".join(sorted(expected))
     if shard is not None:
         scope += f"[shard={shard[0]}/{shard[1]}]"
+    if part is not None:
+        scope += f"[part={part[0]}/{part[1]}]"
     inputs = build_inputs(snapshot, inventory, base_identity=base_identity, merge_identity=merge_identity, environment={name: execution_environment[name] for name in _HERMETIC_ENVIRONMENT}, scope_identity=scope)
     reusable, reason = store.reusable(inputs, expected)
     # An adapter that inherits arbitrary ambient environment cannot prove that
@@ -912,6 +1061,7 @@ def verify_pytest_candidate(
     nodeid_paths: Sequence[str] | None = None,
     nodeids: Sequence[str] | None = None,
     shard: tuple[int, int] | None = None,
+    part: tuple[int, int] | None = None,
     capacity_held_externally: bool = False,
     process_started: Callable[[int, float], None] | None = None,
     external_capacity_wait_seconds: float | None = None,
@@ -936,7 +1086,7 @@ def verify_pytest_candidate(
         capacity=capacity, metrics=metrics, workers=workers,
         hermetic_environment=True, required_lanes=required_lanes,
         runtime_root=runtime_root, nodeid_paths=nodeid_paths, nodeids=nodeids,
-        shard=shard,
+        shard=shard, part=part,
         capacity_held_externally=capacity_held_externally,
         external_capacity_wait_seconds=external_capacity_wait_seconds,
         metrics_run_id=metrics_run_id,
@@ -1019,6 +1169,7 @@ def verify_git_ref(
     metrics: MetricsRecorder | None = None,
     lane_log_dir: Path | None = None,
     shard: tuple[int, int] | None = None,
+    part: tuple[int, int] | None = None,
     parallel_browser_free: bool = False,
     retry_reason: str | None = None,
 ) -> VerificationResult:
@@ -1065,7 +1216,7 @@ def verify_git_ref(
             worktree, snapshot, evidence_root, required_lanes=required_lanes,
             base_identity=base_identity, merge_identity=resolved_sha, workers=workers,
             capacity=capacity, metrics=metrics, lane_log_dir=lane_log_dir,
-            shard=shard, parallel_browser_free=parallel_browser_free,
+            shard=shard, part=part, parallel_browser_free=parallel_browser_free,
             capacity_held_externally=True,
             process_started=register_group,
             external_capacity_wait_seconds=capacity_wait_seconds,
@@ -1079,6 +1230,23 @@ def verify_git_ref(
                 pass
         cleanup()
         atexit.unregister(cleanup)
+
+
+_PART_COUNT_HELP = (
+    "total parts --lanes' whole module scopes are deterministically assigned to, "
+    "balanced by recorded per-scope duration"
+)
+
+
+def _parse_selection(args) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+    """Node-ID shards and module-scope parts are alternative partitions of
+    the same lanes; requesting both at once would compose two independent
+    slicings into a selection no other run could reproduce."""
+    shard = _parse_shard(args.shard_index, args.shard_count)
+    part = _parse_part(args.part_index, args.part_count)
+    if shard is not None and part is not None:
+        raise CandidateVerificationError("--shard-* and --part-* are alternative partitions; give only one")
+    return shard, part
 
 
 def _main(argv: Sequence[str]) -> int:
@@ -1098,6 +1266,8 @@ def _main(argv: Sequence[str]) -> int:
     pushed.add_argument("--lane-log-dir", type=Path)
     pushed.add_argument("--shard-index", type=int, default=None, help="this run's shard, in 0..--shard-count-1")
     pushed.add_argument("--shard-count", type=int, default=None, help="total shards --lanes' node IDs are deterministically partitioned into")
+    pushed.add_argument("--part-index", type=int, default=None, help="this run's part, in 0..--part-count-1")
+    pushed.add_argument("--part-count", type=int, default=None, help=_PART_COUNT_HELP)
     pushed.add_argument(
         "--parallel-browser-free", action="store_true",
         help="explicit opt-in (default off) to run the browser-free lane under xdist with "
@@ -1126,6 +1296,8 @@ def _main(argv: Sequence[str]) -> int:
     local.add_argument("--nodeids", default=None, help="comma-separated exact collected node IDs")
     local.add_argument("--shard-index", type=int, default=None, help="this run's shard, in 0..--shard-count-1")
     local.add_argument("--shard-count", type=int, default=None, help="total shards --lanes' node IDs are deterministically partitioned into")
+    local.add_argument("--part-index", type=int, default=None, help="this run's part, in 0..--part-count-1")
+    local.add_argument("--part-count", type=int, default=None, help=_PART_COUNT_HELP)
     local.add_argument(
         "--run-id", default=os.environ.get("LIFEOS_DEV_METRICS_RUN_ID"),
         help="reuse an external opaque run identity (e.g. LIFEOS_DEV_METRICS_RUN_ID from a "
@@ -1137,17 +1309,47 @@ def _main(argv: Sequence[str]) -> int:
         "--workers as its worker count; browser-free never touches a live server, so this is "
         "safe, but the default stays serial until measurements justify changing it",
     )
+    record = sub.add_parser(
+        "record-scope-durations",
+        help="rewrite the per-scope duration record the part assignment balances against, "
+        "from the lane-execution receipts one completed run left behind",
+    )
+    record.add_argument(
+        "--lane-log-dir", required=True, action="append", type=Path,
+        help="a --lane-log-dir from a completed run; repeat to merge every part of a partitioned run",
+    )
+    record.add_argument(
+        "--output", type=Path, default=None,
+        help=f"where to write the record (default: the runner's own scripts/{SCOPE_DURATION_RECORD})",
+    )
     args = parser.parse_args(argv)
+    if args.command == "record-scope-durations":
+        receipts = sorted(
+            receipt
+            for directory in args.lane_log_dir
+            for receipt in directory.glob("*.json")
+        )
+        try:
+            if not receipts:
+                raise CandidateVerificationError("no lane-execution receipt found in the given directories")
+            merged = merge_scope_durations(receipts)
+        except (CandidateVerificationError, OSError, json.JSONDecodeError) as exc:
+            print(f"scope duration record failed: {exc}", file=sys.stderr)
+            return 1
+        output = args.output or Path(__file__).with_name(SCOPE_DURATION_RECORD)
+        output.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"recorded {len(merged)} module scopes from {len(receipts)} lane receipts to {output}")
+        return 0
     evidence_root = args.evidence_root or default_evidence_root()
     if args.command == "pushed-ref":
         lanes = tuple(filter(None, args.lanes.split(",")))
         try:
-            shard = _parse_shard(args.shard_index, args.shard_count)
+            shard, part = _parse_selection(args)
             capacity = CapacityManager(max_run_workers=args.capacity_max_run_workers)
             result = verify_git_ref(
                 args.repository, args.sha, evidence_root, base_identity=args.base,
                 required_lanes=lanes, workers=args.workers, capacity=capacity,
-                lane_log_dir=args.lane_log_dir, shard=shard,
+                lane_log_dir=args.lane_log_dir, shard=shard, part=part,
                 parallel_browser_free=args.parallel_browser_free,
                 retry_reason=args.retry_reason,
             )
@@ -1159,7 +1361,7 @@ def _main(argv: Sequence[str]) -> int:
         try:
             nodeid_paths = _parse_optional_exact_csv(args.paths, "--paths")
             nodeids = _parse_optional_exact_csv(args.nodeids, "--nodeids")
-            shard = _parse_shard(args.shard_index, args.shard_count)
+            shard, part = _parse_selection(args)
         except CandidateVerificationError as exc:
             print(f"candidate verification failed: {exc}", file=sys.stderr)
             return 1
@@ -1185,7 +1387,7 @@ def _main(argv: Sequence[str]) -> int:
                 capacity=capacity,
                 nodeid_paths=nodeid_paths,
                 nodeids=nodeids,
-                shard=shard,
+                shard=shard, part=part,
                 capacity_held_externally=True,
                 process_started=register_group,
                 external_capacity_wait_seconds=capacity_wait_seconds,
@@ -1231,7 +1433,7 @@ def _supervised_main(argv: Sequence[str]) -> int:
             signal.signal(signum, handler)
 
 
-__all__ = ["CandidateVerificationError", "VerificationResult", "build_inputs", "collect_lane_inventory", "default_evidence_root", "infer_local_base", "make_hermetic_environment", "pytest_lane_executor", "shard_nodeids", "verify_candidate", "verify_pytest_candidate", "verify_git_ref"]
+__all__ = ["CandidateVerificationError", "VerificationResult", "build_inputs", "collect_lane_inventory", "default_evidence_root", "infer_local_base", "load_scope_durations", "make_hermetic_environment", "merge_scope_durations", "partition_lane_scopes", "pytest_lane_executor", "shard_nodeids", "verify_candidate", "verify_pytest_candidate", "verify_git_ref"]
 
 
 if __name__ == "__main__":
