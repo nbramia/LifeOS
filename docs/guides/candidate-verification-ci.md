@@ -112,7 +112,14 @@ the candidate, pushes it to a disposable staging ref, dispatches
 `workflow_dispatch` against it, polls for the resulting check via the
 GitHub API filtered to the dedicated App's `app_id` (never accepting a
 same-named check from any other app), and only then performs the atomic
-`main`+source publish. See `scripts/candidate_publisher.py`'s module
+`main`+source publish. Because a candidate SHA is deterministic from its
+content, re-publishing an unchanged branch rebuilds the identical candidate,
+which may already carry verdicts from an earlier dispatch; the publisher
+snapshots those check-run ids before dispatching and accepts only a check this
+invocation caused, taking the most recently started completed one rather than
+whichever the API lists first. That holds in both directions — a stale failure
+never refuses a candidate whose fresh run passed, and a stale success never
+authorizes publication of one whose own run did not. See `scripts/candidate_publisher.py`'s module
 docstring for the exact ordering guarantee (construct before verify, verify
 before publish).
 

@@ -36,7 +36,7 @@ from urllib.parse import urlencode
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -441,12 +441,69 @@ class CheckOutcome:
     detail: str
 
 
+def _is_required_check(check: dict, check_name: str, trusted_app_id: Optional[int]) -> bool:
+    """Name-and-issuer match for the required check.
+
+    The issuer half is the property that closes the forged-context
+    vulnerability a generic Actions-app-only match cannot: a
+    candidate-controlled workflow can trivially post a check with a matching
+    *name*, but it cannot authenticate as an app whose credentials it was
+    never given.
+    """
+    if check.get("name") != check_name:
+        return False
+    if trusted_app_id is not None and (check.get("app") or {}).get("id") != trusted_app_id:
+        return False
+    return True
+
+
+def _check_recency_key(check: dict) -> tuple[str, int]:
+    """Order matching checks newest-last. `started_at` is ISO-8601 UTC, so
+    it sorts lexicographically; the check id breaks ties and stands in for a
+    missing timestamp, since GitHub check-run ids increase monotonically.
+    """
+    return (str(check.get("started_at") or ""), int(check.get("id") or 0))
+
+
+def existing_check_run_ids(
+    repository: str,
+    candidate_sha: str,
+    check_name: str,
+    *,
+    trusted_app_id: Optional[int] = None,
+    run: Runner = subprocess.run,
+) -> frozenset[int]:
+    """The required-check runs already present on a candidate SHA.
+
+    A candidate SHA is deterministic from its content, so a re-publish of an
+    unchanged branch targets a SHA that may already carry verdicts from an
+    earlier dispatch. Snapshotting their ids before dispatching lets the wait
+    below accept only a check this invocation actually caused.
+
+    A failed query raises rather than returning an empty set: "no existing
+    checks" and "could not tell" must not collapse into the same value, since
+    the empty set is precisely what would let a stale verdict through.
+    """
+    result = _run(run, ["gh", "api", f"repos/{repository}/commits/{candidate_sha}/check-runs"])
+    if result.returncode != 0:
+        raise PublisherError(
+            f"could not read existing {check_name!r} checks for {candidate_sha}: {result.stderr.strip()}"
+        )
+    payload = json.loads(result.stdout)
+    return frozenset(
+        int(check["id"])
+        for check in payload.get("check_runs", [])
+        if _is_required_check(check, check_name, trusted_app_id) and check.get("id") is not None
+    )
+
+
 def await_required_check(
     repository: str,
     candidate_sha: str,
     check_name: str,
     *,
     trusted_app_id: Optional[int] = None,
+    ignore_check_run_ids: Iterable[int] = (),
     timeout_seconds: float = 1800.0,
     poll_interval_seconds: float = 5.0,
     run: Runner = subprocess.run,
@@ -461,28 +518,34 @@ def await_required_check(
     issuer configuration before any GitHub call and always supplies a
     dedicated app id.
 
-    When ``trusted_app_id`` is given, a check with a matching name but a
-    different reporting app is not accepted — this is exactly the property
-    that closes the forged-context vulnerability a generic Actions-app-only
-    match cannot: a candidate-controlled workflow can trivially post a check
-    with a matching *name*, but it cannot authenticate as an app whose
-    credentials it was never given.
+    ``ignore_check_run_ids`` carries the verdicts that already existed on this
+    SHA before the caller dispatched its own verification (see
+    ``existing_check_run_ids``). They are never accepted, in either direction:
+    a stale failure would refuse a candidate that now passes, and a stale
+    success would authorize publication on the strength of a run that did not
+    verify this dispatch. The second is the graver of the two, so the filter
+    is applied before the conclusion is ever read.
+
+    Among the checks that remain, the most recently started completed one
+    decides the outcome — never whichever the API happened to list first.
     """
+    ignored = frozenset(ignore_check_run_ids)
     deadline = now() + timeout_seconds
     while True:
         result = _run(run, ["gh", "api", f"repos/{repository}/commits/{candidate_sha}/check-runs"])
         if result.returncode == 0:
             payload = json.loads(result.stdout)
-            for check in payload.get("check_runs", []):
-                if check.get("name") != check_name:
-                    continue
-                if trusted_app_id is not None and (check.get("app") or {}).get("id") != trusted_app_id:
-                    continue
-                if check.get("status") != "completed":
-                    break
-                conclusion = check.get("conclusion")
+            completed = [
+                check for check in payload.get("check_runs", [])
+                if _is_required_check(check, check_name, trusted_app_id)
+                and check.get("id") not in ignored
+                and check.get("status") == "completed"
+            ]
+            if completed:
+                newest = max(completed, key=_check_recency_key)
+                conclusion = newest.get("conclusion")
                 if conclusion == "success":
-                    return CheckOutcome("success", f"{check_name} succeeded at {check.get('completed_at')}")
+                    return CheckOutcome("success", f"{check_name} succeeded at {newest.get('completed_at')}")
                 return CheckOutcome("failure", f"{check_name} concluded {conclusion}")
         if now() >= deadline:
             return CheckOutcome("timeout", f"no matching completed {check_name} within {timeout_seconds}s")
@@ -713,13 +776,21 @@ def publish_pull_request(
     staging_ref = staging_ref_for(pr.number, candidate.sha)
     push_candidate_for_verification(repo, remote, candidate.sha, staging_ref, run=run)
     try:
+        # Snapshot before dispatching, so the wait below can tell this
+        # invocation's verdict from one already on the SHA. Re-publishing an
+        # unchanged branch rebuilds the identical candidate, which is a normal
+        # recovery path rather than an error.
+        preexisting_checks = existing_check_run_ids(
+            repository, candidate.sha, check_name, trusted_app_id=trusted_app_id, run=run,
+        )
         trigger_trusted_verification(
             repository, workflow_file, candidate.sha, pr_number=pr.number,
             trusted_runner_sha=expected_main_sha, ref=pr.base_ref, run=run,
         )
         check = await_required_check(
             repository, candidate.sha, check_name,
-            trusted_app_id=trusted_app_id, timeout_seconds=check_timeout_seconds,
+            trusted_app_id=trusted_app_id, ignore_check_run_ids=preexisting_checks,
+            timeout_seconds=check_timeout_seconds,
             poll_interval_seconds=check_poll_interval_seconds, run=run, sleep=sleep, now=now,
         )
         if check.state != "success":

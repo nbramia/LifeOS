@@ -406,6 +406,122 @@ def test_await_required_check_ignores_a_matching_name_from_the_wrong_app():
     assert sleeps == [1]
 
 
+def _check_run(run_id: int, conclusion: str, *, started_at: str, app_id: int = 42,
+               name: str = "candidate-verification") -> dict:
+    return {
+        "id": run_id, "name": name, "status": "completed", "conclusion": conclusion,
+        "started_at": started_at, "completed_at": started_at, "app": {"id": app_id},
+    }
+
+
+def test_await_required_check_ignores_a_verdict_that_predates_this_dispatch():
+    """A candidate SHA is deterministic from its content, so re-publishing an
+    unchanged branch lands on a SHA that may already carry an earlier verdict.
+    A stale failure must not refuse a candidate whose fresh run passed."""
+    payload = {"check_runs": [
+        _check_run(1, "failure", started_at="2026-01-01T00:00:00Z"),
+        _check_run(2, "success", started_at="2026-01-01T01:00:00Z"),
+    ]}
+
+    def run(args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    outcome = await_required_check(
+        "nbramia/LifeOS", "deadbeef", "candidate-verification", trusted_app_id=42,
+        ignore_check_run_ids={1},
+        timeout_seconds=100, poll_interval_seconds=1, run=run,
+        sleep=lambda s: None, now=iter([0, 1]).__next__,
+    )
+    assert outcome.state == "success"
+
+
+def test_await_required_check_never_publishes_on_a_stale_success():
+    """The graver direction: a success left over from an earlier dispatch must
+    not authorize publication of a candidate whose own run failed."""
+    payload = {"check_runs": [
+        _check_run(7, "success", started_at="2026-01-01T00:00:00Z"),
+        _check_run(8, "failure", started_at="2026-01-01T01:00:00Z"),
+    ]}
+
+    def run(args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    outcome = await_required_check(
+        "nbramia/LifeOS", "deadbeef", "candidate-verification", trusted_app_id=42,
+        ignore_check_run_ids={7},
+        timeout_seconds=100, poll_interval_seconds=1, run=run,
+        sleep=lambda s: None, now=iter([0, 1]).__next__,
+    )
+    assert outcome.state == "failure"
+
+
+def test_await_required_check_waits_rather_than_reading_an_ignored_verdict():
+    """With only the ignored verdict present, the wait keeps polling — it does
+    not fall back to the stale answer, and it does not report success."""
+    calls = {"n": 0}
+    stale_only = {"check_runs": [_check_run(1, "success", started_at="2026-01-01T00:00:00Z")]}
+
+    def run(args, **kwargs):
+        calls["n"] += 1
+        return SimpleNamespace(returncode=0, stdout=json.dumps(stale_only), stderr="")
+
+    clock = iter([0, 50, 150])
+    outcome = await_required_check(
+        "nbramia/LifeOS", "deadbeef", "candidate-verification", trusted_app_id=42,
+        ignore_check_run_ids={1},
+        timeout_seconds=100, poll_interval_seconds=1, run=run,
+        sleep=lambda s: None, now=lambda: next(clock),
+    )
+    assert outcome.state == "timeout"
+    assert calls["n"] >= 2
+
+
+def test_await_required_check_reads_the_newest_completed_check_not_the_first_listed():
+    """Ordering in the API response must not decide the verdict."""
+    payload = {"check_runs": [
+        _check_run(3, "failure", started_at="2026-01-01T00:00:00Z"),
+        _check_run(4, "success", started_at="2026-01-01T02:00:00Z"),
+    ]}
+
+    def run(args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    outcome = await_required_check(
+        "nbramia/LifeOS", "deadbeef", "candidate-verification", trusted_app_id=42,
+        timeout_seconds=100, poll_interval_seconds=1, run=run,
+        sleep=lambda s: None, now=iter([0, 1]).__next__,
+    )
+    assert outcome.state == "success"
+
+
+def test_existing_check_run_ids_snapshots_only_the_trusted_issuer():
+    payload = {"check_runs": [
+        _check_run(1, "failure", started_at="2026-01-01T00:00:00Z"),
+        _check_run(2, "success", started_at="2026-01-01T00:00:00Z", app_id=999999),
+        _check_run(3, "success", started_at="2026-01-01T00:00:00Z", name="something-else"),
+    ]}
+
+    def run(args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    assert publisher.existing_check_run_ids(
+        "nbramia/LifeOS", "deadbeef", "candidate-verification", trusted_app_id=42, run=run,
+    ) == frozenset({1})
+
+
+def test_existing_check_run_ids_raises_rather_than_reporting_none_on_a_failed_query():
+    """"No existing checks" and "could not tell" must not collapse into the
+    same value — the empty set is exactly what would let a stale verdict
+    through."""
+    def run(args, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    with pytest.raises(publisher.PublisherError, match="could not read existing"):
+        publisher.existing_check_run_ids(
+            "nbramia/LifeOS", "deadbeef", "candidate-verification", trusted_app_id=42, run=run,
+        )
+
+
 def test_await_required_check_times_out_when_nothing_matches():
     def run(args, **kwargs):
         return SimpleNamespace(returncode=0, stdout=json.dumps({"check_runs": []}), stderr="")
@@ -726,6 +842,10 @@ def test_open_shared_head_ref_is_rechecked_before_atomic_publish(monkeypatch, tm
 
     def fake_run(args, **kwargs):
         nonlocal list_calls
+        if args[:2] == ["gh", "api"] and str(args[-1]).endswith("/check-runs"):
+            # The pre-dispatch snapshot of verdicts already on this candidate;
+            # counted separately from the head-exclusivity listings below.
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"check_runs": []}), stderr="")
         if args[:2] == ["gh", "api"]:
             list_calls += 1
             rows = [{
