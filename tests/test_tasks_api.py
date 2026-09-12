@@ -467,6 +467,42 @@ class TestTasksAPI:
         assert "answer or kill the session first" in response.json()["detail"]
         mock_task_manager.update.assert_not_called()
 
+    def test_board_marker_field_edit_is_revalidated_against_the_state_it_writes_to(
+        self, client, mock_task_manager,
+    ):
+        """The guard clears this write against a read taken before the write.
+        The store invokes the precondition against the snapshot the write lands
+        on, so a card claimed in that window is refused there rather than
+        taking the planned write.
+        """
+        from api.services.task_manager import Task
+
+        self._set_current(mock_task_manager, tags=["codex"])
+        claimed_at_write_time = Task(
+            id="abc12345", description="Pull 1099 from Schwab", status="in_progress",
+            tags=["codex", "agent-running"], source_file="LifeOS/Tasks/Finance.md", line_number=7,
+        )
+
+        def update(task_id, **kwargs):
+            precondition = kwargs.get("_precondition")
+            assert precondition is not None, "a board-marked field edit must carry a precondition"
+            precondition(claimed_at_write_time)
+            raise AssertionError("the precondition should have refused before any write")
+
+        mock_task_manager.update.side_effect = update
+        response = client.put("/api/tasks/abc12345", json={
+            "fields": {"effort": "high", "assigned_by": "board"},
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+
+    def test_an_unmarked_update_carries_no_precondition(self, client, mock_task_manager):
+        """The re-check is only for the guarded path — an ordinary write must
+        not pay for it."""
+        self._set_current(mock_task_manager, tags=["codex"])
+        client.put("/api/tasks/abc12345", json={"priority": "high"})
+        assert mock_task_manager.update.call_args.kwargs.get("_precondition") is None
+
     def test_board_marker_status_change_on_unclaimed_agent_card_succeeds(self, client, mock_task_manager):
         """Positive case: the identical board-marked status patch on an
         UNCLAIMED agent card is unaffected."""

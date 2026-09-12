@@ -165,6 +165,20 @@ CANCEL_ALREADY_FINISHED_ERROR: tuple[int, str] = (
     "this card is already finished — nothing to cancel",
 )
 
+class CardDecisionChanged(Exception):
+    """A guarded write's decision does not hold for the state being written.
+
+    Raised from a `TaskManager.update` precondition, which runs against the
+    exact snapshot the write will land on. It carries the refusal the fresh
+    evaluation produced, so the caller reports the real reason — that the card
+    is worker-owned, say — rather than a generic conflict.
+    """
+
+    def __init__(self, error: tuple[int, str]) -> None:
+        super().__init__(error[1])
+        self.status_code, self.detail = error
+
+
 # The actions every server write path that can touch an agent-owned card's
 # lane, assignee, or status funnels through `evaluate_card_action`.
 CARD_ACTIONS: tuple[str, ...] = ("lane_move", "assignee_change", "field_edit", "cancel")

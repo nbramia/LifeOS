@@ -131,7 +131,7 @@ def test_renders_engine_model_effort_host_pickers(page: Page, web_base_url):
     _render(page, {"id": "t1", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {}})
 
     container = page.locator("#test-assignment-container")
-    expect(container.locator("[data-field='assignee']")).to_be_visible()
+    expect(container.locator("[data-field='engine']")).to_be_visible()
     expect(container.locator("[data-row='model']")).to_be_visible()
     expect(container.locator("[data-row='effort']")).to_be_visible()
     expect(container.locator("[data-row='host']")).to_be_visible()
@@ -175,7 +175,7 @@ def test_changing_engine_updates_tags_and_saves(page: Page, web_base_url):
     _load_module(page, web_base_url)
     _render(page, {"id": "t5", "title": "Fix the printer", "tags": ["agent"], "assignee": "", "fields": {}})
 
-    page.locator("[data-field='assignee']").select_option("codex")
+    page.locator("[data-field='engine']").select_option("codex")
     calls = page.evaluate("() => window.__lastCalls")
     assert len(calls) == 1
     assert calls[0]["patch"]["tags"] == ["codex", "agent"]
@@ -194,7 +194,7 @@ def test_all_pickers_including_engine_disabled_when_fields_policy_refuses(page: 
         "policy": {"fields": {"allowed": False, "reason": "the worker owns this task"}},
     })
     container = page.locator("#test-assignment-container")
-    expect(container.locator("[data-field='assignee']")).to_be_disabled()
+    expect(container.locator("[data-field='engine']")).to_be_disabled()
     expect(container.locator("[data-field='model']")).to_be_disabled()
     expect(container.locator("[data-field='effort']")).to_be_disabled()
     expect(container.locator("[data-field='host']")).to_be_disabled()
@@ -208,7 +208,7 @@ def test_fields_policy_allowed_leaves_engine_and_pickers_enabled(page: Page, web
     _load_module(page, web_base_url)
     _render(page, {"id": "t10", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {}})
     container = page.locator("#test-assignment-container")
-    expect(container.locator("[data-field='assignee']")).to_be_enabled()
+    expect(container.locator("[data-field='engine']")).to_be_enabled()
     expect(container.locator("[data-field='effort']")).to_be_enabled()
 
 
@@ -470,14 +470,14 @@ def test_unknown_flagged_model_option_survives_engine_change(page: Page, web_bas
     assert model_select.input_value() == "claude-legacy-9"
 
     # claude -> codex: both show the model picker.
-    page.locator("[data-field='assignee']").select_option("codex")
+    page.locator("[data-field='engine']").select_option("codex")
     unknown_option = model_select.locator("option[data-unknown='true']")
     expect(unknown_option).to_have_count(1)
     expect(unknown_option).to_have_text("claude-legacy-9 (unknown)")
     assert model_select.input_value() == "claude-legacy-9"
 
     # codex -> claude: still survives.
-    page.locator("[data-field='assignee']").select_option("claude")
+    page.locator("[data-field='engine']").select_option("claude")
     unknown_option = model_select.locator("option[data-unknown='true']")
     expect(unknown_option).to_have_count(1)
     expect(unknown_option).to_have_text("claude-legacy-9 (unknown)")
@@ -509,7 +509,7 @@ def test_foreign_model_dropped_to_engine_default_even_via_a_hidden_model_row(pag
     # claude -> local: local's own catalog is empty and hides the model
     # row, but claude's catalog (fetched in the same response) lists
     # claude-sonnet-5 -- dropped immediately.
-    page.locator("[data-field='assignee']").select_option("local")
+    page.locator("[data-field='engine']").select_option("local")
     assert model_select.input_value() == ""
     expect(model_select.locator("option[data-unknown='true']")).to_have_count(0)
     calls = page.evaluate("() => window.__lastCalls")
@@ -517,7 +517,7 @@ def test_foreign_model_dropped_to_engine_default_even_via_a_hidden_model_row(pag
     assert calls[0]["patch"]["fields"]["model"] is None
 
     # local -> codex: stays cleared, the PUT still carries null.
-    page.locator("[data-field='assignee']").select_option("codex")
+    page.locator("[data-field='engine']").select_option("codex")
     assert model_select.input_value() == ""
     calls = page.evaluate("() => window.__lastCalls")
     assert len(calls) == 2
@@ -999,7 +999,7 @@ def test_unknown_flagged_host_option_survives_engine_change(page: Page, web_base
     assert host_select.input_value() == "retired-box"
 
     # claude -> codex: both show the host picker.
-    page.locator("[data-field='assignee']").select_option("codex")
+    page.locator("[data-field='engine']").select_option("codex")
     unknown_option = host_select.locator("option[data-unknown='true']")
     expect(unknown_option).to_have_count(1)
     expect(unknown_option).to_have_text("retired-box (unknown)")

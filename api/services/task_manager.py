@@ -436,6 +436,17 @@ class TaskManager:
         fields_patch = kwargs.pop("fields", None)
         notes_merge = kwargs.pop("_notes_merge", None)
         expected_updated_at = kwargs.pop("_expected_updated_at", None)
+        # Internal board action hook: called with the latest task, before any
+        # of this write's own changes are applied, on every CAS retry. A
+        # caller that decided this write was permitted against an earlier read
+        # re-checks that decision here, against the exact snapshot being
+        # written and under the same lock, and raises to abort. Unlike
+        # `_expected_updated_at` this refuses only when the decision itself
+        # changed, so a concurrent edit the decision does not depend on (a
+        # notes change, say) still goes through.
+        precondition = kwargs.pop("_precondition", None)
+        if precondition is not None and not callable(precondition):
+            raise ValueError("_precondition must be callable")
         # Internal board action hook: unlike a literal ``tags=`` patch, this
         # callback is evaluated against the latest in-memory task on every
         # CAS retry. That lets lifecycle writers and the board's user-tag
@@ -473,6 +484,8 @@ class TaskManager:
                 t = copy.copy(t)
                 if expected_updated_at is not None and t.updated_at != expected_updated_at:
                     raise TaskConflictError("task changed since the action was opened")
+                if precondition is not None:
+                    precondition(t)
                 for key, value in kwargs.items():
                     if key == "status" and value == "done" and t.status != "done":
                         t.done_date = _today()

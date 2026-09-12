@@ -68,6 +68,10 @@ const LIFECYCLE_TAGS = new Set([
 // whether an SSE tick needs to rebuild the drawer at all (#850 finding 2).
 const DRAWER_EDITABLE_FIELDS = [
   'title', 'notes', 'tags', 'context', 'assignee', 'lane',
+  // The model/effort/host pickers write here. Without it a frame whose only
+  // change is a picker value is read as "nothing changed", so a drawer
+  // showing a stale picker has no later frame that can converge it.
+  'fields',
   // Scheduled-card fields, editable in the drawer since #850 finding 4.
   'name', 'message_content', 'enabled',
   // Full schedule editing — trigger type, timing, timezone, action,
@@ -306,11 +310,20 @@ export function initBoard() {
     }
   }
 
+  // Resolves `true` when this call actually refreshed the board and `false`
+  // when it did not, so a caller that chains work on can tell a current board
+  // from a stale one. A caller that ignores the result is unaffected, and the
+  // failure still reaches the operator through the connection-state label
+  // alone — this adds a signal for callers, it does not change what is shown.
   function fetchBoard() {
     return fetch('/api/agents/board')
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
       .then(applyBoard)
-      .catch(err => { if (connStateEl) connStateEl.textContent = 'failed: ' + err; });
+      .then(() => true)
+      .catch(err => {
+        if (connStateEl) connStateEl.textContent = 'failed: ' + err;
+        return false;
+      });
   }
 
   function connectStream() {
@@ -1109,11 +1122,15 @@ export function initBoard() {
           showToast(`Card landed in ${laneLabel(data.lane)}, not ${laneLabel(targetLane)}.`, false);
         }
         // Callers that need to know where the card actually ended up (e.g.
-        // the composer revealing the right lane) read
-        // it off the resolved value; fetchBoard()'s own resolution (undefined)
-        // is irrelevant to them, so hand back `data` once the board refresh
-        // settles.
-        return fetchBoard().then(() => data);
+        // the composer revealing the right lane) read it off the resolved
+        // value, so hand back `data` once the board refresh settles. A caller
+        // that goes on to paint from the board also needs to know whether
+        // that refresh landed, so the outcome rides along on the same object
+        // rather than being swallowed here.
+        return fetchBoard().then((refreshed) => {
+          if (data && typeof data === 'object') data.boardRefreshed = refreshed;
+          return data;
+        });
       })
       .catch(err => {
         showToast(`Couldn't move card: ${err.message}`, true);
@@ -1906,7 +1923,7 @@ export function initBoard() {
 
     mountTagPicker(card, editableTags);
 
-    const assigneeEl = drawerEl.querySelector('[data-field="assignee"]');
+    const assigneeEl = drawerEl.querySelector('.drawer-assignee[data-field="assignee"]');
     assigneeEl.addEventListener('change', async () => {
       const value = assigneeEl.value;
       // Captured immediately, ahead of `moveCard`'s own `fetchBoard()`
@@ -1915,7 +1932,7 @@ export function initBoard() {
       // wait below on the save this handler actually started with.
       const handle = assignmentHandle;
       try {
-        await moveCard(card.id, value ? 'assigned' : 'unassigned', value || undefined);
+        const moved = await moveCard(card.id, value ? 'assigned' : 'unassigned', value || undefined);
         // moveCard already awaited fetchBoard(), so the board's own state is
         // current — but updateOpenDrawer's `!focused` check skips the
         // rebuild while the select (inside the drawer) still holds focus,
@@ -1944,12 +1961,24 @@ export function initBoard() {
         // it can sit closed, or open on a different card, by the time this
         // settles.
         const rebuild = () => attemptDrawerRebuild(card.id);
-        const settleThenRebuild = () => handle.whenIdle().then(() => fetchBoard()).then(() => {
+        const settleThenRebuild = () => handle.whenIdle().then(() => fetchBoard()).then((refreshed) => {
           if (handle.isSaving && handle.isSaving()) return settleThenRebuild();
+          // A failed refresh leaves `board` holding the pre-save snapshot.
+          // Painting from it shows the operator committed values as though
+          // they had been reset, and advancing `openCardSnapshot` would stop
+          // any later frame from noticing the difference — the picker values
+          // would stay wrong until the drawer is reopened, and the next
+          // picker change would write the stale value back to the vault.
+          // Leave both alone and let a later successful frame converge it.
+          if (!refreshed) return;
           rebuild();
         }).catch(() => {});
         if (handle && handle.isSaving && handle.isSaving()) {
           settleThenRebuild();
+        } else if (moved && moved.boardRefreshed === false) {
+          // `moveCard`'s own board refresh failed, so there is nothing
+          // fresher to paint — the same reason `settleThenRebuild` holds off
+          // above. Leave the drawer and its snapshot alone for a later frame.
         } else {
           rebuild();
         }
