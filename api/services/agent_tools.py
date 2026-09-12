@@ -7,6 +7,7 @@ tool-use schema. execute_tool() dispatches by name and returns a string result.
 import asyncio
 import contextvars
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -1009,27 +1010,48 @@ async def execute_tool(name: str, tool_input: dict) -> str:
 _SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_human_queue", "manage_reminders", "manage_schedules", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
 
 
+_MESSAGE_TAG_RE = re.compile(r"#[\w-]+")
+
+
+def _field_attested(key: str, value: str, low_message: str) -> bool:
+    """A field is attested by an explicit `key:value` annotation (the
+    operator's own writing convention, e.g. `key:callmom`) or by the value
+    appearing inside quotes — never by the value merely occurring somewhere
+    in the message's prose, which would attest ordinary words that happen to
+    match an operator field name (e.g. "opus" in "the opus recording")."""
+    key_l, value_l = key.lower(), value.lower()
+    pair = re.search(
+        rf"(?<![\w:]){re.escape(key_l)}\s*:\s*{re.escape(value_l)}(?![\w:])",
+        low_message,
+    )
+    if pair:
+        return True
+    return bool(re.search(rf'["\']{re.escape(value_l)}["\']', low_message))
+
+
 def _journal_filter_task_create_input(tool_input: dict, user_message: str) -> dict:
     """Strip any tag or operator field on a journal-turn `manage_tasks` create
     that the model invented rather than copied from the user's own message:
     journal never assigns or orchestrates, so an item it files stays
     unassigned unless the operator explicitly wrote the tag or field value
-    themselves. A tag is attested by its literal `#tag` text (case-
-    insensitive) appearing in the message; an operator field is attested by
-    its value appearing verbatim (case-insensitive) in the message.
+    themselves. A tag is attested only if its literal `#tag` text appears as
+    one of the message's own tags (not merely as a substring of a longer
+    tag); a field is attested per `_field_attested` above.
     """
-    low = (user_message or "").lower()
+    message = user_message or ""
+    low = message.lower()
+    message_tags = {t.lower() for t in _MESSAGE_TAG_RE.findall(message)}
     filtered = dict(tool_input)
     tags = filtered.get("tags")
     if tags:
         filtered["tags"] = [
-            t for t in tags if f"#{str(t).lstrip('#').lower()}" in low
+            t for t in tags if f"#{str(t).lstrip('#').lower()}" in message_tags
         ]
     fields = filtered.get("fields")
     if fields:
         filtered["fields"] = {
             k: v for k, v in fields.items()
-            if v is not None and str(v).strip() and str(v).lower() in low
+            if v is not None and str(v).strip() and _field_attested(k, str(v), low)
         }
     return filtered
 
@@ -1039,9 +1061,12 @@ def _journal_tool_gate(name: str, tool_input: dict, user_message: str) -> tuple[
     defense in depth behind `tools_for_persona`'s advertised-tool filter, in
     case the model names an excluded tool or a disallowed action
     on one it does have (`manage_tasks`/`manage_schedules` stay advertised
-    for create/list). Returns `(allowed_input, None)` to proceed with the
-    (possibly filtered) input, or `(None, error_message)` to refuse the call
-    without ever reaching the handler.
+    for create/list). A `manage_schedules` create that doesn't name a `bot`
+    is defaulted to the journal bot when one is configured, so a journal
+    notify-schedule pings the journal surface rather than the primary bot.
+    Returns `(allowed_input, None)` to proceed with the (possibly filtered)
+    input, or `(None, error_message)` to refuse the call without ever
+    reaching the handler.
     """
     if name in JOURNAL_EXCLUDED_TOOLS:
         return None, f"Error: '{name}' is not available on the journal persona."
@@ -1056,6 +1081,13 @@ def _journal_tool_gate(name: str, tool_input: dict, user_message: str) -> tuple[
         if action == "create":
             return _journal_filter_task_create_input(tool_input, user_message), None
     if name == "manage_schedules":
+        action = tool_input.get("action")
+        if action not in ("create", "list"):
+            return None, (
+                f"Error: manage_schedules action '{action}' is not available on "
+                "the journal persona — journal files work, it does not "
+                "update or delete existing schedules."
+            )
         schedule_action = tool_input.get("schedule_action")
         if schedule_action not in (None, "", "notify"):
             return None, (
@@ -1063,6 +1095,10 @@ def _journal_tool_gate(name: str, tool_input: dict, user_message: str) -> tuple[
                 "on the journal persona; journal never orchestrates prompt, "
                 "endpoint, or agent schedules."
             )
+        if action == "create" and not tool_input.get("bot"):
+            from api.services.telegram import valid_bot_names
+            if JOURNAL_PERSONA_ID in valid_bot_names():
+                tool_input = {**tool_input, "bot": JOURNAL_PERSONA_ID}
     return tool_input, None
 
 

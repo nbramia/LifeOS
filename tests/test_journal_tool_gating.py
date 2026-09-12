@@ -18,6 +18,7 @@ from api.services.agent_tools import (
     execute_tool_parallel,
     tools_for_persona,
 )
+from api.services.memory_store import MemoryStore
 from api.services.scheduler_store import SchedulerStore
 from api.services.task_manager import TaskManager
 
@@ -70,6 +71,13 @@ def sched(tmp_path, monkeypatch):
     return store
 
 
+@pytest.fixture
+def mem(tmp_path, monkeypatch):
+    store = MemoryStore(file_path=str(tmp_path / "memories.json"))
+    monkeypatch.setattr("api.services.memory_store.get_memory_store", lambda: store)
+    return store
+
+
 class TestExecuteToolParallelJournalGate:
     async def test_non_journal_turn_is_never_gated(self, tm):
         out = await execute_tool_parallel(
@@ -78,12 +86,16 @@ class TestExecuteToolParallelJournalGate:
         assert out.startswith("Task created")
         assert tm.list_tasks()[0].tags == ["invented"]
 
-    async def test_excluded_tool_is_refused_on_a_journal_turn(self):
+    async def test_excluded_tool_is_refused_on_a_journal_turn(self, mem):
+        # `mem` isolates the store so a gate regression can never reach the
+        # operator's real ~/.lifeos/memories.json or fire a live LLM call —
+        # the gate itself is what this test asserts, not a safe fallback.
         out = await execute_tool_parallel(
             "save_memory", {"content": "x"}, persona_id="journal", user_message="x",
         )
         assert out.startswith("Error:")
         assert "journal persona" in out
+        assert mem.list_memories() == []
 
     async def test_excluded_tool_is_not_refused_off_a_journal_turn(self, monkeypatch):
         # save_memory's own handler is irrelevant here -- just confirm the
@@ -149,6 +161,40 @@ class TestExecuteToolParallelJournalGate:
         created = tm.get(tm.list_tasks()[0].id)
         assert created.fields == {}
 
+    async def test_manage_tasks_create_strips_a_tag_that_is_only_a_substring_of_a_message_tag(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "notes", "tags": ["agent", "claude"]},
+            persona_id="journal",
+            user_message="thinking about the #agentic loop and #claude-code docs",
+        )
+        assert out.startswith("Task created")
+        assert tm.list_tasks()[0].tags == []
+
+    async def test_manage_tasks_create_strips_fields_that_are_bare_words_in_the_message(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {
+                "action": "create", "description": "call the vendor",
+                "fields": {"executor": "local", "model": "opus"},
+            },
+            persona_id="journal",
+            user_message="call the local vendor about the opus recording",
+        )
+        assert out.startswith("Task created")
+        created = tm.get(tm.list_tasks()[0].id)
+        assert created.fields == {}
+
+    async def test_manage_tasks_create_keeps_a_genuinely_written_tag(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "notes", "tags": ["claude"]},
+            persona_id="journal",
+            user_message="thinking about the #claude docs",
+        )
+        assert out.startswith("Task created")
+        assert tm.list_tasks()[0].tags == ["claude"]
+
     async def test_manage_tasks_create_keeps_a_field_value_attested_in_the_message(self, tm):
         out = await execute_tool_parallel(
             "manage_tasks",
@@ -201,3 +247,65 @@ class TestExecuteToolParallelJournalGate:
         entry = sched.list_all()[0]
         assert entry.bot == "journal"
         assert entry.timezone == "America/New_York"
+
+    async def test_manage_schedules_create_defaults_bot_to_journal_when_configured(self, sched, monkeypatch):
+        # Simulate an install with TELEGRAM_JOURNAL_BOT_TOKEN configured, the
+        # way test_vault_write_route.py's _enable_journal_persona does: the
+        # registry loader merges dotenv values with os.environ, and
+        # monkeypatch.setenv always wins that merge.
+        monkeypatch.setenv("TELEGRAM_JOURNAL_BOT_TOKEN", "test-token")
+        out = await execute_tool_parallel(
+            "manage_schedules",
+            {
+                "action": "create", "name": "call mom", "schedule_type": "once",
+                "schedule_value": "2030-01-02T15:00:00", "schedule_action": "notify",
+                "message_content": "call mom",
+            },
+            persona_id="journal", user_message="remind me to call mom tomorrow at 3",
+        )
+        assert out.startswith("Schedule created")
+        assert sched.list_all()[0].bot == "journal"
+
+    async def test_manage_schedules_create_leaves_bot_empty_when_journal_not_configured(self, sched, tmp_path, monkeypatch):
+        # Force the registry to resolve no bots at all, regardless of what
+        # this machine's real config/telegram_bots.json or .env carries.
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", tmp_path / "no-registry.json")
+        out = await execute_tool_parallel(
+            "manage_schedules",
+            {
+                "action": "create", "name": "call mom", "schedule_type": "once",
+                "schedule_value": "2030-01-02T15:00:00", "schedule_action": "notify",
+                "message_content": "call mom",
+            },
+            persona_id="journal", user_message="remind me to call mom tomorrow at 3",
+        )
+        assert out.startswith("Schedule created")
+        assert sched.list_all()[0].bot == ""
+
+    async def test_manage_schedules_delete_is_refused_on_a_journal_turn(self, sched):
+        entry = sched.create(
+            action="notify", name="existing", schedule_type="once",
+            schedule_value="2030-01-02T15:00:00", message_content="x",
+        )
+        out = await execute_tool_parallel(
+            "manage_schedules", {"action": "delete", "schedule_id": entry.id},
+            persona_id="journal", user_message="actually, cancel that 3pm reminder",
+        )
+        assert out.startswith("Error:")
+        assert sched.get(entry.id) is not None
+
+    async def test_manage_schedules_update_is_refused_on_a_journal_turn(self, sched):
+        entry = sched.create(
+            action="agent", name="existing", schedule_type="once",
+            schedule_value="2030-01-02T15:00:00", message_content="do work",
+            executor="claude_code",
+        )
+        out = await execute_tool_parallel(
+            "manage_schedules",
+            {"action": "update", "schedule_id": entry.id, "message_content": "changed", "executor": "codex"},
+            persona_id="journal", user_message="change that schedule",
+        )
+        assert out.startswith("Error:")
+        unchanged = sched.get(entry.id)
+        assert unchanged.message_content == "do work"
+        assert unchanged.executor == "claude_code"
