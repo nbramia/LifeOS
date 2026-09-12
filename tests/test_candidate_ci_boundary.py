@@ -382,6 +382,29 @@ def test_candidate_workflow_lane_selection_defaults_to_every_lane_before_narrowi
 
 
 @pytest.mark.unit
+def test_publisher_treats_every_non_success_execution_result_as_a_failed_check():
+    """The publisher must recognize exactly one passing value.
+
+    `needs` resolves to `success` only when every job it names succeeded —
+    and when the execution job becomes several concurrent parts, only when
+    every part succeeded. Everything else (a failure, a cancellation at the
+    ceiling, a job that never started) has to publish failure, which
+    requires the mapping to allow-list `success` rather than deny-list the
+    outcomes anyone happened to think of.
+    """
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/candidate-verification.yml").read_text())
+    publisher = workflow["jobs"]["publish-aggregate"]
+    assert publisher["needs"] == ["execute-candidate"]
+    assert publisher["if"] == "${{ always() }}"
+    script = next(
+        step for step in publisher["steps"] if "github-script" in (step.get("uses") or "")
+    )["with"]["script"]
+    assert "process.env.RESULT === 'success' ? 'success' : 'failure'" in script
+
+
+@pytest.mark.unit
 def test_lane_command_records_slowest_test_durations():
     """The lane command captures durations so gate cost can be attributed."""
     source = (ROOT / "scripts/verify_candidate.py").read_text()

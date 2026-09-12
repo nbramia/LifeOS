@@ -1,7 +1,7 @@
 # Candidate Verification CI
 
 **Status:** Partial
-**Last Updated:** 2026-09-09
+**Last Updated:** 2026-09-12
 **Audience:** Operators
 
 Candidate verification runs on GitHub-hosted ephemeral runners. The publisher
@@ -31,6 +31,69 @@ merge queue and Enterprise "required workflow" repository rules are both
 organization/Enterprise-only features — not merely unconfigured, but
 structurally unavailable here regardless of settings changes. Neither is
 part of this design.
+
+## Partitioning a lane into parts
+
+`--part-index`/`--part-count` split the selected lanes into **parts** on both
+the `pushed-ref` and `local` runners, so several concurrent runs can each
+verify one share of the same candidate. `--shard-index`/`--shard-count`
+partition by individual node ID instead; the two are alternatives and
+requesting both is rejected.
+
+A part is a set of **whole module scopes**, never a fraction of one. That unit
+is load-bearing rather than convenient. `tests/conftest.py` skips
+conditionally — an unavailable embedding service, a locked database — and a
+test separated from state its own module established takes those paths. The
+verifier requires every requested node ID to report `passed`, permitting only
+the privacy audit as a skip, so one extra conditional skip fails the lane even
+though that part's own pytest exited zero with everything it ran green.
+Assigning whole modules keeps every test with its module's state, which is
+also the grouping `--dist loadscope` already relies on inside a single part.
+Scopes are assigned across every requested lane at once, so a module whose
+tests span two lanes still lands wholly in one part.
+
+Parts are balanced by **measured duration**, not test count: equal test counts
+produce wildly unequal wall clocks. `scripts/lane_scope_durations.json` records
+seconds per module, read from the *runner's* own checkout so every part of one
+candidate derives its assignment from byte-identical input. Assignment is
+longest-first: scopes descend by recorded cost, ties broken by name, and each
+goes to the part carrying the least so far. A module with no recorded duration
+is estimated from the recorded mean seconds per test, which degenerates to
+balancing by test count when the record is absent or unreadable — correct, just
+less balanced.
+
+Refresh the record from the lane-execution receipts a completed run leaves in
+its `--lane-log-dir`, passing that flag once per directory to merge every part
+of a partitioned run:
+
+```bash
+~/.venvs/lifeos/bin/python scripts/verify_candidate.py record-scope-durations \
+  --lane-log-dir /path/to/lane-logs
+```
+
+### What still blocks running the gate in parts
+
+The hosted gate runs one execution job, not a matrix, because the `fast-unit`
+lane is not yet safe to partition at all. At least one module —
+`tests/test_briefings_service.py` — takes `require_db`'s conditional skip for
+five of its seven tests when it runs without whichever other module first
+creates the runtime `interactions` table, which it does even when that module
+is the only one selected. A whole-lane run happens to win that ordering; a
+four-part run of the same candidate does not, and the part owning that module
+correctly fails with five skips against the whole lane's one.
+
+That is a cross-module prerequisite, which no partition of whole modules can
+satisfy: such a module has to establish its own store. Until every module in
+the lane is self-sufficient, enabling a matrix would fail the gate for every
+candidate. Prove coverage equivalence — an unpartitioned run and a partitioned
+run of the same candidate reporting the same skip count — before changing the
+topology.
+
+Note also that a workflow change cannot verify itself: `pull_request_target`
+and `workflow_dispatch` both resolve the workflow definition from the base
+branch, so a PR that edits the topology is gated by whatever topology `main`
+carries, and an edited topology's first real exercise is the first candidate
+built after that edit merges.
 
 ## Privacy-audit applicability
 
