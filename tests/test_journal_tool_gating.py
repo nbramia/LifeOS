@@ -39,6 +39,14 @@ class TestToolsForPersona:
         assert "manage_tasks" in names
         assert "manage_schedules" in names
 
+    def test_journal_persona_excludes_manage_reminders(self):
+        # manage_reminders is a deprecated alias of manage_schedules that
+        # writes into the same scheduler store without ever setting `bot` —
+        # journal only gets manage_schedules for this job.
+        names = {t["name"] for t in tools_for_persona("journal")}
+        assert "manage_reminders" not in names
+        assert "manage_reminders" in {t["name"] for t in tools_for_persona("primary")}
+
     def test_journal_list_keeps_exactly_one_cache_breakpoint(self):
         journal_tools = tools_for_persona("journal")
         with_marker = [t for t in journal_tools if "cache_control" in t]
@@ -96,6 +104,26 @@ class TestExecuteToolParallelJournalGate:
         assert out.startswith("Error:")
         assert "journal persona" in out
         assert mem.list_memories() == []
+
+    async def test_manage_reminders_is_refused_on_a_journal_turn(self, sched, monkeypatch):
+        # _reminder_create imports get_reminder_store from the shim at call
+        # time, not from scheduler_store's patched attribute — patch the
+        # shim directly so a gate regression can't be masked by writing to
+        # an already-isolated-but-different store.
+        monkeypatch.setattr(
+            "api.services.reminder_store.get_reminder_store", lambda: sched,
+        )
+        out = await execute_tool_parallel(
+            "manage_reminders",
+            {
+                "action": "create", "name": "call mom", "schedule_type": "once",
+                "schedule_value": "2030-01-02T15:00:00", "message_content": "call mom",
+            },
+            persona_id="journal", user_message="remind me to call mom tomorrow at 3",
+        )
+        assert out.startswith("Error:")
+        assert "journal persona" in out
+        assert sched.list_all() == []
 
     async def test_excluded_tool_is_not_refused_off_a_journal_turn(self, monkeypatch):
         # save_memory's own handler is irrelevant here -- just confirm the
@@ -205,6 +233,17 @@ class TestExecuteToolParallelJournalGate:
         assert out.startswith("Task created")
         created = tm.get(tm.list_tasks()[0].id)
         assert created.fields == {"key": "callmom"}
+
+    async def test_manage_tasks_create_keeps_a_field_value_attested_by_a_quoted_span(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "call the vendor", "fields": {"executor": "local"}},
+            persona_id="journal",
+            user_message='use the "local" executor for this',
+        )
+        assert out.startswith("Task created")
+        created = tm.get(tm.list_tasks()[0].id)
+        assert created.fields == {"executor": "local"}
 
     async def test_manage_schedules_notify_create_is_allowed_on_a_journal_turn(self, sched):
         out = await execute_tool_parallel(

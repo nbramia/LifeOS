@@ -32,6 +32,7 @@ JOURNAL_EXCLUDED_TOOLS = frozenset({
     "save_memory",
     "manage_workouts",
     "manage_human_queue",
+    "manage_reminders",
 })
 
 # ---------------------------------------------------------------------------
