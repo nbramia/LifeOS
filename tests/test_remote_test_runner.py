@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -375,13 +376,18 @@ def test_remote_interrupt_during_execution_records_cancelled_and_still_prints_do
     checkout = _synthetic_remote_checkout(tmp_path)
     # Only the remote *execution* leg (running test.sh) hangs; mkdir -p still
     # returns immediately, so the interrupt lands specifically inside the
-    # "remote-execution" phase rather than an earlier one.
+    # "remote-execution" phase rather than an earlier one. That leg also
+    # creates `execution_started` before it hangs, which the interrupt below
+    # waits on: the wrapper assigns METRICS_ACTIVE_PHASE="remote-execution"
+    # on the line before it invokes ssh, so the file existing proves the
+    # phase window is open rather than assuming it opened by now.
+    execution_started = tmp_path / "remote-execution-started"
     fake_bin = _fake_transport_bin(
         tmp_path,
         ssh_body=(
             "#!/bin/bash\nset -eu\n[ \"$1\" = fakehost ]\n"
             "case \"$2\" in\n"
-            "  *test.sh*) sleep 30 ;;\n"
+            f"  *test.sh*) : > {shlex.quote(str(execution_started))}; sleep 30 ;;\n"
             "  *) exec bash -c \"$2\" ;;\n"
             "esac\n"
         ),
@@ -406,7 +412,13 @@ def test_remote_interrupt_during_execution_records_cancelled_and_still_prints_do
                 saw_running_line = True
                 break
         assert saw_running_line, "never reached the remote-execution phase"
-        time.sleep(0.3)  # let the SECONDS=0/METRICS_ACTIVE_PHASE assignment land
+        ready_deadline = time.time() + 30
+        while not execution_started.exists() and time.time() < ready_deadline:
+            time.sleep(0.01)
+        assert execution_started.exists(), (
+            "the remote-execution leg never started, so an interrupt here "
+            "would not land in the phase under test"
+        )
         os.killpg(proc.pid, signal.SIGINT)
         remaining_output = proc.stdout.read()
         returncode = proc.wait(timeout=10)
