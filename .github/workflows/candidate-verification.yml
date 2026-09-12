@@ -53,12 +53,25 @@ jobs:
   execute-candidate:
     name: candidate-execution
     runs-on: ubuntu-latest
-    # Both retained lanes run in this one job, at the runner's full width
-    # with the capacity headroom the step below establishes. The ceiling
-    # exists to fail a genuinely stuck job, so it sits above the slowest
-    # healthy run observed with enough margin for dependency and Chromium
-    # setup, rather than near the middle of the range.
-    timeout-minutes: 45
+    strategy:
+      # A failing part must never cancel its siblings: each part's own
+      # result feeds the same aggregate below, so cancelling early would
+      # hide which other parts would also have failed without changing
+      # the published conclusion.
+      fail-fast: false
+      matrix:
+        # Whole module scopes are assigned across these parts by recorded
+        # duration. `strategy.job-total` below derives the part count from
+        # this list rather than restating it, so the two cannot disagree
+        # and leave a part's tests unrun while every other part reports
+        # success.
+        part: [0, 1, 2, 3]
+    # Each part runs its own share of the retained lanes at the runner's
+    # full width, with the capacity headroom the step below establishes.
+    # The ceiling exists to fail a genuinely stuck part, so it sits above
+    # the slowest healthy part observed with enough margin for dependency
+    # and Chromium setup, rather than near the middle of the range.
+    timeout-minutes: 25
     permissions:
       contents: read
     env:
@@ -158,6 +171,8 @@ jobs:
             --workers "$WORKERS" \
             --capacity-max-run-workers "$WORKERS" \
             --lane-log-dir "$RUNNER_TEMP/lifeos-lane-logs" \
+            --part-index "${{ matrix.part }}" \
+            --part-count "${{ strategy.job-total }}" \
             --parallel-browser-free
 
       # The step above prints only its summary JSON; pytest's own output goes
@@ -170,7 +185,7 @@ jobs:
         if: ${{ failure() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: lane-logs-${{ env.CANDIDATE_SHA }}
+          name: lane-logs-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}
           path: ${{ runner.temp }}/lifeos-lane-logs
           if-no-files-found: warn
           retention-days: 14

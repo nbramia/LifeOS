@@ -67,6 +67,28 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
 
 
 @pytest.mark.unit
+def test_partitioned_execution_derives_its_part_count_from_the_matrix():
+    """Every part's tests run, and one failing part cannot hide the others.
+
+    The part count is read from the matrix rather than restated beside it:
+    a separately declared count that drifts below the matrix length leaves
+    a part's tests unselected while every part that did run reports
+    success, which is exactly the coverage loss the lane partition exists
+    to avoid. Deriving it makes the two impossible to disagree.
+    """
+    workflow = (ROOT / ".github/workflows/candidate-verification.yml").read_text()
+    assert '--part-index "${{ matrix.part }}"' in workflow
+    assert '--part-count "${{ strategy.job-total }}"' in workflow
+    # A literal count beside the matrix is the drift this guards against.
+    assert "PART_COUNT" not in workflow
+    # A failing part must not cancel its siblings, so the aggregate reports
+    # every part that would have failed rather than only the first.
+    assert "fail-fast: false" in workflow
+    # Each part uploads its own lane log; a shared name collides.
+    assert "lane-logs-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}" in workflow
+
+
+@pytest.mark.unit
 def test_candidate_workflow_pins_actions_and_proves_cpu_wheel_identity():
     workflow = (ROOT / ".github/workflows/candidate-verification.yml").read_text()
     pinned_actions = {
