@@ -1436,10 +1436,6 @@
     "it cannot be this process's own live job (Codex review of #768).",
     "sharing the same database (Codex review of #768). Retries are"
   ],
-  "api/services/journal_capture.py": [
-    "Deterministic capture of journal fragments into `Personal/Log/YYYY-MM-DD.md` (#674).",
-    "The `journal` persona (#659) used to be told to append the fragment itself via"
-  ],
   "api/services/journal_ingest_store.py": [
     "Idempotency store for the journal ring ingestion endpoint (#660)."
   ],

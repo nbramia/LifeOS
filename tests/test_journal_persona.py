@@ -1,5 +1,5 @@
 """Tests for the `journal` persona (#659) — disjointed-fragment capture into
-`Personal/Log/YYYY-MM-DD.md`, distinct from the generated `Personal/Journal/`
+`LifeOS/Log/Journal/YYYY-MM-DD.md`, distinct from the generated `Personal/Journal/`
 daily journal that `journal_trends.py` analyzes.
 
 The persona itself is prose read by the orchestrating LLM (no dedicated code
@@ -117,7 +117,7 @@ class TestPersonaContent:
 
     def test_states_capture_target_and_bullet_shape(self):
         text = _PERSONA_PATH.read_text()
-        assert "Personal/Log/YYYY-MM-DD.md" in text
+        assert "LifeOS/Log/Journal/YYYY-MM-DD.md" in text
         assert "HH:MM" in text
 
     def test_never_writes_to_reserved_journal_dir(self):
@@ -153,12 +153,29 @@ class TestPersonaContent:
         text = _PERSONA_PATH.read_text()
         assert "lifeos_task_create" in text
         assert "lifeos_schedule_create" in text
-        # The three native interactive cases remain explicit.
-        assert "call mum Thursday 3pm" in text
+        # The log-only / ask-when-unsure / silent-file judgment remains explicit.
         assert "I should really call mum" in text
         assert "mum's birthday soon" in text
         assert "Want a task for that?" in text
         assert "never create `agent`, `prompt`, or `endpoint` schedules" in text
+
+    def test_states_the_two_mandated_filing_examples(self):
+        text = _PERSONA_PATH.read_text()
+        assert "remind me to call mom tomorrow at 3" in text
+        assert "create a calendar event to call mom tomorrow at 3" in text
+
+    def test_states_bot_files_but_never_executes(self):
+        text = _PERSONA_PATH.read_text()
+        low = text.lower()
+        assert "you never execute anything yourself" in low
+        assert "no calendar create/update/delete" in low
+
+    def test_states_tags_copied_only_when_explicit(self):
+        text = _PERSONA_PATH.read_text()
+        low = text.lower()
+        assert "#claude" in text
+        assert "verbatim in the user's message" in low
+        assert "stripped" in low
 
     def test_no_real_personal_data(self):
         # Open-source rule: examples must be obviously synthetic, no real
@@ -223,7 +240,7 @@ class TestCaptureTarget:
         from api.services.journal_capture import capture_fragment
 
         capture_fragment("idea about the deploy gate #eng", now=datetime(2026, 8, 23, 9, 14))
-        written = (vault / "Personal" / "Log" / "2026-08-23.md").read_text()
+        written = (vault / "LifeOS" / "Log" / "Journal" / "2026-08-23.md").read_text()
         assert written.startswith("---\ntype: log\ndate: 2026-08-23\n---\n")
         assert "- 09:14 · idea about the deploy gate #eng" in written
 

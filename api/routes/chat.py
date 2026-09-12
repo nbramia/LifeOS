@@ -1062,8 +1062,18 @@ async def ask_stream(request: AskStreamRequest):
             # session rather than answering inline — the surface (Telegram) spawns
             # it and reports back. Explicit intent, so it precedes classification
             # and the agentic loop.
-            from api.services.agent_loop import parse_engine_directive
-            _engine, _engine_task = parse_engine_directive(request.question)
+            #
+            # Journal turns skip this and the intent classification below:
+            # journal is a filing surface, not an orchestrator, and
+            # both interceptors exist to divert a turn to another engine or to
+            # the generic task-vs-reminder clarification — a "remind me to…"
+            # fragment must reach the journal filing policy instead of being
+            # replaced by that clarification, and a code-action phrasing must
+            # not emit `claude_intent` from here.
+            _engine, _engine_task = ("", "")
+            if _effective_pid != JOURNAL_PERSONA_ID:
+                from api.services.agent_loop import parse_engine_directive
+                _engine, _engine_task = parse_engine_directive(request.question)
             if _engine:
                 _label = "Codex" if _engine == "codex" else "Claude Code"
                 await turn.emit(f"data: {json.dumps({'type': 'routing', 'sources': [_engine], 'reasoning': f'User-directed handoff to {_label}', 'latency_ms': 0})}\n\n")
@@ -1075,8 +1085,10 @@ async def ask_stream(request: AskStreamRequest):
             # Compose, task, and reminder intents now flow through the agentic
             # loop which has dedicated tools (create_email_draft, manage_tasks,
             # manage_reminders). Only "code" and "ambiguous" need early return.
-            with trace_span("intent_classify"):
-                action_intent = await classify_action_intent(request.question, conversation_history)
+            action_intent = None
+            if _effective_pid != JOURNAL_PERSONA_ID:
+                with trace_span("intent_classify"):
+                    action_intent = await classify_action_intent(request.question, conversation_history)
 
             if action_intent and action_intent.category == "ambiguous_task_reminder":
                 # ---- AMBIGUOUS: could be task or reminder ----
@@ -1244,6 +1256,8 @@ async def ask_stream(request: AskStreamRequest):
                 personal_context=personal_context,
                 force_local=force_local,
                 force_remote=force_remote,
+                persona_id=_effective_pid or "",
+                user_message=request.question,
             ):
                 if event["type"] == "turn_state":
                     # #615: live, mutable AgentResult -- see the comment by
