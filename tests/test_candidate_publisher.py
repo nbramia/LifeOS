@@ -436,8 +436,8 @@ def test_await_required_check_ignores_a_verdict_that_predates_this_dispatch():
 
 
 def test_await_required_check_never_publishes_on_a_stale_success():
-    """The graver direction: a success left over from an earlier dispatch must
-    not authorize publication of a candidate whose own run failed."""
+    """A success left over from an earlier dispatch does not stand in for this
+    one: the publisher waits for, and reports, the verdict it caused."""
     payload = {"check_runs": [
         _check_run(7, "success", started_at="2026-01-01T00:00:00Z"),
         _check_run(8, "failure", started_at="2026-01-01T01:00:00Z"),

@@ -177,9 +177,11 @@ content, re-publishing an unchanged branch rebuilds the identical candidate,
 which may already carry verdicts from an earlier dispatch; the publisher
 snapshots those check-run ids before dispatching and accepts only a check this
 invocation caused, taking the most recently started completed one rather than
-whichever the API lists first. That holds in both directions — a stale failure
-never refuses a candidate whose fresh run passed, and a stale success never
-authorizes publication of one whose own run did not. See `scripts/candidate_publisher.py`'s module
+whichever the API lists first. The case that motivates this is a stale
+failure, which would otherwise refuse a candidate whose fresh run passed.
+Ignoring a stale success is conservatism rather than a safety boundary: that
+success verified byte-identical content under the same trusted-runner base, so
+the cost is a redundant verification run on every recovery. See `scripts/candidate_publisher.py`'s module
 docstring for the exact ordering guarantee (construct before verify, verify
 before publish).
 

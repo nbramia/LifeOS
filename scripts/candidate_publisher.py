@@ -520,11 +520,21 @@ def await_required_check(
 
     ``ignore_check_run_ids`` carries the verdicts that already existed on this
     SHA before the caller dispatched its own verification (see
-    ``existing_check_run_ids``). They are never accepted, in either direction:
-    a stale failure would refuse a candidate that now passes, and a stale
-    success would authorize publication on the strength of a run that did not
-    verify this dispatch. The second is the graver of the two, so the filter
-    is applied before the conclusion is ever read.
+    ``existing_check_run_ids``). None of them are accepted.
+
+    The load-bearing case is a stale **failure**. A candidate SHA is
+    deterministic from its content, so re-publishing an unchanged branch
+    rebuilds the identical candidate; an earlier failed verdict left on that
+    SHA would otherwise refuse a candidate whose fresh run passes, and the only
+    way out would be to change the branch just to move the SHA.
+
+    Ignoring a stale **success** is conservatism, not a safety boundary. That
+    success verified byte-identical content: the same candidate SHA has the
+    same first parent, hence the same trusted-runner base and the same workflow
+    definition. Rejecting it costs a redundant verification run on every
+    recovery, and buys a publisher that only ever acts on a verdict it caused
+    rather than one it inherited. The filter is applied before any conclusion
+    is read, so neither direction depends on reading it correctly.
 
     Among the checks that remain, the most recently started completed one
     decides the outcome — never whichever the API happened to list first.
