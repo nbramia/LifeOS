@@ -72,6 +72,7 @@ from api.services.agent_board import (
     MANAGED_AGENT_ASSIGNEES,
     REASSIGNED_TAG,
     derive_assignee,
+    is_snoozed as _is_snoozed,
 )
 from api.services.agent_worker.preflight import (
     ROUTE_ASK,
@@ -2777,7 +2778,9 @@ class Worker:
         (`agent-running`, `agent-blocked`, `agent-completed`,
         `agent-failed`, `agent-budget-exceeded`) — engine-only tasks keep
         their assignee tag after claim, so the tag fan-out alone would
-        otherwise re-list in-flight work.
+        otherwise re-list in-flight work. A task with a future
+        `snoozed_until` is excluded too — `claim_for_agent` refuses it as
+        well, so this is a listing-side courtesy, not the only guard.
         """
         seen: set[str] = set()
         all_tasks: list[dict[str, Any]] = []
@@ -2803,6 +2806,8 @@ class Worker:
         for task in all_tasks:
             tags = {str(t).lstrip("#").lower() for t in (task.get("tags") or [])}
             if tags & _CLAIM_EXCLUSION_TAGS:
+                continue
+            if _is_snoozed(task.get("fields")):
                 continue
             if (
                 AGENT_TAG in tags

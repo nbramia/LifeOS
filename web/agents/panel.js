@@ -2,7 +2,8 @@
 //
 // Shared session-detail panel: header render, inline label edit, backfill +
 // live SSE transcript tail, LLM summary fetch, and the action row (Open,
-// Go To, Resume, Kill, Answer, Accept, Reject, Reassign, Mark Done, Cancel, Delete — decided
+// Go To, Resume, Kill, Answer, Accept, Reject, Reassign, Mark Done, Snooze,
+// Unsnooze, Cancel, Delete — decided
 // and rendered by ./session_actions.js). Used by both the Graph tab's side
 // panel (web/agents/graph.js) and the Board tab's card drawer
 // (web/agents/board.js).
@@ -247,7 +248,8 @@ const _EVENTS_RETRY_DELAYS = [800, 1600, 3200];  // ms; ~5.6s before giving up
  *   showActions    — whether the header renders the shared action row at
  *                    all (default true). The Board drawer sets this false
  *                    and renders the row itself instead (it needs Open,
- *                    Answer, Accept, Reject, Reassign, Mark Done, Cancel, and Delete alongside
+ *                    Answer, Accept, Reject, Reassign, Mark Done, Snooze,
+ *                    Unsnooze, Cancel, and Delete alongside
  *                    Go To/Resume/Kill — actions this panel alone, with no
  *                    card, can never offer), so the two never render the
  *                    same session's Kill/Resume/Go To buttons twice.
@@ -266,7 +268,8 @@ export class SessionPanel {
     this.onLabelSaved = opts.onLabelSaved || (() => {});
     this.onSummaryFetched = opts.onSummaryFetched || (() => {});
     this.getDescendants = opts.getDescendants || (() => []);
-    // Card-only actions (Open, Accept, Reject, Reassign, Mark Done, Cancel, Delete) — see
+    // Card-only actions (Open, Accept, Reject, Reassign, Mark Done, Snooze,
+    // Unsnooze, Cancel, Delete) — see
     // ./card_actions.js. `findCard` resolves the freshest copy of the
     // linked card at Delete-confirm time (a caller with a live board
     // lookup, e.g. the Graph tab, can supply one; defaults to whatever
@@ -355,7 +358,8 @@ export class SessionPanel {
   }
 
   // Renders the shared action row (Open, Rename, Go To, Resume, Kill,
-  // Answer, Accept, Reject, Reassign, Mark Done, Cancel, Delete — decided by
+  // Answer, Accept, Reject, Reassign, Mark Done, Snooze, Unsnooze, Cancel,
+  // Delete — decided by
   // session_actions.js's `decideActions`) into this panel's own header.
   // A no-op when `showActions` is false (the Board drawer's embedded
   // panel, which renders the row itself elsewhere). Rename always gets a
@@ -398,8 +402,12 @@ export class SessionPanel {
     const inferredHint = s.status_inferred ? ' (inferred)' : '';
     root.innerHTML = `
       <div class="panel-header">
-        <button class="panel-close" aria-label="Close" data-action="close">×</button>
-        <div class="panel-header-actions" data-field="actions"></div>
+        ${this.showActions ? `
+        <div class="panel-header-top">
+          <div class="panel-header-actions" data-field="actions"></div>
+          <button class="panel-close" aria-label="Close" data-action="close">×</button>
+        </div>
+        ` : `<button class="panel-close" aria-label="Close" data-action="close">×</button>`}
         <div class="label" data-field="label" title="Click to rename this session">${escapeHtml(nodeLabel(s))}</div>
         <div class="cwd-hint" data-field="cwd-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-all">${s.decoded_cwd ? escapeHtml(s.decoded_cwd) : ''}</div>
         ${s.branch ? `<div class="branch-hint" data-field="branch-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.1rem">branch: ${escapeHtml(s.branch)}</div>` : ''}

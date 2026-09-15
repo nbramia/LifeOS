@@ -462,8 +462,8 @@ and the SSE update cadence.
 ### GET /api/agents/board
 
 Full board view model, always built fresh (never cached): `{lanes:
-{unassigned, assigned, in_progress, human_queue, scheduled, review, done},
-generated_at, api_host}`. `api_host` names the machine running the API, so
+{unassigned, assigned, in_progress, human_queue, scheduled, review, done,
+snoozed}, generated_at, api_host}`. `api_host` names the machine running the API, so
 a client can tell a card's assigned host (`fields.host`) apart from "this
 machine". `kind` (`"task"` | `"schedule"`) is the first field of every
 card and the only discriminator between the two shapes below — both kinds
@@ -487,8 +487,10 @@ or writing nothing and returning an error. Body: `{lane, assignee?}`.
 `lane: "done"` marks the task done; `lane: "unassigned"` clears the
 assignee tag; `lane: "assigned"` requires `assignee` (one of
 `me`/`claude`/`codex`/`hermes`/`local`) and replaces any existing assignee
-tag. `review` and `scheduled` can't be set directly (derived from a tag
-and the scheduler store, respectively) and return **400**.
+tag. `review`, `scheduled`, and `snoozed` can't be set directly (derived
+from a tag, the scheduler store, and the `snoozed_until` field,
+respectively — see below) and return **400**. Every successful move also
+clears a card's snooze, whether or not it was actually snoozed.
 
 Four **409** cases, no write in any of them:
 - The card is worker-owned — `agent-running`/`agent-blocked` tag present,
@@ -523,6 +525,25 @@ fields, lanes}`, each of `cancel`/`assignee`/`fields`/`lanes.<lane>` an
 enforces — see [Agent Viz — Technical](../technical/agent-viz.md) for the
 shape. The board and drawer read this instead of re-implementing the
 rules, so they can't disagree with what a write actually does.
+
+### PUT /api/agents/board/cards/{id}/snooze
+
+Set a card's wake-up time, deriving it into the Snoozed lane. Body:
+`{until}` — an ISO-8601 timestamp with a UTC offset, in the future.
+Missing, unparseable, offset-less, or non-future `until` returns **400**
+without touching the task. Eligible on any card whose status/tags alone
+(ignoring any snooze already in effect) derive to Unassigned, Assigned,
+Human queue, or Review; a card that derives to In progress or Done returns
+**409**, and a scheduler entry (never resolves through the task store)
+returns **404**. Only the `snoozed_until` field changes — status, tags,
+and notes are left exactly as they were. Response: `{id, lane, status,
+tags, snoozed_until}`.
+
+### DELETE /api/agents/board/cards/{id}/snooze
+
+Clear a card's wake-up time, restoring its status/tag-derived lane. A
+no-op success (no write) on a card that isn't currently snoozed. Response:
+`{id, lane, status, tags, snoozed_until: null}`.
 
 ### POST /api/agents/board/cards/{id}/accept
 

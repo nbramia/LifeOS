@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>Agents · LifeOS</title>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
 <script src="https://d3js.org/d3.v7.min.js"></script>
@@ -767,22 +767,45 @@
     color: var(--text-secondary);
   }
   .pp-empty { color: var(--text-dim); font-style: italic; }
+  /* `.panel-header-top` is its own row, in normal flow, above the label
+     and the `.meta`/`.panel-chips` badge rows below it — normal flow
+     (never floated) guarantees the badges/chips always render below it,
+     never underneath. `flex-wrap: nowrap` on THIS row, combined with
+     `.panel-close`'s `flex: none` below, keeps the close button pinned to
+     the top-right corner regardless of how tall the action row gets —
+     `.panel-header-actions` is the only item allowed to wrap (onto
+     multiple lines within its own box, via `flex: 1 1 auto; min-width: 0`
+     shrinking it to make room), so a wide action row grows DOWN within
+     its own column instead of pushing the close button onto a second
+     line of this row. */
+  .panel-header-top {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: flex-start;
+    justify-content: flex-end;
+    gap: 0.4rem;
+  }
   /* The shared action row (web/agents/session_actions.js's
-     `renderActionRow`) mounts here — `float:right` positions this whole
-     container next to the close button instead of escaping into the rest
-     of the header (a floated box can still use `display:flex`
-     internally). `flex-wrap` is what actually lays the row out: the
-     Board drawer's own action-row container (`.drawer-actions`) is flex
-     too, so the two surfaces wrap and place a disabled action's reason
-     text (`.drawer-field-reason`) the same way — the row can hold every
-     card-only action a card-linked panel offers, not just the three
-     CLI-only buttons (`.panel-kill`/`.panel-resume`/`.panel-focus`). */
+     `renderActionRow`) mounts here. `flex-wrap` is what actually lays the
+     row out: the Board drawer's own action-row container
+     (`.drawer-actions`) is flex too, so the two surfaces wrap and place a
+     disabled action's reason text (`.drawer-field-reason`) the same way —
+     the row can hold every card-only action a card-linked panel offers,
+     not just the three CLI-only buttons
+     (`.panel-kill`/`.panel-resume`/`.panel-focus`). `flex: 1 1 auto;
+     min-width: 0` lets this shrink and wrap onto multiple lines within
+     `.panel-header-top` (see above) instead of forcing that nowrap row to
+     overflow. */
   .panel-header-actions {
-    float: right;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     gap: 0.4rem;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .panel-header-top > .panel-close {
+    flex: none;
   }
   .panel-close {
     background: none;
@@ -1471,6 +1494,7 @@
   .board-chip-assignee { color: var(--accent); border-color: var(--accent); }
   .board-chip-host { color: var(--claimed); border-color: var(--claimed); }
   .board-chip-assigned-host { color: var(--yielded); border-color: var(--yielded); border-style: dashed; }
+  .board-chip-snoozed { color: var(--yielded); border-color: var(--yielded); }
   /* Session chip → graph tab — a clickable chip on a card whose
      session is live, distinct from the plain (non-interactive) chips
      above it. */
@@ -1683,6 +1707,49 @@
     font-weight: 600;
   }
   .drawer-action.danger:hover { filter: brightness(1.15); border-color: var(--failed); }
+  /* Snooze's picker — a flex item of the action row it's a sibling of
+     (same reasoning as .resume-command above): `flex-basis: 100%` puts it
+     on its own line below the Snooze button, `min-width: 0` on every input
+     lets it shrink inside a narrow drawer instead of forcing horizontal
+     overflow. */
+  .snooze-picker {
+    flex-basis: 100%;
+    margin-top: 0.4rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .snooze-picker[hidden] { display: none; }
+  .snooze-presets { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+  .snooze-custom-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem;
+    max-width: 100%;
+  }
+  .snooze-custom-row .drawer-label { flex-basis: 100%; margin: 0; }
+  .snooze-duration-value,
+  .snooze-duration-unit,
+  .snooze-datetime-value {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.3rem 0.4rem;
+    font-size: 0.75rem;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .snooze-duration-value { width: 4.5rem; flex: 0 1 auto; }
+  .snooze-datetime-value { flex: 1 1 auto; }
   .drawer-session { margin-top: 0.75rem; border-top: 1px solid var(--border); padding-top: 0.5rem; }
   .drawer-session .panel-header { padding: 0; border: none; }
   .drawer-session .events { max-height: 40vh; padding: 0.5rem 0; }
@@ -1733,21 +1800,85 @@
     .board-filters { padding: 0.45rem 0.65rem; gap: 0.4rem; }
     #board-lanes { padding: 0.5rem 0.65rem; gap: 0.5rem; }
     .board-lane { min-width: min(84vw, 280px); }
-    /* The tray wraps at phone width so the assignee row gets the full
-       width for itself instead of competing with the label and status
-       line on one overflowing line — the label and status go back to
-       normal flow (the centred-buttons layout above is absolute-positioned
-       for the wide tray only) so they each get their own wrapped row. */
-    .board-drop-tray { flex-wrap: wrap; justify-content: flex-start; padding: 0.45rem 0.65rem; min-height: 66px; }
-    .board-drop-tray-label { position: static; transform: none; }
-    #board-assignee-drops { flex: 1 0 100%; max-width: 100%; order: 1; }
-    .board-drop-status {
+    .board-drawer {
+      width: 100vw;
+      max-width: 100vw;
+      overflow-x: hidden;
+    }
+    .drawer-header .panel-close {
+      position: absolute;
+      top: 0;
+      right: 0;
+      float: none;
+      z-index: 1;
+    }
+    .drawer-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .drawer-row > *,
+    .board-drawer select {
+      min-width: 0;
+      max-width: 100%;
+    }
+    .drawer-meta-id { overflow-wrap: anywhere; }
+    .drawer-actions > * { max-width: 100%; }
+    .drawer-actions .panel-kill,
+    .drawer-actions .panel-resume,
+    .drawer-actions .panel-focus {
+      float: none;
+      margin-right: 0;
+    }
+    /* Every quick target occupies one grid track. `display: contents` makes
+       assignee buttons and Done participate in the same row even though the
+       assignees retain their semantic group wrapper. */
+    .board-drop-tray {
+      display: grid;
+      grid-template-columns: repeat(var(--board-tray-button-count, 7), minmax(0, 1fr));
+      gap: 0.3rem;
+      justify-content: stretch;
+      padding: 0.45rem 0.65rem;
+      min-height: 66px;
+    }
+    /* The label and status share row 1 at a fixed line-height so neither
+       the drop-status text appearing/clearing during a drag, nor the
+       post-drop confirmation message, ever changes the tray's height —
+       a height change would shove every button out from under a finger
+       mid-drag (see board_gesture.js POINTER_SLOP usage in board.js's
+       onDragMove). */
+    .board-drop-tray-label {
       position: static;
       transform: none;
-      flex: 1 1 100%;
+      grid-column: 1 / 3;
+      grid-row: 1;
+      font-size: 0.65rem;
+      line-height: 1.2;
+    }
+    #board-assignee-drops { display: contents; }
+    #board-assignee-drops .board-assignee-drop,
+    .board-done-drop {
+      grid-row: 2;
+      min-width: 0;
+      width: 100%;
+      padding-inline: 0.2rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 0.65rem;
+    }
+    .board-drop-status,
+    .board-drop-status:empty {
+      display: block;
+      position: static;
+      transform: none;
+      grid-column: 3 / -1;
+      grid-row: 1;
+      justify-self: end;
+      min-width: 0;
       max-width: 100%;
-      text-align: left;
-      order: 2;
+      text-align: right;
+      font-size: 0.65rem;
+      line-height: 1.2;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
   }
 </style>
@@ -1789,7 +1920,7 @@
       <div class="board-lane-filter-options" id="board-lane-filter-options">
         <div class="board-lane-filter-toggles">
           <button type="button" class="board-filter-toggle-btn" id="board-lane-filter-all">All</button>
-          <button type="button" class="board-filter-toggle-btn" id="board-lane-filter-clear" title="Reset to the default lanes (all except Done)">Clear</button>
+          <button type="button" class="board-filter-toggle-btn" id="board-lane-filter-clear" title="Reset to the default lanes (all except Done and Snoozed)">Clear</button>
         </div>
         <!-- one .board-lane-filter-option checkbox per LANES entry, injected by board.js -->
       </div>
@@ -1842,7 +1973,7 @@
   <div class="board-drop-tray" id="board-drop-tray" aria-label="Board quick actions">
     <span class="board-drop-tray-label">Assign</span>
     <div id="board-assignee-drops" role="group" aria-label="Filter board by assignee, or drop a card here to assign it"></div>
-    <button type="button" class="board-drop-target board-done-drop" id="board-done-drop">Done</button>
+    <button type="button" class="board-drop-target board-done-drop" id="board-done-drop" title="Done">Done</button>
     <span class="board-drop-status" id="board-drop-status" role="status" aria-live="polite"></span>
   </div>
   <!-- Multi-select bulk action bar — hidden until a card is

@@ -16,22 +16,27 @@
 // drawer or panel. `card` may be omitted/undefined: a session with no
 // linked board card (the Graph tab's panel before the linked card is
 // known, or a session the board never tracked at all) skips any decision
-// that needs `card` (Open, Accept, Reject, Reassign, Mark Done, Cancel, Delete) rather than
-// inventing one; Answer reads a pending question off `card` when present,
-// off the session directly otherwise (both carry the identical
-// `_pending_question_view` shape from the server).
+// that needs `card` (Open, Accept, Reject, Reassign, Mark Done, Snooze,
+// Unsnooze, Cancel, Delete) rather than inventing one; Answer reads a
+// pending question off `card` when present, off the session directly
+// otherwise (both carry the identical `_pending_question_view` shape from
+// the server).
 //
 // `renderActionRow` builds the actual buttons into a caller-supplied
-// container. Kill, Resume, and Go To are rendered with the panel's
-// existing chrome (`panel-kill` / `panel-resume` / `panel-resume-host` /
-// `panel-focus` — those classes don't float-position correctly unless
-// their container establishes its own block formatting context, which the
-// caller's own `.panel-header-actions` / `.drawer-actions` wrapper does)
-// and their behaviour is built in here; the card-only actions (Open,
-// Accept, Reject, Reassign, Mark Done, Cancel, Delete) have no generic cross-card behaviour
-// (they need a task manager id and, for Delete, a confirmation modal) so
-// the caller supplies a handler per id via `handlers` — both the Board
-// drawer (web/agents/board.js) and a card-linked Graph tab panel
+// container. Kill, Resume, Go To, and Snooze are rendered with built-in
+// chrome (`panel-kill` / `panel-resume` / `panel-resume-host` /
+// `panel-focus` / `snooze-picker` — those classes don't float-position
+// correctly unless their container establishes its own block formatting
+// context, which the caller's own `.panel-header-actions` / `.drawer-actions`
+// wrapper does); Snooze's own network call still goes through the caller's
+// `handlers.snooze`, same as every other card-only action, since only the
+// picker UI (which preset/duration/date-time was chosen) is generic across
+// surfaces — the write itself needs a task manager id. The remaining
+// card-only actions (Open, Accept, Reject, Reassign, Mark Done, Unsnooze,
+// Cancel, Delete) have no generic cross-card behaviour at all (they need a
+// task manager id and, for Delete, a confirmation modal) so the caller
+// supplies a handler per id via `handlers` — both the Board drawer
+// (web/agents/board.js) and a card-linked Graph tab panel
 // (web/agents/panel.js, via ./card_actions.js) do, since a card can now
 // reach either surface. Rename likewise has no generic behaviour (it needs
 // the caller's own label-edit UI) and is always supplied via `handlers`.
@@ -144,8 +149,14 @@ export function showUndoableToast(message, undo) {
 // ---------------------------------------------------------------------
 // Decision — the ordered, canonical action set. Both surfaces render
 // exactly this order: Open, Rename, Go To, Resume, Kill, Answer, Accept,
-// Reject, Reassign, Mark Done, Cancel, Delete.
+// Reject, Reassign, Mark Done, Snooze, Unsnooze, Cancel, Delete.
 // ---------------------------------------------------------------------
+
+// Lanes a card can be snoozed FROM — mirrors agent_board.py's
+// `derive_lane`/the `PUT .../snooze` route's eligibility check (anything
+// that isn't In progress, Done, or a scheduler entry). A card already in
+// `snoozed` isn't in this set — it offers Unsnooze instead, below.
+const SNOOZE_ELIGIBLE_LANES = new Set(['unassigned', 'assigned', 'human_queue', 'review']);
 
 export function decideActions(session, card) {
   const s = session || null;
@@ -238,6 +249,18 @@ export function decideActions(session, card) {
     if (c.lane === 'human_queue' && !pendingQuestion && doneAllowed) {
       out.push({ id: 'resolve', label: 'Mark Done', enabled: true, reason: null, danger: false });
     }
+  }
+
+  // Snooze / Unsnooze — deferring a card until later, or waking it early.
+  // Snooze is offered on any card that isn't actively running or finished
+  // (agent_board.py's SNOOZE_INELIGIBLE_ERROR refuses everything else —
+  // In progress, Done, and scheduler entries — server-side too); Unsnooze
+  // only on a card that's currently dormant. Both card-only.
+  if (c && SNOOZE_ELIGIBLE_LANES.has(c.lane)) {
+    out.push({ id: 'snooze', label: 'Snooze', enabled: true, reason: null, danger: false });
+  }
+  if (c && c.lane === 'snoozed') {
+    out.push({ id: 'unsnooze', label: 'Unsnooze', enabled: true, reason: null, danger: false });
   }
 
   // Cancel — offered only when the server policy allows it. A refused
@@ -596,12 +619,70 @@ export async function resumeSession(root, s) {
 }
 
 // ---------------------------------------------------------------------
+// Snooze — preset/duration/date-time math, pure and directly testable
+// (no DOM), same spirit as `decideActions` above. Every preset is computed
+// from the BROWSER's own clock and calendar (`now`, always a plain `Date`
+// the caller controls — tests freeze it with Playwright's clock API) so
+// "tomorrow morning" and "next Monday" land on the operator's local day,
+// never UTC's.
+// ---------------------------------------------------------------------
+
+function _pad2(n) { return String(n).padStart(2, '0'); }
+
+// ISO-8601 with the LOCAL UTC offset (e.g. "2026-09-16T09:00:00-04:00"),
+// not `Date.prototype.toISOString`'s always-UTC "Z" — `until` is meant to
+// read as the operator's own wall-clock moment. `agent_board.parse_snoozed_until`
+// accepts either; this is simply the more legible one to send.
+export function isoWithOffset(date) {
+  const offsetMin = -date.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? '+' : '-';
+  const abs = Math.abs(offsetMin);
+  return (
+    `${date.getFullYear()}-${_pad2(date.getMonth() + 1)}-${_pad2(date.getDate())}` +
+    `T${_pad2(date.getHours())}:${_pad2(date.getMinutes())}:${_pad2(date.getSeconds())}` +
+    `${sign}${_pad2(Math.floor(abs / 60))}:${_pad2(abs % 60)}`
+  );
+}
+
+export function laterTodayPreset(now) {
+  return new Date(now.getTime() + 3 * 60 * 60 * 1000);
+}
+
+export function tomorrowMorningPreset(now) {
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 9, 0, 0, 0);
+}
+
+// Next Monday, 09:00 local — the SAME day of week rolls a full week ahead
+// (a Monday snooze doesn't wake an hour later; it wakes next week), any
+// other day rolls forward to the nearest Monday.
+export function nextWeekPreset(now) {
+  const day = now.getDay();  // 0=Sun .. 6=Sat
+  const daysAhead = ((1 - day + 7) % 7) || 7;
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate() + daysAhead, 9, 0, 0, 0);
+}
+
+// Hours are exact elapsed time; days are calendar days (`setDate`, local
+// wall clock) rather than a fixed 24h multiple, so "2 days" lands at the
+// same wall-clock time it started at even across a DST change in between
+// — the same reasoning the presets above already use for "tomorrow" and
+// "next Monday".
+export function customDurationUntil(now, amount, unit) {
+  if (unit === 'days') {
+    const until = new Date(now);
+    until.setDate(until.getDate() + amount);
+    return until;
+  }
+  return new Date(now.getTime() + amount * 60 * 60 * 1000);
+}
+
+// ---------------------------------------------------------------------
 // The shared row renderer — turns `decideActions(session, card)` into
 // buttons inside `container`. Skips rebuilding when nothing about the
 // decided set has changed since the last call (same ids, enabled states,
 // and reasons) so a caller that re-renders on every poll tick (the Graph
 // panel's `updateMeta`) doesn't blow away an in-progress interaction — a
-// chosen resume host, a visible resume-command box — for no reason.
+// chosen resume host, a visible resume-command box, an open snooze picker
+// mid-entry — for no reason.
 // ---------------------------------------------------------------------
 
 export function renderActionRow(container, opts = {}) {
@@ -690,6 +771,77 @@ export function renderActionRow(container, opts = {}) {
       copyBtn.onclick = () => _copyResumeCommand(container);
       btn.onclick = () => resumeSession(container, session);
       populateResumeHosts(container, session);
+    } else if (d.id === 'snooze') {
+      // Snooze's own picker UI is generic across surfaces (which preset,
+      // duration, or date-time was chosen); the actual write is a
+      // card-only network call the caller supplies, same as every other
+      // card action (`handlers.snooze(untilIso)` — unlike the rest, this
+      // one handler takes an argument).
+      const picker = document.createElement('div');
+      picker.className = 'snooze-picker';
+      picker.dataset.field = 'snooze-picker';
+      picker.hidden = true;
+      picker.innerHTML = `
+        <div class="snooze-presets">
+          <button type="button" class="drawer-action" data-action="snooze-preset" data-preset="later_today">Later today</button>
+          <button type="button" class="drawer-action" data-action="snooze-preset" data-preset="tomorrow_morning">Tomorrow morning</button>
+          <button type="button" class="drawer-action" data-action="snooze-preset" data-preset="next_week">Next week</button>
+        </div>
+        <div class="snooze-custom-row">
+          <label class="drawer-label" for="snooze-duration-value">Custom duration</label>
+          <input type="number" min="1" step="1" class="snooze-duration-value" id="snooze-duration-value" data-field="snooze-duration-value" placeholder="4" />
+          <select class="snooze-duration-unit" data-field="snooze-duration-unit">
+            <option value="hours">hours</option>
+            <option value="days">days</option>
+          </select>
+          <button type="button" class="drawer-action" data-action="snooze-duration-confirm">Snooze</button>
+        </div>
+        <div class="snooze-custom-row">
+          <label class="drawer-label" for="snooze-datetime-value">Custom date &amp; time</label>
+          <input type="datetime-local" class="snooze-datetime-value" id="snooze-datetime-value" data-field="snooze-datetime-value" />
+          <button type="button" class="drawer-action" data-action="snooze-datetime-confirm">Snooze</button>
+        </div>
+        <div class="drawer-field-error" data-field="snooze-error" hidden>Pick a time in the future.</div>
+      `;
+      container.appendChild(picker);
+      const errorEl = picker.querySelector('[data-field="snooze-error"]');
+      btn.onclick = () => {
+        picker.hidden = !picker.hidden;
+        errorEl.hidden = true;
+      };
+      // A picked time that has fallen into the past (a stale custom entry
+      // left sitting while the clock moved on, or a duration of 0) is
+      // refused right here — the server refuses it too, but there is no
+      // reason to round-trip a request that can only 400.
+      const submit = (until) => {
+        if (!(until instanceof Date) || Number.isNaN(until.getTime()) || until.getTime() <= Date.now()) {
+          errorEl.hidden = false;
+          return;
+        }
+        errorEl.hidden = true;
+        if (handlers.snooze) handlers.snooze(isoWithOffset(until));
+      };
+      picker.querySelectorAll('[data-action="snooze-preset"]').forEach((presetBtn) => {
+        presetBtn.onclick = () => {
+          const now = new Date();
+          const preset = presetBtn.dataset.preset;
+          const until = preset === 'later_today' ? laterTodayPreset(now)
+            : preset === 'tomorrow_morning' ? tomorrowMorningPreset(now)
+            : nextWeekPreset(now);
+          submit(until);
+        };
+      });
+      picker.querySelector('[data-action="snooze-duration-confirm"]').onclick = () => {
+        const value = Number(picker.querySelector('[data-field="snooze-duration-value"]').value);
+        const unit = picker.querySelector('[data-field="snooze-duration-unit"]').value;
+        if (!value || value <= 0) { errorEl.hidden = false; return; }
+        submit(customDurationUntil(new Date(), value, unit));
+      };
+      picker.querySelector('[data-action="snooze-datetime-confirm"]').onclick = () => {
+        const raw = picker.querySelector('[data-field="snooze-datetime-value"]').value;
+        if (!raw) { errorEl.hidden = false; return; }
+        submit(new Date(raw));
+      };
     } else if (d.id === 'focus') {
       btn.onclick = () => focusSession(container, session);
     } else if (d.id === 'kill') {

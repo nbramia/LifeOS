@@ -523,6 +523,56 @@ class TestUpdate:
 
         assert updated.cancelled_date == date.today().isoformat()
 
+    def test_update_status_away_from_done_clears_done_date(self, task_manager):
+        """A status write that leaves done clears done_date, so the date
+        never outlives the status it belongs to."""
+        task = task_manager.create("Done then reopened")
+        task_manager.update(task.id, status="done")
+        updated = task_manager.update(task.id, status="todo")
+
+        assert updated.status == "todo"
+        assert updated.done_date is None
+
+    def test_update_status_away_from_cancelled_clears_cancelled_date(self, task_manager):
+        """A status write that leaves cancelled clears cancelled_date, the
+        same way leaving done clears done_date."""
+        task = task_manager.create("Cancelled then reopened")
+        task_manager.update(task.id, status="cancelled")
+        updated = task_manager.update(task.id, status="todo")
+
+        assert updated.status == "todo"
+        assert updated.cancelled_date is None
+
+    def test_update_status_from_done_to_cancelled_swaps_the_lifecycle_date(self, task_manager):
+        """Moving directly from one terminal status to the other stamps the
+        new date and clears the old one in the same write."""
+        task = task_manager.create("Done then cancelled")
+        task_manager.update(task.id, status="done")
+        updated = task_manager.update(task.id, status="cancelled")
+
+        assert updated.done_date is None
+        assert updated.cancelled_date == date.today().isoformat()
+
+    def test_update_status_to_done_again_does_not_clear_its_own_date(self, task_manager, monkeypatch):
+        """A status write that keeps the task at done (no actual status
+        change) must not clear the date it just stamped. Stamps an old
+        date via a monkeypatched `_today` before flipping it for the
+        second write — both calls landing on the real "today" would make
+        a bug that re-stamps on every status="done" write (even a no-op
+        one) indistinguishable from the correct behavior, since either way
+        `updated.done_date` would equal `first.done_date`."""
+        import api.services.task_manager as task_manager_module
+
+        task = task_manager.create("Already done")
+        monkeypatch.setattr(task_manager_module, "_today", lambda: "2020-01-01")
+        first = task_manager.update(task.id, status="done")
+        assert first.done_date == "2020-01-01"
+
+        monkeypatch.setattr(task_manager_module, "_today", lambda: "2021-06-15")
+        updated = task_manager.update(task.id, status="done", notes="unrelated edit")
+
+        assert updated.done_date == first.done_date == "2020-01-01"
+
     def test_update_nonexistent_task(self, task_manager):
         """Test updating a non-existent task."""
         result = task_manager.update("nonexistent", description="New")
@@ -1913,6 +1963,51 @@ class TestOperatorFields:
         task = task_manager.create("Merge fields", context="Fields", fields={"host": "laptop"})
         updated = task_manager.update(task.id, fields={"effort": "high"})
         assert updated.fields == {"host": "laptop", "effort": "high"}
+
+
+class TestSnoozedUntilFieldRoundTrip:
+    """`snoozed_until` is a plain custom field — these tests exist because
+    its value is a colon-rich ISO-8601 timestamp with a UTC offset,
+    the one shape most likely to break `_INLINE_FIELD_RE`'s `[key:: value]`
+    parsing if the value regex ever stopped being greedy up to the closing
+    bracket."""
+
+    ISO_WITH_OFFSET = "2026-09-16T09:00:00-04:00"
+
+    def test_value_round_trips_through_write_and_reparse(self, task_manager):
+        task = task_manager.create("Snooze round trip", context="Snooze", tags=["me"])
+        written = task_manager.update(task.id, fields={"snoozed_until": self.ISO_WITH_OFFSET})
+        assert written.fields == {"snoozed_until": self.ISO_WITH_OFFSET}
+
+        content = (task_manager.tasks_dir / "Snooze.md").read_text(encoding="utf-8")
+        assert f"[snoozed_until:: {self.ISO_WITH_OFFSET}]" in content
+
+        # Force a reparse from disk (not the in-memory index) to prove the
+        # written line itself round-trips, not just the object in memory.
+        task_manager.reindex_file(str(task_manager.tasks_dir / "Snooze.md"))
+        reparsed = task_manager.get(task.id)
+        assert reparsed.fields == {"snoozed_until": self.ISO_WITH_OFFSET}
+
+    def test_write_leaves_status_tags_and_notes_byte_for_byte_unchanged(self, task_manager):
+        task = task_manager.create(
+            "Snooze preserves the rest", context="Snooze", tags=["me", "urgent-work"],
+            notes="line one\nline two",
+        )
+        updated = task_manager.update(task.id, fields={"snoozed_until": self.ISO_WITH_OFFSET})
+        assert updated.status == task.status
+        assert updated.tags == task.tags
+        assert updated.notes == task.notes
+        assert updated.description == task.description
+
+    def test_clearing_removes_the_field_and_leaves_other_fields(self, task_manager):
+        task = task_manager.create(
+            "Snooze clear", context="Snooze", fields={"host": "laptop"},
+        )
+        task_manager.update(task.id, fields={"snoozed_until": self.ISO_WITH_OFFSET})
+        cleared = task_manager.update(task.id, fields={"snoozed_until": None})
+        assert cleared.fields == {"host": "laptop"}
+        content = (task_manager.tasks_dir / "Snooze.md").read_text(encoding="utf-8")
+        assert "snoozed_until" not in content
 
 
 class TestMergeForwardCacheFields:

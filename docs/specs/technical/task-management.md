@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Task Management
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-15
 
 Engineering view of the task store — how a task is located, written, and
 reindexed. For the product-facing feature description, statuses, and API
@@ -192,6 +192,24 @@ external delete raced the move), the move is treated like any other
 externally-deleted task — reconciled out of the index — rather than raising
 a conflict.
 
+## Lifecycle dates
+
+`Task.done_date`/`Task.cancelled_date` are stamped and cleared at one
+central choke point inside `update()`'s per-key `apply()` closure, the same
+pattern `_clear_stale_snooze` uses for `snoozed_until`: a `status` write that
+lands on `"done"` stamps `done_date` to today (skipped if the task is
+already `"done"`, so a no-op status write never re-stamps it); a `status`
+write that lands on `"cancelled"` stamps `cancelled_date` the same way. A
+`status` write that *leaves* `"done"` clears `done_date`, and one that
+leaves `"cancelled"` clears `cancelled_date` — so a task's lifecycle date
+never survives a status change away from the status it belongs to. Moving
+directly between the two terminal statuses stamps the new date and clears
+the old one in the same write. This is what a board lane-move Undo (see
+[agent-viz.md](../product/agent-viz.md)'s Undo behavior) relies on: writing
+a card's prior status back through `PUT /api/tasks/{id}` — the general
+task-update endpoint, not a lane-endpoint replay — leaves no stale
+`done_date` behind on a card that only passed through Done briefly.
+
 ## Atomic writes
 
 All file writes — task files, `data/task_index.json`, `Dashboard.md`, a
@@ -339,6 +357,14 @@ this store, not a separate one: a card is a task with tag `human` and status
 persistence, no schema change. See the
 [Human Queue guide](../../guides/human-queue.md) for the tool/endpoint
 contract and the `done_when` reference.
+
+## Snoozed-until field
+
+A card's snooze is a wake-up time, `[snoozed_until:: <ISO-8601 with offset>]`, stored the same generic way as `host`/`effort`/`model` — no parser change, no schema change (see [Parsing](#parsing)). `TaskManager` itself does not parse or validate the timestamp; `agent_board.parse_snoozed_until`/`is_snoozed` do (see [Agent Viz — Technical § Snooze](agent-viz.md#snooze)), and the write path (`PUT /api/agents/board/cards/{id}/snooze`) rejects a missing, unparseable, offset-less, or non-future value before ever calling `TaskManager.update`. A stored value that has since passed is left in place — nothing purges it, and it is simply ignored, the same as any other expired-but-present field.
+
+`TaskManager.claim_for_agent`'s `is_claimable` check refuses a task whose `fields` make `agent_board.is_snoozed(task.fields)` true, re-evaluated on every compare-and-swap retry exactly like the existing status/pickup-tag/exclusion-tag checks — a claim attempt against a snoozed task fails the same way a claim against an ineligible status does, independent of whatever listing produced the candidate.
+
+`TaskManager` also owns the one central write-time choke point that keeps a stale `snoozed_until` from lingering on a task whose write lands it somewhere the field is irrelevant: `_clear_stale_snooze(t)`, called at the tail of both `update()`'s `apply()` and `swap_tag()`'s `compute()`, drops the field whenever the write's own resulting status/tags land the task in a natural lane outside `agent_board.SNOOZABLE_LANES` (i.e. `in_progress` or `done`) — it checks only field presence and the natural lane, never parses the timestamp itself. This is what keeps the worker's `/swap-tag` resume (`agent-blocked` → `agent-running`) and a generic `PUT /api/tasks/{id}` status change to `in_progress`/`done`/`cancelled` from leaving a future wake-up time behind on a card that's now running or finished — see [Agent Viz — Technical § Snooze](agent-viz.md#snooze) for the full write-path picture, including the board-specific writes (lane move, Accept, Cancel, Reject/Reassign) that clear it explicitly. `human_queue.resolve_card` (`update(status="done", ...)`) is not one of the paths this clears for a `#human` card: the `human` tag alone keeps the natural lane at `human_queue`, which is still snooze-eligible, so a snoozed `#human` card resolved this way keeps its `snoozed_until` and stays hidden until it wakes.
 
 ## Shared lifecycle projection
 

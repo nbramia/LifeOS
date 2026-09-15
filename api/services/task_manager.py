@@ -31,6 +31,12 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from config.settings import settings
+from api.services.agent_board import (
+    SNOOZABLE_LANES as _SNOOZABLE_LANES,
+    SNOOZED_UNTIL_FIELD as _SNOOZED_UNTIL_FIELD,
+    is_snoozed as _is_snoozed,
+    natural_lane as _natural_lane,
+)
 from api.services.atomic_write import atomic_write_text, atomic_write_lines
 from api.services.operation_lock import exclusive_operation_lock
 
@@ -161,6 +167,32 @@ class Task:
         if "fields" in data and not isinstance(data.get("fields"), dict):
             data["fields"] = {}
         return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
+
+
+def _clear_stale_snooze(t: Task) -> None:
+    """Central choke point: if this task's own status/tags now land it in
+    a natural lane a snooze can never override (In progress or Done — see
+    `agent_board.SNOOZABLE_LANES`), drop `snoozed_until` when present.
+
+    Called at the tail of every write path that can change a task's
+    status or tags (`update`, `swap_tag`) right before the task is
+    persisted, so a snoozed Human-queue card resumed via `/swap-tag`
+    (`agent-blocked` -> `agent-running`), a status write to
+    `in_progress`/`done`/`cancelled`, or any other tag change that lands
+    the card in In progress or Done can never leave a stale future
+    wake-up time behind — one that would otherwise silently re-apply and
+    hide the card again the next time it lands in a snooze-eligible lane
+    (e.g. a resumed card reaching Review before its wake-up time).
+    Mutates `t.fields` in place; a no-op when the field is absent or the
+    natural lane is still snooze-eligible — which is why a `#human` card
+    the human-queue resolve path marks `done` keeps its snooze: the
+    `human` tag alone still puts its natural lane in Human queue.
+    """
+    if _SNOOZED_UNTIL_FIELD not in t.fields:
+        return
+    if _natural_lane(t.status, t.tags) in _SNOOZABLE_LANES:
+        return
+    t.fields = {k: v for k, v in t.fields.items() if k != _SNOOZED_UNTIL_FIELD}
 
 
 def _today() -> str:
@@ -428,10 +460,14 @@ class TaskManager:
     def update(self, task_id: str, **kwargs) -> Optional[Task]:
         """Update a task. Supports: description, status, context, priority,
         due_date, tags, notes, fields. `fields={"k": None}` removes key `k`;
-        `fields={"k": "v"}` sets it. Raises `TaskConflictError` (-> HTTP 409)
-        if the write keeps losing the CAS race against a concurrent edit;
-        `ValueError` (-> HTTP 422) for an unrecognized `status` or hostile
-        `description`/`notes`/`fields` content — see `_validate_text_fields`.
+        `fields={"k": "v"}` sets it. A `status` write that lands on `done` or
+        `cancelled` stamps `done_date`/`cancelled_date`; a `status` write that
+        leaves either one clears that date, so a task's lifecycle date never
+        outlives the status it belongs to. Raises `TaskConflictError` (->
+        HTTP 409) if the write keeps losing the CAS race against a concurrent
+        edit; `ValueError` (-> HTTP 422) for an unrecognized `status` or
+        hostile `description`/`notes`/`fields` content — see
+        `_validate_text_fields`.
         """
         fields_patch = kwargs.pop("fields", None)
         notes_merge = kwargs.pop("_notes_merge", None)
@@ -487,10 +523,20 @@ class TaskManager:
                 if precondition is not None:
                     precondition(t)
                 for key, value in kwargs.items():
-                    if key == "status" and value == "done" and t.status != "done":
-                        t.done_date = _today()
-                    elif key == "status" and value == "cancelled" and t.status != "cancelled":
-                        t.cancelled_date = _today()
+                    if key == "status" and value is not None and value != t.status:
+                        # Stamp the lifecycle date on the way in, and clear it
+                        # on the way back out — a status leaving done or
+                        # cancelled always carries its lifecycle date away
+                        # with it, so a task's `done_date`/`cancelled_date`
+                        # is always in sync with its current `status`.
+                        if value == "done":
+                            t.done_date = _today()
+                        elif t.status == "done":
+                            t.done_date = None
+                        if value == "cancelled":
+                            t.cancelled_date = _today()
+                        elif t.status == "cancelled":
+                            t.cancelled_date = None
                     if hasattr(t, key) and value is not None:
                         setattr(t, key, value)
                 if tags_merge is not None:
@@ -506,6 +552,7 @@ class TaskManager:
                         else:
                             merged[k] = v
                     t.fields = merged
+                _clear_stale_snooze(t)
                 t.updated_at = _now_iso()
                 return t
 
@@ -606,6 +653,7 @@ class TaskManager:
                 new_tags = list(t.tags)
                 new_tags[idx] = to_norm
                 new_task.tags = new_tags
+                _clear_stale_snooze(new_task)
                 new_task.updated_at = _now_iso()
                 return new_task
 
@@ -640,6 +688,10 @@ class TaskManager:
 
         Eligibility is checked again on every compare-and-swap retry so a stale
         worker listing cannot claim a task whose status or assignment changed.
+        A task with a future `snoozed_until` is never claimable — checked
+        here, not only in the worker's own listing, so a direct claim
+        attempt against a snoozed task is refused the same way a stale
+        listing would be.
         """
         pickup = {tag.lstrip("#").lower() for tag in pickup_tags}
         excluded = {tag.lstrip("#").lower() for tag in exclusion_tags}
@@ -650,7 +702,12 @@ class TaskManager:
 
         def is_claimable(task: Task) -> bool:
             tags = {tag.lstrip("#").lower() for tag in task.tags}
-            return task.status.lower() in statuses and bool(tags & pickup) and not bool(tags & excluded)
+            return (
+                task.status.lower() in statuses
+                and bool(tags & pickup)
+                and not bool(tags & excluded)
+                and not _is_snoozed(task.fields)
+            )
 
         with self._lock:
             current = self._tasks.get(task_id)

@@ -4,7 +4,8 @@
 // task store via GET/PUT /api/agents/board*, with a card drawer that reuses
 // the shared SessionPanel (./panel.js) for the linked session's transcript,
 // exactly like the Graph tab's side panel does. The drawer's own action
-// row (Open, Go To, Resume, Kill, Answer, Accept, Reject, Reassign, Mark Done, Cancel, Delete)
+// row (Open, Go To, Resume, Kill, Answer, Accept, Reject, Reassign, Mark
+// Done, Snooze, Unsnooze, Cancel, Delete)
 // is rendered by session_actions.js's `renderActionRow` — the same
 // function the Graph tab's side panel uses for its own header — so the
 // embedded SessionPanel here is constructed with `showActions: false`
@@ -19,7 +20,10 @@ import {
 } from './panel.js';
 import { renderActionRow } from './session_actions.js';
 import { descendantsOf } from './graph_encoding.js';
-import { acceptCard, cardActionHandlers, cancelCard, deleteCard, openDeleteCardModal } from './card_actions.js';
+import {
+  acceptCard, cardActionHandlers, cancelCard, deleteCard, openDeleteCardModal, snoozeCard,
+  undoAcceptedCard,
+} from './card_actions.js';
 import { renderAssignmentPickers } from './assignment.js';
 import { SCHEDULE_ACTIONS, renderScheduleActionSections, actionInputsSatisfied } from './schedule_sections.js';
 import { LANES, laneColor } from './lanes.js';
@@ -90,14 +94,17 @@ const DRAWER_EDITABLE_FIELDS = [
 // (web/agents/linking.js) — persistence, migration, and validation of a
 // stored id list all live there now; `visibleLanes` below is a local mirror
 // kept in sync via `subscribeFilters`.
-const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done').map(l => l.id);
-// plan_lane_move (api/services/agent_board.py) rejects `review` and
-// `scheduled` with "cannot be set directly" — the task composer's own "+"
-// button and lane select exclude both. Scheduled gets its own "+" below
-// (SCHEDULED_LANE_ID) that opens the schedule composer instead; Review
-// still has none, since a card only reaches Review through the worker's
-// own tags.
-const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled').map(l => l.id));
+const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done' && l.id !== 'snoozed').map(l => l.id);
+// plan_lane_move (api/services/agent_board.py) rejects `review`,
+// `scheduled`, and `snoozed` with "cannot be set directly" — no per-lane
+// "+" button for any of the three, all three are excluded from the
+// new-card composer's lane select, and `canDropCard`/`onCardDropped`
+// (below) refuse a drop targeting one before it ever reaches the server.
+// Scheduled gets its own "+" below (SCHEDULED_LANE_ID) that opens the
+// schedule composer instead; Review still has none, since a card only
+// reaches Review through the worker's own tags; snoozing only ever happens
+// through the drawer's Snooze picker.
+const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled' && l.id !== 'snoozed').map(l => l.id));
 const SCHEDULED_LANE_ID = 'scheduled';
 
 function loadSortSelection() {
@@ -583,6 +590,88 @@ export function initBoard() {
     return { allowed: true, reason: '' };
   }
 
+  // Mirrors api/services/agent_board.py's natural_lane(status, tags) — the
+  // lane a card would derive to ignoring any snooze. Used only to compute
+  // Undo's restore target for a card captured mid-snooze, since the
+  // server's own `snoozed` lane can never be set directly (plan_lane_move
+  // refuses it the same way review/scheduled are refused). Deliberately
+  // omits the machine-wait-tag branch production's natural_lane has: a
+  // card this function is ever called on was successfully snoozed, which
+  // the drawer only ever offers from Unassigned, Assigned, Human queue, or
+  // Review (session_actions.js's SNOOZE_ELIGIBLE_LANES), so its natural
+  // lane can never actually be the machine-wait flavor of In progress.
+  function naturalLaneFor(card) {
+    const tags = new Set((card.tags || []).map(t => String(t).replace(/^#+/, '').toLowerCase()));
+    const status = (card.status || 'todo').toLowerCase();
+    if (tags.has('agent-completed') && !tags.has('accepted')) return 'review';
+    if (tags.has('agent-blocked') || tags.has('human') || status === 'blocked') return 'human_queue';
+    if (status === 'in_progress' || tags.has('agent-running')) return 'in_progress';
+    if (status === 'done' || status === 'cancelled') return 'done';
+    return card.assignee ? 'assigned' : 'unassigned';
+  }
+
+  // The shared Undo restore target for both the lane-drop (onCardDropped)
+  // and the tray-assignee-drop (assignCardTo) paths. The invariant: every
+  // lane-move Undo restores the card's exact pre-move status and tags,
+  // through `restoreCardSnapshot` below — never a replay of the lane
+  // endpoint with only a target lane, which plan_lane_move's branches
+  // cannot do safely in either direction. Moving INTO Human queue forces
+  // `status="blocked"` without touching tags; moving INTO Done, In
+  // progress, Assigned, or Unassigned touches only tags or only status,
+  // never both — so replaying any of them to UNDO a move that changed the
+  // other half leaves the card wrong (stuck at the wrong status, or
+  // missing/carrying the wrong tags).
+  //
+  // Two dedicated exceptions keep their own paths, both because
+  // `plan_lane_move` refuses them as a direct target in the first place:
+  // Review (an accept-by-drag-to-Done is undone via the dedicated
+  // undo-accept transition, never a status/tags write — the only way a
+  // snoozed Review card's Undo is ever offered is after a drag to Done
+  // added `accepted`, since `agent-completed` alone already wins the
+  // derived lane back to Review the instant it's written anywhere else,
+  // which short-circuits the undoable toast entirely, without this
+  // function ever being called — see onCardDropped's "landed elsewhere"
+  // check) and Snoozed (`card.lane` itself was `snoozed`, so callers
+  // resolve the card's NATURAL lane first via `naturalLaneFor` rather than
+  // ever passing `snoozed` through here as `lane`). `snoozedUntil`, when
+  // given and still in the future, re-applies the snooze once the
+  // restore (or acceptance) completes.
+  function undoToLane(cardId, lane, snoozedUntil, snapshot) {
+    const restore = lane === 'review'
+      ? undoAcceptedCard(cardId, () => {})
+      : restoreCardSnapshot(cardId, snapshot);
+    return restore
+      .then(() => {
+        const stillFuture = snoozedUntil && new Date(snoozedUntil).getTime() > Date.now();
+        return stillFuture ? snoozeCard({ id: cardId }, snoozedUntil, () => {}) : null;
+      })
+      .then(() => fetchBoard());
+  }
+
+  // Writes the pre-drag status/tags back verbatim via PUT /api/tasks/{id} —
+  // the same endpoint the drawer's own edits use, not the board's tags-only
+  // endpoint (which refuses any payload naming a protected tag, and an
+  // assignee/lifecycle tag is exactly what a full prior-state snapshot can
+  // carry). That endpoint's own assignee/claim-tag guard compares the
+  // snapshot against the card's CURRENT tags and refuses the write (leaving
+  // the card exactly as the server currently has it, with a toast) rather
+  // than silently overwriting a reassignment or claim the worker made while
+  // the card sat outside Human queue — see api/routes/tasks.py's
+  // `update_task`. Rethrows on failure, matching moveCard: undoToLane's
+  // caller (showUndoableToast) only restores the toast's "Undo" label and
+  // keeps the toast up on a rejection, so a swallowed error here would
+  // report a refused restore as a success and, for a card that was
+  // snoozed, still go on to re-snooze a card the restore never actually
+  // touched.
+  function restoreCardSnapshot(cardId, snapshot) {
+    if (!snapshot) return Promise.resolve();
+    return putTask(cardId, { status: snapshot.status, tags: snapshot.tags })
+      .catch((err) => {
+        showToast("Couldn't undo — the card may have changed since.", true);
+        throw err;
+      });
+  }
+
   // Every way to assign a card — dragging an assignee onto a card, or
   // dragging a card onto an assignee — lands here, so neither path can
   // report or offer undo differently from the other.
@@ -595,9 +684,16 @@ export function initBoard() {
       return;
     }
     // Captured before the write so Undo restores where the card actually
-    // was, not wherever the board has drifted to by the time it is clicked.
+    // was, not wherever the board has drifted to by the time it is
+    // clicked. A card dragged while snoozed resolves its Undo target to
+    // the NATURAL lane it was snoozed from, plus the wake-up time, so
+    // Undo restores the snooze too instead of trying (and failing) to
+    // move the card directly into the `snoozed` lane.
     const priorLane = card.lane;
-    const priorAssignee = card.assignee || null;
+    const priorStatus = card.status;
+    const priorTags = (card.tags || []).slice();
+    const priorSnoozedUntil = priorLane === 'snoozed' ? (card.fields && card.fields.snoozed_until) : null;
+    const priorNaturalLane = priorLane === 'snoozed' ? naturalLaneFor(card) : priorLane;
     const title = card.title || card.id;
     setDropStatus(`Assigning ${assignee}…`);
     // Keep this on the same lane endpoint and request shape as the drawer's
@@ -608,7 +704,9 @@ export function initBoard() {
         setDropStatus(`Assigned to ${assignee}.`);
         if (data && data.lane && data.lane !== 'assigned') return;
         showUndoableToast(`Assigned "${title}" to ${assignee}.`, () => (
-          moveCard(card.id, priorLane, priorAssignee || undefined)
+          undoToLane(card.id, priorNaturalLane, priorSnoozedUntil, {
+            status: priorStatus, tags: priorTags,
+          })
         ));
       })
       .catch(() => setDropStatus('Assignment refused.', true));
@@ -627,10 +725,13 @@ export function initBoard() {
   function renderAssigneeDrops() {
     if (!assigneeDropsEl) return;
     const current = getFilters().assignee;
+    assigneeDropsEl.parentElement?.style.setProperty(
+      '--board-tray-button-count', String(ASSIGNEES.length + 1),
+    );
     assigneeDropsEl.innerHTML = ASSIGNEES.map(assignee => `
       <button type="button" class="board-drop-target board-assignee-drop${current === assignee ? ' selected' : ''}"
               data-assignee="${assignee}" aria-pressed="${current === assignee}"
-              aria-label="Filter board to ${assignee}">
+              title="${escapeAttr(assignee)}" aria-label="Filter board to ${escapeAttr(assignee)}">
         ${assignee}
       </button>
     `).join('');
@@ -670,6 +771,15 @@ export function initBoard() {
 
   function cardChips(card) {
     const chips = [];
+    // Snoozed cards show their wake-up time first — the one thing that
+    // actually explains why the card is sitting here instead of its
+    // natural lane.
+    if (card.lane === 'snoozed' && card.fields && card.fields.snoozed_until) {
+      const wake = formatWakeTime(card.fields.snoozed_until);
+      if (wake) {
+        chips.push(`<span class="board-chip board-chip-snoozed" title="wakes ${escapeAttr(wake.exact)}">⏰ ${escapeHtml(wake.label)}</span>`);
+      }
+    }
     if (card.assignee) chips.push(`<span class="board-chip board-chip-assignee">${escapeHtml(card.assignee)}</span>`);
     if (card.fields && card.fields.model) chips.push(`<span class="board-chip">${escapeHtml(card.fields.model)}</span>`);
     if (card.fields && card.fields.effort) chips.push(`<span class="board-chip">${escapeHtml(card.fields.effort)}</span>`);
@@ -1233,9 +1343,15 @@ export function initBoard() {
       assignee = card.assignee || 'me';
     }
     // Captured before the write so Undo restores where the card actually
-    // was, not wherever the board has drifted to by the time it is clicked.
+    // was, not wherever the board has drifted to by the time it is
+    // clicked. A card dragged out of Snoozed resolves its Undo target to
+    // the NATURAL lane it was snoozed from, plus the wake-up time — see
+    // naturalLaneFor/undoToLane.
     const priorLane = card.lane;
-    const priorAssignee = card.assignee || null;
+    const priorStatus = card.status;
+    const priorTags = (card.tags || []).slice();
+    const priorSnoozedUntil = priorLane === 'snoozed' ? (card.fields && card.fields.snoozed_until) : null;
+    const priorNaturalLane = priorLane === 'snoozed' ? naturalLaneFor(card) : priorLane;
     const title = card.title || card.id;
     // moveCard already toasts and re-renders on failure — nothing more to
     // do there, just avoid an unhandled rejection given that it re-throws.
@@ -1246,7 +1362,9 @@ export function initBoard() {
         // A second toast claiming the requested move would contradict it.
         if (data && data.lane && data.lane !== targetLane) return;
         showUndoableToast(`Moved "${title}" to ${laneLabel(targetLane)}.`, () => (
-          moveCard(cardId, priorLane, priorAssignee || undefined)
+          undoToLane(cardId, priorNaturalLane, priorSnoozedUntil, {
+            status: priorStatus, tags: priorTags,
+          })
         ));
       })
       .catch(() => {});
@@ -1325,6 +1443,14 @@ export function initBoard() {
         <input id="new-card-desc" type="text" style="width:100%;box-sizing:border-box;margin:0.35rem 0;padding:0.4rem;background:var(--bg-elev);color:var(--text-primary);border:1px solid var(--border);border-radius:6px" />
         <label style="font-size:0.75rem;color:var(--text-secondary)">Notes (optional)</label>
         <textarea id="new-card-notes" placeholder="Notes…"></textarea>
+        <label style="font-size:0.75rem;color:var(--text-secondary)">Tags</label>
+        <div class="drawer-tags-picker" data-field="tags-picker" role="group" aria-label="Tags">
+          <div class="drawer-tag-chips" data-field="tag-chips" role="list"></div>
+          <input class="drawer-tags drawer-tags-search" data-field="tags" type="search" role="combobox"
+                 aria-autocomplete="list" aria-expanded="false" autocomplete="off"
+                 placeholder="Search or add tags…" />
+          <div class="drawer-tag-options" data-field="tag-options" role="listbox" hidden></div>
+        </div>
         <label style="font-size:0.75rem;color:var(--text-secondary)">Lane</label>
         <select id="new-card-lane" style="width:100%;margin:0.35rem 0;padding:0.4rem;background:var(--bg-elev);color:var(--text-primary);border:1px solid var(--border);border-radius:6px">
           ${LANES.filter(l => DIRECT_LANE_IDS.has(l.id)).map(l => `<option value="${l.id}" ${l.id === initialLane ? 'selected' : ''}>${escapeHtml(l.label)}</option>`).join('')}
@@ -1341,7 +1467,14 @@ export function initBoard() {
       </div>
     `;
     document.body.appendChild(backdrop);
-    const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
+    // Local-only mode (no `persist`): the card doesn't exist yet, so the
+    // picker just tracks chosen tags in memory — read back via `.getTags()`
+    // below when the card is actually created.
+    const composerTagPicker = mountTagPicker(backdrop, [], {});
+    const cleanup = () => {
+      if (composerTagPicker && composerTagPicker.cancel) composerTagPicker.cancel();
+      if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
+    };
     backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
     backdrop.querySelector('#new-card-cancel').onclick = cleanup;
 
@@ -1389,6 +1522,18 @@ export function initBoard() {
         showToast('Only "me" can be assigned directly to In progress — the worker claims agent-assigned tasks itself.', true);
         return;
       }
+      // A tag typed into the picker's search field but never confirmed
+      // (no Enter, no option pick) must still reach the payload, the same
+      // way blur commits it in the drawer — flush it explicitly rather
+      // than rely on Create's click happening to blur the search field
+      // first.
+      if (composerTagPicker && composerTagPicker.commitPendingText) composerTagPicker.commitPendingText();
+      // The picker itself already refuses any tag matching an assignee name
+      // (normalizeEditableTag filters ASSIGNEES the same as the drawer's
+      // picker does), so a chosen tag can never collide with the assignee's
+      // own routing tag — no separate de-dup pass is needed beyond `Set`.
+      const chosenTags = composerTagPicker && composerTagPicker.getTags ? composerTagPicker.getTags() : [];
+      const tags = assignee ? [...new Set([assignee, ...chosenTags])] : chosenTags;
       const btn = backdrop.querySelector('#new-card-create');
       btn.disabled = true;
       btn.textContent = 'Creating…';
@@ -1399,7 +1544,7 @@ export function initBoard() {
           body: JSON.stringify({
             description: desc,
             notes: notes || undefined,
-            tags: assignee ? [assignee] : undefined,
+            tags: tags.length ? tags : undefined,
           }),
         });
         if (!r.ok) {
@@ -2059,8 +2204,17 @@ export function initBoard() {
     return left.length === right.length && left.every((tag, index) => tag === right[index]);
   }
 
-  function mountTagPicker(card, initialTags) {
-    const picker = drawerEl.querySelector('[data-field="tags-picker"]');
+  // `container` is the DOM subtree carrying the `[data-field="tags-picker"]`
+  // markup — the drawer (`drawerEl`) for an existing card, or a composer
+  // modal for a card that doesn't exist yet. `config.persist(tags)` is the
+  // async save call for a card that already has an id (the drawer's
+  // `putBoardTags`); omitting it (the composer) puts the picker in
+  // local-only mode — it just tracks the chosen tags in memory for the
+  // caller to read back via `handle.getTags()` at submit time, with no
+  // network call and no board re-fetch.
+  function mountTagPicker(container, initialTags, config) {
+    const persist = config && config.persist;
+    const picker = container.querySelector('[data-field="tags-picker"]');
     const search = picker && picker.querySelector('[data-field="tags"]');
     const chips = picker && picker.querySelector('[data-field="tag-chips"]');
     const options = picker && picker.querySelector('[data-field="tag-options"]');
@@ -2070,11 +2224,35 @@ export function initBoard() {
     let confirmed = selected.slice();
     let saveChain = Promise.resolve();
     let pendingSaves = 0;
-    let suppressBlur = false;
     let activeOption = -1;
     let showingLegacyValue = true;
     let cancelled = false;
     let saveGeneration = 0;
+    // The suggestion list only opens once the operator has actually asked
+    // for it — typed a query, or pressed ArrowDown/ArrowUp — not on bare
+    // focus with an empty query, which would otherwise sit open over
+    // whatever sits below the picker (the composer's Create button, or the
+    // drawer's action row). Sticky until blur/Escape so a run of picks
+    // (each of which clears the query back to empty) doesn't re-close it
+    // between selections.
+    let openByRequest = false;
+    // iOS Safari doesn't focus a tapped <button>, so a chip's × or a
+    // suggestion option can be activated by touch with no focus change at
+    // all — the focusout handler below then sees a null `relatedTarget`
+    // and can't tell that apart from a genuine tap outside the picker.
+    // This flag is the fallback signal: true for the lifetime of a pointer
+    // gesture that started on a chip or an option, so the focusout handler
+    // can skip committing a still-typed query out from under that
+    // gesture's own click handler (addTag/removeTag). Cleared on a delay
+    // rather than by the click itself, since a tap that never fires
+    // "click" (e.g. one interrupted by a scroll) must not leave it stuck.
+    let pointerDownInsideChipsOrOptions = false;
+    function markPointerDownInsidePicker() {
+      pointerDownInsideChipsOrOptions = true;
+      setTimeout(() => { pointerDownInsideChipsOrOptions = false; }, 0);
+    }
+    chips.addEventListener('pointerdown', markPointerDownInsidePicker);
+    options.addEventListener('pointerdown', markPointerDownInsidePicker);
 
     function renderChips() {
       chips.innerHTML = selected.map(tag => `
@@ -2103,14 +2281,18 @@ export function initBoard() {
       if (canCreate) {
         options.innerHTML += `<button type="button" class="drawer-tag-option drawer-tag-option-create" role="option" data-create-tag="${escapeHtml(normalizeEditableTag(query))}">Create new #${escapeHtml(normalizeEditableTag(query))}</button>`;
       }
-      options.hidden = document.activeElement !== search || (!matches.length && !canCreate);
+      // Empty-query focus alone never opens the list (see `openByRequest`
+      // above) — only a non-blank query or an explicit ArrowDown/ArrowUp
+      // does, so the list can't sit open over the Create button or drawer
+      // action row the moment the field gains focus.
+      options.hidden = document.activeElement !== search
+        || (!query && !openByRequest)
+        || (!matches.length && !canCreate);
       activeOption = -1;
       options.querySelectorAll('[data-select-tag], [data-create-tag]').forEach(button => {
-        button.addEventListener('mousedown', () => { suppressBlur = true; });
         button.addEventListener('click', () => {
           if (button.dataset.createTag) addTag(button.dataset.createTag);
           else addTag(button.dataset.selectTag);
-          suppressBlur = false;
           search.focus();
         });
       });
@@ -2122,11 +2304,16 @@ export function initBoard() {
       const generation = saveGeneration;
       selected = requested;
       renderChips();
+      if (!persist) {
+        // Local-only mode: nothing to save yet, so confirm immediately.
+        confirmed = requested.slice();
+        return;
+      }
       pendingSaves += 1;
       saveChain = saveChain.then(async () => {
         try {
           if (cancelled || generation !== saveGeneration) return;
-          await putBoardTags(card.id, requested);
+          await persist(requested);
           confirmed = requested.slice();
           if (!cancelled && generation === saveGeneration) await fetchBoard();
         } catch (err) {
@@ -2170,13 +2357,25 @@ export function initBoard() {
         // tags remain searches until the operator selects them explicitly.
         if (normalized && !availableEditableTags().includes(normalized)) {
           search.value = normalized;
-          queueSave([normalized]);
+          // Add to whatever's already chosen (chips, or a card's other
+          // editable tags in the drawer) rather than replacing the
+          // selection outright — a chip picked earlier, or another tag
+          // already on the card, must survive a still-typed token being
+          // committed on blur or on Create. `queueSave` re-runs
+          // `uniqueEditableTags`, so this can't duplicate `normalized` or
+          // let a lifecycle/assignee tag slip through.
+          queueSave([...selected, normalized]);
         }
         return;
       }
       const parsed = [];
       const rejected = [];
-      raw.split(/\s+/).forEach(token => {
+      // Commas act as separators alongside whitespace — "alpha, beta"
+      // splits into "alpha" and "beta", not a rejected "alpha," token —
+      // so `[\s,]+` (not `\s+`) is the split, and `.filter(Boolean)` drops
+      // the empty string a trailing/doubled separator would otherwise
+      // leave behind.
+      raw.split(/[\s,]+/).filter(Boolean).forEach(token => {
         const plain = token.replace(/^#/, '');
         if (TAG_TOKEN.test(plain) && normalizeEditableTag(plain)) parsed.push(plain);
         else rejected.push(token);
@@ -2186,7 +2385,13 @@ export function initBoard() {
         showToast(`Ignored invalid tag${rejected.length > 1 ? 's' : ''}: ${rejected.join(', ')}`, true);
       }
       search.value = normalized.join(' ');
-      queueSave(normalized);
+      // Add to whatever's already chosen — same reasoning as the
+      // single-token branch above: a chip picked earlier, or a card's
+      // other editable tags, must survive a multi-word blur/Create commit
+      // rather than being replaced by it. `queueSave` re-runs
+      // `uniqueEditableTags`, so this can't duplicate an already-selected
+      // tag or let a lifecycle/assignee tag slip through.
+      queueSave([...selected, ...normalized]);
     }
 
     renderChips();
@@ -2202,17 +2407,51 @@ export function initBoard() {
       }
       renderOptions();
     });
-    search.addEventListener('input', renderOptions);
-    search.addEventListener('blur', () => {
-      if (suppressBlur) return;
+    search.addEventListener('input', () => {
+      // Typing is itself the operator asking for the list — sticky so
+      // backspacing the query back to empty mid-pick doesn't close it.
+      openByRequest = true;
+      renderOptions();
+    });
+    // A picker-level `focusout` (not a `blur` on `search` alone) — this
+    // container holds search, every suggestion option, and every chip's
+    // remove button, and `focusout` bubbles, so one listener here sees
+    // focus leaving ANY of those. That matters because Tab from `search`
+    // lands on a suggestion (a real, focusable element inside the
+    // container) before it ever leaves the picker: a `search`-only blur
+    // would see that as "gone" and either commit too early or (with a
+    // stay-inside guard) never get a second chance to commit once focus
+    // actually does leave, on the option's own Tab-away. Committing here,
+    // gated on the relatedTarget truly landing outside `picker`, fires
+    // exactly once, on whichever element's focus move actually exits the
+    // container — search moving straight out, or search moving onto a
+    // suggestion/chip-remove button and THAT element then moving out.
+    picker.addEventListener('focusout', (event) => {
+      // Focus is still somewhere inside the picker — the operator is
+      // mid-navigation (an option or a chip's remove button now has
+      // focus), not abandoning the field. Wait for the move that actually
+      // clears the container.
+      if (picker.contains(event.relatedTarget)) return;
+      // iOS Safari doesn't focus a tapped <button>, so a genuine tap on a
+      // chip's × or a suggestion can leave `relatedTarget` null exactly
+      // like a real focus-out does — `pointerDownInsideChipsOrOptions`
+      // tells the two apart so that gesture's own click handler
+      // (addTag/removeTag) runs uncontested by a stale-query commit here.
+      if (pointerDownInsideChipsOrOptions) return;
       saveLegacyText();
-      setTimeout(() => {
-        if (document.activeElement && picker.contains(document.activeElement)) return;
-        options.hidden = true;
-        search.setAttribute('aria-expanded', 'false');
-      }, 0);
+      openByRequest = false;
+      options.hidden = true;
+      search.setAttribute('aria-expanded', 'false');
     });
     search.addEventListener('keydown', (event) => {
+      // ArrowDown/ArrowUp on an empty, not-yet-opened query is itself a
+      // request to open the list — re-render first so `optionButtons`
+      // below reflects the now-visible options instead of navigating a
+      // list that's still hidden (and whose buttons can't take focus).
+      if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && options.hidden) {
+        openByRequest = true;
+        renderOptions();
+      }
       const optionButtons = [...options.querySelectorAll('[data-select-tag], [data-create-tag]')];
       if (event.key === 'ArrowDown' && optionButtons.length) {
         event.preventDefault();
@@ -2228,6 +2467,7 @@ export function initBoard() {
         if (active) active.click();
         else if (normalizeEditableTag(search.value)) addTag(search.value);
       } else if (event.key === 'Escape') {
+        openByRequest = false;
         options.hidden = true;
         search.setAttribute('aria-expanded', 'false');
       }
@@ -2243,8 +2483,20 @@ export function initBoard() {
       rearm: () => { cancelled = false; },
       isSaving: () => !cancelled && pendingSaves > 0,
       whenIdle: () => saveChain,
+      // The composer reads the chosen tags back through this at submit
+      // time instead of persisting through `config.persist`.
+      getTags: () => confirmed.slice(),
+      // Commits whatever token is currently sitting in the search field but
+      // not yet confirmed as a chip — the same normalization/rejection
+      // `saveLegacyText` already applies on blur. The composer calls this
+      // explicitly right before `getTags()` so a typed-but-unconfirmed tag
+      // reaches the create payload the same way blur commits it in the
+      // drawer, without depending on a blur event actually having fired
+      // first (idempotent — a no-op if there's nothing pending, or if
+      // blur already committed it).
+      commitPendingText: () => saveLegacyText(),
     };
-    tagPickerHandle = handle;
+    if (persist) tagPickerHandle = handle;
     return handle;
   }
 
@@ -2259,6 +2511,22 @@ export function initBoard() {
     if (Number.isNaN(parsed.getTime())) return { label: iso, exact: iso };
     return {
       label: parsed.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }),
+      exact: iso,
+    };
+  }
+
+  // A wake-up time renders as a short local date AND time (unlike
+  // formatCardDate's date-only rows above) — "Sep 16, 9:00 AM" — since the
+  // whole point of showing it is telling the operator when the card comes
+  // back, not just what day.
+  function formatWakeTime(iso) {
+    if (!iso) return null;
+    const parsed = new Date(iso);
+    if (Number.isNaN(parsed.getTime())) return { label: iso, exact: iso };
+    return {
+      label: parsed.toLocaleString(undefined, {
+        month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+      }),
       exact: iso,
     };
   }
@@ -2284,6 +2552,17 @@ export function initBoard() {
           <span class="drawer-meta-value" title="${escapeAttr(formatted.exact)}">${escapeHtml(formatted.label)}</span>
         </div>
       `);
+    }
+    if (card.lane === 'snoozed' && card.fields && card.fields.snoozed_until) {
+      const wake = formatWakeTime(card.fields.snoozed_until);
+      if (wake) {
+        items.push(`
+          <div class="drawer-meta-item">
+            <span class="drawer-meta-label">Wakes</span>
+            <span class="drawer-meta-value" title="${escapeAttr(wake.exact)}">${escapeHtml(wake.label)}</span>
+          </div>
+        `);
+      }
     }
     if (card.status) {
       items.push(`
@@ -2458,7 +2737,7 @@ export function initBoard() {
     notesEl.addEventListener('input', () => autosizeNotesTextarea(notesEl));
     autosizeNotesTextarea(notesEl);  // size to existing content on open/re-render
 
-    mountTagPicker(card, editableTags);
+    mountTagPicker(drawerEl, editableTags, { persist: (tags) => putBoardTags(card.id, tags) });
 
     const assigneeEl = drawerEl.querySelector('.drawer-assignee[data-field="assignee"]');
     assigneeEl.addEventListener('change', async () => {
@@ -3018,16 +3297,18 @@ export function initBoard() {
   }
 
   // The drawer's action row — Open, Go To, Resume, Kill, Answer, Accept, Reject,
-  // Reassign, Mark Done, Cancel, Delete.
+  // Reassign, Mark Done, Snooze, Unsnooze, Cancel, Delete.
   // Which of these apply and whether each is
   // enabled or disabled-with-a-reason is decided once, by
   // session_actions.js's `decideActions`, and rendered by its
   // `renderActionRow` — the exact same function the Graph tab's side panel
   // uses for its own header, so the two surfaces can't disagree about a
-  // shared session. Go To/Resume/Kill/Answer are built into
-  // `renderActionRow` itself (it owns Kill's cascade-preview modal,
-  // Resume's host select, and Go To's "Locating…" state); Open, Accept,
-  // Reject, Reassign, Mark Done, Cancel, and Delete come from ./card_actions.js, shared with a
+  // shared session. Go To/Resume/Kill/Answer/Snooze's own picker UI are
+  // built into `renderActionRow` itself (it owns Kill's cascade-preview
+  // modal, Resume's host select, Go To's "Locating…" state, and Snooze's
+  // preset/duration/date-time picker); Open, Accept, Reject, Reassign,
+  // Mark Done, Snooze's write, Unsnooze, and Delete come from
+  // ./card_actions.js, shared with a
   // card-linked Graph tab side panel — Cancel and Delete are overridden
   // below with the extra drawer-specific bookkeeping (closing/rebuilding
   // this drawer) that a bare handoff to `fetchBoard` doesn't cover.
@@ -3035,6 +3316,7 @@ export function initBoard() {
     const actionsEl = drawerEl.querySelector('[data-field="actions"]');
     if (!actionsEl) return;
     const cardHandlers = cardActionHandlers(card, {
+      findCard,
       onChanged: fetchBoard,
       onAccepted: closeDrawer,
       onMutationOpened: pauseTagPickerWrites,

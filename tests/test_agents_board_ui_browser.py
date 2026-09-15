@@ -21,10 +21,11 @@ import json
 import re
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Browser, Page, expect
 
 from api.services import agent_board
 
@@ -158,6 +159,7 @@ def _board_fixture():
                     "session": None, "pending_question": None,
                 },
             ],
+            "snoozed": [],
         },
         "generated_at": 0,
         # Synthetic API host — distinguishes a card's assigned host
@@ -190,13 +192,33 @@ def _remove_card_from_state(board_state: dict, card_id: str) -> None:
                 return
 
 
-def _stub_derive_lane(card: dict) -> str:
-    """Small faithful projection of agent_board.derive_lane for tag writes.
+def _stub_is_snoozed(fields: "dict | None", now: "datetime | None" = None) -> bool:
+    """Small faithful projection of agent_board.is_snoozed."""
+    value = (fields or {}).get("snoozed_until")
+    if not value:
+        return False
+    try:
+        until = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    if until.tzinfo is None:
+        return False
+    current = now if now is not None else datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return until > current
 
-    The browser harness is not a second unit-test suite for lane policy, but
-    an atomic tag response must still move a card when an editable tag such as
-    ``human`` changes its derived lane.
-    """
+
+# Mirrors agent_board.SNOOZABLE_LANES — the natural lanes a snooze can
+# override. A future `snoozed_until` on a card whose natural lane is
+# In progress or Done is ignored: a running or finished card is never
+# hidden behind a stale wake-up time.
+_SNOOZABLE_LANES = {"unassigned", "assigned", "human_queue", "review"}
+
+
+def _stub_natural_lane(card: dict) -> str:
+    """Small faithful projection of agent_board.natural_lane — status/tags
+    alone, ignoring any snooze."""
     tags = {str(tag).lstrip("#").lower() for tag in (card.get("tags") or [])}
     status = (card.get("status") or "todo").lower()
     if "agent-completed" in tags and "accepted" not in tags:
@@ -208,6 +230,23 @@ def _stub_derive_lane(card: dict) -> str:
     if status in {"done", "cancelled"}:
         return "done"
     return "assigned" if tags & _ASSIGNEE_TAGS else "unassigned"
+
+
+def _stub_derive_lane(card: dict, now: "datetime | None" = None) -> str:
+    """Small faithful projection of agent_board.derive_lane for tag writes.
+
+    The browser harness is not a second unit-test suite for lane policy, but
+    an atomic tag response must still move a card when an editable tag such as
+    ``human`` changes its derived lane. A future `fields.snoozed_until`
+    overrides the natural lane only when that natural lane is itself
+    snooze-eligible (`_SNOOZABLE_LANES`) — mirroring production's
+    natural-lane-gated priority, so a running or finished card is never
+    shown as Snoozed.
+    """
+    lane = _stub_natural_lane(card)
+    if lane in _SNOOZABLE_LANES and _stub_is_snoozed(card.get("fields"), now):
+        return "snoozed"
+    return lane
 
 
 @pytest.mark.unit
@@ -231,6 +270,29 @@ def test_stub_derive_lane_matches_production_priority(status, tags):
     assert _stub_derive_lane(card) == agent_board.derive_lane(status, tags)
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("status", "tags", "snoozed_until"),
+    [
+        ("todo", [], "2099-01-01T00:00:00+00:00"),
+        ("todo", ["codex"], "2099-01-01T00:00:00+00:00"),
+        ("blocked", [], "2099-01-01T00:00:00+00:00"),
+        ("done", ["agent-completed"], "2099-01-01T00:00:00+00:00"),
+        ("in_progress", [], "2099-01-01T00:00:00+00:00"),
+        ("done", [], "2099-01-01T00:00:00+00:00"),
+        ("todo", [], "2000-01-01T00:00:00+00:00"),
+        ("todo", [], "not-a-date"),
+        ("todo", [], "2099-01-01T00:00:00"),
+    ],
+)
+def test_stub_derive_lane_matches_production_priority_with_snoozed_field(status, tags, snoozed_until):
+    card = {"status": status, "tags": tags, "fields": {"snoozed_until": snoozed_until}}
+    assert (
+        _stub_derive_lane(card)
+        == agent_board.derive_lane(status, tags, card["fields"])
+    )
+
+
 def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: list, lane_status_code: list,
                   schedule_puts: list, board_stream_frames: list, stream_gate: "threading.Event | None" = None,
                   lane_response: "list | None" = None, open_calls: "list | None" = None,
@@ -239,8 +301,17 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                   kill_calls: "list | None" = None, kill_status_code: "list | None" = None,
                   kill_failures: "list | None" = None,
                   task_deletes: "list | None" = None, schedule_deletes: "list | None" = None,
-                  call_log: "list | None" = None):
+                  call_log: "list | None" = None, snooze_calls: "list | None" = None,
+                  task_put_status_code: "list | None" = None):
     """Stub d3 (offline CDN) + every /api/ call the page makes.
+
+    `snooze_calls`: appended with `{"method": "PUT"|"DELETE", "id", "body"}`
+    for every `PUT`/`DELETE /api/agents/board/cards/{id}/snooze` call, in
+    arrival order. A successful `PUT` sets `fields.snoozed_until` on the
+    matching card and moves it to the `snoozed` lane; a `DELETE` clears the
+    field and moves the card back to whatever `_stub_derive_lane` says its
+    natural lane is — mirroring `plan_lane_move`'s own clearing, a
+    successful `PUT .../lane` also clears a stray `snoozed_until` here.
 
     `open_calls`: appended with each opened card id (POST
     /api/agents/board/cards/{id}/open). `open_response`, when given, is
@@ -256,6 +327,12 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
     entries under `failures` (and an empty `killed` list) instead of a
     clean kill — the "the endpoint said OK but didn't actually kill
     anything" shape, distinct from `kill_status_code`'s transport failure.
+    `task_put_status_code`, when given, is a one-element list read fresh on
+    every `PUT /api/tasks/{id}` call (mirrors `kill_status_code`/
+    `lane_status_code`) — a non-200 entry makes that stub fail (and, unlike
+    the 200 path, never mutates `board_state`), for exercising a refused
+    Undo restore (`web/agents/board.js`'s `restoreCardSnapshot`,
+    `web/agents/card_actions.js`'s `resolveCard`).
     `task_deletes`/`schedule_deletes`: appended with each deleted id
     (DELETE /api/tasks/{id} / DELETE /api/scheduler/{id}); a successful
     delete also removes the card from `board_state` so a re-fetch shows
@@ -367,6 +444,8 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
         undo_match = re.search(r"/api/agents/board/cards/([^/]+)/undo-accept$", url)
         if undo_match and method == "POST":
             card_id = undo_match.group(1)
+            if call_log is not None:
+                call_log.append(("undo_accept", card_id))
             _move_card_in_state(board_state, card_id, "review")
             for card in board_state["lanes"]["review"]:
                 if card["id"] == card_id:
@@ -416,9 +495,108 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                             others = [t for t in card.get("tags", []) if t.lower() not in _ASSIGNEE_TAGS]
                             card["assignee"] = assignee or None
                             card["tags"] = ([assignee] if assignee else []) + others
+                # Mirrors plan_lane_move's target=="done" branch: `#human` is
+                # stripped (Human queue outranks Done in derive_lane, so
+                # leaving it would immediately pull the card back), status
+                # becomes "done", and a review-pending card (agent-completed
+                # without accepted) landing on Done gets `accepted` added —
+                # the same accept semantics the dedicated /accept endpoint
+                # applies — so a card whose tags already reflect a genuine
+                # acceptance has a natural lane of Done until an undo-accept
+                # reverses it.
+                if body.get("lane") == "done":
+                    for cards in board_state["lanes"].values():
+                        for card in cards:
+                            if card["id"] != lane_match.group(1):
+                                continue
+                            tset = {str(t).lstrip("#").lower() for t in card.get("tags", [])}
+                            new_tags = [
+                                t for t in card.get("tags", [])
+                                if str(t).lstrip("#").lower() != "human"
+                            ]
+                            if "agent-completed" in tset and "accepted" not in tset:
+                                new_tags = [*new_tags, "accepted"]
+                            card["tags"] = new_tags
+                            card["status"] = "done"
+                # Mirrors plan_lane_move's target=="human_queue" branch:
+                # status becomes "blocked" unconditionally, and tags are
+                # left untouched (the branch this issue is about — see
+                # restoreCardSnapshot in web/agents/board.js).
+                if body.get("lane") == "human_queue":
+                    for cards in board_state["lanes"].values():
+                        for card in cards:
+                            if card["id"] == lane_match.group(1):
+                                card["status"] = "blocked"
+                # Mirrors plan_lane_move's target=="in_progress" branch:
+                # status becomes "in_progress" and any `#human` is stripped
+                # the same way Done strips it.
+                if body.get("lane") == "in_progress":
+                    for cards in board_state["lanes"].values():
+                        for card in cards:
+                            if card["id"] != lane_match.group(1):
+                                continue
+                            card["tags"] = [
+                                t for t in card.get("tags", [])
+                                if str(t).lstrip("#").lower() != "human"
+                            ]
+                            card["status"] = "in_progress"
+                # Every successful lane move clears a stray snooze, the same
+                # way plan_lane_move does server-side — dragging a snoozed
+                # card out of Snoozed always wakes it.
+                for cards in board_state["lanes"].values():
+                    for card in cards:
+                        if card["id"] == lane_match.group(1):
+                            card.get("fields", {}).pop("snoozed_until", None)
                 route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": lane_match.group(1), "lane": landed}))
             else:
                 route.fulfill(status=code, content_type="application/json", body=json.dumps({"detail": "boom"}))
+            return
+
+        snooze_match = re.search(r"/api/agents/board/cards/([^/]+)/snooze$", url)
+        if snooze_match and method in ("PUT", "DELETE"):
+            card_id = snooze_match.group(1)
+            try:
+                body = json.loads(route.request.post_data or "{}") if method == "PUT" else {}
+            except ValueError:
+                body = {}
+            if snooze_calls is not None:
+                snooze_calls.append({"method": method, "id": card_id, "body": body})
+            if call_log is not None and method == "PUT":
+                call_log.append(("snooze_put", card_id))
+            card = next(
+                (candidate for cards in board_state["lanes"].values() for candidate in cards
+                 if candidate["id"] == card_id),
+                None,
+            )
+            if card is None:
+                route.fulfill(status=404, content_type="application/json", body=json.dumps({"detail": "card not found"}))
+                return
+            if method == "PUT":
+                # Mirrors the server's own eligibility check: refuse (409),
+                # with no write, when the card's NATURAL lane (ignoring any
+                # snooze already in effect) isn't itself snooze-eligible —
+                # e.g. a still-accepted card whose natural lane is Done.
+                if _stub_natural_lane(card) not in _SNOOZABLE_LANES:
+                    route.fulfill(
+                        status=409, content_type="application/json",
+                        body=json.dumps({"detail": "only Unassigned, Assigned, Human queue, and Review cards can be snoozed"}),
+                    )
+                    return
+                card.setdefault("fields", {})["snoozed_until"] = body.get("until")
+                _move_card_in_state(board_state, card_id, "snoozed")
+                landed = "snoozed"
+            else:
+                card.get("fields", {}).pop("snoozed_until", None)
+                landed = _stub_derive_lane(card)
+                _move_card_in_state(board_state, card_id, landed)
+            route.fulfill(
+                status=200, content_type="application/json",
+                body=json.dumps({
+                    "id": card_id, "lane": landed, "status": card.get("status"),
+                    "tags": card.get("tags", []),
+                    "snoozed_until": card.get("fields", {}).get("snoozed_until"),
+                }),
+            )
             return
 
         if re.search(r"/api/tasks$", url) and method == "POST":
@@ -510,14 +688,23 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             except ValueError:
                 body = {}
             task_puts.append(body)
+            task_id = task_match.group(1)
+            put_code = task_put_status_code[0] if task_put_status_code else 200
+            if put_code != 200:
+                route.fulfill(
+                    status=put_code, content_type="application/json",
+                    body=json.dumps({"detail": "boom"}),
+                )
+                return
             # Mutate the fixture card the way a real PUT would, so a test
             # that reopens the drawer to check a saved value doesn't see
             # the stale fixture (mirrors _move_card_in_state; #859 trap 3).
-            task_id = task_match.group(1)
+            card_ref = None
             for cards in board_state["lanes"].values():
                 for card in cards:
                     if card["id"] != task_id:
                         continue
+                    card_ref = card
                     if "fields" in body and isinstance(body["fields"], dict):
                         fields = card.setdefault("fields", {})
                         for key, value in body["fields"].items():
@@ -527,12 +714,22 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                                 fields[key] = value
                     if "notes" in body:
                         card["notes"] = body["notes"]
+                    if "status" in body:
+                        card["status"] = body["status"]
                     if "tags" in body:
                         card["tags"] = body["tags"]
                     if "context" in body:
                         card["context"] = body["context"]
                     if "description" in body:
                         card["title"] = body["description"]
+            # A status/tags write can change the card's derived lane (e.g.
+            # Undo's snapshot restore in web/agents/board.js's
+            # restoreCardSnapshot) — mirror the client's follow-up
+            # GET /api/agents/board reflecting that, the same way the lane
+            # endpoint's own handler above does.
+            if card_ref is not None and ("status" in body or "tags" in body):
+                landed = _stub_derive_lane(card_ref)
+                _move_card_in_state(board_state, task_id, landed)
             route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": task_id}))
             return
 
@@ -601,7 +798,8 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
                  schedule_puts=None, board_stream_frames=None, stream_gate=None, lane_response=None,
                  open_calls=None, open_response=None, task_posts=None, cancel_calls=None, cancel_failures=None,
                  kill_calls=None, kill_status_code=None, kill_failures=None,
-                 task_deletes=None, schedule_deletes=None, call_log=None):
+                 task_deletes=None, schedule_deletes=None, call_log=None, snooze_calls=None,
+                 task_put_status_code=None):
     _stub_routes(
         page,
         board_state if board_state is not None else _board_fixture(),
@@ -623,14 +821,16 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
         task_deletes,
         schedule_deletes,
         call_log,
+        snooze_calls,
+        task_put_status_code,
     )
     page.goto(f"{base_url}/agents")
     page.wait_for_selector('[data-card-id="t1"]')
 
 
 # Canonical lane order — mirrors web/agents/board.js's LANES.
-LANE_IDS = ["unassigned", "assigned", "in_progress", "human_queue", "scheduled", "review", "done"]
-DEFAULT_VISIBLE_LANE_IDS = [lane_id for lane_id in LANE_IDS if lane_id != "done"]
+LANE_IDS = ["unassigned", "assigned", "in_progress", "human_queue", "scheduled", "review", "done", "snoozed"]
+DEFAULT_VISIBLE_LANE_IDS = [lane_id for lane_id in LANE_IDS if lane_id not in ("done", "snoozed")]
 
 
 def _seed_lane_storage(page: Page, raw_value: str):
@@ -639,6 +839,16 @@ def _seed_lane_storage(page: Page, raw_value: str):
     called before `_open_board`/`page.goto`, since `add_init_script` only
     affects future navigations."""
     page.add_init_script(f"window.localStorage.setItem('lifeos.agents.board.lanes', {json.dumps(raw_value)});")
+
+
+def _seed_filters_storage(page: Page, filters: dict):
+    """Pre-seed the CURRENT shared filters key (web/agents/linking.js's
+    FILTERS_STORAGE_KEY) with a full filters object — simulates an operator
+    who already has a saved selection under the current format, as opposed
+    to `_seed_lane_storage`'s pre-linking.js legacy key. Must be called
+    before `_open_board`/`page.goto`."""
+    raw = json.dumps(filters)
+    page.add_init_script(f"window.localStorage.setItem('lifeos.agents.filters.v1', {json.dumps(raw)});")
 
 
 def _check_only_lanes(page: Page, lane_ids):
@@ -683,6 +893,176 @@ def _drag_card(page: Page, card_id: str, target_lane: str):
     page.mouse.move(lane_box["x"] + lane_box["width"] / 2, lane_box["y"] + 15, steps=10)
     page.mouse.move(lane_box["x"] + lane_box["width"] / 2, lane_box["y"] + 15, steps=1)
     page.mouse.up()
+
+
+def _drawer_overflow(page: Page):
+    return page.locator("#board-drawer").evaluate(
+        """drawer => ({
+            drawerClientWidth: drawer.clientWidth,
+            drawerScrollWidth: drawer.scrollWidth,
+            drawerRight: drawer.getBoundingClientRect().right,
+            documentScrollWidth: document.documentElement.scrollWidth,
+        })"""
+    )
+
+
+def _assert_drawer_fits(page: Page):
+    dimensions = _drawer_overflow(page)
+    assert dimensions["drawerScrollWidth"] <= dimensions["drawerClientWidth"], dimensions
+    assert dimensions["drawerRight"] <= 390, dimensions
+    assert dimensions["documentScrollWidth"] <= 390, dimensions
+
+
+class TestMobileDrawerLayout:
+    def test_agents_viewport_locks_scale(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        content = page.locator('meta[name="viewport"]').get_attribute("content")
+        assert content is not None
+        settings = {part.strip() for part in content.split(",")}
+        assert {"initial-scale=1", "maximum-scale=1", "user-scalable=no"} <= settings
+
+    @pytest.mark.parametrize("card_kind", ["plain", "running", "resumable", "schedule"])
+    def test_drawer_fits_a_phone_for_each_card_kind(
+        self, browser: Browser, agents_base_url, card_kind,
+    ):
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+        )
+        page = context.new_page()
+        try:
+            board_state = _board_fixture()
+            card_id = {"plain": "t1", "schedule": "s1"}.get(card_kind, f"t-{card_kind}")
+            if card_kind in {"running", "resumable"}:
+                board_state["lanes"]["in_progress"].append({
+                    "kind": "task", "id": card_id, "title": "Run synthetic checks",
+                    "notes": "", "status": "in_progress",
+                    "tags": ["codex", "agent-running"], "assignee": "codex",
+                    "fields": {}, "context": "Synthetic",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                    "session": {
+                        "session_id": f"cx:synthetic-{card_kind}",
+                        "status": "running" if card_kind == "running" else "completed",
+                        "source": "codex", "engine": "codex", "host": "desktop-box",
+                    },
+                    "pending_question": None,
+                })
+            _open_board(page, agents_base_url, board_state=board_state)
+            page.locator(f'[data-card-id="{card_id}"]').click()
+            expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+            _assert_drawer_fits(page)
+            if card_kind == "running":
+                expect(page.locator("#board-drawer .panel-kill")).to_be_visible()
+                expect(page.locator("#board-drawer .panel-focus")).to_be_visible()
+            if card_kind == "resumable":
+                expect(page.locator("#board-drawer .panel-resume")).to_be_visible()
+        finally:
+            context.close()
+
+    def test_long_model_label_and_card_id_do_not_overflow_phone_drawer(
+        self, browser: Browser, agents_base_url,
+    ):
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+        )
+        page = context.new_page()
+        try:
+            board_state = _board_fixture()
+            card = board_state["lanes"]["assigned"][1]
+            card["id"] = "synthetic-card-" + "identifier-" * 12
+            card["fields"] = {"engine": "codex", "model": "gpt-5.5"}
+            _open_board(page, agents_base_url, board_state=board_state)
+            page.locator(f'[data-card-id="{card["id"]}"]').click()
+            page.locator(".assignment-model").evaluate(
+                """select => {
+                    const option = document.createElement('option');
+                    option.value = 'synthetic-long-model';
+                    option.textContent = 'Synthetic engine and model label '.repeat(12);
+                    option.selected = true;
+                    select.appendChild(option);
+                }"""
+            )
+            _assert_drawer_fits(page)
+        finally:
+            context.close()
+
+    def test_drawer_fits_a_phone_with_the_snooze_picker_open(
+        self, browser: Browser, agents_base_url,
+    ):
+        """The drawer is locked to 390px width; the Snooze picker's own
+        buttons, number/unit inputs, and datetime-local input must all fit
+        inside it without forcing horizontal scroll."""
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+        )
+        page = context.new_page()
+        try:
+            _open_board(page, agents_base_url)
+            page.locator('[data-card-id="t2"]').click()
+            expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+            page.locator('#board-drawer [data-action="snooze"]').click()
+            expect(page.locator('#board-drawer [data-field="snooze-picker"]')).to_be_visible()
+            _assert_drawer_fits(page)
+        finally:
+            context.close()
+
+    def test_close_button_shares_title_row_and_is_fully_visible(
+        self, browser: Browser, agents_base_url,
+    ):
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+        )
+        page = context.new_page()
+        try:
+            _open_board(page, agents_base_url)
+            page.locator('[data-card-id="t1"]').click()
+            boxes = page.locator(".drawer-header").evaluate(
+                """header => {
+                    const title = header.querySelector('.drawer-title').getBoundingClientRect();
+                    const close = header.querySelector('.panel-close').getBoundingClientRect();
+                    return {title, close, viewportWidth: window.innerWidth};
+                }"""
+            )
+            assert boxes["close"]["left"] >= 0, boxes
+            assert boxes["close"]["right"] <= boxes["viewportWidth"], boxes
+            assert boxes["close"]["top"] < boxes["title"]["bottom"], boxes
+            assert boxes["close"]["bottom"] > boxes["title"]["top"], boxes
+        finally:
+            context.close()
+
+    def test_mobile_board_chrome_stays_inside_viewport(
+        self, browser: Browser, agents_base_url,
+    ):
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+        )
+        page = context.new_page()
+        try:
+            _open_board(page, agents_base_url)
+            page.locator("#board-filter-toggle").click()
+            measurements = page.evaluate(
+                """() => ['header', '.board-filters', '#board-lanes', '.board-drop-tray']
+                    .map(selector => {
+                        const rect = document.querySelector(selector).getBoundingClientRect();
+                        return {selector, left: rect.left, right: rect.right};
+                    })"""
+            )
+            assert all(row["left"] >= 0 and row["right"] <= 390 for row in measurements), measurements
+            document_scroll_width = page.evaluate("document.documentElement.scrollWidth")
+            assert document_scroll_width <= 390
+        finally:
+            context.close()
+
+    def test_drawer_width_change_is_scoped_to_phone_width(self, page: Page, agents_base_url):
+        page.set_viewport_size({"width": 1280, "height": 800})
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t1"]').click()
+        assert page.locator("#board-drawer").evaluate(
+            "drawer => drawer.getBoundingClientRect().width"
+        ) == 440
+        page.set_viewport_size({"width": 390, "height": 844})
+        assert page.locator("#board-drawer").evaluate(
+            "drawer => drawer.getBoundingClientRect().width"
+        ) == 390
 
 
 class TestBoardLoad:
@@ -1000,6 +1380,181 @@ class TestDrawerTagsEdit:
         search.fill("agent-running")
         expect(page.locator(".drawer-tag-option-create")).to_have_count(0)
 
+    def test_typing_a_new_tag_and_blurring_keeps_the_cards_other_editable_tag(
+        self, page: Page, agents_base_url,
+    ):
+        """A card that already carries an editable tag — typing a second,
+        different tag into the search field and blurring (no Enter, no
+        option pick) must PUT both tags: `saveLegacyText`'s single-token
+        branch merges the typed token onto the card's current selection
+        rather than replacing it, so `existing-tag` survives alongside the
+        newly typed one."""
+        board_state = copy.deepcopy(_board_fixture())
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        t2["tags"] = ["me", "existing-tag"]
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-tag-chip")).to_contain_text("#existing-tag")
+        tags = page.locator(".drawer-tags")
+        tags.fill("brand-new-tag")
+        page.locator(".drawer-title").click()  # blur the tags field
+        _wait_for(lambda: any("brand-new-tag" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert task_puts == [{"tags": ["existing-tag", "brand-new-tag"]}], task_puts
+        expect(page.locator(".drawer-tag-chip")).to_have_count(2)
+
+    def test_typing_multiple_words_and_blurring_keeps_the_cards_other_editable_tags(
+        self, page: Page, agents_base_url,
+    ):
+        """The multi-token branch of `saveLegacyText` (space-separated text
+        committed on blur) must merge onto the card's current selection,
+        not replace it — a card carrying two editable tags must keep both
+        after a still-typed `gamma delta` is committed."""
+        board_state = copy.deepcopy(_board_fixture())
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        t2["tags"] = ["me", "ex-c", "ex-d"]
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-tag-chip")).to_have_count(2)
+        tags = page.locator(".drawer-tags")
+        tags.fill("gamma delta")
+        page.locator(".drawer-title").click()  # blur the tags field
+        _wait_for(lambda: any("delta" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert task_puts == [{"tags": ["ex-c", "ex-d", "gamma", "delta"]}], task_puts
+        expect(page.locator(".drawer-tag-chip")).to_have_count(4)
+
+    def test_typing_a_comma_separated_pair_and_blurring_adds_both_with_no_error_toast(
+        self, page: Page, agents_base_url,
+    ):
+        """A comma is a separator like whitespace, not part of the token —
+        "alpha, beta" must add both `alpha` and `beta`, never reject
+        `alpha,` as an invalid token."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        tags = page.locator(".drawer-tags")
+        tags.fill("alpha, beta")
+        page.locator(".drawer-title").click()  # blur the tags field
+        _wait_for(lambda: any("beta" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert task_puts == [{"tags": ["alpha", "beta"]}], task_puts
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".drawer-tag-chip")).to_have_count(2)
+
+    def test_arrow_down_then_enter_adds_only_the_picked_option(self, page: Page, agents_base_url):
+        """ArrowDown moves focus from the search field onto the first
+        suggestion, which blurs the field — that focus move must not
+        commit the still-typed query (`hum`) as its own tag; only the
+        picked option (`human`, an existing board tag from fixture card
+        t4) reaches the PUT."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        tags = page.locator(".drawer-tags")
+        tags.fill("hum")
+        expect(page.locator('[data-field="tag-options"] [data-select-tag="human"]')).to_be_visible()
+        tags.press("ArrowDown")
+        expect(page.locator('[data-field="tag-options"] [data-select-tag="human"]')).to_be_focused()
+        page.keyboard.press("Enter")
+        _wait_for(lambda: len(task_puts) > 0, page=page)
+        assert task_puts == [{"tags": ["human"]}], task_puts
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+        expect(page.locator(".drawer-tag-chip")).to_contain_text("#human")
+
+    def test_removing_a_chip_with_a_partial_query_typed_does_not_commit_the_query(
+        self, page: Page, agents_base_url,
+    ):
+        """Clicking a chip's remove button blurs the search field first
+        (the button is inside the picker but outside the field itself) —
+        that focus move must not commit whatever partial query is still
+        typed as a new tag; the click's own removal must land instead."""
+        board_state = copy.deepcopy(_board_fixture())
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        t2["tags"] = ["me", "existing-tag"]
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+        tags = page.locator(".drawer-tags")
+        tags.fill("partial-query")
+        page.locator('[data-remove-tag="existing-tag"]').click()
+        _wait_for(lambda: len(task_puts) > 0, page=page)
+        assert task_puts == [{"tags": []}], task_puts
+
+    def test_typing_then_pressing_tab_twice_commits_and_hides_the_list(self, page: Page, agents_base_url):
+        """Tab from the search field lands on the 'Create new' option —
+        still inside the picker, so nothing commits yet and the list stays
+        open. A second Tab moves focus out of the picker entirely; that's
+        what commits the typed tag and hides the list."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        tags = page.locator(".drawer-tags")
+        tags.fill("tabbed-x")
+        expect(page.locator(".drawer-tag-option-create")).to_contain_text("#tabbed-x")
+        page.keyboard.press("Tab")
+        expect(page.locator(".drawer-tag-option-create")).to_be_focused()
+        expect(page.locator('[data-field="tag-options"]')).to_be_visible()
+        assert task_puts == [], task_puts
+        page.keyboard.press("Tab")
+        _wait_for(lambda: len(task_puts) > 0, page=page)
+        assert task_puts == [{"tags": ["tabbed-x"]}], task_puts
+        expect(page.locator('[data-field="tag-options"]')).to_be_hidden()
+
+    def test_arrow_down_then_click_outside_commits_and_hides_the_list(self, page: Page, agents_base_url):
+        """ArrowDown moves focus onto the first suggestion — still inside
+        the picker, so nothing commits yet. Clicking a control outside the
+        picker entirely is what commits the typed tag and hides the
+        list."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        tags = page.locator(".drawer-tags")
+        tags.fill("arrowed-y")
+        expect(page.locator(".drawer-tag-option-create")).to_contain_text("#arrowed-y")
+        tags.press("ArrowDown")
+        expect(page.locator(".drawer-tag-option-create")).to_be_focused()
+        page.locator(".drawer-title").click()  # click outside the picker
+        _wait_for(lambda: any("arrowed-y" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert task_puts == [{"tags": ["arrowed-y"]}], task_puts
+        expect(page.locator('[data-field="tag-options"]')).to_be_hidden()
+
+    def test_removing_a_chip_via_a_tap_that_never_focuses_the_button(self, page: Page, agents_base_url):
+        """iOS Safari doesn't focus a tapped <button>, so a real chip
+        removal there fires a pointerdown on the button and a focusout on
+        the search field with `relatedTarget: null` — indistinguishable
+        from a genuine focus-out by relatedTarget alone. Dispatch that
+        exact sequence directly (pointerdown, then a null-relatedTarget
+        focusout, then click) rather than relying on Chromium's own
+        click-focuses-buttons behavior, so this exercises the
+        pointerdown-based guard instead of the relatedTarget check above.
+        A partial query typed first must not be committed as a tag, and
+        the chip must still be removed."""
+        board_state = copy.deepcopy(_board_fixture())
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        t2["tags"] = ["me", "existing-tag"]
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+        tags = page.locator(".drawer-tags")
+        tags.fill("partial-tap-query")
+        page.evaluate("""() => {
+          const search = document.querySelector('.drawer-tags');
+          const btn = document.querySelector('[data-remove-tag="existing-tag"]');
+          btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+          search.dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: null }));
+          btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        }""")
+        _wait_for(lambda: len(task_puts) > 0, page=page)
+        assert task_puts == [{"tags": []}], task_puts
+        expect(page.locator(".drawer-tag-chip")).to_have_count(0)
+        expect(page.locator(".drawer-tag-chip")).to_have_count(0)
+
     def test_invalid_and_assignee_tokens_are_dropped(self, page: Page, agents_base_url):
         """Round-1 finding 8: the Tags field must not let a vault-comment
         injection or a duplicate assignee token reach the task store. t2 is
@@ -1108,11 +1663,21 @@ class TestDrawerTagsEdit:
             )
 
         assert not any("stale-two" in (payload.get("tags") or []) for payload in task_puts)
+        # A committed single-token blur adds to the card's already-confirmed
+        # tags rather than replacing them, so each subsequent edit here
+        # accumulates onto the last one that actually persisted (the
+        # cancelled modals never let a queued write land, but the tag it
+        # would have added was never confirmed either — the un-mutated
+        # `confirmed` value used by the next cancel() is what each
+        # following commit builds on).
         assert [payload["tags"] for payload in task_puts] == [
-            ["stale-one"], ["after-reject"], ["after-reassign"], ["after-delete"],
+            ["stale-one"],
+            ["after-reject"],
+            ["after-reject", "after-reassign"],
+            ["after-reject", "after-reassign", "after-delete"],
         ]
         review = next(card for card in board_state["lanes"]["review"] if card["id"] == "t-review")
-        assert review["tags"] == ["codex", "agent-completed", "after-delete"]
+        assert review["tags"] == ["codex", "agent-completed", "after-reject", "after-reassign", "after-delete"]
 
 
 class TestDrawerAssigneeRevert:
@@ -2852,19 +3417,20 @@ class TestLaneFilterMultiSelect:
         page.locator("#board-lane-filter-btn").click()
         expect(page.locator("#board-lane-filter-options")).to_have_class(re.compile(r"\bshow\b"))
 
-    def test_default_selection_is_every_lane_but_done(self, page: Page, agents_base_url):
+    def test_default_selection_is_every_lane_but_done_and_snoozed(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
         self._open_lane_dropdown(page)
         boxes = page.locator("#board-lane-filter-options input[type='checkbox']")
         expect(boxes).to_have_count(len(LANE_IDS))
         for lane_id in LANE_IDS:
             box = page.locator(f"#board-lane-filter-options input[value='{lane_id}']")
-            if lane_id == "done":
+            if lane_id in ("done", "snoozed"):
                 expect(box).not_to_be_checked()
             else:
                 expect(box).to_be_checked()
 
         expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="snoozed"]')).to_have_count(0)
         for lane_id in DEFAULT_VISIBLE_LANE_IDS:
             expect(page.locator(f'.board-lane[data-lane="{lane_id}"]')).to_be_visible()
 
@@ -3005,10 +3571,16 @@ class TestLaneFilterMultiSelect:
         expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
         for lane_id in LANE_IDS:
             box = page.locator(f"#board-lane-filter-options input[value='{lane_id}']")
-            if lane_id == "done":
+            if lane_id in ("done", "snoozed"):
                 expect(box).not_to_be_checked()
             else:
                 expect(box).to_be_checked()
+
+    def test_clear_button_tooltip_names_snoozed_alongside_done(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        title = page.locator("#board-lane-filter-clear").get_attribute("title") or ""
+        assert "done" in title.lower(), title
+        assert "snoozed" in title.lower(), title
 
     def test_unchecking_all_lanes_shows_empty_state_hint_not_a_blank_board(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
@@ -3050,13 +3622,16 @@ class TestLaneAddButton:
         expect(page.locator("#new-card-desc")).to_have_count(0)
         page.locator("#new-schedule-cancel").click()
 
-        # Review is empty in the fixture and hidden by default — check it so
-        # its absent "+" is actually observable, not vacuously passing
-        # because the column itself never rendered.
+        # Review and Snoozed are both empty in the fixture and hidden by
+        # default — check them so their absent "+" is actually observable,
+        # not vacuously passing because the column itself never rendered.
         page.locator("#board-lane-filter-btn").click()
         page.locator("#board-lane-filter-options input[value='review']").check()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
         expect(page.locator('.board-lane[data-lane="review"]')).to_be_visible()
         expect(page.locator('.board-lane[data-lane="review"] .board-lane-add')).to_have_count(0)
+        expect(page.locator('.board-lane[data-lane="snoozed"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="snoozed"] .board-lane-add')).to_have_count(0)
 
     def test_unassigned_lane_add_button_opens_composer_with_lane_preselected(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
@@ -3386,6 +3961,812 @@ class TestLaneAddButton:
         page.locator("#board-lane-filter-btn").click()
         expect(page.locator("#board-lane-filter-options input[value='assigned']")).to_be_checked()
         expect(page.locator("#board-lane-filter-options input[value='human_queue']")).not_to_be_checked()
+
+
+class TestSnoozedLaneVisibility:
+    """AC: the Snoozed lane is hidden by default — including for a session
+    with a selection saved before Snoozed existed — and revealed through
+    the same lane-visibility multi-select that already hides Done."""
+
+    def test_hidden_by_default(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        expect(page.locator('.board-lane[data-lane="snoozed"]')).to_have_count(0)
+        page.locator("#board-lane-filter-btn").click()
+        expect(page.locator("#board-lane-filter-options input[value='snoozed']")).not_to_be_checked()
+
+    def test_hidden_with_a_selection_saved_before_snoozed_existed(self, page: Page, agents_base_url):
+        """A selection persisted by an older session lists only the six
+        lanes that existed then — it can never contain 'snoozed' — so
+        `sanitizeLaneIds` (web/agents/linking.js) intersecting the stored
+        array against the CURRENT set of valid lane ids is what keeps it
+        hidden on restore. No dedicated migration step exists or is
+        needed."""
+        pre_existing_selection = {
+            "search": "", "assignee": "all", "host": "all", "engine": "all",
+            "tag": "", "recency": None,
+            "lanes": ["unassigned", "assigned", "in_progress", "human_queue", "scheduled", "review"],
+        }
+        _seed_filters_storage(page, pre_existing_selection)
+        _open_board(page, agents_base_url)
+        expect(page.locator('.board-lane[data-lane="snoozed"]')).to_have_count(0)
+        page.locator("#board-lane-filter-btn").click()
+        expect(page.locator("#board-lane-filter-options input[value='snoozed']")).not_to_be_checked()
+        # The pre-existing selection itself is otherwise honoured untouched.
+        for lane_id in ["unassigned", "assigned", "in_progress", "human_queue", "scheduled", "review"]:
+            expect(page.locator(f"#board-lane-filter-options input[value='{lane_id}']")).to_be_checked()
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+
+    def test_revealed_through_the_multi_select(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        board_state["lanes"]["snoozed"].append({
+            "kind": "task", "id": "t-snoozed", "title": "Sleeping card",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"snoozed_until": "2099-01-01T09:00:00+00:00"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        _open_board(page, agents_base_url, board_state=board_state)
+        expect(page.locator('.board-lane[data-lane="snoozed"]')).to_have_count(0)
+
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
+        expect(page.locator('.board-lane[data-lane="snoozed"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t-snoozed"]')).to_be_visible()
+
+    def test_no_add_button_on_the_snoozed_lane(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
+        expect(page.locator('.board-lane[data-lane="snoozed"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="snoozed"] .board-lane-add')).to_have_count(0)
+
+    def test_no_drag_into_the_snoozed_lane(self, page: Page, agents_base_url):
+        # Wide viewport so every visible lane (Snoozed makes seven) fits
+        # without horizontal scroll — `_drag_card` reads raw bounding boxes,
+        # which are meaningless for a column scrolled out of view.
+        page.set_viewport_size({"width": 2400, "height": 900})
+        lane_calls = []
+        board_state = _board_fixture()
+        _open_board(page, agents_base_url, board_state=board_state, lane_calls=lane_calls)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
+        expect(page.locator('.board-lane[data-lane="snoozed"]')).to_be_visible()
+
+        _drag_card(page, "t2", "snoozed")
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        assert lane_calls == []
+        # The card never actually left Assigned.
+        expect(page.locator('.board-lane[data-lane="assigned"] [data-card-id="t2"]')).to_be_visible()
+
+    def test_composer_lane_select_never_offers_snoozed(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('.board-lane[data-lane="unassigned"] .board-lane-add').click()
+        expect(page.locator("#new-card-title")).to_be_visible()
+        expect(page.locator("#new-card-lane option[value='snoozed']")).to_have_count(0)
+
+
+class TestSnoozeActionEligibility:
+    """AC: the drawer's Snooze action is offered on Unassigned, Assigned,
+    Human queue, and Review cards, and never on In progress, Done, or a
+    schedule card."""
+
+    def test_offered_on_each_eligible_lane(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        board_state["lanes"]["review"].append({
+            "kind": "task", "id": "t-review", "title": "Needs review",
+            "notes": "", "status": "done", "tags": ["agent-completed", "claude"],
+            "assignee": "claude", "fields": {}, "context": "Ops",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='review']").check()
+        for card_id in ["t1", "t2", "t3", "t-review"]:
+            page.locator(f'[data-card-id="{card_id}"]').click()
+            expect(page.locator('#board-drawer [data-action="snooze"]')).to_be_visible()
+            expect(page.locator('#board-drawer [data-action="unsnooze"]')).to_have_count(0)
+            page.locator('[data-action="drawer-close"]').click()
+
+    def test_not_offered_on_in_progress_done_or_a_schedule_card(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        board_state["lanes"]["in_progress"].append({
+            "kind": "task", "id": "t-running", "title": "Running now",
+            "notes": "", "status": "in_progress", "tags": ["codex", "agent-running"],
+            "assignee": "codex", "fields": {}, "context": "Ops",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": {
+                "session_id": "cx:running", "status": "running",
+                "source": "codex", "engine": "codex", "host": "desktop-box",
+            },
+            "pending_question": None,
+        })
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        # t6 is a cancelled card — hidden behind "include cancelled" even
+        # with the Done lane itself shown.
+        page.locator("#board-filter-done").check()
+
+        for card_id in ["t-running", "t5", "t6"]:
+            page.locator(f'[data-card-id="{card_id}"]').click()
+            expect(page.locator('#board-drawer-backdrop')).to_be_visible()
+            expect(page.locator('#board-drawer [data-action="snooze"]')).to_have_count(0)
+            page.locator('[data-action="drawer-close"]').click()
+
+        page.locator('[data-card-id="s1"]').click()
+        expect(page.locator('#board-drawer-backdrop')).to_be_visible()
+        expect(page.locator('#board-drawer [data-action="snooze"]')).to_have_count(0)
+
+
+def _open_snooze_picker(page: Page, card_id: str):
+    page.locator(f'[data-card-id="{card_id}"]').click()
+    expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+    page.locator('#board-drawer [data-action="snooze"]').click()
+    expect(page.locator('#board-drawer [data-field="snooze-picker"]')).to_be_visible()
+
+
+class TestSnoozePresets:
+    """AC: each preset sends an absolute ISO-8601 `until` with the
+    browser's own UTC offset, computed from the browser's clock/calendar —
+    never a UTC day boundary. Time is frozen with Playwright's clock API:
+    `page.clock.pause_at(time)` (not `page.clock.install(time=...)`, which
+    keeps advancing in sync with the real clock from the installed instant
+    — `pause_at` is what actually freezes it), so these never depend on
+    when the suite happens to run."""
+
+    def test_later_today_is_now_plus_three_hours(self, browser: Browser, agents_base_url):
+        context = browser.new_context(timezone_id="UTC")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            page.clock.pause_at(datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('[data-action="snooze-preset"][data-preset="later_today"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0] == {
+                "method": "PUT", "id": "t2",
+                "body": {"until": "2026-01-01T13:00:00+00:00"},
+            }
+        finally:
+            context.close()
+
+    def test_tomorrow_morning_near_midnight_lands_on_the_local_calendar_day(
+        self, browser: Browser, agents_base_url,
+    ):
+        """Thursday 23:30 local — less than an hour from UTC midnight, and
+        well under 24h from 09:00 the next morning. Proves the preset is
+        computed from the local CALENDAR day (tomorrow's date at 09:00),
+        not a naive "+24h", which this instant would fail to distinguish."""
+        context = browser.new_context(timezone_id="UTC")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            page.clock.pause_at(datetime(2026, 1, 1, 23, 30, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('[data-action="snooze-preset"][data-preset="tomorrow_morning"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0]["body"]["until"] == "2026-01-02T09:00:00+00:00"
+        finally:
+            context.close()
+
+    def test_next_week_from_a_non_monday_is_the_upcoming_monday(self, browser: Browser, agents_base_url):
+        context = browser.new_context(timezone_id="UTC")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            # 2026-01-01 is a Thursday.
+            page.clock.pause_at(datetime(2026, 1, 1, 9, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('[data-action="snooze-preset"][data-preset="next_week"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0]["body"]["until"] == "2026-01-05T09:00:00+00:00"
+        finally:
+            context.close()
+
+    def test_next_week_from_a_monday_rolls_to_the_following_monday(self, browser: Browser, agents_base_url):
+        """On a Monday, "next week" is the FOLLOWING Monday, not the same
+        day a moment later — the operator snoozing on a Monday means a
+        full week, not a few hours."""
+        context = browser.new_context(timezone_id="UTC")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            # 2026-01-05 is a Monday.
+            page.clock.pause_at(datetime(2026, 1, 5, 9, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('[data-action="snooze-preset"][data-preset="next_week"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0]["body"]["until"] == "2026-01-12T09:00:00+00:00"
+        finally:
+            context.close()
+
+    def test_preset_embeds_the_browsers_own_non_utc_offset(self, browser: Browser, agents_base_url):
+        """A non-UTC context proves `until` carries the BROWSER's own local
+        offset (e.g. "-05:00"), not always a UTC "Z"/"+00:00"."""
+        context = browser.new_context(timezone_id="America/New_York")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            # 15:00 UTC = 10:00 local EST (America/New_York, no DST in January).
+            page.clock.pause_at(datetime(2026, 1, 1, 15, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('[data-action="snooze-preset"][data-preset="later_today"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0]["body"]["until"] == "2026-01-01T13:00:00-05:00"
+        finally:
+            context.close()
+
+
+class TestSnoozeCustom:
+    """AC: a custom duration (hours/days) and a custom date-time, both
+    resolved to an absolute `until`; a past custom time is refused
+    client-side with no request sent."""
+
+    def test_custom_duration_in_hours(self, browser: Browser, agents_base_url):
+        context = browser.new_context(timezone_id="UTC")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            page.clock.pause_at(datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('#board-drawer [data-field="snooze-duration-value"]').fill("6")
+            page.locator('#board-drawer [data-field="snooze-duration-unit"]').select_option("hours")
+            page.locator('#board-drawer [data-action="snooze-duration-confirm"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0]["body"]["until"] == "2026-01-01T16:00:00+00:00"
+        finally:
+            context.close()
+
+    def test_custom_duration_in_days(self, browser: Browser, agents_base_url):
+        context = browser.new_context(timezone_id="UTC")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            page.clock.pause_at(datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('#board-drawer [data-field="snooze-duration-value"]').fill("2")
+            page.locator('#board-drawer [data-field="snooze-duration-unit"]').select_option("days")
+            page.locator('#board-drawer [data-action="snooze-duration-confirm"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0]["body"]["until"] == "2026-01-03T10:00:00+00:00"
+        finally:
+            context.close()
+
+    def test_custom_duration_in_days_keeps_wall_clock_time_across_a_dst_spring_forward(
+        self, browser: Browser, agents_base_url,
+    ):
+        """A day duration is calendar days (`setDate`, local wall clock),
+        not a fixed 24h multiple — 2026-03-08 is America/New_York's
+        spring-forward (clocks jump 02:00 -> 03:00, EST -> EDT). Starting
+        at 10:00 EST and adding 2 days must land at 10:00 EDT two days
+        later, not 09:00 or 11:00."""
+        context = browser.new_context(timezone_id="America/New_York")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            # 15:00 UTC = 10:00 local EST (no DST yet on March 7).
+            page.clock.pause_at(datetime(2026, 3, 7, 15, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('#board-drawer [data-field="snooze-duration-value"]').fill("2")
+            page.locator('#board-drawer [data-field="snooze-duration-unit"]').select_option("days")
+            page.locator('#board-drawer [data-action="snooze-duration-confirm"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0]["body"]["until"] == "2026-03-09T10:00:00-04:00"
+        finally:
+            context.close()
+
+    def test_custom_date_time(self, browser: Browser, agents_base_url):
+        context = browser.new_context(timezone_id="UTC")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            page.clock.pause_at(datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('#board-drawer [data-field="snooze-datetime-value"]').fill("2026-02-10T14:30")
+            page.locator('#board-drawer [data-action="snooze-datetime-confirm"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0]["body"]["until"] == "2026-02-10T14:30:00+00:00"
+        finally:
+            context.close()
+
+    def test_past_custom_date_time_is_refused_client_side(self, browser: Browser, agents_base_url):
+        context = browser.new_context(timezone_id="UTC")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            page.clock.pause_at(datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('#board-drawer [data-field="snooze-datetime-value"]').fill("2025-01-01T09:00")
+            page.locator('#board-drawer [data-action="snooze-datetime-confirm"]').click()
+            expect(page.locator('#board-drawer [data-field="snooze-error"]')).to_be_visible()
+            assert snooze_calls == []
+        finally:
+            context.close()
+
+    def test_zero_duration_is_refused_client_side(self, browser: Browser, agents_base_url):
+        context = browser.new_context(timezone_id="UTC")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            page.clock.pause_at(datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('#board-drawer [data-field="snooze-duration-value"]').fill("0")
+            page.locator('#board-drawer [data-action="snooze-duration-confirm"]').click()
+            expect(page.locator('#board-drawer [data-field="snooze-error"]')).to_be_visible()
+            assert snooze_calls == []
+        finally:
+            context.close()
+
+
+class TestSnoozeDisplayAndUnsnooze:
+    """AC: a snoozed card shows its wake-up time on the card and in the
+    drawer, and offers Unsnooze, which sends DELETE."""
+
+    def _snoozed_board(self):
+        board_state = _board_fixture()
+        board_state["lanes"]["snoozed"].append({
+            "kind": "task", "id": "t-snoozed", "title": "Sleeping card",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"snoozed_until": "2099-06-15T09:00:00+00:00"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        return board_state
+
+    def test_wake_time_shown_on_the_card_and_in_the_drawer(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url, board_state=self._snoozed_board())
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
+
+        chip = page.locator('.board-card[data-card-id="t-snoozed"] .board-chip-snoozed')
+        expect(chip).to_be_visible()
+        title = chip.get_attribute("title") or ""
+        assert title.startswith("wakes "), title
+
+        page.locator('[data-card-id="t-snoozed"]').click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+        expect(page.locator('#board-drawer [data-field="meta"]')).to_contain_text("Wakes")
+
+    def test_unsnooze_sends_delete_and_card_returns_to_its_lane(self, page: Page, agents_base_url):
+        snooze_calls = []
+        board_state = self._snoozed_board()
+        _open_board(page, agents_base_url, board_state=board_state, snooze_calls=snooze_calls)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
+
+        page.locator('[data-card-id="t-snoozed"]').click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+        expect(page.locator('#board-drawer [data-action="unsnooze"]')).to_be_visible()
+        expect(page.locator('#board-drawer [data-action="snooze"]')).to_have_count(0)
+        page.locator('#board-drawer [data-action="unsnooze"]').click()
+
+        _wait_for(lambda: len(snooze_calls) == 1, page=page)
+        assert snooze_calls[0]["method"] == "DELETE"
+        assert snooze_calls[0]["id"] == "t-snoozed"
+        expect(page.locator('.board-lane[data-lane="assigned"] [data-card-id="t-snoozed"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="snoozed"] [data-card-id="t-snoozed"]')).to_have_count(0)
+
+
+class TestSnoozeDraggingClearsTheField:
+    """AC: dragging a snoozed card to another lane clears the snooze (the
+    server does it) — the UI must reflect the card landing in its new lane,
+    not staying (or briefly flashing) in Snoozed."""
+
+    def test_dragging_a_snoozed_card_out_lands_it_in_the_target_lane(self, page: Page, agents_base_url):
+        # Wide viewport so every visible lane (Snoozed makes seven) fits
+        # without horizontal scroll — see the comment in
+        # TestSnoozedLaneVisibility.test_no_drag_into_the_snoozed_lane.
+        page.set_viewport_size({"width": 2400, "height": 900})
+        lane_calls = []
+        board_state = _board_fixture()
+        board_state["lanes"]["snoozed"].append({
+            "kind": "task", "id": "t-snoozed", "title": "Sleeping card",
+            "notes": "", "status": "todo", "tags": [], "assignee": None,
+            "fields": {"snoozed_until": "2099-06-15T09:00:00+00:00"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        _open_board(page, agents_base_url, board_state=board_state, lane_calls=lane_calls)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
+        expect(page.locator('[data-card-id="t-snoozed"]')).to_be_visible()
+
+        _drag_card(page, "t-snoozed", "in_progress")
+        _wait_for(lambda: len(lane_calls) == 1, page=page)
+        expect(page.locator('.board-lane[data-lane="in_progress"] [data-card-id="t-snoozed"]')).to_be_visible()
+        expect(page.locator('.board-lane[data-lane="snoozed"] [data-card-id="t-snoozed"]')).to_have_count(0)
+
+
+class TestSnoozeUndoAfterDrag:
+    """Undo after dragging a snoozed card out must never try to move it
+    directly back into `snoozed` — the server refuses that as a direct
+    target the same way it refuses `review`/`scheduled`. Undo instead
+    restores the card's NATURAL lane
+    (what it would derive to ignoring the snooze) and re-applies the
+    captured `snoozed_until` if it's still in the future. Covers both drop
+    paths that offer Undo (the lane drop and the tray-assignee drop), plus
+    the one natural lane — Review — that also isn't directly settable, so
+    its restore goes through undo-accept instead of a lane move."""
+
+    def test_undo_after_lane_drop_restores_the_natural_lane_and_re_snoozes(
+        self, page: Page, agents_base_url,
+    ):
+        # Wide viewport so every visible lane (Snoozed makes seven) fits
+        # without horizontal scroll — `_drag_card` reads raw bounding
+        # boxes, which are meaningless for a column scrolled out of view.
+        page.set_viewport_size({"width": 2400, "height": 900})
+        lane_calls = []
+        snooze_calls = []
+        task_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["snoozed"].append({
+            "kind": "task", "id": "t-snoozed", "title": "Sleeping card",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"snoozed_until": "2099-01-01T00:00:00+00:00"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            lane_calls=lane_calls, snooze_calls=snooze_calls, task_puts=task_puts,
+        )
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
+        expect(page.locator('[data-card-id="t-snoozed"]')).to_be_visible()
+
+        _drag_card(page, "t-snoozed", "unassigned")
+        expect(page.locator(".board-lane[data-lane='unassigned'] [data-card-id='t-snoozed']")).to_be_visible(timeout=5000)
+        assert lane_calls[0] == {"lane": "unassigned"}, lane_calls
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: len(snooze_calls) == 1, page=page)
+        assert snooze_calls[0]["method"] == "PUT"
+        assert snooze_calls[0]["id"] == "t-snoozed"
+        assert snooze_calls[0]["body"]["until"] == "2099-01-01T00:00:00+00:00"
+        # The restore goes through the general task-update endpoint with
+        # the card's exact pre-drag status/tags (which land it back on its
+        # natural lane, Assigned — it carries #me), never a second
+        # lane-endpoint call, and never a direct PUT of "snoozed" itself.
+        assert task_puts == [{"status": "todo", "tags": ["me"]}], task_puts
+        assert lane_calls == [{"lane": "unassigned"}], lane_calls
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='snoozed'] [data-card-id='t-snoozed']")).to_be_visible(timeout=5000)
+
+    def test_undo_after_tray_assignee_drop_restores_the_natural_lane_and_re_snoozes(
+        self, page: Page, agents_base_url,
+    ):
+        # See the comment in test_undo_after_lane_drop_restores_the_natural_lane_and_re_snoozes.
+        page.set_viewport_size({"width": 2400, "height": 900})
+        lane_calls = []
+        snooze_calls = []
+        task_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["snoozed"].append({
+            "kind": "task", "id": "t-snoozed", "title": "Sleeping card",
+            "notes": "", "status": "todo", "tags": [], "assignee": None,
+            "fields": {"snoozed_until": "2099-01-01T00:00:00+00:00"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            lane_calls=lane_calls, snooze_calls=snooze_calls, task_puts=task_puts,
+        )
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
+        expect(page.locator('[data-card-id="t-snoozed"]')).to_be_visible()
+
+        _drag_to(page, '[data-card-id="t-snoozed"]', '.board-assignee-drop[data-assignee="claude"]')
+        _wait_for(lambda: bool(lane_calls), page)
+        assert lane_calls[0] == {"lane": "assigned", "assignee": "claude"}, lane_calls
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: len(snooze_calls) == 1, page=page)
+        assert snooze_calls[0]["body"]["until"] == "2099-01-01T00:00:00+00:00"
+        # The card carried no tags before the drag, so its exact pre-drag
+        # snapshot (restored via the general task-update endpoint, never a
+        # second lane-endpoint call) lands it back on Unassigned.
+        assert task_puts == [{"status": "todo", "tags": []}], task_puts
+        assert lane_calls == [{"lane": "assigned", "assignee": "claude"}], lane_calls
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='snoozed'] [data-card-id='t-snoozed']")).to_be_visible(timeout=5000)
+
+    def test_undo_after_dragging_a_snoozed_review_card_to_done_reverts_the_accept_and_re_snoozes(
+        self, page: Page, agents_base_url,
+    ):
+        """The natural lane for a snoozed Review card is Review itself,
+        which — like Snoozed — can never be set directly. Undo goes
+        through the dedicated undo-accept transition (removing the
+        `accepted` tag the drag-to-Done write added) rather than a lane
+        move, then re-applies the snooze. The stub refuses (409) a snooze
+        PUT on a card whose natural lane isn't snooze-eligible — the same
+        way the real server does — so the card genuinely can't reach
+        Snoozed without undo-accept having run first: skipping it isn't
+        just "a lane move happened instead", it's "the re-snooze itself
+        would be refused"."""
+        # See the comment in test_undo_after_lane_drop_restores_the_natural_lane_and_re_snoozes.
+        page.set_viewport_size({"width": 2400, "height": 900})
+        lane_calls = []
+        snooze_calls = []
+        call_log = []
+        board_state = _board_fixture()
+        board_state["lanes"]["snoozed"].append({
+            "kind": "task", "id": "t-snoozed-review", "title": "Sleeping review card",
+            "notes": "", "status": "done", "tags": ["agent-completed", "claude"], "assignee": "claude",
+            "fields": {"snoozed_until": "2099-01-01T00:00:00+00:00"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            lane_calls=lane_calls, snooze_calls=snooze_calls, call_log=call_log,
+        )
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('[data-card-id="t-snoozed-review"]')).to_be_visible()
+
+        _drag_card(page, "t-snoozed-review", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t-snoozed-review']")).to_be_visible(timeout=5000)
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: len(snooze_calls) == 1, page=page)
+        assert snooze_calls[0]["body"]["until"] == "2099-01-01T00:00:00+00:00"
+        # Exactly one lane PUT ever happens (the original drag to Done) —
+        # the restore goes through undo-accept, never a second lane move
+        # (which would be a PUT of "unassigned"/"assigned"/etc., never
+        # "review" itself, since that's not a direct target either).
+        assert lane_calls == [{"lane": "done"}], lane_calls
+        # undo-accept actually happened — exactly once — and strictly
+        # before the re-snooze PUT, not merely "the card ended up in
+        # Snoozed somehow".
+        undo_indices = [i for i, entry in enumerate(call_log) if entry == ("undo_accept", "t-snoozed-review")]
+        snooze_indices = [i for i, entry in enumerate(call_log) if entry == ("snooze_put", "t-snoozed-review")]
+        assert len(undo_indices) == 1, call_log
+        assert len(snooze_indices) == 1, call_log
+        assert undo_indices[0] < snooze_indices[0], call_log
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='snoozed'] [data-card-id='t-snoozed-review']")).to_be_visible(timeout=5000)
+
+
+class TestComposerTagsPicker:
+    """The New card composer mounts the same Tags picker (`mountTagPicker`)
+    the drawer uses, in local-only mode — chosen tags are tracked in memory
+    (no `PUT .../tags`, no board re-fetch) and read back when the card is
+    actually created, since there's no card id yet to persist against.
+    Fixture tag `human` (t4, human_queue) is a non-lifecycle board tag the
+    picker offers as an existing suggestion."""
+
+    def test_existing_and_new_tag_both_reach_the_create_payload(self, page: Page, agents_base_url):
+        task_posts = []
+        task_puts = []
+        _open_board(page, agents_base_url, task_posts=task_posts, task_puts=task_puts)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Composer tags test")
+        search = page.locator(".drawer-tags")
+        search.fill("hum")
+        expect(page.locator('[data-field="tag-options"] [data-select-tag="human"]')).to_be_visible()
+        page.locator('[data-field="tag-options"] [data-select-tag="human"]').click()
+        search.fill("gamma-tag")
+        expect(page.locator(".drawer-tag-option-create")).to_contain_text("#gamma-tag")
+        page.locator(".drawer-tag-option-create").click()
+        expect(page.locator(".drawer-tag-chip")).to_have_count(2)
+        # Local-only mode: choosing tags never PUTs anything — there's no
+        # card id yet to persist against.
+        assert task_puts == [], task_puts
+
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Composer tags test", "tags": ["human", "gamma-tag"]}, task_posts
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        expect(page.locator('[data-card-id="new-1"]')).to_contain_text("#human")
+        expect(page.locator('[data-card-id="new-1"]')).to_contain_text("#gamma-tag")
+        assert task_puts == [], task_puts
+
+    def test_assignee_and_chosen_tags_merge_without_a_duplicate_routing_tag(self, page: Page, agents_base_url):
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Assignee plus tags")
+        page.locator("#new-card-assignee").select_option("claude")
+        search = page.locator(".drawer-tags")
+        # Typing the assignee's own name is rejected exactly like the
+        # drawer's picker rejects it — no "Create new" option for it, so it
+        # can never end up duplicated alongside the routing tag Create adds.
+        search.fill("claude")
+        expect(page.locator(".drawer-tag-option-create")).to_have_count(0)
+        search.fill("beta-tag")
+        page.locator(".drawer-tag-option-create").click()
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Assignee plus tags", "tags": ["claude", "beta-tag"]}, task_posts
+
+    def test_no_tags_and_no_assignee_leaves_the_create_payload_unchanged(self, page: Page, agents_base_url):
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator("#board-new-card").click()
+        # The composer's Tags picker is actually mounted, visible, and
+        # starts empty — a positive assertion that fails outright against a
+        # composer with no picker at all, not just against a broken payload.
+        picker = page.locator(".modal .drawer-tags-picker")
+        expect(picker).to_be_visible()
+        expect(page.locator(".modal .drawer-tags")).to_be_visible()
+        expect(page.locator(".modal .drawer-tags")).to_have_value("")
+        expect(page.locator(".modal .drawer-tag-chip")).to_have_count(0)
+
+        page.locator("#new-card-desc").fill("Plain composer card")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Plain composer card"}, task_posts
+
+    def test_empty_query_focus_does_not_open_the_suggestion_list_over_create(
+        self, page: Page, agents_base_url,
+    ):
+        """Focusing the Tags search field with an empty query must not pop
+        the suggestion list open over the Create button below it — only
+        typing a query, or pressing ArrowDown/ArrowUp, opens it. Board
+        fixture t4 carries the editable tag `human`, so the list would have
+        a real match to show if it opened on bare focus."""
+        _open_board(page, agents_base_url)
+        page.locator("#board-new-card").click()
+        options = page.locator(".modal [data-field='tag-options']")
+        search = page.locator(".modal .drawer-tags")
+        search.click()
+        expect(options).to_be_hidden()
+        create_btn = page.locator("#new-card-create")
+        box = create_btn.bounding_box()
+        covering = page.evaluate(
+            "([x, y]) => { const el = document.elementFromPoint(x, y); "
+            "return el ? el.id || el.className : null; }",
+            [box["x"] + box["width"] / 2, box["y"] + box["height"] / 2],
+        )
+        assert covering == "new-card-create", covering
+
+        # Typing opens it.
+        search.fill("hum")
+        expect(options).to_be_visible()
+        expect(page.locator('[data-field="tag-options"] [data-select-tag="human"]')).to_be_visible()
+
+        # Clearing the query back to empty keeps it open (sticky once
+        # requested) rather than re-hiding it mid-pick.
+        search.fill("")
+        expect(options).to_be_visible()
+
+        search.press("Escape")
+        expect(options).to_be_hidden()
+
+        # ArrowDown alone (no typing) also opens it and moves focus onto
+        # the first option.
+        search.press("ArrowDown")
+        expect(options).to_be_visible()
+        expect(page.locator('[data-field="tag-options"] [data-select-tag="human"]')).to_be_focused()
+
+    def test_typing_a_lifecycle_tag_is_rejected(self, page: Page, agents_base_url):
+        task_posts = []
+        task_puts = []
+        _open_board(page, agents_base_url, task_posts=task_posts, task_puts=task_puts)
+        page.locator("#board-new-card").click()
+        search = page.locator(".drawer-tags")
+        search.fill("agent-running foo")
+        page.locator("#new-card-desc").click()  # blur the tags field
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        expect(search).to_have_value("foo")
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+        assert task_puts == [], task_puts
+
+        page.locator("#new-card-desc").fill("Lifecycle tag rejected")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Lifecycle tag rejected", "tags": ["foo"]}, task_posts
+        assert not any("agent-running" in (p.get("tags") or []) for p in task_posts)
+
+    def test_pending_typed_tag_commits_on_create_without_a_blur_event(self, page: Page, agents_base_url):
+        """A tag typed into the search field but never confirmed — no
+        Enter, no option pick, and (via a JS-triggered click rather than a
+        real pointer click) no blur event either — must still reach the
+        create payload, exactly like a genuine mouse click on Create
+        (which does naturally blur the field first) already does. This
+        isolates the Create handler's own commit from incidentally relying
+        on that natural blur ordering."""
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Pending tag reaches payload")
+        page.locator(".drawer-tags").fill("synthetic-pending")
+        page.evaluate("document.getElementById('new-card-create').click()")
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {
+            "description": "Pending tag reaches payload", "tags": ["synthetic-pending"],
+        }, task_posts
+
+    def test_pending_typed_tag_adds_to_an_existing_chip_instead_of_replacing_it(
+        self, page: Page, agents_base_url,
+    ):
+        """A chip already chosen (`synthetic-one`) plus a second tag left
+        typed but unconfirmed in the search field when Create is clicked —
+        a real pointer click, which blurs the field first — must reach the
+        create payload alongside each other: `saveLegacyText`'s
+        single-token branch merges the typed token onto the composer's
+        current selection rather than replacing it."""
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Chip plus pending tag")
+        search = page.locator(".drawer-tags")
+        search.fill("synthetic-one")
+        expect(page.locator(".drawer-tag-option-create")).to_contain_text("#synthetic-one")
+        page.locator(".drawer-tag-option-create").click()
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+        search.fill("synthetic-two")
+        # A real click — not the JS-dispatched click the test above uses —
+        # so the field's natural blur runs first, exactly like the
+        # reported reproduction.
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {
+            "description": "Chip plus pending tag", "tags": ["synthetic-one", "synthetic-two"],
+        }, task_posts
+
+    def test_pending_multi_word_text_adds_to_an_existing_chip_instead_of_replacing_it(
+        self, page: Page, agents_base_url,
+    ):
+        """The multi-token branch of `saveLegacyText` (space-separated text
+        left typed but unconfirmed) must merge onto the composer's current
+        selection exactly like the single-token branch does — a chip
+        chosen earlier (`synthetic-four`) must survive a still-typed
+        `gamma delta` being committed on Create."""
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Chip plus pending multi-word text")
+        search = page.locator(".drawer-tags")
+        search.fill("synthetic-four")
+        page.keyboard.press("Enter")
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+        search.fill("gamma delta")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {
+            "description": "Chip plus pending multi-word text",
+            "tags": ["synthetic-four", "gamma", "delta"],
+        }, task_posts
+
+    def test_pending_lifecycle_text_is_rejected_on_create_without_a_blur_event(self, page: Page, agents_base_url):
+        """The same no-blur path as above, but for lifecycle-tag text —
+        the explicit flush must apply the same rejection `saveLegacyText`
+        already does on a real blur, not bypass it."""
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Pending lifecycle text rejected")
+        page.locator(".drawer-tags").fill("agent-running")
+        page.evaluate("document.getElementById('new-card-create').click()")
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Pending lifecycle text rejected"}, task_posts
 
 
 class TestDrawerClickOutsideClose:
@@ -4195,7 +5576,11 @@ class TestAgentCardMoveRulesAndCancel:
         expect(page.get_by_role("button", name="Cancel", exact=True)).to_have_count(0)
 
     def test_removing_agent_marker_tag_leaves_other_editable_tags_via_tags_box(self, page: Page, agents_base_url):
-        """`agent` is an ordinary operator label, not a lifecycle tag."""
+        """`agent` is an ordinary operator label, not a lifecycle tag — it
+        remains an editable chip, removable the same way any other tag is:
+        its own chip's ×. The Tags field's blur-commit only ever adds to
+        the current selection, so removal goes through the chip control,
+        not a retyped list."""
         board_state = copy.deepcopy(_board_fixture())
         board_state["lanes"]["assigned"].append({
             "kind": "task", "id": "t13", "title": "Operator queue card",
@@ -4211,9 +5596,9 @@ class TestAgentCardMoveRulesAndCancel:
         tags = page.locator(".drawer-tags")
         expect(tags).to_be_enabled()
         expect(tags).to_have_value("agent agent-notes notes")
+        expect(page.locator('[data-remove-tag="agent"]')).to_be_visible()
 
-        tags.fill("agent-notes notes")  # remove "agent"
-        page.locator(".drawer-title").click()  # blur the tags field
+        page.locator('[data-remove-tag="agent"]').click()  # remove "agent"
         _wait_for(lambda: bool(task_puts), page=page)
         assert task_puts == [{"tags": ["agent-notes", "notes"]}], task_puts
         t13 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t13")
@@ -4729,10 +6114,13 @@ class TestAssignmentTray:
         self, page: Page, agents_base_url,
     ):
         """Every assignment path reports through one confirm-with-undo toast.
-        Undo returns the card to the lane and assignee it had beforehand.
+        Undo returns the card to the exact status and tags it had
+        beforehand, through the general task-update endpoint rather than a
+        second lane-endpoint call.
         """
         lane_calls = []
-        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        task_puts = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
         _drag_to(page, '.board-assignee-drop[data-assignee="claude"]', '[data-card-id="t1"]')
         _wait_for(lambda: bool(lane_calls), page)
 
@@ -4742,12 +6130,12 @@ class TestAssignmentTray:
         expect(toast.locator(".toast-action")).to_have_text("Undo")
 
         toast.locator(".toast-action").click()
-        _wait_for(lambda: len(lane_calls) >= 2, page)
-        # t1 started unassigned in the unassigned lane; undo restores exactly
-        # that rather than leaving it assigned.
-        assert lane_calls[0] == {"lane": "assigned", "assignee": "claude"}, lane_calls
-        assert lane_calls[1]["lane"] == "unassigned", lane_calls
-        assert not lane_calls[1].get("assignee"), lane_calls
+        _wait_for(lambda: bool(task_puts), page)
+        # t1 started unassigned with no tags; undo restores exactly that
+        # rather than leaving it assigned.
+        assert lane_calls == [{"lane": "assigned", "assignee": "claude"}], lane_calls
+        assert task_puts == [{"status": "todo", "tags": []}], task_puts
+        expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_be_visible()
 
     def test_card_dragged_onto_an_assignee_button_assigns_it(self, page: Page, agents_base_url):
         """The reverse of the existing assignee-onto-card drag. Both directions
@@ -4833,22 +6221,201 @@ class TestAssignmentTray:
         assert abs(group_center - tray_center) < 2, metrics
         assert label["x"] + label["width"] <= group_left, metrics
 
-    def test_assignee_row_spans_the_full_width_on_a_phone(self, page: Page, agents_base_url):
-        page.set_viewport_size({"width": 390, "height": 844})
+    def test_desktop_tray_keeps_its_wide_layout(self, page: Page, agents_base_url):
+        page.set_viewport_size({"width": 1280, "height": 800})
         _open_board(page, agents_base_url)
         metrics = page.evaluate(
             """() => {
                 const tray = document.getElementById('board-drop-tray');
                 const row = document.getElementById('board-assignee-drops');
+                const label = document.querySelector('.board-drop-tray-label');
                 return {
-                    trayWidth: tray.getBoundingClientRect().width,
-                    rowWidth: row.getBoundingClientRect().width,
-                    status: document.getElementById('board-drop-status').getBoundingClientRect().width,
+                    display: getComputedStyle(tray).display,
+                    rowShare: row.getBoundingClientRect().width / tray.getBoundingClientRect().width,
+                    labelPosition: getComputedStyle(label).position,
                 };
             }"""
         )
-        # Full width bar the tray's own horizontal padding.
-        assert metrics["rowWidth"] > metrics["trayWidth"] * 0.85, metrics
+        assert metrics["display"] == "flex", metrics
+        assert 0.5 < metrics["rowShare"] <= 0.67, metrics
+        assert metrics["labelPosition"] == "absolute", metrics
+
+
+class TestMobileAssignmentTray:
+    @staticmethod
+    def _open_mobile(browser: Browser, agents_base_url, assignees=None, **kwargs):
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+        )
+        page = context.new_page()
+        if assignees is not None:
+            source = (WEB_DIR / "agents" / "board.js").read_text()
+            source = source.replace(
+                "const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud'];",
+                f"const ASSIGNEES = {json.dumps(assignees)};",
+            )
+            page.route(
+                "**/static/agents/board.js",
+                lambda route: route.fulfill(
+                    status=200, content_type="application/javascript", body=source,
+                ),
+            )
+        _open_board(page, agents_base_url, **kwargs)
+        return context, page
+
+    @staticmethod
+    def _tray_metrics(page: Page):
+        return page.evaluate(
+            """() => {
+                const tray = document.getElementById('board-drop-tray');
+                const buttons = [...document.querySelectorAll(
+                    '#board-assignee-drops .board-assignee-drop, #board-done-drop'
+                )];
+                const boxes = buttons.map(button => button.getBoundingClientRect());
+                return {
+                    centers: boxes.map(box => box.top + box.height / 2),
+                    widths: boxes.map(box => box.width),
+                    heights: boxes.map(box => box.height),
+                    trayClientWidth: tray.clientWidth,
+                    trayScrollWidth: tray.scrollWidth,
+                    documentScrollWidth: document.documentElement.scrollWidth,
+                    overflowX: getComputedStyle(tray).overflowX,
+                };
+            }"""
+        )
+
+    def test_default_targets_share_one_equal_non_scrolling_phone_row(
+        self, browser: Browser, agents_base_url,
+    ):
+        context, page = self._open_mobile(browser, agents_base_url)
+        try:
+            metrics = self._tray_metrics(page)
+            assert len(metrics["widths"]) == len(_ASSIGNEE_TAGS) + 1, metrics
+            assert max(metrics["centers"]) - min(metrics["centers"]) <= 2, metrics
+            assert max(metrics["widths"]) - min(metrics["widths"]) <= 1, metrics
+            assert min(metrics["heights"]) >= 42, metrics
+            assert metrics["trayScrollWidth"] <= metrics["trayClientWidth"], metrics
+            assert metrics["documentScrollWidth"] <= 390, metrics
+            assert metrics["overflowX"] != "auto", metrics
+            expect(page.locator("#board-done-drop")).to_have_attribute("title", "Done")
+            expect(page.locator("#board-done-drop")).to_have_attribute("aria-label", re.compile(r"^Done lane"))
+        finally:
+            context.close()
+
+    def test_eight_assignees_fit_and_long_name_is_ellipsized_with_full_labels(
+        self, browser: Browser, agents_base_url,
+    ):
+        assignees = [
+            "me", "claude", "codex", "hermes", "local", "cloud",
+            "synthetic-extra-assignee", "synthetic-extremely-long-assignee",
+        ]
+        context, page = self._open_mobile(browser, agents_base_url, assignees=assignees)
+        try:
+            metrics = self._tray_metrics(page)
+            assert len(metrics["widths"]) == 9, metrics
+            assert max(metrics["centers"]) - min(metrics["centers"]) <= 2, metrics
+            assert max(metrics["widths"]) - min(metrics["widths"]) <= 1, metrics
+            assert min(metrics["heights"]) >= 42, metrics
+            assert metrics["trayScrollWidth"] <= metrics["trayClientWidth"], metrics
+            assert metrics["documentScrollWidth"] <= 390, metrics
+
+            full_name = "synthetic-extremely-long-assignee"
+            long_button = page.locator(f'.board-assignee-drop[data-assignee="{full_name}"]')
+            styles = long_button.evaluate(
+                """button => ({
+                    overflow: getComputedStyle(button).overflow,
+                    textOverflow: getComputedStyle(button).textOverflow,
+                    whiteSpace: getComputedStyle(button).whiteSpace,
+                    fontSize: parseFloat(getComputedStyle(button).fontSize),
+                })"""
+            )
+            assert styles["overflow"] == "hidden", styles
+            assert styles["textOverflow"] == "ellipsis", styles
+            assert styles["whiteSpace"] == "nowrap", styles
+            # Smaller than the desktop 0.78rem (12.48px) base, and still legible.
+            assert 8 <= styles["fontSize"] < 12, styles
+            expect(long_button).to_have_attribute("title", full_name)
+            expect(long_button).to_have_attribute("aria-label", f"Filter board to {full_name}")
+        finally:
+            context.close()
+
+    @pytest.mark.parametrize(
+        ("target", "expected"),
+        [
+            ("#board-done-drop", {"lane": "done"}),
+            ('.board-assignee-drop[data-assignee="codex"]', {"lane": "assigned", "assignee": "codex"}),
+        ],
+    )
+    def test_card_drag_to_phone_tray_target_still_writes_the_move(
+        self, browser: Browser, agents_base_url, target, expected,
+    ):
+        lane_calls = []
+        context, page = self._open_mobile(
+            browser, agents_base_url, lane_calls=lane_calls,
+        )
+        try:
+            _drag_to(page, '[data-card-id="t1"]', target)
+            _wait_for(lambda: bool(lane_calls), page)
+            assert lane_calls == [expected]
+        finally:
+            context.close()
+
+    def test_drop_status_text_does_not_shift_tray_buttons_or_height(
+        self, browser: Browser, agents_base_url,
+    ):
+        """A drag hovering a target sets the status text; that text must
+        never change the tray's height, or every button shifts out from
+        under a held finger mid-drag (see board.js onDragMove)."""
+        context, page = self._open_mobile(browser, agents_base_url)
+        try:
+            metrics = """() => {
+                const tray = document.getElementById('board-drop-tray');
+                const button = document.querySelector('.board-assignee-drop[data-assignee="codex"]');
+                return {
+                    trayHeight: tray.getBoundingClientRect().height,
+                    buttonTop: button.getBoundingClientRect().top,
+                };
+            }"""
+            before = page.evaluate(metrics)
+            page.evaluate(
+                "document.getElementById('board-drop-status').textContent = 'Drop to assign codex.'"
+            )
+            during = page.evaluate(metrics)
+            page.evaluate("document.getElementById('board-drop-status').textContent = ''")
+            after = page.evaluate(metrics)
+            assert abs(during["trayHeight"] - before["trayHeight"]) <= 1, (before, during)
+            assert abs(during["buttonTop"] - before["buttonTop"]) <= 1, (before, during)
+            assert abs(after["trayHeight"] - before["trayHeight"]) <= 1, (before, after)
+            assert abs(after["buttonTop"] - before["buttonTop"]) <= 1, (before, after)
+        finally:
+            context.close()
+
+    def test_drag_release_below_button_centre_still_assigns_at_phone_width(
+        self, browser: Browser, agents_base_url,
+    ):
+        """A thumb reaching a bottom-anchored tray button often lands below
+        its visual centre. Releasing there must still assign the card —
+        it must not be lost to the tray growing/shrinking as the drop
+        status text appears and clears during the drag."""
+        lane_calls = []
+        context, page = self._open_mobile(browser, agents_base_url, lane_calls=lane_calls)
+        try:
+            source = page.locator('[data-card-id="t1"]')
+            target = page.locator('.board-assignee-drop[data-assignee="codex"]')
+            src = source.bounding_box()
+            dst = target.bounding_box()
+            release_x = dst["x"] + dst["width"] / 2
+            release_y = dst["y"] + dst["height"] / 2 + 12
+            page.mouse.move(src["x"] + src["width"] / 2, src["y"] + src["height"] / 2)
+            page.mouse.down()
+            page.mouse.move(src["x"] + src["width"] / 2 + 60, src["y"] + src["height"] / 2, steps=4)
+            page.mouse.move(release_x, release_y, steps=10)
+            page.mouse.move(release_x, release_y, steps=1)
+            page.mouse.up()
+            _wait_for(lambda: bool(lane_calls), page)
+            assert lane_calls == [{"lane": "assigned", "assignee": "codex"}], lane_calls
+        finally:
+            context.close()
 
 
 class TestDrawerMetadata:
@@ -4927,8 +6494,16 @@ class TestMutationUndo:
     def test_lane_drag_confirms_with_an_undo_that_restores_the_prior_lane(
         self, page: Page, agents_base_url,
     ):
+        """Undo restores the card's exact pre-drag status, not just its
+        lane — dragging Unassigned into In progress sets status
+        "in_progress" (plan_lane_move's own branch), and replaying
+        `{lane: 'unassigned'}` to undo it would leave status stuck at
+        "in_progress" (that branch only ever touches tags), so the card
+        would stay derived to In progress regardless of the toast claiming
+        it landed back in Unassigned."""
         lane_calls = []
-        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        task_puts = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
         _drag_card(page, "t1", "in_progress")
         _wait_for(lambda: bool(lane_calls), page)
         toast = page.locator(".toast")
@@ -4936,16 +6511,82 @@ class TestMutationUndo:
         expect(toast.locator(".toast-action")).to_have_text("Undo")
 
         toast.locator(".toast-action").click()
-        _wait_for(lambda: len(lane_calls) >= 2, page)
-        assert lane_calls[-1]["lane"] == "unassigned", lane_calls
+        _wait_for(lambda: bool(task_puts), page)
+        assert lane_calls == [{"lane": "in_progress"}], lane_calls
+        assert task_puts == [{"status": "todo", "tags": []}], task_puts
+        expect(page.locator(".toast.error")).to_have_count(0)
         expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_be_visible()
+
+    def test_dragging_an_unassigned_card_to_in_progress_and_undo_restores_it(
+        self, page: Page, agents_base_url,
+    ):
+        """The same invariant, asserted as its own falsifying test: a
+        lossy replay of `{lane: 'unassigned'}` never touches `status`, so
+        it would leave the card at `status="in_progress"` — still
+        deriving to In progress — while the toast claims it moved back to
+        Unassigned."""
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
+        _drag_card(page, "t1", "in_progress")
+        expect(page.locator(".board-lane[data-lane='in_progress'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        assert task_puts[-1] == {"status": "todo", "tags": []}, task_puts
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='unassigned'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+
+    def test_dragging_an_assigned_me_card_to_in_progress_and_undo_restores_it(
+        self, page: Page, agents_base_url,
+    ):
+        """The Assigned half of the same invariant — a `#me` card dragged
+        into In progress and undone must come back `status="todo"`, not
+        stuck at `"in_progress"`."""
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
+        _drag_card(page, "t2", "in_progress")
+        expect(page.locator(".board-lane[data-lane='in_progress'] [data-card-id='t2']")).to_be_visible(timeout=5000)
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        assert task_puts[-1] == {"status": "todo", "tags": ["me"]}, task_puts
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='assigned'] [data-card-id='t2']")).to_be_visible(timeout=5000)
+
+    @staticmethod
+    def _human_todo_card():
+        # A #human card filed at status "todo" (not "blocked") — the one
+        # shape that makes the STATUS half of AC1 falsifiable. A "blocked"
+        # origin can't distinguish the correct restore from the lossy
+        # human_queue-branch replay, which also forces status="blocked".
+        return {
+            "kind": "task", "id": "t-human-open", "title": "Open human queue card",
+            "notes": "", "status": "todo", "tags": ["human", "me"], "assignee": "me",
+            "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        }
 
     def test_mark_done_confirms_with_an_undo_that_returns_the_card(
         self, page: Page, agents_base_url,
     ):
+        """Undo restores the card's exact pre-move status AND tags — a
+        status of "todo" makes the status half of AC1 falsifiable
+        (hardcoding status="blocked" into the restore write would still
+        pass a "blocked"-origin test, but not this one)."""
+        board = _board_fixture()
+        board["lanes"]["human_queue"].append(self._human_todo_card())
         lane_calls = []
-        _open_board(page, agents_base_url, lane_calls=lane_calls)
-        page.locator('[data-card-id="t4"]').click()
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board, lane_calls=lane_calls, task_puts=task_puts)
+        page.locator('[data-card-id="t-human-open"]').click()
         page.locator('#board-drawer [data-action="resolve"]').click()
         _wait_for(lambda: bool(lane_calls), page)
         assert lane_calls[0] == {"lane": "done"}, lane_calls
@@ -4953,8 +6594,291 @@ class TestMutationUndo:
         toast = page.locator(".toast")
         expect(toast.locator(".toast-action")).to_have_text("Undo")
         toast.locator(".toast-action").click()
-        _wait_for(lambda: len(lane_calls) >= 2, page)
-        assert lane_calls[-1] == {"lane": "human_queue"}, lane_calls
+        _wait_for(lambda: bool(task_puts), page)
+        assert task_puts[-1] == {"status": "todo", "tags": ["human", "me"]}, task_puts
+        card = next(c for lane in board["lanes"].values() for c in lane if c["id"] == "t-human-open")
+        assert card["status"] == "todo", card
+        assert card["tags"] == ["human", "me"], card
+        expect(page.locator('.board-lane[data-lane="human_queue"] [data-card-id="t-human-open"]')).to_be_visible()
+
+    def test_dragging_a_human_queue_card_to_done_and_undo_restores_its_state(
+        self, page: Page, agents_base_url,
+    ):
+        """The drag path (onCardDropped), not the drawer's Mark Done button
+        (covered above) — dragging strips `#human` on the way into Done
+        (agent_board.plan_lane_move's `done` branch), and Undo must bring
+        back the exact status and tags the card had before the drag rather
+        than replaying the lane endpoint's human_queue branch, which only
+        ever forces status="blocked" without touching tags. A status of
+        "todo" makes the status half of AC1 falsifiable here too."""
+        page.set_viewport_size({"width": 2400, "height": 900})
+        board = _board_fixture()
+        board["lanes"]["human_queue"].append(self._human_todo_card())
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board, lane_calls=lane_calls, task_puts=task_puts)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('[data-card-id="t-human-open"]')).to_be_visible()
+
+        _drag_card(page, "t-human-open", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t-human-open']")).to_be_visible(timeout=5000)
+        assert lane_calls == [{"lane": "done"}], lane_calls
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        assert task_puts[-1] == {"status": "todo", "tags": ["human", "me"]}, task_puts
+        # Exactly one lane PUT ever happens (the original drag) — the
+        # restore goes through the general task-update endpoint, never a
+        # second lane move that would force status="blocked" without
+        # restoring tags.
+        assert lane_calls == [{"lane": "done"}], lane_calls
+        card = next(c for lane in board["lanes"].values() for c in lane if c["id"] == "t-human-open")
+        assert card["status"] == "todo", card
+        assert card["tags"] == ["human", "me"], card
+        expect(page.locator(".board-lane[data-lane='human_queue'] [data-card-id='t-human-open']")).to_be_visible(timeout=5000)
+
+    def test_dragging_a_manually_blocked_card_to_done_and_undo_restores_it_without_a_human_tag(
+        self, page: Page, agents_base_url,
+    ):
+        """AC2: a card that reached Human queue through a manually-set
+        "blocked" status (no `#human` tag at all — status alone puts it in
+        Human queue) must not have Undo invent a `#human` tag it never
+        carried. Built as its own fixture card rather than reusing t3
+        (`agent-blocked` + an assignee tag): a real `#agent-blocked` card is
+        always worker-claimed (agent_board.is_claimed treats that tag as a
+        claim regardless of a live session), so the server refuses to drag
+        it to Done at all — this exercises the one Human-queue arrival this
+        Undo path can actually be reached from without the tag. Asserts on
+        the restored card's actual end state (not just that a PUT fired):
+        for this no-tag "blocked" card the old lossy replay happens to
+        produce the identical end state, so the request-shape assertion
+        alone is not itself evidence for AC2 — the point of this test is
+        that no `#human` tag gets invented, which the end-state check below
+        actually verifies."""
+        page.set_viewport_size({"width": 2400, "height": 900})
+        board = _board_fixture()
+        board["lanes"]["human_queue"].append({
+            "kind": "task", "id": "t-blocked", "title": "Manually blocked card",
+            "notes": "", "status": "blocked", "tags": [], "assignee": None,
+            "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board, lane_calls=lane_calls, task_puts=task_puts)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('[data-card-id="t-blocked"]')).to_be_visible()
+
+        _drag_card(page, "t-blocked", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t-blocked']")).to_be_visible(timeout=5000)
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        assert task_puts[-1] == {"status": "blocked", "tags": []}, task_puts
+        card = next(c for lane in board["lanes"].values() for c in lane if c["id"] == "t-blocked")
+        assert card["status"] == "blocked", card
+        assert card["tags"] == [], card
+        expect(page.locator(".board-lane[data-lane='human_queue'] [data-card-id='t-blocked']")).to_be_visible(timeout=5000)
+
+    def test_undo_after_marking_done_keeps_a_tag_added_in_the_drawer(
+        self, page: Page, agents_base_url,
+    ):
+        """resolveCard's snapshot must reflect the card's LIVE board state
+        at the moment Mark Done is clicked, not the `card` object the
+        button's own click listener closed over. `renderDrawerActions`
+        (board.js) runs with a fresh card on every board tick, but
+        `renderActionRow` (session_actions.js) only rebinds the actual DOM
+        listeners when the decided action set's signature (which actions
+        are enabled, and why) changes — a tag edit never changes that, so
+        the listener stays bound to whichever card object was current the
+        last time the signature itself changed. Picking a tag from the
+        Tags picker's "Create new" option also leaves focus in the tags
+        search box, so a tag added there and Mark Done clicked without
+        ever refocusing elsewhere must still survive Undo."""
+        board_state = _board_fixture()
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, lane_calls=lane_calls, task_puts=task_puts)
+        page.locator('[data-card-id="t4"]').click()
+        search = page.locator(".drawer-tags")
+        search.fill("example-extra")
+        expect(page.locator(".drawer-tag-option-create")).to_contain_text("#example-extra")
+        page.locator(".drawer-tag-option-create").click()
+        _wait_for(lambda: any("example-extra" in (p.get("tags") or []) for p in task_puts), page=page)
+        t4 = next(card for lane in board_state["lanes"].values() for card in lane if card["id"] == "t4")
+        prior_tags = list(t4["tags"])
+        assert "example-extra" in prior_tags, t4
+
+        # Focus is still inside the drawer (the tags search box) — exactly
+        # the state that leaves the action row's own closure stale.
+        page.locator('#board-drawer [data-action="resolve"]').click()
+        _wait_for(lambda: bool(lane_calls), page)
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: len(task_puts) >= 2 and task_puts[-1].get("status") is not None, page)
+        assert task_puts[-1] == {"status": "blocked", "tags": prior_tags}, task_puts
+
+    def test_dragging_an_unassigned_card_to_done_and_undo_restores_it(
+        self, page: Page, agents_base_url,
+    ):
+        """Undo out of Done is broken for Unassigned (and Assigned) cards
+        too if it merely replays the lane endpoint: plan_lane_move's
+        unassigned/assigned branches never touch `status`, so replaying
+        `{lane: 'unassigned'}` against a card still at status="done"
+        leaves it exactly there (derive_lane keeps deriving Done from that
+        status regardless of what the tags now say), reporting "Card
+        landed in Done, not Unassigned." instead of actually moving it.
+        Any Undo of a move INTO Done must restore the exact pre-move
+        snapshot, whatever the restore target lane is."""
+        page.set_viewport_size({"width": 2400, "height": 900})
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+
+        _drag_card(page, "t1", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+        assert lane_calls == [{"lane": "done"}], lane_calls
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        assert task_puts[-1] == {"status": "todo", "tags": []}, task_puts
+        # Never a second lane-endpoint call, and no "Card landed in Done,
+        # not Unassigned." toast — the restore goes entirely through the
+        # general task-update endpoint.
+        assert lane_calls == [{"lane": "done"}], lane_calls
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='unassigned'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+
+    def test_dragging_an_assigned_me_card_to_done_and_undo_restores_it(
+        self, page: Page, agents_base_url,
+    ):
+        """The Assigned half of the same widened-scope fix, for a card
+        assigned to `#me` — unlike an agent assignee, `#me` is not
+        agent-owned, so a human can actually drag it to Done directly
+        (confirmed live: `evaluate_card_action` allows it)."""
+        page.set_viewport_size({"width": 2400, "height": 900})
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('[data-card-id="t2"]')).to_be_visible()
+
+        _drag_card(page, "t2", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t2']")).to_be_visible(timeout=5000)
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        assert task_puts[-1] == {"status": "todo", "tags": ["me"]}, task_puts
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='assigned'] [data-card-id='t2']")).to_be_visible(timeout=5000)
+
+    def test_dragging_an_assigned_agent_card_to_done_and_undo_restores_it(
+        self, page: Page, agents_base_url,
+    ):
+        """The same fix for a card assigned to an agent engine (`#codex`).
+        Client-only coverage: confirmed live that a real server refuses
+        (409, "agent-owned cards are managed by the agent…") to drag an
+        agent-owned, unclaimed card to Done at all — `evaluate_card_action`
+        — so this specific origin never actually reaches this Undo path on
+        a real server. Kept anyway (mirroring the AC2 test's t3 precedent)
+        because the client logic must still restore correctly if that
+        server-side refusal is ever removed, and it is the only coverage
+        for an agent assignee tag surviving the snapshot round-trip."""
+        page.set_viewport_size({"width": 2400, "height": 900})
+        board = _board_fixture()
+        board["lanes"]["assigned"].append({
+            "kind": "task", "id": "t-agent-assigned", "title": "Agent-assigned card",
+            "notes": "", "status": "todo", "tags": ["codex"], "assignee": "codex",
+            "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board, lane_calls=lane_calls, task_puts=task_puts)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('[data-card-id="t-agent-assigned"]')).to_be_visible()
+
+        _drag_card(page, "t-agent-assigned", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t-agent-assigned']")).to_be_visible(timeout=5000)
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        assert task_puts[-1] == {"status": "todo", "tags": ["codex"]}, task_puts
+        expect(page.locator(".board-lane[data-lane='assigned'] [data-card-id='t-agent-assigned']")).to_be_visible(timeout=5000)
+
+    def test_a_refused_undo_restore_reports_failure_and_does_not_leave_the_card_in_done(
+        self, page: Page, agents_base_url,
+    ):
+        """A refused restore (e.g. a 409 because the card changed in the
+        meantime) reports failure rather than reading as a success: an
+        error toast appears, the original toast's own Undo action stays
+        available, and the card is left exactly where the server has it.
+        Uses a snoozed card so "no re-snooze is attempted on a refused
+        restore" is itself an automated assertion (`snooze_calls == []`),
+        not just something checked by hand."""
+        page.set_viewport_size({"width": 2400, "height": 900})
+        board = _board_fixture()
+        board["lanes"]["snoozed"].append({
+            "kind": "task", "id": "t-snoozed-refused", "title": "Sleeping card",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"snoozed_until": "2099-01-01T00:00:00+00:00"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        lane_calls = []
+        task_puts = []
+        snooze_calls = []
+        _open_board(
+            page, agents_base_url, board_state=board, lane_calls=lane_calls,
+            task_puts=task_puts, snooze_calls=snooze_calls, task_put_status_code=[409],
+        )
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('[data-card-id="t-snoozed-refused"]')).to_be_visible()
+
+        _drag_card(page, "t-snoozed-refused", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t-snoozed-refused']")).to_be_visible(timeout=5000)
+
+        undo_toast = page.locator(".toast:not(.error)")
+        expect(undo_toast.locator(".toast-action")).to_have_text("Undo")
+        undo_toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        # The restore was attempted (and refused) — a fresh error toast
+        # reports it, the original toast's own Undo action is restored
+        # rather than silently dismissed as if the restore had succeeded,
+        # the card is still sitting in Done, and no re-snooze was ever
+        # attempted on a card the restore never actually touched.
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        expect(undo_toast.locator(".toast-action")).to_have_text("Undo")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t-snoozed-refused']")).to_be_visible()
+        assert snooze_calls == [], snooze_calls
 
     def test_cancel_says_it_cannot_be_undone_instead_of_offering_a_dead_link(
         self, page: Page, agents_base_url,
