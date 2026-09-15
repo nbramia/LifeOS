@@ -231,7 +231,7 @@ export function initBoard() {
   let revealedCardId = null;
   let revealHighlightTimer = null;
 
-  // Multi-select (#1096) — a Set of task-card ids, not a DOM class: `render()`
+  // Multi-select — a Set of task-card ids, not a DOM class: `render()`
   // rebuilds every card node (an SSE tick, a filter change, a lane toggle),
   // so the selection has to be re-applied at render time the same way
   // `revealedCardId` is, rather than living on a node that gets discarded.
@@ -251,7 +251,7 @@ export function initBoard() {
     render();
   }
 
-  // Drops any selected id no longer present on the board — called from
+  // Drops any selected id absent from the board — called from
   // `applyBoard` before `render()` so a card that vanished on a live update
   // (deleted elsewhere, or moved out from under a stale selection) drops out
   // of the count rather than being fanned out over on the next bulk action.
@@ -1002,7 +1002,7 @@ export function initBoard() {
     if (e.isPrimary === false || dragState || (e.pointerType === 'mouse' && e.button !== 0)) return;
     // A modifier-held press on a card is a selection click, never a drag —
     // bail before any drag state is set so the trailing click reaches the
-    // card's own listener untouched (#1096).
+    // card's own listener untouched.
     if (source.kind === 'card' && (e.metaKey || e.ctrlKey)) return;
     if (e.target.closest('button, input, select, textarea, a') && source.kind === 'card') return;
     // A session chip has its own click navigation. Do not let the card's
@@ -1520,7 +1520,7 @@ export function initBoard() {
     }
     // Escape's existing drawer precedence takes priority; only once there's
     // no drawer to close does it fall through to clearing a selection
-    // (#1096).
+
     clearSelection();
   });
 
@@ -2659,7 +2659,7 @@ export function initBoard() {
   }
 
   // ------------------------------------------------------------------
-  // Bulk actions (#1096) — fans out over the same per-card endpoints the
+  // Bulk actions — fans out over the same per-card endpoints the
   // drawer and tray already use. Every action collects one {card, ok,
   // reason} outcome per selected card (`fanOut`, above) and shows exactly
   // one summary toast — never a toast, and for Delete never a confirmation

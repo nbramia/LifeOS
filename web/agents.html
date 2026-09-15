@@ -1295,7 +1295,7 @@
   }
   .board-drop-status:empty { display: none; }
   .board-drop-status.error { color: var(--failed); }
-  /* Multi-select bulk bar (#1096) — same slot/sizing as .board-drop-tray
+  /* Multi-select bulk bar — same slot/sizing as .board-drop-tray
      (a sibling, toggled by board.js so exactly one of the two shows at a
      time), never both stacked. */
   .board-bulk-bar[hidden] { display: none; }
@@ -1828,7 +1828,7 @@
     <button type="button" class="board-drop-target board-done-drop" id="board-done-drop">Done</button>
     <span class="board-drop-status" id="board-drop-status" role="status" aria-live="polite"></span>
   </div>
-  <!-- Multi-select bulk action bar (#1096) — hidden until a card is
+  <!-- Multi-select bulk action bar — hidden until a card is
        selected; board.js hides board-drop-tray above while this shows. -->
   <div class="board-bulk-bar" id="board-bulk-bar" aria-label="Bulk actions" hidden>
     <span class="board-bulk-count" id="board-bulk-count"></span>

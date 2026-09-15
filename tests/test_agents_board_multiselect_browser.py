@@ -1,4 +1,4 @@
-"""Browser tests for the /agents board's multi-select and bulk action bar (#1096).
+"""Browser tests for the /agents board's multi-select and bulk action bar.
 
 Follows tests/test_agents_board_ui_browser.py's stub pattern: serves `web/`
 from an ephemeral port and stubs every `/api/` call the page makes, so the
