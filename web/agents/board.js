@@ -1247,6 +1247,12 @@ export function initBoard() {
         showToast('Only "me" can be assigned directly to In progress — the worker claims agent-assigned tasks itself.', true);
         return;
       }
+      // A tag typed into the picker's search field but never confirmed
+      // (no Enter, no option pick) must still reach the payload, the same
+      // way blur commits it in the drawer — flush it explicitly rather
+      // than rely on Create's click happening to blur the search field
+      // first.
+      if (composerTagPicker && composerTagPicker.commitPendingText) composerTagPicker.commitPendingText();
       // The picker itself already refuses any tag matching an assignee name
       // (normalizeEditableTag filters ASSIGNEES the same as the drawer's
       // picker does), so a chosen tag can never collide with the assignee's
@@ -1755,6 +1761,15 @@ export function initBoard() {
       // The composer reads the chosen tags back through this at submit
       // time instead of persisting through `config.persist`.
       getTags: () => confirmed.slice(),
+      // Commits whatever token is currently sitting in the search field but
+      // not yet confirmed as a chip — the same normalization/rejection
+      // `saveLegacyText` already applies on blur. The composer calls this
+      // explicitly right before `getTags()` so a typed-but-unconfirmed tag
+      // reaches the create payload the same way blur commits it in the
+      // drawer, without depending on a blur event actually having fired
+      // first (idempotent — a no-op if there's nothing pending, or if
+      // blur already committed it).
+      commitPendingText: () => saveLegacyText(),
     };
     if (persist) tagPickerHandle = handle;
     return handle;

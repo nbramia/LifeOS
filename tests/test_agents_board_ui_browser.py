@@ -3493,6 +3493,15 @@ class TestComposerTagsPicker:
         task_posts = []
         _open_board(page, agents_base_url, task_posts=task_posts)
         page.locator("#board-new-card").click()
+        # The composer's Tags picker is actually mounted, visible, and
+        # starts empty — a positive assertion that fails outright against a
+        # composer with no picker at all, not just against a broken payload.
+        picker = page.locator(".modal .drawer-tags-picker")
+        expect(picker).to_be_visible()
+        expect(page.locator(".modal .drawer-tags")).to_be_visible()
+        expect(page.locator(".modal .drawer-tags")).to_have_value("")
+        expect(page.locator(".modal .drawer-tag-chip")).to_have_count(0)
+
         page.locator("#new-card-desc").fill("Plain composer card")
         page.locator("#new-card-create").click()
         _wait_for(lambda: len(task_posts) == 1, page=page)
@@ -3516,6 +3525,38 @@ class TestComposerTagsPicker:
         _wait_for(lambda: len(task_posts) == 1, page=page)
         assert task_posts[0] == {"description": "Lifecycle tag rejected", "tags": ["foo"]}, task_posts
         assert not any("agent-running" in (p.get("tags") or []) for p in task_posts)
+
+    def test_pending_typed_tag_commits_on_create_without_a_blur_event(self, page: Page, agents_base_url):
+        """A tag typed into the search field but never confirmed — no
+        Enter, no option pick, and (via a JS-triggered click rather than a
+        real pointer click) no blur event either — must still reach the
+        create payload, exactly like a genuine mouse click on Create
+        (which does naturally blur the field first) already does. This
+        isolates the Create handler's own commit from incidentally relying
+        on that natural blur ordering."""
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Pending tag reaches payload")
+        page.locator(".drawer-tags").fill("synthetic-pending")
+        page.evaluate("document.getElementById('new-card-create').click()")
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {
+            "description": "Pending tag reaches payload", "tags": ["synthetic-pending"],
+        }, task_posts
+
+    def test_pending_lifecycle_text_is_rejected_on_create_without_a_blur_event(self, page: Page, agents_base_url):
+        """The same no-blur path as above, but for lifecycle-tag text —
+        the explicit flush must apply the same rejection `saveLegacyText`
+        already does on a real blur, not bypass it."""
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Pending lifecycle text rejected")
+        page.locator(".drawer-tags").fill("agent-running")
+        page.evaluate("document.getElementById('new-card-create').click()")
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Pending lifecycle text rejected"}, task_posts
 
 
 class TestDrawerClickOutsideClose:
