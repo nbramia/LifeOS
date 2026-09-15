@@ -1130,6 +1130,62 @@ class TestDrawerAssigneeRevert:
         assert lane_calls == [{"lane": "assigned", "assignee": "codex"}]
 
 
+class TestDrawerContextRemoved:
+    def test_no_context_field_in_task_drawer(self, page: Page, agents_base_url):
+        """The drawer renders no Context label or [data-field="context"]
+        input for a task card."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator('#board-drawer [data-field="context"]')).to_have_count(0)
+        expect(page.locator("#board-drawer")).not_to_contain_text("Context")
+
+    def test_assignee_picker_still_works(self, page: Page, agents_base_url):
+        """The Assignee picker renders and saves through the lane endpoint."""
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator('[data-card-id="t2"]').click()
+        assignee = page.locator(".drawer-assignee")
+        expect(assignee).to_be_visible()
+        expect(assignee).to_have_value("me")
+        assignee.select_option("codex")
+        _wait_for(lambda: lane_calls == [{"lane": "assigned", "assignee": "codex"}], page=page)
+
+    def test_drawer_edits_on_a_work_context_task_never_send_context(self, page: Page, agents_base_url):
+        """t2 is fixtured with context "Work". Editing its title, notes,
+        tags, and assignee from the drawer must never send a `context` key
+        in any PUT body — none of those controls are wired to it."""
+        task_puts = []
+        lane_calls = []
+        board_state = copy.deepcopy(_board_fixture())
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        page.locator('[data-card-id="t2"]').click()
+
+        title = page.locator(".drawer-title")
+        title.fill("Ship the release, revised")
+        notes = page.locator(".drawer-notes")
+        notes.click()  # blur title
+        _wait_for(lambda: any(p.get("description") == "Ship the release, revised" for p in task_puts), page=page)
+
+        notes.fill("Updated notes from the drawer")
+        tags = page.locator(".drawer-tags")
+        tags.click()  # blur notes
+        _wait_for(lambda: any(p.get("notes") == "Updated notes from the drawer" for p in task_puts), page=page)
+
+        tags.fill("shipping")
+        page.locator(".drawer-tag-option-create").click()
+        _wait_for(lambda: any("shipping" in (p.get("tags") or []) for p in task_puts), page=page)
+
+        assignee = page.locator(".drawer-assignee")
+        assignee.select_option("codex")
+        _wait_for(lambda: any(c.get("assignee") == "codex" for c in lane_calls), page=page)
+
+        assert task_puts, "expected at least one PUT /api/tasks/{id} call"
+        assert not any("context" in p for p in task_puts), task_puts
+        assert not any("context" in c for c in lane_calls), lane_calls
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        assert t2["context"] == "Work"
+
+
 class TestScheduledCardDrawer:
     def test_editing_title_message_and_enabled_all_save_through_scheduler_api(self, page: Page, agents_base_url):
         """Round-1 finding 4: the scheduled card's title, message, and
@@ -4605,7 +4661,7 @@ class TestDrawerMetadata:
         _open_board(page, agents_base_url)
         page.locator('[data-card-id="t2"]').click()
         expect(page.locator("#board-drawer .drawer-section")).to_have_count(4)
-        for field in ("title", "notes", "context", "tags", "actions", "session-panel"):
+        for field in ("title", "notes", "tags", "actions", "session-panel"):
             expect(page.locator(f'#board-drawer [data-field="{field}"]')).to_have_count(1)
         expect(page.locator("#board-drawer .drawer-assignee")).to_have_count(1)
 

@@ -67,7 +67,7 @@ const LIFECYCLE_TAGS = new Set([
 // Card fields the drawer renders as editable inputs — used to decide
 // whether an SSE tick needs to rebuild the drawer at all (#850 finding 2).
 const DRAWER_EDITABLE_FIELDS = [
-  'title', 'notes', 'tags', 'context', 'assignee', 'lane',
+  'title', 'notes', 'tags', 'assignee', 'lane',
   // The model/effort/host pickers write here. Without it a frame whose only
   // change is a picker value is read as "nothing changed", so a drawer
   // showing a stale picker has no later frame that can converge it.
@@ -723,10 +723,10 @@ export function initBoard() {
   // below) all land here. Relaxes EVERY shared filter that currently hides
   // the card (lanes, assignee, host, engine, tag, search, recency) through
   // one batched `setFilters` call, then confirms the card actually rendered
-  // before scrolling/highlighting — a board-local filter (context, include
-  // cancelled) is left as-is, the operator set those on purpose and they
-  // have no shared counterpart to relax. An unknown id is reported rather
-  // than left to fail silently.
+  // before scrolling/highlighting — the board-local "include cancelled"
+  // filter is left as-is, the operator set it on purpose and it has no
+  // shared counterpart to relax. An unknown id is reported rather than
+  // left to fail silently.
   function revealCard(cardId, opts) {
     const openDrawerFlag = !!(opts && opts.openDrawer);
     const card = findCard(cardId);
@@ -1814,19 +1814,13 @@ export function initBoard() {
       <div class="drawer-section">
       <label class="drawer-label">Notes</label>
       <textarea class="drawer-notes drawer-notes-autosize" data-field="notes" placeholder="Notes…">${escapeHtml(card.notes || '')}</textarea>
-      <div class="drawer-row">
-        <div>
-          <label class="drawer-label">Assignee</label>
-          <select class="drawer-assignee" data-field="assignee" ${assigneeDisabled ? 'disabled' : ''}>
-            <option value="">unassigned</option>
-            ${ASSIGNEES.map(a => `<option value="${a}" ${card.assignee === a ? 'selected' : ''}>${a}</option>`).join('')}
-          </select>
-          ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="assignee-reason">${escapeHtml(assigneePolicy.reason || "This card's assignee can't be changed right now.")}</div>` : ''}
-        </div>
-        <div>
-          <label class="drawer-label">Context</label>
-          <input class="drawer-context" data-field="context" value="${escapeHtml(card.context || '')}" />
-        </div>
+      <div>
+        <label class="drawer-label">Assignee</label>
+        <select class="drawer-assignee" data-field="assignee" ${assigneeDisabled ? 'disabled' : ''}>
+          <option value="">unassigned</option>
+          ${ASSIGNEES.map(a => `<option value="${a}" ${card.assignee === a ? 'selected' : ''}>${a}</option>`).join('')}
+        </select>
+        ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="assignee-reason">${escapeHtml(assigneePolicy.reason || "This card's assignee can't be changed right now.")}</div>` : ''}
       </div>
       <label class="drawer-label" id="drawer-tags-label-${escapeHtml(card.id)}">Tags</label>
       <div class="drawer-tags-picker" data-field="tags-picker" role="group" aria-labelledby="drawer-tags-label-${escapeHtml(card.id)}">
@@ -1996,14 +1990,6 @@ export function initBoard() {
         const fresh = findCard(card.id);
         assigneeEl.value = (fresh || card).assignee || '';
       }
-    });
-
-    const contextEl = drawerEl.querySelector('[data-field="context"]');
-    contextEl.addEventListener('blur', async () => {
-      const value = contextEl.value.trim();
-      if (!value || value === card.context) return;
-      try { await putTask(card.id, { context: value }); await fetchBoard(); }
-      catch (err) { showToast(`Couldn't save context: ${err.message}`, true); contextEl.value = card.context || ''; }
     });
 
     // The drawer's own Assignee select above is the one assignee writer —
