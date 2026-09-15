@@ -4144,6 +4144,11 @@ class TestSnoozeUndoAfterDrag:
 
         _wait_for(lambda: len(snooze_calls) == 1, page=page)
         assert snooze_calls[0]["body"]["until"] == "2099-01-01T00:00:00+00:00"
+        # Exactly one lane PUT ever happens (the original drag to Done) —
+        # the restore goes through undo-accept, never a second lane move
+        # (which would be a PUT of "unassigned"/"assigned"/etc., never
+        # "review" itself, since that's not a direct target either).
+        assert lane_calls == [{"lane": "done"}], lane_calls
         expect(page.locator(".toast.error")).to_have_count(0)
         expect(page.locator(".board-lane[data-lane='snoozed'] [data-card-id='t-snoozed-review']")).to_be_visible(timeout=5000)
 
