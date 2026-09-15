@@ -999,14 +999,12 @@ class TestResumeRowMountedOnce:
 
 # A CLI session (Focus/Resume) with a terminal status (Kill refused, but
 # Resume still shown) and a short, single-word label — the combination
-# that makes `.panel-header-actions` (the shared action row) wrap onto its
-# own line, full panel width, below `.panel-close`. With the action row at
-# full width, `.panel-header .meta` (the badge row right below it, a
-# `display:flex` block establishing its own block-formatting context) has
-# zero space left beside the float at its own top edge, so every badge
-# renders on its own line, at the panel's left edge, UNDER the floated
-# action row — `status` (the first badge once a terminal status hides the
-# live dot ahead of it) lands squarely on top of the Rename button.
+# needed to make `.panel-header-actions` (the shared action row) grow wide
+# enough, and wrap its own buttons onto enough internal lines, that its
+# resulting height reaches down into `.panel-header .meta`'s (the badge
+# row directly below it) own natural top position. `status` (the first
+# badge once a terminal status hides the live dot ahead of it) is the one
+# that lands on top of the Rename button when the fix regresses.
 _FULL_BADGE_SESSION = {
     "session_id": "cc:panel-actions-desktop", "source": "claude_code", "is_cli_session": True,
     "status": "completed", "status_inferred": False, "routing": "claude_code",
@@ -1039,12 +1037,13 @@ _FULL_BADGE_CARD = {
 }
 
 
-def _open_full_badge_graph_panel(page: Page, base_url: str, viewport_width: int, cancel_requests=None):
-    """`cancel_requests`, when given, collects every matched Cancel request
-    URL — Cancel has no visible UI change of its own to assert against, so
-    the test proves the click landed by capturing the request it fires
-    instead."""
-    card = json.loads(json.dumps(_FULL_BADGE_CARD))
+def _open_graph_panel_for(page: Page, base_url: str, viewport_width: int, card_fixture, cancel_requests=None):
+    """Opens the Graph tab's side panel for an arbitrary (session, card)
+    fixture — `card_fixture["session"]` is the linked session. `cancel_requests`,
+    when given, collects every matched Cancel request URL — Cancel has no
+    visible UI change of its own to assert against, so the test proves the
+    click landed by capturing the request it fires instead."""
+    card = json.loads(json.dumps(card_fixture))
     session = card["session"]
     snapshot_session = dict(session, lane=card["lane"], pending_question=session["pending_question"])
 
@@ -1087,6 +1086,12 @@ def _open_full_badge_graph_panel(page: Page, base_url: str, viewport_width: int,
     _click_graph_node(page, session["session_id"])
     page.wait_for_selector('#panel [data-field="actions"] [data-action]')
     return card, session
+
+
+def _open_full_badge_graph_panel(page: Page, base_url: str, viewport_width: int, cancel_requests=None):
+    return _open_graph_panel_for(
+        page, base_url, viewport_width, _FULL_BADGE_CARD, cancel_requests=cancel_requests,
+    )
 
 
 class TestGraphPanelActionsClickableAtDesktopWidth:
@@ -1150,7 +1155,7 @@ class TestGraphPanelActionsClickableAtDesktopWidth:
         rects = page.evaluate(
             """() => {
                 const buttons = [...document.querySelectorAll('#panel [data-field="actions"] button[data-action]')]
-                    .filter(b => !b.hidden)
+                    .filter(b => !b.hidden && b.getBoundingClientRect().width > 0)
                     .map(b => ({id: b.dataset.action, rect: b.getBoundingClientRect()}));
                 const badges = [...document.querySelectorAll(
                     '#panel [data-field="meta"] > *, #panel [data-field="panel-chips"] > *'
@@ -1165,3 +1170,133 @@ class TestGraphPanelActionsClickableAtDesktopWidth:
         for button in rects["buttons"]:
             for badge in rects["badges"]:
                 assert not overlaps(button["rect"], badge["rect"]), (button, badge)
+
+
+# ---------------------------------------------------------------------------
+# TestGraphPanelCloseButtonPinnedTopRight — `.panel-close` must stay in the
+# top-right corner of the header, on the same row as the FIRST line of the
+# action row, regardless of how many actions that row needs or how many
+# lines they wrap onto. Five session/card shapes below independently vary
+# the offered action count and the label length, so a regression that only
+# shows up once the action row needs enough lines to overflow (or once the
+# label itself wraps) can't hide behind a single fixture.
+# ---------------------------------------------------------------------------
+
+def _close_pos_session(session_id, **overrides):
+    base = {
+        "session_id": session_id, "source": "lifeos_agent", "status": "running",
+        "status_inferred": False, "routing": "local", "host": "", "branch": "",
+        "prompt_preview": "", "decoded_cwd": "", "total_dollars": 0.0,
+        "total_input_tokens": 0, "total_output_tokens": 0, "spawn_depth": 0,
+        "label": "Probe", "custom_label": None, "short_label": None,
+        "is_subagent": False, "parent_session_id": None, "pending_question": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def _close_pos_card(card_id, session, **overrides):
+    base = {
+        "kind": "task", "id": card_id, "title": "Probe card",
+        "notes": "", "status": "in_progress", "tags": [], "assignee": "local",
+        "fields": {}, "context": "Work", "updated_at": "2026-01-01T00:00:00+00:00",
+        "lane": "in_progress", "pending_question": session.get("pending_question"),
+        "policy": {}, "session": session,
+    }
+    base.update(overrides)
+    return base
+
+
+def _v_running_minimal():
+    """A plain, non-terminal, non-CLI session with no card-only actions
+    beyond Delete — offers Rename, Kill, Delete: a single, short action
+    row that already kept the close button correctly positioned before
+    this fix, kept here as the baseline every other variant is compared
+    against."""
+    session = _close_pos_session("sess-cp-running", label="Run")
+    return _close_pos_card("t-cp-running", session)
+
+
+def _v_review_completed():
+    """A terminal (Kill refused), Review-lane session — offers Rename,
+    Accept, Reject, Reassign, Delete."""
+    session = _close_pos_session("sess-cp-review", status="completed", label="Review probe")
+    return _close_pos_card("t-cp-review", session, lane="review", assignee="claude")
+
+
+def _v_blocked_answer():
+    """A non-terminal session with a pending question in the Human queue
+    lane — offers Rename, Kill, Answer, Delete (Mark Done is refused while
+    a question is pending)."""
+    pq = {"id": 9, "session_id": "sess-cp-blocked", "question": "Proceed?", "asked_at": 1700, "bot": None}
+    session = _close_pos_session("sess-cp-blocked", status="blocked", label="Blocked probe", pending_question=pq)
+    return _close_pos_card("t-cp-blocked", session, lane="human_queue", assignee=None, pending_question=pq)
+
+
+def _v_assigned_long_label_snooze():
+    """An Assigned-lane session with a cancel policy and a label long
+    enough to wrap the label itself, not just the action row — offers
+    Rename, Kill, Snooze, Cancel, Delete."""
+    session = _close_pos_session(
+        "sess-cp-assigned", status="idle",
+        label="A deliberately long synthetic session label meant to wrap "
+              "across several lines in the narrow side panel",
+    )
+    return _close_pos_card(
+        "t-cp-assigned", session, lane="assigned",
+        policy={"cancel": {"allowed": True, "reason": None}},
+    )
+
+
+def _v_cli_session():
+    """A CLI session (adds Go To/Resume, the latter with its own host
+    `<select>`) linked to an Assigned card offered to `codex` — offers
+    Open, Rename, Go To, Resume, Kill, Snooze, Delete: the widest action
+    row of the five variants."""
+    session = _close_pos_session(
+        "cc:cp-cli", source="claude_code", is_cli_session=True, status="inactive", label="CLI probe",
+    )
+    return _close_pos_card("t-cp-cli", session, lane="assigned", assignee="codex")
+
+
+_CLOSE_POS_VARIANTS = {
+    "running_minimal": _v_running_minimal,
+    "review_completed": _v_review_completed,
+    "blocked_answer": _v_blocked_answer,
+    "assigned_long_label_snooze": _v_assigned_long_label_snooze,
+    "cli_session": _v_cli_session,
+    "full_badge_set": lambda: _FULL_BADGE_CARD,
+}
+
+
+class TestGraphPanelCloseButtonPinnedTopRight:
+    @pytest.mark.parametrize("variant_name", list(_CLOSE_POS_VARIANTS))
+    @pytest.mark.parametrize("viewport_width", [1280, 1024, 390])
+    def test_close_button_shares_the_first_action_rows_top_and_sits_above_the_label(
+        self, page: Page, web_base_url, viewport_width, variant_name,
+    ):
+        card_fixture = _CLOSE_POS_VARIANTS[variant_name]()
+        _open_graph_panel_for(page, web_base_url, viewport_width, card_fixture)
+
+        rects = page.evaluate(
+            """() => {
+                const close = document.querySelector('#panel .panel-close').getBoundingClientRect();
+                const label = document.querySelector('#panel [data-field="label"]').getBoundingClientRect();
+                const buttons = [...document.querySelectorAll('#panel [data-field="actions"] button[data-action]')]
+                    .filter(b => !b.hidden && b.getBoundingClientRect().width > 0)
+                    .map(b => b.getBoundingClientRect());
+                return {close, label, buttons};
+            }"""
+        )
+
+        first_row_top = min(b["top"] for b in rects["buttons"])
+        assert abs(rects["close"]["top"] - first_row_top) <= 2, (
+            f"{variant_name} at {viewport_width}px: close button top "
+            f"{rects['close']['top']} isn't on the first action row's own "
+            f"top {first_row_top} — it dropped onto a later line"
+        )
+        assert rects["close"]["top"] < rects["label"]["top"], (
+            f"{variant_name} at {viewport_width}px: close button "
+            f"(top {rects['close']['top']}) isn't above the session label "
+            f"(top {rects['label']['top']})"
+        )
