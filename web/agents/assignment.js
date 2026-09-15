@@ -27,7 +27,10 @@
 // this directory.
 
 const ENGINES = ['claude', 'codex', 'local', 'hermes', 'cloud'];
-const EFFORTS = ['low', 'medium', 'high', 'max'];
+// Exported so web/agents/schedule_sections.js's execution-context group can
+// offer the same effort vocabulary for a schedule's `agent` action, which
+// stores it as a top-level schedule field rather than a task inline field.
+export const EFFORTS = ['low', 'medium', 'high', 'max'];
 
 // Engines whose executor actually reads a `model` field (claude_code_executor
 // / codex_executor's `--model` flag — see api/services/agent_worker/
@@ -57,7 +60,10 @@ function fieldValue(card, key) {
 // A fetch failure degrades to an empty catalog (the model picker still
 // renders, just with no options besides "let the engine choose").
 let _catalogPromise = null;
-function loadModelCatalog(fetchImpl = fetch) {
+// Exported so web/agents/schedule_sections.js can offer the same model
+// catalog for a schedule's `agent` action — reusing the option source
+// rather than fetching it a second way.
+export function loadModelCatalog(fetchImpl = fetch) {
   if (!_catalogPromise) {
     _catalogPromise = fetchImpl('/api/agents/models')
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
@@ -93,7 +99,10 @@ const _HOSTS_CLIENT_TTL_MS = 30_000;
 let _hostsConsecutiveFailures = 0;
 let _hostsCooldownUntil = 0;
 const _HOSTS_FAILURE_COOLDOWN_MS = 10_000;
-function loadHostCatalog(fetchImpl = fetch) {
+// Exported so web/agents/schedule_sections.js can offer the same host
+// catalog for a schedule's `agent` action, reusing this module's TTL/
+// cooldown behavior rather than a second fetch path.
+export function loadHostCatalog(fetchImpl = fetch) {
   const now = Date.now();
   if (_hostsCache && (now - _hostsCache.at) < _HOSTS_CLIENT_TTL_MS) {
     return _hostsCache.promise;

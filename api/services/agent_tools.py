@@ -2579,17 +2579,26 @@ def _tool_manage_reminders(inp: dict):
 
 def _schedule_create(inp: dict) -> str:
     from api.services.scheduler_store import get_scheduler_store
+    from api.services.scheduler_validation import (
+        validate_action_inputs,
+        ScheduleActionValidationError,
+    )
     store = get_scheduler_store()
     # `action` is the manage_schedules operation (create/list); the schedule's
     # own action is passed as `schedule_action`.
     action = inp.get("schedule_action") or "notify"
+    message_content = inp.get("message_content", "")
+    try:
+        validate_action_inputs(action, message_content, None)
+    except ScheduleActionValidationError as e:
+        return f"Error: {e.detail}"
     entry = store.create(
         name=inp["name"],
         schedule_type=inp["schedule_type"],
         schedule_value=inp["schedule_value"],
         action=action,
         message_type=inp.get("message_type", "static" if action == "notify" else action),
-        message_content=inp.get("message_content", ""),
+        message_content=message_content,
         executor=inp.get("executor", ""),
         bot=inp.get("bot", ""),
         timezone=inp.get("timezone", ""),
@@ -2621,6 +2630,10 @@ def _schedule_list(inp: dict) -> str:
 
 def _schedule_update(inp: dict) -> str:
     from api.services.scheduler_store import get_scheduler_store
+    from api.services.scheduler_validation import (
+        validate_action_inputs,
+        ScheduleActionValidationError,
+    )
     schedule_id = inp.get("schedule_id")
     if not schedule_id:
         return "Error: schedule_id is required for update (use action='list' to find it)."
@@ -2635,6 +2648,20 @@ def _schedule_update(inp: dict) -> str:
     if inp.get("schedule_action") is not None:
         fields["action"] = inp["schedule_action"]
     store = get_scheduler_store()
+    # Validate the entry's resulting shape once this patch is applied, but
+    # only when the patch actually touches a field the resulting action
+    # depends on — an unrelated update (e.g. `enabled`) must still succeed
+    # against a pre-existing entry, matching the HTTP route's own rule.
+    if "action" in fields or "message_content" in fields:
+        entry = store.get(schedule_id)
+        if entry is None:
+            return f"Error: No schedule found with id '{schedule_id}'."
+        resulting_action = fields.get("action", entry.action)
+        resulting_message = fields.get("message_content", entry.message_content)
+        try:
+            validate_action_inputs(resulting_action, resulting_message, entry.endpoint_config)
+        except ScheduleActionValidationError as e:
+            return f"Error: {e.detail}"
     entry = store.update(schedule_id, **fields)
     if entry is None:
         return f"Error: No schedule found with id '{schedule_id}'."

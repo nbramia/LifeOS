@@ -1533,7 +1533,7 @@
     margin: 0.6rem 0 0.25rem;
   }
   .drawer-notes, .drawer-tags, .drawer-assignee,
-  .drawer-schedule-value, .drawer-timezone, .drawer-select {
+  .drawer-schedule-value, .drawer-timezone, .drawer-select, .drawer-input {
     width: 100%;
     background: var(--bg-elev);
     color: var(--text-primary);
@@ -1544,6 +1544,12 @@
     font-size: 0.8rem;
   }
   .drawer-notes { min-height: 5rem; resize: vertical; }
+  /* The agent action's collapsed persona/model/effort/host/working-dir
+     group — collapsed by default so the common notify/prompt/endpoint
+     drawer stays short; the summary reuses .drawer-label's type
+     treatment rather than the browser's own disclosure-triangle default. */
+  .drawer-exec-context { margin-top: 0.6rem; }
+  .drawer-exec-context-summary { cursor: pointer; margin: 0.6rem 0 0.25rem; }
   .drawer-tags-picker {
     position: relative;
     width: 100%;

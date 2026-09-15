@@ -21,6 +21,7 @@ import { renderActionRow } from './session_actions.js';
 import { descendantsOf } from './graph_encoding.js';
 import { acceptCard, cardActionHandlers, cancelCard, deleteCard, openDeleteCardModal } from './card_actions.js';
 import { renderAssignmentPickers } from './assignment.js';
+import { SCHEDULE_ACTIONS, renderScheduleActionSections } from './schedule_sections.js';
 import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
 import { POINTER_SLOP, pointerIsActive, shouldCancelPointerGesture } from './board_gesture.js';
@@ -77,14 +78,10 @@ const DRAWER_EDITABLE_FIELDS = [
   // Full schedule editing — trigger type, timing, timezone, action,
   // executor, and delivery bot — all through PUT /api/scheduler/{id}.
   'schedule_type', 'schedule_value', 'timezone', 'action', 'executor', 'bot',
+  // Per-action inputs — an endpoint action's call config and an
+  // agent action's execution context, all through the same PUT.
+  'endpoint_config', 'persona_id', 'model_id', 'effort', 'host', 'working_dir',
 ];
-
-// Action a schedule fires when it's due. Mirrors VALID_ACTIONS in
-// api/services/scheduler_store.py.
-const SCHEDULE_ACTIONS = ['notify', 'prompt', 'endpoint', 'agent'];
-// Executor tags a schedule's `agent` action hands off to the agent worker
-// with. Mirrors the executor values accepted by api/routes/scheduler.py.
-const SCHEDULE_EXECUTORS = ['local', 'cloud', 'cloud-haiku', 'cloud-sonnet'];
 
 // Lane filter — multi-select checkbox dropdown. Hidden lanes are
 // removed from the grid entirely (not just emptied), so the remaining
@@ -778,6 +775,26 @@ export function initBoard() {
     return div;
   }
 
+  // The action chip summarizes what firing this schedule actually does —
+  // an endpoint's method and path (path truncated at 40 characters with
+  // the full path kept as the chip's title, so a long route is still
+  // fully available on hover) or an agent action's executor (falling back
+  // to "default" for the empty-executor "agent worker's own default
+  // route" case, matching the drawer's own Executor select label).
+  function scheduleActionChipText(card) {
+    if (card.action === 'endpoint') {
+      const cfg = card.endpoint_config || {};
+      const method = String(cfg.method || 'GET').toUpperCase();
+      const path = cfg.endpoint || '';
+      const truncated = path.length > 40 ? `${path.slice(0, 40)}…` : path;
+      return { text: `endpoint: ${method} ${truncated}`, title: path };
+    }
+    if (card.action === 'agent') {
+      return { text: `agent: ${card.executor || 'default'}`, title: '' };
+    }
+    return { text: card.action || 'notify', title: '' };
+  }
+
   function renderScheduleCard(card) {
     const div = document.createElement('div');
     div.className = 'board-card board-card-schedule';
@@ -785,9 +802,11 @@ export function initBoard() {
     div.dataset.lane = card.lane;
     if (card.id === revealedCardId) div.classList.add('reveal-highlight');
     const nextFire = card.next_fire_at ? new Date(card.next_fire_at).toLocaleString() : '—';
+    const actionChip = scheduleActionChipText(card);
     div.innerHTML = `
       <div class="board-card-title">${escapeHtml(card.name || '(schedule)')}</div>
       <div class="board-card-chips">
+        <span class="board-chip" title="${escapeHtml(actionChip.title)}">${escapeHtml(actionChip.text)}</span>
         ${card.recurring ? '<span class="board-chip">recurring</span>' : '<span class="board-chip">one-off</span>'}
         <span class="board-chip">next: ${escapeHtml(nextFire)}</span>
       </div>
@@ -1572,21 +1591,6 @@ export function initBoard() {
     return r.json();
   }
 
-  // Bot-registry cache backing the schedule drawer's Bot select — mirrors
-  // assignment.js's loadHostCatalog in NOT caching a failure (so the next
-  // drawer open retries), but without its reachability TTL/cooldown: the
-  // bot registry doesn't drift minute to minute the way host online/offline
-  // status does, so a plain once-per-page-load cache on success is enough.
-  let _botsCatalogPromise = null;
-  function loadBotCatalog(fetchImpl = fetch) {
-    if (_botsCatalogPromise) return _botsCatalogPromise;
-    const promise = fetchImpl('/api/scheduler/bots')
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .catch(() => { _botsCatalogPromise = null; return null; });
-    _botsCatalogPromise = promise;
-    return promise;
-  }
-
   function formatNextFire(iso) {
     if (!iso) return 'Not scheduled to fire again.';
     const d = new Date(iso);
@@ -1984,8 +1988,6 @@ export function initBoard() {
       </div>
       <div class="drawer-section"><div class="drawer-session" data-field="session-panel"></div></div>
       ` : `
-      <label class="drawer-label">Message</label>
-      <textarea class="drawer-notes" data-field="message-content" placeholder="Message…">${escapeHtml(card.message_content || '')}</textarea>
       <label class="drawer-label"><input type="checkbox" data-field="enabled" ${card.enabled ? 'checked' : ''} /> Enabled</label>
       <div class="drawer-row">
         <div>
@@ -2004,28 +2006,12 @@ export function initBoard() {
       <label class="drawer-label">Timezone</label>
       <input class="drawer-timezone" data-field="timezone" value="${escapeHtml(card.timezone || '')}" placeholder="e.g. America/New_York" />
       <div class="drawer-field-error" data-field="timezone-error" hidden></div>
-      <div class="drawer-row">
-        <div>
-          <label class="drawer-label">Action</label>
-          <select class="drawer-select" data-field="action">
-            ${SCHEDULE_ACTIONS.map(a => `<option value="${a}" ${card.action === a ? 'selected' : ''}>${a}</option>`).join('')}
-          </select>
-        </div>
-        <div>
-          <div data-row="executor" ${card.action === 'agent' ? '' : 'hidden'}>
-            <label class="drawer-label">Executor</label>
-            <select class="drawer-select" data-field="executor">
-              <option value="" ${!card.executor ? 'selected' : ''}>default route</option>
-              ${SCHEDULE_EXECUTORS.map(e => `<option value="${e}" ${card.executor === e ? 'selected' : ''}>${e}</option>`).join('')}
-            </select>
-          </div>
-          <div data-row="bot" ${card.action === 'agent' ? 'hidden' : ''}>
-            <label class="drawer-label">Bot</label>
-            <select class="drawer-select" data-field="bot" disabled></select>
-            <div class="drawer-field-reason" data-field="bot-reason" hidden></div>
-          </div>
-        </div>
-      </div>
+      <label class="drawer-label">Action</label>
+      <select class="drawer-select" data-field="action">
+        ${SCHEDULE_ACTIONS.map(a => `<option value="${a}" ${card.action === a ? 'selected' : ''}>${a}</option>`).join('')}
+      </select>
+      <div class="drawer-field-error" data-field="action-error" hidden></div>
+      <div class="drawer-section" data-field="action-sections"></div>
       <div class="drawer-schedule-info" data-field="next-fire-preview"></div>
       <div class="drawer-schedule-info" data-field="last-run-info"></div>
       <div class="drawer-actions" data-field="schedule-actions">
@@ -2193,21 +2179,293 @@ export function initBoard() {
   // scheduler API, never the vault file directly — on blur for text
   // inputs and on change for selects/the checkbox, refetching the board on
   // a successful save. A rejected save shows the server's `detail` inline
-  // next to the offending field (schedule value, timezone) or as a toast
-  // (every other field), and snaps the control back to the last value the
-  // server actually accepted. The schedule type select is the one
-  // exception: changing it only updates the value field's label and
+  // next to the offending field (schedule value, timezone, action) or as a
+  // toast (every other field), and snaps the control back to the last
+  // value the server actually accepted. The schedule type select is the
+  // one exception: changing it only updates the value field's label and
   // placeholder locally — it saves together with the schedule value, on
   // the value field's own blur, so a type and a value that doesn't parse
   // under it can never reach the server in the same write (see below).
-  function renderScheduleDrawerFields(card) {
-    const msgEl = drawerEl.querySelector('[data-field="message-content"]');
-    msgEl.addEventListener('blur', async () => {
-      const value = msgEl.value;
-      if (value === (card.message_content || '')) return;
-      try { await putSchedule(card.id, { message_content: value }); await fetchBoard(); }
-      catch (err) { showToast(`Couldn't save message: ${err.message}`, true); msgEl.value = card.message_content || ''; }
+  // The action select is the other exception: switching to an action whose
+  // section doesn't yet have what it needs to fire (see
+  // `actionInputsSatisfied`) holds the switch locally instead of saving it
+  // alone, and a rejected save carrying it leaves the select and its
+  // section showing the operator's own entry rather than reverting them
+  // (see `pendingAction` below).
+  // Normalizes an `endpoint_config` (or its absence) into a comparable
+  // key, for skipping a redundant save when the endpoint fields are
+  // blurred/changed without actually being edited — the same "no-op if
+  // unchanged" rule every other schedule field below follows.
+  // Mirrors readEndpointConfig()'s own shape (schedule_sections.js):
+  // method upper-cased, endpoint defaulted to "", absent params as `null`.
+  function endpointConfigKey(cfg) {
+    const c = cfg || {};
+    return JSON.stringify({
+      method: String(c.method || 'GET').toUpperCase(),
+      endpoint: c.endpoint || '',
+      params: c.params === undefined ? null : c.params,
     });
+  }
+
+  // Mirrors the server's per-action requirement (api/services/scheduler_validation.py's
+  // `validate_action_inputs`): an `endpoint` action needs a GET/POST method,
+  // a path starting with `/api/`, and params that are either absent or a
+  // JSON object; notify/prompt/agent need a non-blank message. Used by the
+  // Action select's change handler below to decide whether a target action
+  // can be saved on its own or must wait for its section's own input.
+  function actionInputsSatisfied(action, values) {
+    if (action === 'endpoint') {
+      const cfg = values.endpoint_config || {};
+      const method = String(cfg.method || '').toUpperCase();
+      if (method !== 'GET' && method !== 'POST') return false;
+      const path = cfg.endpoint;
+      if (typeof path !== 'string' || !path.startsWith('/api/')) return false;
+      const params = cfg.params;
+      if (params !== undefined && params !== null && (typeof params !== 'object' || Array.isArray(params))) return false;
+      return true;
+    }
+    if (action === 'notify' || action === 'prompt' || action === 'agent') {
+      return !!(values.message_content || '').trim();
+    }
+    return true;
+  }
+
+  function renderScheduleDrawerFields(card) {
+    const actionSectionsEl = drawerEl.querySelector('[data-field="action-sections"]');
+    const sectionValues = {
+      message_content: card.message_content || '',
+      endpoint_config: card.endpoint_config || null,
+      executor: card.executor || '',
+      bot: card.bot || '',
+      persona_id: card.persona_id || '',
+      model_id: card.model_id || '',
+      effort: card.effort || '',
+      host: card.host || '',
+      working_dir: card.working_dir || '',
+    };
+    const sections = renderScheduleActionSections(actionSectionsEl, card.action, sectionValues);
+
+    // What the server last actually accepted for each per-action field —
+    // a rejected save reverts its control to these, mirroring every other
+    // schedule field's own lastSaved* tracking below.
+    let lastSavedMessage = sectionValues.message_content;
+    let lastSavedBot = sectionValues.bot;
+    let lastSavedSectionExecutor = sectionValues.executor;
+    let lastSavedEndpointConfig = sectionValues.endpoint_config;
+    let lastSavedEndpointConfigKey = endpointConfigKey(lastSavedEndpointConfig);
+    let lastSavedPersonaId = sectionValues.persona_id;
+    let lastSavedModelId = sectionValues.model_id;
+    let lastSavedEffort = sectionValues.effort;
+    let lastSavedHost = sectionValues.host;
+    let lastSavedWorkingDir = sectionValues.working_dir;
+
+    // (Re)wires save-on-blur/change for whichever fields the current
+    // action's section actually rendered — called once after the initial
+    // render and again after every `sections.setAction()` rebuild, since
+    // a rebuild replaces the DOM elements the previous wiring pass
+    // attached to.
+    function wireActionSectionFields() {
+      const els = sections.elements;
+
+      if (els.message) {
+        els.message.addEventListener('blur', async () => {
+          const value = els.message.value;
+          if (value === (lastSavedMessage || '')) return;
+          // A pending action switch (set by the Action select's own
+          // change handler below, when the target action's section
+          // didn't yet satisfy the server's requirement) rides along in
+          // this same PUT — the server sees one write with both fields,
+          // never an action alone with nothing to back it.
+          const savingAction = pendingAction;
+          const patch = { message_content: value };
+          if (savingAction) patch.action = savingAction;
+          try {
+            await putSchedule(card.id, patch);
+            lastSavedMessage = value;
+            // `sectionValues` is the same object `sections` reads from —
+            // updating it here keeps a later `setAction()` (switching away
+            // and back to this action mid-session) rendering this saved
+            // value instead of the stale one the drawer opened with.
+            sectionValues.message_content = value;
+            if (savingAction) {
+              lastSavedAction = savingAction;
+              pendingAction = null;
+              clearActionError();
+            }
+            await fetchBoard();
+          } catch (err) {
+            if (savingAction) {
+              // The action switch is still pending — leave the select and
+              // this field exactly as the operator left them so they can
+              // fix and retry, rather than reverting content they just
+              // typed.
+              showActionError(err.message);
+            } else {
+              showToast(`Couldn't save message: ${err.message}`, true);
+              els.message.value = lastSavedMessage || '';
+            }
+          }
+        });
+      }
+
+      if (els.bot) {
+        els.bot.addEventListener('change', async () => {
+          try {
+            await putSchedule(card.id, { bot: els.bot.value });
+            lastSavedBot = els.bot.value;
+            sectionValues.bot = lastSavedBot;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save bot: ${err.message}`, true);
+            els.bot.value = lastSavedBot;
+          }
+        });
+      }
+
+      if (els.executor) {
+        els.executor.addEventListener('change', async () => {
+          try {
+            await putSchedule(card.id, { executor: els.executor.value });
+            lastSavedSectionExecutor = els.executor.value;
+            sectionValues.executor = lastSavedSectionExecutor;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save executor: ${err.message}`, true);
+            els.executor.value = lastSavedSectionExecutor;
+          }
+        });
+      }
+
+      if (els.method && els.path && els.params) {
+        const saveEndpointConfig = async () => {
+          const cfg = sections.readEndpointConfig();
+          if (cfg === null) return; // invalid JSON/non-object params — error already shown, nothing sent
+          const key = endpointConfigKey(cfg);
+          if (key === lastSavedEndpointConfigKey) return;
+          // See the message handler above: a pending action switch rides
+          // along in this same PUT once these fields actually satisfy the
+          // target action's requirement. Until then (e.g. the method is
+          // picked before a path is entered), hold the edit locally same
+          // as the switch itself, rather than sending a combined PUT the
+          // server would reject for a field the operator hasn't finished.
+          const savingAction = pendingAction;
+          if (savingAction && !actionInputsSatisfied(savingAction, { endpoint_config: cfg })) return;
+          const patch = { endpoint_config: cfg };
+          if (savingAction) patch.action = savingAction;
+          try {
+            await putSchedule(card.id, patch);
+            lastSavedEndpointConfig = cfg;
+            lastSavedEndpointConfigKey = key;
+            sectionValues.endpoint_config = cfg;
+            sections.clearParamsError();
+            if (savingAction) {
+              lastSavedAction = savingAction;
+              pendingAction = null;
+              clearActionError();
+            }
+            await fetchBoard();
+          } catch (err) {
+            if (savingAction) {
+              // Leave the method/path/params fields exactly as entered —
+              // the action switch is still pending, and reverting them
+              // would discard the operator's own fix along with the
+              // rejection.
+              showActionError(err.message);
+            } else {
+              sections.showParamsError(err.message);
+              els.method.value = String((lastSavedEndpointConfig && lastSavedEndpointConfig.method) || 'GET').toUpperCase();
+              els.path.value = (lastSavedEndpointConfig && lastSavedEndpointConfig.endpoint) || '';
+              els.params.value = lastSavedEndpointConfig && lastSavedEndpointConfig.params !== undefined
+                ? JSON.stringify(lastSavedEndpointConfig.params, null, 2) : '';
+            }
+          }
+        };
+        els.method.addEventListener('change', saveEndpointConfig);
+        els.path.addEventListener('blur', saveEndpointConfig);
+        els.params.addEventListener('blur', saveEndpointConfig);
+      }
+
+      if (els.personaId) {
+        els.personaId.addEventListener('blur', async () => {
+          const value = els.personaId.value.trim();
+          if (value === lastSavedPersonaId) return;
+          try {
+            await putSchedule(card.id, { persona_id: value });
+            lastSavedPersonaId = value;
+            sectionValues.persona_id = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save persona: ${err.message}`, true);
+            els.personaId.value = lastSavedPersonaId;
+          }
+        });
+      }
+
+      if (els.modelId) {
+        els.modelId.addEventListener('change', async () => {
+          const value = els.modelId.value;
+          if (value === lastSavedModelId) return;
+          try {
+            await putSchedule(card.id, { model_id: value });
+            lastSavedModelId = value;
+            sectionValues.model_id = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save model: ${err.message}`, true);
+            els.modelId.value = lastSavedModelId;
+          }
+        });
+      }
+
+      if (els.effort) {
+        els.effort.addEventListener('change', async () => {
+          const value = els.effort.value;
+          if (value === lastSavedEffort) return;
+          try {
+            await putSchedule(card.id, { effort: value });
+            lastSavedEffort = value;
+            sectionValues.effort = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save effort: ${err.message}`, true);
+            els.effort.value = lastSavedEffort;
+          }
+        });
+      }
+
+      if (els.host) {
+        els.host.addEventListener('change', async () => {
+          const value = els.host.value;
+          if (value === lastSavedHost) return;
+          try {
+            await putSchedule(card.id, { host: value });
+            lastSavedHost = value;
+            sectionValues.host = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save host: ${err.message}`, true);
+            els.host.value = lastSavedHost;
+          }
+        });
+      }
+
+      if (els.workingDir) {
+        els.workingDir.addEventListener('blur', async () => {
+          const value = els.workingDir.value.trim();
+          if (value === lastSavedWorkingDir) return;
+          try {
+            await putSchedule(card.id, { working_dir: value });
+            lastSavedWorkingDir = value;
+            sectionValues.working_dir = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save working directory: ${err.message}`, true);
+            els.workingDir.value = lastSavedWorkingDir;
+          }
+        });
+      }
+    }
+    wireActionSectionFields();
 
     const enabledEl = drawerEl.querySelector('[data-field="enabled"]');
     enabledEl.addEventListener('change', async () => {
@@ -2231,11 +2489,7 @@ export function initBoard() {
     const tzEl = drawerEl.querySelector('[data-field="timezone"]');
     const tzErrorEl = drawerEl.querySelector('[data-field="timezone-error"]');
     const actionEl = drawerEl.querySelector('[data-field="action"]');
-    const executorRow = drawerEl.querySelector('[data-row="executor"]');
-    const executorEl = drawerEl.querySelector('[data-field="executor"]');
-    const botRow = drawerEl.querySelector('[data-row="bot"]');
-    const botEl = drawerEl.querySelector('[data-field="bot"]');
-    const botReasonEl = drawerEl.querySelector('[data-field="bot-reason"]');
+    const actionErrorEl = drawerEl.querySelector('[data-field="action-error"]');
     const previewEl = drawerEl.querySelector('[data-field="next-fire-preview"]');
     const lastRunEl = drawerEl.querySelector('[data-field="last-run-info"]');
     const triggerBtnEl = drawerEl.querySelector('[data-action="trigger-now"]');
@@ -2251,8 +2505,22 @@ export function initBoard() {
     let lastSavedValue = card.schedule_value;
     let lastSavedTz = card.timezone || '';
     let lastSavedAction = card.action;
-    let lastSavedExecutor = card.executor || '';
-    let lastSavedBot = card.bot || '';
+    // An action selected in the drawer but not yet included in a
+    // successful PUT — set when the target action's own section doesn't
+    // yet have what it needs to fire (see `actionInputsSatisfied`), and
+    // cleared once a save carrying it succeeds. Never persisted anywhere
+    // else, so closing and reopening the drawer (a fresh `renderDrawer`
+    // from the card's actual stored action) discards it.
+    let pendingAction = null;
+
+    function showActionError(message) {
+      actionErrorEl.textContent = message;
+      actionErrorEl.hidden = false;
+    }
+    function clearActionError() {
+      actionErrorEl.hidden = true;
+      actionErrorEl.textContent = '';
+    }
 
     function updateValueLabel(type) {
       if (type === 'once') {
@@ -2262,12 +2530,6 @@ export function initBoard() {
         valueLabelEl.textContent = 'Cron expression';
         valueEl.placeholder = '0 9 * * *';
       }
-    }
-
-    function setActionVisibility(action) {
-      const isAgent = action === 'agent';
-      executorRow.hidden = !isAgent;
-      botRow.hidden = isAgent;
     }
 
     typeEl.addEventListener('change', () => {
@@ -2328,82 +2590,35 @@ export function initBoard() {
     });
 
     actionEl.addEventListener('change', async () => {
-      // Show/hide the executor and bot controls immediately — no need to
-      // wait for the save (or reopen the drawer) to see the right one.
-      setActionVisibility(actionEl.value);
-      try {
-        await putSchedule(card.id, { action: actionEl.value });
-        lastSavedAction = actionEl.value;
-        await fetchBoard();
-      } catch (err) {
-        showToast(`Couldn't save action: ${err.message}`, true);
-        actionEl.value = lastSavedAction;
-        setActionVisibility(lastSavedAction);
-      }
-    });
-
-    executorEl.addEventListener('change', async () => {
-      try {
-        await putSchedule(card.id, { executor: executorEl.value });
-        lastSavedExecutor = executorEl.value;
-        await fetchBoard();
-      } catch (err) {
-        showToast(`Couldn't save executor: ${err.message}`, true);
-        executorEl.value = lastSavedExecutor;
-      }
-    });
-
-    botEl.addEventListener('change', async () => {
-      try {
-        await putSchedule(card.id, { bot: botEl.value });
-        lastSavedBot = botEl.value;
-        await fetchBoard();
-      } catch (err) {
-        showToast(`Couldn't save bot: ${err.message}`, true);
-        botEl.value = lastSavedBot;
-      }
-    });
-
-    // When the registry loads, the bot select offers only names the API
-    // accepts — the empty "default (primary)" option (distinguishable from
-    // the registry's own "primary" row) plus whatever GET
-    // /api/scheduler/bots returns. A stored name the loaded registry
-    // doesn't include (a bot renamed after the schedule was written) is
-    // appended as a selected, flagged-unknown option instead of leaving
-    // the select with no matching value. When the fetch itself fails, the
-    // stored name isn't known to be invalid — just unconfirmed — so it's
-    // kept visible and selected without that flag, and the select is
-    // disabled with the reason shown as visible text next to it,
-    // mirroring the host dropdown's pattern
-    // (web/agents/assignment.js's seedHostOptions/populateHostOptions).
-    loadBotCatalog().then(catalog => {
-      const stored = card.bot || '';
-      if (!catalog) {
-        const optionsHtml = ['<option value="">default (primary)</option>'];
-        if (stored) {
-          optionsHtml.push(`<option value="${escapeHtml(stored)}" selected>${escapeHtml(stored)}</option>`);
-        }
-        botEl.innerHTML = optionsHtml.join('');
-        botEl.value = stored;
-        botEl.disabled = true;
-        botReasonEl.textContent = 'bot registry unavailable — reopen to retry';
-        botReasonEl.hidden = false;
+      // Switch the visible section immediately, ahead of any save, then
+      // re-wire the freshly rendered fields' own save-on-blur/change
+      // handlers, since the section rebuild replaced their DOM elements.
+      const target = actionEl.value;
+      sections.setAction(target);
+      wireActionSectionFields();
+      clearActionError();
+      if (!actionInputsSatisfied(target, sectionValues)) {
+        // The target action's section doesn't have what it needs to fire
+        // yet (e.g. endpoint with no method/path, or notify/prompt/agent
+        // with a blank message) — hold the switch locally instead of
+        // writing an action the server would reject anyway. The section's
+        // own save-on-blur/change handler above sends `action` together
+        // with whatever value satisfies it, in one PUT.
+        pendingAction = target;
         return;
       }
-      const names = catalog.bots || [];
-      const known = names.includes(stored);
-      const options = ['<option value="">default (primary)</option>'];
-      for (const name of names) {
-        options.push(`<option value="${escapeHtml(name)}" ${stored === name ? 'selected' : ''}>${escapeHtml(name)}</option>`);
+      pendingAction = null;
+      try {
+        await putSchedule(card.id, { action: target });
+        lastSavedAction = target;
+        await fetchBoard();
+      } catch (err) {
+        // Leave the select and its freshly rendered section showing the
+        // operator's own choice — the stored action is unchanged, and a
+        // later edit to the section's own field retries the switch.
+        pendingAction = target;
+        showActionError(err.message);
       }
-      if (stored && !known) {
-        options.push(`<option value="${escapeHtml(stored)}" selected data-unknown="true">${escapeHtml(stored)} (unknown)</option>`);
-      }
-      botEl.innerHTML = options.join('');
-      botEl.value = stored;
-      botEl.disabled = false;
-      botReasonEl.hidden = true;
-      botReasonEl.textContent = '';
     });
 
     drawerEl.querySelector('[data-action="trigger-now"]').addEventListener('click', async () => {

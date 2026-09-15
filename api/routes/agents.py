@@ -1121,6 +1121,15 @@ def _schedule_card(entry) -> dict[str, Any]:
         "action": entry.action,
         "executor": entry.executor,
         "bot": entry.bot,
+        # Per-action inputs — an endpoint action's call config and
+        # an agent action's execution context, so the drawer can render
+        # and edit them without a second fetch.
+        "endpoint_config": entry.endpoint_config,
+        "persona_id": entry.persona_id,
+        "model_id": entry.model_id,
+        "effort": entry.effort,
+        "host": entry.host,
+        "working_dir": entry.working_dir,
     }
 
 
