@@ -150,8 +150,6 @@ export function initBoard() {
   let panel = null;  // SessionPanel for the drawer's linked-session transcript
   let assignmentHandle = null;  // renderAssignmentPickers()'s return value for the open drawer, or null
   let tagPickerHandle = null;
-  let selectedAssignee = null;
-  let quickActionCardId = null;
 
   // A card snapshot older than an in-flight picker save re-seeds the
   // model/effort/host pickers with the pre-save value on remount -- a
@@ -437,10 +435,9 @@ export function initBoard() {
     if (recencyRaw != null && recencyRaw !== 'all') {
       const recencySec = Number(recencyRaw);
       const stamp = card.kind === 'schedule' ? card.next_fire_at : card.updated_at;
-      if (stamp) {
-        const ageSec = (Date.now() - new Date(stamp).getTime()) / 1000;
-        if (ageSec > recencySec) return false;
-      }
+      if (!stamp) return false;
+      const ageSec = (Date.now() - new Date(stamp).getTime()) / 1000;
+      if (ageSec > recencySec) return false;
     }
 
     // Only cancelled task cards are behind this filter — the Done lane
@@ -476,13 +473,11 @@ export function initBoard() {
     return { allowed: true, reason: '' };
   }
 
-  // Every way to assign a card — tapping an assignee then a card, dragging
-  // an assignee onto a card, dragging a card onto an assignee — lands here,
-  // so none of them can clear the tray selection, report, or offer undo
-  // differently from the others.
+  // Every way to assign a card — dragging an assignee onto a card, or
+  // dragging a card onto an assignee — lands here, so neither path can
+  // report or offer undo differently from the other.
   function assignCardTo(card, assignee) {
     if (!card || card.kind !== 'task') return;
-    clearAssigneeSelection();
     const reason = assignmentPolicyReason(card);
     if (reason) {
       setDropStatus(reason, true);
@@ -509,28 +504,23 @@ export function initBoard() {
       .catch(() => setDropStatus('Assignment refused.', true));
   }
 
-  function assignSelectedAssignee(card) {
-    if (!selectedAssignee || !card || card.kind !== 'task') return false;
-    assignCardTo(card, selectedAssignee);
-    return true;
-  }
-
   function assignAssigneeToCard(cardId, assignee) {
     assignCardTo(findCard(cardId), assignee);
   }
 
-  function clearAssigneeSelection() {
-    if (!selectedAssignee) return;
-    selectedAssignee = null;
-    renderAssigneeDrops();
-  }
-
+  // The tray buttons mirror `#board-filter-assignee` (same shared
+  // `assignee` filter, same value set) — clicking one filters the board to
+  // that assignee, clicking it again clears the filter back to `all`.
+  // `syncSharedFilterControls` re-renders this whenever the shared filter
+  // changes from any origin (the dropdown, Clear filters, a graph-tab
+  // change), so the tray and dropdown always agree on the selection.
   function renderAssigneeDrops() {
     if (!assigneeDropsEl) return;
+    const current = getFilters().assignee;
     assigneeDropsEl.innerHTML = ASSIGNEES.map(assignee => `
-      <button type="button" class="board-drop-target board-assignee-drop${selectedAssignee === assignee ? ' selected' : ''}"
-              data-assignee="${assignee}" aria-pressed="${selectedAssignee === assignee}"
-              aria-label="Assign selected card to ${assignee}">
+      <button type="button" class="board-drop-target board-assignee-drop${current === assignee ? ' selected' : ''}"
+              data-assignee="${assignee}" aria-pressed="${current === assignee}"
+              aria-label="Filter board to ${assignee}">
         ${assignee}
       </button>
     `).join('');
@@ -539,11 +529,8 @@ export function initBoard() {
         if (consumeClickSuppression('tray', `assignee:${button.dataset.assignee}`)) {
           return;
         }
-        selectedAssignee = selectedAssignee === button.dataset.assignee ? null : button.dataset.assignee;
-        renderAssigneeDrops();
-        setDropStatus(selectedAssignee
-          ? `Tap a card to assign it to ${selectedAssignee}, or drag this button onto a card.`
-          : '');
+        const clicked = button.dataset.assignee;
+        setFilter('assignee', getFilters().assignee === clicked ? 'all' : clicked);
       });
       button.addEventListener('pointerdown', e => onPointerDown(e, {
         kind: 'assignee', assignee: button.dataset.assignee, sourceEl: button,
@@ -551,12 +538,20 @@ export function initBoard() {
     });
   }
 
+  // The button stays visible in both states — clicking it toggles the Done
+  // lane's visibility (the same `lanes` filter the lane multi-select
+  // writes), so it needs to convey which state is active rather than
+  // disappear in one of them. Dropping a card on it is a separate path
+  // (`onDragMove`/`onCardDropped`) that keeps working regardless of this
+  // toggle state.
   function updateQuickDropTargets() {
     if (!doneDropEl) return;
-    const hidden = !visibleLanes.has('done');
-    doneDropEl.hidden = !hidden;
-    doneDropEl.setAttribute('aria-label', hidden
-      ? 'Drop a card here to move it to Done' : 'Done lane is visible');
+    const laneVisible = visibleLanes.has('done');
+    doneDropEl.classList.toggle('active', laneVisible);
+    doneDropEl.setAttribute('aria-pressed', String(laneVisible));
+    doneDropEl.setAttribute('aria-label', laneVisible
+      ? 'Done lane shown — click to hide it, or drop a card here to move it to Done'
+      : 'Done lane hidden — click to show it, or drop a card here to move it to Done');
   }
 
   // ------------------------------------------------------------------
@@ -628,14 +623,11 @@ export function initBoard() {
     `;
     div.addEventListener('click', () => {
       if (consumeClickSuppression('card', card.id)) return;
-      if (assignSelectedAssignee(card)) return;
       openDrawer(card.id);
     });
-    div.addEventListener('focus', () => { quickActionCardId = card.id; });
     div.addEventListener('keydown', e => {
       if (e.target !== div || (e.key !== 'Enter' && e.key !== ' ')) return;
       e.preventDefault();
-      if (assignSelectedAssignee(card)) return;
       openDrawer(card.id);
     });
     const sessionChip = div.querySelector('.board-chip-session');
@@ -768,7 +760,7 @@ export function initBoard() {
     }
     if (shared.recency != null && shared.recency !== 'all') {
       const stamp = card.kind === 'schedule' ? card.next_fire_at : card.updated_at;
-      if (stamp && (Date.now() - new Date(stamp).getTime()) / 1000 > Number(shared.recency)) {
+      if (!stamp || (Date.now() - new Date(stamp).getTime()) / 1000 > Number(shared.recency)) {
         updates.recency = 'all';
       }
     }
@@ -829,6 +821,19 @@ export function initBoard() {
   let dragState = null;   // { kind, card, assignee, sourceEl, pointerId, pointerType, ghost, startX, startY, moved }
   let suppressNextClick = null;
   let suppressNextTrayClick = null;
+
+  // A press on a card or tray button anchors a native text selection the
+  // instant it lands on a text node — before slop distance decides whether
+  // the gesture is a drag. Stopping `selectstart` while that pointer
+  // gesture is live (`dragState` set by `onPointerDown`, cleared once the
+  // gesture ends) keeps a selection from ever starting, rather than
+  // clearing one after the fact. Scoped to `dragState` rather than a
+  // standing `user-select: none` on `.board-card` so card text stays
+  // selectable outside of a pointer gesture, and the drawer (which never
+  // sets `dragState`) is unaffected.
+  document.addEventListener('selectstart', (e) => {
+    if (dragState) e.preventDefault();
+  });
 
   function setClickSuppression(kind, key) {
     const slot = kind === 'tray' ? 'suppressNextTrayClick' : 'suppressNextClick';
@@ -2488,12 +2493,9 @@ export function initBoard() {
   updateQuickDropTargets();
   if (doneDropEl) {
     doneDropEl.addEventListener('click', () => {
-      const card = quickActionCardId && findCard(quickActionCardId);
-      if (!card) {
-        setDropStatus('Focus a task card first, then activate Done.', true);
-        return;
-      }
-      onCardDropped(card.id, 'done');
+      applyLaneSelection(visibleLanes.has('done')
+        ? [...visibleLanes].filter(id => id !== 'done')
+        : [...visibleLanes, 'done']);
     });
   }
 
@@ -2564,6 +2566,7 @@ export function initBoard() {
       searchEl.value = state.search;
     }
     if (assigneeFilterEl && assigneeFilterEl.value !== state.assignee) assigneeFilterEl.value = state.assignee;
+    renderAssigneeDrops();
     if (hostFilterEl && hostFilterEl.value !== state.host) hostFilterEl.value = state.host;
     if (engineFilterEl && engineFilterEl.value !== state.engine) engineFilterEl.value = state.engine;
     if (tagFilterEl && document.activeElement !== tagFilterEl && tagFilterEl.value !== state.tag) {
