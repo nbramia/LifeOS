@@ -165,14 +165,11 @@ curl -X POST http://localhost:8000/api/scheduler \
 
 ## Managing Schedules
 
-`PUT /api/scheduler/{id}` validates every field it's given: an unrecognised
-`schedule_type` or `action` rejects the write with a 400 (the same status
-`POST /api/scheduler` uses for those two fields), and an unparsable cron
-expression or ISO datetime, or an unresolvable IANA `timezone`, rejects it
-with a 422. Either way nothing is saved. `POST /api/scheduler` does not run
-the cron / datetime / timezone checks — a schedule created with an unparsable
-value stores fine and then never computes a next fire, which is why the
-update path checks them.
+`POST /api/scheduler` and `PUT /api/scheduler/{id}` validate every field
+they're given: an unrecognised `schedule_type` or `action` rejects the write
+with a 400, and an unparsable cron expression or ISO datetime, or an
+unresolvable IANA `timezone`, rejects it with a 422. Either way nothing is
+saved.
 
 Nothing is saved when a check fails. A request that changes `schedule_type`
 without also sending a matching `schedule_value` is checked against the

@@ -144,6 +144,61 @@ class TestSchedulerAPI:
         assert client.delete("/api/scheduler/nope").status_code == 404
 
 
+class TestCreateScheduleValidation:
+    """POST /api/scheduler validates timezone and schedule_value the same
+    way PUT /api/scheduler/{id} does — a schedule created with an
+    unparsable value must never store, since it would then never compute
+    a next fire."""
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    @pytest.fixture
+    def mock_store(self):
+        with patch("api.routes.scheduler.get_scheduler_store") as mock:
+            store = mock.return_value
+            store.create.return_value = _sample_entry()
+            yield store
+
+    def test_rejects_invalid_cron_expression(self, client, mock_store):
+        resp = client.post("/api/scheduler", json={
+            "name": "X", "schedule_type": "cron", "schedule_value": "not a cron string",
+            "action": "notify",
+        })
+        assert resp.status_code == 422
+        assert "Invalid cron expression 'not a cron string'" in resp.json()["detail"]
+        mock_store.create.assert_not_called()
+
+    def test_rejects_invalid_once_datetime(self, client, mock_store):
+        resp = client.post("/api/scheduler", json={
+            "name": "X", "schedule_type": "once", "schedule_value": "not-a-date",
+            "action": "notify",
+        })
+        assert resp.status_code == 422
+        assert "Invalid ISO datetime 'not-a-date'" in resp.json()["detail"]
+        mock_store.create.assert_not_called()
+
+    def test_rejects_unknown_timezone(self, client, mock_store):
+        resp = client.post("/api/scheduler", json={
+            "name": "X", "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            "action": "notify", "timezone": "Nowhere/Fake",
+        })
+        assert resp.status_code == 422
+        assert "Unknown timezone 'Nowhere/Fake'" in resp.json()["detail"]
+        mock_store.create.assert_not_called()
+
+    def test_accepts_valid_cron_and_timezone(self, client, mock_store):
+        resp = client.post("/api/scheduler", json={
+            "name": "X", "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            "action": "notify", "message_content": "hi", "timezone": "America/Chicago",
+        })
+        assert resp.status_code == 200
+        mock_store.create.assert_called_once()
+
+
 class TestUpdateScheduleValidation:
     """PUT /api/scheduler/{id} validates schedule_type, action, timezone,
     and schedule_value before writing anything, mirroring the checks
@@ -617,6 +672,55 @@ class TestPreviewSchedule:
         parsed = datetime.fromisoformat(resp.json()["next"][0])
         local = parsed.astimezone(ZoneInfo("America/Chicago"))
         assert local.hour == 9
+
+    def test_response_includes_explicit_timezone(self, client):
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            "timezone": "America/New_York",
+        })
+        assert resp.status_code == 200
+        assert resp.json()["timezone"] == "America/New_York"
+
+    def test_response_includes_default_timezone_when_omitted(self, client):
+        with patch("api.routes.scheduler.settings.timezone", "America/Chicago"):
+            resp = client.post("/api/scheduler/preview", json={
+                "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            })
+        assert resp.status_code == 200
+        assert resp.json()["timezone"] == "America/Chicago"
+
+    def test_naive_once_datetime_agrees_with_created_schedules_next_trigger(self, client):
+        """A naive `once` datetime in a non-default timezone: the instant
+        `POST /api/scheduler/preview` reports must be the exact instant a
+        schedule created with the same body computes as its
+        `next_trigger_at` — both read the same naive wall-clock value as
+        `Asia/Tokyo`, not the server's default zone."""
+        from api.services.scheduler_store import SchedulerStore
+
+        future_naive = "2027-03-15T08:30:00"
+        preview_resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "once", "schedule_value": future_naive,
+            "timezone": "Asia/Tokyo",
+        })
+        assert preview_resp.status_code == 200
+        assert preview_resp.json()["next"] == [
+            datetime.fromisoformat(future_naive).replace(tzinfo=ZoneInfo("Asia/Tokyo"))
+            .astimezone(timezone.utc).isoformat()
+        ]
+
+        import tempfile
+        import pathlib
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SchedulerStore(
+                vault_path=pathlib.Path(tmp) / "vault", index_path=pathlib.Path(tmp) / "idx.json",
+            )
+            with patch("api.routes.scheduler.get_scheduler_store", return_value=store):
+                create_resp = client.post("/api/scheduler", json={
+                    "name": "Tokyo once", "schedule_type": "once", "schedule_value": future_naive,
+                    "action": "notify", "message_content": "hi", "timezone": "Asia/Tokyo",
+                })
+        assert create_resp.status_code == 200
+        assert create_resp.json()["next_trigger_at"] == preview_resp.json()["next"][0]
 
     def test_not_captured_by_the_schedule_id_route(self, client):
         """POST /preview is declared before GET/PUT/DELETE /{schedule_id} —

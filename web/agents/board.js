@@ -1564,9 +1564,6 @@ export function initBoard() {
   }
 
   function openNewScheduleForm() {
-    let defaultTimezone = '';
-    try { defaultTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (_) { /* no-op */ }
-
     const backdrop = document.createElement('div');
     backdrop.className = 'modal-backdrop';
     backdrop.innerHTML = `
@@ -1576,7 +1573,8 @@ export function initBoard() {
         <input class="drawer-input" data-field="name" type="text" />
         <label class="drawer-label"><input type="checkbox" data-field="enabled" checked /> Enabled</label>
         <label class="drawer-label">Timezone</label>
-        <input class="drawer-input" data-field="timezone" type="text" value="${escapeHtml(defaultTimezone)}" placeholder="e.g. America/New_York" />
+        <input class="drawer-input" data-field="timezone" type="text" placeholder="Configured default" />
+        <div class="drawer-field-error" data-field="timezone-error" hidden></div>
         <label class="drawer-label">Trigger</label>
         <select class="drawer-select" data-field="trigger-mode">
           ${TRIGGER_MODES.map(m => `<option value="${m.id}" ${m.id === 'daily' ? 'selected' : ''}>${m.label}</option>`).join('')}
@@ -1606,6 +1604,7 @@ export function initBoard() {
     const nameEl = backdrop.querySelector('[data-field="name"]');
     const enabledEl = backdrop.querySelector('[data-field="enabled"]');
     const tzEl = backdrop.querySelector('[data-field="timezone"]');
+    const tzErrorEl = backdrop.querySelector('[data-field="timezone-error"]');
     const modeEl = backdrop.querySelector('[data-field="trigger-mode"]');
     const triggerFieldsEl = backdrop.querySelector('[data-field="trigger-fields"]');
     const triggerErrorEl = backdrop.querySelector('[data-field="trigger-error"]');
@@ -1627,6 +1626,7 @@ export function initBoard() {
 
     function clearFieldErrors() {
       triggerErrorEl.hidden = true; triggerErrorEl.textContent = '';
+      tzErrorEl.hidden = true; tzErrorEl.textContent = '';
       actionErrorEl.hidden = true; actionErrorEl.textContent = '';
       generalErrorEl.hidden = true; generalErrorEl.textContent = '';
       sections.clearParamsError();
@@ -1683,6 +1683,7 @@ export function initBoard() {
     async function runPreview() {
       const trig = readTrigger(triggerState);
       if (!trig) {
+        ++previewSeq; // discard any in-flight response from before the trigger was cleared
         previewListEl.innerHTML = '';
         previewErrorEl.hidden = true;
         previewErrorEl.textContent = '';
@@ -1707,8 +1708,9 @@ export function initBoard() {
         previewErrorEl.hidden = true;
         previewErrorEl.textContent = '';
         const times = data.next || [];
+        const resolvedTz = data.timezone || tz;
         previewListEl.innerHTML = times.length
-          ? times.map(t => `<div class="drawer-schedule-info">${escapeHtml(formatPreviewTime(t, tz))}</div>`).join('')
+          ? times.map(t => `<div class="drawer-schedule-info">${escapeHtml(formatPreviewTime(t, resolvedTz))}</div>`).join('')
           : '<div class="drawer-schedule-info">No upcoming fires.</div>';
       } catch (err) {
         if (seq !== previewSeq) return;
@@ -1727,6 +1729,11 @@ export function initBoard() {
       if (/^Invalid cron expression|^Invalid ISO datetime/.test(message)) {
         triggerErrorEl.textContent = message;
         triggerErrorEl.hidden = false;
+        return;
+      }
+      if (/^Unknown timezone/.test(message)) {
+        tzErrorEl.textContent = message;
+        tzErrorEl.hidden = false;
         return;
       }
       if (message.startsWith('endpoint_config.')) {
@@ -1755,7 +1762,10 @@ export function initBoard() {
       schedulePreview();
     });
     nameEl.addEventListener('input', updateCreateEnabled);
-    tzEl.addEventListener('input', schedulePreview);
+    tzEl.addEventListener('input', () => {
+      tzErrorEl.hidden = true;
+      schedulePreview();
+    });
     actionEl.addEventListener('change', () => {
       // Carries forward whatever the outgoing section's own fields
       // currently hold, so switching action and back doesn't discard

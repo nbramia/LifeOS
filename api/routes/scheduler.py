@@ -152,6 +152,7 @@ class PreviewScheduleRequest(BaseModel):
 
 class PreviewScheduleResponse(BaseModel):
     next: list[str]
+    timezone: str
 
 
 PREVIEW_TRIGGER_COUNT = 3
@@ -286,6 +287,11 @@ async def create_schedule(request: CreateScheduleRequest):
     """Create a new schedule."""
     if request.schedule_type not in ("once", "cron"):
         raise HTTPException(status_code=400, detail="schedule_type must be 'once' or 'cron'")
+    try:
+        ZoneInfo(request.timezone)
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"Unknown timezone '{request.timezone}'")
+    _validate_schedule_value(request.schedule_type, request.schedule_value)
     action = _resolve_action(request.action, request.message_type)
     if action not in VALID_ACTIONS:
         raise HTTPException(status_code=400, detail=f"action must be one of {VALID_ACTIONS}")
@@ -370,7 +376,7 @@ async def preview_schedule(request: PreviewScheduleRequest):
         request.schedule_type, request.schedule_value, request.timezone,
         count=PREVIEW_TRIGGER_COUNT, label="preview",
     )
-    return PreviewScheduleResponse(next=triggers)
+    return PreviewScheduleResponse(next=triggers, timezone=request.timezone)
 
 
 @router.get("/{schedule_id}", response_model=ScheduleResponse)

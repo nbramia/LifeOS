@@ -262,6 +262,60 @@ class TestPreview:
         expect(error_el).to_be_visible(timeout=5000)
         expect(error_el).to_have_text("Invalid cron expression 'x': bad")
 
+    def test_blank_timezone_omits_the_key_from_the_preview_body(self, page: Page, agents_base_url):
+        """The Timezone field is blank by default — the composer must never
+        send an empty-string `timezone`, which would override the server's
+        configured default with an invalid value."""
+        preview_calls = []
+        _open_board(
+            page, agents_base_url, preview_calls=preview_calls,
+            preview_response={"next": [], "timezone": "America/New_York"},
+        )
+        _open_composer(page)
+        _wait_for(lambda: len(preview_calls) > 0, page)
+        assert "timezone" not in preview_calls[0]
+
+    def test_preview_times_formatted_using_the_responses_timezone(self, page: Page, agents_base_url):
+        """The preview list must render times in the zone the server
+        actually resolved (the response's `timezone`), not necessarily
+        whatever is currently typed in the Timezone field."""
+        _open_board(
+            page, agents_base_url,
+            preview_response={"next": ["2099-01-01T00:00:00+00:00"], "timezone": "Asia/Tokyo"},
+        )
+        modal = _open_composer(page)
+        modal.locator('[data-field="timezone"]').fill("America/Chicago")
+        entries = modal.locator('[data-field="preview-list"] .drawer-schedule-info')
+        # 2099-01-01T00:00:00Z is 09:00 in Asia/Tokyo (UTC+9) — a Chicago
+        # rendering (UTC-6) would show 6:00 PM the day before instead.
+        expect(entries).to_contain_text("9:00", timeout=5000)
+
+    def test_stale_preview_response_does_not_repopulate_a_cleared_list(self, page: Page, agents_base_url):
+        """A delayed response for a trigger that's since been cleared must
+        never repopulate the (now-empty) preview list."""
+        call_count = {"n": 0}
+
+        def delayed_preview(route):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                time.sleep(0.5)
+            route.fulfill(
+                status=200, content_type="application/json",
+                body=json.dumps({"next": ["2099-01-01T09:00:00+00:00"], "timezone": "UTC"}),
+            )
+
+        _open_board(page, agents_base_url, preview_response={"next": []})
+        page.route(re.compile(r"/api/scheduler/preview$"), delayed_preview)
+        modal = _open_composer(page)
+        _wait_for(lambda: call_count["n"] >= 1, page)
+        # Clear the trigger (daily's default time is otherwise always
+        # valid) before the delayed first response has a chance to land.
+        modal.locator('[data-field="trigger-mode"]').select_option("cron")
+        modal.locator('[data-field="trigger-cron"]').fill("")
+        expect(modal.locator('[data-field="preview-list"]')).to_be_empty()
+        page.wait_for_timeout(900)  # let the delayed first response land
+        expect(modal.locator('[data-field="preview-list"]')).to_be_empty()
+
 
 class TestCreate:
     def test_create_payload_for_an_endpoint_schedule(self, page: Page, agents_base_url):
@@ -314,6 +368,33 @@ class TestCreate:
         error_el = modal.locator('[data-field="endpoint-params-error"]')
         expect(error_el).to_have_text("endpoint_config.endpoint must start with '/api/', got 'bad'", timeout=5000)
         # The composer stays open with Create re-enabled for a retry.
+        expect(modal).to_be_visible()
+        expect(modal.locator("#new-schedule-create")).to_be_enabled()
+        assert len(create_calls) == 1
+
+    def test_blank_timezone_omits_the_key_from_the_create_body(self, page: Page, agents_base_url):
+        create_calls = []
+        _open_board(page, agents_base_url, create_calls=create_calls, preview_response={"next": []})
+        modal = _open_composer(page)
+        modal.locator('[data-field="name"]').fill("Morning ping")
+        modal.locator('[data-field="message-content"]').fill("Good morning")
+        modal.locator("#new-schedule-create").click()
+        _wait_for(lambda: len(create_calls) == 1, page)
+        assert "timezone" not in create_calls[0]
+
+    def test_create_422_unknown_timezone_renders_at_the_timezone_field(self, page: Page, agents_base_url):
+        create_calls = []
+        _open_board(
+            page, agents_base_url, create_calls=create_calls, preview_response={"next": []},
+            create_response={"detail": "Unknown timezone 'Nowhere/Fake'"}, create_status=422,
+        )
+        modal = _open_composer(page)
+        modal.locator('[data-field="name"]').fill("Bad tz")
+        modal.locator('[data-field="message-content"]').fill("hi")
+        modal.locator('[data-field="timezone"]').fill("Nowhere/Fake")
+        modal.locator("#new-schedule-create").click()
+        error_el = modal.locator('[data-field="timezone-error"]')
+        expect(error_el).to_have_text("Unknown timezone 'Nowhere/Fake'", timeout=5000)
         expect(modal).to_be_visible()
         expect(modal.locator("#new-schedule-create")).to_be_enabled()
         assert len(create_calls) == 1
