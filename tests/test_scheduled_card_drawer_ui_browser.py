@@ -10,9 +10,13 @@ Covers: schedule type/value/timezone/action/executor/bot each saving through
 showing the 422 detail inline and leaving the stored value untouched; the
 bot select offering only the names `GET /api/scheduler/bots` returns (plus
 an empty "primary" option) and disabling with a visible reason when that
-fetch fails; the executor/bot swap when the action select changes; the
-next-fire preview updating from the PUT response; and Trigger now calling
-the trigger endpoint and refreshing the last-run line.
+fetch fails; the executor/bot swap when the action select changes; an
+action switch whose target section isn't yet satisfied (no endpoint config,
+a blank message) holding locally instead of saving until the section's own
+input is filled, then saving both together, with a rejection shown inline
+next to the Action select rather than as a toast; the next-fire preview
+updating from the PUT response; and Trigger now calling the trigger
+endpoint and refreshing the last-run line.
 """
 import http.server
 import json
@@ -132,17 +136,48 @@ def _stub_routes(page: Page, board_state: dict, schedule_puts: list, trigger_cal
                 )
                 return
 
-            # An endpoint path that doesn't start with "/api/" simulates the
-            # server rejecting the combined method/path/params save, as
-            # `_validate_action_inputs` (api/routes/scheduler.py) does.
-            if "endpoint_config" in body and not str(body["endpoint_config"].get("endpoint", "")).startswith("/api/"):
-                route.fulfill(
-                    status=422, content_type="application/json",
-                    body=json.dumps({"detail": f"endpoint_config.endpoint must start with '/api/', got {body['endpoint_config'].get('endpoint')!r}"}),
-                )
-                return
-
             schedule_id = schedule_match.group(1)
+            stored_card = None
+            for cards in board_state["lanes"].values():
+                for card in cards:
+                    if card["id"] == schedule_id:
+                        stored_card = card
+
+            # Mirrors api/services/scheduler_validation.py's
+            # `validate_action_inputs`: a PUT that touches `action`,
+            # `message_content`, or `endpoint_config` is checked against
+            # the RESULTING action's requirements, falling back to the
+            # entry's stored value for whichever of the three the patch
+            # doesn't touch -- an unrelated field (e.g. `enabled`) never
+            # re-validates a pre-existing entry.
+            if stored_card is not None and ({"action", "message_content", "endpoint_config"} & body.keys()):
+                resulting_action = body.get("action", stored_card.get("action"))
+                resulting_message = body.get("message_content", stored_card.get("message_content", ""))
+                resulting_endpoint_config = body.get("endpoint_config", stored_card.get("endpoint_config"))
+                if resulting_action == "endpoint":
+                    cfg = resulting_endpoint_config if isinstance(resulting_endpoint_config, dict) else {}
+                    endpoint_method = str(cfg.get("method", "")).strip().upper()
+                    endpoint_path = cfg.get("endpoint")
+                    if endpoint_method not in ("GET", "POST"):
+                        route.fulfill(
+                            status=422, content_type="application/json",
+                            body=json.dumps({"detail": f"endpoint_config.method must be 'GET' or 'POST', got {cfg.get('method')!r}"}),
+                        )
+                        return
+                    if not isinstance(endpoint_path, str) or not endpoint_path.startswith("/api/"):
+                        route.fulfill(
+                            status=422, content_type="application/json",
+                            body=json.dumps({"detail": f"endpoint_config.endpoint must start with '/api/', got {endpoint_path!r}"}),
+                        )
+                        return
+                elif resulting_action in ("notify", "prompt", "agent"):
+                    if not (resulting_message or "").strip():
+                        route.fulfill(
+                            status=422, content_type="application/json",
+                            body=json.dumps({"detail": "message_content must not be blank"}),
+                        )
+                        return
+
             next_trigger_at = None
             for cards in board_state["lanes"].values():
                 for card in cards:
@@ -612,7 +647,83 @@ class TestPerActionSections:
         # synchronously, before the PUT is even sent -- is still caught.
         assert page.locator('[data-field="endpoint-method"]').is_visible()
         assert page.locator('[data-field="message-content"]').count() == 0
-        _wait_for(lambda: {"action": "endpoint"} in schedule_puts, page=page)
+        # The fixture's notify card has no endpoint_config, so switching to
+        # endpoint doesn't yet have what it needs to fire -- the switch is
+        # held locally rather than written.
+        page.wait_for_timeout(200)
+        assert schedule_puts == []
+
+    def test_switching_to_endpoint_without_config_sends_nothing_until_filled(self, page: Page, agents_base_url):
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)  # fixture: notify, no endpoint_config
+        page.locator('[data-field="action"]').select_option("endpoint")
+        page.wait_for_timeout(200)
+        assert schedule_puts == []
+
+        # Method stays at its default (GET, already valid) -- filling and
+        # blurring the path alone is enough to satisfy the endpoint action
+        # (params are optional), so that one blur is what fires the
+        # combined save.
+        path = page.locator('[data-field="endpoint-path"]')
+        path.fill("/api/tasks/summary")
+        path.blur()
+        _wait_for(
+            lambda: {
+                "action": "endpoint",
+                "endpoint_config": {"method": "GET", "endpoint": "/api/tasks/summary"},
+            } in schedule_puts,
+            page=page,
+        )
+        assert len(schedule_puts) == 1
+        chip = page.locator('[data-card-id="s1"] .board-chip').first
+        expect(chip).to_have_text("endpoint: GET /api/tasks/summary")
+
+    def test_switching_to_notify_with_blank_message_sends_nothing_until_typed(self, page: Page, agents_base_url):
+        schedule_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "endpoint"
+        board_state["lanes"]["scheduled"][0]["message_content"] = ""
+        board_state["lanes"]["scheduled"][0]["endpoint_config"] = {"method": "GET", "endpoint": "/api/tasks"}
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        page.locator('[data-field="action"]').select_option("notify")
+        page.wait_for_timeout(200)
+        assert schedule_puts == []
+
+        page.locator('[data-field="message-content"]').fill("Good morning")
+        page.locator('[data-field="message-content"]').blur()
+        _wait_for(
+            lambda: {"action": "notify", "message_content": "Good morning"} in schedule_puts,
+            page=page,
+        )
+        assert len(schedule_puts) == 1
+
+    def test_action_change_rejection_shown_inline_and_keeps_entered_inputs(self, page: Page, agents_base_url):
+        schedule_puts = []
+        board_state = _board_fixture()
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)  # notify, no endpoint_config
+        page.locator('[data-field="action"]').select_option("endpoint")
+        # Method stays at its default (GET, already valid) -- only the path
+        # is wrong, so filling and blurring it alone fires the combined PUT.
+        path = page.locator('[data-field="endpoint-path"]')
+        path.fill("not-a-route")
+        path.blur()  # combined PUT (action + endpoint_config), rejected by the stub
+
+        error_el = page.locator('[data-field="action-error"]')
+        expect(error_el).to_be_visible(timeout=5000)
+        expect(error_el).to_contain_text("must start with '/api/'")
+        # The operator's own entry stays visible -- not reverted, unlike an
+        # ordinary (non-action-carrying) endpoint_config save rejection.
+        expect(path).to_have_value("not-a-route")
+        expect(page.locator('[data-field="endpoint-params-error"]')).to_be_hidden()
+        # The rejected write never reached board_state -- closing and
+        # reopening the drawer (a fresh render from the card's actual
+        # stored data) still shows the original action, not "endpoint".
+        assert board_state["lanes"]["scheduled"][0]["action"] == "notify"
+        page.locator('[data-action="drawer-close"]').click()
+        page.locator('[data-card-id="s1"]').click()
+        page.wait_for_selector('[data-field="action"]')
+        expect(page.locator('[data-field="action"]')).to_have_value("notify")
+        expect(page.locator('[data-field="message-content"]')).to_be_visible()
 
 
 class TestEndpointAction:
@@ -816,3 +927,4 @@ class TestActionChip:
         page.wait_for_selector('[data-card-id="s1"]')
         chip = page.locator('[data-card-id="s1"] .board-chip').first
         expect(chip).to_have_text("agent: default")
+

@@ -575,6 +575,100 @@ class TestManageSchedulesAgentTool:
         assert created[0].action == "agent"
         assert created[0].executor == "cloud"
 
+    def test_create_blank_message_rejected_and_writes_nothing(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "create",
+                "name": "Silent",
+                "schedule_type": "cron",
+                "schedule_value": "0 9 * * *",
+                "schedule_action": "notify",
+                "message_content": "   ",
+            })
+        assert "Error" in out
+        assert "message_content must not be blank" in out
+        assert store.list_all() == []
+
+    def test_create_endpoint_action_without_config_rejected_and_writes_nothing(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "create",
+                "name": "Unconfigured endpoint",
+                "schedule_type": "cron",
+                "schedule_value": "0 9 * * *",
+                "schedule_action": "endpoint",
+            })
+        assert "Error" in out
+        assert "endpoint_config.method" in out
+        assert store.list_all() == []
+
+    def test_update_to_blank_message_rejected_and_leaves_entry_unchanged(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        created = store.create(name="Keep me", schedule_type="cron",
+                               schedule_value="0 9 * * *", action="notify",
+                               message_content="Good morning")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "update", "schedule_id": created.id,
+                "message_content": "   ",
+            })
+        assert "Error" in out
+        assert "message_content must not be blank" in out
+        refreshed = store.get(created.id)
+        assert refreshed.message_content == "Good morning"
+
+    def test_update_action_to_endpoint_without_config_rejected_and_leaves_entry_unchanged(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        created = store.create(name="Notifier", schedule_type="cron",
+                               schedule_value="0 9 * * *", action="notify",
+                               message_content="Good morning")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "update", "schedule_id": created.id,
+                "schedule_action": "endpoint",
+            })
+        assert "Error" in out
+        assert "endpoint_config.method" in out
+        refreshed = store.get(created.id)
+        assert refreshed.action == "notify"
+
+    def test_update_action_to_prompt_with_existing_message_accepted(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        created = store.create(name="Switches action", schedule_type="cron",
+                               schedule_value="0 9 * * *", action="notify",
+                               message_content="Good morning")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "update", "schedule_id": created.id,
+                "schedule_action": "prompt",
+            })
+        assert "Schedule updated" in out
+        refreshed = store.get(created.id)
+        assert refreshed.action == "prompt"
+        assert refreshed.message_content == "Good morning"
+
     def test_list_schedules_tool(self, tmp_path):
         from api.services.scheduler_store import SchedulerStore
         from api.services import agent_tools

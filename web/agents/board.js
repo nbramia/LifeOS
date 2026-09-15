@@ -2010,6 +2010,7 @@ export function initBoard() {
       <select class="drawer-select" data-field="action">
         ${SCHEDULE_ACTIONS.map(a => `<option value="${a}" ${card.action === a ? 'selected' : ''}>${a}</option>`).join('')}
       </select>
+      <div class="drawer-field-error" data-field="action-error" hidden></div>
       <div class="drawer-section" data-field="action-sections"></div>
       <div class="drawer-schedule-info" data-field="next-fire-preview"></div>
       <div class="drawer-schedule-info" data-field="last-run-info"></div>
@@ -2178,13 +2179,19 @@ export function initBoard() {
   // scheduler API, never the vault file directly — on blur for text
   // inputs and on change for selects/the checkbox, refetching the board on
   // a successful save. A rejected save shows the server's `detail` inline
-  // next to the offending field (schedule value, timezone) or as a toast
-  // (every other field), and snaps the control back to the last value the
-  // server actually accepted. The schedule type select is the one
-  // exception: changing it only updates the value field's label and
+  // next to the offending field (schedule value, timezone, action) or as a
+  // toast (every other field), and snaps the control back to the last
+  // value the server actually accepted. The schedule type select is the
+  // one exception: changing it only updates the value field's label and
   // placeholder locally — it saves together with the schedule value, on
   // the value field's own blur, so a type and a value that doesn't parse
   // under it can never reach the server in the same write (see below).
+  // The action select is the other exception: switching to an action whose
+  // section doesn't yet have what it needs to fire (see
+  // `actionInputsSatisfied`) holds the switch locally instead of saving it
+  // alone, and a rejected save carrying it leaves the select and its
+  // section showing the operator's own entry rather than reverting them
+  // (see `pendingAction` below).
   // Normalizes an `endpoint_config` (or its absence) into a comparable
   // key, for skipping a redundant save when the endpoint fields are
   // blurred/changed without actually being edited — the same "no-op if
@@ -2198,6 +2205,29 @@ export function initBoard() {
       endpoint: c.endpoint || '',
       params: c.params === undefined ? null : c.params,
     });
+  }
+
+  // Mirrors the server's per-action requirement (api/services/scheduler_validation.py's
+  // `validate_action_inputs`): an `endpoint` action needs a GET/POST method,
+  // a path starting with `/api/`, and params that are either absent or a
+  // JSON object; notify/prompt/agent need a non-blank message. Used by the
+  // Action select's change handler below to decide whether a target action
+  // can be saved on its own or must wait for its section's own input.
+  function actionInputsSatisfied(action, values) {
+    if (action === 'endpoint') {
+      const cfg = values.endpoint_config || {};
+      const method = String(cfg.method || '').toUpperCase();
+      if (method !== 'GET' && method !== 'POST') return false;
+      const path = cfg.endpoint;
+      if (typeof path !== 'string' || !path.startsWith('/api/')) return false;
+      const params = cfg.params;
+      if (params !== undefined && params !== null && (typeof params !== 'object' || Array.isArray(params))) return false;
+      return true;
+    }
+    if (action === 'notify' || action === 'prompt' || action === 'agent') {
+      return !!(values.message_content || '').trim();
+    }
+    return true;
   }
 
   function renderScheduleDrawerFields(card) {
@@ -2241,18 +2271,39 @@ export function initBoard() {
         els.message.addEventListener('blur', async () => {
           const value = els.message.value;
           if (value === (lastSavedMessage || '')) return;
+          // A pending action switch (set by the Action select's own
+          // change handler below, when the target action's section
+          // didn't yet satisfy the server's requirement) rides along in
+          // this same PUT — the server sees one write with both fields,
+          // never an action alone with nothing to back it.
+          const savingAction = pendingAction;
+          const patch = { message_content: value };
+          if (savingAction) patch.action = savingAction;
           try {
-            await putSchedule(card.id, { message_content: value });
+            await putSchedule(card.id, patch);
             lastSavedMessage = value;
             // `sectionValues` is the same object `sections` reads from —
             // updating it here keeps a later `setAction()` (switching away
             // and back to this action mid-session) rendering this saved
             // value instead of the stale one the drawer opened with.
             sectionValues.message_content = value;
+            if (savingAction) {
+              lastSavedAction = savingAction;
+              pendingAction = null;
+              clearActionError();
+            }
             await fetchBoard();
           } catch (err) {
-            showToast(`Couldn't save message: ${err.message}`, true);
-            els.message.value = lastSavedMessage || '';
+            if (savingAction) {
+              // The action switch is still pending — leave the select and
+              // this field exactly as the operator left them so they can
+              // fix and retry, rather than reverting content they just
+              // typed.
+              showActionError(err.message);
+            } else {
+              showToast(`Couldn't save message: ${err.message}`, true);
+              els.message.value = lastSavedMessage || '';
+            }
           }
         });
       }
@@ -2291,19 +2342,38 @@ export function initBoard() {
           if (cfg === null) return; // invalid JSON/non-object params — error already shown, nothing sent
           const key = endpointConfigKey(cfg);
           if (key === lastSavedEndpointConfigKey) return;
+          // See the message handler above: a pending action switch rides
+          // along in this same PUT rather than being sent (and rejected)
+          // on its own.
+          const savingAction = pendingAction;
+          const patch = { endpoint_config: cfg };
+          if (savingAction) patch.action = savingAction;
           try {
-            await putSchedule(card.id, { endpoint_config: cfg });
+            await putSchedule(card.id, patch);
             lastSavedEndpointConfig = cfg;
             lastSavedEndpointConfigKey = key;
             sectionValues.endpoint_config = cfg;
             sections.clearParamsError();
+            if (savingAction) {
+              lastSavedAction = savingAction;
+              pendingAction = null;
+              clearActionError();
+            }
             await fetchBoard();
           } catch (err) {
-            sections.showParamsError(err.message);
-            els.method.value = String((lastSavedEndpointConfig && lastSavedEndpointConfig.method) || 'GET').toUpperCase();
-            els.path.value = (lastSavedEndpointConfig && lastSavedEndpointConfig.endpoint) || '';
-            els.params.value = lastSavedEndpointConfig && lastSavedEndpointConfig.params !== undefined
-              ? JSON.stringify(lastSavedEndpointConfig.params, null, 2) : '';
+            if (savingAction) {
+              // Leave the method/path/params fields exactly as entered —
+              // the action switch is still pending, and reverting them
+              // would discard the operator's own fix along with the
+              // rejection.
+              showActionError(err.message);
+            } else {
+              sections.showParamsError(err.message);
+              els.method.value = String((lastSavedEndpointConfig && lastSavedEndpointConfig.method) || 'GET').toUpperCase();
+              els.path.value = (lastSavedEndpointConfig && lastSavedEndpointConfig.endpoint) || '';
+              els.params.value = lastSavedEndpointConfig && lastSavedEndpointConfig.params !== undefined
+                ? JSON.stringify(lastSavedEndpointConfig.params, null, 2) : '';
+            }
           }
         };
         els.method.addEventListener('change', saveEndpointConfig);
@@ -2415,6 +2485,7 @@ export function initBoard() {
     const tzEl = drawerEl.querySelector('[data-field="timezone"]');
     const tzErrorEl = drawerEl.querySelector('[data-field="timezone-error"]');
     const actionEl = drawerEl.querySelector('[data-field="action"]');
+    const actionErrorEl = drawerEl.querySelector('[data-field="action-error"]');
     const previewEl = drawerEl.querySelector('[data-field="next-fire-preview"]');
     const lastRunEl = drawerEl.querySelector('[data-field="last-run-info"]');
     const triggerBtnEl = drawerEl.querySelector('[data-action="trigger-now"]');
@@ -2430,6 +2501,22 @@ export function initBoard() {
     let lastSavedValue = card.schedule_value;
     let lastSavedTz = card.timezone || '';
     let lastSavedAction = card.action;
+    // An action selected in the drawer but not yet included in a
+    // successful PUT — set when the target action's own section doesn't
+    // yet have what it needs to fire (see `actionInputsSatisfied`), and
+    // cleared once a save carrying it succeeds. Never persisted anywhere
+    // else, so closing and reopening the drawer (a fresh `renderDrawer`
+    // from the card's actual stored action) discards it.
+    let pendingAction = null;
+
+    function showActionError(message) {
+      actionErrorEl.textContent = message;
+      actionErrorEl.hidden = false;
+    }
+    function clearActionError() {
+      actionErrorEl.hidden = true;
+      actionErrorEl.textContent = '';
+    }
 
     function updateValueLabel(type) {
       if (type === 'once') {
@@ -2502,17 +2589,31 @@ export function initBoard() {
       // Switch the visible section immediately, ahead of any save, then
       // re-wire the freshly rendered fields' own save-on-blur/change
       // handlers, since the section rebuild replaced their DOM elements.
-      sections.setAction(actionEl.value);
+      const target = actionEl.value;
+      sections.setAction(target);
       wireActionSectionFields();
+      clearActionError();
+      if (!actionInputsSatisfied(target, sectionValues)) {
+        // The target action's section doesn't have what it needs to fire
+        // yet (e.g. endpoint with no method/path, or notify/prompt/agent
+        // with a blank message) — hold the switch locally instead of
+        // writing an action the server would reject anyway. The section's
+        // own save-on-blur/change handler above sends `action` together
+        // with whatever value satisfies it, in one PUT.
+        pendingAction = target;
+        return;
+      }
+      pendingAction = null;
       try {
-        await putSchedule(card.id, { action: actionEl.value });
-        lastSavedAction = actionEl.value;
+        await putSchedule(card.id, { action: target });
+        lastSavedAction = target;
         await fetchBoard();
       } catch (err) {
-        showToast(`Couldn't save action: ${err.message}`, true);
-        actionEl.value = lastSavedAction;
-        sections.setAction(lastSavedAction);
-        wireActionSectionFields();
+        // Leave the select and its freshly rendered section showing the
+        // operator's own choice — the stored action is unchanged, and a
+        // later edit to the section's own field retries the switch.
+        pendingAction = target;
+        showActionError(err.message);
       }
     });
 

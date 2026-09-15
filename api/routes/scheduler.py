@@ -21,6 +21,10 @@ from api.services.scheduler_store import (
     ScheduleEntry,
     VALID_ACTIONS,
 )
+from api.services.scheduler_validation import (
+    validate_action_inputs,
+    ScheduleActionValidationError,
+)
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -194,50 +198,22 @@ def _validate_schedule_value(schedule_type: str, schedule_value: str) -> None:
 def _validate_action_inputs(
     action: str, message_content: str, endpoint_config: Optional[dict],
 ) -> Optional[dict]:
-    """Validate that a schedule's resulting action has the inputs it
-    needs to fire, 422 on failure. Shared by ``create_schedule`` and
+    """Validate that a schedule's resulting action has the inputs it needs
+    to fire, 422 on failure. Shared by ``create_schedule`` and
     ``update_schedule`` below so the drawer and every other client (chat
-    tools, MCP) get the same rules — without this, a schedule could be
-    saved with an action whose fire path has nothing to work with (e.g. an
-    ``endpoint`` action with no endpoint configured produces "No endpoint
-    configuration provided." only once it actually fires).
+    tools, MCP) get the same rules and the same detail text — the actual
+    rule lives in ``api/services/scheduler_validation.py``'s
+    ``validate_action_inputs``, which ``manage_schedules``
+    (``api/services/agent_tools.py``) also calls directly.
 
     Returns the ``endpoint_config`` to store: for ``endpoint``, the same
     dict with ``method`` normalized to upper case; for every other action,
     ``endpoint_config`` unchanged.
     """
-    if action == "endpoint":
-        cfg = endpoint_config if isinstance(endpoint_config, dict) else {}
-        method = str(cfg.get("method", "")).strip().upper()
-        if method not in ("GET", "POST"):
-            raise HTTPException(
-                status_code=422,
-                detail=f"endpoint_config.method must be 'GET' or 'POST', got {cfg.get('method')!r}",
-            )
-        path = cfg.get("endpoint")
-        if not isinstance(path, str) or not path.startswith("/api/"):
-            raise HTTPException(
-                status_code=422,
-                detail=f"endpoint_config.endpoint must start with '/api/', got {path!r}",
-            )
-        params = cfg.get("params")
-        if params is not None and not isinstance(params, dict):
-            raise HTTPException(
-                status_code=422,
-                detail="endpoint_config.params must be a JSON object",
-            )
-        normalized = dict(cfg)
-        normalized["method"] = method
-        return normalized
-
-    if action in ("notify", "prompt", "agent"):
-        if not (message_content or "").strip():
-            raise HTTPException(
-                status_code=422,
-                detail="message_content must not be blank",
-            )
-
-    return endpoint_config
+    try:
+        return validate_action_inputs(action, message_content, endpoint_config)
+    except ScheduleActionValidationError as e:
+        raise HTTPException(status_code=422, detail=e.detail)
 
 
 def _validate_update_fields(schedule_id: str, request: "UpdateScheduleRequest", store) -> None:
