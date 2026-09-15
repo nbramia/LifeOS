@@ -173,6 +173,14 @@ _INLINE_SUMMARY_MAX_CHARS = 2000
 _BLOCKED_PROMPT_SEND_ATTEMPTS = 3
 _BLOCKED_PROMPT_RETRY_DELAY_S = 0.5
 
+# Lifecycle drift sweep (kill landing on a BLOCKED/parked session, or while
+# the worker is down, bypasses the projector hook — see
+# `_reconcile_lifecycle_drift`). Window and limit both bound the per-tick
+# scan: only recently-terminal sessions are considered, and at most this
+# many are reconciled in one tick.
+_LIFECYCLE_DRIFT_SWEEP_WINDOW_S = 24 * 60 * 60
+_LIFECYCLE_DRIFT_SWEEP_LIMIT = 50
+
 # Answered-question claims use the existing `processed` integer as a small
 # durable lease: 0 = queued, 2 = claimed, 1 = conclusively handled. SessionStore
 # releases only claims inherited at process start; live claims are cleaned up by
@@ -946,6 +954,11 @@ class Worker:
         # worker is paused or near its daily cap (#852 R2).
         self._process_human_queue()
         self._replay_wait_wakeups()
+        # Heal any vault tag left stranded by a terminal status write that
+        # bypassed the projector (e.g. a kill landing on a parked/offline
+        # session — see `_reconcile_lifecycle_drift`). Also never gated on
+        # the spend cap: it reconciles existing state, never starts new work.
+        self._reconcile_lifecycle_drift()
 
         # Use the configured per-task default budget as the "can I afford to
         # start the cheapest task right now?" estimate. Calling with 0.0 would
@@ -2623,6 +2636,62 @@ class Worker:
                 self.session_store.complete_wait_wakeup(wait["wait_id"])
             except Exception as exc:
                 logger.warning("human-queue wake replay failed for %s: %s", wait["wait_id"], exc)
+
+    def _reconcile_lifecycle_drift(self) -> int:
+        """Heal a vault tag left stranded by a terminal status write that
+        bypassed the projector.
+
+        `update_status` fires the `set_status_projector` hook (installed at
+        construction time) whenever it lands a terminal status, which
+        reconciles the vault tag through `lifecycle_projector`. A kill
+        instead flips the row via `mark_cancelled` (`teardown_session`,
+        inter_agent.py) — a raw status write with no projector hook. A kill
+        landing on a session that's still being actively polled is still
+        fine: the executor observes the terminal row on its own next poll
+        and reconciles it through the ordinary `update_status` +
+        `_reconcile_vault_terminal` path. But a kill landing on a session
+        parked at BLOCKED, or while the worker itself is down, leaves no
+        poll to do that — the vault tag is stranded at `#agent-running` /
+        `#agent-blocked` forever.
+
+        `SessionStore.list_terminal_unprojected` finds exactly that drift
+        signature (terminal status, no acknowledged projection for it) and
+        is already scoped to vault-backed sessions and bounded in size —
+        see its docstring for the cost argument. This sweep applies the
+        same projection those sessions would have gotten had the terminal
+        write gone through `update_status`, via the shared projector so a
+        session already reconciled by that path (or already re-opened for
+        a follow-up turn, which flips the row back to non-terminal) is
+        left untouched rather than double-projected.
+        """
+        healed = 0
+        since = int(time.time()) - _LIFECYCLE_DRIFT_SWEEP_WINDOW_S
+        for session in self.session_store.list_terminal_unprojected(
+            since=since, limit=_LIFECYCLE_DRIFT_SWEEP_LIMIT,
+        ):
+            task = self._fetch_task(session.task_id)
+            if task is None:
+                continue
+            event = LifecycleEvent(
+                event_id=LifecycleProjector.event_id(
+                    session.task_id, session.attempt_id, session.status,
+                    suffix="lifecycle_drift_sweep",
+                ),
+                task_id=session.task_id,
+                session_id=session.session_id,
+                attempt_id=session.attempt_id,
+                target_status=session.status,
+                expected_version=task.get("updated_at"),
+                reason="lifecycle_drift_sweep",
+            )
+            try:
+                if self.lifecycle_projector.transition(event, task=SimpleNamespace(**task)):
+                    healed += 1
+            except Exception as exc:
+                logger.warning(
+                    "lifecycle drift reconciliation failed for %s: %s", session.task_id, exc,
+                )
+        return healed
 
     def _check_human_queue_done_when(self, done_when: dict) -> tuple[bool, str]:
         """Evaluate one card's `done_when`. Returns `(passed, description)`;

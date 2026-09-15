@@ -5,11 +5,13 @@ import threading
 
 import pytest
 
-from api.services.agent_board import derive_lane
-from api.services.agent_worker.lifecycle import LifecycleEvent, LifecycleProjector
+from api.services.agent_board import RUNNING_TAG, derive_lane
+from api.services.agent_worker.lifecycle import FAILED_TAG, LifecycleEvent, LifecycleProjector
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_CLAIMED,
+    STATUS_FAILED,
+    STATUS_RUNNING,
     OCCURRENCE_DISPATCHED,
     SessionStore,
     WAIT_DEPENDENCY,
@@ -19,6 +21,20 @@ from api.services.agent_worker.session_store import (
 from api.services.task_manager import TaskManager
 
 pytestmark = pytest.mark.unit
+
+
+def _make_worker(sessions: SessionStore, manager: TaskManager):
+    """A tick-free `Worker` stub wired just enough for the lifecycle-drift
+    sweep: real store + real projector, no HTTP/Telegram/executors."""
+    from api.services.agent_worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    worker.session_store = sessions
+    worker.lifecycle_projector = LifecycleProjector(sessions, manager)
+    worker._fetch_task = lambda task_id: (
+        manager.get(task_id).to_dict() if manager.get(task_id) else None
+    )
+    return worker
 
 
 def test_occurrence_claim_is_single_winner_and_reusable(tmp_path):
@@ -166,3 +182,123 @@ def test_human_queue_wake_replays_through_projector_and_is_single_path(tmp_path)
     # dispatch the same wake a second time.
     worker._replay_wait_wakeups()
     assert len(dispatched) == 1
+
+
+def test_drift_sweep_reconciles_a_kill_parked_at_blocked(tmp_path):
+    """A kill landing on a session parked at BLOCKED bypasses the projector
+    (`mark_cancelled` is a raw status write) and there's no poll left on a
+    parked session to reconcile the vault the ordinary way — the drift
+    sweep is the only thing that still fixes the tag."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create(
+        "Synthetic parked task", status="blocked", tags=["claude_code", RUNNING_TAG],
+    )
+    sessions = SessionStore(tmp_path / "sessions.db")
+    session = sessions.create(task.id, status=STATUS_BLOCKED, routing="claude_code")
+
+    # Operator kill: flips the row terminal without touching Markdown.
+    assert sessions.mark_cancelled(
+        task.id, attempt_id=session.attempt_id, reason="operator_killed",
+    )
+    assert RUNNING_TAG in manager.get(task.id).tags  # drifted: still #agent-running
+
+    worker = _make_worker(sessions, manager)
+    healed = worker._reconcile_lifecycle_drift()
+
+    refreshed = manager.get(task.id)
+    assert healed == 1
+    assert FAILED_TAG in refreshed.tags
+    assert RUNNING_TAG not in refreshed.tags
+    assert refreshed.status == "cancelled"
+
+
+def test_drift_sweep_reconciles_a_kill_that_landed_while_worker_was_down(tmp_path):
+    """A kill can land via the operator HTTP endpoint at any time, including
+    while the worker process itself isn't running to poll anything. On the
+    next tick after restart, the sweep must still find and fix the drift
+    purely from durable state — no in-memory carryover required."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create(
+        "Synthetic offline-kill task", status="in_progress", tags=["claude_code", RUNNING_TAG],
+    )
+    sessions = SessionStore(tmp_path / "sessions.db")
+    session = sessions.create(task.id, status=STATUS_RUNNING, routing="claude_code")
+
+    # The kill lands (e.g. via the operator HTTP endpoint) while nothing is
+    # polling this session — simulated here by never touching update_status.
+    assert sessions.mark_cancelled(
+        task.id, attempt_id=session.attempt_id, reason="operator_killed",
+    )
+    assert RUNNING_TAG in manager.get(task.id).tags  # drifted before "restart"
+
+    # "Restart": a brand-new worker object, same durable stores — the sweep
+    # must not depend on anything the old process held in memory.
+    restarted_worker = _make_worker(sessions, manager)
+    healed = restarted_worker._reconcile_lifecycle_drift()
+
+    refreshed = manager.get(task.id)
+    assert healed == 1
+    assert FAILED_TAG in refreshed.tags
+    assert RUNNING_TAG not in refreshed.tags
+
+
+def test_drift_sweep_does_not_double_project_a_live_kill_already_reconciled(tmp_path):
+    """Killing a session that's still being actively polled already
+    reconciles correctly today: the executor observes the terminal row and
+    calls `update_status`, which fires the projector hook on its own. The
+    sweep must recognize that projection and leave it alone rather than
+    projecting the same transition a second time."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create(
+        "Synthetic live-kill task", status="in_progress", tags=["claude_code", RUNNING_TAG],
+    )
+    sessions = SessionStore(tmp_path / "sessions.db")
+    session = sessions.create(task.id, status=STATUS_RUNNING, routing="claude_code")
+    worker = _make_worker(sessions, manager)
+    sessions.set_status_projector(worker._project_session_status)
+
+    # Kill flips the row FAILED (no projection yet — mark_cancelled bypasses
+    # the hook), then the executor's own next poll observes the terminal row
+    # and calls update_status, which *does* fire the hook this time.
+    assert sessions.mark_cancelled(
+        task.id, attempt_id=session.attempt_id, reason="operator_killed",
+    )
+    sessions.update_status(
+        task.id, STATUS_FAILED, attempt_id=session.attempt_id, turn_id=session.turn_id,
+    )
+    reconciled = manager.get(task.id)
+    assert FAILED_TAG in reconciled.tags
+    assert RUNNING_TAG not in reconciled.tags
+
+    # Nothing left for the sweep to do — the live-kill path already applied
+    # the projection for this exact (task, status).
+    assert sessions.list_terminal_unprojected(since=0, limit=10) == []
+    healed = worker._reconcile_lifecycle_drift()
+
+    refreshed = manager.get(task.id)
+    assert healed == 0
+    assert refreshed.tags == reconciled.tags
+    assert refreshed.updated_at == reconciled.updated_at
+
+
+def test_drift_sweep_leaves_a_reopened_followup_session_alone(tmp_path):
+    """A task legitimately reopened to #agent-running for a resumed
+    follow-up turn leaves its session row non-terminal. The sweep only ever
+    looks at terminal rows, so it must never touch this — even though the
+    vault tag and the (still-live) session look superficially similar to a
+    freshly-dispatched task."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create(
+        "Synthetic reopened task", status="in_progress", tags=["claude_code", RUNNING_TAG],
+    )
+    sessions = SessionStore(tmp_path / "sessions.db")
+    sessions.create(task.id, status=STATUS_CLAIMED, routing="claude_code")
+
+    worker = _make_worker(sessions, manager)
+    healed = worker._reconcile_lifecycle_drift()
+
+    refreshed = manager.get(task.id)
+    assert healed == 0
+    assert RUNNING_TAG in refreshed.tags
+    assert refreshed.tags == task.tags
+    assert refreshed.updated_at == task.updated_at

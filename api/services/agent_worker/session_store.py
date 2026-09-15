@@ -341,6 +341,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     workflow_id                TEXT   -- doctor repair this session executes for; NULL = not a repair session
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+CREATE INDEX IF NOT EXISTS idx_sessions_status_activity ON sessions(status, last_activity_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_root ON sessions(root_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_yield ON sessions(status) WHERE status = 'yielded';
@@ -431,6 +432,8 @@ CREATE TABLE IF NOT EXISTS lifecycle_projections (
 );
 CREATE INDEX IF NOT EXISTS idx_lifecycle_projections_pending
     ON lifecycle_projections(state, created_at);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_projections_task
+    ON lifecycle_projections(task_id, target_status, state);
 
 -- Exact cancellation fences.  A FAILED status alone is not enough to tell a
 -- cancellation apart from an ordinary failure (the latter may race a clean
@@ -1810,6 +1813,49 @@ class SessionStore:
             rows = conn.execute(
                 f"SELECT * FROM sessions WHERE status NOT IN ({placeholders})",
                 tuple(TERMINAL_STATUSES),
+            ).fetchall()
+        return [self._row_to_session(r) for r in rows]
+
+    def list_terminal_unprojected(
+        self, *, since: int, limit: int = 50,
+    ) -> list[Session]:
+        """Terminal, vault-backed sessions with no acknowledged lifecycle
+        projection for their current status.
+
+        This is the drift signature left by a status write that bypasses
+        the `set_status_projector` hook on `update_status` — e.g.
+        `mark_cancelled` (used by a kill) flips the row straight to a
+        terminal status with no projection recorded, so a session that
+        wasn't actively being polled when the kill landed never gets its
+        vault tag reconciled. Operator root-spawns and spawned children
+        carry no vault task and never get such a projection by design
+        (`has_vault_task` in worker.py) — they're excluded here rather than
+        by the caller, so they can't crowd out real drift under `limit`.
+
+        Bounded on both axes so this is safe to call every tick: `since`
+        restricts the scan to recently-terminal sessions via the
+        `(status, last_activity_at)` index rather than the full history of
+        terminal sessions, and `limit` caps how many are returned.
+        """
+        placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM sessions AS s
+                WHERE s.status IN ({placeholders})
+                  AND s.last_activity_at >= ?
+                  AND (s.origin IS NULL OR s.origin != 'operator')
+                  AND s.parent_session_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM lifecycle_projections AS p
+                      WHERE p.task_id = s.task_id
+                        AND p.target_status = s.status
+                        AND p.state = 'applied'
+                  )
+                ORDER BY s.last_activity_at ASC
+                LIMIT ?
+                """,
+                (*TERMINAL_STATUSES, since, limit),
             ).fetchall()
         return [self._row_to_session(r) for r in rows]
 
