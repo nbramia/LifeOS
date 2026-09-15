@@ -5897,34 +5897,43 @@ class TestMutationUndo:
         assert lane_calls == [{"lane": "done"}], lane_calls
         expect(page.locator(".board-lane[data-lane='human_queue'] [data-card-id='t4']")).to_be_visible(timeout=5000)
 
-    def test_dragging_an_agent_blocked_card_to_done_and_undo_restores_it_without_a_human_tag(
+    def test_dragging_a_manually_blocked_card_to_done_and_undo_restores_it_without_a_human_tag(
         self, page: Page, agents_base_url,
     ):
-        """AC2: a card that reached Human queue through `agent-blocked` (not
-        `#human`) must not have Undo invent a `#human` tag or a "blocked"
-        status it never actually held — t3 arrives at Human queue purely
-        through the `agent-blocked` tag with status "blocked" already, so
-        this also exercises the pending-question guard on the card the
-        stub gives it."""
+        """AC2: a card that reached Human queue through a manually-set
+        "blocked" status (no `#human` tag at all — status alone puts it in
+        Human queue) must not have Undo invent a `#human` tag it never
+        carried. Built as its own fixture card rather than reusing t3
+        (`agent-blocked` + an assignee tag): a real `#agent-blocked` card is
+        always worker-claimed (agent_board.is_claimed treats that tag as a
+        claim regardless of a live session), so the server refuses to drag
+        it to Done at all — this exercises the one Human-queue arrival this
+        Undo path can actually be reached from without the tag."""
         page.set_viewport_size({"width": 2400, "height": 900})
+        board = _board_fixture()
+        board["lanes"]["human_queue"].append({
+            "kind": "task", "id": "t-blocked", "title": "Manually blocked card",
+            "notes": "", "status": "blocked", "tags": [], "assignee": None,
+            "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
         lane_calls = []
         task_puts = []
-        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
+        _open_board(page, agents_base_url, board_state=board, lane_calls=lane_calls, task_puts=task_puts)
         page.locator("#board-lane-filter-btn").click()
         page.locator("#board-lane-filter-options input[value='done']").check()
-        expect(page.locator('[data-card-id="t3"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t-blocked"]')).to_be_visible()
 
-        _drag_card(page, "t3", "done")
-        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t3']")).to_be_visible(timeout=5000)
+        _drag_card(page, "t-blocked", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t-blocked']")).to_be_visible(timeout=5000)
 
         toast = page.locator(".toast")
         expect(toast.locator(".toast-action")).to_have_text("Undo")
         toast.locator(".toast-action").click()
 
         _wait_for(lambda: bool(task_puts), page)
-        assert task_puts[-1] == {"status": "blocked", "tags": ["agent-blocked", "codex"]}, task_puts
-        assert "human" not in task_puts[-1]["tags"], task_puts
-        expect(page.locator(".board-lane[data-lane='human_queue'] [data-card-id='t3']")).to_be_visible(timeout=5000)
+        assert task_puts[-1] == {"status": "blocked", "tags": []}, task_puts
+        expect(page.locator(".board-lane[data-lane='human_queue'] [data-card-id='t-blocked']")).to_be_visible(timeout=5000)
 
     def test_cancel_says_it_cannot_be_undone_instead_of_offering_a_dead_link(
         self, page: Page, agents_base_url,
