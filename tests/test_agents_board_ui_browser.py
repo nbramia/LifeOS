@@ -4751,22 +4751,201 @@ class TestAssignmentTray:
         assert abs(group_center - tray_center) < 2, metrics
         assert label["x"] + label["width"] <= group_left, metrics
 
-    def test_assignee_row_spans_the_full_width_on_a_phone(self, page: Page, agents_base_url):
-        page.set_viewport_size({"width": 390, "height": 844})
+    def test_desktop_tray_keeps_its_wide_layout(self, page: Page, agents_base_url):
+        page.set_viewport_size({"width": 1280, "height": 800})
         _open_board(page, agents_base_url)
         metrics = page.evaluate(
             """() => {
                 const tray = document.getElementById('board-drop-tray');
                 const row = document.getElementById('board-assignee-drops');
+                const label = document.querySelector('.board-drop-tray-label');
                 return {
-                    trayWidth: tray.getBoundingClientRect().width,
-                    rowWidth: row.getBoundingClientRect().width,
-                    status: document.getElementById('board-drop-status').getBoundingClientRect().width,
+                    display: getComputedStyle(tray).display,
+                    rowShare: row.getBoundingClientRect().width / tray.getBoundingClientRect().width,
+                    labelPosition: getComputedStyle(label).position,
                 };
             }"""
         )
-        # Full width bar the tray's own horizontal padding.
-        assert metrics["rowWidth"] > metrics["trayWidth"] * 0.85, metrics
+        assert metrics["display"] == "flex", metrics
+        assert 0.5 < metrics["rowShare"] <= 0.67, metrics
+        assert metrics["labelPosition"] == "absolute", metrics
+
+
+class TestMobileAssignmentTray:
+    @staticmethod
+    def _open_mobile(browser: Browser, agents_base_url, assignees=None, **kwargs):
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+        )
+        page = context.new_page()
+        if assignees is not None:
+            source = (WEB_DIR / "agents" / "board.js").read_text()
+            source = source.replace(
+                "const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud'];",
+                f"const ASSIGNEES = {json.dumps(assignees)};",
+            )
+            page.route(
+                "**/static/agents/board.js",
+                lambda route: route.fulfill(
+                    status=200, content_type="application/javascript", body=source,
+                ),
+            )
+        _open_board(page, agents_base_url, **kwargs)
+        return context, page
+
+    @staticmethod
+    def _tray_metrics(page: Page):
+        return page.evaluate(
+            """() => {
+                const tray = document.getElementById('board-drop-tray');
+                const buttons = [...document.querySelectorAll(
+                    '#board-assignee-drops .board-assignee-drop, #board-done-drop'
+                )];
+                const boxes = buttons.map(button => button.getBoundingClientRect());
+                return {
+                    centers: boxes.map(box => box.top + box.height / 2),
+                    widths: boxes.map(box => box.width),
+                    heights: boxes.map(box => box.height),
+                    trayClientWidth: tray.clientWidth,
+                    trayScrollWidth: tray.scrollWidth,
+                    documentScrollWidth: document.documentElement.scrollWidth,
+                    overflowX: getComputedStyle(tray).overflowX,
+                };
+            }"""
+        )
+
+    def test_default_targets_share_one_equal_non_scrolling_phone_row(
+        self, browser: Browser, agents_base_url,
+    ):
+        context, page = self._open_mobile(browser, agents_base_url)
+        try:
+            metrics = self._tray_metrics(page)
+            assert len(metrics["widths"]) == len(_ASSIGNEE_TAGS) + 1, metrics
+            assert max(metrics["centers"]) - min(metrics["centers"]) <= 2, metrics
+            assert max(metrics["widths"]) - min(metrics["widths"]) <= 1, metrics
+            assert min(metrics["heights"]) >= 42, metrics
+            assert metrics["trayScrollWidth"] <= metrics["trayClientWidth"], metrics
+            assert metrics["documentScrollWidth"] <= 390, metrics
+            assert metrics["overflowX"] != "auto", metrics
+            expect(page.locator("#board-done-drop")).to_have_attribute("title", "Done")
+            expect(page.locator("#board-done-drop")).to_have_attribute("aria-label", re.compile(r"^Done lane"))
+        finally:
+            context.close()
+
+    def test_eight_assignees_fit_and_long_name_is_ellipsized_with_full_labels(
+        self, browser: Browser, agents_base_url,
+    ):
+        assignees = [
+            "me", "claude", "codex", "hermes", "local", "cloud",
+            "synthetic-extra-assignee", "synthetic-extremely-long-assignee",
+        ]
+        context, page = self._open_mobile(browser, agents_base_url, assignees=assignees)
+        try:
+            metrics = self._tray_metrics(page)
+            assert len(metrics["widths"]) == 9, metrics
+            assert max(metrics["centers"]) - min(metrics["centers"]) <= 2, metrics
+            assert max(metrics["widths"]) - min(metrics["widths"]) <= 1, metrics
+            assert min(metrics["heights"]) >= 42, metrics
+            assert metrics["trayScrollWidth"] <= metrics["trayClientWidth"], metrics
+            assert metrics["documentScrollWidth"] <= 390, metrics
+
+            full_name = "synthetic-extremely-long-assignee"
+            long_button = page.locator(f'.board-assignee-drop[data-assignee="{full_name}"]')
+            styles = long_button.evaluate(
+                """button => ({
+                    overflow: getComputedStyle(button).overflow,
+                    textOverflow: getComputedStyle(button).textOverflow,
+                    whiteSpace: getComputedStyle(button).whiteSpace,
+                    fontSize: parseFloat(getComputedStyle(button).fontSize),
+                })"""
+            )
+            assert styles["overflow"] == "hidden", styles
+            assert styles["textOverflow"] == "ellipsis", styles
+            assert styles["whiteSpace"] == "nowrap", styles
+            # Smaller than the desktop 0.78rem (12.48px) base, and still legible.
+            assert 8 <= styles["fontSize"] < 12, styles
+            expect(long_button).to_have_attribute("title", full_name)
+            expect(long_button).to_have_attribute("aria-label", f"Filter board to {full_name}")
+        finally:
+            context.close()
+
+    @pytest.mark.parametrize(
+        ("target", "expected"),
+        [
+            ("#board-done-drop", {"lane": "done"}),
+            ('.board-assignee-drop[data-assignee="codex"]', {"lane": "assigned", "assignee": "codex"}),
+        ],
+    )
+    def test_card_drag_to_phone_tray_target_still_writes_the_move(
+        self, browser: Browser, agents_base_url, target, expected,
+    ):
+        lane_calls = []
+        context, page = self._open_mobile(
+            browser, agents_base_url, lane_calls=lane_calls,
+        )
+        try:
+            _drag_to(page, '[data-card-id="t1"]', target)
+            _wait_for(lambda: bool(lane_calls), page)
+            assert lane_calls == [expected]
+        finally:
+            context.close()
+
+    def test_drop_status_text_does_not_shift_tray_buttons_or_height(
+        self, browser: Browser, agents_base_url,
+    ):
+        """A drag hovering a target sets the status text; that text must
+        never change the tray's height, or every button shifts out from
+        under a held finger mid-drag (see board.js onDragMove)."""
+        context, page = self._open_mobile(browser, agents_base_url)
+        try:
+            metrics = """() => {
+                const tray = document.getElementById('board-drop-tray');
+                const button = document.querySelector('.board-assignee-drop[data-assignee="codex"]');
+                return {
+                    trayHeight: tray.getBoundingClientRect().height,
+                    buttonTop: button.getBoundingClientRect().top,
+                };
+            }"""
+            before = page.evaluate(metrics)
+            page.evaluate(
+                "document.getElementById('board-drop-status').textContent = 'Drop to assign codex.'"
+            )
+            during = page.evaluate(metrics)
+            page.evaluate("document.getElementById('board-drop-status').textContent = ''")
+            after = page.evaluate(metrics)
+            assert abs(during["trayHeight"] - before["trayHeight"]) <= 1, (before, during)
+            assert abs(during["buttonTop"] - before["buttonTop"]) <= 1, (before, during)
+            assert abs(after["trayHeight"] - before["trayHeight"]) <= 1, (before, after)
+            assert abs(after["buttonTop"] - before["buttonTop"]) <= 1, (before, after)
+        finally:
+            context.close()
+
+    def test_drag_release_below_button_centre_still_assigns_at_phone_width(
+        self, browser: Browser, agents_base_url,
+    ):
+        """A thumb reaching a bottom-anchored tray button often lands below
+        its visual centre. Releasing there must still assign the card —
+        it must not be lost to the tray growing/shrinking as the drop
+        status text appears and clears during the drag."""
+        lane_calls = []
+        context, page = self._open_mobile(browser, agents_base_url, lane_calls=lane_calls)
+        try:
+            source = page.locator('[data-card-id="t1"]')
+            target = page.locator('.board-assignee-drop[data-assignee="codex"]')
+            src = source.bounding_box()
+            dst = target.bounding_box()
+            release_x = dst["x"] + dst["width"] / 2
+            release_y = dst["y"] + dst["height"] / 2 + 12
+            page.mouse.move(src["x"] + src["width"] / 2, src["y"] + src["height"] / 2)
+            page.mouse.down()
+            page.mouse.move(src["x"] + src["width"] / 2 + 60, src["y"] + src["height"] / 2, steps=4)
+            page.mouse.move(release_x, release_y, steps=10)
+            page.mouse.move(release_x, release_y, steps=1)
+            page.mouse.up()
+            _wait_for(lambda: bool(lane_calls), page)
+            assert lane_calls == [{"lane": "assigned", "assignee": "codex"}], lane_calls
+        finally:
+            context.close()
 
 
 class TestDrawerMetadata:
