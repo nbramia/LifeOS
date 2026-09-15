@@ -402,8 +402,10 @@ export class SessionPanel {
     const inferredHint = s.status_inferred ? ' (inferred)' : '';
     root.innerHTML = `
       <div class="panel-header">
-        <button class="panel-close" aria-label="Close" data-action="close">×</button>
-        <div class="panel-header-actions" data-field="actions"></div>
+        <div class="panel-header-top">
+          <div class="panel-header-actions" data-field="actions"></div>
+          <button class="panel-close" aria-label="Close" data-action="close">×</button>
+        </div>
         <div class="label" data-field="label" title="Click to rename this session">${escapeHtml(nodeLabel(s))}</div>
         <div class="cwd-hint" data-field="cwd-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-all">${s.decoded_cwd ? escapeHtml(s.decoded_cwd) : ''}</div>
         ${s.branch ? `<div class="branch-hint" data-field="branch-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.1rem">branch: ${escapeHtml(s.branch)}</div>` : ''}

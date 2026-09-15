@@ -767,18 +767,30 @@
     color: var(--text-secondary);
   }
   .pp-empty { color: var(--text-dim); font-style: italic; }
+  /* `.panel-header-top` is its own row, in normal flow, above the label
+     and the `.meta`/`.panel-chips` badge rows below it — a float here
+     would only reserve space against inline content on the SAME line,
+     not against a sibling flex container's items further down, so a wide
+     badge/chip row could paint underneath (and intercept clicks on) a
+     floated action row instead of stopping short of it. Making this row
+     part of normal flow instead guarantees the badges/chips always
+     render below it, never underneath. */
+  .panel-header-top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: flex-end;
+    gap: 0.4rem;
+  }
   /* The shared action row (web/agents/session_actions.js's
-     `renderActionRow`) mounts here — `float:right` positions this whole
-     container next to the close button instead of escaping into the rest
-     of the header (a floated box can still use `display:flex`
-     internally). `flex-wrap` is what actually lays the row out: the
-     Board drawer's own action-row container (`.drawer-actions`) is flex
-     too, so the two surfaces wrap and place a disabled action's reason
-     text (`.drawer-field-reason`) the same way — the row can hold every
-     card-only action a card-linked panel offers, not just the three
-     CLI-only buttons (`.panel-kill`/`.panel-resume`/`.panel-focus`). */
+     `renderActionRow`) mounts here. `flex-wrap` is what actually lays the
+     row out: the Board drawer's own action-row container
+     (`.drawer-actions`) is flex too, so the two surfaces wrap and place a
+     disabled action's reason text (`.drawer-field-reason`) the same way —
+     the row can hold every card-only action a card-linked panel offers,
+     not just the three CLI-only buttons
+     (`.panel-kill`/`.panel-resume`/`.panel-focus`). */
   .panel-header-actions {
-    float: right;
     display: flex;
     flex-wrap: wrap;
     align-items: center;

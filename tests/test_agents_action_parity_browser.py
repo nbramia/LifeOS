@@ -31,7 +31,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page
+from playwright.sync_api import Page, expect
 
 pytestmark = [pytest.mark.browser, pytest.mark.slow]
 
@@ -985,3 +985,168 @@ class TestResumeRowMountedOnce:
         kill = next(d for d in out if d["id"] == "kill")
         assert kill["enabled"] is False
         assert "isn't supported yet" in kill["reason"]
+
+
+# ---------------------------------------------------------------------------
+# TestGraphPanelActionsClickableAtDesktopWidth — a card-linked Graph tab
+# session with the full badge/chip set (status, source, host, routing,
+# cost, tokens, depth, model/effort chips) at a realistic desktop width.
+# Every offered action button must be reachable by a real `page.click()` —
+# no `force=True`, no `element.click()` dispatch — so a badge or chip
+# sitting on top of the action row (intercepting the click instead of
+# letting it reach the button underneath) fails the test.
+# ---------------------------------------------------------------------------
+
+_FULL_BADGE_SESSION = {
+    "session_id": "cc:panel-actions-desktop", "source": "claude_code", "status": "inactive",
+    "status_inferred": False, "routing": "claude_code", "host": "synthetic-studio-desktop-host",
+    "is_cli_session": True, "branch": "", "prompt_preview": "",
+    "decoded_cwd": "/home/synthetic/proj", "total_dollars": 12.3456,
+    "total_input_tokens": 123456, "total_output_tokens": 65432, "spawn_depth": 2,
+    "label": "Desktop panel overlap probe", "custom_label": None, "short_label": None,
+    "is_subagent": False, "parent_session_id": None,
+    "model_label": "Synthetic Opus Model", "effort": "high",
+    "pending_question": {
+        "id": 42, "session_id": "cc:panel-actions-desktop",
+        "question": "Proceed with the synthetic deploy?", "asked_at": 1700, "bot": None,
+    },
+}
+_FULL_BADGE_CARD = {
+    "kind": "task", "id": "t-panel-actions-desktop", "title": "Ship the synthetic desktop-panel fix",
+    "notes": "", "status": "in_progress", "tags": ["claude"], "assignee": "claude",
+    "fields": {}, "context": "Work", "updated_at": "2026-01-01T00:00:00+00:00",
+    "lane": "assigned",
+    "pending_question": _FULL_BADGE_SESSION["pending_question"],
+    "policy": {"cancel": {"allowed": True, "reason": None}},
+    "session": _FULL_BADGE_SESSION,
+}
+
+
+def _open_full_badge_graph_panel(page: Page, base_url: str, viewport_width: int, requests=None):
+    """`requests`, when given, collects every matched Open/Cancel request
+    URL under its `"open"` / `"cancel"` keys — those two actions have no
+    visible UI change of their own to assert against, so the test proves
+    the click landed by capturing the request it fires instead."""
+    card = json.loads(json.dumps(_FULL_BADGE_CARD))
+    session = card["session"]
+    snapshot_session = dict(session, lane=card["lane"], pending_question=session["pending_question"])
+
+    def handler(route):
+        url = route.request.url
+        path = url.split("?", 1)[0]
+        if "/api/agents/board/stream" in url:
+            return
+        if "/api/agents/stream" in url and "/sessions/" not in url:
+            return
+        if requests is not None and route.request.method == "POST":
+            if path.endswith(f"/board/cards/{card['id']}/open"):
+                requests["open"].append(url)
+            elif path.endswith(f"/board/cards/{card['id']}/cancel"):
+                requests["cancel"].append(url)
+        if path.endswith("/api/agents/board"):
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(_board_fixture(card)))
+            return
+        if "/api/agents/snapshot" in url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                "sessions": [snapshot_session], "edges": [], "generated_at": 0, "api_host": "studio",
+            }))
+            return
+        _stub_common(route, card)
+
+    page.route("**/api/**", handler)
+    page.set_viewport_size({"width": viewport_width, "height": 800})
+    page.goto(f"{base_url}/agents")
+    page.wait_for_selector(f'.board-card[data-card-id="{card["id"]}"]')
+
+    page.click('[data-tab="graph"]')
+    page.wait_for_selector("#filter-route")
+    page.select_option("#filter-recency", "all")
+    page.locator("#filter-terminal").check()
+    _click_graph_node(page, session["session_id"])
+    page.wait_for_selector('#panel [data-field="actions"] [data-action]')
+    return card, session
+
+
+class TestGraphPanelActionsClickableAtDesktopWidth:
+    # The fixture above offers exactly these ids (see `decideActions`):
+    # Open (assigned + claude), Rename (session-level), Go To/Resume (CLI,
+    # not a subagent), Kill (is_cli_session, enabled), Answer (pending
+    # question), Snooze (assigned is snooze-eligible), Cancel (policy
+    # allows it), Delete (always, for any card).
+    @pytest.mark.parametrize("action_id", [
+        "open", "rename", "focus", "resume", "kill", "answer", "snooze", "cancel", "delete",
+    ])
+    def test_every_offered_action_is_reachable_by_a_real_click_at_1280x800(
+        self, page: Page, web_base_url, action_id,
+    ):
+        requests = {"open": [], "cancel": []}
+        card, session = _open_full_badge_graph_panel(page, web_base_url, 1280, requests=requests)
+
+        offered = _extract_actions(page, '#panel [data-field="actions"]')
+        assert action_id in {a["id"] for a in offered}, (
+            f"fixture doesn't actually offer {action_id!r} — nothing to prove clickable: {offered}"
+        )
+
+        # A real click — no force, no synthetic dispatch — so an
+        # "element intercepts pointer events" failure (a badge or chip
+        # painted over the button) fails this test instead of being
+        # silently bypassed.
+        page.click(f'#panel [data-field="actions"] [data-action="{action_id}"]', timeout=5000)
+
+        if action_id == "open":
+            page.wait_for_timeout(200)
+            assert requests["open"], "clicking Open fired no request"
+        elif action_id == "cancel":
+            page.wait_for_timeout(200)
+            assert requests["cancel"], "clicking Cancel fired no request"
+        elif action_id == "rename":
+            expect(page.locator("#label-edit-input")).to_be_visible()
+        elif action_id in ("focus", "resume"):
+            # Both fire a POST that flips the button's own label while
+            # in flight — proof the click reached the button and its
+            # handler ran, not just that no exception was raised.
+            expect(page.locator(f'#panel [data-action="{action_id}"]')).to_be_disabled()
+        elif action_id == "kill":
+            expect(page.locator("#kill-confirm")).to_be_visible()
+        elif action_id == "answer":
+            expect(page.locator("#answer-text")).to_be_visible()
+        elif action_id == "snooze":
+            expect(page.locator('#panel [data-field="snooze-picker"]')).to_be_visible()
+        elif action_id == "delete":
+            expect(page.locator("#delete-confirm")).to_be_visible()
+        else:
+            raise AssertionError(f"no post-click assertion wired for {action_id!r}")
+
+    @pytest.mark.parametrize("viewport_width", [1280, 1024])
+    def test_action_row_does_not_overlap_the_badge_row(self, page: Page, web_base_url, viewport_width):
+        """Direct geometry check, independent of click hit-testing: no
+        action button's bounding box may intersect the meta badge row's or
+        the chip row's bounding box, at either a wide or a narrower desktop
+        width."""
+        _open_full_badge_graph_panel(page, web_base_url, viewport_width)
+
+        rects = page.evaluate(
+            """() => {
+                const rectOf = (sel) => {
+                    const el = document.querySelector(sel);
+                    return el ? el.getBoundingClientRect() : null;
+                };
+                const buttons = [...document.querySelectorAll('#panel [data-field="actions"] button[data-action]')]
+                    .filter(b => !b.hidden)
+                    .map(b => b.getBoundingClientRect());
+                return {
+                    meta: rectOf('#panel [data-field="meta"]'),
+                    chips: rectOf('#panel [data-field="panel-chips"]'),
+                    buttons,
+                };
+            }"""
+        )
+
+        def overlaps(a, b):
+            if not a or not b:
+                return False
+            return a["left"] < b["right"] and a["right"] > b["left"] and a["top"] < b["bottom"] and a["bottom"] > b["top"]
+
+        for rect in rects["buttons"]:
+            assert not overlaps(rect, rects["meta"]), (rect, rects["meta"])
+            assert not overlaps(rect, rects["chips"]), (rect, rects["chips"])
