@@ -80,6 +80,20 @@ A **New card** button in the filter bar opens a composer — title, optional not
 - Review and Scheduled don't get a **+** — neither lane can be set directly; a card reaches Review or Scheduled the same way it always has (the worker's own tags, or the scheduler).
 - Creating a card straight into a lane the filter is currently hiding reveals that lane, updating the saved filter selection, so the new card is actually visible.
 
+### Multi-select
+
+Holding Cmd (macOS) or Ctrl (other platforms) while clicking a task card toggles it into a selection instead of opening the drawer; modifier-clicking a selected card removes it. A selected card gets a purple outline. A plain click always clears the selection first, then opens that card's drawer as usual; Escape clears the selection when no drawer or modal is open, deferring to Escape's existing drawer-close behavior when one is. Scheduled cards are never selectable — a modifier-click on one behaves exactly as a plain click does. A modifier-held press never starts a card drag. A card that drops out of the board on a live update (deleted, or moved out from under the filter) drops out of the selection too, and the count updates.
+
+While at least one card is selected, a bottom action bar replaces the assignee tray (see [Assignee](#assignee)) and shows the count plus four actions and a clear control:
+
+- **Delete** shows one confirmation naming the number of selected cards, then deletes each one through the same path as the drawer's Delete, including killing a live, killable session first on a card that has one.
+- **Assign** opens a picker with the same assignee list the drawer uses, plus unassigned, and applies the choice to every selected card.
+- **Tag** opens the same searchable picker the drawer's Tags field uses — existing board tags, or **Create new** — and adds that one tag to every selected card, preserving each card's existing tags (protected system tags included). It only adds; there is no bulk removal.
+- **Mark Done** moves every selected card to Done: a Review card through the same acceptance transition as **Accept**, every other card through the plain lane-move endpoint. A card already in Done is a no-op.
+- The clear control (and Escape) empties the selection without acting on it.
+
+Each bulk action runs its write once per selected card and reports one summary toast naming how many succeeded; a card the server refuses (a claimed card an operator tries to reassign, for example) is left unchanged and named in the same toast alongside the server's reason, while every other card in the batch still goes through. There is no per-card confirmation and no per-card undo — Delete's one confirmation is the only prompt a bulk action shows.
+
 ### Pending questions
 
 When an agent asks a clarifying question, the card carrying that session shows the question text and an **Answer** button in the drawer. Answering writes the reply through the same path a Telegram reply takes — the worker resumes the session on its next tick exactly as if you'd answered by text.
