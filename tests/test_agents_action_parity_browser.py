@@ -31,7 +31,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page
+from playwright.sync_api import Page, expect
 
 pytestmark = [pytest.mark.browser, pytest.mark.slow]
 
@@ -985,3 +985,318 @@ class TestResumeRowMountedOnce:
         kill = next(d for d in out if d["id"] == "kill")
         assert kill["enabled"] is False
         assert "isn't supported yet" in kill["reason"]
+
+
+# ---------------------------------------------------------------------------
+# TestGraphPanelActionsClickableAtDesktopWidth — a card-linked Graph tab
+# session with the full badge/chip set (status, source, host, routing,
+# cost, tokens, depth, model/effort chips) at a realistic desktop width.
+# Every offered action button must be reachable by a real `page.click()` —
+# no `force=True`, no `element.click()` dispatch — so a badge or chip
+# sitting on top of the action row (intercepting the click instead of
+# letting it reach the button underneath) fails the test.
+# ---------------------------------------------------------------------------
+
+# A CLI session (Focus/Resume) with a terminal status (Kill refused, but
+# Resume still shown) and a short, single-word label — the combination
+# needed to make `.panel-header-actions` (the shared action row) grow wide
+# enough, and wrap its own buttons onto enough internal lines, that its
+# resulting height reaches down into `.panel-header .meta`'s (the badge
+# row directly below it) own natural top position. `status` (the first
+# badge once a terminal status hides the live dot ahead of it) is the
+# badge positioned directly over the Rename button whenever the header
+# layout lets a badge paint over the action row.
+_FULL_BADGE_SESSION = {
+    "session_id": "cc:panel-actions-desktop", "source": "claude_code", "is_cli_session": True,
+    "status": "completed", "status_inferred": False, "routing": "claude_code",
+    "host": "synthetic-studio-desktop-host", "branch": "", "prompt_preview": "",
+    "decoded_cwd": "", "total_dollars": 12.3456,
+    "total_input_tokens": 123456, "total_output_tokens": 65432, "spawn_depth": 2,
+    "label": "Deploy", "custom_label": None, "short_label": None,
+    "is_subagent": False, "parent_session_id": None,
+    "model_label": "Synthetic Opus Model", "effort": "high",
+    "pending_question": {
+        "id": 42, "session_id": "cc:panel-actions-desktop",
+        "question": "Proceed with the synthetic deploy?", "asked_at": 1700, "bot": None,
+    },
+}
+# `assignee: "local"` (not claude/codex) keeps Open off this fixture's
+# offered set — Open's own click wiring is already covered by
+# TestGraphPanelCardOnlyHandlersWired above. `lane: "assigned"` makes
+# Snooze eligible; the Cancel policy and pending question add Cancel and
+# Answer. Combined with the CLI session above, this offers Rename, Go To,
+# Resume, Answer, Snooze, Cancel, and Delete — no Kill (the session is
+# terminal) and no Open (assignee isn't claude/codex).
+_FULL_BADGE_CARD = {
+    "kind": "task", "id": "t-panel-actions-desktop", "title": "Ship the synthetic desktop-panel fix",
+    "notes": "", "status": "in_progress", "tags": ["claude"], "assignee": "local",
+    "fields": {}, "context": "Work", "updated_at": "2026-01-01T00:00:00+00:00",
+    "lane": "assigned",
+    "pending_question": _FULL_BADGE_SESSION["pending_question"],
+    "policy": {"cancel": {"allowed": True, "reason": None}},
+    "session": _FULL_BADGE_SESSION,
+}
+
+
+def _open_graph_panel_for(page: Page, base_url: str, viewport_width: int, card_fixture, cancel_requests=None):
+    """Opens the Graph tab's side panel for an arbitrary (session, card)
+    fixture — `card_fixture["session"]` is the linked session. `cancel_requests`,
+    when given, collects every matched Cancel request URL — Cancel has no
+    visible UI change of its own to assert against, so the test proves the
+    click landed by capturing the request it fires instead."""
+    card = json.loads(json.dumps(card_fixture))
+    session = card["session"]
+    snapshot_session = dict(session, lane=card["lane"], pending_question=session["pending_question"])
+
+    def handler(route):
+        url = route.request.url
+        path = url.split("?", 1)[0]
+        if "/api/agents/board/stream" in url:
+            return
+        if "/api/agents/stream" in url and "/sessions/" not in url:
+            return
+        if (cancel_requests is not None and route.request.method == "POST"
+                and path.endswith(f"/board/cards/{card['id']}/cancel")):
+            cancel_requests.append(url)
+        if path.endswith("/api/agents/board"):
+            lanes = {
+                "unassigned": [], "assigned": [], "in_progress": [],
+                "human_queue": [], "scheduled": [], "review": [], "done": [],
+            }
+            lanes[card["lane"]] = [card]
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                "lanes": lanes, "generated_at": 0,
+            }))
+            return
+        if "/api/agents/snapshot" in url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                "sessions": [snapshot_session], "edges": [], "generated_at": 0, "api_host": "studio",
+            }))
+            return
+        _stub_common(route, card)
+
+    page.route("**/api/**", handler)
+    page.set_viewport_size({"width": viewport_width, "height": 800})
+    page.goto(f"{base_url}/agents")
+    page.wait_for_selector(f'.board-card[data-card-id="{card["id"]}"]')
+
+    page.click('[data-tab="graph"]')
+    page.wait_for_selector("#filter-route")
+    page.select_option("#filter-recency", "all")
+    page.locator("#filter-terminal").check()
+    _click_graph_node(page, session["session_id"])
+    page.wait_for_selector('#panel [data-field="actions"] [data-action]')
+    return card, session
+
+
+def _open_full_badge_graph_panel(page: Page, base_url: str, viewport_width: int, cancel_requests=None):
+    return _open_graph_panel_for(
+        page, base_url, viewport_width, _FULL_BADGE_CARD, cancel_requests=cancel_requests,
+    )
+
+
+class TestGraphPanelActionsClickableAtDesktopWidth:
+    # The fixture above offers exactly these ids (see `decideActions`):
+    # Rename (session-level), Go To/Resume (CLI, not a subagent), Answer
+    # (pending question), Snooze (assigned is snooze-eligible), Cancel
+    # (policy allows it), Delete (always, for any card) — no Kill (the
+    # session is terminal) and no Open (assignee isn't claude/codex).
+    @pytest.mark.parametrize("action_id", [
+        "rename", "focus", "resume", "answer", "snooze", "cancel", "delete",
+    ])
+    def test_every_offered_action_is_reachable_by_a_real_click_at_1280x800(
+        self, page: Page, web_base_url, action_id,
+    ):
+        cancel_requests = []
+        card, session = _open_full_badge_graph_panel(page, web_base_url, 1280, cancel_requests=cancel_requests)
+
+        offered = _extract_actions(page, '#panel [data-field="actions"]')
+        assert action_id in {a["id"] for a in offered}, (
+            f"fixture doesn't actually offer {action_id!r} — nothing to prove clickable: {offered}"
+        )
+
+        # A real click — no force, no synthetic dispatch — so an
+        # "element intercepts pointer events" failure (a badge painted
+        # over the button, e.g. `.badge[data-field="status"]` over Rename
+        # or `.badge[data-field="host"]` over Cancel) fails this test
+        # instead of being silently bypassed.
+        page.click(f'#panel [data-field="actions"] [data-action="{action_id}"]', timeout=5000)
+
+        if action_id == "cancel":
+            page.wait_for_timeout(200)
+            assert cancel_requests, "clicking Cancel fired no request"
+        elif action_id == "rename":
+            expect(page.locator("#label-edit-input")).to_be_visible()
+        elif action_id in ("focus", "resume"):
+            # Both fire a POST that flips the button's own label while in
+            # flight — proof the click reached the button and its handler
+            # ran, not just that no exception was raised.
+            expect(page.locator(f'#panel [data-action="{action_id}"]')).to_be_disabled()
+        elif action_id == "answer":
+            expect(page.locator("#answer-text")).to_be_visible()
+        elif action_id == "snooze":
+            expect(page.locator('#panel [data-field="snooze-picker"]')).to_be_visible()
+        elif action_id == "delete":
+            expect(page.locator("#delete-confirm")).to_be_visible()
+        else:
+            raise AssertionError(f"no post-click assertion wired for {action_id!r}")
+
+    @pytest.mark.parametrize("viewport_width", [1280, 1024])
+    def test_action_row_does_not_overlap_the_badge_row(self, page: Page, web_base_url, viewport_width):
+        """Direct geometry check, independent of click hit-testing: no
+        action button's bounding box may intersect an individual badge's or
+        chip's bounding box, at either a wide or a narrower desktop width.
+        Checks each badge/chip individually rather than their `.meta`/
+        `.panel-chips` parent container — a badge that can't wrap (no
+        break opportunity in its text) can overflow its own parent's box,
+        so the parent's own bounding rect alone would miss exactly the
+        overlap this bug produces."""
+        _open_full_badge_graph_panel(page, web_base_url, viewport_width)
+
+        rects = page.evaluate(
+            """() => {
+                const buttons = [...document.querySelectorAll('#panel [data-field="actions"] button[data-action]')]
+                    .filter(b => !b.hidden && b.getBoundingClientRect().width > 0)
+                    .map(b => ({id: b.dataset.action, rect: b.getBoundingClientRect()}));
+                const badges = [...document.querySelectorAll(
+                    '#panel [data-field="meta"] > *, #panel [data-field="panel-chips"] > *'
+                )].map(el => ({field: el.dataset ? el.dataset.field : null, rect: el.getBoundingClientRect()}));
+                return {buttons, badges};
+            }"""
+        )
+
+        def overlaps(a, b):
+            return a["left"] < b["right"] and a["right"] > b["left"] and a["top"] < b["bottom"] and a["bottom"] > b["top"]
+
+        for button in rects["buttons"]:
+            for badge in rects["badges"]:
+                assert not overlaps(button["rect"], badge["rect"]), (button, badge)
+
+
+# ---------------------------------------------------------------------------
+# TestGraphPanelCloseButtonPinnedTopRight — `.panel-close` must stay in the
+# top-right corner of the header, on the same row as the FIRST line of the
+# action row, regardless of how many actions that row needs or how many
+# lines they wrap onto. Five session/card shapes below independently vary
+# the offered action count and the label length, so a regression that only
+# shows up once the action row needs enough lines to overflow (or once the
+# label itself wraps) can't hide behind a single fixture.
+# ---------------------------------------------------------------------------
+
+def _close_pos_session(session_id, **overrides):
+    base = {
+        "session_id": session_id, "source": "lifeos_agent", "status": "running",
+        "status_inferred": False, "routing": "local", "host": "", "branch": "",
+        "prompt_preview": "", "decoded_cwd": "", "total_dollars": 0.0,
+        "total_input_tokens": 0, "total_output_tokens": 0, "spawn_depth": 0,
+        "label": "Probe", "custom_label": None, "short_label": None,
+        "is_subagent": False, "parent_session_id": None, "pending_question": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def _close_pos_card(card_id, session, **overrides):
+    base = {
+        "kind": "task", "id": card_id, "title": "Probe card",
+        "notes": "", "status": "in_progress", "tags": [], "assignee": "local",
+        "fields": {}, "context": "Work", "updated_at": "2026-01-01T00:00:00+00:00",
+        "lane": "in_progress", "pending_question": session.get("pending_question"),
+        "policy": {}, "session": session,
+    }
+    base.update(overrides)
+    return base
+
+
+def _v_running_minimal():
+    """A plain, non-terminal, non-CLI session with no card-only actions
+    beyond Delete — offers Rename, Kill, Delete: a single, short action
+    row, kept here as the simplest baseline the other, wider-row variants
+    are compared against."""
+    session = _close_pos_session("sess-cp-running", label="Run")
+    return _close_pos_card("t-cp-running", session)
+
+
+def _v_review_completed():
+    """A terminal (Kill refused), Review-lane session — offers Rename,
+    Accept, Reject, Reassign, Delete."""
+    session = _close_pos_session("sess-cp-review", status="completed", label="Review probe")
+    return _close_pos_card("t-cp-review", session, lane="review", assignee="claude")
+
+
+def _v_blocked_answer():
+    """A non-terminal session with a pending question in the Human queue
+    lane — offers Rename, Kill, Answer, Delete (Mark Done is refused while
+    a question is pending)."""
+    pq = {"id": 9, "session_id": "sess-cp-blocked", "question": "Proceed?", "asked_at": 1700, "bot": None}
+    session = _close_pos_session("sess-cp-blocked", status="blocked", label="Blocked probe", pending_question=pq)
+    return _close_pos_card("t-cp-blocked", session, lane="human_queue", assignee=None, pending_question=pq)
+
+
+def _v_assigned_long_label_snooze():
+    """An Assigned-lane session with a cancel policy and a label long
+    enough to wrap the label itself, not just the action row — offers
+    Rename, Kill, Snooze, Cancel, Delete."""
+    session = _close_pos_session(
+        "sess-cp-assigned", status="idle",
+        label="A deliberately long synthetic session label meant to wrap "
+              "across several lines in the narrow side panel",
+    )
+    return _close_pos_card(
+        "t-cp-assigned", session, lane="assigned",
+        policy={"cancel": {"allowed": True, "reason": None}},
+    )
+
+
+def _v_cli_session():
+    """A CLI session (adds Go To/Resume, the latter with its own host
+    `<select>`) linked to an Assigned card offered to `codex` — offers
+    Open, Rename, Go To, Resume, Kill, Snooze, Delete: the widest action
+    row of the five variants."""
+    session = _close_pos_session(
+        "cc:cp-cli", source="claude_code", is_cli_session=True, status="inactive", label="CLI probe",
+    )
+    return _close_pos_card("t-cp-cli", session, lane="assigned", assignee="codex")
+
+
+_CLOSE_POS_VARIANTS = {
+    "running_minimal": _v_running_minimal,
+    "review_completed": _v_review_completed,
+    "blocked_answer": _v_blocked_answer,
+    "assigned_long_label_snooze": _v_assigned_long_label_snooze,
+    "cli_session": _v_cli_session,
+    "full_badge_set": lambda: _FULL_BADGE_CARD,
+}
+
+
+class TestGraphPanelCloseButtonPinnedTopRight:
+    @pytest.mark.parametrize("variant_name", list(_CLOSE_POS_VARIANTS))
+    @pytest.mark.parametrize("viewport_width", [1280, 1024, 390])
+    def test_close_button_shares_the_first_action_rows_top_and_sits_above_the_label(
+        self, page: Page, web_base_url, viewport_width, variant_name,
+    ):
+        card_fixture = _CLOSE_POS_VARIANTS[variant_name]()
+        _open_graph_panel_for(page, web_base_url, viewport_width, card_fixture)
+
+        rects = page.evaluate(
+            """() => {
+                const close = document.querySelector('#panel .panel-close').getBoundingClientRect();
+                const label = document.querySelector('#panel [data-field="label"]').getBoundingClientRect();
+                const buttons = [...document.querySelectorAll('#panel [data-field="actions"] button[data-action]')]
+                    .filter(b => !b.hidden && b.getBoundingClientRect().width > 0)
+                    .map(b => b.getBoundingClientRect());
+                return {close, label, buttons};
+            }"""
+        )
+
+        first_row_top = min(b["top"] for b in rects["buttons"])
+        assert abs(rects["close"]["top"] - first_row_top) <= 2, (
+            f"{variant_name} at {viewport_width}px: close button top "
+            f"{rects['close']['top']} isn't on the first action row's own "
+            f"top {first_row_top} — it dropped onto a later line"
+        )
+        assert rects["close"]["top"] < rects["label"]["top"], (
+            f"{variant_name} at {viewport_width}px: close button "
+            f"(top {rects['close']['top']}) isn't above the session label "
+            f"(top {rects['label']['top']})"
+        )

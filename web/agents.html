@@ -767,22 +767,45 @@
     color: var(--text-secondary);
   }
   .pp-empty { color: var(--text-dim); font-style: italic; }
+  /* `.panel-header-top` is its own row, in normal flow, above the label
+     and the `.meta`/`.panel-chips` badge rows below it — normal flow
+     (never floated) guarantees the badges/chips always render below it,
+     never underneath. `flex-wrap: nowrap` on THIS row, combined with
+     `.panel-close`'s `flex: none` below, keeps the close button pinned to
+     the top-right corner regardless of how tall the action row gets —
+     `.panel-header-actions` is the only item allowed to wrap (onto
+     multiple lines within its own box, via `flex: 1 1 auto; min-width: 0`
+     shrinking it to make room), so a wide action row grows DOWN within
+     its own column instead of pushing the close button onto a second
+     line of this row. */
+  .panel-header-top {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: flex-start;
+    justify-content: flex-end;
+    gap: 0.4rem;
+  }
   /* The shared action row (web/agents/session_actions.js's
-     `renderActionRow`) mounts here — `float:right` positions this whole
-     container next to the close button instead of escaping into the rest
-     of the header (a floated box can still use `display:flex`
-     internally). `flex-wrap` is what actually lays the row out: the
-     Board drawer's own action-row container (`.drawer-actions`) is flex
-     too, so the two surfaces wrap and place a disabled action's reason
-     text (`.drawer-field-reason`) the same way — the row can hold every
-     card-only action a card-linked panel offers, not just the three
-     CLI-only buttons (`.panel-kill`/`.panel-resume`/`.panel-focus`). */
+     `renderActionRow`) mounts here. `flex-wrap` is what actually lays the
+     row out: the Board drawer's own action-row container
+     (`.drawer-actions`) is flex too, so the two surfaces wrap and place a
+     disabled action's reason text (`.drawer-field-reason`) the same way —
+     the row can hold every card-only action a card-linked panel offers,
+     not just the three CLI-only buttons
+     (`.panel-kill`/`.panel-resume`/`.panel-focus`). `flex: 1 1 auto;
+     min-width: 0` lets this shrink and wrap onto multiple lines within
+     `.panel-header-top` (see above) instead of forcing that nowrap row to
+     overflow. */
   .panel-header-actions {
-    float: right;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     gap: 0.4rem;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .panel-header-top > .panel-close {
+    flex: none;
   }
   .panel-close {
     background: none;
