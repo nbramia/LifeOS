@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-08
+**Last Updated:** 2026-09-15
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Four adjacent catalogs split out for size:
 
@@ -32,7 +32,8 @@ Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Fou
 15. [Performance Trace Endpoints](#performance-trace-endpoints)
 16. [Admin Endpoints](#admin-endpoints)
 17. [Card Assignment Endpoints](#card-assignment-endpoints-851)
-18. [MCP Tools — see mcp-tools.md](mcp-tools.md)
+18. [Home Endpoints (Eero)](#home-endpoints-eero)
+19. [MCP Tools — see mcp-tools.md](mcp-tools.md)
 
 ---
 
@@ -806,6 +807,50 @@ Open an Assigned card (`status == "todo"`, a recognized assignee tag, no session
 
 ---
 
+## Home Endpoints (Eero)
+
+Pause/resume household internet access via eero — the `home` integration namespace's first provider. Every route is gated 503 until an eero session token is available; see [Home — eero guide](../../guides/home-eero.md) for setup and failure alerting.
+
+### GET /api/home/eero/status
+
+Every configured target's current state, read live from the vendor. Returns `{targets: [{name, type, paused, resume_at}]}`. `resume_at` is the pending scheduled auto-resume time (ISO datetime), or `null`.
+
+### POST /api/home/eero/{name}/pause
+
+Pause a profile or device's internet access. Idempotent and state-reconciling: sets the value, reads it back, and reports what the vendor actually has. `name` matches a configured target case-insensitively.
+
+**Request body (optional):**
+```json
+{"minutes": 60}
+```
+`minutes` (1-1440) schedules an automatic resume via the scheduler. Omitted, the target's configured `default_minutes` applies if it has one, else the pause is indefinite and any existing pending resume is cleared. `indefinite: true` forces an indefinite pause regardless of `default_minutes` and cannot be combined with `minutes` (`422`). `scheduled: true` marks this as a scheduler fire (a recurring cron schedule or a timed pause's own auto-resume): a success with no `mismatch` then returns an empty `scheduler_message`, which the scheduler's fire loop sends nothing for.
+
+**Response:**
+```json
+{
+  "name": "Kid's iPad",
+  "type": "profile",
+  "requested_paused": true,
+  "paused": true,
+  "mismatch": false,
+  "resume_at": "2026-09-15T19:00:00+00:00",
+  "scheduler_message": "Kid's iPad: paused"
+}
+```
+`mismatch` is `true` when the read-back state differs from what was requested (the write succeeded at the transport level but the vendor didn't apply it). **Errors:** `404` for an unknown target name (lists configured names, no vendor call made); `502` if the vendor rejects the write or returns an unrecognized response shape, or if the session is dead (a refresh was attempted and failed) — both alert via Telegram and a human-queue card.
+
+### POST /api/home/eero/{name}/resume
+
+Resume a profile or device's internet access. Same idempotent, state-reconciling, and error shape as pause. Cancels any pending scheduled auto-resume for the target.
+
+**Request body (optional):**
+```json
+{"scheduled": true}
+```
+`scheduled: true` marks this as the scheduler's own fire of a timed pause's auto-resume: the route retries the vendor write up to 3 times with backoff before giving up, alerting (human-queue key `eero-resume-failed:<name>`) and returning `502` only after every attempt fails — the scheduler marks a one-off entry fired before calling the endpoint and never re-fires it, so this route is the only chance to retry. As with pause, a `scheduled: true` call that succeeds with no `mismatch` returns an empty `scheduler_message`.
+
+---
+
 ## Related Documents
 
 - [api-communications.md](api-communications.md) — Chat/search, Google integration, and messaging HTTP endpoints (split out from this file)
@@ -820,3 +865,4 @@ Open an Assigned card (`status == "todo"`, a recognized assignee tag, no session
 - [Configuration](../../guides/configuration.md) — Env vars referenced by several endpoints (LIFEOS_USER_NAME, LIFEOS_WORK_DOMAIN, etc.)
 - [Observability](../technical/observability.md#route-timing) — How `/api/perf/routes` is populated (`RouteTimingMiddleware`, the slow-request threshold)
 - [Agent Viz](agent-viz.md) — The `/agents` Kanban board these endpoints back
+- [Home — eero](../../guides/home-eero.md) — Login, target configuration, and failure alerting for the Home Endpoints above

@@ -636,6 +636,26 @@ def test_investments_tool_curated():
 
 
 @pytest.mark.unit
+def test_home_eero_tools_curated():
+    """The three eero pause/resume/status operations are exposed via
+    CURATED_ENDPOINTS, each with a description inside the 30-word budget."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    by_name = {c["name"]: c for c in module.CURATED_ENDPOINTS.values()}
+    for name, method in (
+        ("lifeos_home_eero_pause", "POST"),
+        ("lifeos_home_eero_resume", "POST"),
+        ("lifeos_home_eero_status", "GET"),
+    ):
+        cfg = by_name.get(name)
+        assert cfg is not None, f"{name} missing from CURATED_ENDPOINTS"
+        assert cfg["method"] == method
+        assert len(cfg["description"].split()) <= 30
+
+
+@pytest.mark.unit
 def test_investments_format_digest():
     """_format_response renders a portfolio digest that surfaces synced_at."""
     import importlib.util

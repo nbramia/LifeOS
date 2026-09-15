@@ -72,6 +72,7 @@ config/family_members.json.bak.*
 config/linkedin_tags.json
 config/linkedin_industry_mappings.json
 config/linkedin_bad_matches.json
+config/home/eero_targets.json
 config/agent_capabilities.md
 config/crm_mappings.yaml
 config/gsheet_sync.yaml

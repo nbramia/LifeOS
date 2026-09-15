@@ -1405,6 +1405,22 @@ class Settings(BaseSettings):
                     "token, separate from LIFEOS_MCP_BEARER_TOKEN/LIFEOS_HEALTH_INGEST_TOKEN."
     )
 
+    # Home automation — eero. Fallback session token for the eero
+    # vendor client: the gitignored state file data/home/eero_session.json is
+    # tried first (so a refreshed token survives a restart), this is the
+    # bootstrap/fallback. Empty disables every /api/home/eero/* endpoint (503).
+    eero_session_token: str = Field(
+        default="",
+        alias="LIFEOS_EERO_SESSION_TOKEN",
+        description="Fallback eero vendor session token, used when "
+                    "data/home/eero_session.json is absent. Obtain one with "
+                    "`scripts/eero_login.py --login <email-or-phone>` then "
+                    "`--code <code>`, which writes the state file directly — "
+                    "setting this env var is only needed to seed a session "
+                    "without running the login script. Empty disables the "
+                    "endpoints (503)."
+    )
+
     # Pebble writes finalized, framed capture evidence into this producer-owned
     # archive.  Filing is opt-in until an operator has verified dry-run output;
     # no network credential or cloud LLM fallback is involved.
