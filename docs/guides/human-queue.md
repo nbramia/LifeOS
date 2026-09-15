@@ -1,16 +1,19 @@
 # Human Queue
 
 **Status:** Complete
-**Last Updated:** 2026-09-07
+**Last Updated:** 2026-09-15
 **Audience:** Operator, Contributor
 
 The Human queue is a shared, fire-and-forget list of things only the operator
-can do — an interactive session that notices an expired login, a nightly
-sync that fails on a stale credential, a Codex run that hits a decision it
-can't make on its own. Any agent — interactive Claude Code, the agent
+can do — a nightly sync that fails on a stale credential, an unattended run
+that stops on something no agent can perform, a check that needs the
+operator's own hardware. Any agent — interactive Claude Code, the agent
 worker, `/chat`, or Hermes — can file a card without stopping, and LifeOS
 itself files cards for known operator-only failures (sync errors, an
 expired Monarch session).
+
+Cards are meant to be rare. An agent talking to the operator asks instead of
+filing; the bar is in the instruction paragraph below.
 
 A card is a task ([task-management](../specs/technical/task-management.md))
 with tag `human` and status `blocked` — no new storage, no schema change.
@@ -23,14 +26,20 @@ Paste this into an operator-level instruction file (`CLAUDE.md`/`AGENTS.md`
 on a machine you run agents from) so every agent on that machine knows the
 convention:
 
-> When a conversation surfaces a task that only the operator can do — one
-> the conversation itself can't finish (a credential to re-enter, an
-> approval, a decision only the operator can make) — file it with
-> `lifeos_human_queue_add` (a short title, notes on what's needed and why, and
-> a stable `key` so re-observing the same problem updates one card instead of
-> piling up duplicates). When you later see the thing done, resolve it with
-> `lifeos_human_queue_resolve`. Never file work you can do yourself — file
-> only what genuinely requires the operator.
+> File a Human-queue card only when a task genuinely won't be completed as
+> part of the ongoing conversation — or when you ask and the operator
+> confirms they want one. If the operator is in the conversation, ask them
+> directly; while it's ongoing, keep surfacing the decision or need rather
+> than filing a card instead of asking. Never file a card as a reminder, a
+> to-do, or a handoff for work that is merely unfinished and ongoing. Do not
+> file design decisions, scope or policy questions, review exceptions, or
+> approval for work you're about to do; those belong in the conversation, or
+> in a GitHub issue if they should outlive it. Never file work you can do
+> yourself. If you're unsure, don't file — these should be rare. File with
+> `lifeos_human_queue_add` (short title, notes on what's needed and why, and a
+> stable `key` so re-observing the same problem updates one card instead of
+> creating duplicates), and resolve it with `lifeos_human_queue_resolve` when
+> you see it done.
 
 The repository ships this paragraph; installing it into an operator's own
 instruction files is a manual, per-install step.
