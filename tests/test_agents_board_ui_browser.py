@@ -3435,12 +3435,12 @@ class TestLaneAddButton:
 
 
 class TestComposerTagsPicker:
-    """#1087: the New card composer mounts the same Tags picker
-    (`mountTagPicker`) the drawer uses, in local-only mode — chosen tags are
-    tracked in memory (no `PUT .../tags`, no board re-fetch) and read back
-    when the card is actually created, since there's no card id yet to
-    persist against. Fixture tag `human` (t4, human_queue) is a non-lifecycle
-    board tag the picker offers as an existing suggestion."""
+    """The New card composer mounts the same Tags picker (`mountTagPicker`)
+    the drawer uses, in local-only mode — chosen tags are tracked in memory
+    (no `PUT .../tags`, no board re-fetch) and read back when the card is
+    actually created, since there's no card id yet to persist against.
+    Fixture tag `human` (t4, human_queue) is a non-lifecycle board tag the
+    picker offers as an existing suggestion."""
 
     def test_existing_and_new_tag_both_reach_the_create_payload(self, page: Page, agents_base_url):
         task_posts = []
