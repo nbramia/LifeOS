@@ -3434,6 +3434,90 @@ class TestLaneAddButton:
         expect(page.locator("#board-lane-filter-options input[value='human_queue']")).not_to_be_checked()
 
 
+class TestComposerTagsPicker:
+    """#1087: the New card composer mounts the same Tags picker
+    (`mountTagPicker`) the drawer uses, in local-only mode — chosen tags are
+    tracked in memory (no `PUT .../tags`, no board re-fetch) and read back
+    when the card is actually created, since there's no card id yet to
+    persist against. Fixture tag `human` (t4, human_queue) is a non-lifecycle
+    board tag the picker offers as an existing suggestion."""
+
+    def test_existing_and_new_tag_both_reach_the_create_payload(self, page: Page, agents_base_url):
+        task_posts = []
+        task_puts = []
+        _open_board(page, agents_base_url, task_posts=task_posts, task_puts=task_puts)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Composer tags test")
+        search = page.locator(".drawer-tags")
+        search.fill("hum")
+        expect(page.locator('[data-field="tag-options"] [data-select-tag="human"]')).to_be_visible()
+        page.locator('[data-field="tag-options"] [data-select-tag="human"]').click()
+        search.fill("gamma-tag")
+        expect(page.locator(".drawer-tag-option-create")).to_contain_text("#gamma-tag")
+        page.locator(".drawer-tag-option-create").click()
+        expect(page.locator(".drawer-tag-chip")).to_have_count(2)
+        # Local-only mode: choosing tags never PUTs anything — there's no
+        # card id yet to persist against.
+        assert task_puts == [], task_puts
+
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Composer tags test", "tags": ["human", "gamma-tag"]}, task_posts
+        expect(page.locator("#new-card-title")).to_have_count(0)
+        expect(page.locator('[data-card-id="new-1"]')).to_contain_text("#human")
+        expect(page.locator('[data-card-id="new-1"]')).to_contain_text("#gamma-tag")
+        assert task_puts == [], task_puts
+
+    def test_assignee_and_chosen_tags_merge_without_a_duplicate_routing_tag(self, page: Page, agents_base_url):
+        task_posts = []
+        lane_calls = []
+        _open_board(page, agents_base_url, task_posts=task_posts, lane_calls=lane_calls)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Assignee plus tags")
+        page.locator("#new-card-assignee").select_option("claude")
+        search = page.locator(".drawer-tags")
+        # Typing the assignee's own name is rejected exactly like the
+        # drawer's picker rejects it — no "Create new" option for it, so it
+        # can never end up duplicated alongside the routing tag Create adds.
+        search.fill("claude")
+        expect(page.locator(".drawer-tag-option-create")).to_have_count(0)
+        search.fill("beta-tag")
+        page.locator(".drawer-tag-option-create").click()
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Assignee plus tags", "tags": ["claude", "beta-tag"]}, task_posts
+
+    def test_no_tags_and_no_assignee_leaves_the_create_payload_unchanged(self, page: Page, agents_base_url):
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Plain composer card")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Plain composer card"}, task_posts
+
+    def test_typing_a_lifecycle_tag_is_rejected(self, page: Page, agents_base_url):
+        task_posts = []
+        task_puts = []
+        _open_board(page, agents_base_url, task_posts=task_posts, task_puts=task_puts)
+        page.locator("#board-new-card").click()
+        search = page.locator(".drawer-tags")
+        search.fill("agent-running foo")
+        page.locator("#new-card-desc").click()  # blur the tags field
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        expect(search).to_have_value("foo")
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+        assert task_puts == [], task_puts
+
+        page.locator("#new-card-desc").fill("Lifecycle tag rejected")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {"description": "Lifecycle tag rejected", "tags": ["foo"]}, task_posts
+        assert not any("agent-running" in (p.get("tags") or []) for p in task_posts)
+
+
 class TestDrawerClickOutsideClose:
     """AC 4: a click on the backdrop (board background/lane/card) closes
     the drawer; a click inside it does not; a mousedown-inside ->

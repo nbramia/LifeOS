@@ -1168,6 +1168,14 @@ export function initBoard() {
         <input id="new-card-desc" type="text" style="width:100%;box-sizing:border-box;margin:0.35rem 0;padding:0.4rem;background:var(--bg-elev);color:var(--text-primary);border:1px solid var(--border);border-radius:6px" />
         <label style="font-size:0.75rem;color:var(--text-secondary)">Notes (optional)</label>
         <textarea id="new-card-notes" placeholder="Notes…"></textarea>
+        <label style="font-size:0.75rem;color:var(--text-secondary)">Tags</label>
+        <div class="drawer-tags-picker" data-field="tags-picker" role="group" aria-label="Tags">
+          <div class="drawer-tag-chips" data-field="tag-chips" role="list"></div>
+          <input class="drawer-tags drawer-tags-search" data-field="tags" type="search" role="combobox"
+                 aria-autocomplete="list" aria-expanded="false" autocomplete="off"
+                 placeholder="Search or add tags…" />
+          <div class="drawer-tag-options" data-field="tag-options" role="listbox" hidden></div>
+        </div>
         <label style="font-size:0.75rem;color:var(--text-secondary)">Lane</label>
         <select id="new-card-lane" style="width:100%;margin:0.35rem 0;padding:0.4rem;background:var(--bg-elev);color:var(--text-primary);border:1px solid var(--border);border-radius:6px">
           ${LANES.filter(l => DIRECT_LANE_IDS.has(l.id)).map(l => `<option value="${l.id}" ${l.id === initialLane ? 'selected' : ''}>${escapeHtml(l.label)}</option>`).join('')}
@@ -1184,7 +1192,14 @@ export function initBoard() {
       </div>
     `;
     document.body.appendChild(backdrop);
-    const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
+    // Local-only mode (no `persist`): the card doesn't exist yet, so the
+    // picker just tracks chosen tags in memory — read back via `.getTags()`
+    // below when the card is actually created.
+    const composerTagPicker = mountTagPicker(backdrop, [], {});
+    const cleanup = () => {
+      if (composerTagPicker && composerTagPicker.cancel) composerTagPicker.cancel();
+      if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
+    };
     backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
     backdrop.querySelector('#new-card-cancel').onclick = cleanup;
 
@@ -1232,6 +1247,12 @@ export function initBoard() {
         showToast('Only "me" can be assigned directly to In progress — the worker claims agent-assigned tasks itself.', true);
         return;
       }
+      // The picker itself already refuses any tag matching an assignee name
+      // (normalizeEditableTag filters ASSIGNEES the same as the drawer's
+      // picker does), so a chosen tag can never collide with the assignee's
+      // own routing tag — no separate de-dup pass is needed beyond `Set`.
+      const chosenTags = composerTagPicker && composerTagPicker.getTags ? composerTagPicker.getTags() : [];
+      const tags = assignee ? [...new Set([assignee, ...chosenTags])] : chosenTags;
       const btn = backdrop.querySelector('#new-card-create');
       btn.disabled = true;
       btn.textContent = 'Creating…';
@@ -1242,7 +1263,7 @@ export function initBoard() {
           body: JSON.stringify({
             description: desc,
             notes: notes || undefined,
-            tags: assignee ? [assignee] : undefined,
+            tags: tags.length ? tags : undefined,
           }),
         });
         if (!r.ok) {
@@ -1533,8 +1554,17 @@ export function initBoard() {
     return left.length === right.length && left.every((tag, index) => tag === right[index]);
   }
 
-  function mountTagPicker(card, initialTags) {
-    const picker = drawerEl.querySelector('[data-field="tags-picker"]');
+  // `container` is the DOM subtree carrying the `[data-field="tags-picker"]`
+  // markup — the drawer (`drawerEl`) for an existing card, or a composer
+  // modal for a card that doesn't exist yet. `config.persist(tags)` is the
+  // async save call for a card that already has an id (the drawer's
+  // `putBoardTags`); omitting it (the composer) puts the picker in
+  // local-only mode — it just tracks the chosen tags in memory for the
+  // caller to read back via `handle.getTags()` at submit time, with no
+  // network call and no board re-fetch.
+  function mountTagPicker(container, initialTags, config) {
+    const persist = config && config.persist;
+    const picker = container.querySelector('[data-field="tags-picker"]');
     const search = picker && picker.querySelector('[data-field="tags"]');
     const chips = picker && picker.querySelector('[data-field="tag-chips"]');
     const options = picker && picker.querySelector('[data-field="tag-options"]');
@@ -1596,11 +1626,16 @@ export function initBoard() {
       const generation = saveGeneration;
       selected = requested;
       renderChips();
+      if (!persist) {
+        // Local-only mode: nothing to save yet, so confirm immediately.
+        confirmed = requested.slice();
+        return;
+      }
       pendingSaves += 1;
       saveChain = saveChain.then(async () => {
         try {
           if (cancelled || generation !== saveGeneration) return;
-          await putBoardTags(card.id, requested);
+          await persist(requested);
           confirmed = requested.slice();
           if (!cancelled && generation === saveGeneration) await fetchBoard();
         } catch (err) {
@@ -1717,8 +1752,11 @@ export function initBoard() {
       rearm: () => { cancelled = false; },
       isSaving: () => !cancelled && pendingSaves > 0,
       whenIdle: () => saveChain,
+      // The composer reads the chosen tags back through this at submit
+      // time instead of persisting through `config.persist`.
+      getTags: () => confirmed.slice(),
     };
-    tagPickerHandle = handle;
+    if (persist) tagPickerHandle = handle;
     return handle;
   }
 
@@ -1926,7 +1964,7 @@ export function initBoard() {
     notesEl.addEventListener('input', () => autosizeNotesTextarea(notesEl));
     autosizeNotesTextarea(notesEl);  // size to existing content on open/re-render
 
-    mountTagPicker(card, editableTags);
+    mountTagPicker(drawerEl, editableTags, { persist: (tags) => putBoardTags(card.id, tags) });
 
     const assigneeEl = drawerEl.querySelector('.drawer-assignee[data-field="assignee"]');
     assigneeEl.addEventListener('change', async () => {
