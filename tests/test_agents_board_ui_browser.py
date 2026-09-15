@@ -209,16 +209,16 @@ def _stub_is_snoozed(fields: "dict | None", now: "datetime | None" = None) -> bo
     return until > current
 
 
-def _stub_derive_lane(card: dict, now: "datetime | None" = None) -> str:
-    """Small faithful projection of agent_board.derive_lane for tag writes.
+# Mirrors agent_board.SNOOZABLE_LANES — the natural lanes a snooze can
+# override. A future `snoozed_until` on a card whose natural lane is
+# In progress or Done is ignored: a running or finished card is never
+# hidden behind a stale wake-up time.
+_SNOOZABLE_LANES = {"unassigned", "assigned", "human_queue", "review"}
 
-    The browser harness is not a second unit-test suite for lane policy, but
-    an atomic tag response must still move a card when an editable tag such as
-    ``human`` changes its derived lane. A future `fields.snoozed_until` wins
-    over every status/tag rule below, mirroring production's priority.
-    """
-    if _stub_is_snoozed(card.get("fields"), now):
-        return "snoozed"
+
+def _stub_natural_lane(card: dict) -> str:
+    """Small faithful projection of agent_board.natural_lane — status/tags
+    alone, ignoring any snooze."""
     tags = {str(tag).lstrip("#").lower() for tag in (card.get("tags") or [])}
     status = (card.get("status") or "todo").lower()
     if "agent-completed" in tags and "accepted" not in tags:
@@ -230,6 +230,23 @@ def _stub_derive_lane(card: dict, now: "datetime | None" = None) -> str:
     if status in {"done", "cancelled"}:
         return "done"
     return "assigned" if tags & _ASSIGNEE_TAGS else "unassigned"
+
+
+def _stub_derive_lane(card: dict, now: "datetime | None" = None) -> str:
+    """Small faithful projection of agent_board.derive_lane for tag writes.
+
+    The browser harness is not a second unit-test suite for lane policy, but
+    an atomic tag response must still move a card when an editable tag such as
+    ``human`` changes its derived lane. A future `fields.snoozed_until`
+    overrides the natural lane only when that natural lane is itself
+    snooze-eligible (`_SNOOZABLE_LANES`) — mirroring production's
+    natural-lane-gated priority, so a running or finished card is never
+    shown as Snoozed.
+    """
+    lane = _stub_natural_lane(card)
+    if lane in _SNOOZABLE_LANES and _stub_is_snoozed(card.get("fields"), now):
+        return "snoozed"
+    return lane
 
 
 @pytest.mark.unit
