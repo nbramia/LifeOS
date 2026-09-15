@@ -596,6 +596,39 @@ class TestRoundTrip:
         }
         assert _format_entry_line(reparsed) == line
 
+    def test_hash_in_endpoint_params_and_path_not_treated_as_tag(self):
+        """A `#` inside a field value (params or path) is never mistaken for an executor tag."""
+        entry = ScheduleEntry(
+            id="ep4", name="Notify channel", schedule_type="cron", schedule_value="0 9 * * *",
+            action="endpoint", message_type="endpoint",
+            endpoint_config={
+                "endpoint": "/api/x#frag", "method": "POST",
+                "params": {"channel": "#general"},
+            },
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        reparsed = _parse_entry_line(line)
+        assert reparsed.executor == ""
+        assert reparsed.endpoint_config == entry.endpoint_config
+        assert _format_entry_line(reparsed) == line
+
+    def test_real_executor_tag_survives_hash_in_endpoint_params(self):
+        entry = ScheduleEntry(
+            id="ep5", name="Notify channel", schedule_type="cron", schedule_value="0 9 * * *",
+            action="endpoint", message_type="endpoint", executor="cloud",
+            endpoint_config={
+                "endpoint": "/api/x", "method": "POST",
+                "params": {"channel": "#general"},
+            },
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        reparsed = _parse_entry_line(line)
+        assert reparsed.executor == "cloud"
+        assert reparsed.endpoint_config == entry.endpoint_config
+        assert _format_entry_line(reparsed) == line
+
 
 class TestCronComputation:
     def test_cron_next_trigger(self):

@@ -302,15 +302,16 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
     id_match = _ID_RE.search(rest)
     entry_id = id_match.group(1) if id_match else uuid.uuid4().hex[:8]
 
-    tags = _TAG_RE.findall(rest)
+    # Strip the id comment and inline fields before scanning for tags, so a
+    # `#` inside a field value (e.g. endpoint params or path) is never
+    # mistaken for an executor tag.
+    stripped = _ID_RE.sub("", rest)
+    stripped = _INLINE_FIELD_RE.sub("", stripped)
+    tags = _TAG_RE.findall(stripped)
     executor = tags[0] if tags else ""
 
     # Name = leading text with inline fields, tags and id comment removed.
-    name = rest
-    name = _ID_RE.sub("", name)
-    name = _INLINE_FIELD_RE.sub("", name)
-    name = re.sub(r'#[\w-]+', "", name)
-    name = name.strip()
+    name = re.sub(r'#[\w-]+', "", stripped).strip()
 
     action = fields.get("action") or "notify"
     message_type = fields.get("mtype") or "static"
