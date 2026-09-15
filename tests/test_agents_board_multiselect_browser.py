@@ -69,8 +69,14 @@ _PROTECTED_TAGS = _ASSIGNEE_TAGS | {
 #   t1 — plain unassigned card, selectable.
 #   t2 — plain "me"-assigned card, selectable.
 #   t3 — claimed, agent-owned, WITH a live killable session (in_progress,
-#        #codex + #agent-running) — the claimed-delete-kill and
-#        protected-tag-preservation target, and the assign-refusal target.
+#        #codex + #agent-running, plus an ordinary editable #followup tag) —
+#        the claimed-delete-kill and protected-tag-preservation target, and
+#        the assign-refusal target. The #followup tag exists so a bulk Tag
+#        write's REQUEST BODY can be asserted to still carry it — the
+#        stub's tags-merge route reconstructs protected tags from the
+#        card's own prior state regardless of what the client actually
+#        sends, so only a client-sent editable tag proves the client itself
+#        preserved it.
 #   t4 — a Review card (#agent-completed) — Mark Done's Accept-transition
 #        target.
 #   t5 — a plain Assigned card, not Done — Mark Done's plain lane-move
@@ -112,7 +118,7 @@ def _board_fixture():
             "in_progress": [
                 {
                     "kind": "task", "id": "t3", "title": "Migrate the database",
-                    "notes": "", "status": "in_progress", "tags": ["codex", "agent-running"],
+                    "notes": "", "status": "in_progress", "tags": ["codex", "agent-running", "followup"],
                     "assignee": "codex",
                     "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
                     "session": {"session_id": "s3", "status": "running", "source": "local", "host": "worker-box"},
@@ -368,7 +374,7 @@ class TestModifierSelect:
         _open_board(page, agents_base_url)
         _card(page, "t1").click(modifiers=["Control"])
         expect(_card(page, "t1")).to_have_class(re.compile(r"\bboard-card-selected\b"))
-        expect(page.locator("#board-drawer-backdrop")).to_have_attribute("hidden", "")
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
         expect(page.locator("#board-bulk-count")).to_have_text("1 selected")
 
     def test_second_modifier_click_adds_and_reclicking_deselects(self, page: Page, agents_base_url):
@@ -386,18 +392,18 @@ class TestModifierSelect:
 class TestBulkBarVisibility:
     def test_bar_shows_with_selection_and_hides_the_assignee_tray(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
-        expect(page.locator("#board-bulk-bar")).to_have_attribute("hidden", "")
-        expect(page.locator("#board-drop-tray")).not_to_have_attribute("hidden", "")
+        expect(page.locator("#board-bulk-bar")).to_be_hidden()
+        expect(page.locator("#board-drop-tray")).to_be_visible()
         _card(page, "t1").click(modifiers=["Control"])
-        expect(page.locator("#board-bulk-bar")).not_to_have_attribute("hidden", "")
-        expect(page.locator("#board-drop-tray")).to_have_attribute("hidden", "")
+        expect(page.locator("#board-bulk-bar")).to_be_visible()
+        expect(page.locator("#board-drop-tray")).to_be_hidden()
 
     def test_bar_hides_again_once_selection_empties(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
         _card(page, "t1").click(modifiers=["Control"])
         _card(page, "t1").click(modifiers=["Control"])
-        expect(page.locator("#board-bulk-bar")).to_have_attribute("hidden", "")
-        expect(page.locator("#board-drop-tray")).not_to_have_attribute("hidden", "")
+        expect(page.locator("#board-bulk-bar")).to_be_hidden()
+        expect(page.locator("#board-drop-tray")).to_be_visible()
 
 
 class TestClearingSelection:
@@ -406,16 +412,16 @@ class TestClearingSelection:
         _card(page, "t1").click(modifiers=["Control"])
         _card(page, "t2").click()
         expect(_card(page, "t1")).not_to_have_class(re.compile(r"\bboard-card-selected\b"))
-        expect(page.locator("#board-bulk-bar")).to_have_attribute("hidden", "")
-        expect(page.locator("#board-drawer-backdrop")).not_to_have_attribute("hidden", "")
+        expect(page.locator("#board-bulk-bar")).to_be_hidden()
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
         expect(page.locator(".drawer-title")).to_have_value("Ship the release")
 
     def test_escape_clears_selection_when_no_drawer_or_modal_open(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
         _card(page, "t1").click(modifiers=["Control"])
-        expect(page.locator("#board-bulk-bar")).not_to_have_attribute("hidden", "")
+        expect(page.locator("#board-bulk-bar")).to_be_visible()
         page.keyboard.press("Escape")
-        expect(page.locator("#board-bulk-bar")).to_have_attribute("hidden", "")
+        expect(page.locator("#board-bulk-bar")).to_be_hidden()
         expect(_card(page, "t1")).not_to_have_class(re.compile(r"\bboard-card-selected\b"))
 
     def test_clear_control_empties_selection(self, page: Page, agents_base_url):
@@ -423,9 +429,37 @@ class TestClearingSelection:
         _card(page, "t1").click(modifiers=["Control"])
         _card(page, "t2").click(modifiers=["Control"])
         page.locator("#board-bulk-clear").click()
-        expect(page.locator("#board-bulk-bar")).to_have_attribute("hidden", "")
+        expect(page.locator("#board-bulk-bar")).to_be_hidden()
         expect(_card(page, "t1")).not_to_have_class(re.compile(r"\bboard-card-selected\b"))
         expect(_card(page, "t2")).not_to_have_class(re.compile(r"\bboard-card-selected\b"))
+
+    def test_keyboard_activation_clears_selection_and_opens_drawer(self, page: Page, agents_base_url):
+        """Enter/Space on a focused card mirrors the plain-click branch: it
+        clears any active selection before opening that card's drawer,
+        rather than leaving a stale selection (and bulk bar) underneath the
+        newly opened drawer."""
+        _open_board(page, agents_base_url)
+        _card(page, "t1").click(modifiers=["Control"])
+        expect(_card(page, "t1")).to_have_class(re.compile(r"\bboard-card-selected\b"))
+        _card(page, "t2").focus()
+        page.keyboard.press("Enter")
+        expect(_card(page, "t1")).not_to_have_class(re.compile(r"\bboard-card-selected\b"))
+        expect(page.locator("#board-bulk-bar")).to_be_hidden()
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+        expect(page.locator(".drawer-title")).to_have_value("Ship the release")
+
+    def test_escape_closes_drawer_with_title_textarea_focused(self, page: Page, agents_base_url):
+        """Escape's existing drawer-close precedence must still win even
+        when the drawer's own title field holds focus — the title
+        textarea's Enter-to-save keydown handler only intercepts Enter, so
+        Escape still bubbles to the document-level handler that closes the
+        drawer, rather than falling through to (a no-op) clear-selection."""
+        _open_board(page, agents_base_url)
+        _card(page, "t2").click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+        page.locator(".drawer-title").click()
+        page.keyboard.press("Escape")
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
 
 
 class TestBulkAssign:
@@ -468,8 +502,23 @@ class TestBulkTag:
         page.locator("#board-bulk-tag-popover .board-bulk-popover-create").click()
         _wait_for(lambda: len(calls["tag_puts"]) == 1, page)
         expect(page.locator(".toast")).to_have_text("Tagged 1 of 1.")
+        # Assert the CLIENT'S REQUEST body, not just the resulting card
+        # state — the stub's tags-merge route reconstructs protected tags
+        # from the card's own prior state regardless of what the client
+        # actually sent, so a client that dropped "followup" (t3's ordinary
+        # editable tag) and sent only the new tag would still leave the
+        # card carrying its protected tags, passing an assertion against
+        # `board_state` alone without ever proving the client preserved its
+        # own editable tags.
+        sent_tags = calls["tag_puts"][0]["tags"]
+        assert "followup" in sent_tags
+        assert "urgent" in sent_tags
+        # The request must never carry a protected tag either — the drawer's
+        # own tag picker sends only the editable set and lets the server
+        # merge protected tags back in.
+        assert "codex" not in sent_tags and "agent-running" not in sent_tags
         tags = _find_card(board_state, "t3")["tags"]
-        assert "urgent" in tags
+        assert "urgent" in tags and "followup" in tags
         assert "agent-running" in tags and "codex" in tags
 
 
@@ -537,6 +586,78 @@ class TestSelectionAcrossRerender:
         expect(_card(page, "t1")).to_have_class(re.compile(r"\bboard-card-selected\b"))
 
 
+class TestBulkActionUsesLiveCardState:
+    def test_bulk_tag_request_reflects_a_tag_added_via_sse_after_selection(self, page: Page, agents_base_url):
+        """selectedTaskCards() reads `allCards()` — the live `board` state —
+        fresh every time a bulk action runs, rather than a card snapshot
+        captured at selection time. Proven by adding a tag to a selected
+        card through a live SSE update after it's selected, then confirming
+        the bulk Tag write's request body includes that SSE-added tag
+        alongside the new one — a stale click-time snapshot would only ever
+        send the new tag."""
+        gate = threading.Event()
+        board_state, calls = _open_board(page, agents_base_url, stream_gate=gate, board_stream_frames=[])
+        _card(page, "t1").click(modifiers=["Control"])
+        expect(page.locator("#board-bulk-count")).to_have_text("1 selected")
+
+        card = _find_card(board_state, "t1")
+        card["tags"] = ["sse-added"]
+        frame = f"event: board\ndata: {json.dumps(board_state)}\n\n"
+        _stub_routes(page, board_state, calls, board_stream_frames=[frame], stream_gate=gate)
+        gate.set()
+        _wait_for(lambda: page.locator('[data-card-id="t1"] .board-chip-tag').count() > 0, page, timeout_ms=8000)
+        expect(_card(page, "t1")).to_have_class(re.compile(r"\bboard-card-selected\b"))
+
+        page.locator("#board-bulk-tag").click()
+        page.locator("#board-bulk-tag-popover [data-field='tag-search']").fill("livecheck")
+        page.locator("#board-bulk-tag-popover .board-bulk-popover-create").click()
+        _wait_for(lambda: len(calls["tag_puts"]) == 1, page)
+        sent_tags = calls["tag_puts"][0]["tags"]
+        assert "sse-added" in sent_tags
+        assert "livecheck" in sent_tags
+
+
+class TestBulkActionInFlightGuard:
+    def test_double_click_mark_done_fires_one_write_per_card(self, page: Page, agents_base_url):
+        """Two `click` events dispatched back-to-back on Mark Done — the
+        race a real double-click (or two clicks while a slow/loaded server
+        holds the first fan-out's requests open) opens — must only ever
+        start one fan-out. `dispatchEvent` (unlike Playwright's own
+        `.click()`, which requires the element to be enabled) still invokes
+        `addEventListener` callbacks on a disabled button, so this reaches
+        the handler's own in-flight check rather than being blocked purely
+        by the `disabled` attribute — proving the guard itself, not just
+        the button's disabled affordance."""
+        board_state, calls = _open_board(page, agents_base_url)
+        _card(page, "t5").click(modifiers=["Control"])  # plain Assigned card, not Review/Done
+        expect(page.locator("#board-bulk-count")).to_have_text("1 selected")
+        page.evaluate("""
+            () => {
+                const btn = document.getElementById('board-bulk-done');
+                btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
+        """)
+        _wait_for(lambda: len(calls["lane_puts"]) >= 1, page)
+        # Give a wrongly-started second fan-out time to also land before
+        # asserting there's only one.
+        page.wait_for_timeout(200)
+        assert len(calls["lane_puts"]) == 1
+
+    def test_double_click_delete_opens_exactly_one_modal(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        _card(page, "t1").click(modifiers=["Control"])
+        expect(page.locator("#board-bulk-count")).to_have_text("1 selected")
+        page.evaluate("""
+            () => {
+                const btn = document.getElementById('board-bulk-delete');
+                btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
+        """)
+        expect(page.locator(".modal-backdrop")).to_have_count(1)
+
+
 class TestModifierPointerdownNoDrag:
     def test_modifier_held_press_never_starts_a_drag(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
@@ -577,8 +698,8 @@ class TestScheduledCardNotSelectable:
         schedule_card = _card(page, "s1")
         expect(schedule_card).to_have_count(1)
         schedule_card.click(modifiers=["Control"])
-        expect(page.locator("#board-drawer-backdrop")).not_to_have_attribute("hidden", "")
-        expect(page.locator("#board-bulk-bar")).to_have_attribute("hidden", "")
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+        expect(page.locator("#board-bulk-bar")).to_be_hidden()
 
 
 class TestModifierClickOverridesArmedTray:

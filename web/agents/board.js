@@ -747,6 +747,9 @@ export function initBoard() {
     div.addEventListener('keydown', e => {
       if (e.target !== div || (e.key !== 'Enter' && e.key !== ' ')) return;
       e.preventDefault();
+      // Mirrors the plain-click branch above: activating a card always
+      // clears any selection before opening its drawer, keyboard or mouse.
+      clearSelection();
       openDrawer(card.id);
     });
     const sessionChip = div.querySelector('.board-chip-session');
@@ -2665,6 +2668,19 @@ export function initBoard() {
   // one summary toast — never a toast, and for Delete never a confirmation
   // modal, per card. No undo toast: unlike a single-card action, a bulk
   // action has no single prior state to offer restoring.
+  //
+  // In-flight guard: a single `bulkActionInFlight` flag, checked and set
+  // atomically (synchronously, before any `await`) at the top of each of
+  // the four consequential entry points below — the three fan-out runners
+  // and the delete confirmation's own open — so a second click dispatched
+  // before the first has finished (a double-click, or two clicks while a
+  // slow/loaded server holds the first fan-out's requests open) sees the
+  // flag already set and does nothing, rather than starting a second,
+  // fully independent fan-out or stacking a second confirmation modal. The
+  // guard also disables all four bar buttons for its duration — covering
+  // Delete's confirmation modal from the moment it opens through its own
+  // cancel or fan-out, not just the fan-out itself — and always releases
+  // in a `finally`/on every dismissal path, including a thrown error.
   // ------------------------------------------------------------------
 
   // Same write shape as the drawer's Assignee select and assignment.js's
@@ -2673,6 +2689,31 @@ export function initBoard() {
   // protected lifecycle tags — untouched. Goes through the plain task PUT
   // (not the lane endpoint), which runs the same assignee-change policy
   // check (api/routes/tasks.py) so a claimed card still 409s per card.
+  let bulkActionInFlight = false;
+
+  function setBulkButtonsDisabled(disabled) {
+    [bulkTagBtn, bulkAssignBtn, bulkDoneBtn, bulkDeleteBtn].forEach(btn => {
+      if (btn) btn.disabled = disabled;
+    });
+  }
+
+  // Returns `false` (and does nothing) when a bulk action is already
+  // running — the caller must bail immediately without starting any work.
+  // Returns `true` once the flag is claimed, having already disabled the
+  // bar's buttons so a disabled second click can't even reach its own
+  // handler.
+  function beginBulkAction() {
+    if (bulkActionInFlight) return false;
+    bulkActionInFlight = true;
+    setBulkButtonsDisabled(true);
+    return true;
+  }
+
+  function endBulkAction() {
+    bulkActionInFlight = false;
+    setBulkButtonsDisabled(false);
+  }
+
   async function bulkAssignOne(card, assignee) {
     const nonAssigneeTags = (card.tags || []).filter(t => !ASSIGNEES.includes(String(t).toLowerCase()));
     const tags = assignee ? [assignee, ...nonAssigneeTags] : nonAssigneeTags;
@@ -2683,10 +2724,15 @@ export function initBoard() {
     const cards = selectedTaskCards();
     if (cards.length === 0) return;
     closeBulkPopovers();
-    const results = await fanOut(cards, (card) => bulkAssignOne(card, assignee));
-    reportBulkOutcome('Assigned', results);
-    await fetchBoard();
-    clearSelection();
+    if (!beginBulkAction()) return;
+    try {
+      const results = await fanOut(cards, (card) => bulkAssignOne(card, assignee));
+      reportBulkOutcome('Assigned', results);
+      await fetchBoard();
+      clearSelection();
+    } finally {
+      endBulkAction();
+    }
   }
 
   // Adds one tag through the same endpoint (and merge behavior) as the
@@ -2706,10 +2752,15 @@ export function initBoard() {
     const cards = selectedTaskCards();
     if (cards.length === 0) return;
     closeBulkPopovers();
-    const results = await fanOut(cards, (card) => bulkTagOne(card, tag));
-    reportBulkOutcome('Tagged', results);
-    await fetchBoard();
-    clearSelection();
+    if (!beginBulkAction()) return;
+    try {
+      const results = await fanOut(cards, (card) => bulkTagOne(card, tag));
+      reportBulkOutcome('Tagged', results);
+      await fetchBoard();
+      clearSelection();
+    } finally {
+      endBulkAction();
+    }
   }
 
   // Raw per-card writes for the bulk fan-out — unlike `moveCard` (used by
@@ -2748,14 +2799,19 @@ export function initBoard() {
   async function runBulkMarkDone() {
     const cards = selectedTaskCards();
     if (cards.length === 0) return;
-    const results = await fanOut(cards, async (card) => {
-      if (card.lane === 'done') return;
-      if (card.lane === 'review') await acceptCardEndpoint(card.id);
-      else await moveCardToLaneEndpoint(card.id, 'done');
-    });
-    reportBulkOutcome('Marked done', results);
-    await fetchBoard();
-    clearSelection();
+    if (!beginBulkAction()) return;
+    try {
+      const results = await fanOut(cards, async (card) => {
+        if (card.lane === 'done') return;
+        if (card.lane === 'review') await acceptCardEndpoint(card.id);
+        else await moveCardToLaneEndpoint(card.id, 'done');
+      });
+      reportBulkOutcome('Marked done', results);
+      await fetchBoard();
+      clearSelection();
+    } finally {
+      endBulkAction();
+    }
   }
 
   // One confirmation naming the count, then the same kill-then-delete core
@@ -2764,6 +2820,10 @@ export function initBoard() {
   function openBulkDeleteConfirm() {
     const cards = selectedTaskCards();
     if (cards.length === 0) return;
+    // Claimed from the moment the confirmation opens, not just while its
+    // fan-out runs — a second click on Delete while this modal is still
+    // sitting open (awaiting a confirm/cancel) must not stack a second one.
+    if (!beginBulkAction()) return;
     const backdrop = document.createElement('div');
     backdrop.className = 'modal-backdrop';
     backdrop.innerHTML = `
@@ -2778,17 +2838,22 @@ export function initBoard() {
     `;
     document.body.appendChild(backdrop);
     const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
-    backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
-    backdrop.querySelector('#bulk-delete-cancel').onclick = cleanup;
+    const cancel = () => { cleanup(); endBulkAction(); };
+    backdrop.addEventListener('click', e => { if (e.target === backdrop) cancel(); });
+    backdrop.querySelector('#bulk-delete-cancel').onclick = cancel;
     backdrop.querySelector('#bulk-delete-confirm').onclick = async () => {
       const btn = backdrop.querySelector('#bulk-delete-confirm');
       btn.disabled = true;
       btn.textContent = 'Deleting…';
-      const results = await fanOut(cards, (card) => deleteCard(card, { findCard }));
-      cleanup();
-      reportBulkOutcome('Deleted', results);
-      await fetchBoard();
-      clearSelection();
+      try {
+        const results = await fanOut(cards, (card) => deleteCard(card, { findCard }));
+        cleanup();
+        reportBulkOutcome('Deleted', results);
+        await fetchBoard();
+        clearSelection();
+      } finally {
+        endBulkAction();
+      }
     };
   }
 

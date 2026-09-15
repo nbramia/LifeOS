@@ -1211,6 +1211,12 @@
   }
   .board-lane-filter-option:hover { background: var(--bg-elev); }
   .board-lane-filter-option input { margin: 0; }
+  /* board.js's renderBulkBar() sets this element's `hidden` attribute
+     whenever the bulk bar takes its place — without this override the
+     tray's own unconditional `display: flex` below wins over the
+     browser's default `[hidden] { display: none }`, the same reason
+     .board-bulk-bar needs its own such rule. */
+  .board-drop-tray[hidden] { display: none; }
   .board-drop-tray {
     position: relative;
     flex: 0 0 auto;
