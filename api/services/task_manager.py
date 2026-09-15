@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from config.settings import settings
+from api.services.agent_board import is_snoozed as _is_snoozed
 from api.services.atomic_write import atomic_write_text, atomic_write_lines
 from api.services.operation_lock import exclusive_operation_lock
 
@@ -640,6 +641,10 @@ class TaskManager:
 
         Eligibility is checked again on every compare-and-swap retry so a stale
         worker listing cannot claim a task whose status or assignment changed.
+        A task with a future `snoozed_until` is never claimable — checked
+        here, not only in the worker's own listing, so a direct claim
+        attempt against a snoozed task is refused the same way a stale
+        listing would be.
         """
         pickup = {tag.lstrip("#").lower() for tag in pickup_tags}
         excluded = {tag.lstrip("#").lower() for tag in exclusion_tags}
@@ -650,7 +655,12 @@ class TaskManager:
 
         def is_claimable(task: Task) -> bool:
             tags = {tag.lstrip("#").lower() for tag in task.tags}
-            return task.status.lower() in statuses and bool(tags & pickup) and not bool(tags & excluded)
+            return (
+                task.status.lower() in statuses
+                and bool(tags & pickup)
+                and not bool(tags & excluded)
+                and not _is_snoozed(task.fields)
+            )
 
         with self._lock:
             current = self._tasks.get(task_id)

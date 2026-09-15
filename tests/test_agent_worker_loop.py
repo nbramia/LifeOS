@@ -1949,6 +1949,43 @@ def test_list_and_claim_bare_agent_still_works(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_future_snoozed_task_is_excluded_from_the_listing(tmp_path: Path):
+    """`_list_agent_tasks` excludes a task with a future `snoozed_until`
+    field even though it otherwise carries a pickup tag and an eligible
+    status — the listing-side courtesy alongside `claim_for_agent`'s own
+    refusal."""
+    api = FakeApi(tasks=[
+        {"id": "t-snoozed", "description": "dormant", "status": "todo",
+         "tags": ["hermes"], "fields": {"snoozed_until": "2099-01-01T00:00:00+00:00"}},
+        {"id": "t-awake", "description": "active", "status": "todo",
+         "tags": ["hermes"], "fields": {}},
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(
+                         status=STATUS_COMPLETED, final_text="done",
+                     )))
+    ids = {t["id"] for t in w._list_agent_tasks()}
+    assert ids == {"t-awake"}
+
+
+@pytest.mark.unit
+def test_past_snoozed_task_is_listed_and_claimable(tmp_path: Path):
+    api = FakeApi(tasks=[
+        {"id": "t-woken", "description": "woken", "status": "todo",
+         "tags": ["hermes"], "fields": {"snoozed_until": "2000-01-01T00:00:00+00:00"}},
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(
+                         status=STATUS_COMPLETED, final_text="done",
+                     )))
+    ids = {t["id"] for t in w._list_agent_tasks()}
+    assert ids == {"t-woken"}
+    assert w._claim("t-woken") is True
+
+
+@pytest.mark.unit
 def test_me_alone_is_not_listed_for_claim(tmp_path: Path):
     api = FakeApi(tasks=[
         {"id": "t-me", "description": "human only", "status": "todo",

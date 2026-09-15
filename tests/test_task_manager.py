@@ -1915,6 +1915,51 @@ class TestOperatorFields:
         assert updated.fields == {"host": "laptop", "effort": "high"}
 
 
+class TestSnoozedUntilFieldRoundTrip:
+    """`snoozed_until` is a plain custom field — these tests exist because
+    its value is a colon-rich ISO-8601 timestamp with a UTC offset,
+    the one shape most likely to break `_INLINE_FIELD_RE`'s `[key:: value]`
+    parsing if the value regex ever stopped being greedy up to the closing
+    bracket."""
+
+    ISO_WITH_OFFSET = "2026-09-16T09:00:00-04:00"
+
+    def test_value_round_trips_through_write_and_reparse(self, task_manager):
+        task = task_manager.create("Snooze round trip", context="Snooze", tags=["me"])
+        written = task_manager.update(task.id, fields={"snoozed_until": self.ISO_WITH_OFFSET})
+        assert written.fields == {"snoozed_until": self.ISO_WITH_OFFSET}
+
+        content = (task_manager.tasks_dir / "Snooze.md").read_text(encoding="utf-8")
+        assert f"[snoozed_until:: {self.ISO_WITH_OFFSET}]" in content
+
+        # Force a reparse from disk (not the in-memory index) to prove the
+        # written line itself round-trips, not just the object in memory.
+        task_manager.reindex_file(str(task_manager.tasks_dir / "Snooze.md"))
+        reparsed = task_manager.get(task.id)
+        assert reparsed.fields == {"snoozed_until": self.ISO_WITH_OFFSET}
+
+    def test_write_leaves_status_tags_and_notes_byte_for_byte_unchanged(self, task_manager):
+        task = task_manager.create(
+            "Snooze preserves the rest", context="Snooze", tags=["me", "urgent-work"],
+            notes="line one\nline two",
+        )
+        updated = task_manager.update(task.id, fields={"snoozed_until": self.ISO_WITH_OFFSET})
+        assert updated.status == task.status
+        assert updated.tags == task.tags
+        assert updated.notes == task.notes
+        assert updated.description == task.description
+
+    def test_clearing_removes_the_field_and_leaves_other_fields(self, task_manager):
+        task = task_manager.create(
+            "Snooze clear", context="Snooze", fields={"host": "laptop"},
+        )
+        task_manager.update(task.id, fields={"snoozed_until": self.ISO_WITH_OFFSET})
+        cleared = task_manager.update(task.id, fields={"snoozed_until": None})
+        assert cleared.fields == {"host": "laptop"}
+        content = (task_manager.tasks_dir / "Snooze.md").read_text(encoding="utf-8")
+        assert "snoozed_until" not in content
+
+
 class TestMergeForwardCacheFields:
     def test_reminder_id_survives_reindex_after_external_touch(self, task_manager):
         task = task_manager.create("Linked task", context="Reminder", reminder_id="rem-123")

@@ -13,6 +13,7 @@ import logging
 import socket
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -992,6 +993,16 @@ async def stream_snapshots() -> StreamingResponse:
 # decision, and performs the write. See docs/specs/technical/agent-viz.md.
 # ---------------------------------------------------------------------------
 
+def _now() -> datetime:
+    """The board's current-time seam — snooze expiry is wall-clock driven,
+    not a vault edit, so `_build_board` needs a fresh "now" on every call
+    rather than one baked in at import time. Tests monkeypatch this module
+    attribute to move a card across its wake-up time without a sleep;
+    production always reads the real clock.
+    """
+    return datetime.now(timezone.utc)
+
+
 # Board SSE tick interval. The task watcher's own debounce is 2.0s (see
 # api/services/task_watcher.py); ticking the board every 0.5s on top of that
 # (plus the shared cache's 0.25s TTL, see _BOARD_CACHE_TTL below) keeps
@@ -1134,6 +1145,7 @@ def _build_board() -> dict[str, Any]:
     session_store = _get_session_store()
 
     tasks = task_manager.list_tasks()
+    now = _now()
 
     sessions_by_task: dict[str, list[dict[str, Any]]] = {}
     for sd in _build_snapshot()["sessions"]:
@@ -1147,7 +1159,7 @@ def _build_board() -> dict[str, Any]:
 
     lanes: dict[str, list[dict[str, Any]]] = {lane: [] for lane in agent_board.LANES}
     for task in tasks:
-        lane = agent_board.derive_lane(task.status, task.tags)
+        lane = agent_board.derive_lane(task.status, task.tags, task.fields, now)
         lanes[lane].append(_task_card(task, sessions_by_task, open_question_by_task, session_store))
 
     for entry in scheduler_store.list_all():
@@ -1251,6 +1263,13 @@ class BoardTagsRequest(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
 
+class SnoozeRequest(BaseModel):
+    """Body for PUT /api/agents/board/cards/{id}/snooze — an absolute
+    wake-up time, required to carry a UTC offset (see
+    `agent_board.parse_snoozed_until`)."""
+    until: str = Field(..., min_length=1, max_length=64)
+
+
 class UndoAcceptRequest(BaseModel):
     """Opaque token returned by the Accept transition (optional for legacy clients)."""
     token: str | None = Field(default=None, max_length=200)
@@ -1306,6 +1325,12 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
             if replan_result.get("plan") is not None and replan_result["plan"].tags is not None
             else current_tags
         )
+    if plan.fields is not None:
+        # Every successful plan clears `snoozed_until` — a static kwarg,
+        # not recomputed per CAS retry like `_tags_merge` above, since
+        # clearing an absent field is already a no-op regardless of what
+        # the retry's fresh snapshot looks like.
+        write_kwargs["fields"] = plan.fields
 
     if write_kwargs:
         replan_result: dict[str, Any] = {}
@@ -1325,7 +1350,7 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
             raise HTTPException(status_code=404, detail="card not found")
         _invalidate_board_cache()
 
-    lane = agent_board.derive_lane(task.status, task.tags)
+    lane = agent_board.derive_lane(task.status, task.tags, task.fields)
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
 
 
@@ -1361,8 +1386,109 @@ async def update_board_card_tags(card_id: str, body: BoardTagsRequest) -> dict[s
     if task is None:
         raise HTTPException(status_code=404, detail="card not found")
     _invalidate_board_cache()
-    lane = agent_board.derive_lane(task.status, task.tags)
+    lane = agent_board.derive_lane(task.status, task.tags, task.fields)
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
+
+
+@router.put("/board/cards/{card_id}/snooze")
+async def snooze_board_card(card_id: str, body: SnoozeRequest) -> dict[str, Any]:
+    """Set a card's wake-up time, deriving it into the Snoozed lane.
+
+    Eligible on any card whose status/tags alone (ignoring any snooze
+    already in effect) derive to Unassigned, Assigned, Human queue, or
+    Review — a card that derives to In progress or Done is refused, and so
+    is a scheduler entry (`card_id` never resolves through `TaskManager`).
+    `until` must be an ISO-8601 timestamp with a UTC offset, in the future
+    — anything else is refused without touching the task (see
+    `agent_board.parse_snoozed_until`). Only `snoozed_until` changes:
+    status, tags, and notes are left exactly as they were.
+    """
+    from api.services import agent_board
+    from api.services.task_manager import get_task_manager, TaskConflictError
+
+    parsed = agent_board.parse_snoozed_until(body.until)
+    if parsed is None or parsed <= _now():
+        raise HTTPException(
+            status_code=agent_board.SNOOZE_UNTIL_INVALID_ERROR[0],
+            detail=agent_board.SNOOZE_UNTIL_INVALID_ERROR[1],
+        )
+
+    task_manager = get_task_manager()
+    task = task_manager.get(card_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="card not found")
+
+    def ineligible(status: str, tags) -> bool:
+        return agent_board.derive_lane(status, tags) in ("in_progress", "done")
+
+    if ineligible(task.status, task.tags):
+        raise HTTPException(
+            status_code=agent_board.SNOOZE_INELIGIBLE_ERROR[0],
+            detail=agent_board.SNOOZE_INELIGIBLE_ERROR[1],
+        )
+
+    # Re-checked against the exact snapshot the write lands on, under the
+    # store's own lock — a card the worker claims into In progress in this
+    # window must not be snoozed out from under it.
+    def check(current) -> None:
+        if ineligible(current.status, current.tags):
+            raise agent_board.CardDecisionChanged(agent_board.SNOOZE_INELIGIBLE_ERROR)
+
+    try:
+        task = task_manager.update(
+            card_id,
+            fields={agent_board.SNOOZED_UNTIL_FIELD: body.until},
+            _precondition=check,
+        )
+    except agent_board.CardDecisionChanged as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail="card not found")
+    _invalidate_board_cache()
+    lane = agent_board.derive_lane(task.status, task.tags, task.fields)
+    return {
+        "id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags),
+        "snoozed_until": task.fields.get(agent_board.SNOOZED_UNTIL_FIELD),
+    }
+
+
+@router.delete("/board/cards/{card_id}/snooze")
+async def unsnooze_board_card(card_id: str) -> dict[str, Any]:
+    """Clear a card's wake-up time, restoring its status/tag-derived lane.
+
+    A no-op success (no write) on a card that isn't currently snoozed.
+    """
+    from api.services import agent_board
+    from api.services.task_manager import get_task_manager, TaskConflictError
+
+    task_manager = get_task_manager()
+    task = task_manager.get(card_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="card not found")
+
+    if agent_board.SNOOZED_UNTIL_FIELD not in task.fields:
+        lane = agent_board.derive_lane(task.status, task.tags, task.fields)
+        return {
+            "id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags),
+            "snoozed_until": None,
+        }
+
+    try:
+        task = task_manager.update(card_id, fields={agent_board.SNOOZED_UNTIL_FIELD: None})
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail="card not found")
+    _invalidate_board_cache()
+    lane = agent_board.derive_lane(task.status, task.tags, task.fields)
+    return {
+        "id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags),
+        "snoozed_until": None,
+    }
 
 
 @router.post("/board/cards/{card_id}/accept")
@@ -1380,7 +1506,7 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
 
     tags_norm = {t.lstrip("#").lower() for t in task.tags}
     already_accepted = agent_board.ACCEPTED_TAG in tags_norm
-    if agent_board.derive_lane(task.status, task.tags) != "review" and not already_accepted:
+    if agent_board.derive_lane(task.status, task.tags, task.fields) != "review" and not already_accepted:
         raise HTTPException(status_code=409, detail="card is not in the Review lane")
 
     needs_tag = not already_accepted
@@ -1397,6 +1523,7 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
 
             task = task_manager.update(
                 card_id, status="done", _tags_merge=add_accepted,
+                fields={agent_board.SNOOZED_UNTIL_FIELD: None},
             )
         except TaskConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1404,7 +1531,7 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="card not found")
         _invalidate_board_cache()
 
-    lane = agent_board.derive_lane(task.status, task.tags)
+    lane = agent_board.derive_lane(task.status, task.tags, task.fields)
     # updated_at is already refreshed only by the successful CAS write and is
     # therefore a narrow opaque etag for the toast's Undo action.
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags),
@@ -1435,10 +1562,10 @@ async def undo_accept_board_card(card_id: str, body: UndoAcceptRequest | None = 
     accepted = agent_board.ACCEPTED_TAG
     normalized = {t.lstrip("#").lower() for t in task.tags}
     if accepted not in normalized:
-        if agent_board.derive_lane(task.status, task.tags) == "review":
+        if agent_board.derive_lane(task.status, task.tags, task.fields) == "review":
             # A second undo after the first one is a harmless retry. Preserve
             # the existing 409 for an unrelated, never-accepted card below.
-            lane = agent_board.derive_lane(task.status, task.tags)
+            lane = agent_board.derive_lane(task.status, task.tags, task.fields)
             return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
         raise HTTPException(status_code=409, detail="card is not accepted")
 
@@ -1465,7 +1592,7 @@ async def undo_accept_board_card(card_id: str, body: UndoAcceptRequest | None = 
     if task is None:
         raise HTTPException(status_code=404, detail="card not found")
     _invalidate_board_cache()
-    lane = agent_board.derive_lane(task.status, task.tags)
+    lane = agent_board.derive_lane(task.status, task.tags, task.fields)
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
 
 
@@ -1703,7 +1830,7 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
         return {
             "id": updated.id,
             "action": action,
-            "lane": agent_board.derive_lane(updated.status, updated.tags),
+            "lane": agent_board.derive_lane(updated.status, updated.tags, updated.fields),
             "status": updated.status,
             "tags": list(updated.tags),
             "queued": followup_id is not None,
@@ -1767,7 +1894,7 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
         logger.warning("cli_sessions lookup for cancel of %s failed: %s", card_id, exc)
         live_cli_sessions = []
     if task.status == "cancelled":
-        lane = agent_board.derive_lane(task.status, task.tags)
+        lane = agent_board.derive_lane(task.status, task.tags, task.fields)
         return {
             "id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags),
             "killed": [],
@@ -1846,6 +1973,7 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
     try:
         task = task_manager.update(
             card_id, status="cancelled", tags=new_tags, _precondition=cancel_still_allowed,
+            fields={agent_board.SNOOZED_UNTIL_FIELD: None},
         )
     except agent_board.CardDecisionChanged as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -1867,7 +1995,7 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="card not found")
     _invalidate_board_cache()
 
-    lane = agent_board.derive_lane(task.status, task.tags)
+    lane = agent_board.derive_lane(task.status, task.tags, task.fields)
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags), "killed": killed, "failures": failures}
 
 

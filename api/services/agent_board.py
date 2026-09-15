@@ -13,6 +13,7 @@ lane field anywhere in the vault or the task index.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 # Tags the agent worker itself writes as it drives a task through its
@@ -64,11 +65,55 @@ LANES: tuple[str, ...] = (
     "scheduled",
     "review",
     "done",
+    "snoozed",
 )
 
 # Lanes a task can derive into (excludes "scheduled", which only ever holds
 # scheduler entries).
 TASK_LANES: tuple[str, ...] = tuple(lane for lane in LANES if lane != "scheduled")
+
+# The custom `[snoozed_until:: <ISO-8601 with offset>]` task field that
+# drives the Snoozed lane — a wake-up time and nothing else; status and
+# tags are left untouched by a snooze.
+SNOOZED_UNTIL_FIELD = "snoozed_until"
+
+
+def parse_snoozed_until(value: Optional[str]) -> Optional[datetime]:
+    """Parse a `snoozed_until` field value into an aware UTC datetime.
+
+    Returns None for a missing, unparseable, or offset-less value. An
+    offset-less ISO-8601 string parses successfully but carries no
+    timezone, and a naive local time must never be treated as a wake time —
+    the API layer rejects such a value outright rather than guessing a zone.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def is_snoozed(fields: Optional[dict], now: Optional[datetime] = None) -> bool:
+    """True while `fields[SNOOZED_UNTIL_FIELD]` parses to a moment after `now`.
+
+    `now` defaults to the real current time; callers that need a fixed
+    instant (tests, and the board's own stream tick — see
+    `api/routes/agents.py`) pass one explicitly so the same task derives
+    differently on either side of its wake-up time without a sleep. A past
+    or missing wake-up time returns False and is otherwise ignored — an
+    expired value is never cleaned up, only treated as absent.
+    """
+    until = parse_snoozed_until((fields or {}).get(SNOOZED_UNTIL_FIELD))
+    if until is None:
+        return False
+    current = now if now is not None else datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return until > current
 
 
 def _norm_tags(tags: Iterable[str]) -> set[str]:
@@ -100,13 +145,27 @@ def derive_assignee(tags: Iterable[str]) -> Optional[str]:
     return None
 
 
-def derive_lane(status: str, tags: Iterable[str]) -> str:
-    """Derive a task's board lane from its status + tags.
+def derive_lane(
+    status: str,
+    tags: Iterable[str],
+    fields: Optional[dict] = None,
+    now: Optional[datetime] = None,
+) -> str:
+    """Derive a task's board lane from its status + tags (+ snooze field).
 
     See the lane table in issue #850. Never stored — recomputed on every
-    read from the task's current status/tags.
+    read from the task's current status/tags/fields.
 
     Priority (highest first), and why:
+      0. Snoozed — a future `snoozed_until` wins over everything
+         else. Snoozing is only ever offered on a card whose status/tags
+         alone would derive to Unassigned, Assigned, Human queue, or
+         Review — every write path that transitions a card out of one of
+         those (a lane move, Accept, Cancel) clears the field, so an
+         In progress or Done card's derivation never actually depends on
+         this rule in practice. A past or missing value is ignored, and
+         derivation falls through to the status/tag rules below exactly as
+         if the field were absent.
       1. Review — an `agent-completed` tag without `accepted` wins over
          everything else, INCLUDING a terminal status, so a task the worker
          marked done still surfaces for the operator's accept/reject instead
@@ -122,6 +181,9 @@ def derive_lane(status: str, tags: Iterable[str]) -> str:
          of the working lanes above.
       6. Unassigned — the default: an open task with no assignee tag.
     """
+    if is_snoozed(fields, now):
+        return "snoozed"
+
     tset = _norm_tags(tags)
     status_norm = (status or "todo").lower()
 
@@ -163,6 +225,14 @@ CANCEL_NOT_AGENT_OWNED_ERROR: tuple[int, str] = (
 CANCEL_ALREADY_FINISHED_ERROR: tuple[int, str] = (
     409,
     "this card is already finished — nothing to cancel",
+)
+SNOOZE_INELIGIBLE_ERROR: tuple[int, str] = (
+    409,
+    "only Unassigned, Assigned, Human queue, and Review cards can be snoozed",
+)
+SNOOZE_UNTIL_INVALID_ERROR: tuple[int, str] = (
+    400,
+    "until must be an ISO-8601 timestamp with a UTC offset, in the future",
 )
 
 class CardDecisionChanged(Exception):
@@ -301,7 +371,7 @@ def evaluate_card_action(
     if action == "lane_move":
         if target_lane not in LANES:
             return (400, f"unknown lane '{target_lane}'")
-        if target_lane in ("review", "scheduled"):
+        if target_lane in ("review", "scheduled", "snoozed"):
             return (400, f"lane '{target_lane}' cannot be set directly")
         # The worker owns this card while it's actively running or waiting
         # on an answer — every drag is refused, on every lane, since a
@@ -391,12 +461,18 @@ def lane_for_session(
 class LaneMovePlan:
     """What a `PUT /board/cards/{id}/lane` request should write, or why not.
 
-    `status` / `tags` are `None` when that field shouldn't change. `error`
-    is `(http_status, detail)` when the move is invalid or forbidden — the
-    caller should raise an `HTTPException` and perform no write.
+    `status` / `tags` are `None` when that field shouldn't change. `fields`
+    is the `TaskManager.update(fields=...)` patch to apply alongside them —
+    every successful plan clears `snoozed_until`: dragging a snoozed card
+    to any other lane always wakes it, whether or not it was actually
+    snoozed to begin with (clearing an absent field is a no-op).
+    `error` is `(http_status, detail)` when the move is invalid or
+    forbidden — the caller should raise an `HTTPException` and perform no
+    write.
     """
     status: Optional[str] = None
     tags: Optional[list[str]] = None
+    fields: Optional[dict] = None
     error: Optional[tuple[int, str]] = None
 
 
@@ -473,6 +549,12 @@ def plan_lane_move(
     if error is not None:
         return LaneMovePlan(error=error)
 
+    # Every successful move clears `snoozed_until` — a lane move always
+    # wakes the card, whether or not it was actually snoozed (clearing an
+    # absent field is a no-op in `TaskManager.update`).
+    def _plan(*, status: Optional[str] = None, tags: Optional[list[str]] = None) -> LaneMovePlan:
+        return LaneMovePlan(status=status, tags=tags, fields={SNOOZED_UNTIL_FIELD: None})
+
     tags_list = [str(t) for t in (current_tags or [])]
     tset_lower = {t.lstrip("#").lower() for t in tags_list}
     is_review = is_review_pending(tags_list)
@@ -480,7 +562,7 @@ def plan_lane_move(
     if target_lane == "unassigned":
         # Dropping into Unassigned clears the assignee tag.
         new_tags = [t for t in tags_list if t.lstrip("#").lower() not in ASSIGNEE_TAGS]
-        return LaneMovePlan(tags=new_tags)
+        return _plan(tags=new_tags)
 
     if target_lane == "assigned":
         assignee_norm = (assignee or "").lstrip("#").lower()
@@ -491,7 +573,7 @@ def plan_lane_move(
             ))
         new_tags = [t for t in tags_list if t.lstrip("#").lower() not in ASSIGNEE_TAGS]
         new_tags.append(assignee_norm)
-        return LaneMovePlan(tags=new_tags)
+        return _plan(tags=new_tags)
 
     if target_lane == "in_progress":
         # A card can arrive here from Human queue (#human) — strip it so it
@@ -500,11 +582,11 @@ def plan_lane_move(
         strip = {HUMAN_TAG}
         if tset_lower & strip:
             new_tags = [t for t in tags_list if t.lstrip("#").lower() not in strip]
-            return LaneMovePlan(status="in_progress", tags=new_tags)
-        return LaneMovePlan(status="in_progress")
+            return _plan(status="in_progress", tags=new_tags)
+        return _plan(status="in_progress")
 
     if target_lane == "human_queue":
-        return LaneMovePlan(status="blocked")
+        return _plan(status="blocked")
 
     if target_lane == "done":
         # A card can arrive here from Human queue — strip `human` so it
@@ -519,14 +601,15 @@ def plan_lane_move(
             new_tags = [t for t in tags_list if t.lstrip("#").lower() not in strip]
             if needs_accept:
                 new_tags.append(ACCEPTED_TAG)
-            return LaneMovePlan(status="done", tags=new_tags)
-        return LaneMovePlan(status="done")
+            return _plan(status="done", tags=new_tags)
+        return _plan(status="done")
 
-    # Review and Scheduled are derived — Review from the worker's
+    # Review, Scheduled, and Snoozed are derived — Review from the worker's
     # agent-completed/accepted tags (use POST .../accept instead), Scheduled
-    # from the scheduler store. Neither is directly settable by dragging a
-    # card there. Unreachable given evaluate_card_action's checks above;
-    # kept as a defensive fallback.
+    # from the scheduler store, Snoozed from `snoozed_until` (use PUT
+    # .../snooze instead). None of the three is directly settable by
+    # dragging a card there. Unreachable given evaluate_card_action's checks
+    # above; kept as a defensive fallback.
     return LaneMovePlan(error=(400, f"lane '{target_lane}' cannot be set directly"))
 
 

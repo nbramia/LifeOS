@@ -132,6 +132,29 @@ def test_claim_for_agent_returns_false_when_already_claimed(manager: TaskManager
 
 
 @pytest.mark.unit
+def test_claim_for_agent_refuses_a_future_snoozed_task(manager: TaskManager):
+    """The worker's own claim, not just its listing, must refuse a
+    snoozed task — enforced here so a claim attempt that bypasses the
+    listing entirely still can't pick up dormant work."""
+    task = manager.create("snoozed", tags=["hermes"])
+    manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+    assert _claim(manager, task.id) == (False, False)
+    refreshed = manager.get(task.id)
+    assert refreshed.status == "todo"
+    assert refreshed.tags == ["hermes"]
+
+
+@pytest.mark.unit
+def test_claim_for_agent_allows_a_past_snoozed_task(manager: TaskManager):
+    task = manager.create("woken", tags=["hermes"])
+    manager.update(task.id, fields={"snoozed_until": "2000-01-01T00:00:00+00:00"})
+    assert _claim(manager, task.id) == (True, False)
+    refreshed = manager.get(task.id)
+    assert refreshed.status == "in_progress"
+    assert "agent-running" in refreshed.tags
+
+
+@pytest.mark.unit
 def test_claim_for_agent_is_atomic_under_race(manager: TaskManager):
     task = manager.create("racey engine", tags=["cloud"])
     n = 8

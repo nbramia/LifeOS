@@ -876,6 +876,45 @@ class TestTasksAPI:
         assert response.json()["reason"] == "task is no longer eligible"
 
 
+class TestClaimAgentEndpointSnoozeExclusion:
+    """End-to-end through the real route + a real TaskManager (not the mock
+    `TestTasksAPI` above uses) — proves the atomic claim itself, not just
+    `TaskManager.claim_for_agent` in isolation, refuses a future-snoozed
+    task."""
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    @pytest.fixture
+    def manager(self, tmp_path, monkeypatch):
+        from api.services.task_manager import TaskManager
+        import api.services.task_manager as task_manager_module
+        tm = TaskManager(vault_path=tmp_path / "vault", index_path=tmp_path / "task_index.json")
+        monkeypatch.setattr(task_manager_module, "_task_manager", tm)
+        return tm
+
+    def test_claim_agent_route_refuses_a_future_snoozed_task(self, client, manager):
+        task = manager.create("Snoozed engine task", tags=["hermes"])
+        manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+        response = client.post(f"/api/tasks/{task.id}/claim-agent")
+        assert response.status_code == 200
+        assert response.json()["claimed"] is False
+        refreshed = manager.get(task.id)
+        assert refreshed.status == "todo"
+        assert refreshed.tags == ["hermes"]
+
+    def test_claim_agent_route_allows_a_past_snoozed_task(self, client, manager):
+        task = manager.create("Woken engine task", tags=["hermes"])
+        manager.update(task.id, fields={"snoozed_until": "2000-01-01T00:00:00+00:00"})
+        response = client.post(f"/api/tasks/{task.id}/claim-agent")
+        assert response.status_code == 200
+        assert response.json()["claimed"] is True
+        assert manager.get(task.id).status == "in_progress"
+
+
 class TestListTasksParameterDocs:
     """The MCP tool schema for `lifeos_task_list` is generated from this route's
     OpenAPI spec (mcp_server._build_input_schema). Bare `Optional[str] = None`
