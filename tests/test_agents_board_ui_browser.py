@@ -1385,10 +1385,10 @@ class TestDrawerTagsEdit:
     ):
         """A card that already carries an editable tag — typing a second,
         different tag into the search field and blurring (no Enter, no
-        option pick) must PUT both tags, not replace the card's existing
-        one with only the just-typed token. Before the fix, the blur path
-        (`saveLegacyText`'s single-token branch) called `queueSave` with
-        only the new tag, discarding `existing-tag`."""
+        option pick) must PUT both tags: `saveLegacyText`'s single-token
+        branch merges the typed token onto the card's current selection
+        rather than replacing it, so `existing-tag` survives alongside the
+        newly typed one."""
         board_state = copy.deepcopy(_board_fixture())
         t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
         t2["tags"] = ["me", "existing-tag"]
@@ -4557,10 +4557,9 @@ class TestComposerTagsPicker:
         """A chip already chosen (`synthetic-one`) plus a second tag left
         typed but unconfirmed in the search field when Create is clicked —
         a real pointer click, which blurs the field first — must reach the
-        create payload alongside each other. Before the fix, the blur path
-        (`saveLegacyText`'s single-token branch) called `queueSave` with
-        only the just-typed token, silently dropping every chip chosen
-        earlier."""
+        create payload alongside each other: `saveLegacyText`'s
+        single-token branch merges the typed token onto the composer's
+        current selection rather than replacing it."""
         task_posts = []
         _open_board(page, agents_base_url, task_posts=task_posts)
         page.locator("#board-new-card").click()
