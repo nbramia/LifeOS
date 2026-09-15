@@ -34,6 +34,16 @@ source of truth; `data/scheduler_index.json` is a rebuildable cache.
 - **`#executor` tag** — for `action:: agent`, the executor: `#local`, `#cloud`, `#cloud-haiku`, or `#cloud-sonnet`.
 - **`[bot:: <name>]`** — which Telegram bot delivers the notification (see below); omitted means the primary bot.
 
+`endpoint` schedules carry the call itself in the line, so it is fully defined
+by the vault: `[endpoint:: <METHOD> <path>]` (e.g.
+`[endpoint:: POST /api/home/eero/Kid-iPad/pause]`) and, when params are
+non-empty, `[params:: <compact JSON>]`. When the params JSON contains a
+character the inline-field syntax can't hold (`]` or a newline), the field
+instead carries a `b64:`-prefixed base64 form; parsing decodes it back to the
+identical dict. Editing either field in Obsidian changes what the schedule
+calls — no other configuration is needed, and a rebuilt index cache recovers
+the call from these fields alone.
+
 Agent schedules may also carry optional execution fields such as
 `[persona_id:: journal]`, `[model_id:: synthetic-model]`, `[effort:: high]`,
 `[host:: workstation]`, and `[working_dir:: /srv/project]`. They are explicit

@@ -21,13 +21,16 @@ line as an indented ``> `` blockquote body, so it can be read and edited in
 Obsidian and round-trips back through reindexing. Indented blockquote lines
 directly following a schedule line are reserved for this body — a standalone
 note placed there will be absorbed into the schedule's ``message_content`` on
-reindex. The structured
-``endpoint_config`` and computed ``next_trigger_at`` (plus run history) live in
-a rebuildable index cache (``data/scheduler_index.json``) and are merged back
-by ID when markdown is reindexed. The cache is never the source of truth — it
-can be deleted and rebuilt from the vault.
+reindex. For ``endpoint`` schedules the route, method, and params also
+round-trip through the line as ``[endpoint:: <METHOD> <path>]`` and
+``[params:: <compact JSON>]`` — the vault line fully defines the call. The
+computed ``next_trigger_at`` (plus run history) has no markdown representation
+and lives only in a rebuildable index cache (``data/scheduler_index.json``),
+merged back by ID when markdown is reindexed. The cache is never the source of
+truth — it can be deleted and rebuilt from the vault.
 """
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -213,6 +216,34 @@ _CHECKBOX_RE = re.compile(r'^- \[(.)\]\s+(.*)$')
 # Instruction-text body: an indented blockquote line beneath a schedule line.
 _BODY_LINE_RE = re.compile(r'^\s+>\s?(.*)$')
 _BODY_INDENT = "    "
+_PARAMS_B64_PREFIX = "b64:"
+
+
+def _encode_params(params: dict) -> str:
+    """Compact JSON for the ``[params:: …]`` inline field.
+
+    The inline-field syntax cannot hold ``]`` or a newline, so when the
+    compact JSON contains either, it is base64-encoded and marked with the
+    ``b64:`` prefix instead.
+    """
+    compact = json.dumps(params, separators=(",", ":"), default=str)
+    if "]" in compact or "\n" in compact:
+        return _PARAMS_B64_PREFIX + base64.b64encode(compact.encode("utf-8")).decode("ascii")
+    return compact
+
+
+def _decode_params(raw: str) -> dict:
+    """Inverse of ``_encode_params``. Raises ValueError/TypeError on malformed input."""
+    if raw.startswith(_PARAMS_B64_PREFIX):
+        decoded = base64.b64decode(
+            raw[len(_PARAMS_B64_PREFIX):].encode("ascii"), validate=True
+        ).decode("utf-8")
+        parsed = json.loads(decoded)
+    else:
+        parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("params must be a JSON object")
+    return parsed
 
 
 def _format_entry_line(entry: ScheduleEntry) -> str:
@@ -226,6 +257,13 @@ def _format_entry_line(entry: ScheduleEntry) -> str:
         parts.append(f"[tz:: {entry.timezone}]")
     parts.append(f"[action:: {entry.action}]")
     parts.append(f"[mtype:: {entry.message_type}]")
+    if entry.action == "endpoint" and entry.endpoint_config:
+        method = (entry.endpoint_config.get("method") or "GET").upper()
+        path = entry.endpoint_config.get("endpoint", "")
+        parts.append(f"[endpoint:: {method} {path}]")
+        params = entry.endpoint_config.get("params") or {}
+        if params:
+            parts.append(f"[params:: {_encode_params(params)}]")
     if entry.bot:
         parts.append(f"[bot:: {entry.bot}]")
     if entry.executor:
@@ -277,13 +315,27 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
     action = fields.get("action") or "notify"
     message_type = fields.get("mtype") or "static"
 
-    return ScheduleEntry(
+    endpoint_config = None
+    params_malformed = False
+    if "endpoint" in fields:
+        method, _, path = fields["endpoint"].partition(" ")
+        params: dict = {}
+        if "params" in fields:
+            try:
+                params = _decode_params(fields["params"])
+            except (ValueError, TypeError):
+                params_malformed = True
+                params = {}
+        endpoint_config = {"endpoint": path, "method": method.upper(), "params": params}
+
+    entry = ScheduleEntry(
         id=entry_id,
         name=name,
         schedule_type=schedule_type,
         schedule_value=schedule_value,
         action=action,
         message_type=message_type,
+        endpoint_config=endpoint_config,
         executor=executor,
         bot=fields.get("bot", ""),
         enabled=(symbol == " "),
@@ -297,6 +349,10 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
         host=fields.get("host", ""),
         working_dir=fields.get("working_dir", ""),
     )
+    if params_malformed:
+        logger.warning(f"Malformed params field for schedule {entry_id}; falling back to cache")
+        entry._params_malformed = True
+    return entry
 
 
 def _format_entry_block(entry: ScheduleEntry) -> list[str]:
@@ -682,9 +738,16 @@ class SchedulerStore:
         prior = self._entries
         entries: dict[str, ScheduleEntry] = {}
         for _start, _end, entry in _iter_entry_blocks(lines):
+            had_endpoint_field = entry.endpoint_config is not None
             self._merge_prior(entry, prior.get(entry.id))
             entry.next_trigger_at = compute_next_trigger(entry) if entry.enabled else None
             entries[entry.id] = entry
+            # One-time migration: a pre-existing endpoint schedule whose line
+            # predates this field carries no endpoint field, so the cache
+            # supplied endpoint_config above. Persist it into the vault line
+            # now; the next parse finds it directly, so this runs at most once.
+            if entry.action == "endpoint" and not had_endpoint_field and entry.endpoint_config:
+                self._rewrite_block(entry)
         return entries
 
     @staticmethod
@@ -693,8 +756,12 @@ class SchedulerStore:
 
         ``message_content`` now lives in the markdown body, so markdown wins when
         a body is present; the cache fallback only fills entries written before
-        bodies existed (lazy migration). ``endpoint_config`` and run history have
-        no markdown representation and are always carried from the cache.
+        bodies existed (lazy migration). ``endpoint_config`` is similar: a vault
+        line carrying endpoint fields wins outright (including over a params
+        value that failed to parse, where only the cached ``params`` is used as
+        a fallback); a line with no endpoint fields at all still falls back to
+        the cache. Run history has no markdown representation and is always
+        carried from the cache.
         """
         if not prior:
             return
@@ -702,6 +769,8 @@ class SchedulerStore:
             entry.message_content = prior.message_content
         if entry.endpoint_config is None:
             entry.endpoint_config = prior.endpoint_config
+        elif getattr(entry, "_params_malformed", False) and prior.endpoint_config:
+            entry.endpoint_config["params"] = prior.endpoint_config.get("params") or {}
         if not entry.created_at:
             entry.created_at = prior.created_at
         if not entry.last_triggered_at:
