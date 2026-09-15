@@ -594,6 +594,8 @@ Create a schedule. Supports `schedule_type` of `once` (ISO datetime) or `cron`, 
 
 `bot` (optional) selects which Telegram bot delivers the notification. Valid values are `primary` and the names registered in `config/telegram_bots.json`; anything else returns **422** with the accepted names. Omit it, or send an empty string, for the primary bot.
 
+`timezone` must resolve as a valid IANA zone, and `schedule_value` must parse for its `schedule_type` (a cron expression for `cron`, an ISO datetime for `once`) — either failure returns **422** with a detail naming what's wrong, and nothing is stored.
+
 The resulting action must have what it needs to fire, checked after every other field above: for `action: "endpoint"`, `endpoint_config` must have a `method` of `GET` or `POST` (case-insensitive; stored upper-case), an `endpoint` path starting with `/api/`, and `params` absent or a JSON object; for `notify`/`prompt`/`agent`, `message_content` must be non-blank. Either failure returns **422** naming the specific field. An `agent` action's execution context — `persona_id`, `model_id`, `effort`, `host`, `working_dir` — round-trips as plain top-level fields alongside `executor`; all default to empty (no override).
 
 ### GET /api/scheduler
