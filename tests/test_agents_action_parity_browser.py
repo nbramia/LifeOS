@@ -1003,8 +1003,9 @@ class TestResumeRowMountedOnce:
 # enough, and wrap its own buttons onto enough internal lines, that its
 # resulting height reaches down into `.panel-header .meta`'s (the badge
 # row directly below it) own natural top position. `status` (the first
-# badge once a terminal status hides the live dot ahead of it) is the one
-# that lands on top of the Rename button when the fix regresses.
+# badge once a terminal status hides the live dot ahead of it) is the
+# badge positioned directly over the Rename button whenever the header
+# layout lets a badge paint over the action row.
 _FULL_BADGE_SESSION = {
     "session_id": "cc:panel-actions-desktop", "source": "claude_code", "is_cli_session": True,
     "status": "completed", "status_inferred": False, "routing": "claude_code",
@@ -1210,9 +1211,8 @@ def _close_pos_card(card_id, session, **overrides):
 def _v_running_minimal():
     """A plain, non-terminal, non-CLI session with no card-only actions
     beyond Delete — offers Rename, Kill, Delete: a single, short action
-    row that already kept the close button correctly positioned before
-    this fix, kept here as the baseline every other variant is compared
-    against."""
+    row, kept here as the simplest baseline the other, wider-row variants
+    are compared against."""
     session = _close_pos_session("sess-cp-running", label="Run")
     return _close_pos_card("t-cp-running", session)
 
