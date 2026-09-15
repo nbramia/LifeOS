@@ -8,6 +8,7 @@ path is tested against a real store on a temp vault.
 import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 pytestmark = pytest.mark.unit
 
@@ -528,6 +529,105 @@ class TestListBots:
                 resp = client.get("/api/scheduler/bots")
         assert resp.status_code == 200
         assert resp.json() == {"bots": ["primary"]}
+        mock.return_value.get.assert_not_called()
+
+
+class TestPreviewSchedule:
+    """`POST /api/scheduler/preview` — the create-schedule composer's live
+    fire-time preview, computed with `compute_next_n_triggers` but never
+    touching the store."""
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    def test_cron_in_non_utc_timezone(self, client):
+        """DST-safe: asserts the returned times land at 9am local and at a
+        UTC offset America/New_York actually uses (-4 EDT or -5 EST) rather
+        than depending on today's date landing on either side of a DST
+        transition, or on a fixed offset a cron-evaluated-in-UTC bug would
+        also happen to produce."""
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            "timezone": "America/New_York",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["next"]) == 3
+        parsed = [datetime.fromisoformat(t) for t in data["next"]]
+        assert parsed == sorted(parsed)
+        for dt in parsed:
+            assert dt.tzinfo == timezone.utc
+            local = dt.astimezone(ZoneInfo("America/New_York"))
+            assert (local.hour, local.minute) == (9, 0)
+            assert local.utcoffset() in (timedelta(hours=-4), timedelta(hours=-5))
+
+    def test_once_in_future_returns_single_time(self, client):
+        future = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "once", "schedule_value": future.isoformat(),
+        })
+        assert resp.status_code == 200
+        assert resp.json()["next"] == [future.astimezone(timezone.utc).isoformat()]
+
+    def test_once_in_past_returns_empty(self, client):
+        past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "once", "schedule_value": past,
+        })
+        assert resp.status_code == 200
+        assert resp.json()["next"] == []
+
+    def test_invalid_cron_returns_422_matching_create_wording(self, client):
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "cron", "schedule_value": "not a cron",
+        })
+        assert resp.status_code == 422
+        assert "Invalid cron expression 'not a cron'" in resp.json()["detail"]
+
+    def test_invalid_iso_datetime_returns_422_matching_create_wording(self, client):
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "once", "schedule_value": "not-a-date",
+        })
+        assert resp.status_code == 422
+        assert "Invalid ISO datetime 'not-a-date'" in resp.json()["detail"]
+
+    def test_invalid_timezone_returns_422(self, client):
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            "timezone": "Nowhere/Fake",
+        })
+        assert resp.status_code == 422
+        assert "Unknown timezone 'Nowhere/Fake'" in resp.json()["detail"]
+
+    def test_bad_schedule_type_returns_400(self, client):
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "weekly", "schedule_value": "0 9 * * *",
+        })
+        assert resp.status_code == 400
+
+    def test_omitted_timezone_defaults_to_configured_timezone(self, client):
+        with patch("api.routes.scheduler.settings.timezone", "America/Chicago"):
+            resp = client.post("/api/scheduler/preview", json={
+                "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            })
+        assert resp.status_code == 200
+        parsed = datetime.fromisoformat(resp.json()["next"][0])
+        local = parsed.astimezone(ZoneInfo("America/Chicago"))
+        assert local.hour == 9
+
+    def test_not_captured_by_the_schedule_id_route(self, client):
+        """POST /preview is declared before GET/PUT/DELETE /{schedule_id} —
+        a store whose `get` would happily resolve "preview" as a schedule
+        id must never be reached for this path."""
+        with patch("api.routes.scheduler.get_scheduler_store") as mock:
+            mock.return_value.get.return_value = _sample_entry()
+            resp = client.post("/api/scheduler/preview", json={
+                "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            })
+        assert resp.status_code == 200
         mock.return_value.get.assert_not_called()
 
 

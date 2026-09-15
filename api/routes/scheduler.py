@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from api.services.scheduler_store import (
     get_scheduler_store,
     get_scheduler,
+    compute_next_n_triggers,
     ScheduleEntry,
     VALID_ACTIONS,
 )
@@ -141,6 +142,19 @@ class SendMessageRequest(BaseModel):
                     "(config/telegram_bots.json). Falls back to the primary bot "
                     "if unset or unrecognised.",
     )
+
+
+class PreviewScheduleRequest(BaseModel):
+    schedule_type: str = Field(..., description="'once' or 'cron'")
+    schedule_value: str = Field(..., description="ISO datetime (once) or cron expression (cron)")
+    timezone: str = Field(default_factory=lambda: settings.timezone, description="IANA timezone")
+
+
+class PreviewScheduleResponse(BaseModel):
+    next: list[str]
+
+
+PREVIEW_TRIGGER_COUNT = 3
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +348,29 @@ async def list_bots():
     from api.services.telegram import valid_bot_names
 
     return {"bots": valid_bot_names()}
+
+
+@router.post("/preview", response_model=PreviewScheduleResponse)
+async def preview_schedule(request: PreviewScheduleRequest):
+    """Preview the next fire times for a trigger without creating a schedule.
+
+    Uses the same trigger semantics the scheduler itself fires on — a cron
+    expression evaluated in ``timezone`` — so a create-schedule composer can
+    show what a trigger will actually do before saving it. Declared ahead of
+    ``GET /{schedule_id}`` so ``preview`` is never captured as an id."""
+    if request.schedule_type not in ("once", "cron"):
+        raise HTTPException(status_code=400, detail="schedule_type must be 'once' or 'cron'")
+    try:
+        ZoneInfo(request.timezone)
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"Unknown timezone '{request.timezone}'")
+    _validate_schedule_value(request.schedule_type, request.schedule_value)
+
+    triggers = compute_next_n_triggers(
+        request.schedule_type, request.schedule_value, request.timezone,
+        count=PREVIEW_TRIGGER_COUNT, label="preview",
+    )
+    return PreviewScheduleResponse(next=triggers)
 
 
 @router.get("/{schedule_id}", response_model=ScheduleResponse)
