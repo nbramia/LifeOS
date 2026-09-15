@@ -4,7 +4,8 @@
 // task store via GET/PUT /api/agents/board*, with a card drawer that reuses
 // the shared SessionPanel (./panel.js) for the linked session's transcript,
 // exactly like the Graph tab's side panel does. The drawer's own action
-// row (Open, Go To, Resume, Kill, Answer, Accept, Reject, Reassign, Mark Done, Cancel, Delete)
+// row (Open, Go To, Resume, Kill, Answer, Accept, Reject, Reassign, Mark
+// Done, Snooze, Unsnooze, Cancel, Delete)
 // is rendered by session_actions.js's `renderActionRow` — the same
 // function the Graph tab's side panel uses for its own header — so the
 // embedded SessionPanel here is constructed with `showActions: false`
@@ -19,7 +20,9 @@ import {
 } from './panel.js';
 import { renderActionRow } from './session_actions.js';
 import { descendantsOf } from './graph_encoding.js';
-import { acceptCard, cardActionHandlers, cancelCard, openDeleteCardModal } from './card_actions.js';
+import {
+  acceptCard, cardActionHandlers, cancelCard, openDeleteCardModal, snoozeCard, undoAcceptedCard,
+} from './card_actions.js';
 import { renderAssignmentPickers } from './assignment.js';
 import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
@@ -93,11 +96,14 @@ const SCHEDULE_EXECUTORS = ['local', 'cloud', 'cloud-haiku', 'cloud-sonnet'];
 // (web/agents/linking.js) — persistence, migration, and validation of a
 // stored id list all live there now; `visibleLanes` below is a local mirror
 // kept in sync via `subscribeFilters`.
-const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done').map(l => l.id);
-// plan_lane_move (api/services/agent_board.py) rejects `review` and
-// `scheduled` with "cannot be set directly" — no per-lane "+" button for
-// either, and both are excluded from the new-card composer's lane select.
-const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled').map(l => l.id));
+const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done' && l.id !== 'snoozed').map(l => l.id);
+// plan_lane_move (api/services/agent_board.py) rejects `review`,
+// `scheduled`, and `snoozed` with "cannot be set directly" — no per-lane
+// "+" button for any of the three, all three are excluded from the
+// new-card composer's lane select, and `canDropCard`/`onCardDropped`
+// (below) refuse a drop targeting one before it ever reaches the server.
+// Snoozing only ever happens through the drawer's Snooze picker.
+const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled' && l.id !== 'snoozed').map(l => l.id));
 
 function loadSortSelection() {
   return readSortSelection(localStorage, SORT_STORAGE_KEY, SORT_OPTIONS, DEFAULT_SORT);
@@ -473,6 +479,53 @@ export function initBoard() {
     return { allowed: true, reason: '' };
   }
 
+  // Mirrors api/services/agent_board.py's natural_lane(status, tags) — the
+  // lane a card would derive to ignoring any snooze. Used only to compute
+  // Undo's restore target for a card captured mid-snooze, since the
+  // server's own `snoozed` lane can never be set directly (plan_lane_move
+  // refuses it the same way review/scheduled are refused). Deliberately
+  // omits the machine-wait-tag branch production's natural_lane has: a
+  // card this function is ever called on was successfully snoozed, which
+  // the drawer only ever offers from Unassigned, Assigned, Human queue, or
+  // Review (session_actions.js's SNOOZE_ELIGIBLE_LANES), so its natural
+  // lane can never actually be the machine-wait flavor of In progress.
+  function naturalLaneFor(card) {
+    const tags = new Set((card.tags || []).map(t => String(t).replace(/^#+/, '').toLowerCase()));
+    const status = (card.status || 'todo').toLowerCase();
+    if (tags.has('agent-completed') && !tags.has('accepted')) return 'review';
+    if (tags.has('agent-blocked') || tags.has('human') || status === 'blocked') return 'human_queue';
+    if (status === 'in_progress' || tags.has('agent-running')) return 'in_progress';
+    if (status === 'done' || status === 'cancelled') return 'done';
+    return card.assignee ? 'assigned' : 'unassigned';
+  }
+
+  // The shared Undo restore target for both the lane-drop (onCardDropped)
+  // and the tray-assignee-drop (assignCardTo) paths. `lane` is the card's
+  // NATURAL lane at capture time (see naturalLaneFor) — for a card that
+  // was snoozed, `card.lane` itself was `snoozed`, which plan_lane_move
+  // always refuses as a direct target, so callers resolve the natural
+  // lane first rather than ever passing `snoozed` through here. Review is
+  // ALSO not directly settable; the only way a snoozed Review card's Undo
+  // is ever actually offered is after a drag to Done added `accepted`
+  // (agent-completed alone already wins the derived lane back to Review
+  // the instant it's written anywhere else, which short-circuits the
+  // undoable toast entirely, without this function ever being called —
+  // see onCardDropped's "landed elsewhere" check) — so restoring Review always
+  // means undoing that acceptance, not a lane move. `snoozedUntil`, when
+  // given and still in the future, re-applies the snooze once the lane (or
+  // acceptance) is restored.
+  function undoToLane(cardId, lane, assignee, snoozedUntil) {
+    const restore = lane === 'review'
+      ? undoAcceptedCard(cardId, () => {})
+      : moveCard(cardId, lane, assignee || undefined);
+    return restore
+      .then(() => {
+        const stillFuture = snoozedUntil && new Date(snoozedUntil).getTime() > Date.now();
+        return stillFuture ? snoozeCard({ id: cardId }, snoozedUntil, () => {}) : null;
+      })
+      .then(() => fetchBoard());
+  }
+
   // Every way to assign a card — dragging an assignee onto a card, or
   // dragging a card onto an assignee — lands here, so neither path can
   // report or offer undo differently from the other.
@@ -485,9 +538,15 @@ export function initBoard() {
       return;
     }
     // Captured before the write so Undo restores where the card actually
-    // was, not wherever the board has drifted to by the time it is clicked.
+    // was, not wherever the board has drifted to by the time it is
+    // clicked. A card dragged while snoozed resolves its Undo target to
+    // the NATURAL lane it was snoozed from, plus the wake-up time, so
+    // Undo restores the snooze too instead of trying (and failing) to
+    // move the card directly into the `snoozed` lane.
     const priorLane = card.lane;
     const priorAssignee = card.assignee || null;
+    const priorSnoozedUntil = priorLane === 'snoozed' ? (card.fields && card.fields.snoozed_until) : null;
+    const priorNaturalLane = priorLane === 'snoozed' ? naturalLaneFor(card) : priorLane;
     const title = card.title || card.id;
     setDropStatus(`Assigning ${assignee}…`);
     // Keep this on the same lane endpoint and request shape as the drawer's
@@ -498,7 +557,7 @@ export function initBoard() {
         setDropStatus(`Assigned to ${assignee}.`);
         if (data && data.lane && data.lane !== 'assigned') return;
         showUndoableToast(`Assigned "${title}" to ${assignee}.`, () => (
-          moveCard(card.id, priorLane, priorAssignee || undefined)
+          undoToLane(card.id, priorNaturalLane, priorAssignee, priorSnoozedUntil)
         ));
       })
       .catch(() => setDropStatus('Assignment refused.', true));
@@ -563,6 +622,15 @@ export function initBoard() {
 
   function cardChips(card) {
     const chips = [];
+    // Snoozed cards show their wake-up time first — the one thing that
+    // actually explains why the card is sitting here instead of its
+    // natural lane.
+    if (card.lane === 'snoozed' && card.fields && card.fields.snoozed_until) {
+      const wake = formatWakeTime(card.fields.snoozed_until);
+      if (wake) {
+        chips.push(`<span class="board-chip board-chip-snoozed" title="wakes ${escapeAttr(wake.exact)}">⏰ ${escapeHtml(wake.label)}</span>`);
+      }
+    }
     if (card.assignee) chips.push(`<span class="board-chip board-chip-assignee">${escapeHtml(card.assignee)}</span>`);
     if (card.fields && card.fields.model) chips.push(`<span class="board-chip">${escapeHtml(card.fields.model)}</span>`);
     if (card.fields && card.fields.effort) chips.push(`<span class="board-chip">${escapeHtml(card.fields.effort)}</span>`);
@@ -1079,9 +1147,14 @@ export function initBoard() {
       assignee = card.assignee || 'me';
     }
     // Captured before the write so Undo restores where the card actually
-    // was, not wherever the board has drifted to by the time it is clicked.
+    // was, not wherever the board has drifted to by the time it is
+    // clicked. A card dragged out of Snoozed resolves its Undo target to
+    // the NATURAL lane it was snoozed from, plus the wake-up time — see
+    // naturalLaneFor/undoToLane.
     const priorLane = card.lane;
     const priorAssignee = card.assignee || null;
+    const priorSnoozedUntil = priorLane === 'snoozed' ? (card.fields && card.fields.snoozed_until) : null;
+    const priorNaturalLane = priorLane === 'snoozed' ? naturalLaneFor(card) : priorLane;
     const title = card.title || card.id;
     // moveCard already toasts and re-renders on failure — nothing more to
     // do there, just avoid an unhandled rejection given that it re-throws.
@@ -1092,7 +1165,7 @@ export function initBoard() {
         // A second toast claiming the requested move would contradict it.
         if (data && data.lane && data.lane !== targetLane) return;
         showUndoableToast(`Moved "${title}" to ${laneLabel(targetLane)}.`, () => (
-          moveCard(cardId, priorLane, priorAssignee || undefined)
+          undoToLane(cardId, priorNaturalLane, priorAssignee, priorSnoozedUntil)
         ));
       })
       .catch(() => {});
@@ -1793,6 +1866,22 @@ export function initBoard() {
     };
   }
 
+  // A wake-up time renders as a short local date AND time (unlike
+  // formatCardDate's date-only rows above) — "Sep 16, 9:00 AM" — since the
+  // whole point of showing it is telling the operator when the card comes
+  // back, not just what day.
+  function formatWakeTime(iso) {
+    if (!iso) return null;
+    const parsed = new Date(iso);
+    if (Number.isNaN(parsed.getTime())) return { label: iso, exact: iso };
+    return {
+      label: parsed.toLocaleString(undefined, {
+        month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+      }),
+      exact: iso,
+    };
+  }
+
   // The read-only block: what the card reports about itself, as opposed to
   // the fields above it that the operator edits. A date the card doesn't
   // carry is omitted rather than rendered empty.
@@ -1814,6 +1903,17 @@ export function initBoard() {
           <span class="drawer-meta-value" title="${escapeAttr(formatted.exact)}">${escapeHtml(formatted.label)}</span>
         </div>
       `);
+    }
+    if (card.lane === 'snoozed' && card.fields && card.fields.snoozed_until) {
+      const wake = formatWakeTime(card.fields.snoozed_until);
+      if (wake) {
+        items.push(`
+          <div class="drawer-meta-item">
+            <span class="drawer-meta-label">Wakes</span>
+            <span class="drawer-meta-value" title="${escapeAttr(wake.exact)}">${escapeHtml(wake.label)}</span>
+          </div>
+        `);
+      }
     }
     if (card.status) {
       items.push(`
@@ -2344,16 +2444,18 @@ export function initBoard() {
   }
 
   // The drawer's action row — Open, Go To, Resume, Kill, Answer, Accept, Reject,
-  // Reassign, Mark Done, Cancel, Delete.
+  // Reassign, Mark Done, Snooze, Unsnooze, Cancel, Delete.
   // Which of these apply and whether each is
   // enabled or disabled-with-a-reason is decided once, by
   // session_actions.js's `decideActions`, and rendered by its
   // `renderActionRow` — the exact same function the Graph tab's side panel
   // uses for its own header, so the two surfaces can't disagree about a
-  // shared session. Go To/Resume/Kill/Answer are built into
-  // `renderActionRow` itself (it owns Kill's cascade-preview modal,
-  // Resume's host select, and Go To's "Locating…" state); Open, Accept,
-  // Reject, Reassign, Mark Done, Cancel, and Delete come from ./card_actions.js, shared with a
+  // shared session. Go To/Resume/Kill/Answer/Snooze's own picker UI are
+  // built into `renderActionRow` itself (it owns Kill's cascade-preview
+  // modal, Resume's host select, Go To's "Locating…" state, and Snooze's
+  // preset/duration/date-time picker); Open, Accept, Reject, Reassign,
+  // Mark Done, Snooze's write, Unsnooze, and Delete come from
+  // ./card_actions.js, shared with a
   // card-linked Graph tab side panel — Cancel and Delete are overridden
   // below with the extra drawer-specific bookkeeping (closing/rebuilding
   // this drawer) that a bare handoff to `fetchBoard` doesn't cover.

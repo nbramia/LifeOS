@@ -15,10 +15,11 @@ export const LANES = [
   { id: 'scheduled',   label: 'Scheduled' },
   { id: 'review',      label: 'Review' },
   { id: 'done',        label: 'Done' },
+  { id: 'snoozed',     label: 'Snoozed' },
 ];
 
 // Okabe-Ito colour-blind-safe palette (minus black, which doesn't read on
-// the dark background) — seven distinct, legible-on-dark hues, one per lane.
+// the dark background) — eight distinct, legible-on-dark hues, one per lane.
 export const LANE_COLORS = {
   unassigned:  '#56B4E9',
   assigned:    '#0072B2',
@@ -27,6 +28,7 @@ export const LANE_COLORS = {
   scheduled:   '#CC79A7',
   review:      '#F0E442',
   done:        '#9a9aa8',
+  snoozed:     '#E69F00',
 };
 
 export function laneColor(lane) {

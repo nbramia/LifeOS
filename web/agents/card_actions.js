@@ -2,8 +2,9 @@
 //
 // The network call, toast, and (for Delete) the kill-then-delete
 // confirmation modal behind each card-only action in the shared action row
-// (Open, Accept, Reject, Reassign, Mark Done, Cancel, Delete — see ./session_actions.js's
-// `decideActions`) — the part that's identical wherever a card-aware panel
+// (Open, Accept, Reject, Reassign, Mark Done, Snooze, Unsnooze, Cancel,
+// Delete — see ./session_actions.js's `decideActions`) — the part that's
+// identical wherever a card-aware panel
 // offers them: the Board drawer (web/agents/board.js) and a card-linked
 // Graph tab side panel (web/agents/panel.js). A caller supplies `onChanged`
 // (refresh this surface's own view of the card after a write succeeds) and,
@@ -219,6 +220,40 @@ export async function resolveCard(card, onChanged) {
   } catch (err) { showToast(`Couldn't resolve card: ${err.message}`, true); }
 }
 
+// `until` is an absolute ISO-8601 string with a UTC offset, already
+// computed by the caller's picker UI (session_actions.js's
+// `renderActionRow` snooze branch) — this function only performs the
+// write and reports the result.
+export async function snoozeCard(card, until, onChanged) {
+  try {
+    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/snooze`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ until }),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    showToast('Snoozed.', false);
+    if (onChanged) await onChanged();
+  } catch (err) { showToast(`Snooze failed: ${err.message}`, true); }
+}
+
+export async function unsnoozeCard(card, onChanged) {
+  try {
+    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/snooze`, { method: 'DELETE' });
+    if (!r.ok) {
+      const text = await r.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    showToast('Unsnoozed.', false);
+    if (onChanged) await onChanged();
+  } catch (err) { showToast(`Unsnooze failed: ${err.message}`, true); }
+}
+
 export async function cancelCard(card, onChanged) {
   try {
     const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/cancel`, { method: 'POST' });
@@ -396,6 +431,8 @@ export function cardActionHandlers(card, {
       onMutationConfirmed, onMutationFailed,
     }),
     resolve: () => resolveCard(card, changed),
+    snooze: (until) => snoozeCard(card, until, changed),
+    unsnooze: () => unsnoozeCard(card, changed),
     cancel: () => cancelCard(card, changed),
     delete: () => openDeleteCardModal(card, {
       findCard, onDeleted: changed, onMutationOpened, onMutationCancelled,

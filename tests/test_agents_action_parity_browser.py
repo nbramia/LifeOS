@@ -172,13 +172,15 @@ class TestDecideActions:
         session = dict(_BARE_SESSION, session_id="cc:parity-open")
         card = {"kind": "task", "lane": "assigned", "assignee": "claude", "pending_question": None}
         out = _decide(page, session, card)
-        assert _ids(out) == ["open", "rename", "focus", "resume", "kill", "delete"], out
+        # Assigned is snooze-eligible, so Snooze rides along before Delete.
+        assert _ids(out) == ["open", "rename", "focus", "resume", "kill", "snooze", "delete"], out
 
     def test_card_review_lane_offers_accept(self, page: Page, web_base_url):
         _load_actions_module(page, web_base_url)
         card = {"kind": "task", "lane": "review", "assignee": "claude", "pending_question": None}
         out = _decide(page, None, card)
-        assert _ids(out) == ["accept", "reject", "reassign", "delete"], out
+        # Review is snooze-eligible too.
+        assert _ids(out) == ["accept", "reject", "reassign", "snooze", "delete"], out
 
     def test_review_without_session_disables_reject_and_explains_why(self, page: Page, web_base_url):
         """A Review card with no linked session still shows both feedback
@@ -202,7 +204,9 @@ class TestDecideActions:
         card = {"kind": "task", "lane": "review", "assignee": "claude", "pending_question": None}
         session = dict(_BARE_SESSION, status="completed")
         out = _decide(page, session, card)
-        assert _ids(out) == ["rename", "focus", "resume", "accept", "reject", "reassign", "delete"], out
+        assert _ids(out) == [
+            "rename", "focus", "resume", "accept", "reject", "reassign", "snooze", "delete",
+        ], out
 
     def test_human_queue_action_is_named_mark_done(self, page: Page, web_base_url):
         _load_actions_module(page, web_base_url)
@@ -270,8 +274,12 @@ class TestDecideActions:
         }
         out = _decide(page, session, card)
         # Open needs lane=assigned (not review) and Resolve needs
-        # lane=human_queue, so neither applies here — everything else does.
-        assert _ids(out) == ["rename", "focus", "resume", "kill", "answer", "accept", "reject", "reassign", "cancel", "delete"], out
+        # lane=human_queue, so neither applies here — everything else does,
+        # including Snooze (review is snooze-eligible).
+        assert _ids(out) == [
+            "rename", "focus", "resume", "kill", "answer", "accept", "reject",
+            "reassign", "snooze", "cancel", "delete",
+        ], out
 
 
 # ---------------------------------------------------------------------------
@@ -424,10 +432,10 @@ class TestActionParity:
         assert panel_actions, "panel rendered no actions"
         assert board_actions == panel_actions, (board_actions, panel_actions)
         # And the canonical set — proves this scenario actually exercises
-        # Open/Focus/Resume/Kill/Answer/Cancel/Delete together, not just
-        # that two empty lists match.
+        # Open/Focus/Resume/Kill/Answer/Snooze/Cancel/Delete together, not
+        # just that two empty lists match. Assigned is snooze-eligible.
         assert [a["id"] for a in board_actions] == [
-            "open", "rename", "focus", "resume", "kill", "answer", "cancel", "delete",
+            "open", "rename", "focus", "resume", "kill", "answer", "snooze", "cancel", "delete",
         ], board_actions
 
     def test_review_lane_accept_parity(self, page: Page, web_base_url):
@@ -484,7 +492,10 @@ class TestActionParity:
         )
 
         assert board_actions == panel_actions, (board_actions, panel_actions)
-        assert [a["id"] for a in board_actions] == ["rename", "focus", "resume", "kill", "accept", "reject", "reassign", "delete"], board_actions
+        # Review is snooze-eligible.
+        assert [a["id"] for a in board_actions] == [
+            "rename", "focus", "resume", "kill", "accept", "reject", "reassign", "snooze", "delete",
+        ], board_actions
 
 
 # ---------------------------------------------------------------------------
@@ -547,8 +558,9 @@ class TestGraphTabParity:
             "the Graph tab never handed SessionPanel the card"
         )
         assert graph_actions == board_actions, (board_actions, graph_actions)
+        # Assigned is snooze-eligible.
         assert [a["id"] for a in graph_actions] == [
-            "open", "rename", "focus", "resume", "kill", "answer", "cancel", "delete",
+            "open", "rename", "focus", "resume", "kill", "answer", "snooze", "cancel", "delete",
         ], graph_actions
 
 
