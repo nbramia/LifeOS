@@ -1380,6 +1380,29 @@ class TestDrawerTagsEdit:
         search.fill("agent-running")
         expect(page.locator(".drawer-tag-option-create")).to_have_count(0)
 
+    def test_typing_a_new_tag_and_blurring_keeps_the_cards_other_editable_tag(
+        self, page: Page, agents_base_url,
+    ):
+        """A card that already carries an editable tag — typing a second,
+        different tag into the search field and blurring (no Enter, no
+        option pick) must PUT both tags, not replace the card's existing
+        one with only the just-typed token. Before the fix, the blur path
+        (`saveLegacyText`'s single-token branch) called `queueSave` with
+        only the new tag, discarding `existing-tag`."""
+        board_state = copy.deepcopy(_board_fixture())
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        t2["tags"] = ["me", "existing-tag"]
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-tag-chip")).to_contain_text("#existing-tag")
+        tags = page.locator(".drawer-tags")
+        tags.fill("brand-new-tag")
+        page.locator(".drawer-title").click()  # blur the tags field
+        _wait_for(lambda: any("brand-new-tag" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert task_puts == [{"tags": ["existing-tag", "brand-new-tag"]}], task_puts
+        expect(page.locator(".drawer-tag-chip")).to_have_count(2)
+
     def test_invalid_and_assignee_tokens_are_dropped(self, page: Page, agents_base_url):
         """Round-1 finding 8: the Tags field must not let a vault-comment
         injection or a duplicate assignee token reach the task store. t2 is
@@ -1488,11 +1511,21 @@ class TestDrawerTagsEdit:
             )
 
         assert not any("stale-two" in (payload.get("tags") or []) for payload in task_puts)
+        # A committed single-token blur adds to the card's already-confirmed
+        # tags rather than replacing them, so each subsequent edit here
+        # accumulates onto the last one that actually persisted (the
+        # cancelled modals never let a queued write land, but the tag it
+        # would have added was never confirmed either — the un-mutated
+        # `confirmed` value used by the next cancel() is what each
+        # following commit builds on).
         assert [payload["tags"] for payload in task_puts] == [
-            ["stale-one"], ["after-reject"], ["after-reassign"], ["after-delete"],
+            ["stale-one"],
+            ["after-reject"],
+            ["after-reject", "after-reassign"],
+            ["after-reject", "after-reassign", "after-delete"],
         ]
         review = next(card for card in board_state["lanes"]["review"] if card["id"] == "t-review")
-        assert review["tags"] == ["codex", "agent-completed", "after-delete"]
+        assert review["tags"] == ["codex", "agent-completed", "after-reject", "after-reassign", "after-delete"]
 
 
 class TestDrawerAssigneeRevert:
@@ -4438,6 +4471,48 @@ class TestComposerTagsPicker:
         _wait_for(lambda: len(task_posts) == 1, page=page)
         assert task_posts[0] == {"description": "Plain composer card"}, task_posts
 
+    def test_empty_query_focus_does_not_open_the_suggestion_list_over_create(
+        self, page: Page, agents_base_url,
+    ):
+        """Focusing the Tags search field with an empty query must not pop
+        the suggestion list open over the Create button below it — only
+        typing a query, or pressing ArrowDown/ArrowUp, opens it. Board
+        fixture t4 carries the editable tag `human`, so the list would have
+        a real match to show if it opened on bare focus."""
+        _open_board(page, agents_base_url)
+        page.locator("#board-new-card").click()
+        options = page.locator(".modal [data-field='tag-options']")
+        search = page.locator(".modal .drawer-tags")
+        search.click()
+        expect(options).to_be_hidden()
+        create_btn = page.locator("#new-card-create")
+        box = create_btn.bounding_box()
+        covering = page.evaluate(
+            "([x, y]) => { const el = document.elementFromPoint(x, y); "
+            "return el ? el.id || el.className : null; }",
+            [box["x"] + box["width"] / 2, box["y"] + box["height"] / 2],
+        )
+        assert covering == "new-card-create", covering
+
+        # Typing opens it.
+        search.fill("hum")
+        expect(options).to_be_visible()
+        expect(page.locator('[data-field="tag-options"] [data-select-tag="human"]')).to_be_visible()
+
+        # Clearing the query back to empty keeps it open (sticky once
+        # requested) rather than re-hiding it mid-pick.
+        search.fill("")
+        expect(options).to_be_visible()
+
+        search.press("Escape")
+        expect(options).to_be_hidden()
+
+        # ArrowDown alone (no typing) also opens it and moves focus onto
+        # the first option.
+        search.press("ArrowDown")
+        expect(options).to_be_visible()
+        expect(page.locator('[data-field="tag-options"] [data-select-tag="human"]')).to_be_focused()
+
     def test_typing_a_lifecycle_tag_is_rejected(self, page: Page, agents_base_url):
         task_posts = []
         task_puts = []
@@ -4474,6 +4549,35 @@ class TestComposerTagsPicker:
         _wait_for(lambda: len(task_posts) == 1, page=page)
         assert task_posts[0] == {
             "description": "Pending tag reaches payload", "tags": ["synthetic-pending"],
+        }, task_posts
+
+    def test_pending_typed_tag_adds_to_an_existing_chip_instead_of_replacing_it(
+        self, page: Page, agents_base_url,
+    ):
+        """A chip already chosen (`synthetic-one`) plus a second tag left
+        typed but unconfirmed in the search field when Create is clicked —
+        a real pointer click, which blurs the field first — must reach the
+        create payload alongside each other. Before the fix, the blur path
+        (`saveLegacyText`'s single-token branch) called `queueSave` with
+        only the just-typed token, silently dropping every chip chosen
+        earlier."""
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Chip plus pending tag")
+        search = page.locator(".drawer-tags")
+        search.fill("synthetic-one")
+        expect(page.locator(".drawer-tag-option-create")).to_contain_text("#synthetic-one")
+        page.locator(".drawer-tag-option-create").click()
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+        search.fill("synthetic-two")
+        # A real click — not the JS-dispatched click the test above uses —
+        # so the field's natural blur runs first, exactly like the
+        # reported reproduction.
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {
+            "description": "Chip plus pending tag", "tags": ["synthetic-one", "synthetic-two"],
         }, task_posts
 
     def test_pending_lifecycle_text_is_rejected_on_create_without_a_blur_event(self, page: Page, agents_base_url):

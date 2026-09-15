@@ -2229,6 +2229,14 @@ export function initBoard() {
     let showingLegacyValue = true;
     let cancelled = false;
     let saveGeneration = 0;
+    // The suggestion list only opens once the operator has actually asked
+    // for it — typed a query, or pressed ArrowDown/ArrowUp — not on bare
+    // focus with an empty query, which would otherwise sit open over
+    // whatever sits below the picker (the composer's Create button, or the
+    // drawer's action row). Sticky until blur/Escape so a run of picks
+    // (each of which clears the query back to empty) doesn't re-close it
+    // between selections.
+    let openByRequest = false;
 
     function renderChips() {
       chips.innerHTML = selected.map(tag => `
@@ -2257,7 +2265,13 @@ export function initBoard() {
       if (canCreate) {
         options.innerHTML += `<button type="button" class="drawer-tag-option drawer-tag-option-create" role="option" data-create-tag="${escapeHtml(normalizeEditableTag(query))}">Create new #${escapeHtml(normalizeEditableTag(query))}</button>`;
       }
-      options.hidden = document.activeElement !== search || (!matches.length && !canCreate);
+      // Empty-query focus alone never opens the list (see `openByRequest`
+      // above) — only a non-blank query or an explicit ArrowDown/ArrowUp
+      // does, so the list can't sit open over the Create button or drawer
+      // action row the moment the field gains focus.
+      options.hidden = document.activeElement !== search
+        || (!query && !openByRequest)
+        || (!matches.length && !canCreate);
       activeOption = -1;
       options.querySelectorAll('[data-select-tag], [data-create-tag]').forEach(button => {
         button.addEventListener('mousedown', () => { suppressBlur = true; });
@@ -2329,7 +2343,14 @@ export function initBoard() {
         // tags remain searches until the operator selects them explicitly.
         if (normalized && !availableEditableTags().includes(normalized)) {
           search.value = normalized;
-          queueSave([normalized]);
+          // Add to whatever's already chosen (chips, or a card's other
+          // editable tags in the drawer) rather than replacing the
+          // selection outright — a chip picked earlier, or another tag
+          // already on the card, must survive a still-typed token being
+          // committed on blur or on Create. `queueSave` re-runs
+          // `uniqueEditableTags`, so this can't duplicate `normalized` or
+          // let a lifecycle/assignee tag slip through.
+          queueSave([...selected, normalized]);
         }
         return;
       }
@@ -2361,10 +2382,16 @@ export function initBoard() {
       }
       renderOptions();
     });
-    search.addEventListener('input', renderOptions);
+    search.addEventListener('input', () => {
+      // Typing is itself the operator asking for the list — sticky so
+      // backspacing the query back to empty mid-pick doesn't close it.
+      openByRequest = true;
+      renderOptions();
+    });
     search.addEventListener('blur', () => {
       if (suppressBlur) return;
       saveLegacyText();
+      openByRequest = false;
       setTimeout(() => {
         if (document.activeElement && picker.contains(document.activeElement)) return;
         options.hidden = true;
@@ -2372,6 +2399,14 @@ export function initBoard() {
       }, 0);
     });
     search.addEventListener('keydown', (event) => {
+      // ArrowDown/ArrowUp on an empty, not-yet-opened query is itself a
+      // request to open the list — re-render first so `optionButtons`
+      // below reflects the now-visible options instead of navigating a
+      // list that's still hidden (and whose buttons can't take focus).
+      if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && options.hidden) {
+        openByRequest = true;
+        renderOptions();
+      }
       const optionButtons = [...options.querySelectorAll('[data-select-tag], [data-create-tag]')];
       if (event.key === 'ArrowDown' && optionButtons.length) {
         event.preventDefault();
@@ -2387,6 +2422,7 @@ export function initBoard() {
         if (active) active.click();
         else if (normalizeEditableTag(search.value)) addTag(search.value);
       } else if (event.key === 'Escape') {
+        openByRequest = false;
         options.hidden = true;
         search.setAttribute('aria-expanded', 'false');
       }
