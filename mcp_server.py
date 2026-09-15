@@ -374,7 +374,7 @@ CURATED_ENDPOINTS = {
     },
     "/api/home/eero/{name}/pause:POST": {
         "name": "lifeos_home_eero_pause",
-        "description": "Pause a household eero profile or device's internet access. Idempotent. Optional minutes (1-1440) schedules an automatic resume.",
+        "description": "Pause a household eero profile or device's internet access. Idempotent. Optional minutes (1-1440) schedules an automatic resume; omitted, the target's configured default applies, else indefinite.",
         "method": "POST",
         "path": "/api/home/eero/{name}/pause"
     },

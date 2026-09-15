@@ -823,7 +823,7 @@ Pause a profile or device's internet access. Idempotent and state-reconciling: s
 ```json
 {"minutes": 60}
 ```
-`minutes` (1-1440) schedules an automatic resume via the scheduler; omitted, the pause is indefinite and any existing pending resume is cleared. Out-of-range values return a validation error.
+`minutes` (1-1440) schedules an automatic resume via the scheduler. Omitted, the target's configured `default_minutes` applies if it has one, else the pause is indefinite and any existing pending resume is cleared. `indefinite: true` forces an indefinite pause regardless of `default_minutes` and cannot be combined with `minutes` (`422`). `scheduled: true` marks this as a scheduler fire (a recurring cron schedule or a timed pause's own auto-resume): a success with no `mismatch` then returns an empty `scheduler_message`, which the scheduler's fire loop sends nothing for.
 
 **Response:**
 ```json
@@ -847,7 +847,7 @@ Resume a profile or device's internet access. Same idempotent, state-reconciling
 ```json
 {"scheduled": true}
 ```
-`scheduled: true` marks this as the scheduler's own fire of a timed pause's auto-resume: the route retries the vendor write up to 3 times with backoff before giving up, alerting (human-queue key `eero-resume-failed:<name>`) and returning `502` only after every attempt fails — the scheduler marks a one-off entry fired before calling the endpoint and never re-fires it, so this route is the only chance to retry.
+`scheduled: true` marks this as the scheduler's own fire of a timed pause's auto-resume: the route retries the vendor write up to 3 times with backoff before giving up, alerting (human-queue key `eero-resume-failed:<name>`) and returning `502` only after every attempt fails — the scheduler marks a one-off entry fired before calling the endpoint and never re-fires it, so this route is the only chance to retry. As with pause, a `scheduled: true` call that succeeds with no `mismatch` returns an empty `scheduler_message`.
 
 ---
 

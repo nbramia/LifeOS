@@ -8,6 +8,7 @@ no test writes to a real vault Scheduler Inbox outside a tmp_path-isolated
 SchedulerStore, and no test sends a real Telegram message.
 """
 import json
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -17,7 +18,7 @@ from fastapi.testclient import TestClient
 
 import api.routes.home as home_route
 import api.services.home.eero as eero
-from api.services.scheduler_store import SchedulerStore
+from api.services.scheduler_store import SchedulerStore, _format_endpoint_result
 
 pytestmark = pytest.mark.unit
 
@@ -84,6 +85,11 @@ def _ok_handler(*, paused: bool):
             return httpx.Response(200, json={"data": {"paused": paused}})
         return httpx.Response(200, json={"data": {"paused": paused}})
     return handler
+
+
+def _minutes_until(resume_at: str) -> float:
+    dt = datetime.fromisoformat(resume_at)
+    return (dt - datetime.now(timezone.utc)).total_seconds() / 60
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +442,163 @@ class TestScheduledResumeEntry:
 
 
 # ---------------------------------------------------------------------------
+# Per-target default duration
+# ---------------------------------------------------------------------------
+
+class TestDefaultMinutes:
+    @pytest.mark.asyncio
+    async def test_pause_without_minutes_uses_target_default(self, env, monkeypatch):
+        _write_targets(env, {
+            "Kid's iPad": {"type": "profile", "url": "/2.2/networks/12345/profiles/67890", "default_minutes": 45},
+        })
+        _write_token(env, "tok")
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(_ok_handler(paused=True)))
+
+        result = await eero.pause("kid's ipad")
+        assert result["resume_at"] is not None
+        assert 44 <= _minutes_until(result["resume_at"]) <= 45
+
+        op_key = eero._operation_key("Kid's iPad")
+        assert eero._pending_entry(env["store"], op_key) is not None
+
+    @pytest.mark.asyncio
+    async def test_explicit_minutes_overrides_default(self, env, monkeypatch):
+        _write_targets(env, {
+            "Kid's iPad": {"type": "profile", "url": "/2.2/networks/12345/profiles/67890", "default_minutes": 45},
+        })
+        _write_token(env, "tok")
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(_ok_handler(paused=True)))
+
+        result = await eero.pause("kid's ipad", minutes=10)
+        assert 9 <= _minutes_until(result["resume_at"]) <= 10
+
+    @pytest.mark.asyncio
+    async def test_no_default_no_minutes_stays_indefinite(self, env, monkeypatch):
+        _write_targets(env, PROFILE_TARGETS)  # no default_minutes configured
+        _write_token(env, "tok")
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(_ok_handler(paused=True)))
+
+        result = await eero.pause("kid's ipad")
+        assert result["resume_at"] is None
+
+    def test_invalid_default_minutes_type_skips_entry(self, env):
+        _write_targets(env, {
+            "Kid's iPad": {"type": "profile", "url": "/2.2/networks/12345/profiles/67890", "default_minutes": "soon"},
+            "Guest Laptop": {"type": "device", "network_id": "12345", "mac": "AA:BB:CC:00:00:01"},
+        })
+        assert eero.configured_target_names() == ["Guest Laptop"]
+
+    def test_default_minutes_bool_is_invalid(self, env):
+        _write_targets(env, {
+            "Kid's iPad": {"type": "profile", "url": "/2.2/networks/12345/profiles/67890", "default_minutes": True},
+        })
+        assert eero.configured_target_names() == []
+
+    def test_default_minutes_out_of_range_is_invalid(self, env):
+        _write_targets(env, {
+            "Kid's iPad": {"type": "profile", "url": "/2.2/networks/12345/profiles/67890", "default_minutes": 1500},
+        })
+        assert eero.configured_target_names() == []
+
+
+# ---------------------------------------------------------------------------
+# Indefinite pause
+# ---------------------------------------------------------------------------
+
+class TestIndefinitePause:
+    @pytest.mark.asyncio
+    async def test_indefinite_overrides_default_and_clears_pending(self, env, monkeypatch):
+        _write_targets(env, {
+            "Kid's iPad": {"type": "profile", "url": "/2.2/networks/12345/profiles/67890", "default_minutes": 45},
+        })
+        _write_token(env, "tok")
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(_ok_handler(paused=True)))
+
+        await eero.pause("kid's ipad", minutes=30)
+        op_key = eero._operation_key("Kid's iPad")
+        assert eero._pending_entry(env["store"], op_key) is not None
+
+        result = await eero.pause("kid's ipad", indefinite=True)
+        assert result["resume_at"] is None
+        assert eero._pending_entry(env["store"], op_key) is None
+
+    @pytest.mark.asyncio
+    async def test_indefinite_with_minutes_is_rejected_without_vendor_call(self, env, monkeypatch):
+        _write_targets(env, PROFILE_TARGETS)
+        _write_token(env, "tok")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("vendor must not be contacted when validation fails")
+
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(handler))
+        with pytest.raises(ValueError):
+            await eero.pause("kid's ipad", minutes=30, indefinite=True)
+
+
+# ---------------------------------------------------------------------------
+# Silent scheduled calls
+# ---------------------------------------------------------------------------
+
+class TestScheduledMessage:
+    @pytest.mark.asyncio
+    async def test_scheduled_pause_success_has_empty_message(self, env, monkeypatch):
+        _write_targets(env, PROFILE_TARGETS)
+        _write_token(env, "tok")
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(_ok_handler(paused=True)))
+
+        result = await eero.pause("kid's ipad", scheduled=True)
+        assert result["mismatch"] is False
+        assert result["scheduler_message"] == ""
+
+    @pytest.mark.asyncio
+    async def test_scheduled_resume_success_has_empty_message(self, env, monkeypatch):
+        _write_targets(env, PROFILE_TARGETS)
+        _write_token(env, "tok")
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(_ok_handler(paused=False)))
+
+        result = await eero.resume("kid's ipad", scheduled=True)
+        assert result["mismatch"] is False
+        assert result["scheduler_message"] == ""
+
+    @pytest.mark.asyncio
+    async def test_scheduled_with_mismatch_is_not_empty(self, env, monkeypatch):
+        _write_targets(env, PROFILE_TARGETS)
+        _write_token(env, "tok")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "PUT":
+                return httpx.Response(200, json={"data": {"paused": True}})
+            # Vendor reports the opposite of what was requested.
+            return httpx.Response(200, json={"data": {"paused": False}})
+
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(handler))
+        result = await eero.pause("kid's ipad", scheduled=True)
+        assert result["mismatch"] is True
+        assert result["scheduler_message"] != ""
+
+    @pytest.mark.asyncio
+    async def test_non_scheduled_keeps_message_even_without_mismatch(self, env, monkeypatch):
+        _write_targets(env, PROFILE_TARGETS)
+        _write_token(env, "tok")
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(_ok_handler(paused=True)))
+
+        result = await eero.pause("kid's ipad")
+        assert result["scheduler_message"] == "Kid's iPad: paused"
+
+    def test_format_endpoint_result_of_scheduled_success_is_empty(self):
+        """End-to-end check of the scheduler's own formatting function
+        (api/services/scheduler_store.py) against a pause/resume-shaped
+        scheduled-success response — this is what makes the fire loop send
+        nothing for it."""
+        data = {
+            "name": "Kid's iPad", "type": "profile", "requested_paused": True,
+            "paused": True, "mismatch": False, "resume_at": None,
+            "scheduler_message": "",
+        }
+        assert _format_endpoint_result(data) == ""
+
+
+# ---------------------------------------------------------------------------
 # Scheduled resume — retry and failure alert
 # ---------------------------------------------------------------------------
 
@@ -587,6 +750,32 @@ class TestRoutes:
         _write_token(env, "tok")
         resp = app_client.post("/api/home/eero/kid's ipad/pause", json={"minutes": 1441})
         assert resp.status_code == 422
+
+    def test_pause_indefinite_with_minutes_is_422(self, env, app_client):
+        _write_targets(env, PROFILE_TARGETS)
+        _write_token(env, "tok")
+        resp = app_client.post(
+            "/api/home/eero/kid's ipad/pause", json={"minutes": 30, "indefinite": True},
+        )
+        assert resp.status_code == 422
+
+    def test_pause_indefinite_ignores_target_default(self, env, app_client, monkeypatch):
+        _write_targets(env, {
+            "Kid's iPad": {"type": "profile", "url": "/2.2/networks/12345/profiles/67890", "default_minutes": 45},
+        })
+        _write_token(env, "tok")
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(_ok_handler(paused=True)))
+        resp = app_client.post("/api/home/eero/kid's ipad/pause", json={"indefinite": True})
+        assert resp.status_code == 200
+        assert resp.json()["resume_at"] is None
+
+    def test_pause_scheduled_success_has_empty_scheduler_message(self, env, app_client, monkeypatch):
+        _write_targets(env, PROFILE_TARGETS)
+        _write_token(env, "tok")
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(_ok_handler(paused=True)))
+        resp = app_client.post("/api/home/eero/kid's ipad/pause", json={"scheduled": True})
+        assert resp.status_code == 200
+        assert resp.json()["scheduler_message"] == ""
 
     def test_pause_success_returns_200_with_scheduler_message(self, env, app_client, monkeypatch):
         _write_targets(env, PROFILE_TARGETS)

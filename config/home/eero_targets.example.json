@@ -1,7 +1,8 @@
 {
   "Kid's iPad": {
     "type": "profile",
-    "url": "/2.2/networks/12345/profiles/67890"
+    "url": "/2.2/networks/12345/profiles/67890",
+    "default_minutes": 60
   },
   "Guest Laptop": {
     "type": "device",

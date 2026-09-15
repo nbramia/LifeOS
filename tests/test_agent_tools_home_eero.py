@@ -29,6 +29,10 @@ class TestToolRegistration:
         tool = next(t for t in TOOL_DEFINITIONS if t["name"] == "pause_internet")
         assert tool["input_schema"]["required"] == ["name"]
 
+    def test_pause_internet_has_indefinite_property(self):
+        tool = next(t for t in TOOL_DEFINITIONS if t["name"] == "pause_internet")
+        assert tool["input_schema"]["properties"]["indefinite"]["type"] == "boolean"
+
     def test_resume_internet_requires_name(self):
         tool = next(t for t in TOOL_DEFINITIONS if t["name"] == "resume_internet")
         assert tool["input_schema"]["required"] == ["name"]
@@ -51,7 +55,7 @@ class TestPauseInternet:
 
     @pytest.mark.asyncio
     async def test_pause_reports_state(self, monkeypatch):
-        async def fake_pause(name, minutes=None):
+        async def fake_pause(name, minutes=None, *, indefinite=False):
             return {
                 "name": "Kid's iPad", "type": "profile", "requested_paused": True,
                 "paused": True, "mismatch": False, "resume_at": None,
@@ -64,7 +68,7 @@ class TestPauseInternet:
 
     @pytest.mark.asyncio
     async def test_pause_reports_resume_at_when_scheduled(self, monkeypatch):
-        async def fake_pause(name, minutes=None):
+        async def fake_pause(name, minutes=None, *, indefinite=False):
             return {
                 "name": "Kid's iPad", "type": "profile", "requested_paused": True,
                 "paused": True, "mismatch": False, "resume_at": "2026-09-15T20:00:00+00:00",
@@ -76,7 +80,7 @@ class TestPauseInternet:
 
     @pytest.mark.asyncio
     async def test_unknown_target_lists_configured_names(self, monkeypatch):
-        async def fake_pause(name, minutes=None):
+        async def fake_pause(name, minutes=None, *, indefinite=False):
             raise eero.EeroUnknownTarget(name, "Kid's iPad, Guest Laptop")
         monkeypatch.setattr(eero, "pause", fake_pause)
         out = await _tool_pause_internet({"name": "nonexistent"})
@@ -86,7 +90,7 @@ class TestPauseInternet:
 
     @pytest.mark.asyncio
     async def test_session_dead_is_a_friendly_error(self, monkeypatch):
-        async def fake_pause(name, minutes=None):
+        async def fake_pause(name, minutes=None, *, indefinite=False):
             raise eero.EeroSessionDead()
         monkeypatch.setattr(eero, "pause", fake_pause)
         out = await _tool_pause_internet({"name": "kid's ipad"})
@@ -94,7 +98,7 @@ class TestPauseInternet:
 
     @pytest.mark.asyncio
     async def test_api_error_is_a_friendly_error(self, monkeypatch):
-        async def fake_pause(name, minutes=None):
+        async def fake_pause(name, minutes=None, *, indefinite=False):
             raise eero.EeroAPIError("vendor rejected the write")
         monkeypatch.setattr(eero, "pause", fake_pause)
         out = await _tool_pause_internet({"name": "kid's ipad"})
@@ -117,6 +121,30 @@ class TestPauseInternet:
 
         out = await _tool_pause_internet({"name": "kid's ipad", "minutes": 0})
         assert out.startswith("Error:")
+
+    @pytest.mark.asyncio
+    async def test_indefinite_with_minutes_is_rejected_without_vendor_call(self, monkeypatch):
+        def fail_resolve(name):
+            raise AssertionError("must not resolve target before validating indefinite/minutes")
+        monkeypatch.setattr(eero, "_resolve_target", fail_resolve)
+
+        out = await _tool_pause_internet({"name": "kid's ipad", "minutes": 30, "indefinite": True})
+        assert out.startswith("Error:")
+
+    @pytest.mark.asyncio
+    async def test_indefinite_is_passed_through_to_service(self, monkeypatch):
+        captured = {}
+
+        async def fake_pause(name, minutes=None, *, indefinite=False):
+            captured["indefinite"] = indefinite
+            return {
+                "name": "Kid's iPad", "type": "profile", "requested_paused": True,
+                "paused": True, "mismatch": False, "resume_at": None,
+                "scheduler_message": "Kid's iPad: paused",
+            }
+        monkeypatch.setattr(eero, "pause", fake_pause)
+        await _tool_pause_internet({"name": "kid's ipad", "indefinite": True})
+        assert captured["indefinite"] is True
 
 
 class TestResumeInternet:

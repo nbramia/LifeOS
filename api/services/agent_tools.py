@@ -955,14 +955,17 @@ TOOL_DEFINITIONS = [
         "description": (
             "Cut a household profile or device off the internet via eero, e.g. "
             "'pause the iPad'. Idempotent — pausing an already-paused target just "
-            "confirms it. `minutes` schedules an automatic resume; omit it for an "
-            "indefinite pause."
+            "confirms it. `minutes` schedules an automatic resume; if omitted, the "
+            "target's configured default duration applies, else the pause is "
+            "indefinite. `indefinite` forces an indefinite pause regardless of "
+            "that default and can't be combined with `minutes`."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Configured target name (matches case-insensitively)."},
-                "minutes": {"type": "integer", "description": "Auto-resume after this many minutes (1-1440). Omit for an indefinite pause."},
+                "minutes": {"type": "integer", "description": "Auto-resume after this many minutes (1-1440). Omit to use the target's configured default, else pause indefinitely."},
+                "indefinite": {"type": "boolean", "description": "Force an indefinite pause, ignoring the target's configured default. Cannot be combined with minutes."},
             },
             "required": ["name"],
         },
@@ -3786,7 +3789,9 @@ async def _tool_pause_internet(inp: dict) -> str:
     if not eero.has_session_token():
         return "Error: eero is not configured (no session token)."
     try:
-        result = await eero.pause(inp["name"], inp.get("minutes"))
+        result = await eero.pause(
+            inp["name"], inp.get("minutes"), indefinite=bool(inp.get("indefinite", False)),
+        )
     except eero.EeroUnknownTarget as e:
         return _eero_unknown_target_message(e)
     except (eero.EeroSessionUnconfigured, eero.EeroSessionDead):

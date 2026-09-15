@@ -24,18 +24,27 @@ returns a response shape this client doesn't recognize, raises
 ``EeroAPIError`` (502 + a human-queue card keyed ``eero-api-error``) rather
 than reporting a false success.
 
-A pause given a duration hands the resume off to the scheduler
-(``api/services/scheduler_store.py``) as a one-off ``endpoint`` action keyed
-``eero-resume:<normalized-name>`` — durable across a restart, since the
-scheduler's source of truth is the vault. A scheduler-fired resume
-(``scheduled=True``) retries a vendor-level failure (``EeroAPIError``,
-including a transport failure) up to 3 times with backoff inside the
-request; a dead session stops after one attempt, since ``_authed_request``
-already alerts once when it decides the session is dead and every retry
-would fail the same way. Either outcome alerts loudly (human-queue key
-``eero-resume-failed:<normalized-name>``) and returns 502, since the
-scheduler marks a one-off entry fired *before* calling the endpoint and
-never re-fires it — this route is the only chance to retry or alert.
+A pause given a duration (explicit ``minutes``, or a target's configured
+``default_minutes`` when ``minutes`` is omitted) hands the resume off to the
+scheduler (``api/services/scheduler_store.py``) as a one-off ``endpoint``
+action keyed ``eero-resume:<normalized-name>`` — durable across a restart,
+since the scheduler's source of truth is the vault. Passing ``indefinite``
+forces an indefinite pause regardless of ``default_minutes`` and clears any
+pending resume. A scheduler-fired resume (``scheduled=True``) retries a
+vendor-level failure (``EeroAPIError``, including a transport failure) up to
+3 times with backoff inside the request; a dead session stops after one
+attempt, since ``_authed_request`` already alerts once when it decides the
+session is dead and every retry would fail the same way. Either outcome
+alerts loudly (human-queue key ``eero-resume-failed:<normalized-name>``) and
+returns 502, since the scheduler marks a one-off entry fired *before*
+calling the endpoint and never re-fires it — this route is the only chance
+to retry or alert.
+
+Any pause or resume call carrying ``scheduled=True`` that succeeds with no
+mismatch returns an empty ``scheduler_message`` — the scheduler's fire loop
+sends nothing for an empty message, so a cron or one-off scheduled call
+posts no Telegram line on an unremarkable success. A mismatch still
+produces a non-empty message.
 """
 import asyncio
 import json
@@ -115,6 +124,7 @@ class Target:
     url: str = ""          # profile only
     network_id: str = ""   # device only
     mac: str = ""          # device only
+    default_minutes: Optional[int] = None  # applied when pause omits `minutes`
 
     @property
     def vendor_path(self) -> str:
@@ -361,20 +371,32 @@ def _load_targets() -> dict[str, Target]:
         if not isinstance(entry, dict):
             logger.warning("eero target %r: entry must be an object; skipping", name)
             continue
+        default_minutes = entry.get("default_minutes")
+        if default_minutes is not None:
+            if (
+                isinstance(default_minutes, bool)
+                or not isinstance(default_minutes, int)
+                or not (1 <= default_minutes <= 1440)
+            ):
+                logger.warning(
+                    "eero target %r: invalid 'default_minutes' (%r), must be an integer in 1..1440; skipping",
+                    name, default_minutes,
+                )
+                continue
         ttype = entry.get("type")
         if ttype == "profile":
             url = entry.get("url")
             if not isinstance(url, str) or not url.startswith("/"):
                 logger.warning("eero target %r: profile entry missing/invalid 'url'; skipping", name)
                 continue
-            target = Target(name=str(name), type="profile", url=url)
+            target = Target(name=str(name), type="profile", url=url, default_minutes=default_minutes)
         elif ttype == "device":
             network_id = entry.get("network_id")
             mac = entry.get("mac")
             if not isinstance(network_id, str) or not network_id or not isinstance(mac, str) or not mac:
                 logger.warning("eero target %r: device entry missing/invalid 'network_id'/'mac'; skipping", name)
                 continue
-            target = Target(name=str(name), type="device", network_id=network_id, mac=mac)
+            target = Target(name=str(name), type="device", network_id=network_id, mac=mac, default_minutes=default_minutes)
         else:
             logger.warning("eero target %r: 'type' must be 'profile' or 'device' (got %r); skipping", name, ttype)
             continue
@@ -438,12 +460,21 @@ def _delete_finished(store, op_key: str) -> None:
 # Public operations
 # ---------------------------------------------------------------------------
 
-def _result(target: Target, *, requested_paused: bool, paused: bool, resume_at: Optional[str]) -> dict:
+def _result(
+    target: Target, *, requested_paused: bool, paused: bool, resume_at: Optional[str],
+    scheduled: bool = False,
+) -> dict:
     mismatch = requested_paused != paused
-    state_word = "paused" if paused else "resumed"
-    scheduler_message = f"{target.name}: {state_word}"
-    if mismatch:
-        scheduler_message += " (requested state did not take — check the eero app)"
+    if scheduled and not mismatch:
+        # A scheduler-fired call (cron or the one-off auto-resume) that
+        # succeeded as requested sends no Telegram line — the fire loop
+        # suppresses an empty scheduler_message. A mismatch still reports.
+        scheduler_message = ""
+    else:
+        state_word = "paused" if paused else "resumed"
+        scheduler_message = f"{target.name}: {state_word}"
+        if mismatch:
+            scheduler_message += " (requested state did not take — check the eero app)"
     return {
         "name": target.name,
         "type": target.type,
@@ -455,14 +486,27 @@ def _result(target: Target, *, requested_paused: bool, paused: bool, resume_at: 
     }
 
 
-async def pause(name: str, minutes: Optional[int] = None) -> dict:
-    """Pause a target's internet access. `minutes` (1-1440) schedules an
-    automatic resume via the scheduler; omitted, the pause is indefinite and
-    any existing pending resume is cleared.
+async def pause(
+    name: str, minutes: Optional[int] = None, *, indefinite: bool = False, scheduled: bool = False,
+) -> dict:
+    """Pause a target's internet access.
 
-    `minutes` is validated before any vendor call — the route gets this for
-    free from pydantic, but a caller that skips pydantic (the agent tool,
-    fed loosely-typed JSON from a tool call) does not."""
+    Duration resolves in this order: `indefinite=True` forces an indefinite
+    pause and clears any pending resume, regardless of the target's
+    `default_minutes`. Otherwise explicit `minutes` (1-1440) schedules an
+    automatic resume via the scheduler; if `minutes` is omitted, the
+    target's configured `default_minutes` is used when present, else the
+    pause is indefinite. `indefinite=True` together with `minutes` is a
+    validation error.
+
+    `minutes` and the indefinite/minutes conflict are validated before any
+    vendor call — the route gets this for free from pydantic, but a caller
+    that skips pydantic (the agent tool, fed loosely-typed JSON from a tool
+    call) does not. `scheduled=True` (a cron or one-off scheduler fire)
+    suppresses `scheduler_message` on an unremarkable success — see
+    `_result`."""
+    if indefinite and minutes is not None:
+        raise ValueError("cannot pass both `indefinite` and `minutes`")
     if minutes is not None:
         if isinstance(minutes, bool) or not isinstance(minutes, int) or not (1 <= minutes <= 1440):
             raise ValueError(f"minutes must be an integer in 1..1440, got {minutes!r}")
@@ -470,13 +514,15 @@ async def pause(name: str, minutes: Optional[int] = None) -> dict:
     await _authed_write("PUT", target.vendor_path, {"paused": True})
     paused = await _authed_read(target.vendor_path)
 
+    effective_minutes = None if indefinite else (minutes if minutes is not None else target.default_minutes)
+
     store = get_scheduler_store()
     op_key = _operation_key(target.name)
     resume_at = None
-    if minutes is not None:
+    if effective_minutes is not None:
         _delete_pending(store, op_key)
         _delete_finished(store, op_key)
-        resume_dt = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        resume_dt = datetime.now(timezone.utc) + timedelta(minutes=effective_minutes)
         resume_at = resume_dt.isoformat()
         store.create(
             name=f"Eero resume: {target.name}",
@@ -494,7 +540,7 @@ async def pause(name: str, minutes: Optional[int] = None) -> dict:
     else:
         _delete_pending(store, op_key)
 
-    return _result(target, requested_paused=True, paused=paused, resume_at=resume_at)
+    return _result(target, requested_paused=True, paused=paused, resume_at=resume_at, scheduled=scheduled)
 
 
 async def resume(name: str, *, scheduled: bool = False) -> dict:
@@ -532,7 +578,7 @@ async def resume(name: str, *, scheduled: bool = False) -> dict:
         _delete_pending(store, op_key)
 
     paused = await _authed_read(target.vendor_path)
-    return _result(target, requested_paused=False, paused=paused, resume_at=None)
+    return _result(target, requested_paused=False, paused=paused, resume_at=None, scheduled=scheduled)
 
 
 async def list_status() -> list[dict]:

@@ -164,7 +164,7 @@ Pause/resume household internet access via eero. See the [Home — eero guide](.
 
 | Tool | Description |
 |------|-------------|
-| `lifeos_home_eero_pause` | Pause a profile/device's internet access; optional `minutes` schedules an auto-resume |
+| `lifeos_home_eero_pause` | Pause a profile/device's internet access; optional `minutes` schedules an auto-resume, else the target's configured default applies |
 | `lifeos_home_eero_resume` | Resume a profile/device's internet access; cancels any pending scheduled auto-resume |
 | `lifeos_home_eero_status` | List every configured target's current paused state and pending scheduled resume |
 

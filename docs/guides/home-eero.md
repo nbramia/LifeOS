@@ -53,7 +53,8 @@ Each entry is a name (matched case-insensitively) mapped to either a
 {
   "Kid's iPad": {
     "type": "profile",
-    "url": "/2.2/networks/12345/profiles/67890"
+    "url": "/2.2/networks/12345/profiles/67890",
+    "default_minutes": 60
   },
   "Guest Laptop": {
     "type": "device",
@@ -67,6 +68,12 @@ Prefer **profile** targets: they're the abstraction eero's own app is built
 on, so they're the more stable identifier. Find a profile's `network_id`/
 `profile_id` from the eero app's network settings, or from the vendor API
 directly while logged in.
+
+`default_minutes` (1-1440) is optional. It's the auto-resume duration a
+pause uses when its request omits `minutes` — an explicit `minutes` always
+overrides it, and an invalid `default_minutes` (not an integer, or out of
+range) skips the whole target entry with a warning, the same as any other
+malformed field.
 
 A missing config file starts the service with zero configured targets, not
 an error. A malformed entry (missing/invalid field, unrecognized `type`) is
@@ -106,8 +113,43 @@ A pause given `minutes` (1-1440) schedules the resume as a one-off entry in
 the scheduler (`LifeOS/Scheduler/Inbox.md`), so it survives a restart of
 whatever process issued the pause. Calling pause again on a target with a
 pending resume replaces it — exactly one pending resume exists per target.
-Pausing without `minutes` makes the pause indefinite and clears any pending
-resume.
+Pausing without `minutes` uses the target's `default_minutes` if it has one;
+otherwise it makes the pause indefinite and clears any pending resume.
+Sending `{"indefinite": true}` forces an indefinite pause regardless of
+`default_minutes` — combining it with `minutes` is a validation error.
+
+### Silent scheduled calls
+
+Pause and resume both accept `scheduled: true` in their body. A call that
+succeeds with no `mismatch` then returns an empty `scheduler_message`, which
+the scheduler's fire loop treats as nothing to send — so a scheduled pause
+or resume that behaves as expected posts no Telegram line. A mismatch, or
+any failure, still reports. The one-off auto-resume a timed pause creates
+already posts `{"scheduled": true}` to `/resume`, so its ordinary success is
+silent too.
+
+Set `scheduled: true` yourself to build a **recurring** scheduled pause — a
+plain cron `endpoint` schedule, no dedicated feature needed:
+
+```bash
+curl -X POST http://localhost:8000/api/scheduler \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Bedtime cutoff: Kid'\''s iPad",
+    "schedule_type": "cron",
+    "schedule_value": "0 21 * * *",
+    "action": "endpoint",
+    "endpoint_config": {
+      "endpoint": "/api/home/eero/Kid'\''s iPad/pause",
+      "method": "POST",
+      "params": {"minutes": 480, "scheduled": true}
+    }
+  }'
+```
+
+This pauses "Kid's iPad" every night at 9pm for 8 hours, auto-resuming via
+the same scheduler-backed mechanism as a manual timed pause, and — as long
+as the vendor agrees with what was requested — silently.
 
 ## Failure alerts
 
