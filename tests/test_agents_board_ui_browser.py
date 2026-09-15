@@ -1403,6 +1403,87 @@ class TestDrawerTagsEdit:
         assert task_puts == [{"tags": ["existing-tag", "brand-new-tag"]}], task_puts
         expect(page.locator(".drawer-tag-chip")).to_have_count(2)
 
+    def test_typing_multiple_words_and_blurring_keeps_the_cards_other_editable_tags(
+        self, page: Page, agents_base_url,
+    ):
+        """The multi-token branch of `saveLegacyText` (space-separated text
+        committed on blur) must merge onto the card's current selection,
+        not replace it — a card carrying two editable tags must keep both
+        after a still-typed `gamma delta` is committed."""
+        board_state = copy.deepcopy(_board_fixture())
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        t2["tags"] = ["me", "ex-c", "ex-d"]
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-tag-chip")).to_have_count(2)
+        tags = page.locator(".drawer-tags")
+        tags.fill("gamma delta")
+        page.locator(".drawer-title").click()  # blur the tags field
+        _wait_for(lambda: any("delta" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert task_puts == [{"tags": ["ex-c", "ex-d", "gamma", "delta"]}], task_puts
+        expect(page.locator(".drawer-tag-chip")).to_have_count(4)
+
+    def test_typing_a_comma_separated_pair_and_blurring_adds_both_with_no_error_toast(
+        self, page: Page, agents_base_url,
+    ):
+        """A comma is a separator like whitespace, not part of the token —
+        "alpha, beta" must add both `alpha` and `beta`, never reject
+        `alpha,` as an invalid token."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        tags = page.locator(".drawer-tags")
+        tags.fill("alpha, beta")
+        page.locator(".drawer-title").click()  # blur the tags field
+        _wait_for(lambda: any("beta" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert task_puts == [{"tags": ["alpha", "beta"]}], task_puts
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".drawer-tag-chip")).to_have_count(2)
+
+    def test_arrow_down_then_enter_adds_only_the_picked_option(self, page: Page, agents_base_url):
+        """ArrowDown moves focus from the search field onto the first
+        suggestion, which blurs the field — that focus move must not
+        commit the still-typed query (`hum`) as its own tag; only the
+        picked option (`human`, an existing board tag from fixture card
+        t4) reaches the PUT."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        tags = page.locator(".drawer-tags")
+        tags.fill("hum")
+        expect(page.locator('[data-field="tag-options"] [data-select-tag="human"]')).to_be_visible()
+        tags.press("ArrowDown")
+        expect(page.locator('[data-field="tag-options"] [data-select-tag="human"]')).to_be_focused()
+        page.keyboard.press("Enter")
+        _wait_for(lambda: len(task_puts) > 0, page=page)
+        assert task_puts == [{"tags": ["human"]}], task_puts
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+        expect(page.locator(".drawer-tag-chip")).to_contain_text("#human")
+
+    def test_removing_a_chip_with_a_partial_query_typed_does_not_commit_the_query(
+        self, page: Page, agents_base_url,
+    ):
+        """Clicking a chip's remove button blurs the search field first
+        (the button is inside the picker but outside the field itself) —
+        that focus move must not commit whatever partial query is still
+        typed as a new tag; the click's own removal must land instead."""
+        board_state = copy.deepcopy(_board_fixture())
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        t2["tags"] = ["me", "existing-tag"]
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+        tags = page.locator(".drawer-tags")
+        tags.fill("partial-query")
+        page.locator('[data-remove-tag="existing-tag"]').click()
+        _wait_for(lambda: len(task_puts) > 0, page=page)
+        assert task_puts == [{"tags": []}], task_puts
+        expect(page.locator(".drawer-tag-chip")).to_have_count(0)
+
     def test_invalid_and_assignee_tokens_are_dropped(self, page: Page, agents_base_url):
         """Round-1 finding 8: the Tags field must not let a vault-comment
         injection or a duplicate assignee token reach the task store. t2 is
@@ -4579,6 +4660,30 @@ class TestComposerTagsPicker:
             "description": "Chip plus pending tag", "tags": ["synthetic-one", "synthetic-two"],
         }, task_posts
 
+    def test_pending_multi_word_text_adds_to_an_existing_chip_instead_of_replacing_it(
+        self, page: Page, agents_base_url,
+    ):
+        """The multi-token branch of `saveLegacyText` (space-separated text
+        left typed but unconfirmed) must merge onto the composer's current
+        selection exactly like the single-token branch does — a chip
+        chosen earlier (`synthetic-four`) must survive a still-typed
+        `gamma delta` being committed on Create."""
+        task_posts = []
+        _open_board(page, agents_base_url, task_posts=task_posts)
+        page.locator("#board-new-card").click()
+        page.locator("#new-card-desc").fill("Chip plus pending multi-word text")
+        search = page.locator(".drawer-tags")
+        search.fill("synthetic-four")
+        page.keyboard.press("Enter")
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+        search.fill("gamma delta")
+        page.locator("#new-card-create").click()
+        _wait_for(lambda: len(task_posts) == 1, page=page)
+        assert task_posts[0] == {
+            "description": "Chip plus pending multi-word text",
+            "tags": ["synthetic-four", "gamma", "delta"],
+        }, task_posts
+
     def test_pending_lifecycle_text_is_rejected_on_create_without_a_blur_event(self, page: Page, agents_base_url):
         """The same no-blur path as above, but for lifecycle-tag text —
         the explicit flush must apply the same rejection `saveLegacyText`
@@ -5400,7 +5505,11 @@ class TestAgentCardMoveRulesAndCancel:
         expect(page.get_by_role("button", name="Cancel", exact=True)).to_have_count(0)
 
     def test_removing_agent_marker_tag_leaves_other_editable_tags_via_tags_box(self, page: Page, agents_base_url):
-        """`agent` is an ordinary operator label, not a lifecycle tag."""
+        """`agent` is an ordinary operator label, not a lifecycle tag — it
+        remains an editable chip, removable the same way any other tag is:
+        its own chip's ×. The Tags field's blur-commit only ever adds to
+        the current selection, so removal goes through the chip control,
+        not a retyped list."""
         board_state = copy.deepcopy(_board_fixture())
         board_state["lanes"]["assigned"].append({
             "kind": "task", "id": "t13", "title": "Operator queue card",
@@ -5416,9 +5525,9 @@ class TestAgentCardMoveRulesAndCancel:
         tags = page.locator(".drawer-tags")
         expect(tags).to_be_enabled()
         expect(tags).to_have_value("agent agent-notes notes")
+        expect(page.locator('[data-remove-tag="agent"]')).to_be_visible()
 
-        tags.fill("agent-notes notes")  # remove "agent"
-        page.locator(".drawer-title").click()  # blur the tags field
+        page.locator('[data-remove-tag="agent"]').click()  # remove "agent"
         _wait_for(lambda: bool(task_puts), page=page)
         assert task_puts == [{"tags": ["agent-notes", "notes"]}], task_puts
         t13 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t13")

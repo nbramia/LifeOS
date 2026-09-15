@@ -2356,7 +2356,12 @@ export function initBoard() {
       }
       const parsed = [];
       const rejected = [];
-      raw.split(/\s+/).forEach(token => {
+      // Commas act as separators alongside whitespace — "alpha, beta"
+      // splits into "alpha" and "beta", not a rejected "alpha," token —
+      // so `[\s,]+` (not `\s+`) is the split, and `.filter(Boolean)` drops
+      // the empty string a trailing/doubled separator would otherwise
+      // leave behind.
+      raw.split(/[\s,]+/).filter(Boolean).forEach(token => {
         const plain = token.replace(/^#/, '');
         if (TAG_TOKEN.test(plain) && normalizeEditableTag(plain)) parsed.push(plain);
         else rejected.push(token);
@@ -2366,7 +2371,13 @@ export function initBoard() {
         showToast(`Ignored invalid tag${rejected.length > 1 ? 's' : ''}: ${rejected.join(', ')}`, true);
       }
       search.value = normalized.join(' ');
-      queueSave(normalized);
+      // Add to whatever's already chosen — same reasoning as the
+      // single-token branch above: a chip picked earlier, or a card's
+      // other editable tags, must survive a multi-word blur/Create commit
+      // rather than being replaced by it. `queueSave` re-runs
+      // `uniqueEditableTags`, so this can't duplicate an already-selected
+      // tag or let a lifecycle/assignee tag slip through.
+      queueSave([...selected, ...normalized]);
     }
 
     renderChips();
@@ -2388,8 +2399,18 @@ export function initBoard() {
       openByRequest = true;
       renderOptions();
     });
-    search.addEventListener('blur', () => {
+    search.addEventListener('blur', (event) => {
       if (suppressBlur) return;
+      // A focus move that stays inside the picker — onto the suggestion
+      // list (ArrowDown/ArrowUp) or onto a chip's remove button — isn't
+      // the operator abandoning the field's text, just momentarily moving
+      // off it; committing here would save a still-in-progress query as
+      // its own tag before Enter even reaches the highlighted option, or
+      // commit-then-rerender the chips out from under an in-flight ×
+      // click. Only a focus move OUTSIDE the picker (or the composer's
+      // own Create handler, via `commitPendingText`, called explicitly)
+      // commits.
+      if (event.relatedTarget && picker.contains(event.relatedTarget)) return;
       saveLegacyText();
       openByRequest = false;
       setTimeout(() => {
