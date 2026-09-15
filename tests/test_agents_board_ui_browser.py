@@ -1194,6 +1194,39 @@ class TestLiveUpdates:
         expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_have_count(0)
         assert page.url == url_before  # no page reload/navigation happened
 
+    @pytest.mark.parametrize("initial_allowed", [False, True])
+    def test_board_frame_updates_cancel_visibility_in_open_drawer(
+        self, page: Page, agents_base_url, initial_allowed: bool,
+    ):
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        card = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        card["policy"] = {
+            "cancel": _allowed(initial_allowed, None if initial_allowed else "refused"),
+        }
+        board_stream_frames: list[str] = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t2"]').click()
+        cancel = page.get_by_role("button", name="Cancel", exact=True)
+        expect(cancel).to_have_count(1 if initial_allowed else 0)
+
+        updated_board = copy.deepcopy(board_state)
+        updated_card = next(
+            card for card in updated_board["lanes"]["assigned"] if card["id"] == "t2"
+        )
+        updated_card["policy"]["cancel"] = _allowed(
+            not initial_allowed, None if not initial_allowed else "refused",
+        )
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(updated_board)}\n\n")
+        stream_gate.set()
+
+        expect(cancel).to_have_count(0 if initial_allowed else 1, timeout=5000)
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+
     def test_drawer_notes_survive_a_board_frame_while_typing_and_flushes_on_blur(self, page: Page, agents_base_url):
         """Round-2 finding 5 (reworks round-1 finding 12(b)'s test, which was
         a false positive): the prior version delivered its frame on the
@@ -3779,13 +3812,9 @@ class TestAgentCardMoveRulesAndCancel:
         expect(page.locator(".toast.error")).to_contain_text("cx:live1", timeout=5000)
         assert cancel_calls == ["t8"]
 
-    def test_cancel_button_disabled_with_reason_for_a_me_card_with_cancel_refused(self, page: Page, agents_base_url):
-        """The production-shaped case: a `me`-assigned card carries a real
-        `policy.cancel = {allowed: false, reason: ...}` block (every task
-        card does), not no policy at all. A control on a card with a real
-        policy block is never hidden when refused — it renders disabled,
-        with the server's reason visible next to it, the same as every
-        other refused control in this drawer."""
+    def test_refused_cancel_and_reason_are_absent_for_a_me_card(self, page: Page, agents_base_url):
+        """A task with an explicit refused Cancel policy omits both the
+        unavailable control and its server-provided explanation."""
         board_state = copy.deepcopy(_board_fixture())
         board_state["lanes"]["assigned"].append({
             "kind": "task", "id": "t11", "title": "My own task",
@@ -3801,12 +3830,30 @@ class TestAgentCardMoveRulesAndCancel:
         })
         _open_board(page, agents_base_url, board_state=board_state)
         page.locator('[data-card-id="t11"]').click()
-        cancel_btn = page.get_by_role("button", name="Cancel", exact=True)
-        expect(cancel_btn).to_be_visible()
-        expect(cancel_btn).to_be_disabled()
-        expect(page.locator('[data-field="cancel-reason"]')).to_contain_text(
+        expect(page.get_by_role("button", name="Cancel", exact=True)).to_have_count(0)
+        expect(page.locator('[data-field="cancel-reason"]')).to_have_count(0)
+        expect(page.locator("#board-drawer")).not_to_contain_text(
             "cancel is only available for agent-assigned cards"
         )
+
+    def test_allowed_cancel_shares_delete_row_and_fits_phone_width(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append(_unclaimed_agent_owned_card())
+        page.set_viewport_size({"width": 1280, "height": 800})
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t8"]').click()
+
+        cancel = page.get_by_role("button", name="Cancel", exact=True)
+        delete = page.get_by_role("button", name="Delete", exact=True)
+        expect(cancel).to_be_enabled()
+        expect(delete).to_be_visible()
+        assert cancel.evaluate("el => el.offsetTop") == delete.evaluate("el => el.offsetTop")
+
+        page.set_viewport_size({"width": 390, "height": 844})
+        actions = page.locator('#board-drawer [data-field="actions"]')
+        expect(actions).to_be_visible()
+        scroll_width, client_width = actions.evaluate("el => [el.scrollWidth, el.clientWidth]")
+        assert scroll_width <= client_width
 
     def test_cancel_on_unclaimed_agent_card_posts_and_lands_in_done(self, page: Page, agents_base_url):
         board_state = copy.deepcopy(_board_fixture())
@@ -4814,4 +4861,3 @@ class TestDrawerFieldHooks:
         page.locator("#board-drawer .drawer-assignee").select_option("hermes")
         _wait_for(lambda: bool(lane_calls), page)
         assert lane_calls[0] == {"lane": "assigned", "assignee": "hermes"}, lane_calls
-
