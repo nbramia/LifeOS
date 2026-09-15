@@ -152,15 +152,28 @@ class TestDeriveLaneSnooze:
         assert agent_board.derive_lane("todo", [], fields, before) == "snoozed"
         assert agent_board.derive_lane("todo", [], fields, after) == "unassigned"
 
-    def test_in_progress_and_done_still_derive_over_a_future_snooze_field(self):
-        # In practice a future `snoozed_until` never coexists with these
-        # statuses — every write path that transitions into them clears the
-        # field (plan_lane_move, Accept, Cancel) — but derive_lane's own
-        # priority is "snoozed wins" per the issue, so this documents that
-        # an untouched stale field IS honored rather than silently ignored.
+    def test_in_progress_and_done_ignore_a_future_snooze_field(self):
+        # A snooze can never hide a running or finished card — the override
+        # only ever applies when the natural (status/tag-only) lane is
+        # itself snooze-eligible (SNOOZABLE_LANES). A future `snoozed_until`
+        # on an in_progress or done task is simply ignored.
         fields = {"snoozed_until": self.FUTURE}
-        assert agent_board.derive_lane("in_progress", [], fields) == "snoozed"
-        assert agent_board.derive_lane("done", [], fields) == "snoozed"
+        assert agent_board.derive_lane("in_progress", [], fields) == "in_progress"
+        assert agent_board.derive_lane("done", [], fields) == "done"
+        assert agent_board.derive_lane("cancelled", [], fields) == "done"
+        assert agent_board.derive_lane("todo", ["agent-running"], fields) == "in_progress"
+
+    def test_natural_lane_matches_derive_lane_with_no_fields(self):
+        cases = [
+            ("todo", []), ("todo", ["me"]), ("in_progress", []),
+            ("blocked", ["human"]), ("done", ["agent-completed"]),
+            ("done", ["agent-completed", "accepted"]), ("cancelled", []),
+        ]
+        for status, tags in cases:
+            assert agent_board.natural_lane(status, tags) == agent_board.derive_lane(status, tags), (status, tags)
+
+    def test_snoozable_lanes_matches_the_eligible_set(self):
+        assert agent_board.SNOOZABLE_LANES == {"unassigned", "assigned", "human_queue", "review"}
 
 
 # ---------------------------------------------------------------------------

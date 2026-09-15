@@ -466,6 +466,26 @@ class TestReviewActions:
         assert queued[0]["session_id"] == session.session_id
         assert queued[0]["answer"] == "Please add a synthetic edge-case check."
 
+    def test_reject_clears_a_stale_snooze(self, client, stores):
+        """A snoozed Review card rejected back to In progress must not
+        carry a future `snoozed_until` forward — In progress is never
+        snooze-eligible, and a lingering value would silently re-hide the
+        card the next time it lands back in Review."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Snoozed review, rejected", tags=["codex", "agent-completed"], status="done")
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="local")
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry the synthetic case."},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["lane"] == "in_progress"
+        updated = task_manager.get(task.id)
+        assert updated.status == "in_progress"
+        assert "snoozed_until" not in updated.fields
+
     def test_reassign_preserves_session_context_and_moves_to_assigned(self, client, stores):
         task_manager, _sched, session_store, _transcript = stores
         task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done", notes="Prior output")
@@ -486,6 +506,26 @@ class TestReviewActions:
         assert "Try a second synthetic approach." in (updated.notes or "")
         assert session_store.get(task.id).session_id == session.session_id
         assert session_store.get_messages(session.session_id)[0]["content"] == "Prior synthetic result"
+
+    def test_reassign_clears_a_stale_snooze(self, client, stores):
+        """Assigned IS a snooze-eligible natural lane, so the write-path
+        natural-lane guard alone would not clear this — the reassignment
+        must clear it explicitly, since reassigning a card is an operator
+        action that wakes it, the same as a lane-move drag."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Snoozed review, reassigned", tags=["codex", "agent-completed"], status="done")
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["lane"] == "assigned"
+        updated = task_manager.get(task.id)
+        assert updated.tags == ["claude", "agent-reassigned"]
+        assert "snoozed_until" not in updated.fields
 
     def test_reassign_without_a_prior_session_moves_the_card_and_reports_no_context(
         self, client, stores,
@@ -1048,6 +1088,26 @@ class TestSnoozeBoardCard:
         board = client.get("/api/agents/board").json()
         assert task.id in [c["id"] for c in board["lanes"]["snoozed"]]
 
+    @pytest.mark.parametrize("until,expected", [
+        ("20990101T000000+0000", "2099-01-01T00:00:00+00:00"),  # compact form
+        ("2099-01-01T00:00:00Z", "2099-01-01T00:00:00+00:00"),  # Z suffix
+    ])
+    def test_until_is_stored_normalized_not_verbatim(self, client, stores, until, expected):
+        """`fromisoformat` accepts compact and `Z`-suffixed forms, but a
+        browser's `Date` constructor doesn't parse them all uniformly —
+        the vault stores the canonical `parsed.isoformat()` form instead of
+        echoing whatever was sent."""
+        task_manager, *_ = stores
+        task = task_manager.create("Snooze normalization card")
+        r = client.put(f"/api/agents/board/cards/{task.id}/snooze", json={"until": until})
+        assert r.status_code == 200, r.text
+        assert r.json()["snoozed_until"] == expected
+
+        after = task_manager.get(task.id)
+        assert after.fields.get("snoozed_until") == expected
+        content = (task_manager.tasks_dir / "Inbox.md").read_text(encoding="utf-8")
+        assert f"[snoozed_until:: {expected}]" in content
+
     @pytest.mark.parametrize("status,tags", [
         ("in_progress", []),
         ("todo", ["agent", "agent-running"]),
@@ -1574,6 +1634,22 @@ class TestAcceptBoardCard:
         assert "accepted" in updated.tags
         assert updated.status == "done"
 
+    def test_accept_works_on_a_snoozed_review_card_and_clears_the_snooze(self, client, stores):
+        """A snoozed Review card is still a Review card as far as Accept is
+        concerned — it uses the natural (status/tag-only) lane, not the
+        snoozed one, so accepting it both moves it to Done and wakes it."""
+        task_manager, *_ = stores
+        task = task_manager.create("Snoozed review, accepted", tags=["agent-completed"], status="done")
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert r.status_code == 200, r.text
+        assert r.json()["lane"] == "done"
+        updated = task_manager.get(task.id)
+        assert "accepted" in updated.tags
+        assert updated.status == "done"
+        assert "snoozed_until" not in updated.fields
+
     def test_accept_is_idempotent(self, client, stores):
         task_manager, *_ = stores
         task = task_manager.create("Refactor the parser", tags=["agent-completed"], status="done")
@@ -1856,6 +1932,33 @@ class TestPendingQuestions:
 # ---------------------------------------------------------------------------
 # Hermes label fix + Codex stream dispatch (#850)
 # ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestSnapshotLaneMatchesBoardForSnoozedCard:
+    def test_snapshot_session_lane_matches_board_lane_when_snoozed(self, client, stores):
+        """`lane_for_session` must pass the task's fields through to
+        `derive_lane`, the same as every other lane-derivation call site in
+        `agents.py` — otherwise the Graph tab's node colour disagrees with
+        the card's own board column for a snoozed Review card, which
+        always has a linked session."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create(
+            "Snoozed review with a session", tags=["codex", "agent-completed"], status="done",
+        )
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+        session = session_store.create(task_id=task.id, status="completed", routing="codex")
+
+        board = client.get("/api/agents/board").json()
+        board_lane = next(
+            lane for lane, cards in board["lanes"].items()
+            if task.id in [c["id"] for c in cards]
+        )
+        assert board_lane == "snoozed"
+
+        snapshot = client.get("/api/agents/snapshot").json()
+        sessions = {sd["session_id"]: sd for sd in snapshot["sessions"]}
+        assert sessions[session.session_id]["lane"] == "snoozed"
+
 
 @pytest.mark.unit
 class TestHermesLabelAndCodexStream:

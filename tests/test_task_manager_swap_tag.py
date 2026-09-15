@@ -34,6 +34,27 @@ def test_swap_tag_swaps_when_present(manager: TaskManager):
 
 
 @pytest.mark.unit
+def test_swap_tag_clears_a_stale_snooze_when_the_worker_resumes_a_blocked_card(manager: TaskManager):
+    """A snoozed Human-queue card (`agent-blocked`) is exactly the typical
+    card an operator sets aside. Answering its question resumes the agent
+    through `swap_tag(from="agent-blocked", to="agent-running")` — the
+    worker's own resume path, not `TaskManager.update`. The resulting
+    In progress card must never render as Snoozed, so the write clears the
+    field itself rather than relying on `derive_lane`'s natural-lane guard
+    alone."""
+    from api.services import agent_board
+
+    task = manager.create("Answered question", tags=["claude", "agent-blocked"])
+    manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+
+    assert manager.swap_tag(task.id, "agent-blocked", "agent-running") is True
+
+    refreshed = manager.get(task.id)
+    assert "snoozed_until" not in refreshed.fields
+    assert agent_board.derive_lane(refreshed.status, refreshed.tags, refreshed.fields) == "in_progress"
+
+
+@pytest.mark.unit
 def test_swap_tag_accepts_hash_prefix(manager: TaskManager):
     task = manager.create("with hash", tags=["agent"])
     assert manager.swap_tag(task.id, "#agent", "#agent-running") is True

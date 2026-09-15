@@ -487,6 +487,7 @@ def _lane_for_session_dict(sd: dict[str, Any], tasks_by_id: dict[str, Any] | Non
     task_id = sd.get("task_id")
     task_status: str | None = None
     task_tags: list[str] = []
+    task_fields: dict[str, str] = {}
     if task_id:
         try:
             if tasks_by_id is not None:
@@ -498,9 +499,10 @@ def _lane_for_session_dict(sd: dict[str, Any], tasks_by_id: dict[str, Any] | Non
             if task is not None:
                 task_status = task.status
                 task_tags = list(task.tags)
+                task_fields = dict(task.fields)
         except Exception as exc:  # noqa: BLE001 — defensive: never break the snapshot on a lane lookup
             logger.debug("task_manager lookup failed for %s: %s", task_id, exc)
-    return agent_board.lane_for_session(sd.get("status"), task_status, task_tags)
+    return agent_board.lane_for_session(sd.get("status"), task_status, task_tags, task_fields, _now())
 
 
 def _build_snapshot() -> dict[str, Any]:
@@ -1400,8 +1402,12 @@ async def snooze_board_card(card_id: str, body: SnoozeRequest) -> dict[str, Any]
     is a scheduler entry (`card_id` never resolves through `TaskManager`).
     `until` must be an ISO-8601 timestamp with a UTC offset, in the future
     — anything else is refused without touching the task (see
-    `agent_board.parse_snoozed_until`). Only `snoozed_until` changes:
-    status, tags, and notes are left exactly as they were.
+    `agent_board.parse_snoozed_until`). Persisted as `parsed.isoformat()`
+    (UTC, canonical `+00:00` form) rather than verbatim — `until` may
+    arrive as a compact form, with a space separator, or with a `Z` suffix,
+    all of which `datetime.fromisoformat` accepts but a browser's `Date`
+    constructor does not uniformly parse back. Only `snoozed_until`
+    changes: status, tags, and notes are left exactly as they were.
     """
     from api.services import agent_board
     from api.services.task_manager import get_task_manager, TaskConflictError
@@ -1412,6 +1418,7 @@ async def snooze_board_card(card_id: str, body: SnoozeRequest) -> dict[str, Any]
             status_code=agent_board.SNOOZE_UNTIL_INVALID_ERROR[0],
             detail=agent_board.SNOOZE_UNTIL_INVALID_ERROR[1],
         )
+    normalized_until = parsed.isoformat()
 
     task_manager = get_task_manager()
     task = task_manager.get(card_id)
@@ -1419,7 +1426,7 @@ async def snooze_board_card(card_id: str, body: SnoozeRequest) -> dict[str, Any]
         raise HTTPException(status_code=404, detail="card not found")
 
     def ineligible(status: str, tags) -> bool:
-        return agent_board.derive_lane(status, tags) in ("in_progress", "done")
+        return agent_board.natural_lane(status, tags) not in agent_board.SNOOZABLE_LANES
 
     if ineligible(task.status, task.tags):
         raise HTTPException(
@@ -1437,7 +1444,7 @@ async def snooze_board_card(card_id: str, body: SnoozeRequest) -> dict[str, Any]
     try:
         task = task_manager.update(
             card_id,
-            fields={agent_board.SNOOZED_UNTIL_FIELD: body.until},
+            fields={agent_board.SNOOZED_UNTIL_FIELD: normalized_until},
             _precondition=check,
         )
     except agent_board.CardDecisionChanged as exc:
@@ -1506,7 +1513,11 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
 
     tags_norm = {t.lstrip("#").lower() for t in task.tags}
     already_accepted = agent_board.ACCEPTED_TAG in tags_norm
-    if agent_board.derive_lane(task.status, task.tags, task.fields) != "review" and not already_accepted:
+    # Uses the natural (status/tag-only) lane, not the snoozed one — a
+    # snoozed Review card is still a Review card as far as Accept is
+    # concerned; accepting it both moves it to Done and wakes it (the
+    # `fields=` clear on the write below).
+    if agent_board.natural_lane(task.status, task.tags) != "review" and not already_accepted:
         raise HTTPException(status_code=409, detail="card is not in the Review lane")
 
     needs_tag = not already_accepted
@@ -1762,6 +1773,7 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             updated = task_manager.update(
                 card_id, status=plan.status, _tags_merge=merge_review_tags,
                 _notes_merge=merge_note,
+                fields={agent_board.SNOOZED_UNTIL_FIELD: None},
             )
         except (TaskConflictError, ValueError) as exc:
             raise HTTPException(status_code=409 if isinstance(exc, TaskConflictError) else 422, detail=str(exc)) from exc

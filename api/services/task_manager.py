@@ -31,7 +31,12 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from config.settings import settings
-from api.services.agent_board import is_snoozed as _is_snoozed
+from api.services.agent_board import (
+    SNOOZABLE_LANES as _SNOOZABLE_LANES,
+    SNOOZED_UNTIL_FIELD as _SNOOZED_UNTIL_FIELD,
+    is_snoozed as _is_snoozed,
+    natural_lane as _natural_lane,
+)
 from api.services.atomic_write import atomic_write_text, atomic_write_lines
 from api.services.operation_lock import exclusive_operation_lock
 
@@ -162,6 +167,31 @@ class Task:
         if "fields" in data and not isinstance(data.get("fields"), dict):
             data["fields"] = {}
         return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
+
+
+def _clear_stale_snooze(t: Task) -> None:
+    """Central choke point: if this task's own status/tags now land it in
+    a natural lane a snooze can never override (In progress or Done — see
+    `agent_board.SNOOZABLE_LANES`), drop `snoozed_until` when present.
+
+    Called at the tail of every write path that can change a task's
+    status or tags (`update`, `swap_tag`) right before the task is
+    persisted, so a snoozed Human-queue card resumed via `/swap-tag`
+    (`agent-blocked` -> `agent-running`), a status write to
+    `in_progress`/`done`/`cancelled` (including the human-queue resolve
+    path, which calls `update(status="done", ...)`), or any other tag
+    change that lands the card in In progress or Done can never leave a
+    stale future wake-up time behind — one that would otherwise silently
+    re-apply and hide the card again the next time it lands in a
+    snooze-eligible lane (e.g. a resumed card reaching Review before its
+    wake-up time). Mutates `t.fields` in place; a no-op when the field is
+    absent or the natural lane is still snooze-eligible.
+    """
+    if _SNOOZED_UNTIL_FIELD not in t.fields:
+        return
+    if _natural_lane(t.status, t.tags) in _SNOOZABLE_LANES:
+        return
+    t.fields = {k: v for k, v in t.fields.items() if k != _SNOOZED_UNTIL_FIELD}
 
 
 def _today() -> str:
@@ -507,6 +537,7 @@ class TaskManager:
                         else:
                             merged[k] = v
                     t.fields = merged
+                _clear_stale_snooze(t)
                 t.updated_at = _now_iso()
                 return t
 
@@ -607,6 +638,7 @@ class TaskManager:
                 new_tags = list(t.tags)
                 new_tags[idx] = to_norm
                 new_task.tags = new_tags
+                _clear_stale_snooze(new_task)
                 new_task.updated_at = _now_iso()
                 return new_task
 

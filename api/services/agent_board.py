@@ -77,6 +77,15 @@ TASK_LANES: tuple[str, ...] = tuple(lane for lane in LANES if lane != "scheduled
 # tags are left untouched by a snooze.
 SNOOZED_UNTIL_FIELD = "snoozed_until"
 
+# The natural lanes (status/tags alone, ignoring any snooze) a snooze is
+# ever allowed to override. A card whose natural lane is In progress or
+# Done is never shown as Snoozed, no matter what `snoozed_until` says —
+# the operator's intent is "set aside a dormant card", not "hide a
+# running or finished one". `snooze_board_card`'s eligibility check and
+# `TaskManager`'s write-time clearing (see task_manager.py) both key off
+# this same set so the three stay in lockstep.
+SNOOZABLE_LANES: frozenset[str] = frozenset({"unassigned", "assigned", "human_queue", "review"})
+
 
 def parse_snoozed_until(value: Optional[str]) -> Optional[datetime]:
     """Parse a `snoozed_until` field value into an aware UTC datetime.
@@ -145,27 +154,12 @@ def derive_assignee(tags: Iterable[str]) -> Optional[str]:
     return None
 
 
-def derive_lane(
-    status: str,
-    tags: Iterable[str],
-    fields: Optional[dict] = None,
-    now: Optional[datetime] = None,
-) -> str:
-    """Derive a task's board lane from its status + tags (+ snooze field).
-
-    See the lane table in issue #850. Never stored — recomputed on every
-    read from the task's current status/tags/fields.
+def natural_lane(status: str, tags: Iterable[str]) -> str:
+    """Derive a task's board lane from status + tags alone, ignoring any
+    snooze — what `derive_lane` would return if the task carried no
+    `snoozed_until` field at all.
 
     Priority (highest first), and why:
-      0. Snoozed — a future `snoozed_until` wins over everything
-         else. Snoozing is only ever offered on a card whose status/tags
-         alone would derive to Unassigned, Assigned, Human queue, or
-         Review — every write path that transitions a card out of one of
-         those (a lane move, Accept, Cancel) clears the field, so an
-         In progress or Done card's derivation never actually depends on
-         this rule in practice. A past or missing value is ignored, and
-         derivation falls through to the status/tag rules below exactly as
-         if the field were absent.
       1. Review — an `agent-completed` tag without `accepted` wins over
          everything else, INCLUDING a terminal status, so a task the worker
          marked done still surfaces for the operator's accept/reject instead
@@ -181,9 +175,6 @@ def derive_lane(
          of the working lanes above.
       6. Unassigned — the default: an open task with no assignee tag.
     """
-    if is_snoozed(fields, now):
-        return "snoozed"
-
     tset = _norm_tags(tags)
     status_norm = (status or "todo").lower()
 
@@ -203,6 +194,37 @@ def derive_lane(
     if derive_assignee(tset) is not None:
         return "assigned"
     return "unassigned"
+
+
+def derive_lane(
+    status: str,
+    tags: Iterable[str],
+    fields: Optional[dict] = None,
+    now: Optional[datetime] = None,
+) -> str:
+    """Derive a task's board lane from its status + tags (+ snooze field).
+
+    Never stored — recomputed on every read from the task's current
+    status/tags/fields. Computes the `natural_lane` (see above) first, then
+    overrides it with `snoozed` only when that natural lane is itself
+    snooze-eligible (`SNOOZABLE_LANES` — Unassigned, Assigned, Human queue,
+    or Review) AND the wake-up time is still in the future. A card whose
+    natural lane is In progress or Done is never shown as Snoozed, even
+    with a future `snoozed_until` still on it — a running or finished card
+    must never be hidden. In practice a stale future value shouldn't
+    survive onto such a card anyway: `TaskManager`'s write path clears it
+    the moment a write's own status/tags land the task in an unsnoozable
+    natural lane (see task_manager.py), and every board write path that
+    transitions a card out of a snooze-eligible lane (lane move, Accept,
+    Cancel, Reject, Reassign) clears it too. This override rule is what
+    keeps derivation correct even if some future write path forgets to.
+    A past or missing `snoozed_until` is ignored, and derivation is exactly
+    the natural lane.
+    """
+    lane = natural_lane(status, tags)
+    if lane in SNOOZABLE_LANES and is_snoozed(fields, now):
+        return "snoozed"
+    return lane
 
 
 WORKER_OWNED_ERROR: tuple[int, str] = (
@@ -442,18 +464,22 @@ def lane_for_session(
     session_status: str,
     task_status: Optional[str],
     task_tags: Optional[Iterable[str]] = None,
+    task_fields: Optional[dict] = None,
+    now: Optional[datetime] = None,
 ) -> str:
     """Derive the board lane a session's node should render in.
 
     A session linked to a task (`task_status is not None`) always takes that
-    task's own derived lane (`derive_lane`), so the graph's node colour
-    always agrees with that card's column on the board. A session with no
-    linked task (most CLI and ad hoc sessions) instead maps from its own
-    status: `running`/`claimed`/`yielded` -> in_progress, `blocked` ->
-    human_queue, a terminal status -> done, anything else -> unassigned.
+    task's own derived lane (`derive_lane`, including its snooze — a
+    snoozed Review card's session must render `snoozed` on the graph too,
+    the same lane its board card shows), so the graph's node colour always
+    agrees with that card's column on the board. A session with no linked
+    task (most CLI and ad hoc sessions) instead maps from its own status:
+    `running`/`claimed`/`yielded` -> in_progress, `blocked` -> human_queue,
+    a terminal status -> done, anything else -> unassigned.
     """
     if task_status is not None:
-        return derive_lane(task_status, task_tags or [])
+        return derive_lane(task_status, task_tags or [], task_fields, now)
     return _SESSION_STATUS_LANES.get((session_status or "").lower(), "unassigned")
 
 
