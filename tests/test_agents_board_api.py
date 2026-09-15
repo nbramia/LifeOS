@@ -360,6 +360,35 @@ class TestGetBoard:
         assert card["executor"] == "cloud"
         assert card["bot"] == ""
 
+    def test_scheduled_card_carries_per_action_inputs_for_the_drawer(self, client, stores):
+        """The drawer's per-action sections (an endpoint action's call
+        config, an agent action's execution context) render from the card
+        alone, with no second fetch — so the card must carry every one of
+        those fields."""
+        _tm, scheduler_store, *_ = stores
+        scheduler_store.create(
+            name="Pinned agent run", schedule_type="cron", schedule_value="0 9 * * *",
+            action="agent", message_content="Draft the pinned update",
+            persona_id="primary", model_id="claude-synthetic-model",
+            effort="high", host="synthetic-host", working_dir="/tmp/synthetic-project",
+        )
+        scheduler_store.create(
+            name="Endpoint check", schedule_type="cron", schedule_value="0 8 * * *",
+            action="endpoint", endpoint_config={"method": "GET", "endpoint": "/api/health", "params": {"x": 1}},
+        )
+        r = client.get("/api/agents/board")
+        cards = {c["name"]: c for c in r.json()["lanes"]["scheduled"]}
+
+        agent_card = cards["Pinned agent run"]
+        assert agent_card["persona_id"] == "primary"
+        assert agent_card["model_id"] == "claude-synthetic-model"
+        assert agent_card["effort"] == "high"
+        assert agent_card["host"] == "synthetic-host"
+        assert agent_card["working_dir"] == "/tmp/synthetic-project"
+
+        endpoint_card = cards["Endpoint check"]
+        assert endpoint_card["endpoint_config"] == {"method": "GET", "endpoint": "/api/health", "params": {"x": 1}}
+
     def test_scheduled_cron_entry_carries_last_run_after_it_fires(self, client, stores):
         """Round-1 finding 16: a recurring entry that has already fired once
         but is still enabled with a future next trigger stays in Scheduled —

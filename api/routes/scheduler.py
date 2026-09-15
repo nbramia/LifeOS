@@ -191,6 +191,55 @@ def _validate_schedule_value(schedule_type: str, schedule_value: str) -> None:
             )
 
 
+def _validate_action_inputs(
+    action: str, message_content: str, endpoint_config: Optional[dict],
+) -> Optional[dict]:
+    """Validate that a schedule's resulting action has the inputs it
+    needs to fire, 422 on failure. Shared by ``create_schedule`` and
+    ``update_schedule`` below so the drawer and every other client (chat
+    tools, MCP) get the same rules — without this, a schedule could be
+    saved with an action whose fire path has nothing to work with (e.g. an
+    ``endpoint`` action with no endpoint configured produces "No endpoint
+    configuration provided." only once it actually fires).
+
+    Returns the ``endpoint_config`` to store: for ``endpoint``, the same
+    dict with ``method`` normalized to upper case; for every other action,
+    ``endpoint_config`` unchanged.
+    """
+    if action == "endpoint":
+        cfg = endpoint_config if isinstance(endpoint_config, dict) else {}
+        method = str(cfg.get("method", "")).strip().upper()
+        if method not in ("GET", "POST"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"endpoint_config.method must be 'GET' or 'POST', got {cfg.get('method')!r}",
+            )
+        path = cfg.get("endpoint")
+        if not isinstance(path, str) or not path.startswith("/api/"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"endpoint_config.endpoint must start with '/api/', got {path!r}",
+            )
+        params = cfg.get("params")
+        if params is not None and not isinstance(params, dict):
+            raise HTTPException(
+                status_code=422,
+                detail="endpoint_config.params must be a JSON object",
+            )
+        normalized = dict(cfg)
+        normalized["method"] = method
+        return normalized
+
+    if action in ("notify", "prompt", "agent"):
+        if not (message_content or "").strip():
+            raise HTTPException(
+                status_code=422,
+                detail="message_content must not be blank",
+            )
+
+    return endpoint_config
+
+
 def _validate_update_fields(schedule_id: str, request: "UpdateScheduleRequest", store) -> None:
     """Validate the fields present in a PUT before anything is written.
 
@@ -251,6 +300,7 @@ async def create_schedule(request: CreateScheduleRequest):
     if action not in VALID_ACTIONS:
         raise HTTPException(status_code=400, detail=f"action must be one of {VALID_ACTIONS}")
     request.bot = _require_known_bot(request.bot)
+    request.endpoint_config = _validate_action_inputs(action, request.message_content, request.endpoint_config)
 
     store = get_scheduler_store()
     entry = store.create(
@@ -326,6 +376,22 @@ async def update_schedule(schedule_id: str, request: UpdateScheduleRequest):
     request.bot = _require_known_bot(request.bot)
     store = get_scheduler_store()
     _validate_update_fields(schedule_id, request, store)
+    # Only when the patch actually touches one of the three action-input
+    # fields — an unrelated patch (e.g. `enabled`) to a pre-existing
+    # invalid entry must still succeed, matching `_validate_update_fields`'s
+    # own "only what's present is checked" rule above.
+    if request.action is not None or request.message_content is not None or request.endpoint_config is not None:
+        entry = store.get(schedule_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        resulting_action = request.action if request.action is not None else entry.action
+        resulting_message = request.message_content if request.message_content is not None else entry.message_content
+        resulting_endpoint_config = (
+            request.endpoint_config if request.endpoint_config is not None else entry.endpoint_config
+        )
+        normalized = _validate_action_inputs(resulting_action, resulting_message, resulting_endpoint_config)
+        if request.endpoint_config is not None:
+            request.endpoint_config = normalized
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
     entry = store.update(schedule_id, **updates)
     if not entry:
