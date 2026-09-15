@@ -192,6 +192,24 @@ external delete raced the move), the move is treated like any other
 externally-deleted task — reconciled out of the index — rather than raising
 a conflict.
 
+## Lifecycle dates
+
+`Task.done_date`/`Task.cancelled_date` are stamped and cleared at one
+central choke point inside `update()`'s per-key `apply()` closure, the same
+pattern `_clear_stale_snooze` uses for `snoozed_until`: a `status` write that
+lands on `"done"` stamps `done_date` to today (skipped if the task is
+already `"done"`, so a no-op status write never re-stamps it); a `status`
+write that lands on `"cancelled"` stamps `cancelled_date` the same way. A
+`status` write that *leaves* `"done"` clears `done_date`, and one that
+leaves `"cancelled"` clears `cancelled_date` — so a task's lifecycle date
+never survives a status change away from the status it belongs to. Moving
+directly between the two terminal statuses stamps the new date and clears
+the old one in the same write. This is what a board lane-move Undo (see
+[agent-viz.md](../product/agent-viz.md)'s Undo behavior) relies on: writing
+a card's prior status back through `PUT /api/tasks/{id}` — the general
+task-update endpoint, not a lane-endpoint replay — leaves no stale
+`done_date` behind on a card that only passed through Done briefly.
+
 ## Atomic writes
 
 All file writes — task files, `data/task_index.json`, `Dashboard.md`, a

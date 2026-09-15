@@ -460,10 +460,14 @@ class TaskManager:
     def update(self, task_id: str, **kwargs) -> Optional[Task]:
         """Update a task. Supports: description, status, context, priority,
         due_date, tags, notes, fields. `fields={"k": None}` removes key `k`;
-        `fields={"k": "v"}` sets it. Raises `TaskConflictError` (-> HTTP 409)
-        if the write keeps losing the CAS race against a concurrent edit;
-        `ValueError` (-> HTTP 422) for an unrecognized `status` or hostile
-        `description`/`notes`/`fields` content — see `_validate_text_fields`.
+        `fields={"k": "v"}` sets it. A `status` write that lands on `done` or
+        `cancelled` stamps `done_date`/`cancelled_date`; a `status` write that
+        leaves either one clears that date, so a task's lifecycle date never
+        outlives the status it belongs to. Raises `TaskConflictError` (->
+        HTTP 409) if the write keeps losing the CAS race against a concurrent
+        edit; `ValueError` (-> HTTP 422) for an unrecognized `status` or
+        hostile `description`/`notes`/`fields` content — see
+        `_validate_text_fields`.
         """
         fields_patch = kwargs.pop("fields", None)
         notes_merge = kwargs.pop("_notes_merge", None)
@@ -519,10 +523,20 @@ class TaskManager:
                 if precondition is not None:
                     precondition(t)
                 for key, value in kwargs.items():
-                    if key == "status" and value == "done" and t.status != "done":
-                        t.done_date = _today()
-                    elif key == "status" and value == "cancelled" and t.status != "cancelled":
-                        t.cancelled_date = _today()
+                    if key == "status" and value is not None and value != t.status:
+                        # Stamp the lifecycle date on the way in, and clear it
+                        # on the way back out — a status leaving done or
+                        # cancelled always carries its lifecycle date away
+                        # with it, so a task's `done_date`/`cancelled_date`
+                        # is always in sync with its current `status`.
+                        if value == "done":
+                            t.done_date = _today()
+                        elif t.status == "done":
+                            t.done_date = None
+                        if value == "cancelled":
+                            t.cancelled_date = _today()
+                        elif t.status == "cancelled":
+                            t.cancelled_date = None
                     if hasattr(t, key) and value is not None:
                         setattr(t, key, value)
                 if tags_merge is not None:
