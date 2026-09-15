@@ -517,10 +517,13 @@ export function initBoard() {
   function renderAssigneeDrops() {
     if (!assigneeDropsEl) return;
     const current = getFilters().assignee;
+    assigneeDropsEl.parentElement?.style.setProperty(
+      '--board-tray-button-count', String(ASSIGNEES.length + 1),
+    );
     assigneeDropsEl.innerHTML = ASSIGNEES.map(assignee => `
       <button type="button" class="board-drop-target board-assignee-drop${current === assignee ? ' selected' : ''}"
               data-assignee="${assignee}" aria-pressed="${current === assignee}"
-              aria-label="Filter board to ${assignee}">
+              title="${escapeAttr(assignee)}" aria-label="Filter board to ${escapeAttr(assignee)}">
         ${assignee}
       </button>
     `).join('');
