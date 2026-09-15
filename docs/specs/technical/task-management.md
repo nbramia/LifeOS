@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Task Management
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-15
 
 Engineering view of the task store — how a task is located, written, and
 reindexed. For the product-facing feature description, statuses, and API
@@ -339,6 +339,12 @@ this store, not a separate one: a card is a task with tag `human` and status
 persistence, no schema change. See the
 [Human Queue guide](../../guides/human-queue.md) for the tool/endpoint
 contract and the `done_when` reference.
+
+## Snoozed-until field
+
+A card's snooze is a wake-up time, `[snoozed_until:: <ISO-8601 with offset>]`, stored the same generic way as `host`/`effort`/`model` — no parser change, no schema change (see [Parsing](#parsing)). `TaskManager` itself does not parse or validate the timestamp; `agent_board.parse_snoozed_until`/`is_snoozed` do (see [Agent Viz — Technical § Snooze](agent-viz.md#snooze)), and the write path (`PUT /api/agents/board/cards/{id}/snooze`) rejects a missing, unparseable, offset-less, or non-future value before ever calling `TaskManager.update`. A stored value that has since passed is left in place — nothing purges it, and it is simply ignored, the same as any other expired-but-present field.
+
+`TaskManager.claim_for_agent`'s `is_claimable` check refuses a task whose `fields` make `agent_board.is_snoozed(task.fields)` true, re-evaluated on every compare-and-swap retry exactly like the existing status/pickup-tag/exclusion-tag checks — a claim attempt against a snoozed task fails the same way a claim against an ineligible status does, independent of whatever listing produced the candidate.
 
 ## Shared lifecycle projection
 
