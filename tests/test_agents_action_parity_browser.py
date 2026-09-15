@@ -246,16 +246,25 @@ class TestDecideActions:
         assert "resolve" not in _ids(out), out
         assert "answer" in _ids(out), out
 
-    def test_cancel_disabled_carries_server_reason(self, page: Page, web_base_url):
+    def test_refused_cancel_is_omitted(self, page: Page, web_base_url):
         _load_actions_module(page, web_base_url)
         card = {
             "kind": "task", "lane": "in_progress", "assignee": None, "pending_question": None,
             "policy": {"cancel": {"allowed": False, "reason": "already claimed by another agent"}},
         }
         out = _decide(page, None, card)
+        assert "cancel" not in _ids(out), out
+
+    def test_allowed_cancel_is_present_and_enabled(self, page: Page, web_base_url):
+        _load_actions_module(page, web_base_url)
+        card = {
+            "kind": "task", "lane": "assigned", "assignee": "codex", "pending_question": None,
+            "policy": {"cancel": {"allowed": True, "reason": None}},
+        }
+        out = _decide(page, None, card)
         cancel = next(d for d in out if d["id"] == "cancel")
-        assert cancel["enabled"] is False
-        assert cancel["reason"] == "already claimed by another agent"
+        assert cancel["enabled"] is True
+        assert cancel["reason"] is None
 
     def test_delete_always_last_and_danger_for_any_card(self, page: Page, web_base_url):
         _load_actions_module(page, web_base_url)
@@ -270,12 +279,12 @@ class TestDecideActions:
         card = {
             "kind": "task", "lane": "review", "assignee": "claude",
             "pending_question": {"id": 2, "question": "Proceed?"},
-            "policy": {"cancel": {"allowed": False, "reason": "n/a"}},
+            "policy": {"cancel": {"allowed": True, "reason": None}},
         }
         out = _decide(page, session, card)
         # Open needs lane=assigned (not review) and Resolve needs
         # lane=human_queue, so neither applies here — everything else does,
-        # including Snooze (review is snooze-eligible).
+        # including Snooze (review is snooze-eligible) and Cancel (allowed).
         assert _ids(out) == [
             "rename", "focus", "resume", "kill", "answer", "accept", "reject",
             "reassign", "snooze", "cancel", "delete",
@@ -331,7 +340,7 @@ def _click_graph_node(page: Page, session_id: str) -> None:
 
 
 # A rich session+card pair exercising Open, Focus, Resume, Kill (disabled),
-# Answer, Cancel (disabled), and Delete together — Accept/Resolve need
+# Answer, refused Cancel omission, and Delete together — Accept/Resolve need
 # different lanes, covered separately below and by TestDecideActions above.
 _PARITY_SESSION = {
     "session_id": "cc:parity-shared", "source": "claude_code", "status": "inactive",
@@ -432,10 +441,11 @@ class TestActionParity:
         assert panel_actions, "panel rendered no actions"
         assert board_actions == panel_actions, (board_actions, panel_actions)
         # And the canonical set — proves this scenario actually exercises
-        # Open/Focus/Resume/Kill/Answer/Snooze/Cancel/Delete together, not
+        # Open/Focus/Resume/Kill/Answer/Snooze/Delete together, including a
+        # refused Cancel policy (omitted rather than shown disabled), not
         # just that two empty lists match. Assigned is snooze-eligible.
         assert [a["id"] for a in board_actions] == [
-            "open", "rename", "focus", "resume", "kill", "answer", "snooze", "cancel", "delete",
+            "open", "rename", "focus", "resume", "kill", "answer", "snooze", "delete",
         ], board_actions
 
     def test_review_lane_accept_parity(self, page: Page, web_base_url):
@@ -558,9 +568,10 @@ class TestGraphTabParity:
             "the Graph tab never handed SessionPanel the card"
         )
         assert graph_actions == board_actions, (board_actions, graph_actions)
-        # Assigned is snooze-eligible.
+        # Assigned is snooze-eligible; Cancel is refused (see _PARITY_CARD's
+        # policy) and so is omitted rather than shown disabled.
         assert [a["id"] for a in graph_actions] == [
-            "open", "rename", "focus", "resume", "kill", "answer", "snooze", "cancel", "delete",
+            "open", "rename", "focus", "resume", "kill", "answer", "snooze", "delete",
         ], graph_actions
 
 

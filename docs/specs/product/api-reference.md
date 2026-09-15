@@ -615,6 +615,10 @@ Create a schedule. Supports `schedule_type` of `once` (ISO datetime) or `cron`, 
 
 `bot` (optional) selects which Telegram bot delivers the notification. Valid values are `primary` and the names registered in `config/telegram_bots.json`; anything else returns **422** with the accepted names. Omit it, or send an empty string, for the primary bot.
 
+`timezone` must resolve as a valid IANA zone, and `schedule_value` must parse for its `schedule_type` (a cron expression for `cron`, an ISO datetime for `once`) — either failure returns **422** with a detail naming what's wrong, and nothing is stored.
+
+The resulting action must have what it needs to fire, checked after every other field above: for `action: "endpoint"`, `endpoint_config` must have a `method` of `GET` or `POST` (case-insensitive; stored upper-case), an `endpoint` path starting with `/api/`, and `params` absent or a JSON object; for `notify`/`prompt`/`agent`, `message_content` must be non-blank. Either failure returns **422** naming the specific field. An `agent` action's execution context — `persona_id`, `model_id`, `effort`, `host`, `working_dir` — round-trips as plain top-level fields alongside `executor`; all default to empty (no override).
+
 ### GET /api/scheduler
 
 List all schedules.
@@ -627,9 +631,15 @@ Get a specific schedule.
 
 List the Telegram bot names a schedule's `bot` field may use: `primary` plus every configured registry bot (an entry in `config/telegram_bots.json` counts only once its `token_env` is set), as `{"bots": [...]}`. Exactly the names `POST`/`PUT` accept. Backs the board drawer's bot picker.
 
+### POST /api/scheduler/preview
+
+Preview the next fire times a trigger produces, without creating a schedule. Body: `schedule_type` (`once` or `cron`), `schedule_value`, and `timezone` (optional, defaults to the configured `LIFEOS_TIMEZONE`). Returns `{"next": [...], "timezone": "<resolved IANA zone>"}` — up to three ISO-8601 UTC datetimes, using the same cron-in-timezone evaluation the scheduler itself fires on, plus the IANA zone that evaluation actually used (the request's `timezone` if supplied, else the configured default). `once` returns at most one time (the value itself, converted to UTC) when it's still in the future, else an empty list. An unrecognised `schedule_type` returns **400**; an invalid cron expression, ISO datetime, or timezone returns **422** with the same detail wording `POST`/`PUT /api/scheduler` use. Declared ahead of `GET /{id}` so `preview` is never captured as a schedule id. Backs the board's create-schedule composer's live preview, whose Timezone field is blank by default (meaning the configured default) rather than pre-filled from the browser's locale.
+
 ### PUT /api/scheduler/{id}
 
 Update a schedule. Only the fields present in the request body are changed, and nothing is written if any check fails. An unrecognised `bot` returns **422** with the accepted names. `schedule_type` (must be `once` or `cron`) and `action` (must be one of `notify`/`prompt`/`endpoint`/`agent`) return **400**, matching `POST /api/scheduler`. `timezone` (must resolve as an IANA zone) and `schedule_value` (must parse as a cron expression for a `cron` schedule, or an ISO datetime for a `once` schedule — using `schedule_type` from the request if given, otherwise the entry's stored type) return **422** with a detail naming what's wrong. A request that sends `schedule_type` **without** `schedule_value` is validated against the entry's stored value under the new type, and returns the same **422** when that value doesn't parse — converting a schedule means sending both fields in one request.
+
+The same resulting-action check `POST /api/scheduler` runs applies here too, but only when the request touches `action`, `message_content`, or `endpoint_config` — a patch that touches none of the three (e.g. `{"enabled": false}`) is never re-validated, regardless of whether the stored entry itself currently satisfies the rule. Whichever of the three fields the request doesn't supply falls back to the entry's currently stored value to decide the resulting action's inputs — so `{"action": "endpoint"}` alone is rejected with **422** against an entry with no `endpoint_config`, and `{"endpoint_config": {...}}` alone is checked against the entry's current `action`.
 
 ### DELETE /api/scheduler/{id}
 

@@ -34,6 +34,16 @@ source of truth; `data/scheduler_index.json` is a rebuildable cache.
 - **`#executor` tag** — for `action:: agent`, the executor: `#local`, `#cloud`, `#cloud-haiku`, or `#cloud-sonnet`.
 - **`[bot:: <name>]`** — which Telegram bot delivers the notification (see below); omitted means the primary bot.
 
+`endpoint` schedules carry the call itself in the line, so it is fully defined
+by the vault: `[endpoint:: <METHOD> <path>]` (e.g.
+`[endpoint:: POST /api/home/eero/Kid-iPad/pause]`) and, when params are
+non-empty, `[params:: <compact JSON>]`. When the params JSON contains a
+character the inline-field syntax can't hold (`]` or a newline), the field
+instead carries a `b64:`-prefixed base64 form; parsing decodes it back to the
+identical dict. Editing either field in Obsidian changes what the schedule
+calls — no other configuration is needed, and a rebuilt index cache recovers
+the call from these fields alone.
+
 Agent schedules may also carry optional execution fields such as
 `[persona_id:: journal]`, `[model_id:: synthetic-model]`, `[effort:: high]`,
 `[host:: workstation]`, and `[working_dir:: /srv/project]`. They are explicit
@@ -155,14 +165,11 @@ curl -X POST http://localhost:8000/api/scheduler \
 
 ## Managing Schedules
 
-`PUT /api/scheduler/{id}` validates every field it's given: an unrecognised
-`schedule_type` or `action` rejects the write with a 400 (the same status
-`POST /api/scheduler` uses for those two fields), and an unparsable cron
-expression or ISO datetime, or an unresolvable IANA `timezone`, rejects it
-with a 422. Either way nothing is saved. `POST /api/scheduler` does not run
-the cron / datetime / timezone checks — a schedule created with an unparsable
-value stores fine and then never computes a next fire, which is why the
-update path checks them.
+`POST /api/scheduler` and `PUT /api/scheduler/{id}` validate every field
+they're given: an unrecognised `schedule_type` or `action` rejects the write
+with a 400, and an unparsable cron expression or ISO datetime, or an
+unresolvable IANA `timezone`, rejects it with a 422. Either way nothing is
+saved.
 
 Nothing is saved when a check fails. A request that changes `schedule_type`
 without also sending a matching `schedule_value` is checked against the

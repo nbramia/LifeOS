@@ -17,6 +17,7 @@ from api.services.scheduler_store import (
     SchedulerScheduler,
     ScheduleEntry,
     compute_next_trigger,
+    compute_next_n_triggers,
     _format_entry_line,
     _parse_entry_line,
     _format_cron_human,
@@ -333,6 +334,170 @@ class TestMarkdownSourceOfTruth:
         assert "Persist" in names
 
 
+class TestEndpointConfigVaultRoundTrip:
+    """The endpoint route, method, and params round-trip through the vault line."""
+
+    def test_create_writes_endpoint_and_params_fields(self, store):
+        store.create(
+            name="Pause internet", schedule_type="cron", schedule_value="0 22 * * *",
+            message_type="endpoint",
+            endpoint_config={
+                "endpoint": "/api/home/eero/Kid-iPad/pause", "method": "POST",
+                "params": {"scheduled": True},
+            },
+        )
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "[endpoint:: POST /api/home/eero/Kid-iPad/pause]" in content
+        assert '[params:: {"scheduled":true}]' in content
+
+    def test_empty_params_omits_params_field(self, store):
+        store.create(
+            name="Status poll", schedule_type="cron", schedule_value="0 * * * *",
+            message_type="endpoint",
+            endpoint_config={"endpoint": "/health", "method": "GET", "params": {}},
+        )
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "[endpoint:: GET /health]" in content
+        assert "[params::" not in content
+
+    def test_non_endpoint_schedule_has_no_endpoint_or_params_fields(self, store):
+        store.create(name="Water plants", schedule_type="cron", schedule_value="0 18 * * *",
+                     message_type="static", message_content="hydrate")
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "[endpoint::" not in content
+        assert "[params::" not in content
+
+    def test_update_rewrites_endpoint_fields(self, store):
+        entry = store.create(
+            name="Poll", schedule_type="cron", schedule_value="0 * * * *",
+            message_type="endpoint",
+            endpoint_config={"endpoint": "/health", "method": "GET", "params": {}},
+        )
+        store.update(entry.id, endpoint_config={
+            "endpoint": "/api/other", "method": "POST", "params": {"x": 1},
+        })
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "[endpoint:: POST /api/other]" in content
+        assert '[params:: {"x":1}]' in content
+        assert "/health" not in content
+
+    def test_endpoint_config_survives_deleted_cache(self, store, tmp_path):
+        """No cache is needed to recover endpoint_config from the vault line."""
+        entry = store.create(
+            name="Nightly pause", schedule_type="cron", schedule_value="0 22 * * *",
+            message_type="endpoint",
+            endpoint_config={
+                "endpoint": "/api/home/eero/Kid-iPad/pause", "method": "POST",
+                "params": {"scheduled": True},
+            },
+        )
+        # A fresh store over the same vault with a brand-new (nonexistent)
+        # index path rebuilds purely from Inbox.md.
+        rebuilt = SchedulerStore(
+            vault_path=tmp_path / "vault", index_path=tmp_path / "fresh_index.json",
+        )
+        assert rebuilt.get(entry.id).endpoint_config == {
+            "endpoint": "/api/home/eero/Kid-iPad/pause", "method": "POST",
+            "params": {"scheduled": True},
+        }
+
+    def test_params_with_bracket_falls_back_to_base64_and_round_trips(self, store, tmp_path):
+        params = {"targets": ["Kid-iPad", "Kid-Laptop"]}
+        entry = store.create(
+            name="Pause multiple", schedule_type="cron", schedule_value="0 22 * * *",
+            message_type="endpoint",
+            endpoint_config={"endpoint": "/api/home/eero/pause", "method": "POST", "params": params},
+        )
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "[params:: b64:" in content
+
+        rebuilt = SchedulerStore(
+            vault_path=tmp_path / "vault", index_path=tmp_path / "fresh_index2.json",
+        )
+        assert rebuilt.get(entry.id).endpoint_config["params"] == params
+
+    def test_vault_endpoint_fields_win_over_stale_cache(self, store):
+        entry = store.create(
+            name="Poll", schedule_type="cron", schedule_value="0 * * * *",
+            message_type="endpoint",
+            endpoint_config={"endpoint": "/health", "method": "GET", "params": {"v": 1}},
+        )
+        # self._entries (the in-memory cache) still holds the original config;
+        # hand-edit the vault line directly to a different endpoint/params.
+        content = store.inbox_path.read_text(encoding="utf-8")
+        patched = content.replace(
+            '[endpoint:: GET /health] [params:: {"v":1}]',
+            '[endpoint:: POST /api/changed] [params:: {"v":2}]',
+        )
+        assert patched != content
+        store.inbox_path.write_text(patched, encoding="utf-8")
+
+        store.reindex_file(str(store.inbox_path))
+        refreshed = store.get(entry.id)
+        assert refreshed.endpoint_config == {
+            "endpoint": "/api/changed", "method": "POST", "params": {"v": 2},
+        }
+
+    def test_legacy_line_without_endpoint_fields_migrates_once(self, store):
+        entry = store.create(
+            name="Legacy poll", schedule_type="cron", schedule_value="0 * * * *",
+            message_type="endpoint",
+            endpoint_config={"endpoint": "/health", "method": "GET", "params": {"v": 1}},
+        )
+        # Simulate a pre-existing line written before the endpoint fields
+        # existed: strip them from the vault, leaving the cache populated.
+        content = store.inbox_path.read_text(encoding="utf-8")
+        patched = content.replace(' [endpoint:: GET /health] [params:: {"v":1}]', "")
+        assert patched != content
+        store.inbox_path.write_text(patched, encoding="utf-8")
+
+        store.reindex_file(str(store.inbox_path))
+        migrated = store.inbox_path.read_text(encoding="utf-8")
+        assert "[endpoint:: GET /health]" in migrated
+        assert '[params:: {"v":1}]' in migrated
+        assert store.get(entry.id).endpoint_config == {
+            "endpoint": "/health", "method": "GET", "params": {"v": 1},
+        }
+
+        # A second reindex over the now-complete line must not rewrite again.
+        store.reindex_file(str(store.inbox_path))
+        assert store.inbox_path.read_text(encoding="utf-8") == migrated
+
+    def test_malformed_params_falls_back_to_cached_params(self, store, caplog):
+        entry = store.create(
+            name="Poll", schedule_type="cron", schedule_value="0 * * * *",
+            message_type="endpoint",
+            endpoint_config={"endpoint": "/health", "method": "GET", "params": {"v": 1}},
+        )
+        content = store.inbox_path.read_text(encoding="utf-8")
+        patched = content.replace('[params:: {"v":1}]', '[params:: {"v":}]')
+        assert patched != content
+        store.inbox_path.write_text(patched, encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            store.reindex_file(str(store.inbox_path))
+        refreshed = store.get(entry.id)
+        assert refreshed.endpoint_config == {
+            "endpoint": "/health", "method": "GET", "params": {"v": 1},
+        }
+        assert entry.id in caplog.text
+
+    def test_malformed_params_without_cache_falls_back_to_empty_dict(self, tmp_path):
+        raw_store = SchedulerStore(
+            vault_path=tmp_path / "vault2", index_path=tmp_path / "fresh_index3.json",
+        )
+        line = ('- [ ] Legacy [cron:: 0 * * * *] [action:: endpoint] [mtype:: endpoint] '
+                '[endpoint:: GET /health] [params:: {"v":}] <!-- id:deadbeef -->')
+        raw_store.inbox_path.write_text(
+            "---\ntype: scheduler\n---\n# Scheduler Inbox\n\n" + line + "\n",
+            encoding="utf-8",
+        )
+        raw_store.reindex_file(str(raw_store.inbox_path))
+        entry = raw_store.get("deadbeef")
+        assert entry is not None
+        assert entry.endpoint_config == {"endpoint": "/health", "method": "GET", "params": {}}
+
+
 class TestRoundTrip:
     """parse → format → parse is lossless for the markdown definition fields."""
 
@@ -381,6 +546,90 @@ class TestRoundTrip:
         assert _parse_entry_line("- [ ] just a task with no trigger") is None
         assert _parse_entry_line("plain text") is None
 
+    def test_endpoint_with_params_round_trip(self):
+        entry = ScheduleEntry(
+            id="ep1", name="Pause", schedule_type="cron", schedule_value="0 22 * * *",
+            action="endpoint", message_type="endpoint",
+            endpoint_config={
+                "endpoint": "/api/home/eero/pause", "method": "POST",
+                "params": {"scheduled": True},
+            },
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        assert "[endpoint:: POST /api/home/eero/pause]" in line
+        assert '[params:: {"scheduled":true}]' in line
+        reparsed = _parse_entry_line(line)
+        assert reparsed.endpoint_config == entry.endpoint_config
+        assert _format_entry_line(reparsed) == line
+
+    def test_endpoint_params_bracket_uses_base64_fallback(self):
+        entry = ScheduleEntry(
+            id="ep2", name="Pause multi", schedule_type="cron", schedule_value="0 22 * * *",
+            action="endpoint", message_type="endpoint",
+            endpoint_config={
+                "endpoint": "/api/home/eero/pause", "method": "POST",
+                "params": {"targets": ["a", "b"]},
+            },
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        assert "[params:: b64:" in line
+        reparsed = _parse_entry_line(line)
+        assert reparsed.endpoint_config["params"] == {"targets": ["a", "b"]}
+        assert _format_entry_line(reparsed) == line
+
+    def test_endpoint_path_with_spaces_round_trips(self):
+        """The method is the first whitespace-delimited token; the path is the remainder."""
+        entry = ScheduleEntry(
+            id="ep3", name="Pause target", schedule_type="cron", schedule_value="0 22 * * *",
+            action="endpoint", message_type="endpoint",
+            endpoint_config={
+                "endpoint": "/api/home/eero/Kid iPad/pause", "method": "POST", "params": {},
+            },
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        assert "[endpoint:: POST /api/home/eero/Kid iPad/pause]" in line
+        reparsed = _parse_entry_line(line)
+        assert reparsed.endpoint_config == {
+            "endpoint": "/api/home/eero/Kid iPad/pause", "method": "POST", "params": {},
+        }
+        assert _format_entry_line(reparsed) == line
+
+    def test_hash_in_endpoint_params_and_path_not_treated_as_tag(self):
+        """A `#` inside a field value (params or path) is never mistaken for an executor tag."""
+        entry = ScheduleEntry(
+            id="ep4", name="Notify channel", schedule_type="cron", schedule_value="0 9 * * *",
+            action="endpoint", message_type="endpoint",
+            endpoint_config={
+                "endpoint": "/api/x#frag", "method": "POST",
+                "params": {"channel": "#general"},
+            },
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        reparsed = _parse_entry_line(line)
+        assert reparsed.executor == ""
+        assert reparsed.endpoint_config == entry.endpoint_config
+        assert _format_entry_line(reparsed) == line
+
+    def test_real_executor_tag_survives_hash_in_endpoint_params(self):
+        entry = ScheduleEntry(
+            id="ep5", name="Notify channel", schedule_type="cron", schedule_value="0 9 * * *",
+            action="endpoint", message_type="endpoint", executor="cloud",
+            endpoint_config={
+                "endpoint": "/api/x", "method": "POST",
+                "params": {"channel": "#general"},
+            },
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        reparsed = _parse_entry_line(line)
+        assert reparsed.executor == "cloud"
+        assert reparsed.endpoint_config == entry.endpoint_config
+        assert _format_entry_line(reparsed) == line
+
 
 class TestCronComputation:
     def test_cron_next_trigger(self):
@@ -404,6 +653,52 @@ class TestCronComputation:
         entry = ScheduleEntry(id="t", name="T", schedule_type="cron",
                               schedule_value="invalid cron")
         assert compute_next_trigger(entry) is None
+
+
+class TestComputeNextNTriggers:
+    """`compute_next_n_triggers` is the pure helper `compute_next_trigger`
+    now shares — covered directly here for the multi-trigger case the
+    single-trigger helper never exercises, plus the once/invalid cases
+    `compute_next_trigger`'s own tests above already cover for count=1."""
+
+    def test_cron_returns_count_ascending_utc_times(self):
+        triggers = compute_next_n_triggers("cron", "0 9 * * *", "UTC", count=3)
+        assert len(triggers) == 3
+        parsed = [datetime.fromisoformat(t) for t in triggers]
+        assert parsed == sorted(parsed)
+        assert all(p > datetime.now(timezone.utc) for p in parsed)
+        assert all(p.tzinfo == timezone.utc for p in parsed)
+
+    def test_once_future_returns_single_time(self):
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        triggers = compute_next_n_triggers("once", future, "UTC", count=3)
+        assert len(triggers) == 1
+
+    def test_once_past_returns_empty(self):
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        assert compute_next_n_triggers("once", past, "UTC", count=3) == []
+
+    def test_invalid_cron_returns_empty(self):
+        assert compute_next_n_triggers("cron", "invalid cron", "UTC", count=3) == []
+
+    def test_invalid_timezone_returns_empty(self):
+        assert compute_next_n_triggers("cron", "0 9 * * *", "Nowhere/Fake", count=3) == []
+
+    def test_unknown_schedule_type_returns_empty(self):
+        assert compute_next_n_triggers("weekly", "0 9 * * *", "UTC", count=3) == []
+
+    def test_zero_count_returns_empty_for_cron(self):
+        assert compute_next_n_triggers("cron", "0 9 * * *", "UTC", count=0) == []
+
+    def test_compute_next_trigger_matches_first_of_n(self):
+        """`compute_next_trigger` must keep returning exactly the first
+        element `compute_next_n_triggers` would — the refactor shares logic
+        without changing either function's observable behavior."""
+        entry = ScheduleEntry(id="t", name="T", schedule_type="cron", schedule_value="0 9 * * *",
+                              timezone="America/New_York")
+        single = compute_next_trigger(entry)
+        many = compute_next_n_triggers("cron", "0 9 * * *", "America/New_York", count=1, label="t")
+        assert single == many[0]
 
 
 class TestDueChecking:

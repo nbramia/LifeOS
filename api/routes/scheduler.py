@@ -18,8 +18,13 @@ from pydantic import BaseModel, Field
 from api.services.scheduler_store import (
     get_scheduler_store,
     get_scheduler,
+    compute_next_n_triggers,
     ScheduleEntry,
     VALID_ACTIONS,
+)
+from api.services.scheduler_validation import (
+    validate_action_inputs,
+    ScheduleActionValidationError,
 )
 from config.settings import settings
 
@@ -139,6 +144,20 @@ class SendMessageRequest(BaseModel):
     )
 
 
+class PreviewScheduleRequest(BaseModel):
+    schedule_type: str = Field(..., description="'once' or 'cron'")
+    schedule_value: str = Field(..., description="ISO datetime (once) or cron expression (cron)")
+    timezone: str = Field(default_factory=lambda: settings.timezone, description="IANA timezone")
+
+
+class PreviewScheduleResponse(BaseModel):
+    next: list[str]
+    timezone: str
+
+
+PREVIEW_TRIGGER_COUNT = 3
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -189,6 +208,27 @@ def _validate_schedule_value(schedule_type: str, schedule_value: str) -> None:
                 status_code=422,
                 detail=f"Invalid ISO datetime '{schedule_value}': {e}",
             )
+
+
+def _validate_action_inputs(
+    action: str, message_content: str, endpoint_config: Optional[dict],
+) -> Optional[dict]:
+    """Validate that a schedule's resulting action has the inputs it needs
+    to fire, 422 on failure. Shared by ``create_schedule`` and
+    ``update_schedule`` below so the drawer and every other client (chat
+    tools, MCP) get the same rules and the same detail text — the actual
+    rule lives in ``api/services/scheduler_validation.py``'s
+    ``validate_action_inputs``, which ``manage_schedules``
+    (``api/services/agent_tools.py``) also calls directly.
+
+    Returns the ``endpoint_config`` to store: for ``endpoint``, the same
+    dict with ``method`` normalized to upper case; for every other action,
+    ``endpoint_config`` unchanged.
+    """
+    try:
+        return validate_action_inputs(action, message_content, endpoint_config)
+    except ScheduleActionValidationError as e:
+        raise HTTPException(status_code=422, detail=e.detail)
 
 
 def _validate_update_fields(schedule_id: str, request: "UpdateScheduleRequest", store) -> None:
@@ -247,10 +287,16 @@ async def create_schedule(request: CreateScheduleRequest):
     """Create a new schedule."""
     if request.schedule_type not in ("once", "cron"):
         raise HTTPException(status_code=400, detail="schedule_type must be 'once' or 'cron'")
+    try:
+        ZoneInfo(request.timezone)
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"Unknown timezone '{request.timezone}'")
+    _validate_schedule_value(request.schedule_type, request.schedule_value)
     action = _resolve_action(request.action, request.message_type)
     if action not in VALID_ACTIONS:
         raise HTTPException(status_code=400, detail=f"action must be one of {VALID_ACTIONS}")
     request.bot = _require_known_bot(request.bot)
+    request.endpoint_config = _validate_action_inputs(action, request.message_content, request.endpoint_config)
 
     store = get_scheduler_store()
     entry = store.create(
@@ -310,6 +356,29 @@ async def list_bots():
     return {"bots": valid_bot_names()}
 
 
+@router.post("/preview", response_model=PreviewScheduleResponse)
+async def preview_schedule(request: PreviewScheduleRequest):
+    """Preview the next fire times for a trigger without creating a schedule.
+
+    Uses the same trigger semantics the scheduler itself fires on — a cron
+    expression evaluated in ``timezone`` — so a create-schedule composer can
+    show what a trigger will actually do before saving it. Declared ahead of
+    ``GET /{schedule_id}`` so ``preview`` is never captured as an id."""
+    if request.schedule_type not in ("once", "cron"):
+        raise HTTPException(status_code=400, detail="schedule_type must be 'once' or 'cron'")
+    try:
+        ZoneInfo(request.timezone)
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"Unknown timezone '{request.timezone}'")
+    _validate_schedule_value(request.schedule_type, request.schedule_value)
+
+    triggers = compute_next_n_triggers(
+        request.schedule_type, request.schedule_value, request.timezone,
+        count=PREVIEW_TRIGGER_COUNT, label="preview",
+    )
+    return PreviewScheduleResponse(next=triggers, timezone=request.timezone)
+
+
 @router.get("/{schedule_id}", response_model=ScheduleResponse)
 async def get_schedule(schedule_id: str):
     """Get a specific schedule by ID."""
@@ -326,6 +395,22 @@ async def update_schedule(schedule_id: str, request: UpdateScheduleRequest):
     request.bot = _require_known_bot(request.bot)
     store = get_scheduler_store()
     _validate_update_fields(schedule_id, request, store)
+    # Only when the patch actually touches one of the three action-input
+    # fields — an unrelated patch (e.g. `enabled`) to a pre-existing
+    # invalid entry must still succeed, matching `_validate_update_fields`'s
+    # own "only what's present is checked" rule above.
+    if request.action is not None or request.message_content is not None or request.endpoint_config is not None:
+        entry = store.get(schedule_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        resulting_action = request.action if request.action is not None else entry.action
+        resulting_message = request.message_content if request.message_content is not None else entry.message_content
+        resulting_endpoint_config = (
+            request.endpoint_config if request.endpoint_config is not None else entry.endpoint_config
+        )
+        normalized = _validate_action_inputs(resulting_action, resulting_message, resulting_endpoint_config)
+        if request.endpoint_config is not None:
+            request.endpoint_config = normalized
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
     entry = store.update(schedule_id, **updates)
     if not entry:

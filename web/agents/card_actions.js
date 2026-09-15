@@ -311,14 +311,54 @@ export async function cancelCard(card, onChanged) {
   } catch (err) { showToast(`Cancel failed: ${err.message}`, true); }
 }
 
+// Kill-then-delete core for one card: a task card with a live, killable
+// session (not a CLI-backed one, which the kill endpoint can't tear down)
+// kills that session and its subagents first and only deletes once the kill
+// succeeds; a CLI-backed live session is deleted without a kill attempt,
+// since the operator has to close that pane by hand. A scheduled card never
+// carries a session, so it always deletes straight through. Throws on
+// failure (kill or delete), with no side effects beyond the network calls
+// themselves — no toast, no DOM. Shared by the single-card confirmation
+// modal below and a bulk-delete fan-out, so both apply the exact same
+// kill-before-delete behavior without duplicating it.
+export async function deleteCard(card, { findCard } = {}) {
+  const fresh = (findCard ? findCard(card.id) : card) || card;
+  const isTask = card.kind === 'task';
+  const hasLiveSession = !!(fresh.session && !TERMINAL.has(fresh.session.status));
+  const isCliSession = !!(fresh.session && (fresh.session.source === 'claude_code' || fresh.session.source === 'codex'));
+  const needsKill = isTask && hasLiveSession && !isCliSession;
+  if (needsKill) {
+    const kr = await fetch(`/api/agents/sessions/${encodeURIComponent(fresh.session.session_id)}/kill`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),
+    });
+    if (!kr.ok) {
+      const text = await kr.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(`Kill failed: HTTP ${kr.status}: ${msg}`);
+    }
+    const killResult = await kr.json();
+    const failures = killResult.failures || [];
+    if (failures.length > 0) {
+      throw new Error(`Kill failed: ${failures.map(f => f.reason || f.session_id).join('; ')}`);
+    }
+  }
+  const deleteUrl = isTask
+    ? `/api/tasks/${encodeURIComponent(card.id)}`
+    : `/api/scheduler/${encodeURIComponent(card.id)}`;
+  const dr = await fetch(deleteUrl, { method: 'DELETE' });
+  if (!dr.ok) {
+    const text = await dr.text();
+    let msg = text;
+    try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+    throw new Error(msg || `HTTP ${dr.status}`);
+  }
+}
+
 // Delete confirmation — title, `.target` naming the card, cancel + danger
 // confirm that disables and relabels itself while the request is in flight
-// and re-enables on failure. A task card with a live, killable session (not
-// a CLI-backed one, which this endpoint can't tear down) kills that session
-// and its subagents first and only deletes once the kill succeeds; a
-// CLI-backed live session is deleted without a kill attempt, since the
-// operator has to close that pane by hand. A scheduled card never carries a
-// session, so it always deletes straight through.
+// and re-enables on failure. Wraps `deleteCard` above with the operator-
+// facing modal and its note text.
 export function openDeleteCardModal(card, {
   findCard,
   onDeleted,
@@ -400,32 +440,7 @@ export function openDeleteCardModal(card, {
     confirmBtn.textContent = 'Deleting…';
     try {
       if (onMutationConfirmed) onMutationConfirmed();
-      if (freshNeedsKill) {
-        const kr = await fetch(`/api/agents/sessions/${encodeURIComponent(fresh.session.session_id)}/kill`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: '' }),
-        });
-        if (!kr.ok) {
-          const text = await kr.text();
-          let msg = text;
-          try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
-          throw new Error(`Kill failed: HTTP ${kr.status}: ${msg}`);
-        }
-        const killResult = await kr.json();
-        const failures = killResult.failures || [];
-        if (failures.length > 0) {
-          throw new Error(`Kill failed: ${failures.map(f => f.reason || f.session_id).join('; ')}`);
-        }
-      }
-      const deleteUrl = isTask
-        ? `/api/tasks/${encodeURIComponent(card.id)}`
-        : `/api/scheduler/${encodeURIComponent(card.id)}`;
-      const dr = await fetch(deleteUrl, { method: 'DELETE' });
-      if (!dr.ok) {
-        const text = await dr.text();
-        let msg = text;
-        try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
-        throw new Error(msg || `HTTP ${dr.status}`);
-      }
+      await deleteCard(card, { findCard });
       pending = false;
       cleanup();
       showToast('Deleted.', false);

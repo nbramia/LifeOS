@@ -21,9 +21,11 @@ import {
 import { renderActionRow } from './session_actions.js';
 import { descendantsOf } from './graph_encoding.js';
 import {
-  acceptCard, cardActionHandlers, cancelCard, openDeleteCardModal, snoozeCard, undoAcceptedCard,
+  acceptCard, cardActionHandlers, cancelCard, deleteCard, openDeleteCardModal, snoozeCard,
+  undoAcceptedCard,
 } from './card_actions.js';
 import { renderAssignmentPickers } from './assignment.js';
+import { SCHEDULE_ACTIONS, renderScheduleActionSections, actionInputsSatisfied } from './schedule_sections.js';
 import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
 import { POINTER_SLOP, pointerIsActive, shouldCancelPointerGesture } from './board_gesture.js';
@@ -70,7 +72,7 @@ const LIFECYCLE_TAGS = new Set([
 // Card fields the drawer renders as editable inputs — used to decide
 // whether an SSE tick needs to rebuild the drawer at all (#850 finding 2).
 const DRAWER_EDITABLE_FIELDS = [
-  'title', 'notes', 'tags', 'context', 'assignee', 'lane',
+  'title', 'notes', 'tags', 'assignee', 'lane',
   // The model/effort/host pickers write here. Without it a frame whose only
   // change is a picker value is read as "nothing changed", so a drawer
   // showing a stale picker has no later frame that can converge it.
@@ -80,14 +82,10 @@ const DRAWER_EDITABLE_FIELDS = [
   // Full schedule editing — trigger type, timing, timezone, action,
   // executor, and delivery bot — all through PUT /api/scheduler/{id}.
   'schedule_type', 'schedule_value', 'timezone', 'action', 'executor', 'bot',
+  // Per-action inputs — an endpoint action's call config and an
+  // agent action's execution context, all through the same PUT.
+  'endpoint_config', 'persona_id', 'model_id', 'effort', 'host', 'working_dir',
 ];
-
-// Action a schedule fires when it's due. Mirrors VALID_ACTIONS in
-// api/services/scheduler_store.py.
-const SCHEDULE_ACTIONS = ['notify', 'prompt', 'endpoint', 'agent'];
-// Executor tags a schedule's `agent` action hands off to the agent worker
-// with. Mirrors the executor values accepted by api/routes/scheduler.py.
-const SCHEDULE_EXECUTORS = ['local', 'cloud', 'cloud-haiku', 'cloud-sonnet'];
 
 // Lane filter — multi-select checkbox dropdown. Hidden lanes are
 // removed from the grid entirely (not just emptied), so the remaining
@@ -102,8 +100,12 @@ const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done' && l.id !== '
 // "+" button for any of the three, all three are excluded from the
 // new-card composer's lane select, and `canDropCard`/`onCardDropped`
 // (below) refuse a drop targeting one before it ever reaches the server.
-// Snoozing only ever happens through the drawer's Snooze picker.
+// Scheduled gets its own "+" below (SCHEDULED_LANE_ID) that opens the
+// schedule composer instead; Review still has none, since a card only
+// reaches Review through the worker's own tags; snoozing only ever happens
+// through the drawer's Snooze picker.
 const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled' && l.id !== 'snoozed').map(l => l.id));
+const SCHEDULED_LANE_ID = 'scheduled';
 
 function loadSortSelection() {
   return readSortSelection(localStorage, SORT_STORAGE_KEY, SORT_OPTIONS, DEFAULT_SORT);
@@ -141,6 +143,16 @@ export function initBoard() {
   const dropStatusEl = document.getElementById('board-drop-status');
   const drawerBackdrop = document.getElementById('board-drawer-backdrop');
   const drawerEl = document.getElementById('board-drawer');
+  const dropTrayEl = document.getElementById('board-drop-tray');
+  const bulkBarEl = document.getElementById('board-bulk-bar');
+  const bulkCountEl = document.getElementById('board-bulk-count');
+  const bulkTagBtn = document.getElementById('board-bulk-tag');
+  const bulkTagPopover = document.getElementById('board-bulk-tag-popover');
+  const bulkAssignBtn = document.getElementById('board-bulk-assign');
+  const bulkAssignPopover = document.getElementById('board-bulk-assign-popover');
+  const bulkDoneBtn = document.getElementById('board-bulk-done');
+  const bulkDeleteBtn = document.getElementById('board-bulk-delete');
+  const bulkClearBtn = document.getElementById('board-bulk-clear');
 
   let board = { lanes: Object.fromEntries(LANES.map(l => [l.id, []])) };
   let visibleLanes = new Set(getFilters().lanes);
@@ -227,6 +239,104 @@ export function initBoard() {
   let revealedCardId = null;
   let revealHighlightTimer = null;
 
+  // Multi-select — a Set of task-card ids, not a DOM class: `render()`
+  // rebuilds every card node (an SSE tick, a filter change, a lane toggle),
+  // so the selection has to be re-applied at render time the same way
+  // `revealedCardId` is, rather than living on a node that gets discarded.
+  // Only task cards are ever added — scheduled cards are never selectable.
+  let selectedCardIds = new Set();
+
+  function clearSelection() {
+    if (selectedCardIds.size === 0) return;
+    selectedCardIds.clear();
+    closeBulkPopovers();
+    render();
+  }
+
+  function toggleCardSelection(cardId) {
+    if (selectedCardIds.has(cardId)) selectedCardIds.delete(cardId);
+    else selectedCardIds.add(cardId);
+    render();
+  }
+
+  // Drops any selected id absent from the board — called from
+  // `applyBoard` before `render()` so a card that vanished on a live update
+  // (deleted elsewhere, or moved out from under a stale selection) drops out
+  // of the count rather than being fanned out over on the next bulk action.
+  function pruneSelection() {
+    if (selectedCardIds.size === 0) return;
+    const present = new Set(allCards().map(c => c.id));
+    for (const id of [...selectedCardIds]) {
+      if (!present.has(id)) selectedCardIds.delete(id);
+    }
+  }
+
+  function selectedTaskCards() {
+    return allCards().filter(c => c.kind === 'task' && selectedCardIds.has(c.id));
+  }
+
+  function closeBulkPopovers() {
+    if (bulkTagPopover) bulkTagPopover.hidden = true;
+    if (bulkAssignPopover) bulkAssignPopover.hidden = true;
+  }
+
+  // Renders the bottom bulk-action bar and swaps it in for the assignee
+  // tray while at least one card is selected — the tray comes back exactly
+  // when the selection empties. Called from `render()` so the count and
+  // visibility always match `selectedCardIds` after any rebuild.
+  function renderBulkBar() {
+    if (!bulkBarEl) return;
+    const n = selectedCardIds.size;
+    const active = n > 0;
+    bulkBarEl.hidden = !active;
+    if (dropTrayEl) dropTrayEl.hidden = active;
+    if (!active) {
+      closeBulkPopovers();
+      return;
+    }
+    if (bulkCountEl) bulkCountEl.textContent = `${n} selected`;
+  }
+
+  // Summarizes a fan-out's per-card outcomes into the one toast a bulk
+  // action shows — never one toast per card. `results` is
+  // `[{card, ok, reason}]`; a refused/failed card's `reason` is the
+  // server's own `detail` (or a transport error message), never
+  // re-derived client-side.
+  function reportBulkOutcome(verb, results) {
+    const succeeded = results.filter(r => r.ok);
+    const failed = results.filter(r => !r.ok);
+    if (failed.length === 0) {
+      showToast(`${verb} ${succeeded.length} of ${results.length}.`, false);
+      return;
+    }
+    const refusals = failed.map(r => `${r.card.title || r.card.id}: ${r.reason}`).join('; ');
+    showToast(`${verb} ${succeeded.length} of ${results.length} — refused: ${refusals}`, true);
+  }
+
+  // Runs `action(card)` for every card in `cards`, at most `limit` in
+  // flight at once, and resolves with one `{card, ok, reason}` per card —
+  // a rejected `action` is caught here so one card's refusal never stops
+  // the rest of the batch from running.
+  async function fanOut(cards, action, limit = 4) {
+    const results = new Array(cards.length);
+    let next = 0;
+    async function worker() {
+      while (next < cards.length) {
+        const index = next++;
+        const card = cards[index];
+        try {
+          await action(card);
+          results[index] = { card, ok: true };
+        } catch (err) {
+          results[index] = { card, ok: false, reason: (err && err.message) || String(err) };
+        }
+      }
+    }
+    const workers = Array.from({ length: Math.min(limit, cards.length) }, worker);
+    await Promise.all(workers);
+    return results;
+  }
+
   // ------------------------------------------------------------------
   // Data load + live updates
   // ------------------------------------------------------------------
@@ -247,6 +357,7 @@ export function initBoard() {
     board = next;
     boardLoaded = true;
     updateFilterOptions();
+    pruneSelection();
     render();
     if (openCardId) {
       const fresh = findCard(openCardId);
@@ -723,6 +834,7 @@ export function initBoard() {
     // is what keeps the highlight surviving that rebuild rather than a
     // one-time class added to a node that gets discarded.
     if (card.id === revealedCardId) div.classList.add('reveal-highlight');
+    if (selectedCardIds.has(card.id)) div.classList.add('board-card-selected');
     const showAccept = card.lane === 'review';
     div.innerHTML = `
       <div class="board-card-title">${live ? '<span class="live-dot" title="live"></span>' : ''}${escapeHtml(card.title || '(untitled)')}</div>
@@ -730,13 +842,25 @@ export function initBoard() {
       <div class="board-card-chips">${cardChips(card)}</div>
       ${showAccept ? '<button type="button" class="board-card-accept">Accept</button>' : ''}
     `;
-    div.addEventListener('click', () => {
+    div.addEventListener('click', (e) => {
       if (consumeClickSuppression('card', card.id)) return;
+      // A modifier click toggles this card into/out of the selection
+      // instead of opening the drawer, and never touches the tray/filter
+      // state — a plain click is the only thing that clears a selection or
+      // opens the drawer.
+      if (e.metaKey || e.ctrlKey) {
+        toggleCardSelection(card.id);
+        return;
+      }
+      clearSelection();
       openDrawer(card.id);
     });
     div.addEventListener('keydown', e => {
       if (e.target !== div || (e.key !== 'Enter' && e.key !== ' ')) return;
       e.preventDefault();
+      // Mirrors the plain-click branch above: activating a card always
+      // clears any selection before opening its drawer, keyboard or mouse.
+      clearSelection();
       openDrawer(card.id);
     });
     const sessionChip = div.querySelector('.board-chip-session');
@@ -765,6 +889,26 @@ export function initBoard() {
     return div;
   }
 
+  // The action chip summarizes what firing this schedule actually does —
+  // an endpoint's method and path (path truncated at 40 characters with
+  // the full path kept as the chip's title, so a long route is still
+  // fully available on hover) or an agent action's executor (falling back
+  // to "default" for the empty-executor "agent worker's own default
+  // route" case, matching the drawer's own Executor select label).
+  function scheduleActionChipText(card) {
+    if (card.action === 'endpoint') {
+      const cfg = card.endpoint_config || {};
+      const method = String(cfg.method || 'GET').toUpperCase();
+      const path = cfg.endpoint || '';
+      const truncated = path.length > 40 ? `${path.slice(0, 40)}…` : path;
+      return { text: `endpoint: ${method} ${truncated}`, title: path };
+    }
+    if (card.action === 'agent') {
+      return { text: `agent: ${card.executor || 'default'}`, title: '' };
+    }
+    return { text: card.action || 'notify', title: '' };
+  }
+
   function renderScheduleCard(card) {
     const div = document.createElement('div');
     div.className = 'board-card board-card-schedule';
@@ -772,9 +916,11 @@ export function initBoard() {
     div.dataset.lane = card.lane;
     if (card.id === revealedCardId) div.classList.add('reveal-highlight');
     const nextFire = card.next_fire_at ? new Date(card.next_fire_at).toLocaleString() : '—';
+    const actionChip = scheduleActionChipText(card);
     div.innerHTML = `
       <div class="board-card-title">${escapeHtml(card.name || '(schedule)')}</div>
       <div class="board-card-chips">
+        <span class="board-chip" title="${escapeHtml(actionChip.title)}">${escapeHtml(actionChip.text)}</span>
         ${card.recurring ? '<span class="board-chip">recurring</span>' : '<span class="board-chip">one-off</span>'}
         <span class="board-chip">next: ${escapeHtml(nextFire)}</span>
       </div>
@@ -795,6 +941,7 @@ export function initBoard() {
       hint.className = 'board-lanes-empty-hint';
       hint.textContent = 'No lanes selected — use the Lanes filter above to show columns.';
       lanesEl.appendChild(hint);
+      renderBulkBar();
       return;
     }
     for (const lane of LANES) {
@@ -813,9 +960,15 @@ export function initBoard() {
       column.innerHTML = `
         <div class="board-lane-header" style="border-top-color:${laneColor(lane.id)}">${escapeHtml(lane.label)} <span class="board-lane-count">${cards.length}</span></div>
         ${DIRECT_LANE_IDS.has(lane.id) ? `<button type="button" class="board-lane-add" data-lane="${lane.id}" title="New card in ${escapeHtml(lane.label)}">+</button>` : ''}
+        ${lane.id === SCHEDULED_LANE_ID ? `<button type="button" class="board-lane-add" data-lane="${lane.id}" title="New schedule">+</button>` : ''}
       `;
       const addBtn = column.querySelector('.board-lane-add');
-      if (addBtn) addBtn.addEventListener('click', () => openNewCardForm(lane.id));
+      if (addBtn) {
+        addBtn.addEventListener('click', () => {
+          if (lane.id === SCHEDULED_LANE_ID) openNewScheduleForm();
+          else openNewCardForm(lane.id);
+        });
+      }
       const cardsEl = document.createElement('div');
       cardsEl.className = 'board-lane-cards';
       for (const card of cards) {
@@ -824,6 +977,7 @@ export function initBoard() {
       column.appendChild(cardsEl);
       lanesEl.appendChild(column);
     }
+    renderBulkBar();
   }
 
   // Makes card `cardId` visible and scrolls it into view — the graph tab's
@@ -832,10 +986,10 @@ export function initBoard() {
   // below) all land here. Relaxes EVERY shared filter that currently hides
   // the card (lanes, assignee, host, engine, tag, search, recency) through
   // one batched `setFilters` call, then confirms the card actually rendered
-  // before scrolling/highlighting — a board-local filter (context, include
-  // cancelled) is left as-is, the operator set those on purpose and they
-  // have no shared counterpart to relax. An unknown id is reported rather
-  // than left to fail silently.
+  // before scrolling/highlighting — the board-local "include cancelled"
+  // filter is left as-is, the operator set it on purpose and it has no
+  // shared counterpart to relax. An unknown id is reported rather than
+  // left to fail silently.
   function revealCard(cardId, opts) {
     const openDrawerFlag = !!(opts && opts.openDrawer);
     const card = findCard(cardId);
@@ -988,6 +1142,10 @@ export function initBoard() {
 
   function onPointerDown(e, source) {
     if (e.isPrimary === false || dragState || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    // A modifier-held press on a card is a selection click, never a drag —
+    // bail before any drag state is set so the trailing click reaches the
+    // card's own listener untouched.
+    if (source.kind === 'card' && (e.metaKey || e.ctrlKey)) return;
     if (e.target.closest('button, input, select, textarea, a') && source.kind === 'card') return;
     // A session chip has its own click navigation. Do not let the card's
     // drag handler capture that pointer on the card, or the browser retargets
@@ -1452,6 +1610,372 @@ export function initBoard() {
   if (newCardBtn) newCardBtn.addEventListener('click', () => openNewCardForm());
 
   // ------------------------------------------------------------------
+  // New-schedule composer
+  // ------------------------------------------------------------------
+
+  const TRIGGER_MODES = [
+    { id: 'once', label: 'One-time' },
+    { id: 'daily', label: 'Daily' },
+    { id: 'weekdays', label: 'Weekdays' },
+    { id: 'custom', label: 'Custom days' },
+    { id: 'cron', label: 'Cron' },
+  ];
+  // Sunday-first (index 0 = Sun), matching cron's own day-of-week field.
+  const DOW_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const GENERATED_TRIGGER_MODES = new Set(['daily', 'weekdays', 'custom']);
+
+  // Parses a <input type="time"> value ("HH:MM") into cron's minute/hour
+  // fields — `parseInt` drops any leading zero, matching cron convention
+  // (e.g. "09:05" -> minute 5, hour 9).
+  function parseTriggerTime(time) {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(time || '');
+    if (!m) return null;
+    return { hour: parseInt(m[1], 10), minute: parseInt(m[2], 10) };
+  }
+
+  // Builds the cron expression a generated mode (daily/weekdays/custom)
+  // currently represents, or `null` while its own fields are incomplete
+  // (no time yet, or — for custom — no day checked). `once` and `cron`
+  // aren't cron generators and always return `null` here.
+  function buildGeneratedCron(mode, state) {
+    const parts = parseTriggerTime(state.time);
+    if (!parts) return null;
+    if (mode === 'daily') return `${parts.minute} ${parts.hour} * * *`;
+    if (mode === 'weekdays') return `${parts.minute} ${parts.hour} * * 1-5`;
+    if (mode === 'custom') {
+      if (state.days.size === 0) return null;
+      const days = [...state.days].sort((a, b) => a - b).join(',');
+      return `${parts.minute} ${parts.hour} * * ${days}`;
+    }
+    return null;
+  }
+
+  function triggerFieldsHtml(state) {
+    if (state.mode === 'once') {
+      return `
+        <label class="drawer-label">When</label>
+        <input type="datetime-local" class="drawer-input" data-field="trigger-once" value="${escapeHtml(state.onceValue)}" />
+      `;
+    }
+    if (state.mode === 'cron') {
+      return `
+        <label class="drawer-label">Cron expression</label>
+        <input class="drawer-input" data-field="trigger-cron" value="${escapeHtml(state.cronText)}" placeholder="0 9 * * *" />
+      `;
+    }
+    // daily / weekdays / custom all pick a time; custom also picks days.
+    const daysHtml = state.mode === 'custom' ? `
+        <div class="drawer-daypicker" data-field="trigger-days">
+          ${DOW_LABELS.map((label, i) => `
+            <label class="drawer-daycheck"><input type="checkbox" data-field="trigger-day" value="${i}" ${state.days.has(i) ? 'checked' : ''} /> ${label}</label>
+          `).join('')}
+        </div>
+    ` : '';
+    return `
+      ${daysHtml}
+      <label class="drawer-label">Time</label>
+      <input type="time" class="drawer-input" data-field="trigger-time" value="${escapeHtml(state.time)}" />
+    `;
+  }
+
+  // Reads the trigger builder's current state into `{schedule_type,
+  // schedule_value}`, or `null` while it's incomplete — the same shape
+  // `POST /api/scheduler` and `POST /api/scheduler/preview` both take.
+  function readTrigger(state) {
+    if (state.mode === 'once') {
+      return state.onceValue ? { schedule_type: 'once', schedule_value: state.onceValue } : null;
+    }
+    if (state.mode === 'cron') {
+      const text = (state.cronText || '').trim();
+      return text ? { schedule_type: 'cron', schedule_value: text } : null;
+    }
+    const cron = buildGeneratedCron(state.mode, state);
+    return cron ? { schedule_type: 'cron', schedule_value: cron } : null;
+  }
+
+  // Formats a preview ISO datetime in `tz` — the schedule's own timezone,
+  // never the browser's, so the preview matches what the trigger actually
+  // means. Falls back to the browser's own locale formatting for a
+  // datetime whose `tz` didn't resolve (shouldn't happen: the server
+  // already 422s an unresolvable timezone before returning any preview).
+  function formatPreviewTime(iso, tz) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    try {
+      return d.toLocaleString('en-US', { timeZone: tz || undefined, dateStyle: 'medium', timeStyle: 'short' });
+    } catch (_) {
+      return d.toLocaleString();
+    }
+  }
+
+  function openNewScheduleForm() {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-labelledby="new-schedule-title">
+        <h2 id="new-schedule-title">New schedule</h2>
+        <label class="drawer-label">Name</label>
+        <input class="drawer-input" data-field="name" type="text" />
+        <label class="drawer-label"><input type="checkbox" data-field="enabled" checked /> Enabled</label>
+        <label class="drawer-label">Timezone</label>
+        <input class="drawer-input" data-field="timezone" type="text" placeholder="Configured default" />
+        <div class="drawer-field-error" data-field="timezone-error" hidden></div>
+        <label class="drawer-label">Trigger</label>
+        <select class="drawer-select" data-field="trigger-mode">
+          ${TRIGGER_MODES.map(m => `<option value="${m.id}" ${m.id === 'daily' ? 'selected' : ''}>${m.label}</option>`).join('')}
+        </select>
+        <div data-field="trigger-fields"></div>
+        <div class="drawer-field-error" data-field="trigger-error" hidden></div>
+        <div data-field="preview-list"></div>
+        <div class="drawer-field-error" data-field="preview-error" hidden></div>
+        <label class="drawer-label">Action</label>
+        <select class="drawer-select" data-field="action">
+          ${SCHEDULE_ACTIONS.map(a => `<option value="${a}" ${a === 'notify' ? 'selected' : ''}>${a}</option>`).join('')}
+        </select>
+        <div class="drawer-section" data-field="action-sections"></div>
+        <div class="drawer-field-error" data-field="action-error" hidden></div>
+        <div class="drawer-field-error" data-field="general-error" hidden></div>
+        <div class="actions">
+          <button id="new-schedule-cancel">Cancel</button>
+          <button class="danger" id="new-schedule-create" disabled>Create</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(backdrop);
+    const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
+    backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
+    backdrop.querySelector('#new-schedule-cancel').onclick = cleanup;
+
+    const nameEl = backdrop.querySelector('[data-field="name"]');
+    const enabledEl = backdrop.querySelector('[data-field="enabled"]');
+    const tzEl = backdrop.querySelector('[data-field="timezone"]');
+    const tzErrorEl = backdrop.querySelector('[data-field="timezone-error"]');
+    const modeEl = backdrop.querySelector('[data-field="trigger-mode"]');
+    const triggerFieldsEl = backdrop.querySelector('[data-field="trigger-fields"]');
+    const triggerErrorEl = backdrop.querySelector('[data-field="trigger-error"]');
+    const previewListEl = backdrop.querySelector('[data-field="preview-list"]');
+    const previewErrorEl = backdrop.querySelector('[data-field="preview-error"]');
+    const actionEl = backdrop.querySelector('[data-field="action"]');
+    const actionSectionsEl = backdrop.querySelector('[data-field="action-sections"]');
+    const actionErrorEl = backdrop.querySelector('[data-field="action-error"]');
+    const generalErrorEl = backdrop.querySelector('[data-field="general-error"]');
+    const createBtn = backdrop.querySelector('#new-schedule-create');
+
+    const sectionValues = {
+      message_content: '', endpoint_config: null, executor: '', bot: '',
+      persona_id: '', model_id: '', effort: '', host: '', working_dir: '',
+    };
+    const sections = renderScheduleActionSections(actionSectionsEl, actionEl.value, sectionValues);
+
+    const triggerState = { mode: 'daily', onceValue: '', time: '09:00', days: new Set(), cronText: '' };
+
+    function clearFieldErrors() {
+      triggerErrorEl.hidden = true; triggerErrorEl.textContent = '';
+      tzErrorEl.hidden = true; tzErrorEl.textContent = '';
+      actionErrorEl.hidden = true; actionErrorEl.textContent = '';
+      generalErrorEl.hidden = true; generalErrorEl.textContent = '';
+      sections.clearParamsError();
+    }
+
+    function updateCreateEnabled() {
+      createBtn.disabled = !(nameEl.value.trim() && readTrigger(triggerState));
+    }
+
+    function wireTriggerFields() {
+      const onceEl = triggerFieldsEl.querySelector('[data-field="trigger-once"]');
+      if (onceEl) onceEl.addEventListener('input', () => {
+        triggerState.onceValue = onceEl.value;
+        triggerErrorEl.hidden = true;
+        updateCreateEnabled();
+        schedulePreview();
+      });
+      const cronEl = triggerFieldsEl.querySelector('[data-field="trigger-cron"]');
+      if (cronEl) cronEl.addEventListener('input', () => {
+        triggerState.cronText = cronEl.value;
+        triggerErrorEl.hidden = true;
+        updateCreateEnabled();
+        schedulePreview();
+      });
+      const timeEl = triggerFieldsEl.querySelector('[data-field="trigger-time"]');
+      if (timeEl) timeEl.addEventListener('input', () => {
+        triggerState.time = timeEl.value;
+        triggerErrorEl.hidden = true;
+        updateCreateEnabled();
+        schedulePreview();
+      });
+      for (const dayEl of triggerFieldsEl.querySelectorAll('[data-field="trigger-day"]')) {
+        dayEl.addEventListener('change', () => {
+          const value = Number(dayEl.value);
+          if (dayEl.checked) triggerState.days.add(value); else triggerState.days.delete(value);
+          triggerErrorEl.hidden = true;
+          updateCreateEnabled();
+          schedulePreview();
+        });
+      }
+    }
+
+    function renderTriggerFields() {
+      triggerFieldsEl.innerHTML = triggerFieldsHtml(triggerState);
+      wireTriggerFields();
+    }
+
+    let previewTimer = null;
+    let previewSeq = 0;
+    function schedulePreview() {
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(runPreview, 300);
+    }
+    async function runPreview() {
+      const trig = readTrigger(triggerState);
+      if (!trig) {
+        ++previewSeq; // discard any in-flight response from before the trigger was cleared
+        previewListEl.innerHTML = '';
+        previewErrorEl.hidden = true;
+        previewErrorEl.textContent = '';
+        return;
+      }
+      const tz = tzEl.value.trim();
+      const seq = ++previewSeq;
+      try {
+        const r = await fetch('/api/scheduler/preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...trig, timezone: tz || undefined }),
+        });
+        if (!r.ok) {
+          const text = await r.text();
+          let msg = text;
+          try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+          throw new Error(msg || `HTTP ${r.status}`);
+        }
+        const data = await r.json();
+        if (seq !== previewSeq) return; // superseded by a later change
+        previewErrorEl.hidden = true;
+        previewErrorEl.textContent = '';
+        const times = data.next || [];
+        const resolvedTz = data.timezone || tz;
+        previewListEl.innerHTML = times.length
+          ? times.map(t => `<div class="drawer-schedule-info">${escapeHtml(formatPreviewTime(t, resolvedTz))}</div>`).join('')
+          : '<div class="drawer-schedule-info">No upcoming fires.</div>';
+      } catch (err) {
+        if (seq !== previewSeq) return;
+        previewListEl.innerHTML = '';
+        previewErrorEl.textContent = err.message;
+        previewErrorEl.hidden = false;
+      }
+    }
+
+    // Maps the single `detail` string a rejected create returns to the
+    // field it actually names — mirroring the wording
+    // `api/routes/scheduler.py` and `api/services/scheduler_validation.py`
+    // produce — rather than showing every rejection as one generic error.
+    function applyCreateError(detail) {
+      const message = detail || 'Something went wrong.';
+      if (/^Invalid cron expression|^Invalid ISO datetime/.test(message)) {
+        triggerErrorEl.textContent = message;
+        triggerErrorEl.hidden = false;
+        return;
+      }
+      if (/^Unknown timezone/.test(message)) {
+        tzErrorEl.textContent = message;
+        tzErrorEl.hidden = false;
+        return;
+      }
+      if (message.startsWith('endpoint_config.')) {
+        sections.showParamsError(message);
+        return;
+      }
+      if (/^Unknown Telegram bot/.test(message) || message === 'message_content must not be blank') {
+        actionErrorEl.textContent = message;
+        actionErrorEl.hidden = false;
+        return;
+      }
+      generalErrorEl.textContent = message;
+      generalErrorEl.hidden = false;
+    }
+
+    modeEl.addEventListener('change', () => {
+      const newMode = modeEl.value;
+      if (newMode === 'cron' && GENERATED_TRIGGER_MODES.has(triggerState.mode)) {
+        const generated = buildGeneratedCron(triggerState.mode, triggerState);
+        if (generated) triggerState.cronText = generated;
+      }
+      triggerState.mode = newMode;
+      renderTriggerFields();
+      triggerErrorEl.hidden = true;
+      updateCreateEnabled();
+      schedulePreview();
+    });
+    nameEl.addEventListener('input', updateCreateEnabled);
+    tzEl.addEventListener('input', () => {
+      tzErrorEl.hidden = true;
+      schedulePreview();
+    });
+    actionEl.addEventListener('change', () => {
+      // Carries forward whatever the outgoing section's own fields
+      // currently hold, so switching action and back doesn't discard
+      // input the operator already typed (invalid endpoint params JSON
+      // -- `getValues()` returning `null` -- leaves `sectionValues`
+      // untouched rather than losing the section's other fields too).
+      const current = sections.getValues();
+      if (current) Object.assign(sectionValues, current);
+      sections.setAction(actionEl.value);
+      clearFieldErrors();
+    });
+
+    createBtn.addEventListener('click', async () => {
+      const name = nameEl.value.trim();
+      const trig = readTrigger(triggerState);
+      if (!name || !trig) return; // Create stays disabled until both hold
+      const sectionsValues = sections.getValues();
+      if (sectionsValues === null) return; // invalid endpoint params JSON — sections already showed its own error
+
+      clearFieldErrors();
+      const tz = tzEl.value.trim();
+      const body = {
+        name,
+        schedule_type: trig.schedule_type,
+        schedule_value: trig.schedule_value,
+        action: actionEl.value,
+        enabled: enabledEl.checked,
+        ...sectionsValues,
+      };
+      if (tz) body.timezone = tz;
+
+      createBtn.disabled = true;
+      createBtn.textContent = 'Creating…';
+      try {
+        const r = await fetch('/api/scheduler', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          const text = await r.text();
+          let detail = text;
+          try { const j = JSON.parse(text); detail = j.detail || detail; } catch (_) {}
+          applyCreateError(detail);
+          createBtn.disabled = false;
+          createBtn.textContent = 'Create';
+          return;
+        }
+        const created = await r.json().catch(() => null);
+        cleanup();
+        await fetchBoard();
+        if (created && created.id) revealCard(created.id, { openDrawer: false });
+      } catch (err) {
+        applyCreateError(err.message);
+        createBtn.disabled = false;
+        createBtn.textContent = 'Create';
+      }
+    });
+
+    renderTriggerFields();
+    updateCreateEnabled();
+    schedulePreview();
+  }
+
+  // ------------------------------------------------------------------
   // Drawer
   // ------------------------------------------------------------------
 
@@ -1528,13 +2052,19 @@ export function initBoard() {
 
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
-    if (!openCardId) return;
-    if (drawerBackdrop && drawerBackdrop.hidden) return;
-    // A modal (new-card composer, answer prompt) renders on top of the
-    // drawer (.modal-backdrop z-index 100 > .board-drawer-backdrop's 90) —
-    // let it own Escape instead of closing the drawer underneath it.
+    // A modal (new-card composer, answer prompt, bulk delete confirm)
+    // renders on top of both the drawer (.modal-backdrop z-index 100 >
+    // .board-drawer-backdrop's 90) and the selection — let it own Escape
+    // instead of closing/clearing what's underneath it.
     if (document.querySelector('.modal-backdrop')) return;
-    closeDrawer();
+    if (openCardId && !(drawerBackdrop && drawerBackdrop.hidden)) {
+      closeDrawer();
+      return;
+    }
+    // Escape's existing drawer precedence takes priority; only once there's
+    // no drawer to close does it fall through to clearing a selection
+
+    clearSelection();
   });
 
   async function putTask(taskId, patch) {
@@ -1582,21 +2112,6 @@ export function initBoard() {
     return r.json();
   }
 
-  // Bot-registry cache backing the schedule drawer's Bot select — mirrors
-  // assignment.js's loadHostCatalog in NOT caching a failure (so the next
-  // drawer open retries), but without its reachability TTL/cooldown: the
-  // bot registry doesn't drift minute to minute the way host online/offline
-  // status does, so a plain once-per-page-load cache on success is enough.
-  let _botsCatalogPromise = null;
-  function loadBotCatalog(fetchImpl = fetch) {
-    if (_botsCatalogPromise) return _botsCatalogPromise;
-    const promise = fetchImpl('/api/scheduler/bots')
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .catch(() => { _botsCatalogPromise = null; return null; });
-    _botsCatalogPromise = promise;
-    return promise;
-  }
-
   function formatNextFire(iso) {
     if (!iso) return 'Not scheduled to fire again.';
     const d = new Date(iso);
@@ -1612,12 +2127,9 @@ export function initBoard() {
     return `Last run: ${at} — ${outcome}${snippet}`;
   }
 
-  // Notes autosize — height tracks content up to 2/3 of the
-  // viewport height, after which `.drawer-notes-autosize`'s
-  // `overflow-y: auto` (web/agents.html) takes over scrolling. Scoped to
-  // the task notes textarea only — the schedule drawer's message-content
-  // textarea keeps its plain fixed/manual-resize box.
-  function autosizeNotesTextarea(el) {
+  // Shared autosize core: grows `el` to fit its content, up to `maxHeight`
+  // (in px) when given, or without limit when omitted/null.
+  function autosizeTextarea(el, maxHeight) {
     if (!el) return;
     el.style.height = 'auto';
     // `* { box-sizing: border-box }` (web/agents.html) means the assigned
@@ -1629,8 +2141,23 @@ export function initBoard() {
     // minimum — clipping and forcing an early internal scroll.
     const cs = getComputedStyle(el);
     const borderY = parseFloat(cs.borderTopWidth || '0') + parseFloat(cs.borderBottomWidth || '0');
-    const maxHeight = window.innerHeight * (2 / 3);
-    el.style.height = Math.min(el.scrollHeight + borderY, maxHeight) + 'px';
+    const target = el.scrollHeight + borderY;
+    el.style.height = (maxHeight == null ? target : Math.min(target, maxHeight)) + 'px';
+  }
+
+  // Notes autosize — height tracks content up to 2/3 of the
+  // viewport height, after which `.drawer-notes-autosize`'s
+  // `overflow-y: auto` (web/agents.html) takes over scrolling. Scoped to
+  // the task notes textarea only — the schedule drawer's message-content
+  // textarea keeps its plain fixed/manual-resize box.
+  function autosizeNotesTextarea(el) {
+    autosizeTextarea(el, window.innerHeight * (2 / 3));
+  }
+
+  // Title autosize — grows with no cap; a title is short enough that it
+  // never needs the notes field's internal-scroll ceiling.
+  function autosizeTitleTextarea(el) {
+    autosizeTextarea(el, null);
   }
 
   const TAG_TOKEN = /^[\w-]+$/;
@@ -2004,26 +2531,20 @@ export function initBoard() {
     drawerEl.innerHTML = `
       <div class="drawer-header">
         <button class="panel-close" data-action="drawer-close">×</button>
-        <input class="drawer-title" data-field="title" value="${escapeHtml(titleValue)}" />
+        <textarea class="drawer-title" data-field="title" rows="1">${escapeHtml(titleValue)}</textarea>
       </div>
       ${isTask ? `
       <div class="drawer-section drawer-meta" data-field="meta">${cardMetaHtml(card)}</div>
       <div class="drawer-section">
       <label class="drawer-label">Notes</label>
       <textarea class="drawer-notes drawer-notes-autosize" data-field="notes" placeholder="Notes…">${escapeHtml(card.notes || '')}</textarea>
-      <div class="drawer-row">
-        <div>
-          <label class="drawer-label">Assignee</label>
-          <select class="drawer-assignee" data-field="assignee" ${assigneeDisabled ? 'disabled' : ''}>
-            <option value="">unassigned</option>
-            ${ASSIGNEES.map(a => `<option value="${a}" ${card.assignee === a ? 'selected' : ''}>${a}</option>`).join('')}
-          </select>
-          ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="assignee-reason">${escapeHtml(assigneePolicy.reason || "This card's assignee can't be changed right now.")}</div>` : ''}
-        </div>
-        <div>
-          <label class="drawer-label">Context</label>
-          <input class="drawer-context" data-field="context" value="${escapeHtml(card.context || '')}" />
-        </div>
+      <div>
+        <label class="drawer-label">Assignee</label>
+        <select class="drawer-assignee" data-field="assignee" ${assigneeDisabled ? 'disabled' : ''}>
+          <option value="">unassigned</option>
+          ${ASSIGNEES.map(a => `<option value="${a}" ${card.assignee === a ? 'selected' : ''}>${a}</option>`).join('')}
+        </select>
+        ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="assignee-reason">${escapeHtml(assigneePolicy.reason || "This card's assignee can't be changed right now.")}</div>` : ''}
       </div>
       <label class="drawer-label" id="drawer-tags-label-${escapeHtml(card.id)}">Tags</label>
       <div class="drawer-tags-picker" data-field="tags-picker" role="group" aria-labelledby="drawer-tags-label-${escapeHtml(card.id)}">
@@ -2041,8 +2562,6 @@ export function initBoard() {
       </div>
       <div class="drawer-section"><div class="drawer-session" data-field="session-panel"></div></div>
       ` : `
-      <label class="drawer-label">Message</label>
-      <textarea class="drawer-notes" data-field="message-content" placeholder="Message…">${escapeHtml(card.message_content || '')}</textarea>
       <label class="drawer-label"><input type="checkbox" data-field="enabled" ${card.enabled ? 'checked' : ''} /> Enabled</label>
       <div class="drawer-row">
         <div>
@@ -2061,28 +2580,12 @@ export function initBoard() {
       <label class="drawer-label">Timezone</label>
       <input class="drawer-timezone" data-field="timezone" value="${escapeHtml(card.timezone || '')}" placeholder="e.g. America/New_York" />
       <div class="drawer-field-error" data-field="timezone-error" hidden></div>
-      <div class="drawer-row">
-        <div>
-          <label class="drawer-label">Action</label>
-          <select class="drawer-select" data-field="action">
-            ${SCHEDULE_ACTIONS.map(a => `<option value="${a}" ${card.action === a ? 'selected' : ''}>${a}</option>`).join('')}
-          </select>
-        </div>
-        <div>
-          <div data-row="executor" ${card.action === 'agent' ? '' : 'hidden'}>
-            <label class="drawer-label">Executor</label>
-            <select class="drawer-select" data-field="executor">
-              <option value="" ${!card.executor ? 'selected' : ''}>default route</option>
-              ${SCHEDULE_EXECUTORS.map(e => `<option value="${e}" ${card.executor === e ? 'selected' : ''}>${e}</option>`).join('')}
-            </select>
-          </div>
-          <div data-row="bot" ${card.action === 'agent' ? 'hidden' : ''}>
-            <label class="drawer-label">Bot</label>
-            <select class="drawer-select" data-field="bot" disabled></select>
-            <div class="drawer-field-reason" data-field="bot-reason" hidden></div>
-          </div>
-        </div>
-      </div>
+      <label class="drawer-label">Action</label>
+      <select class="drawer-select" data-field="action">
+        ${SCHEDULE_ACTIONS.map(a => `<option value="${a}" ${card.action === a ? 'selected' : ''}>${a}</option>`).join('')}
+      </select>
+      <div class="drawer-field-error" data-field="action-error" hidden></div>
+      <div class="drawer-section" data-field="action-sections"></div>
       <div class="drawer-schedule-info" data-field="next-fire-preview"></div>
       <div class="drawer-schedule-info" data-field="last-run-info"></div>
       <div class="drawer-actions" data-field="schedule-actions">
@@ -2094,18 +2597,48 @@ export function initBoard() {
     drawerEl.querySelector('[data-action="drawer-close"]').onclick = closeDrawer;
 
     const titleEl = drawerEl.querySelector('[data-field="title"]');
-    titleEl.addEventListener('blur', async () => {
-      const value = titleEl.value.trim();
-      if (!value || value === titleValue) return;
+    // Titles are single-line values in the vault: a pasted or otherwise
+    // typed newline is collapsed to a space before it's ever compared or
+    // saved, so the field never turns a task's description into a
+    // multi-line value. `lastSavedTitle` (not the render-time `titleValue`)
+    // is what a save compares and reverts against, so a second commit of
+    // the same value — Enter followed by a later blur, with no further
+    // typing in between — is a no-op instead of firing a duplicate PUT.
+    let lastSavedTitle = titleValue;
+    async function saveTitle() {
+      const value = titleEl.value.replace(/\r\n|\r|\n/g, ' ').trim();
+      if (!value || value === lastSavedTitle) return;
       try {
         if (isTask) await putTask(card.id, { description: value });
         else await putSchedule(card.id, { name: value });
+        lastSavedTitle = value;
         await fetchBoard();
       } catch (err) {
         showToast(`Couldn't save title: ${err.message}`, true);
-        titleEl.value = titleValue;
+        titleEl.value = lastSavedTitle;
+        autosizeTitleTextarea(titleEl);
       }
+    }
+    titleEl.addEventListener('blur', saveTitle);
+    // Enter commits the title (the same save `blur` uses) instead of
+    // inserting a line break — skipped mid-IME-composition so committing
+    // an East Asian input method's conversion doesn't fire an early save.
+    // This never calls `.blur()`: doing so would move
+    // `document.activeElement` to `<body>`, outside `drawerEl`, which
+    // would drop the field out of `updateOpenDrawer`'s `focused` guard
+    // (board.js's drawer-update path) while the save above is still in
+    // flight — an unrelated live-board tick for the same card could then
+    // repaint the title from the server's still-stale value, flashing the
+    // just-typed text back to the old one on screen. Leaving focus in the
+    // field keeps that guard in effect exactly like it already does for
+    // the notes field while typing.
+    titleEl.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' || e.isComposing) return;
+      e.preventDefault();
+      saveTitle();
     });
+    titleEl.addEventListener('input', () => autosizeTitleTextarea(titleEl));
+    autosizeTitleTextarea(titleEl);  // size to existing content on open/re-render
 
     if (!isTask) {
       renderScheduleDrawerFields(card);
@@ -2195,14 +2728,6 @@ export function initBoard() {
       }
     });
 
-    const contextEl = drawerEl.querySelector('[data-field="context"]');
-    contextEl.addEventListener('blur', async () => {
-      const value = contextEl.value.trim();
-      if (!value || value === card.context) return;
-      try { await putTask(card.id, { context: value }); await fetchBoard(); }
-      catch (err) { showToast(`Couldn't save context: ${err.message}`, true); contextEl.value = card.context || ''; }
-    });
-
     // The drawer's own Assignee select above is the one assignee writer —
     // it already writes exactly one assignee tag through the lane endpoint
     // and supports `me`, which the module's own engine select can't
@@ -2228,21 +2753,270 @@ export function initBoard() {
   // scheduler API, never the vault file directly — on blur for text
   // inputs and on change for selects/the checkbox, refetching the board on
   // a successful save. A rejected save shows the server's `detail` inline
-  // next to the offending field (schedule value, timezone) or as a toast
-  // (every other field), and snaps the control back to the last value the
-  // server actually accepted. The schedule type select is the one
-  // exception: changing it only updates the value field's label and
+  // next to the offending field (schedule value, timezone, action) or as a
+  // toast (every other field), and snaps the control back to the last
+  // value the server actually accepted. The schedule type select is the
+  // one exception: changing it only updates the value field's label and
   // placeholder locally — it saves together with the schedule value, on
   // the value field's own blur, so a type and a value that doesn't parse
   // under it can never reach the server in the same write (see below).
-  function renderScheduleDrawerFields(card) {
-    const msgEl = drawerEl.querySelector('[data-field="message-content"]');
-    msgEl.addEventListener('blur', async () => {
-      const value = msgEl.value;
-      if (value === (card.message_content || '')) return;
-      try { await putSchedule(card.id, { message_content: value }); await fetchBoard(); }
-      catch (err) { showToast(`Couldn't save message: ${err.message}`, true); msgEl.value = card.message_content || ''; }
+  // The action select is the other exception: switching to an action whose
+  // section doesn't yet have what it needs to fire (see
+  // `actionInputsSatisfied`) holds the switch locally instead of saving it
+  // alone, and a rejected save carrying it leaves the select and its
+  // section showing the operator's own entry rather than reverting them
+  // (see `pendingAction` below).
+  // Normalizes an `endpoint_config` (or its absence) into a comparable
+  // key, for skipping a redundant save when the endpoint fields are
+  // blurred/changed without actually being edited — the same "no-op if
+  // unchanged" rule every other schedule field below follows.
+  // Mirrors readEndpointConfig()'s own shape (schedule_sections.js):
+  // method upper-cased, endpoint defaulted to "", absent params as `null`.
+  function endpointConfigKey(cfg) {
+    const c = cfg || {};
+    return JSON.stringify({
+      method: String(c.method || 'GET').toUpperCase(),
+      endpoint: c.endpoint || '',
+      params: c.params === undefined ? null : c.params,
     });
+  }
+
+  function renderScheduleDrawerFields(card) {
+    const actionSectionsEl = drawerEl.querySelector('[data-field="action-sections"]');
+    const sectionValues = {
+      message_content: card.message_content || '',
+      endpoint_config: card.endpoint_config || null,
+      executor: card.executor || '',
+      bot: card.bot || '',
+      persona_id: card.persona_id || '',
+      model_id: card.model_id || '',
+      effort: card.effort || '',
+      host: card.host || '',
+      working_dir: card.working_dir || '',
+    };
+    const sections = renderScheduleActionSections(actionSectionsEl, card.action, sectionValues);
+
+    // What the server last actually accepted for each per-action field —
+    // a rejected save reverts its control to these, mirroring every other
+    // schedule field's own lastSaved* tracking below.
+    let lastSavedMessage = sectionValues.message_content;
+    let lastSavedBot = sectionValues.bot;
+    let lastSavedSectionExecutor = sectionValues.executor;
+    let lastSavedEndpointConfig = sectionValues.endpoint_config;
+    let lastSavedEndpointConfigKey = endpointConfigKey(lastSavedEndpointConfig);
+    let lastSavedPersonaId = sectionValues.persona_id;
+    let lastSavedModelId = sectionValues.model_id;
+    let lastSavedEffort = sectionValues.effort;
+    let lastSavedHost = sectionValues.host;
+    let lastSavedWorkingDir = sectionValues.working_dir;
+
+    // (Re)wires save-on-blur/change for whichever fields the current
+    // action's section actually rendered — called once after the initial
+    // render and again after every `sections.setAction()` rebuild, since
+    // a rebuild replaces the DOM elements the previous wiring pass
+    // attached to.
+    function wireActionSectionFields() {
+      const els = sections.elements;
+
+      if (els.message) {
+        els.message.addEventListener('blur', async () => {
+          const value = els.message.value;
+          if (value === (lastSavedMessage || '')) return;
+          // A pending action switch (set by the Action select's own
+          // change handler below, when the target action's section
+          // didn't yet satisfy the server's requirement) rides along in
+          // this same PUT — the server sees one write with both fields,
+          // never an action alone with nothing to back it.
+          const savingAction = pendingAction;
+          const patch = { message_content: value };
+          if (savingAction) patch.action = savingAction;
+          try {
+            await putSchedule(card.id, patch);
+            lastSavedMessage = value;
+            // `sectionValues` is the same object `sections` reads from —
+            // updating it here keeps a later `setAction()` (switching away
+            // and back to this action mid-session) rendering this saved
+            // value instead of the stale one the drawer opened with.
+            sectionValues.message_content = value;
+            if (savingAction) {
+              lastSavedAction = savingAction;
+              pendingAction = null;
+              clearActionError();
+            }
+            await fetchBoard();
+          } catch (err) {
+            if (savingAction) {
+              // The action switch is still pending — leave the select and
+              // this field exactly as the operator left them so they can
+              // fix and retry, rather than reverting content they just
+              // typed.
+              showActionError(err.message);
+            } else {
+              showToast(`Couldn't save message: ${err.message}`, true);
+              els.message.value = lastSavedMessage || '';
+            }
+          }
+        });
+      }
+
+      if (els.bot) {
+        els.bot.addEventListener('change', async () => {
+          try {
+            await putSchedule(card.id, { bot: els.bot.value });
+            lastSavedBot = els.bot.value;
+            sectionValues.bot = lastSavedBot;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save bot: ${err.message}`, true);
+            els.bot.value = lastSavedBot;
+          }
+        });
+      }
+
+      if (els.executor) {
+        els.executor.addEventListener('change', async () => {
+          try {
+            await putSchedule(card.id, { executor: els.executor.value });
+            lastSavedSectionExecutor = els.executor.value;
+            sectionValues.executor = lastSavedSectionExecutor;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save executor: ${err.message}`, true);
+            els.executor.value = lastSavedSectionExecutor;
+          }
+        });
+      }
+
+      if (els.method && els.path && els.params) {
+        const saveEndpointConfig = async () => {
+          const cfg = sections.readEndpointConfig();
+          if (cfg === null) return; // invalid JSON/non-object params — error already shown, nothing sent
+          const key = endpointConfigKey(cfg);
+          if (key === lastSavedEndpointConfigKey) return;
+          // See the message handler above: a pending action switch rides
+          // along in this same PUT once these fields actually satisfy the
+          // target action's requirement. Until then (e.g. the method is
+          // picked before a path is entered), hold the edit locally same
+          // as the switch itself, rather than sending a combined PUT the
+          // server would reject for a field the operator hasn't finished.
+          const savingAction = pendingAction;
+          if (savingAction && !actionInputsSatisfied(savingAction, { endpoint_config: cfg })) return;
+          const patch = { endpoint_config: cfg };
+          if (savingAction) patch.action = savingAction;
+          try {
+            await putSchedule(card.id, patch);
+            lastSavedEndpointConfig = cfg;
+            lastSavedEndpointConfigKey = key;
+            sectionValues.endpoint_config = cfg;
+            sections.clearParamsError();
+            if (savingAction) {
+              lastSavedAction = savingAction;
+              pendingAction = null;
+              clearActionError();
+            }
+            await fetchBoard();
+          } catch (err) {
+            if (savingAction) {
+              // Leave the method/path/params fields exactly as entered —
+              // the action switch is still pending, and reverting them
+              // would discard the operator's own fix along with the
+              // rejection.
+              showActionError(err.message);
+            } else {
+              sections.showParamsError(err.message);
+              els.method.value = String((lastSavedEndpointConfig && lastSavedEndpointConfig.method) || 'GET').toUpperCase();
+              els.path.value = (lastSavedEndpointConfig && lastSavedEndpointConfig.endpoint) || '';
+              els.params.value = lastSavedEndpointConfig && lastSavedEndpointConfig.params !== undefined
+                ? JSON.stringify(lastSavedEndpointConfig.params, null, 2) : '';
+            }
+          }
+        };
+        els.method.addEventListener('change', saveEndpointConfig);
+        els.path.addEventListener('blur', saveEndpointConfig);
+        els.params.addEventListener('blur', saveEndpointConfig);
+      }
+
+      if (els.personaId) {
+        els.personaId.addEventListener('blur', async () => {
+          const value = els.personaId.value.trim();
+          if (value === lastSavedPersonaId) return;
+          try {
+            await putSchedule(card.id, { persona_id: value });
+            lastSavedPersonaId = value;
+            sectionValues.persona_id = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save persona: ${err.message}`, true);
+            els.personaId.value = lastSavedPersonaId;
+          }
+        });
+      }
+
+      if (els.modelId) {
+        els.modelId.addEventListener('change', async () => {
+          const value = els.modelId.value;
+          if (value === lastSavedModelId) return;
+          try {
+            await putSchedule(card.id, { model_id: value });
+            lastSavedModelId = value;
+            sectionValues.model_id = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save model: ${err.message}`, true);
+            els.modelId.value = lastSavedModelId;
+          }
+        });
+      }
+
+      if (els.effort) {
+        els.effort.addEventListener('change', async () => {
+          const value = els.effort.value;
+          if (value === lastSavedEffort) return;
+          try {
+            await putSchedule(card.id, { effort: value });
+            lastSavedEffort = value;
+            sectionValues.effort = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save effort: ${err.message}`, true);
+            els.effort.value = lastSavedEffort;
+          }
+        });
+      }
+
+      if (els.host) {
+        els.host.addEventListener('change', async () => {
+          const value = els.host.value;
+          if (value === lastSavedHost) return;
+          try {
+            await putSchedule(card.id, { host: value });
+            lastSavedHost = value;
+            sectionValues.host = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save host: ${err.message}`, true);
+            els.host.value = lastSavedHost;
+          }
+        });
+      }
+
+      if (els.workingDir) {
+        els.workingDir.addEventListener('blur', async () => {
+          const value = els.workingDir.value.trim();
+          if (value === lastSavedWorkingDir) return;
+          try {
+            await putSchedule(card.id, { working_dir: value });
+            lastSavedWorkingDir = value;
+            sectionValues.working_dir = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save working directory: ${err.message}`, true);
+            els.workingDir.value = lastSavedWorkingDir;
+          }
+        });
+      }
+    }
+    wireActionSectionFields();
 
     const enabledEl = drawerEl.querySelector('[data-field="enabled"]');
     enabledEl.addEventListener('change', async () => {
@@ -2266,11 +3040,7 @@ export function initBoard() {
     const tzEl = drawerEl.querySelector('[data-field="timezone"]');
     const tzErrorEl = drawerEl.querySelector('[data-field="timezone-error"]');
     const actionEl = drawerEl.querySelector('[data-field="action"]');
-    const executorRow = drawerEl.querySelector('[data-row="executor"]');
-    const executorEl = drawerEl.querySelector('[data-field="executor"]');
-    const botRow = drawerEl.querySelector('[data-row="bot"]');
-    const botEl = drawerEl.querySelector('[data-field="bot"]');
-    const botReasonEl = drawerEl.querySelector('[data-field="bot-reason"]');
+    const actionErrorEl = drawerEl.querySelector('[data-field="action-error"]');
     const previewEl = drawerEl.querySelector('[data-field="next-fire-preview"]');
     const lastRunEl = drawerEl.querySelector('[data-field="last-run-info"]');
     const triggerBtnEl = drawerEl.querySelector('[data-action="trigger-now"]');
@@ -2286,8 +3056,22 @@ export function initBoard() {
     let lastSavedValue = card.schedule_value;
     let lastSavedTz = card.timezone || '';
     let lastSavedAction = card.action;
-    let lastSavedExecutor = card.executor || '';
-    let lastSavedBot = card.bot || '';
+    // An action selected in the drawer but not yet included in a
+    // successful PUT — set when the target action's own section doesn't
+    // yet have what it needs to fire (see `actionInputsSatisfied`), and
+    // cleared once a save carrying it succeeds. Never persisted anywhere
+    // else, so closing and reopening the drawer (a fresh `renderDrawer`
+    // from the card's actual stored action) discards it.
+    let pendingAction = null;
+
+    function showActionError(message) {
+      actionErrorEl.textContent = message;
+      actionErrorEl.hidden = false;
+    }
+    function clearActionError() {
+      actionErrorEl.hidden = true;
+      actionErrorEl.textContent = '';
+    }
 
     function updateValueLabel(type) {
       if (type === 'once') {
@@ -2297,12 +3081,6 @@ export function initBoard() {
         valueLabelEl.textContent = 'Cron expression';
         valueEl.placeholder = '0 9 * * *';
       }
-    }
-
-    function setActionVisibility(action) {
-      const isAgent = action === 'agent';
-      executorRow.hidden = !isAgent;
-      botRow.hidden = isAgent;
     }
 
     typeEl.addEventListener('change', () => {
@@ -2363,82 +3141,35 @@ export function initBoard() {
     });
 
     actionEl.addEventListener('change', async () => {
-      // Show/hide the executor and bot controls immediately — no need to
-      // wait for the save (or reopen the drawer) to see the right one.
-      setActionVisibility(actionEl.value);
-      try {
-        await putSchedule(card.id, { action: actionEl.value });
-        lastSavedAction = actionEl.value;
-        await fetchBoard();
-      } catch (err) {
-        showToast(`Couldn't save action: ${err.message}`, true);
-        actionEl.value = lastSavedAction;
-        setActionVisibility(lastSavedAction);
-      }
-    });
-
-    executorEl.addEventListener('change', async () => {
-      try {
-        await putSchedule(card.id, { executor: executorEl.value });
-        lastSavedExecutor = executorEl.value;
-        await fetchBoard();
-      } catch (err) {
-        showToast(`Couldn't save executor: ${err.message}`, true);
-        executorEl.value = lastSavedExecutor;
-      }
-    });
-
-    botEl.addEventListener('change', async () => {
-      try {
-        await putSchedule(card.id, { bot: botEl.value });
-        lastSavedBot = botEl.value;
-        await fetchBoard();
-      } catch (err) {
-        showToast(`Couldn't save bot: ${err.message}`, true);
-        botEl.value = lastSavedBot;
-      }
-    });
-
-    // When the registry loads, the bot select offers only names the API
-    // accepts — the empty "default (primary)" option (distinguishable from
-    // the registry's own "primary" row) plus whatever GET
-    // /api/scheduler/bots returns. A stored name the loaded registry
-    // doesn't include (a bot renamed after the schedule was written) is
-    // appended as a selected, flagged-unknown option instead of leaving
-    // the select with no matching value. When the fetch itself fails, the
-    // stored name isn't known to be invalid — just unconfirmed — so it's
-    // kept visible and selected without that flag, and the select is
-    // disabled with the reason shown as visible text next to it,
-    // mirroring the host dropdown's pattern
-    // (web/agents/assignment.js's seedHostOptions/populateHostOptions).
-    loadBotCatalog().then(catalog => {
-      const stored = card.bot || '';
-      if (!catalog) {
-        const optionsHtml = ['<option value="">default (primary)</option>'];
-        if (stored) {
-          optionsHtml.push(`<option value="${escapeHtml(stored)}" selected>${escapeHtml(stored)}</option>`);
-        }
-        botEl.innerHTML = optionsHtml.join('');
-        botEl.value = stored;
-        botEl.disabled = true;
-        botReasonEl.textContent = 'bot registry unavailable — reopen to retry';
-        botReasonEl.hidden = false;
+      // Switch the visible section immediately, ahead of any save, then
+      // re-wire the freshly rendered fields' own save-on-blur/change
+      // handlers, since the section rebuild replaced their DOM elements.
+      const target = actionEl.value;
+      sections.setAction(target);
+      wireActionSectionFields();
+      clearActionError();
+      if (!actionInputsSatisfied(target, sectionValues)) {
+        // The target action's section doesn't have what it needs to fire
+        // yet (e.g. endpoint with no method/path, or notify/prompt/agent
+        // with a blank message) — hold the switch locally instead of
+        // writing an action the server would reject anyway. The section's
+        // own save-on-blur/change handler above sends `action` together
+        // with whatever value satisfies it, in one PUT.
+        pendingAction = target;
         return;
       }
-      const names = catalog.bots || [];
-      const known = names.includes(stored);
-      const options = ['<option value="">default (primary)</option>'];
-      for (const name of names) {
-        options.push(`<option value="${escapeHtml(name)}" ${stored === name ? 'selected' : ''}>${escapeHtml(name)}</option>`);
+      pendingAction = null;
+      try {
+        await putSchedule(card.id, { action: target });
+        lastSavedAction = target;
+        await fetchBoard();
+      } catch (err) {
+        // Leave the select and its freshly rendered section showing the
+        // operator's own choice — the stored action is unchanged, and a
+        // later edit to the section's own field retries the switch.
+        pendingAction = target;
+        showActionError(err.message);
       }
-      if (stored && !known) {
-        options.push(`<option value="${escapeHtml(stored)}" selected data-unknown="true">${escapeHtml(stored)} (unknown)</option>`);
-      }
-      botEl.innerHTML = options.join('');
-      botEl.value = stored;
-      botEl.disabled = false;
-      botReasonEl.hidden = true;
-      botReasonEl.textContent = '';
     });
 
     drawerEl.querySelector('[data-action="trigger-now"]').addEventListener('click', async () => {
@@ -2698,6 +3429,279 @@ export function initBoard() {
         : [...visibleLanes, 'done']);
     });
   }
+
+  // ------------------------------------------------------------------
+  // Bulk actions — fans out over the same per-card endpoints the
+  // drawer and tray already use. Every action collects one {card, ok,
+  // reason} outcome per selected card (`fanOut`, above) and shows exactly
+  // one summary toast — never a toast, and for Delete never a confirmation
+  // modal, per card. No undo toast: unlike a single-card action, a bulk
+  // action has no single prior state to offer restoring.
+  //
+  // In-flight guard: a single `bulkActionInFlight` flag, checked and set
+  // atomically (synchronously, before any `await`) at the top of each of
+  // the four consequential entry points below — the three fan-out runners
+  // and the delete confirmation's own open — so a second click dispatched
+  // before the first has finished (a double-click, or two clicks while a
+  // slow/loaded server holds the first fan-out's requests open) sees the
+  // flag already set and does nothing, rather than starting a second,
+  // fully independent fan-out or stacking a second confirmation modal. The
+  // guard also disables all four bar buttons for its duration — covering
+  // Delete's confirmation modal from the moment it opens through its own
+  // cancel or fan-out, not just the fan-out itself — and always releases
+  // in a `finally`/on every dismissal path, including a thrown error.
+  // ------------------------------------------------------------------
+
+  // Same write shape as the drawer's Assignee select and assignment.js's
+  // own engine picker: drop any existing assignee tag and stamp the new
+  // one (or nothing, for unassigned), keeping every other tag — including
+  // protected lifecycle tags — untouched. Goes through the plain task PUT
+  // (not the lane endpoint), which runs the same assignee-change policy
+  // check (api/routes/tasks.py) so a claimed card still 409s per card.
+  let bulkActionInFlight = false;
+
+  function setBulkButtonsDisabled(disabled) {
+    [bulkTagBtn, bulkAssignBtn, bulkDoneBtn, bulkDeleteBtn].forEach(btn => {
+      if (btn) btn.disabled = disabled;
+    });
+  }
+
+  // Returns `false` (and does nothing) when a bulk action is already
+  // running — the caller must bail immediately without starting any work.
+  // Returns `true` once the flag is claimed, having already disabled the
+  // bar's buttons so a disabled second click can't even reach its own
+  // handler.
+  function beginBulkAction() {
+    if (bulkActionInFlight) return false;
+    bulkActionInFlight = true;
+    setBulkButtonsDisabled(true);
+    return true;
+  }
+
+  function endBulkAction() {
+    bulkActionInFlight = false;
+    setBulkButtonsDisabled(false);
+  }
+
+  async function bulkAssignOne(card, assignee) {
+    const nonAssigneeTags = (card.tags || []).filter(t => !ASSIGNEES.includes(String(t).toLowerCase()));
+    const tags = assignee ? [assignee, ...nonAssigneeTags] : nonAssigneeTags;
+    await putTask(card.id, { tags });
+  }
+
+  async function runBulkAssign(assignee) {
+    const cards = selectedTaskCards();
+    if (cards.length === 0) return;
+    closeBulkPopovers();
+    if (!beginBulkAction()) return;
+    try {
+      const results = await fanOut(cards, (card) => bulkAssignOne(card, assignee));
+      reportBulkOutcome('Assigned', results);
+      await fetchBoard();
+      clearSelection();
+    } finally {
+      endBulkAction();
+    }
+  }
+
+  // Adds one tag through the same endpoint (and merge behavior) as the
+  // drawer's tag picker — `putBoardTags` sends only the editable tag set,
+  // and the server preserves every protected tag already on the card
+  // (update_board_card_tags's `update_tags_preserving`). ADD only, matching
+  // the issue's scope — no bulk untagging.
+  async function bulkTagOne(card, tag) {
+    const current = editableTagsForCard(card);
+    if (current.includes(tag)) return;  // already has it — counts as success
+    await putBoardTags(card.id, [...current, tag]);
+  }
+
+  async function runBulkTag(rawTag) {
+    const tag = normalizeEditableTag(rawTag);
+    if (!tag) return;
+    const cards = selectedTaskCards();
+    if (cards.length === 0) return;
+    closeBulkPopovers();
+    if (!beginBulkAction()) return;
+    try {
+      const results = await fanOut(cards, (card) => bulkTagOne(card, tag));
+      reportBulkOutcome('Tagged', results);
+      await fetchBoard();
+      clearSelection();
+    } finally {
+      endBulkAction();
+    }
+  }
+
+  // Raw per-card writes for the bulk fan-out — unlike `moveCard` (used by
+  // drag/drop and the drawer), these never toast or refresh the board on
+  // their own: a bulk action collects every card's outcome first and shows
+  // exactly one summary toast, then one `fetchBoard()`, so a per-card
+  // helper here must have no side effects beyond the network call itself.
+  async function acceptCardEndpoint(cardId) {
+    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(cardId)}/accept`, { method: 'POST' });
+    if (!r.ok) {
+      const text = await r.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    return r.json();
+  }
+
+  async function moveCardToLaneEndpoint(cardId, lane) {
+    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(cardId)}/lane`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lane }),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    return r.json();
+  }
+
+  // Mark Done: a Review card goes through the same Accept transition as the
+  // inline Accept button and the tray's Done target; every other card goes
+  // through the plain lane-move endpoint, same as dragging it onto Done. A
+  // card already in Done is a no-op that counts as success.
+  async function runBulkMarkDone() {
+    const cards = selectedTaskCards();
+    if (cards.length === 0) return;
+    if (!beginBulkAction()) return;
+    try {
+      const results = await fanOut(cards, async (card) => {
+        if (card.lane === 'done') return;
+        if (card.lane === 'review') await acceptCardEndpoint(card.id);
+        else await moveCardToLaneEndpoint(card.id, 'done');
+      });
+      reportBulkOutcome('Marked done', results);
+      await fetchBoard();
+      clearSelection();
+    } finally {
+      endBulkAction();
+    }
+  }
+
+  // One confirmation naming the count, then the same kill-then-delete core
+  // the single-card Delete modal uses (card_actions.js's `deleteCard`) —
+  // never a modal per card.
+  function openBulkDeleteConfirm() {
+    const cards = selectedTaskCards();
+    if (cards.length === 0) return;
+    // Claimed from the moment the confirmation opens, not just while its
+    // fan-out runs — a second click on Delete while this modal is still
+    // sitting open (awaiting a confirm/cancel) must not stack a second one.
+    if (!beginBulkAction()) return;
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-labelledby="bulk-delete-title">
+        <h2 id="bulk-delete-title">Delete ${cards.length} card${cards.length === 1 ? '' : 's'}?</h2>
+        <div class="descendants">A selected card with a live, killable session is killed first. This can't be undone.</div>
+        <div class="actions">
+          <button id="bulk-delete-cancel">Cancel</button>
+          <button class="danger" id="bulk-delete-confirm">Delete</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(backdrop);
+    const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
+    const cancel = () => { cleanup(); endBulkAction(); };
+    backdrop.addEventListener('click', e => { if (e.target === backdrop) cancel(); });
+    backdrop.querySelector('#bulk-delete-cancel').onclick = cancel;
+    backdrop.querySelector('#bulk-delete-confirm').onclick = async () => {
+      const btn = backdrop.querySelector('#bulk-delete-confirm');
+      btn.disabled = true;
+      btn.textContent = 'Deleting…';
+      try {
+        const results = await fanOut(cards, (card) => deleteCard(card, { findCard }));
+        cleanup();
+        reportBulkOutcome('Deleted', results);
+        await fetchBoard();
+        clearSelection();
+      } finally {
+        endBulkAction();
+      }
+    };
+  }
+
+  function renderBulkAssignPopover() {
+    if (!bulkAssignPopover) return;
+    bulkAssignPopover.innerHTML = `
+      <button type="button" class="board-bulk-popover-option" data-assignee="">unassigned</button>
+      ${ASSIGNEES.map(a => `<button type="button" class="board-bulk-popover-option" data-assignee="${escapeAttr(a)}">${escapeHtml(a)}</button>`).join('')}
+    `;
+    bulkAssignPopover.querySelectorAll('[data-assignee]').forEach(button => {
+      button.addEventListener('click', () => runBulkAssign(button.dataset.assignee || null));
+    });
+  }
+
+  const bulkTagSearchEl = bulkTagPopover && bulkTagPopover.querySelector('[data-field="tag-search"]');
+  const bulkTagOptionsEl = bulkTagPopover && bulkTagPopover.querySelector('[data-field="options"]');
+
+  function renderBulkTagOptions(query) {
+    if (!bulkTagOptionsEl) return;
+    const q = String(query || '').trim().replace(/^#+/, '').toLowerCase();
+    const matches = availableEditableTags().filter(tag => !q || tag.includes(q));
+    const normalizedQuery = normalizeEditableTag(query);
+    const canCreate = !!normalizedQuery && !availableEditableTags().includes(normalizedQuery);
+    bulkTagOptionsEl.innerHTML = matches.map(tag => (
+      `<button type="button" class="board-bulk-popover-option" data-tag="${escapeAttr(tag)}">#${escapeHtml(tag)}</button>`
+    )).join('') + (canCreate
+      ? `<button type="button" class="board-bulk-popover-option board-bulk-popover-create" data-tag="${escapeAttr(normalizedQuery)}">Create new #${escapeHtml(normalizedQuery)}</button>`
+      : '');
+    bulkTagOptionsEl.querySelectorAll('[data-tag]').forEach(button => {
+      button.addEventListener('click', () => runBulkTag(button.dataset.tag));
+    });
+  }
+
+  if (bulkTagSearchEl) {
+    bulkTagSearchEl.addEventListener('input', () => renderBulkTagOptions(bulkTagSearchEl.value));
+    bulkTagSearchEl.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      runBulkTag(bulkTagSearchEl.value);
+    });
+  }
+
+  if (bulkTagBtn) {
+    bulkTagBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (bulkAssignPopover) bulkAssignPopover.hidden = true;
+      if (!bulkTagPopover) return;
+      const opening = bulkTagPopover.hidden;
+      bulkTagPopover.hidden = !opening;
+      if (opening) {
+        if (bulkTagSearchEl) bulkTagSearchEl.value = '';
+        renderBulkTagOptions('');
+        if (bulkTagSearchEl) bulkTagSearchEl.focus();
+      }
+    });
+  }
+  if (bulkAssignBtn) {
+    bulkAssignBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (bulkTagPopover) bulkTagPopover.hidden = true;
+      if (!bulkAssignPopover) return;
+      const opening = bulkAssignPopover.hidden;
+      if (opening) renderBulkAssignPopover();
+      bulkAssignPopover.hidden = !opening;
+    });
+  }
+  document.addEventListener('click', (e) => {
+    if (bulkAssignPopover && !bulkAssignPopover.hidden
+      && !bulkAssignPopover.contains(e.target) && e.target !== bulkAssignBtn) {
+      bulkAssignPopover.hidden = true;
+    }
+    if (bulkTagPopover && !bulkTagPopover.hidden
+      && !bulkTagPopover.contains(e.target) && e.target !== bulkTagBtn) {
+      bulkTagPopover.hidden = true;
+    }
+  });
+  if (bulkDoneBtn) bulkDoneBtn.addEventListener('click', () => runBulkMarkDone());
+  if (bulkDeleteBtn) bulkDeleteBtn.addEventListener('click', () => openBulkDeleteConfirm());
+  if (bulkClearBtn) bulkClearBtn.addEventListener('click', () => clearSelection());
 
   // ------------------------------------------------------------------
   // Wire filters + boot

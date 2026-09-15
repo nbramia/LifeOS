@@ -21,13 +21,16 @@ line as an indented ``> `` blockquote body, so it can be read and edited in
 Obsidian and round-trips back through reindexing. Indented blockquote lines
 directly following a schedule line are reserved for this body — a standalone
 note placed there will be absorbed into the schedule's ``message_content`` on
-reindex. The structured
-``endpoint_config`` and computed ``next_trigger_at`` (plus run history) live in
-a rebuildable index cache (``data/scheduler_index.json``) and are merged back
-by ID when markdown is reindexed. The cache is never the source of truth — it
-can be deleted and rebuilt from the vault.
+reindex. For ``endpoint`` schedules the route, method, and params also
+round-trip through the line as ``[endpoint:: <METHOD> <path>]`` and
+``[params:: <compact JSON>]`` — the vault line fully defines the call. The
+computed ``next_trigger_at`` (plus run history) has no markdown representation
+and lives only in a rebuildable index cache (``data/scheduler_index.json``),
+merged back by ID when markdown is reindexed. The cache is never the source of
+truth — it can be deleted and rebuilt from the vault.
 """
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -101,6 +104,57 @@ class ScheduleEntry:
         return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
 
 
+def compute_next_n_triggers(
+    schedule_type: str, schedule_value: str, tz_name: str, count: int = 1, *, label: str = "",
+) -> list[str]:
+    """
+    Compute up to ``count`` upcoming UTC trigger times for a schedule_type/
+    schedule_value/timezone, most-imminent first.
+
+    For cron expressions, times are interpreted in ``tz_name`` and converted
+    to UTC, so "daily at 6pm" means 6pm local, not 6pm UTC. For ``once``, at
+    most one time comes back — ``schedule_value`` itself, converted to UTC,
+    when it's still in the future, else an empty list. ``label`` names the
+    schedule in log output only (e.g. its id); an entry with none yet (a
+    preview request that hasn't been saved) passes an empty string.
+    """
+    now_utc = datetime.now(timezone.utc)
+
+    if schedule_type == "once":
+        try:
+            trigger_time = datetime.fromisoformat(schedule_value)
+            if trigger_time.tzinfo is None:
+                tz = ZoneInfo(tz_name)
+                trigger_time = trigger_time.replace(tzinfo=tz)
+            trigger_time_utc = trigger_time.astimezone(timezone.utc)
+            if trigger_time_utc > now_utc:
+                return [trigger_time_utc.isoformat()]
+            return []  # past one-time schedule
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Invalid datetime for schedule {label}: {e}")
+            return []
+
+    elif schedule_type == "cron":
+        try:
+            tz = ZoneInfo(tz_name)
+            cron = croniter(schedule_value, datetime.now(tz))
+            triggers = []
+            for _ in range(max(count, 0)):
+                next_time_local = cron.get_next(datetime)
+                if next_time_local.tzinfo is None:
+                    next_time_local = next_time_local.replace(tzinfo=tz)
+                triggers.append(next_time_local.astimezone(timezone.utc).isoformat())
+            return triggers
+        except (ValueError, KeyError) as e:
+            logger.error(
+                f"Invalid cron expression for schedule {label}: "
+                f"{schedule_value} - {e}"
+            )
+            return []
+
+    return []
+
+
 def compute_next_trigger(entry: ScheduleEntry) -> Optional[str]:
     """
     Compute the next trigger time for a schedule.
@@ -109,39 +163,11 @@ def compute_next_trigger(entry: ScheduleEntry) -> Optional[str]:
     (defaults to settings.timezone) and converted to UTC for storage, so
     "daily at 6pm" means 6pm local, not 6pm UTC.
     """
-    now_utc = datetime.now(timezone.utc)
-
-    if entry.schedule_type == "once":
-        try:
-            trigger_time = datetime.fromisoformat(entry.schedule_value)
-            if trigger_time.tzinfo is None:
-                tz = ZoneInfo(entry.timezone or settings.timezone)
-                trigger_time = trigger_time.replace(tzinfo=tz)
-            trigger_time_utc = trigger_time.astimezone(timezone.utc)
-            if trigger_time_utc > now_utc:
-                return trigger_time_utc.isoformat()
-            return None  # past one-time schedule
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Invalid datetime for schedule {entry.id}: {e}")
-            return None
-
-    elif entry.schedule_type == "cron":
-        try:
-            tz = ZoneInfo(entry.timezone or settings.timezone)
-            now_local = datetime.now(tz)
-            cron = croniter(entry.schedule_value, now_local)
-            next_time_local = cron.get_next(datetime)
-            if next_time_local.tzinfo is None:
-                next_time_local = next_time_local.replace(tzinfo=tz)
-            return next_time_local.astimezone(timezone.utc).isoformat()
-        except (ValueError, KeyError) as e:
-            logger.error(
-                f"Invalid cron expression for schedule {entry.id}: "
-                f"{entry.schedule_value} - {e}"
-            )
-            return None
-
-    return None
+    triggers = compute_next_n_triggers(
+        entry.schedule_type, entry.schedule_value, entry.timezone or settings.timezone,
+        count=1, label=entry.id,
+    )
+    return triggers[0] if triggers else None
 
 
 def _format_cron_human(cron_expr: str, tz_name: str = "") -> str:
@@ -213,6 +239,34 @@ _CHECKBOX_RE = re.compile(r'^- \[(.)\]\s+(.*)$')
 # Instruction-text body: an indented blockquote line beneath a schedule line.
 _BODY_LINE_RE = re.compile(r'^\s+>\s?(.*)$')
 _BODY_INDENT = "    "
+_PARAMS_B64_PREFIX = "b64:"
+
+
+def _encode_params(params: dict) -> str:
+    """Compact JSON for the ``[params:: …]`` inline field.
+
+    The inline-field syntax cannot hold ``]`` or a newline, so when the
+    compact JSON contains either, it is base64-encoded and marked with the
+    ``b64:`` prefix instead.
+    """
+    compact = json.dumps(params, separators=(",", ":"), default=str)
+    if "]" in compact or "\n" in compact:
+        return _PARAMS_B64_PREFIX + base64.b64encode(compact.encode("utf-8")).decode("ascii")
+    return compact
+
+
+def _decode_params(raw: str) -> dict:
+    """Inverse of ``_encode_params``. Raises ValueError/TypeError on malformed input."""
+    if raw.startswith(_PARAMS_B64_PREFIX):
+        decoded = base64.b64decode(
+            raw[len(_PARAMS_B64_PREFIX):].encode("ascii"), validate=True
+        ).decode("utf-8")
+        parsed = json.loads(decoded)
+    else:
+        parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("params must be a JSON object")
+    return parsed
 
 
 def _format_entry_line(entry: ScheduleEntry) -> str:
@@ -226,6 +280,13 @@ def _format_entry_line(entry: ScheduleEntry) -> str:
         parts.append(f"[tz:: {entry.timezone}]")
     parts.append(f"[action:: {entry.action}]")
     parts.append(f"[mtype:: {entry.message_type}]")
+    if entry.action == "endpoint" and entry.endpoint_config:
+        method = (entry.endpoint_config.get("method") or "GET").upper()
+        path = entry.endpoint_config.get("endpoint", "")
+        parts.append(f"[endpoint:: {method} {path}]")
+        params = entry.endpoint_config.get("params") or {}
+        if params:
+            parts.append(f"[params:: {_encode_params(params)}]")
     if entry.bot:
         parts.append(f"[bot:: {entry.bot}]")
     if entry.executor:
@@ -264,26 +325,41 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
     id_match = _ID_RE.search(rest)
     entry_id = id_match.group(1) if id_match else uuid.uuid4().hex[:8]
 
-    tags = _TAG_RE.findall(rest)
+    # Strip the id comment and inline fields before scanning for tags, so a
+    # `#` inside a field value (e.g. endpoint params or path) is never
+    # mistaken for an executor tag.
+    stripped = _ID_RE.sub("", rest)
+    stripped = _INLINE_FIELD_RE.sub("", stripped)
+    tags = _TAG_RE.findall(stripped)
     executor = tags[0] if tags else ""
 
     # Name = leading text with inline fields, tags and id comment removed.
-    name = rest
-    name = _ID_RE.sub("", name)
-    name = _INLINE_FIELD_RE.sub("", name)
-    name = re.sub(r'#[\w-]+', "", name)
-    name = name.strip()
+    name = re.sub(r'#[\w-]+', "", stripped).strip()
 
     action = fields.get("action") or "notify"
     message_type = fields.get("mtype") or "static"
 
-    return ScheduleEntry(
+    endpoint_config = None
+    params_malformed = False
+    if "endpoint" in fields:
+        method, _, path = fields["endpoint"].partition(" ")
+        params: dict = {}
+        if "params" in fields:
+            try:
+                params = _decode_params(fields["params"])
+            except (ValueError, TypeError):
+                params_malformed = True
+                params = {}
+        endpoint_config = {"endpoint": path, "method": method.upper(), "params": params}
+
+    entry = ScheduleEntry(
         id=entry_id,
         name=name,
         schedule_type=schedule_type,
         schedule_value=schedule_value,
         action=action,
         message_type=message_type,
+        endpoint_config=endpoint_config,
         executor=executor,
         bot=fields.get("bot", ""),
         enabled=(symbol == " "),
@@ -297,6 +373,10 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
         host=fields.get("host", ""),
         working_dir=fields.get("working_dir", ""),
     )
+    if params_malformed:
+        logger.warning(f"Malformed params field for schedule {entry_id}; falling back to cache")
+        entry._params_malformed = True
+    return entry
 
 
 def _format_entry_block(entry: ScheduleEntry) -> list[str]:
@@ -682,9 +762,16 @@ class SchedulerStore:
         prior = self._entries
         entries: dict[str, ScheduleEntry] = {}
         for _start, _end, entry in _iter_entry_blocks(lines):
+            had_endpoint_field = entry.endpoint_config is not None
             self._merge_prior(entry, prior.get(entry.id))
             entry.next_trigger_at = compute_next_trigger(entry) if entry.enabled else None
             entries[entry.id] = entry
+            # One-time migration: a pre-existing endpoint schedule whose line
+            # predates this field carries no endpoint field, so the cache
+            # supplied endpoint_config above. Persist it into the vault line
+            # now; the next parse finds it directly, so this runs at most once.
+            if entry.action == "endpoint" and not had_endpoint_field and entry.endpoint_config:
+                self._rewrite_block(entry)
         return entries
 
     @staticmethod
@@ -693,8 +780,12 @@ class SchedulerStore:
 
         ``message_content`` now lives in the markdown body, so markdown wins when
         a body is present; the cache fallback only fills entries written before
-        bodies existed (lazy migration). ``endpoint_config`` and run history have
-        no markdown representation and are always carried from the cache.
+        bodies existed (lazy migration). ``endpoint_config`` is similar: a vault
+        line carrying endpoint fields wins outright (including over a params
+        value that failed to parse, where only the cached ``params`` is used as
+        a fallback); a line with no endpoint fields at all still falls back to
+        the cache. Run history has no markdown representation and is always
+        carried from the cache.
         """
         if not prior:
             return
@@ -702,6 +793,8 @@ class SchedulerStore:
             entry.message_content = prior.message_content
         if entry.endpoint_config is None:
             entry.endpoint_config = prior.endpoint_config
+        elif getattr(entry, "_params_malformed", False) and prior.endpoint_config:
+            entry.endpoint_config["params"] = prior.endpoint_config.get("params") or {}
         if not entry.created_at:
             entry.created_at = prior.created_at
         if not entry.last_triggered_at:

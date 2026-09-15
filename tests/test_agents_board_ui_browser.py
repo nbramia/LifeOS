@@ -1510,6 +1510,62 @@ class TestDrawerAssigneeRevert:
         assert lane_calls == [{"lane": "assigned", "assignee": "codex"}]
 
 
+class TestDrawerContextRemoved:
+    def test_no_context_field_in_task_drawer(self, page: Page, agents_base_url):
+        """The drawer renders no Context label or [data-field="context"]
+        input for a task card."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator('#board-drawer [data-field="context"]')).to_have_count(0)
+        expect(page.locator("#board-drawer")).not_to_contain_text("Context")
+
+    def test_assignee_picker_still_works(self, page: Page, agents_base_url):
+        """The Assignee picker renders and saves through the lane endpoint."""
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator('[data-card-id="t2"]').click()
+        assignee = page.locator(".drawer-assignee")
+        expect(assignee).to_be_visible()
+        expect(assignee).to_have_value("me")
+        assignee.select_option("codex")
+        _wait_for(lambda: lane_calls == [{"lane": "assigned", "assignee": "codex"}], page=page)
+
+    def test_drawer_edits_on_a_work_context_task_never_send_context(self, page: Page, agents_base_url):
+        """t2 is fixtured with context "Work". Editing its title, notes,
+        tags, and assignee from the drawer must never send a `context` key
+        in any PUT body — none of those controls are wired to it."""
+        task_puts = []
+        lane_calls = []
+        board_state = copy.deepcopy(_board_fixture())
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts, lane_calls=lane_calls)
+        page.locator('[data-card-id="t2"]').click()
+
+        title = page.locator(".drawer-title")
+        title.fill("Ship the release, revised")
+        notes = page.locator(".drawer-notes")
+        notes.click()  # blur title
+        _wait_for(lambda: any(p.get("description") == "Ship the release, revised" for p in task_puts), page=page)
+
+        notes.fill("Updated notes from the drawer")
+        tags = page.locator(".drawer-tags")
+        tags.click()  # blur notes
+        _wait_for(lambda: any(p.get("notes") == "Updated notes from the drawer" for p in task_puts), page=page)
+
+        tags.fill("shipping")
+        page.locator(".drawer-tag-option-create").click()
+        _wait_for(lambda: any("shipping" in (p.get("tags") or []) for p in task_puts), page=page)
+
+        assignee = page.locator(".drawer-assignee")
+        assignee.select_option("codex")
+        _wait_for(lambda: any(c.get("assignee") == "codex" for c in lane_calls), page=page)
+
+        assert task_puts, "expected at least one PUT /api/tasks/{id} call"
+        assert not any("context" in p for p in task_puts), task_puts
+        assert not any("context" in c for c in lane_calls), lane_calls
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        assert t2["context"] == "Work"
+
+
 class TestScheduledCardDrawer:
     def test_editing_title_message_and_enabled_all_save_through_scheduler_api(self, page: Page, agents_base_url):
         """Round-1 finding 4: the scheduled card's title, message, and
@@ -1573,6 +1629,39 @@ class TestLiveUpdates:
         expect(page.locator('.board-lane[data-lane="in_progress"] [data-card-id="t1"]')).to_be_visible(timeout=8000)
         expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_have_count(0)
         assert page.url == url_before  # no page reload/navigation happened
+
+    @pytest.mark.parametrize("initial_allowed", [False, True])
+    def test_board_frame_updates_cancel_visibility_in_open_drawer(
+        self, page: Page, agents_base_url, initial_allowed: bool,
+    ):
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        card = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        card["policy"] = {
+            "cancel": _allowed(initial_allowed, None if initial_allowed else "refused"),
+        }
+        board_stream_frames: list[str] = []
+
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t2"]').click()
+        cancel = page.get_by_role("button", name="Cancel", exact=True)
+        expect(cancel).to_have_count(1 if initial_allowed else 0)
+
+        updated_board = copy.deepcopy(board_state)
+        updated_card = next(
+            card for card in updated_board["lanes"]["assigned"] if card["id"] == "t2"
+        )
+        updated_card["policy"]["cancel"] = _allowed(
+            not initial_allowed, None if not initial_allowed else "refused",
+        )
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(updated_board)}\n\n")
+        stream_gate.set()
+
+        expect(cancel).to_have_count(0 if initial_allowed else 1, timeout=5000)
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
 
     def test_drawer_notes_survive_a_board_frame_while_typing_and_flushes_on_blur(self, page: Page, agents_base_url):
         """Round-2 finding 5 (reworks round-1 finding 12(b)'s test, which was
@@ -3319,23 +3408,38 @@ class TestLaneFilterMultiSelect:
 
 class TestLaneAddButton:
     """AC 3: a full-width '+' button per visible DIRECT lane opens the
-    composer with that lane preselected; Review and Scheduled get no
-    button (plan_lane_move rejects both — api/services/agent_board.py).
-    Creating from the Assigned lane's '+' carries the chosen assignee tag
-    through both the POST /api/tasks body and the follow-up PUT .../lane."""
+    task composer with that lane preselected; Review gets no button at all
+    (plan_lane_move rejects it directly — api/services/agent_board.py).
+    Scheduled carries its own '+' that opens the schedule composer instead
+    (see tests/test_schedule_composer_ui_browser.py) — neither lane's
+    button ever opens the OTHER composer. Creating from the Assigned lane's
+    '+' carries the chosen assignee tag through both the POST /api/tasks
+    body and the follow-up PUT .../lane."""
 
-    def test_add_button_present_on_direct_lanes_and_absent_on_scheduled_and_review(self, page: Page, agents_base_url):
+    def test_add_button_present_on_direct_lanes_and_scheduled_absent_on_review(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
         for lane_id in ["unassigned", "assigned", "in_progress", "human_queue"]:
             expect(page.locator(f'.board-lane[data-lane="{lane_id}"] .board-lane-add')).to_be_visible()
-        # Guard the absence assertion the same way the Review half below
-        # does — asserting `.to_have_count(0)` alone passes vacuously if the
-        # Scheduled column itself is not rendering at all.
-        expect(page.locator('.board-lane[data-lane="scheduled"]')).to_be_visible()
-        expect(page.locator('.board-lane[data-lane="scheduled"] .board-lane-add')).to_have_count(0)
+        # The task composer's own lane select still excludes both
+        # undroppable lanes — Scheduled getting its own "+" (below) doesn't
+        # change what this select offers.
+        page.locator('.board-lane[data-lane="unassigned"] .board-lane-add').click()
+        expect(page.locator("#new-card-lane")).to_be_visible()
+        expect(page.locator('#new-card-lane option[value="scheduled"]')).to_have_count(0)
+        expect(page.locator('#new-card-lane option[value="review"]')).to_have_count(0)
+        page.locator("#new-card-cancel").click()
+
+        # Scheduled's own "+" opens the schedule composer, not the task
+        # composer this section otherwise covers.
+        expect(page.locator('.board-lane[data-lane="scheduled"] .board-lane-add')).to_be_visible()
+        page.locator('.board-lane[data-lane="scheduled"] .board-lane-add').click()
+        expect(page.locator('[data-field="action"]')).to_be_visible()
+        expect(page.locator("#new-card-desc")).to_have_count(0)
+        page.locator("#new-schedule-cancel").click()
 
         # Review and Snoozed are both empty in the fixture and hidden by
-        # default — check them so their absent "+" is actually observable.
+        # default — check them so their absent "+" is actually observable,
+        # not vacuously passing because the column itself never rendered.
         page.locator("#board-lane-filter-btn").click()
         page.locator("#board-lane-filter-options input[value='review']").check()
         page.locator("#board-lane-filter-options input[value='snoozed']").check()
@@ -4546,6 +4650,245 @@ class TestNotesAutosize:
         assert offset_height <= 400 * 0.67, offset_height  # 66vh + a little rounding slack
 
 
+class TestDrawerTitleWrap:
+    """The drawer title field is a `<textarea class="drawer-title"
+    data-field="title">` that wraps and grows with its content instead of
+    scrolling sideways. Saving stays blur-triggered; Enter commits the same
+    save without inserting a newline, and a pasted newline is collapsed to
+    a space before it ever reaches the PUT body."""
+
+    _LONG_TITLE = (
+        "Investigate the recurring outage affecting the checkout service "
+        "during peak traffic and coordinate a fix across every affected region"
+    )
+
+    def test_long_title_wraps_with_no_horizontal_scroll(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["title"] = self._LONG_TITLE
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        expect(title).to_have_value(self._LONG_TITLE)
+        scroll_width = title.evaluate("el => el.scrollWidth")
+        client_width = title.evaluate("el => el.clientWidth")
+        assert scroll_width <= client_width, (scroll_width, client_width)
+        # A single line of this title would need far more than the drawer's
+        # ~400px width — the box only avoids horizontal scroll (asserted
+        # above) by actually wrapping onto more than one line, which shows
+        # up as a multi-line-tall box rather than a single input row.
+        line_height = title.evaluate("el => parseFloat(getComputedStyle(el).lineHeight)")
+        offset_height = title.evaluate("el => el.offsetHeight")
+        assert offset_height > line_height * 1.5, (offset_height, line_height)
+
+    def test_height_grows_as_the_operator_types(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        short_height = title.evaluate("el => el.offsetHeight")
+        title.fill(self._LONG_TITLE)
+        grown_height = title.evaluate("el => el.offsetHeight")
+        assert grown_height > short_height, (short_height, grown_height)
+
+    def test_enter_saves_without_inserting_a_newline(self, page: Page, agents_base_url):
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        title.fill("Retitled via Enter")
+        title.press("Enter")
+        _wait_for(lambda: task_puts == [{"description": "Retitled via Enter"}], page=page)
+        assert "\n" not in title.input_value()
+
+    def test_pasted_newlines_collapse_to_spaces_in_the_put_body(self, page: Page, agents_base_url):
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        # Simulate a paste landing multi-line content in the field —
+        # dispatching `input` mirrors what a real paste triggers for the
+        # autosize + eventual blur-save handlers. `focus()` first, since an
+        # unfocused element's `blur()` call is a no-op that never fires the
+        # blur event this test depends on.
+        title.evaluate(
+            "el => { el.focus(); el.value = 'Line one\\nLine two\\nLine three'; "
+            "el.dispatchEvent(new Event('input', { bubbles: true })); el.blur(); }"
+        )
+        _wait_for(lambda: len(task_puts) == 1, page=page)
+        assert task_puts == [{"description": "Line one Line two Line three"}]
+
+    def test_scheduled_card_title_wraps_and_saves_through_the_scheduler_api(
+        self, page: Page, agents_base_url,
+    ):
+        board_state = _board_fixture()
+        for card in board_state["lanes"]["scheduled"]:
+            if card["id"] == "s1":
+                card["name"] = self._LONG_TITLE
+        schedule_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        page.locator('[data-card-id="s1"]').click()
+        title = page.locator(".drawer-title")
+        expect(title).to_have_value(self._LONG_TITLE)
+        scroll_width = title.evaluate("el => el.scrollWidth")
+        client_width = title.evaluate("el => el.clientWidth")
+        assert scroll_width <= client_width, (scroll_width, client_width)
+
+        title.fill("Evening briefing, renamed")
+        title.press("Enter")
+        _wait_for(lambda: schedule_puts == [{"name": "Evening briefing, renamed"}], page=page)
+        assert "\n" not in title.input_value()
+
+    def test_empty_or_unchanged_title_does_not_save(self, page: Page, agents_base_url):
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        expect(title).to_have_value("Investigate outage")
+
+        # Unchanged: blur without editing.
+        title.click()
+        page.locator(".drawer-notes").click()  # blur the title field
+        page.wait_for_timeout(200)
+        assert task_puts == []
+
+        # Emptied out entirely.
+        title.fill("")
+        page.locator(".drawer-notes").click()  # blur the title field
+        page.wait_for_timeout(200)
+        assert task_puts == []
+        expect(title).to_have_value("")
+
+    def test_failed_save_restores_the_previous_title_and_shows_the_error_toast(
+        self, page: Page, agents_base_url,
+    ):
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        title.fill("This will not stick")
+        title.press("Enter")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        release(0, status=500, detail="boom")
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        expect(title).to_have_value("Investigate outage")
+
+    def test_close_button_does_not_overlap_the_wrapped_title_text(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["title"] = self._LONG_TITLE
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        close_box = page.locator('[data-action="drawer-close"]').bounding_box()
+        title_box = title.bounding_box()
+        assert close_box and title_box
+        # `.drawer-title`'s right padding reserves a gutter the size of the
+        # close button so text never lays out underneath it — compute the
+        # content box's right edge (the box minus that padding, which is
+        # where wrapped glyphs actually end) and assert the close button
+        # starts at or beyond it.
+        padding_right = title.evaluate("el => parseFloat(getComputedStyle(el).paddingRight)")
+        content_right_edge = title_box["x"] + title_box["width"] - padding_right
+        assert close_box["x"] >= content_right_edge - 1, (close_box, title_box, content_right_edge)
+
+    def test_desktop_and_phone_widths_both_wrap_without_horizontal_scroll(
+        self, page: Page, agents_base_url,
+    ):
+        board_state = _board_fixture()
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["title"] = self._LONG_TITLE
+        for viewport in ({"width": 1280, "height": 800}, {"width": 390, "height": 844}):
+            page.set_viewport_size(viewport)
+            _open_board(page, agents_base_url, board_state=copy.deepcopy(board_state))
+            page.locator('[data-card-id="t1"]').click()
+            title = page.locator(".drawer-title")
+            expect(title).to_have_value(self._LONG_TITLE)
+            scroll_width = title.evaluate("el => el.scrollWidth")
+            client_width = title.evaluate("el => el.clientWidth")
+            assert scroll_width <= client_width, (viewport, scroll_width, client_width)
+
+    def test_enter_keeps_focus_in_the_title_field_and_saves_exactly_once(
+        self, page: Page, agents_base_url,
+    ):
+        """Enter must commit the title by calling the same save logic the
+        blur handler uses, directly — never by calling `.blur()` on the
+        field itself, which would move `document.activeElement` all the
+        way to `<body>`, outside `.board-drawer`, and drop the title out of
+        `updateOpenDrawer`'s `focused` guard while the save is still in
+        flight. A later, ordinary blur with no further edit — the ONLY
+        other event still wired to the same save function — must not
+        re-save the identical value a second time."""
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        title.fill("Retitled via Enter, focus stays")
+        title.press("Enter")
+        _wait_for(lambda: task_puts == [{"description": "Retitled via Enter, focus stays"}], page=page)
+        assert title.evaluate("el => el === document.activeElement")
+
+        page.locator(".drawer-notes").click()  # blurs the title field
+        page.wait_for_timeout(200)
+        assert task_puts == [{"description": "Retitled via Enter, focus stays"}]
+
+    def test_title_edit_survives_an_unrelated_board_frame_while_the_save_is_in_flight(
+        self, page: Page, agents_base_url,
+    ):
+        """Holds the title's own PUT in flight (`_hold_task_field_puts`),
+        then delivers an SSE `board` frame — withheld behind `stream_gate`
+        until this exact point, same technique as `TestLiveUpdates`'s notes
+        tests — that changes an UNRELATED field (a tag) on the SAME open
+        card. Enter's commit keeps focus in the title field rather than
+        calling `.blur()`, so `updateOpenDrawer`'s `focused` guard still
+        covers the field while its save is in flight, exactly as it
+        already does for the notes field mid-edit: the frame's stale title
+        never repaints over the operator's just-typed, already-saving
+        text."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_stream_frames: list[str] = []
+        task_puts: list = []
+        _open_board(
+            page, agents_base_url, board_state=board_state, task_puts=task_puts,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        title.fill("Renamed while a tick arrives")
+        title.press("Enter")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        # An unrelated field changes on the SAME card (t1) while the
+        # title's own save is still held.
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        # Proof the frame was actually applied: the tag chip shows up in
+        # the lane view, which render() always rebuilds regardless of
+        # drawer focus.
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text(
+            "urgent", timeout=5000,
+        )
+        # The title must still show the operator's just-typed value, not
+        # the frame's stale one.
+        expect(title).to_have_value("Renamed while a tick arrives")
+
+        release(0)
+        _wait_for(lambda: task_puts == [{"description": "Renamed while a tick arrives"}], page=page)
+
+
 class TestNoConsoleErrorsMainFlow:
     """Exercises the board's lane filter, per-lane add,
     drawer click-outside-close, notes autosize — and asserts the page never
@@ -4881,13 +5224,9 @@ class TestAgentCardMoveRulesAndCancel:
         expect(page.locator(".toast.error")).to_contain_text("cx:live1", timeout=5000)
         assert cancel_calls == ["t8"]
 
-    def test_cancel_button_disabled_with_reason_for_a_me_card_with_cancel_refused(self, page: Page, agents_base_url):
-        """The production-shaped case: a `me`-assigned card carries a real
-        `policy.cancel = {allowed: false, reason: ...}` block (every task
-        card does), not no policy at all. A control on a card with a real
-        policy block is never hidden when refused — it renders disabled,
-        with the server's reason visible next to it, the same as every
-        other refused control in this drawer."""
+    def test_refused_cancel_and_reason_are_absent_for_a_me_card(self, page: Page, agents_base_url):
+        """A task with an explicit refused Cancel policy omits both the
+        unavailable control and its server-provided explanation."""
         board_state = copy.deepcopy(_board_fixture())
         board_state["lanes"]["assigned"].append({
             "kind": "task", "id": "t11", "title": "My own task",
@@ -4903,12 +5242,30 @@ class TestAgentCardMoveRulesAndCancel:
         })
         _open_board(page, agents_base_url, board_state=board_state)
         page.locator('[data-card-id="t11"]').click()
-        cancel_btn = page.get_by_role("button", name="Cancel", exact=True)
-        expect(cancel_btn).to_be_visible()
-        expect(cancel_btn).to_be_disabled()
-        expect(page.locator('[data-field="cancel-reason"]')).to_contain_text(
+        expect(page.get_by_role("button", name="Cancel", exact=True)).to_have_count(0)
+        expect(page.locator('[data-field="cancel-reason"]')).to_have_count(0)
+        expect(page.locator("#board-drawer")).not_to_contain_text(
             "cancel is only available for agent-assigned cards"
         )
+
+    def test_allowed_cancel_shares_delete_row_and_fits_phone_width(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["assigned"].append(_unclaimed_agent_owned_card())
+        page.set_viewport_size({"width": 1280, "height": 800})
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t8"]').click()
+
+        cancel = page.get_by_role("button", name="Cancel", exact=True)
+        delete = page.get_by_role("button", name="Delete", exact=True)
+        expect(cancel).to_be_enabled()
+        expect(delete).to_be_visible()
+        assert cancel.evaluate("el => el.offsetTop") == delete.evaluate("el => el.offsetTop")
+
+        page.set_viewport_size({"width": 390, "height": 844})
+        actions = page.locator('#board-drawer [data-field="actions"]')
+        expect(actions).to_be_visible()
+        scroll_width, client_width = actions.evaluate("el => [el.scrollWidth, el.clientWidth]")
+        assert scroll_width <= client_width
 
     def test_cancel_on_unclaimed_agent_card_posts_and_lands_in_done(self, page: Page, agents_base_url):
         board_state = copy.deepcopy(_board_fixture())
@@ -5842,7 +6199,7 @@ class TestDrawerMetadata:
         _open_board(page, agents_base_url)
         page.locator('[data-card-id="t2"]').click()
         expect(page.locator("#board-drawer .drawer-section")).to_have_count(4)
-        for field in ("title", "notes", "context", "tags", "actions", "session-panel"):
+        for field in ("title", "notes", "tags", "actions", "session-panel"):
             expect(page.locator(f'#board-drawer [data-field="{field}"]')).to_have_count(1)
         expect(page.locator("#board-drawer .drawer-assignee")).to_have_count(1)
 

@@ -8,6 +8,7 @@ path is tested against a real store on a temp vault.
 import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 pytestmark = pytest.mark.unit
 
@@ -63,7 +64,8 @@ class TestSchedulerAPI:
     def test_create_propagates_execution_context(self, client, mock_store):
         response = client.post("/api/scheduler", json={
             "name": "Pinned", "schedule_type": "cron", "schedule_value": "0 9 * * *",
-            "action": "agent", "persona_id": "primary", "model_id": "gpt-synthetic",
+            "action": "agent", "message_content": "Draft the pinned update",
+            "persona_id": "primary", "model_id": "gpt-synthetic",
             "effort": "high", "host": "server", "working_dir": "/tmp/synthetic",
         })
         assert response.status_code == 200
@@ -140,6 +142,61 @@ class TestSchedulerAPI:
     def test_delete_not_found(self, client, mock_store):
         mock_store.delete.return_value = False
         assert client.delete("/api/scheduler/nope").status_code == 404
+
+
+class TestCreateScheduleValidation:
+    """POST /api/scheduler validates timezone and schedule_value the same
+    way PUT /api/scheduler/{id} does — a schedule created with an
+    unparsable value must never store, since it would then never compute
+    a next fire."""
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    @pytest.fixture
+    def mock_store(self):
+        with patch("api.routes.scheduler.get_scheduler_store") as mock:
+            store = mock.return_value
+            store.create.return_value = _sample_entry()
+            yield store
+
+    def test_rejects_invalid_cron_expression(self, client, mock_store):
+        resp = client.post("/api/scheduler", json={
+            "name": "X", "schedule_type": "cron", "schedule_value": "not a cron string",
+            "action": "notify",
+        })
+        assert resp.status_code == 422
+        assert "Invalid cron expression 'not a cron string'" in resp.json()["detail"]
+        mock_store.create.assert_not_called()
+
+    def test_rejects_invalid_once_datetime(self, client, mock_store):
+        resp = client.post("/api/scheduler", json={
+            "name": "X", "schedule_type": "once", "schedule_value": "not-a-date",
+            "action": "notify",
+        })
+        assert resp.status_code == 422
+        assert "Invalid ISO datetime 'not-a-date'" in resp.json()["detail"]
+        mock_store.create.assert_not_called()
+
+    def test_rejects_unknown_timezone(self, client, mock_store):
+        resp = client.post("/api/scheduler", json={
+            "name": "X", "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            "action": "notify", "timezone": "Nowhere/Fake",
+        })
+        assert resp.status_code == 422
+        assert "Unknown timezone 'Nowhere/Fake'" in resp.json()["detail"]
+        mock_store.create.assert_not_called()
+
+    def test_accepts_valid_cron_and_timezone(self, client, mock_store):
+        resp = client.post("/api/scheduler", json={
+            "name": "X", "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            "action": "notify", "message_content": "hi", "timezone": "America/Chicago",
+        })
+        assert resp.status_code == 200
+        mock_store.create.assert_called_once()
 
 
 class TestUpdateScheduleValidation:
@@ -271,6 +328,170 @@ class TestUpdateScheduleValidation:
         mock_store.update.assert_called_once()
 
 
+class TestActionInputValidation:
+    """The resulting action's own required inputs are enforced on both
+    create and update, in one shared function -- so a schedule
+    whose action has nothing to fire with is rejected before it's ever
+    saved, rather than failing silently at fire time."""
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    @pytest.fixture
+    def mock_store(self):
+        with patch("api.routes.scheduler.get_scheduler_store") as mock:
+            store = mock.return_value
+            entry = _sample_entry(action="agent", message_content="Draft my weekly review")
+            store.create.return_value = entry
+            store.get.return_value = entry
+            store.update.return_value = entry
+            yield store
+
+    def _create_payload(self, **overrides):
+        payload = {
+            "name": "X", "schedule_type": "cron", "schedule_value": "0 9 * * *",
+        }
+        payload.update(overrides)
+        return payload
+
+    # -- create: endpoint action --
+
+    def test_create_endpoint_action_without_config_rejects_on_method(self, client, mock_store):
+        resp = client.post("/api/scheduler", json=self._create_payload(action="endpoint"))
+        assert resp.status_code == 422
+        assert "endpoint_config.method" in resp.text
+        mock_store.create.assert_not_called()
+
+    def test_create_endpoint_action_with_bad_method_rejected(self, client, mock_store):
+        resp = client.post("/api/scheduler", json=self._create_payload(
+            action="endpoint", endpoint_config={"method": "DELETE", "endpoint": "/api/tasks"},
+        ))
+        assert resp.status_code == 422
+        assert "endpoint_config.method" in resp.text
+        mock_store.create.assert_not_called()
+
+    def test_create_endpoint_action_with_bad_path_rejected(self, client, mock_store):
+        resp = client.post("/api/scheduler", json=self._create_payload(
+            action="endpoint", endpoint_config={"method": "GET", "endpoint": "tasks"},
+        ))
+        assert resp.status_code == 422
+        assert "endpoint_config.endpoint" in resp.text
+        mock_store.create.assert_not_called()
+
+    def test_create_endpoint_action_with_non_object_params_rejected(self, client, mock_store):
+        resp = client.post("/api/scheduler", json=self._create_payload(
+            action="endpoint", endpoint_config={"method": "GET", "endpoint": "/api/tasks", "params": "nope"},
+        ))
+        assert resp.status_code == 422
+        assert "endpoint_config.params" in resp.text
+        mock_store.create.assert_not_called()
+
+    def test_create_endpoint_action_with_valid_config_normalizes_method_to_upper_case(self, client, mock_store):
+        resp = client.post("/api/scheduler", json=self._create_payload(
+            action="endpoint", endpoint_config={"method": "get", "endpoint": "/api/tasks"},
+        ))
+        assert resp.status_code == 200
+        assert mock_store.create.call_args.kwargs["endpoint_config"]["method"] == "GET"
+
+    def test_create_endpoint_action_with_absent_params_accepted(self, client, mock_store):
+        resp = client.post("/api/scheduler", json=self._create_payload(
+            action="endpoint", endpoint_config={"method": "POST", "endpoint": "/api/tasks"},
+        ))
+        assert resp.status_code == 200
+
+    def test_create_endpoint_action_with_object_params_accepted(self, client, mock_store):
+        resp = client.post("/api/scheduler", json=self._create_payload(
+            action="endpoint", endpoint_config={"method": "POST", "endpoint": "/api/tasks", "params": {"status": "todo"}},
+        ))
+        assert resp.status_code == 200
+        assert mock_store.create.call_args.kwargs["endpoint_config"]["params"] == {"status": "todo"}
+
+    # -- create: notify / prompt / agent --
+
+    @pytest.mark.parametrize("action", ["notify", "prompt", "agent"])
+    def test_create_blank_message_content_rejected(self, client, mock_store, action):
+        resp = client.post("/api/scheduler", json=self._create_payload(action=action))
+        assert resp.status_code == 422
+        assert "message_content" in resp.text
+        mock_store.create.assert_not_called()
+
+    @pytest.mark.parametrize("action", ["notify", "prompt", "agent"])
+    def test_create_whitespace_only_message_content_rejected(self, client, mock_store, action):
+        resp = client.post("/api/scheduler", json=self._create_payload(action=action, message_content="   "))
+        assert resp.status_code == 422
+        assert "message_content" in resp.text
+        mock_store.create.assert_not_called()
+
+    @pytest.mark.parametrize("action", ["notify", "prompt", "agent"])
+    def test_create_non_blank_message_content_accepted(self, client, mock_store, action):
+        resp = client.post("/api/scheduler", json=self._create_payload(action=action, message_content="hi"))
+        assert resp.status_code == 200
+
+    # -- update: only validated when the patch touches action/message_content/endpoint_config --
+
+    def test_update_action_alone_validated_against_the_stored_message_content(self, client, mock_store):
+        mock_store.get.return_value = _sample_entry(action="notify", message_content="")
+        resp = client.put("/api/scheduler/sch-1", json={"action": "prompt"})
+        assert resp.status_code == 422
+        assert "message_content" in resp.text
+        mock_store.update.assert_not_called()
+
+    def test_update_action_alone_accepted_against_the_stored_message_content(self, client, mock_store):
+        mock_store.get.return_value = _sample_entry(action="notify", message_content="hi")
+        resp = client.put("/api/scheduler/sch-1", json={"action": "prompt"})
+        assert resp.status_code == 200
+        assert mock_store.update.call_args.kwargs["action"] == "prompt"
+
+    def test_update_action_to_endpoint_without_existing_config_rejected(self, client, mock_store):
+        mock_store.get.return_value = _sample_entry(action="notify", message_content="hi", endpoint_config=None)
+        resp = client.put("/api/scheduler/sch-1", json={"action": "endpoint"})
+        assert resp.status_code == 422
+        assert "endpoint_config.method" in resp.text
+        mock_store.update.assert_not_called()
+
+    def test_update_endpoint_config_alone_validated_against_the_stored_action(self, client, mock_store):
+        mock_store.get.return_value = _sample_entry(action="endpoint", endpoint_config={"method": "GET", "endpoint": "/api/tasks"})
+        resp = client.put("/api/scheduler/sch-1", json={"endpoint_config": {"method": "PATCH", "endpoint": "/api/tasks"}})
+        assert resp.status_code == 422
+        assert "endpoint_config.method" in resp.text
+        mock_store.update.assert_not_called()
+
+    def test_update_endpoint_config_normalizes_method_to_upper_case(self, client, mock_store):
+        mock_store.get.return_value = _sample_entry(action="endpoint", endpoint_config={"method": "GET", "endpoint": "/api/tasks"})
+        resp = client.put("/api/scheduler/sch-1", json={"endpoint_config": {"method": "post", "endpoint": "/api/tasks"}})
+        assert resp.status_code == 200
+        assert mock_store.update.call_args.kwargs["endpoint_config"]["method"] == "POST"
+
+    def test_update_message_content_alone_rejected_when_blank_for_the_stored_action(self, client, mock_store):
+        mock_store.get.return_value = _sample_entry(action="prompt", message_content="the old prompt")
+        resp = client.put("/api/scheduler/sch-1", json={"message_content": ""})
+        assert resp.status_code == 422
+        assert "message_content" in resp.text
+        mock_store.update.assert_not_called()
+
+    def test_update_unrelated_field_on_a_preexisting_invalid_entry_still_succeeds(self, client, mock_store):
+        """An entry whose stored fields wouldn't pass this check on their
+        own must not be permanently unable to accept an unrelated patch --
+        only a patch that touches action,
+        message_content, or endpoint_config is checked."""
+        mock_store.get.return_value = _sample_entry(action="notify", message_content="")
+        resp = client.put("/api/scheduler/sch-1", json={"enabled": False})
+        assert resp.status_code == 200
+        mock_store.update.assert_called_once()
+        assert mock_store.update.call_args.kwargs.get("enabled") is False
+        assert "action" not in mock_store.update.call_args.kwargs
+        assert "message_content" not in mock_store.update.call_args.kwargs
+
+    def test_update_endpoint_config_touching_only_params_validated_against_stored_method_and_path(self, client, mock_store):
+        mock_store.get.return_value = _sample_entry(action="endpoint", endpoint_config={"method": "GET", "endpoint": "/api/tasks"})
+        resp = client.put("/api/scheduler/sch-1", json={"endpoint_config": {"method": "GET", "endpoint": "/api/tasks", "params": {"status": "todo"}}})
+        assert resp.status_code == 200
+        assert mock_store.update.call_args.kwargs["endpoint_config"]["params"] == {"status": "todo"}
+
+
 class TestScheduleTypeConversionAgainstARealStore:
     """End-to-end proof of a cron<->once conversion against a real
     SchedulerStore (not a mock), so a passing test means the stored entry
@@ -366,6 +587,154 @@ class TestListBots:
         mock.return_value.get.assert_not_called()
 
 
+class TestPreviewSchedule:
+    """`POST /api/scheduler/preview` — the create-schedule composer's live
+    fire-time preview, computed with `compute_next_n_triggers` but never
+    touching the store."""
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    def test_cron_in_non_utc_timezone(self, client):
+        """DST-safe: asserts the returned times land at 9am local and at a
+        UTC offset America/New_York actually uses (-4 EDT or -5 EST) rather
+        than depending on today's date landing on either side of a DST
+        transition, or on a fixed offset a cron-evaluated-in-UTC bug would
+        also happen to produce."""
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            "timezone": "America/New_York",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["next"]) == 3
+        parsed = [datetime.fromisoformat(t) for t in data["next"]]
+        assert parsed == sorted(parsed)
+        for dt in parsed:
+            assert dt.tzinfo == timezone.utc
+            local = dt.astimezone(ZoneInfo("America/New_York"))
+            assert (local.hour, local.minute) == (9, 0)
+            assert local.utcoffset() in (timedelta(hours=-4), timedelta(hours=-5))
+
+    def test_once_in_future_returns_single_time(self, client):
+        future = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "once", "schedule_value": future.isoformat(),
+        })
+        assert resp.status_code == 200
+        assert resp.json()["next"] == [future.astimezone(timezone.utc).isoformat()]
+
+    def test_once_in_past_returns_empty(self, client):
+        past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "once", "schedule_value": past,
+        })
+        assert resp.status_code == 200
+        assert resp.json()["next"] == []
+
+    def test_invalid_cron_returns_422_matching_create_wording(self, client):
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "cron", "schedule_value": "not a cron",
+        })
+        assert resp.status_code == 422
+        assert "Invalid cron expression 'not a cron'" in resp.json()["detail"]
+
+    def test_invalid_iso_datetime_returns_422_matching_create_wording(self, client):
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "once", "schedule_value": "not-a-date",
+        })
+        assert resp.status_code == 422
+        assert "Invalid ISO datetime 'not-a-date'" in resp.json()["detail"]
+
+    def test_invalid_timezone_returns_422(self, client):
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            "timezone": "Nowhere/Fake",
+        })
+        assert resp.status_code == 422
+        assert "Unknown timezone 'Nowhere/Fake'" in resp.json()["detail"]
+
+    def test_bad_schedule_type_returns_400(self, client):
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "weekly", "schedule_value": "0 9 * * *",
+        })
+        assert resp.status_code == 400
+
+    def test_omitted_timezone_defaults_to_configured_timezone(self, client):
+        with patch("api.routes.scheduler.settings.timezone", "America/Chicago"):
+            resp = client.post("/api/scheduler/preview", json={
+                "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            })
+        assert resp.status_code == 200
+        parsed = datetime.fromisoformat(resp.json()["next"][0])
+        local = parsed.astimezone(ZoneInfo("America/Chicago"))
+        assert local.hour == 9
+
+    def test_response_includes_explicit_timezone(self, client):
+        resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            "timezone": "America/New_York",
+        })
+        assert resp.status_code == 200
+        assert resp.json()["timezone"] == "America/New_York"
+
+    def test_response_includes_default_timezone_when_omitted(self, client):
+        with patch("api.routes.scheduler.settings.timezone", "America/Chicago"):
+            resp = client.post("/api/scheduler/preview", json={
+                "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            })
+        assert resp.status_code == 200
+        assert resp.json()["timezone"] == "America/Chicago"
+
+    def test_naive_once_datetime_agrees_with_created_schedules_next_trigger(self, client):
+        """A naive `once` datetime in a non-default timezone: the instant
+        `POST /api/scheduler/preview` reports must be the exact instant a
+        schedule created with the same body computes as its
+        `next_trigger_at` — both read the same naive wall-clock value as
+        `Asia/Tokyo`, not the server's default zone."""
+        from api.services.scheduler_store import SchedulerStore
+
+        future_naive = "2027-03-15T08:30:00"
+        preview_resp = client.post("/api/scheduler/preview", json={
+            "schedule_type": "once", "schedule_value": future_naive,
+            "timezone": "Asia/Tokyo",
+        })
+        assert preview_resp.status_code == 200
+        assert preview_resp.json()["next"] == [
+            datetime.fromisoformat(future_naive).replace(tzinfo=ZoneInfo("Asia/Tokyo"))
+            .astimezone(timezone.utc).isoformat()
+        ]
+
+        import tempfile
+        import pathlib
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SchedulerStore(
+                vault_path=pathlib.Path(tmp) / "vault", index_path=pathlib.Path(tmp) / "idx.json",
+            )
+            with patch("api.routes.scheduler.get_scheduler_store", return_value=store):
+                create_resp = client.post("/api/scheduler", json={
+                    "name": "Tokyo once", "schedule_type": "once", "schedule_value": future_naive,
+                    "action": "notify", "message_content": "hi", "timezone": "Asia/Tokyo",
+                })
+        assert create_resp.status_code == 200
+        assert create_resp.json()["next_trigger_at"] == preview_resp.json()["next"][0]
+
+    def test_not_captured_by_the_schedule_id_route(self, client):
+        """POST /preview is declared before GET/PUT/DELETE /{schedule_id} —
+        a store whose `get` would happily resolve "preview" as a schedule
+        id must never be reached for this path."""
+        with patch("api.routes.scheduler.get_scheduler_store") as mock:
+            mock.return_value.get.return_value = _sample_entry()
+            resp = client.post("/api/scheduler/preview", json={
+                "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            })
+        assert resp.status_code == 200
+        mock.return_value.get.assert_not_called()
+
+
 class TestReminderAliasStillWorks:
     """The legacy /api/reminders surface must keep functioning."""
 
@@ -409,6 +778,100 @@ class TestManageSchedulesAgentTool:
         assert len(created) == 1
         assert created[0].action == "agent"
         assert created[0].executor == "cloud"
+
+    def test_create_blank_message_rejected_and_writes_nothing(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "create",
+                "name": "Silent",
+                "schedule_type": "cron",
+                "schedule_value": "0 9 * * *",
+                "schedule_action": "notify",
+                "message_content": "   ",
+            })
+        assert "Error" in out
+        assert "message_content must not be blank" in out
+        assert store.list_all() == []
+
+    def test_create_endpoint_action_without_config_rejected_and_writes_nothing(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "create",
+                "name": "Unconfigured endpoint",
+                "schedule_type": "cron",
+                "schedule_value": "0 9 * * *",
+                "schedule_action": "endpoint",
+            })
+        assert "Error" in out
+        assert "endpoint_config.method" in out
+        assert store.list_all() == []
+
+    def test_update_to_blank_message_rejected_and_leaves_entry_unchanged(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        created = store.create(name="Keep me", schedule_type="cron",
+                               schedule_value="0 9 * * *", action="notify",
+                               message_content="Good morning")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "update", "schedule_id": created.id,
+                "message_content": "   ",
+            })
+        assert "Error" in out
+        assert "message_content must not be blank" in out
+        refreshed = store.get(created.id)
+        assert refreshed.message_content == "Good morning"
+
+    def test_update_action_to_endpoint_without_config_rejected_and_leaves_entry_unchanged(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        created = store.create(name="Notifier", schedule_type="cron",
+                               schedule_value="0 9 * * *", action="notify",
+                               message_content="Good morning")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "update", "schedule_id": created.id,
+                "schedule_action": "endpoint",
+            })
+        assert "Error" in out
+        assert "endpoint_config.method" in out
+        refreshed = store.get(created.id)
+        assert refreshed.action == "notify"
+
+    def test_update_action_to_prompt_with_existing_message_accepted(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        created = store.create(name="Switches action", schedule_type="cron",
+                               schedule_value="0 9 * * *", action="notify",
+                               message_content="Good morning")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "update", "schedule_id": created.id,
+                "schedule_action": "prompt",
+            })
+        assert "Schedule updated" in out
+        refreshed = store.get(created.id)
+        assert refreshed.action == "prompt"
+        assert refreshed.message_content == "Good morning"
 
     def test_list_schedules_tool(self, tmp_path):
         from api.services.scheduler_store import SchedulerStore
