@@ -553,14 +553,25 @@ class TestUpdate:
         assert updated.done_date is None
         assert updated.cancelled_date == date.today().isoformat()
 
-    def test_update_status_to_done_again_does_not_clear_its_own_date(self, task_manager):
+    def test_update_status_to_done_again_does_not_clear_its_own_date(self, task_manager, monkeypatch):
         """A status write that keeps the task at done (no actual status
-        change) must not clear the date it just stamped."""
+        change) must not clear the date it just stamped. Stamps an old
+        date via a monkeypatched `_today` before flipping it for the
+        second write — both calls landing on the real "today" would make
+        a bug that re-stamps on every status="done" write (even a no-op
+        one) indistinguishable from the correct behavior, since either way
+        `updated.done_date` would equal `first.done_date`."""
+        import api.services.task_manager as task_manager_module
+
         task = task_manager.create("Already done")
+        monkeypatch.setattr(task_manager_module, "_today", lambda: "2020-01-01")
         first = task_manager.update(task.id, status="done")
+        assert first.done_date == "2020-01-01"
+
+        monkeypatch.setattr(task_manager_module, "_today", lambda: "2021-06-15")
         updated = task_manager.update(task.id, status="done", notes="unrelated edit")
 
-        assert updated.done_date == first.done_date
+        assert updated.done_date == first.done_date == "2020-01-01"
 
     def test_update_nonexistent_task(self, task_manager):
         """Test updating a non-existent task."""

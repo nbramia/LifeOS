@@ -520,14 +520,26 @@ export function initBoard() {
   // `status="blocked"` and never touches tags, so replaying it after the
   // card's own trip through Done (which strips `#human` on the way in) or
   // Assigned (which swaps the assignee tag) can't bring back the tag or
-  // status the card actually had before the drag. `snapshot` — the
-  // card's exact status/tags immediately before the drag — restores that
-  // directly instead, through the same general task-update endpoint the
-  // drawer's own edits use (see restoreCardSnapshot below).
-  function undoToLane(cardId, lane, assignee, snoozedUntil, snapshot) {
+  // status the card actually had before the drag.
+  //
+  // A restore FROM Done is equally unsafe by replay, in the other
+  // direction: plan_lane_move's `unassigned`/`assigned`/`in_progress`
+  // branches only ever touch TAGS, never `status` — so replaying any of
+  // them against a card current sitting at `status="done"` leaves it at
+  // `status="done"` regardless of the tag write, and `derive_lane` keeps
+  // deriving Done from that status no matter what the tags now say. The
+  // card silently never leaves Done at all (`wasMovedToDone` is true
+  // whenever the move actually being undone had `targetLane === 'done'`,
+  // independent of the restore target).
+  //
+  // Either way, `snapshot` — the card's exact status/tags immediately
+  // before the drag — restores that directly instead, through the same
+  // general task-update endpoint the drawer's own edits use (see
+  // restoreCardSnapshot below).
+  function undoToLane(cardId, lane, assignee, snoozedUntil, snapshot, wasMovedToDone) {
     const restore = lane === 'review'
       ? undoAcceptedCard(cardId, () => {})
-      : lane === 'human_queue'
+      : (lane === 'human_queue' || wasMovedToDone)
         ? restoreCardSnapshot(cardId, snapshot)
         : moveCard(cardId, lane, assignee || undefined);
     return restore
@@ -547,12 +559,18 @@ export function initBoard() {
   // the card exactly as the server currently has it, with a toast) rather
   // than silently overwriting a reassignment or claim the worker made while
   // the card sat outside Human queue — see api/routes/tasks.py's
-  // `update_task`.
+  // `update_task`. Rethrows on failure, matching moveCard: undoToLane's
+  // caller (showUndoableToast) only restores the toast's "Undo" label and
+  // keeps the toast up on a rejection, so a swallowed error here would
+  // report a refused restore as a success and, for a card that was
+  // snoozed, still go on to re-snooze a card the restore never actually
+  // touched.
   function restoreCardSnapshot(cardId, snapshot) {
     if (!snapshot) return Promise.resolve();
     return putTask(cardId, { status: snapshot.status, tags: snapshot.tags })
-      .catch(() => {
+      .catch((err) => {
         showToast("Couldn't undo — the card may have changed since.", true);
+        throw err;
       });
   }
 
@@ -1203,7 +1221,7 @@ export function initBoard() {
         showUndoableToast(`Moved "${title}" to ${laneLabel(targetLane)}.`, () => (
           undoToLane(cardId, priorNaturalLane, priorAssignee, priorSnoozedUntil, {
             status: priorStatus, tags: priorTags,
-          })
+          }, targetLane === 'done')
         ));
       })
       .catch(() => {});
@@ -2501,6 +2519,7 @@ export function initBoard() {
     const actionsEl = drawerEl.querySelector('[data-field="actions"]');
     if (!actionsEl) return;
     const cardHandlers = cardActionHandlers(card, {
+      findCard,
       onChanged: fetchBoard,
       onAccepted: closeDrawer,
       onMutationOpened: pauseTagPickerWrites,

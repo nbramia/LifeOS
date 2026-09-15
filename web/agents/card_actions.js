@@ -205,7 +205,19 @@ async function putTask(taskId, patch) {
 // endpoint the drawer's own edits use — its assignee/claim-tag guard
 // refuses the write (leaving the card as the server currently has it)
 // rather than clobbering a reassignment or claim made while it sat in Done.
-export async function resolveCard(card, onChanged) {
+//
+// `findCard`, when given, resolves the card's live board state at the
+// moment this is actually invoked — `card` itself is whatever
+// `cardActionHandlers(card, ...)` closed over when the drawer's action row
+// was last (re)built, which the drawer skips redoing while focus sits
+// inside it (e.g. right after picking a tag in the Tags search box), so a
+// tag added there is not yet reflected in `card` by the time Mark Done is
+// clicked. Snapshotting from the stale closure would restore the card
+// without that tag on Undo; snapshotting from `findCard`'s live read does not.
+export async function resolveCard(card, onChanged, findCard) {
+  const current = (findCard && findCard(card.id)) || card;
+  const priorStatus = current.status;
+  const priorTags = (current.tags || []).slice();
   try {
     const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/lane`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lane: 'done' }),
@@ -224,8 +236,6 @@ export async function resolveCard(card, onChanged) {
     if (data && data.lane && data.lane !== 'done') {
       showToast(`Card landed in ${laneLabelFor(data.lane)}, not Done.`, false);
     } else {
-      const priorStatus = card.status;
-      const priorTags = (card.tags || []).slice();
       showUndoableToast(`Marked "${card.title || card.id}" done.`, () => (
         putTask(card.id, { status: priorStatus, tags: priorTags })
           .then(async (undoData) => {
@@ -451,7 +461,7 @@ export function cardActionHandlers(card, {
       onMutationOpened, onMutationCancelled,
       onMutationConfirmed, onMutationFailed,
     }),
-    resolve: () => resolveCard(card, changed),
+    resolve: () => resolveCard(card, changed, findCard),
     snooze: (until) => snoozeCard(card, until, changed),
     unsnooze: () => unsnoozeCard(card, changed),
     cancel: () => cancelCard(card, changed),

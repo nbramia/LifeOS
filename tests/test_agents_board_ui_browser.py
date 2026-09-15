@@ -301,7 +301,8 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                   kill_calls: "list | None" = None, kill_status_code: "list | None" = None,
                   kill_failures: "list | None" = None,
                   task_deletes: "list | None" = None, schedule_deletes: "list | None" = None,
-                  call_log: "list | None" = None, snooze_calls: "list | None" = None):
+                  call_log: "list | None" = None, snooze_calls: "list | None" = None,
+                  task_put_status_code: "list | None" = None):
     """Stub d3 (offline CDN) + every /api/ call the page makes.
 
     `snooze_calls`: appended with `{"method": "PUT"|"DELETE", "id", "body"}`
@@ -326,6 +327,12 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
     entries under `failures` (and an empty `killed` list) instead of a
     clean kill — the "the endpoint said OK but didn't actually kill
     anything" shape, distinct from `kill_status_code`'s transport failure.
+    `task_put_status_code`, when given, is a one-element list read fresh on
+    every `PUT /api/tasks/{id}` call (mirrors `kill_status_code`/
+    `lane_status_code`) — a non-200 entry makes that stub fail (and, unlike
+    the 200 path, never mutates `board_state`), for exercising a refused
+    Undo restore (`web/agents/board.js`'s `restoreCardSnapshot`,
+    `web/agents/card_actions.js`'s `resolveCard`).
     `task_deletes`/`schedule_deletes`: appended with each deleted id
     (DELETE /api/tasks/{id} / DELETE /api/scheduler/{id}); a successful
     delete also removes the card from `board_state` so a re-fetch shows
@@ -681,10 +688,17 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             except ValueError:
                 body = {}
             task_puts.append(body)
+            task_id = task_match.group(1)
+            put_code = task_put_status_code[0] if task_put_status_code else 200
+            if put_code != 200:
+                route.fulfill(
+                    status=put_code, content_type="application/json",
+                    body=json.dumps({"detail": "boom"}),
+                )
+                return
             # Mutate the fixture card the way a real PUT would, so a test
             # that reopens the drawer to check a saved value doesn't see
             # the stale fixture (mirrors _move_card_in_state; #859 trap 3).
-            task_id = task_match.group(1)
             card_ref = None
             for cards in board_state["lanes"].values():
                 for card in cards:
@@ -784,7 +798,8 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
                  schedule_puts=None, board_stream_frames=None, stream_gate=None, lane_response=None,
                  open_calls=None, open_response=None, task_posts=None, cancel_calls=None, cancel_failures=None,
                  kill_calls=None, kill_status_code=None, kill_failures=None,
-                 task_deletes=None, schedule_deletes=None, call_log=None, snooze_calls=None):
+                 task_deletes=None, schedule_deletes=None, call_log=None, snooze_calls=None,
+                 task_put_status_code=None):
     _stub_routes(
         page,
         board_state if board_state is not None else _board_fixture(),
@@ -807,6 +822,7 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
         schedule_deletes,
         call_log,
         snooze_calls,
+        task_put_status_code,
     )
     page.goto(f"{base_url}/agents")
     page.wait_for_selector('[data-card-id="t1"]')
@@ -5841,17 +5857,32 @@ class TestMutationUndo:
         assert lane_calls[-1]["lane"] == "unassigned", lane_calls
         expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_be_visible()
 
+    @staticmethod
+    def _human_todo_card():
+        # A #human card filed at status "todo" (not "blocked") — the one
+        # shape that makes the STATUS half of AC1 falsifiable. A "blocked"
+        # origin can't distinguish the correct restore from the lossy
+        # human_queue-branch replay, which also forces status="blocked".
+        return {
+            "kind": "task", "id": "t-human-open", "title": "Open human queue card",
+            "notes": "", "status": "todo", "tags": ["human", "me"], "assignee": "me",
+            "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        }
+
     def test_mark_done_confirms_with_an_undo_that_returns_the_card(
         self, page: Page, agents_base_url,
     ):
-        """Undo restores the card's exact pre-move status and tags, not just
-        its lane — t4 is a manually-filed `#human` card (status "blocked"),
-        so asserting lane alone would pass even though a status="blocked"-
-        without-touching-tags replay silently drops the tag."""
+        """Undo restores the card's exact pre-move status AND tags — a
+        status of "todo" makes the status half of AC1 falsifiable
+        (hardcoding status="blocked" into the restore write would still
+        pass a "blocked"-origin test, but not this one)."""
+        board = _board_fixture()
+        board["lanes"]["human_queue"].append(self._human_todo_card())
         lane_calls = []
         task_puts = []
-        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
-        page.locator('[data-card-id="t4"]').click()
+        _open_board(page, agents_base_url, board_state=board, lane_calls=lane_calls, task_puts=task_puts)
+        page.locator('[data-card-id="t-human-open"]').click()
         page.locator('#board-drawer [data-action="resolve"]').click()
         _wait_for(lambda: bool(lane_calls), page)
         assert lane_calls[0] == {"lane": "done"}, lane_calls
@@ -5860,8 +5891,11 @@ class TestMutationUndo:
         expect(toast.locator(".toast-action")).to_have_text("Undo")
         toast.locator(".toast-action").click()
         _wait_for(lambda: bool(task_puts), page)
-        assert task_puts[-1] == {"status": "blocked", "tags": ["human", "me"]}, task_puts
-        expect(page.locator('.board-lane[data-lane="human_queue"] [data-card-id="t4"]')).to_be_visible()
+        assert task_puts[-1] == {"status": "todo", "tags": ["human", "me"]}, task_puts
+        card = next(c for lane in board["lanes"].values() for c in lane if c["id"] == "t-human-open")
+        assert card["status"] == "todo", card
+        assert card["tags"] == ["human", "me"], card
+        expect(page.locator('.board-lane[data-lane="human_queue"] [data-card-id="t-human-open"]')).to_be_visible()
 
     def test_dragging_a_human_queue_card_to_done_and_undo_restores_its_state(
         self, page: Page, agents_base_url,
@@ -5871,17 +5905,20 @@ class TestMutationUndo:
         (agent_board.plan_lane_move's `done` branch), and Undo must bring
         back the exact status and tags the card had before the drag rather
         than replaying the lane endpoint's human_queue branch, which only
-        ever forces status="blocked" without touching tags."""
+        ever forces status="blocked" without touching tags. A status of
+        "todo" makes the status half of AC1 falsifiable here too."""
         page.set_viewport_size({"width": 2400, "height": 900})
+        board = _board_fixture()
+        board["lanes"]["human_queue"].append(self._human_todo_card())
         lane_calls = []
         task_puts = []
-        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
+        _open_board(page, agents_base_url, board_state=board, lane_calls=lane_calls, task_puts=task_puts)
         page.locator("#board-lane-filter-btn").click()
         page.locator("#board-lane-filter-options input[value='done']").check()
-        expect(page.locator('[data-card-id="t4"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t-human-open"]')).to_be_visible()
 
-        _drag_card(page, "t4", "done")
-        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t4']")).to_be_visible(timeout=5000)
+        _drag_card(page, "t-human-open", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t-human-open']")).to_be_visible(timeout=5000)
         assert lane_calls == [{"lane": "done"}], lane_calls
 
         toast = page.locator(".toast")
@@ -5889,13 +5926,16 @@ class TestMutationUndo:
         toast.locator(".toast-action").click()
 
         _wait_for(lambda: bool(task_puts), page)
-        assert task_puts[-1] == {"status": "blocked", "tags": ["human", "me"]}, task_puts
+        assert task_puts[-1] == {"status": "todo", "tags": ["human", "me"]}, task_puts
         # Exactly one lane PUT ever happens (the original drag) — the
         # restore goes through the general task-update endpoint, never a
         # second lane move that would force status="blocked" without
         # restoring tags.
         assert lane_calls == [{"lane": "done"}], lane_calls
-        expect(page.locator(".board-lane[data-lane='human_queue'] [data-card-id='t4']")).to_be_visible(timeout=5000)
+        card = next(c for lane in board["lanes"].values() for c in lane if c["id"] == "t-human-open")
+        assert card["status"] == "todo", card
+        assert card["tags"] == ["human", "me"], card
+        expect(page.locator(".board-lane[data-lane='human_queue'] [data-card-id='t-human-open']")).to_be_visible(timeout=5000)
 
     def test_dragging_a_manually_blocked_card_to_done_and_undo_restores_it_without_a_human_tag(
         self, page: Page, agents_base_url,
@@ -5908,7 +5948,13 @@ class TestMutationUndo:
         always worker-claimed (agent_board.is_claimed treats that tag as a
         claim regardless of a live session), so the server refuses to drag
         it to Done at all — this exercises the one Human-queue arrival this
-        Undo path can actually be reached from without the tag."""
+        Undo path can actually be reached from without the tag. Asserts on
+        the restored card's actual end state (not just that a PUT fired):
+        for this no-tag "blocked" card the old lossy replay happens to
+        produce the identical end state, so the request-shape assertion
+        alone is not itself evidence for AC2 — the point of this test is
+        that no `#human` tag gets invented, which the end-state check below
+        actually verifies."""
         page.set_viewport_size({"width": 2400, "height": 900})
         board = _board_fixture()
         board["lanes"]["human_queue"].append({
@@ -5933,7 +5979,186 @@ class TestMutationUndo:
 
         _wait_for(lambda: bool(task_puts), page)
         assert task_puts[-1] == {"status": "blocked", "tags": []}, task_puts
+        card = next(c for lane in board["lanes"].values() for c in lane if c["id"] == "t-blocked")
+        assert card["status"] == "blocked", card
+        assert card["tags"] == [], card
         expect(page.locator(".board-lane[data-lane='human_queue'] [data-card-id='t-blocked']")).to_be_visible(timeout=5000)
+
+    def test_undo_after_marking_done_keeps_a_tag_added_in_the_drawer(
+        self, page: Page, agents_base_url,
+    ):
+        """Round-1 review, Action Required 1: resolveCard's snapshot must
+        reflect the card's LIVE board state at the moment Mark Done is
+        clicked, not the `card` object `cardActionHandlers(card)` closed
+        over when the drawer's action row was last (re)built.
+        `renderDrawerActions(fresh)` only fires from a full drawer rebuild,
+        which `updateOpenDrawer` (board.js) skips while focus sits inside
+        the drawer — and picking a tag from the Tags picker's "Create new"
+        option leaves focus in the tags search box, so a tag added there
+        and then Mark Done clicked without ever refocusing outside the
+        drawer must still survive Undo."""
+        board_state = _board_fixture()
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, lane_calls=lane_calls, task_puts=task_puts)
+        page.locator('[data-card-id="t4"]').click()
+        search = page.locator(".drawer-tags")
+        search.fill("example-extra")
+        expect(page.locator(".drawer-tag-option-create")).to_contain_text("#example-extra")
+        page.locator(".drawer-tag-option-create").click()
+        _wait_for(lambda: any("example-extra" in (p.get("tags") or []) for p in task_puts), page=page)
+        t4 = next(card for lane in board_state["lanes"].values() for card in lane if card["id"] == "t4")
+        prior_tags = list(t4["tags"])
+        assert "example-extra" in prior_tags, t4
+
+        # Focus is still inside the drawer (the tags search box) — exactly
+        # the state that leaves the action row's own closure stale.
+        page.locator('#board-drawer [data-action="resolve"]').click()
+        _wait_for(lambda: bool(lane_calls), page)
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: len(task_puts) >= 2 and task_puts[-1].get("status") is not None, page)
+        assert task_puts[-1] == {"status": "blocked", "tags": prior_tags}, task_puts
+
+    def test_dragging_an_unassigned_card_to_done_and_undo_restores_it(
+        self, page: Page, agents_base_url,
+    ):
+        """Undo out of Done is broken for Unassigned (and Assigned) cards
+        too if it merely replays the lane endpoint: plan_lane_move's
+        unassigned/assigned branches never touch `status`, so replaying
+        `{lane: 'unassigned'}` against a card still at status="done"
+        leaves it exactly there (derive_lane keeps deriving Done from that
+        status regardless of what the tags now say), reporting "Card
+        landed in Done, not Unassigned." instead of actually moving it.
+        Any Undo of a move INTO Done must restore the exact pre-move
+        snapshot, whatever the restore target lane is."""
+        page.set_viewport_size({"width": 2400, "height": 900})
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+
+        _drag_card(page, "t1", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+        assert lane_calls == [{"lane": "done"}], lane_calls
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        assert task_puts[-1] == {"status": "todo", "tags": []}, task_puts
+        # Never a second lane-endpoint call, and no "Card landed in Done,
+        # not Unassigned." toast — the restore goes entirely through the
+        # general task-update endpoint.
+        assert lane_calls == [{"lane": "done"}], lane_calls
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='unassigned'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+
+    def test_dragging_an_assigned_me_card_to_done_and_undo_restores_it(
+        self, page: Page, agents_base_url,
+    ):
+        """The Assigned half of the same widened-scope fix, for a card
+        assigned to `#me` — unlike an agent assignee, `#me` is not
+        agent-owned, so a human can actually drag it to Done directly
+        (confirmed live: `evaluate_card_action` allows it)."""
+        page.set_viewport_size({"width": 2400, "height": 900})
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('[data-card-id="t2"]')).to_be_visible()
+
+        _drag_card(page, "t2", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t2']")).to_be_visible(timeout=5000)
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        assert task_puts[-1] == {"status": "todo", "tags": ["me"]}, task_puts
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='assigned'] [data-card-id='t2']")).to_be_visible(timeout=5000)
+
+    def test_dragging_an_assigned_agent_card_to_done_and_undo_restores_it(
+        self, page: Page, agents_base_url,
+    ):
+        """The same fix for a card assigned to an agent engine (`#codex`).
+        Client-only coverage: confirmed live that a real server refuses
+        (409, "agent-owned cards are managed by the agent…") to drag an
+        agent-owned, unclaimed card to Done at all — `evaluate_card_action`
+        — so this specific origin never actually reaches this Undo path on
+        a real server. Kept anyway (mirroring the AC2 test's t3 precedent)
+        because the client logic must still restore correctly if that
+        server-side refusal is ever removed, and it is the only coverage
+        for an agent assignee tag surviving the snapshot round-trip."""
+        page.set_viewport_size({"width": 2400, "height": 900})
+        board = _board_fixture()
+        board["lanes"]["assigned"].append({
+            "kind": "task", "id": "t-agent-assigned", "title": "Agent-assigned card",
+            "notes": "", "status": "todo", "tags": ["codex"], "assignee": "codex",
+            "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board, lane_calls=lane_calls, task_puts=task_puts)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('[data-card-id="t-agent-assigned"]')).to_be_visible()
+
+        _drag_card(page, "t-agent-assigned", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t-agent-assigned']")).to_be_visible(timeout=5000)
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        assert task_puts[-1] == {"status": "todo", "tags": ["codex"]}, task_puts
+        expect(page.locator(".board-lane[data-lane='assigned'] [data-card-id='t-agent-assigned']")).to_be_visible(timeout=5000)
+
+    def test_a_refused_undo_restore_reports_failure_and_does_not_leave_the_card_in_done(
+        self, page: Page, agents_base_url,
+    ):
+        """Round-1 review, Action Required 4: restoreCardSnapshot must
+        rethrow on a refused restore (e.g. a 409 because the card changed
+        in the meantime) rather than swallow it — swallowing let the Undo
+        toast dismiss itself as though the restore had succeeded, while
+        the card actually stayed exactly where it was."""
+        page.set_viewport_size({"width": 2400, "height": 900})
+        lane_calls = []
+        task_puts = []
+        _open_board(
+            page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts,
+            task_put_status_code=[409],
+        )
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('[data-card-id="t4"]')).to_be_visible()
+
+        _drag_card(page, "t4", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t4']")).to_be_visible(timeout=5000)
+
+        undo_toast = page.locator(".toast:not(.error)")
+        expect(undo_toast.locator(".toast-action")).to_have_text("Undo")
+        undo_toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        # The restore was attempted (and refused) — a fresh error toast
+        # reports it, the original toast's own Undo action is restored
+        # rather than silently dismissed as if the restore had succeeded,
+        # and the card is still sitting in Done.
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        expect(undo_toast.locator(".toast-action")).to_have_text("Undo")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t4']")).to_be_visible()
 
     def test_cancel_says_it_cannot_be_undone_instead_of_offering_a_dead_link(
         self, page: Page, agents_base_url,
