@@ -1408,13 +1408,18 @@
   }
   .drawer-header { position: relative; margin-bottom: 0.75rem; }
   .drawer-title {
+    display: block;
     width: 100%;
     background: transparent;
     border: none;
     color: var(--text-primary);
+    font-family: inherit;
     font-size: 1rem;
     font-weight: 600;
+    line-height: 1.3;
     padding: 0.2rem 1.75rem 0.2rem 0;
+    resize: none;
+    overflow: hidden;
   }
   .drawer-title:focus { outline: 1px solid var(--accent); border-radius: 4px; }
   .drawer-label {
