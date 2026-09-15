@@ -723,10 +723,10 @@ export function initBoard() {
   // below) all land here. Relaxes EVERY shared filter that currently hides
   // the card (lanes, assignee, host, engine, tag, search, recency) through
   // one batched `setFilters` call, then confirms the card actually rendered
-  // before scrolling/highlighting — a board-local filter (context, include
-  // cancelled) is left as-is, the operator set those on purpose and they
-  // have no shared counterpart to relax. An unknown id is reported rather
-  // than left to fail silently.
+  // before scrolling/highlighting — the board-local "include cancelled"
+  // filter is left as-is, the operator set it on purpose and it has no
+  // shared counterpart to relax. An unknown id is reported rather than
+  // left to fail silently.
   function revealCard(cardId, opts) {
     const openDrawerFlag = !!(opts && opts.openDrawer);
     const card = findCard(cardId);
