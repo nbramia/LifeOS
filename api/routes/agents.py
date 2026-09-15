@@ -13,7 +13,7 @@ import logging
 import socket
 import threading
 import time
-from typing import Any
+from typing import Any, Sequence
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
@@ -332,6 +332,9 @@ def _apply_cli_session_to_dict(sd: dict[str, Any], cli: CliSession) -> None:
     """
     sd["status"] = cli.status
     sd["status_inferred"] = False
+    # Marks a row the `cli_sessions` teardown path can actually reach, as
+    # opposed to a worker-spawned CLI session in the `sessions` table.
+    sd["is_cli_session"] = True
     sd["host"] = cli.host
     sd["branch"] = cli.branch
     sd["prompt_preview"] = cli.prompt_preview
@@ -360,6 +363,7 @@ def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
         "session_id": cli.session_id,
         "task_id": cli.task_id,
         "status": cli.status,
+        "is_cli_session": True,
         "routing": cli.engine,
         "parent_session_id": None,
         "root_session_id": cli.session_id,
@@ -1747,14 +1751,13 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
 
     session_store = _get_session_store()
 
-    # A live cc:/cx: CLI session (opened via the board's Open button)
-    # lives in the separate `cli_sessions` table, keyed by its own
-    # session_id, not task_id — actually killing a CLI process is a
-    # separate concern, so this is always a reported failure, never a
-    # teardown. Looked up before the idempotent already-cancelled
-    # short-circuit below (and before the worker-session teardown) so a
-    # repeat Cancel call on a card whose CLI session is still open reports
-    # that failure every time, not just the first.
+    # A live cc:/cx: CLI session (opened via the board's Open button) lives in
+    # the separate `cli_sessions` table, keyed by its own session_id, not
+    # task_id, so the worker-session teardown below can never reach one.
+    # Looked up here, ahead of the idempotent already-cancelled short-circuit,
+    # so that branch can still report a session left open behind a card that
+    # is already cancelled; the teardown itself happens further down, only
+    # once this cancel is known to be allowed.
     try:
         live_cli_sessions = [
             cli for cli in session_store.list_cli_sessions_for_task(card_id)
@@ -1763,22 +1766,21 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — never block cancel on this lookup
         logger.warning("cli_sessions lookup for cancel of %s failed: %s", card_id, exc)
         live_cli_sessions = []
-    cli_failures = [
-        {
-            "session_id": cli.session_id,
-            "reason": (
-                f"a live {cli.engine} CLI session ({cli.session_id}) is still open "
-                "and can't be killed by Cancel yet — close it manually"
-            ),
-        }
-        for cli in live_cli_sessions
-    ]
-
     if task.status == "cancelled":
         lane = agent_board.derive_lane(task.status, task.tags)
         return {
             "id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags),
-            "killed": [], "failures": cli_failures,
+            "killed": [],
+            "failures": [
+                {
+                    "session_id": cli.session_id,
+                    "reason": (
+                        f"a live {cli.engine} CLI session ({cli.session_id}) is still "
+                        "open on an already-cancelled card"
+                    ),
+                }
+                for cli in live_cli_sessions
+            ],
         }
 
     has_live = session_store.has_live_session(card_id, status=task.status, tags=task.tags)
@@ -1815,6 +1817,13 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
                 ),
             ) from exc
 
+    # Placed after the refusal checks above: tearing a session down for a card
+    # whose cancel is then refused would stop work the operator never
+    # cancelled.
+    cli_killed, cli_failures = await _kill_cli_sessions(
+        live_cli_sessions, "cancelled from the board",
+    )
+    killed = killed + cli_killed
     failures = subtree_failures + cli_failures
 
     # Strip the tags that would otherwise keep the card out of Done —
@@ -2344,7 +2353,17 @@ async def operator_kill_session(session_id: str, body: KillRequest | None = None
 
     target = session_store.get_by_session_id(session_id)
     if target is None:
-        raise HTTPException(status_code=404, detail=f"session {session_id} not found")
+        # A board-opened CLI session lives in `cli_sessions`, keyed by its own
+        # session id, so the lookup above can never find one. It has no
+        # subtree — an interactive terminal spawns no tracked children — so it
+        # is torn down directly rather than through `_kill_session_subtree`.
+        cli = session_store.get_cli_session(session_id)
+        if cli is None:
+            raise HTTPException(status_code=404, detail=f"session {session_id} not found")
+        if cli.status == CLI_STATUS_ENDED:
+            return {"killed": [], "failures": [], "reason": "already ended"}
+        killed, failures = await _kill_cli_sessions([cli], reason or "killed by the operator")
+        return {"killed": killed, "failures": failures}
     if target.status in TERMINAL_STATUSES:
         return {"killed": [], "failures": [], "reason": f"already {target.status}"}
 
@@ -3665,6 +3684,105 @@ def _activate_pane(pane_id: int, env: dict[str, str]) -> tuple[bool, str]:
         return True, ""
     return False, (proc.stderr.decode("utf-8", errors="replace").strip()
                    or f"wezterm activate-pane exited rc={proc.returncode}")
+
+
+def _kill_pane(pane_id: int, env: dict[str, str]) -> tuple[bool, str]:
+    """Run `wezterm cli kill-pane --pane-id <id>`. Returns (success, detail).
+
+    Kills the one pane the CLI session runs in, and with it that pane's
+    process — never the wezterm-gui process, which owns every other pane the
+    operator has open. (`cli_sessions.wezterm_pid` is that GUI pid, which is
+    why it is not the teardown target.) A non-zero rc is returned rather than
+    raised: the usual cause is a pane the operator already closed, which the
+    caller treats as a session that is already down.
+    """
+    import shutil
+    import subprocess
+
+    wezterm_bin = shutil.which("wezterm") or "wezterm"
+    argv = [wezterm_bin, "cli", "kill-pane", "--pane-id", str(pane_id)]
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv
+            argv,
+            env=env,
+            capture_output=True,
+            timeout=5.0,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        return False, f"wezterm not found: {exc}"
+    except subprocess.TimeoutExpired as exc:
+        return False, f"wezterm kill-pane timed out: {exc}"
+
+    if proc.returncode == 0:
+        return True, ""
+    return False, (proc.stderr.decode("utf-8", errors="replace").strip()
+                   or f"wezterm kill-pane exited rc={proc.returncode}")
+
+
+async def _kill_cli_sessions(
+    sessions: Sequence[CliSession], reason: str,
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Tear down board-opened `cc:`/`cx:` CLI sessions.
+
+    These live in `cli_sessions`, not `sessions`, so `_kill_session_subtree`
+    can never reach them — a card driven by an interactive CLI session needs
+    this path to be stopped at all.
+
+    A session whose pane is gone, or that has no recorded pane, is still
+    marked terminal: the row exists to say whether work is running, and
+    leaving it live because the process already died would strand the card.
+    A session on another machine is reported, not killed — this API can only
+    reach its own wezterm.
+    """
+    session_store = _get_session_store()
+    transcript_store = _get_transcript_store()
+    killed: list[str] = []
+    failures: list[dict[str, str]] = []
+    env: dict[str, str] | None = None
+
+    for cli in sessions:
+        if cli.status == CLI_STATUS_ENDED:
+            continue
+        if cli.host and cli.host != api_host_name():
+            failures.append({
+                "session_id": cli.session_id,
+                "reason": (
+                    f"the {cli.engine} CLI session ({cli.session_id}) runs on "
+                    f"{cli.host!r}, not this API host — stop it there"
+                ),
+            })
+            continue
+        detail = ""
+        if cli.pane_id is not None:
+            if env is None:
+                env = _resume_env()
+            _, detail = await asyncio.to_thread(_kill_pane, cli.pane_id, env)
+        else:
+            detail = "no pane recorded for this session"
+        try:
+            session_store.mark_cli_session_ended(cli.session_id)
+        except Exception as exc:  # noqa: BLE001
+            failures.append({
+                "session_id": cli.session_id,
+                "reason": f"could not mark the CLI session ended: {exc}",
+            })
+            continue
+        try:
+            transcript_store.append(cli.session_id, "operator_killed", {
+                "reason": reason,
+                "engine": cli.engine,
+                "pane_id": cli.pane_id,
+                # Empty when the pane was killed; otherwise why it could not
+                # be, which is recorded rather than dropped because the row
+                # is marked ended either way.
+                "pane_detail": detail,
+            })
+        except Exception as exc:  # noqa: BLE001 — the kill already happened
+            logger.warning("transcript append failed for %s: %s", cli.session_id, exc)
+        killed.append(cli.session_id)
+
+    return killed, failures
 
 
 @router.post("/cx-pane-bind")

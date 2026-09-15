@@ -952,3 +952,24 @@ class TestResumeRowMountedOnce:
         assert result["sameButton"], "Resume's button was recreated instead of revealed in place"
         assert result["sameSelect"], "Resume's host select was recreated instead of revealed in place"
         assert result["selectValuePreserved"], "a chosen resume host was discarded by the rebuild"
+
+
+    def test_kill_is_offered_for_a_board_opened_cli_session(self, page: Page, web_base_url):
+        """A `cli_sessions` row can be torn down by killing its pane, so Kill
+        is live rather than disabled-and-explained."""
+        _load_actions_module(page, web_base_url)
+        session = dict(_BARE_SESSION, session_id="cx:opened", status="running", is_cli_session=True)
+        out = _decide(page, session, None)
+        kill = next(d for d in out if d["id"] == "kill")
+        assert kill["enabled"] is True
+        assert kill["reason"] is None
+
+    def test_kill_stays_refused_for_a_worker_spawned_cli_session(self, page: Page, web_base_url):
+        """Same source, no pane handle — this one still has no teardown path,
+        and says so rather than offering a button that cannot work."""
+        _load_actions_module(page, web_base_url)
+        session = dict(_BARE_SESSION, session_id="cc:worker", status="running")
+        out = _decide(page, session, None)
+        kill = next(d for d in out if d["id"] == "kill")
+        assert kill["enabled"] is False
+        assert "isn't supported yet" in kill["reason"]

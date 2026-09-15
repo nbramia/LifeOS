@@ -188,7 +188,11 @@ export function decideActions(session, card) {
   // endpoint can't tear one down yet — the operator has to close it by
   // hand); offered live for anything else non-terminal.
   if (s && !TERMINAL.has(s.status)) {
-    if (isCliSession(s)) {
+    // A session the board opened is a `cli_sessions` row (`is_cli_session`),
+    // and the kill endpoint tears one down by killing the pane it runs in. A
+    // worker-spawned CLI session is a `sessions` row with the same source and
+    // no such handle, so it stays disabled-and-explained.
+    if (isCliSession(s) && !s.is_cli_session) {
       out.push({
         id: 'kill', label: 'Kill', enabled: false, danger: false,
         reason: `killing a live ${sourceLabelFor(s)} session isn't supported yet — close it manually`,

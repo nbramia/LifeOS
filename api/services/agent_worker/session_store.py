@@ -3922,6 +3922,32 @@ class SessionStore:
             ).fetchone()
         return self._row_to_cli_session(row)
 
+    def mark_cli_session_ended(self, session_id: str) -> CliSession | None:
+        """Mark one `cli_sessions` row terminal, by its storage id.
+
+        Operator teardown, not a hook event: killing the pane a CLI session
+        runs in gives its SessionEnd hook no chance to post, so the row has to
+        be closed here or the session would stay `running`/`idle` forever.
+        Idempotent — a row already `ended` keeps its original `ended_at`.
+        Returns None when no such row exists.
+        """
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE cli_sessions
+                   SET status = ?,
+                       last_event_at = ?,
+                       ended_at = COALESCE(ended_at, ?)
+                 WHERE session_id = ?
+                """,
+                (CLI_STATUS_ENDED, now, now, session_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM cli_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return self._row_to_cli_session(row) if row else None
+
     def get_cli_session(self, session_id: str) -> CliSession | None:
         with self._connect() as conn:
             row = conn.execute(

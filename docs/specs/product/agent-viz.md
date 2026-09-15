@@ -321,7 +321,7 @@ A kill takes down the target session **and every descendant in its subtree** —
 - If the target was a Managed Agents (cloud) session, the worker process also tears down the remote session via the Anthropic API so you stop being billed for idle session-hours.
 - The task in your vault transitions to whatever the worker writes as the post-kill tag (typically `#agent-failed`).
 
-CLI sessions (Claude Code and Codex) do not get a Kill button — the page has no safe primitive for terminating a CLI process from outside its own terminal. If you need to stop one, do it in the terminal where it's running, or via `kill` on the underlying PID.
+A CLI session the board opened gets a working **Kill**: it ends the pane that session runs in, and the card's session shows terminal. **Cancel** on such a card does the same before marking the card cancelled, so cancelling actually stops the work rather than leaving an agent running behind a closed card. A session recorded against another machine is reported instead — this API can only reach its own terminal — and so is a worker-spawned CLI session, which has no pane handle to end; for either, stop it in the terminal where it's running.
 
 ---
 
