@@ -1820,17 +1820,29 @@ class SessionStore:
         self, *, since: int, limit: int = 50,
     ) -> list[Session]:
         """Terminal, vault-backed sessions with no acknowledged lifecycle
-        projection for their current status.
+        projection for their current attempt and status.
 
-        This is the drift signature left by a status write that bypasses
-        the `set_status_projector` hook on `update_status` — e.g.
-        `mark_cancelled` (used by a kill) flips the row straight to a
-        terminal status with no projection recorded, so a session that
-        wasn't actively being polled when the kill landed never gets its
-        vault tag reconciled. Operator root-spawns and spawned children
-        carry no vault task and never get such a projection by design
-        (`has_vault_task` in worker.py) — they're excluded here rather than
-        by the caller, so they can't crowd out real drift under `limit`.
+        This is a candidate signature for a status write that bypasses the
+        `set_status_projector` hook on `update_status` — e.g. `mark_cancelled`
+        (used by a kill) flips the row straight to a terminal status with no
+        projection recorded, so a session that wasn't actively being polled
+        when the kill landed never gets its vault tag reconciled. It is not
+        the whole drift signature by itself: it also matches every
+        historical terminal session that predates this projection marker
+        entirely (no row was ever recorded for those either), so the caller
+        must additionally confirm the task's current vault tag is still
+        non-terminal before touching anything. Operator root-spawns and
+        spawned children carry no vault task and never get such a
+        projection by design (`has_vault_task` in worker.py) — they're
+        excluded here rather than by the caller, so they can't crowd out
+        real drift under `limit`.
+
+        The exists-check is scoped to the session's current `attempt_id`
+        (NULL-safe via `IS`, since a legacy row may have no attempt at all)
+        so an applied projection from an earlier attempt can never mask a
+        genuine second drift on a later attempt of the same task/status —
+        a task can legitimately be killed at the same terminal status more
+        than once across separate reopened executions.
 
         Bounded on both axes so this is safe to call every tick: `since`
         restricts the scan to recently-terminal sessions via the
@@ -1849,6 +1861,7 @@ class SessionStore:
                   AND NOT EXISTS (
                       SELECT 1 FROM lifecycle_projections AS p
                       WHERE p.task_id = s.task_id
+                        AND p.attempt_id IS s.attempt_id
                         AND p.target_status = s.status
                         AND p.state = 'applied'
                   )

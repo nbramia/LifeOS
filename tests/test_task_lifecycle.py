@@ -5,7 +5,9 @@ import threading
 
 import pytest
 
-from api.services.agent_board import RUNNING_TAG, derive_lane
+from types import SimpleNamespace
+
+from api.services.agent_board import COMPLETED_TAG, RUNNING_TAG, derive_lane
 from api.services.agent_worker.lifecycle import FAILED_TAG, LifecycleEvent, LifecycleProjector
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
@@ -302,3 +304,156 @@ def test_drift_sweep_leaves_a_reopened_followup_session_alone(tmp_path):
     assert RUNNING_TAG in refreshed.tags
     assert refreshed.tags == task.tags
     assert refreshed.updated_at == task.updated_at
+
+
+def test_drift_sweep_leaves_a_settled_task_alone_when_no_projection_was_ever_recorded(tmp_path):
+    """`list_terminal_unprojected`'s "no applied projection" candidate
+    signature also matches every historical terminal session that predates
+    the projector itself — none of those ever recorded a row either. The
+    real drift signature is the task's *current* vault tag, not the
+    presence of a projections row: a task the operator already accepted
+    (`#accepted #agent-completed`, status done) must be left byte-identical
+    even though its session row is terminal and unprojected."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create(
+        "Synthetic already-settled task", status="done",
+        tags=["claude_code", COMPLETED_TAG, "accepted"],
+    )
+    sessions = SessionStore(tmp_path / "sessions.db")
+    session = sessions.create(task.id, status=STATUS_RUNNING, routing="claude_code")
+    # A later status write on this same attempt/turn that never went through
+    # a projector hook — mirrors a historical session that predates this
+    # sweep. No hook is wired on this store, so no projection row exists,
+    # matching production's 0-applied-rows state for old sessions.
+    sessions.update_status(
+        task.id, STATUS_FAILED, attempt_id=session.attempt_id, turn_id=session.turn_id,
+    )
+    assert sessions.list_pending_projections() == []
+    assert sessions.list_terminal_unprojected(since=0, limit=10) != []  # candidate, not yet filtered
+
+    worker = _make_worker(sessions, manager)
+    healed = worker._reconcile_lifecycle_drift()
+
+    refreshed = manager.get(task.id)
+    assert healed == 0
+    assert refreshed.tags == task.tags
+    assert refreshed.status == task.status
+    assert refreshed.updated_at == task.updated_at
+
+
+def test_drift_sweep_heals_a_second_drift_after_reopen_with_new_attempt(tmp_path):
+    """A task can legitimately be killed at the same terminal status twice
+    across separate reopened executions. The first kill's applied
+    projection must not mask the second one — the dedupe has to be scoped
+    to the attempt, not just the (task, status) pair."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create(
+        "Synthetic twice-killed task", status="blocked", tags=["claude_code", RUNNING_TAG],
+    )
+    sessions = SessionStore(tmp_path / "sessions.db")
+    first_session = sessions.create(task.id, status=STATUS_BLOCKED, routing="claude_code")
+    assert sessions.mark_cancelled(
+        task.id, attempt_id=first_session.attempt_id, reason="operator_killed",
+    )
+    worker = _make_worker(sessions, manager)
+    first_healed = worker._reconcile_lifecycle_drift()
+    first_reconciled = manager.get(task.id)
+    assert first_healed == 1
+    assert FAILED_TAG in first_reconciled.tags
+
+    # Reopen for a follow-up turn: a new attempt id, session goes back to
+    # non-terminal. The real reopen path also swaps the vault tag back to
+    # #agent-running — mirrored here directly since this test only
+    # exercises the session-store/projector half of that path.
+    reopened = sessions.begin_new_execution(task.id)
+    manager.update(task.id, status="in_progress", tags=["claude_code", RUNNING_TAG])
+
+    # Parked and killed again — same terminal status as before, different
+    # attempt.
+    assert sessions.mark_cancelled(
+        task.id, attempt_id=reopened.attempt_id, reason="operator_killed",
+    )
+
+    second_healed = worker._reconcile_lifecycle_drift()
+    refreshed = manager.get(task.id)
+    assert second_healed == 1
+    assert FAILED_TAG in refreshed.tags
+    assert RUNNING_TAG not in refreshed.tags
+
+
+def test_tick_wires_in_the_lifecycle_drift_sweep(tmp_path, monkeypatch):
+    """`tick()` must actually invoke `_reconcile_lifecycle_drift` — every
+    other tick step is stubbed to a no-op so this isolates just that
+    wiring, following the pattern of
+    `test_human_queue_wake_replays_through_projector_and_is_single_path`
+    above and `TestTickInvokesHumanQueue` in
+    test_agent_worker_human_queue.py."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create(
+        "Synthetic tick-wired task", status="blocked", tags=["claude_code", RUNNING_TAG],
+    )
+    sessions = SessionStore(tmp_path / "sessions.db")
+    session = sessions.create(task.id, status=STATUS_BLOCKED, routing="claude_code")
+    assert sessions.mark_cancelled(
+        task.id, attempt_id=session.attempt_id, reason="operator_killed",
+    )
+
+    worker = _make_worker(sessions, manager)
+    worker.spend_tracker = SimpleNamespace(can_start_task=lambda estimate: True)
+    for step in (
+        "_process_human_queue",
+        "_replay_wait_wakeups",
+        "_wake_sleeping_sessions",
+        "_poll_managed_sessions",
+        "_resume_yielded_for_children",
+        "_dispatch_spawned_sessions",
+        "_process_clarification_answers",
+        "_timeout_stale_clarifications",
+    ):
+        monkeypatch.setattr(worker, step, lambda: None)
+    monkeypatch.setattr(worker, "_list_agent_tasks", lambda: [])
+
+    worker.tick()
+
+    refreshed = manager.get(task.id)
+    assert FAILED_TAG in refreshed.tags
+    assert RUNNING_TAG not in refreshed.tags
+
+
+class TestListTerminalUnprojectedHasVaultTaskGate:
+    """`has_vault_task` (origin != 'operator' and no parent_session_id) must
+    exclude operator root-spawns and spawned children from the drift-sweep
+    candidate query — they carry synthetic task ids with no vault row, so
+    reconciling them would 404."""
+
+    def test_excludes_operator_origin_session(self, tmp_path):
+        sessions = SessionStore(tmp_path / "sessions.db")
+        session = sessions.create("operator-task", origin="operator")
+        sessions.update_status(
+            session.task_id, STATUS_FAILED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        assert sessions.list_terminal_unprojected(since=0, limit=10) == []
+
+    def test_excludes_spawned_child_session(self, tmp_path):
+        sessions = SessionStore(tmp_path / "sessions.db")
+        session = sessions.create(
+            "child-task", parent_session_id="parent-session-1",
+            root_session_id="parent-session-1",
+        )
+        sessions.update_status(
+            session.task_id, STATUS_FAILED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        assert sessions.list_terminal_unprojected(since=0, limit=10) == []
+
+    def test_includes_an_ordinary_vault_backed_session(self, tmp_path):
+        """Control case — the gate must not accidentally exclude everything."""
+        sessions = SessionStore(tmp_path / "sessions.db")
+        session = sessions.create("normal-task")
+        sessions.update_status(
+            session.task_id, STATUS_FAILED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        rows = sessions.list_terminal_unprojected(since=0, limit=10)
+        assert {row.task_id for row in rows} == {"normal-task"}

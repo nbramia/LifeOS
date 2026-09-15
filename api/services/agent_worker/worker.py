@@ -177,8 +177,12 @@ _BLOCKED_PROMPT_RETRY_DELAY_S = 0.5
 # the worker is down, bypasses the projector hook — see
 # `_reconcile_lifecycle_drift`). Window and limit both bound the per-tick
 # scan: only recently-terminal sessions are considered, and at most this
-# many are reconciled in one tick.
-_LIFECYCLE_DRIFT_SWEEP_WINDOW_S = 24 * 60 * 60
+# many are reconciled in one tick. 90 days comfortably covers a worker
+# outage on the order of the longest one observed on this host (18 days)
+# with margin; unhealable rows (task deleted from the vault) get a durable
+# resolved marker so they don't cost a rescan on every subsequent tick, which
+# is what makes a window this wide safe to hold open.
+_LIFECYCLE_DRIFT_SWEEP_WINDOW_S = 90 * 24 * 60 * 60
 _LIFECYCLE_DRIFT_SWEEP_LIMIT = 50
 
 # Answered-question claims use the existing `processed` integer as a small
@@ -2654,29 +2658,57 @@ class Worker:
         poll to do that — the vault tag is stranded at `#agent-running` /
         `#agent-blocked` forever.
 
-        `SessionStore.list_terminal_unprojected` finds exactly that drift
-        signature (terminal status, no acknowledged projection for it) and
-        is already scoped to vault-backed sessions and bounded in size —
-        see its docstring for the cost argument. This sweep applies the
-        same projection those sessions would have gotten had the terminal
-        write gone through `update_status`, via the shared projector so a
-        session already reconciled by that path (or already re-opened for
-        a follow-up turn, which flips the row back to non-terminal) is
-        left untouched rather than double-projected.
+        `SessionStore.list_terminal_unprojected` finds sessions with that
+        signature (terminal status, no acknowledged projection for the
+        current attempt/status) and is already scoped to vault-backed
+        sessions and bounded in size — see its docstring for the cost
+        argument. It only narrows the *candidate* set: "no applied
+        projection" also matches every historical terminal session that
+        predates this projector (it never recorded one either), so the
+        actual drift signature — the task's vault tag is still non-terminal
+        (`RUNNING_TAG` / `BLOCKED_TAG`) — is checked below before anything
+        is touched. Reconciling on the candidate signature alone would
+        rewrite tasks that were already settled by another path (e.g. an
+        operator's `#accepted #agent-completed`), clobbering that decision.
+
+        This sweep applies the same projection a genuinely-drifted session
+        would have gotten had the terminal write gone through
+        `update_status`, via the shared projector so a session already
+        reconciled by that path (or already re-opened for a follow-up turn,
+        which flips the row back to non-terminal) is left untouched rather
+        than double-projected.
         """
         healed = 0
         since = int(time.time()) - _LIFECYCLE_DRIFT_SWEEP_WINDOW_S
         for session in self.session_store.list_terminal_unprojected(
             since=since, limit=_LIFECYCLE_DRIFT_SWEEP_LIMIT,
         ):
+            event_id = LifecycleProjector.event_id(
+                session.task_id, session.attempt_id, session.status,
+                suffix="lifecycle_drift_sweep",
+            )
             task = self._fetch_task(session.task_id)
             if task is None:
+                # Task deleted from the vault — nothing left to reconcile.
+                # Record a resolved marker so this row stops matching the
+                # candidate query on every future tick: `_fetch_task` is an
+                # HTTP GET per row and this state can never heal, so leaving
+                # it unmarked would cost that GET forever.
+                self.session_store.begin_projection(
+                    event_id, task_id=session.task_id, session_id=session.session_id,
+                    attempt_id=session.attempt_id, expected_version=None,
+                    target_status=session.status, payload={},
+                )
+                self.session_store.acknowledge_projection(event_id)
+                continue
+            tags = self._norm_task_tags(task)
+            if RUNNING_TAG not in tags and BLOCKED_TAG not in tags:
+                # Not actually drifted — the vault tag is already terminal
+                # (settled by the live-kill path, an operator edit, or a
+                # historical session that predates this sweep entirely).
                 continue
             event = LifecycleEvent(
-                event_id=LifecycleProjector.event_id(
-                    session.task_id, session.attempt_id, session.status,
-                    suffix="lifecycle_drift_sweep",
-                ),
+                event_id=event_id,
                 task_id=session.task_id,
                 session_id=session.session_id,
                 attempt_id=session.attempt_id,
