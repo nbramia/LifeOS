@@ -29,12 +29,19 @@ The vault markdown is authoritative; the JSON index is a rebuildable cache.
 - **Source:** `LifeOS/Scheduler/Inbox.md` — one checkbox line per schedule (line schema in the guide). `_format_entry_line`/`_parse_entry_line` (`scheduler_store.py:198`, `:219`) are inverse for the definition fields, giving a lossless round-trip.
 - **Cache:** `data/scheduler_index.json` — the full `ScheduleEntry` (including payload + computed `next_trigger_at`). Safe to delete; `rebuild_index` (`:538`) regenerates it from markdown.
 
-Only a subset of fields lives in markdown (the user-editable definition). The
-payload (`message_content`, `endpoint_config`) and run history
-(`last_status`, `last_result`, `last_triggered_at`) live only in the cache and
-are **merged back by ID** on every reindex via `_merge_prior`
-(`scheduler_store.py:553`). This is why editing a line in Obsidian never wipes
-a schedule's prompt text or history.
+Only a subset of fields lives in markdown (the user-editable definition).
+`message_content` lives in an indented blockquote body beneath the checkbox
+line; markdown wins when a body is present, and the cache is used only as a
+fallback for a line written before bodies existed. For an `endpoint` action,
+the vault line's `[endpoint:: METHOD path]` and `[params:: …]` fields define
+the call config directly; the cache is used only as a fallback for a line
+that carries no endpoint fields at all (an older-format line, migrated into
+the vault the first time it's loaded) or when `params` fails to parse (falls
+back to the cached `params` alone). Both fallbacks, plus run history
+(`last_status`, `last_result`, `last_triggered_at`, which has no markdown
+representation and lives only in the cache), are **merged back by ID** on
+every reindex via `_merge_prior` (`scheduler_store.py:553`). This is why
+editing a line in Obsidian never wipes a schedule's prompt text or history.
 
 CRUD writes both sides: `create`/`update`/`mark_triggered`
 (`:387`, `:415`, `:438`) edit the markdown line by ID and re-save the cache;
