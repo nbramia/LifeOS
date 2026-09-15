@@ -1106,15 +1106,13 @@ class TestCancelBoardCard:
         assert body["status"] == "cancelled"
         assert session_store.get_by_session_id(target.session_id).status == STATUS_FAILED
 
-    def test_cancel_surfaces_a_live_cli_session_as_a_failure_instead_of_silent_success(
+    def test_cancel_reports_a_cli_session_on_another_host_instead_of_killing_it(
         self, client, stores, monkeypatch,
     ):
-        """A live cc:/cx: CLI session (opened via the board's
-        Open button) lives in the separate `cli_sessions` table, keyed by
-        its own session_id, not task_id — Cancel can't tear it down (a
-        separate issue), but it must not silently claim a teardown it
-        didn't perform. The task is still marked cancelled; the untorn-down
-        session is reported under `failures`."""
+        """This API can only reach its own wezterm, so a CLI session recorded
+        against a different machine is reported rather than torn down. The
+        task is still marked cancelled; the session it could not reach is
+        named under `failures`."""
         task_manager, _sched, session_store, _transcript = stores
         monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
         # status="in_progress" with no agent-running tag is what
@@ -1132,16 +1130,15 @@ class TestCancelBoardCard:
         assert body["killed"] == []
         assert len(body["failures"]) == 1
         assert body["failures"][0]["session_id"] == "cx:live1"
-        assert "cx:live1" in body["failures"][0]["reason"]
+        assert "some-host" in body["failures"][0]["reason"]
 
-    def test_cancel_repeated_after_a_cli_warning_reports_the_same_failure_again(
+    def test_cancel_repeated_on_an_unreachable_cli_session_reports_it_again(
         self, client, stores, monkeypatch,
     ):
-        """A second Cancel call on a card whose CLI session is still open
-        must report that failure again, not `failures: []` — the
-        already-cancelled short-circuit runs AFTER the CLI lookup now, not
-        before it, so a repeat click still tells the operator the CLI
-        session needs closing manually."""
+        """A second Cancel on a card whose CLI session this API cannot reach
+        must report it again, not `failures: []` — the already-cancelled
+        short-circuit runs after the CLI lookup, so a repeat click still tells
+        the operator a session is open that it could not stop."""
         task_manager, _sched, session_store, _transcript = stores
         monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
         task = task_manager.create("Opened via a CLI session", tags=["codex"], status="in_progress")
@@ -1831,3 +1828,133 @@ class TestGuardedWriteRevalidation:
             task_manager.get = original_get
         assert response.status_code == 409, response.text
         assert task_manager.get(task.id).status == "done"
+
+
+@pytest.mark.unit
+class TestCliSessionTeardown:
+    """Kill and Cancel reach board-opened `cc:`/`cx:` sessions, which live in
+    `cli_sessions` and so are invisible to the worker-session teardown."""
+
+    @staticmethod
+    def _local_cli_card(task_manager, session_store, monkeypatch, *, pane_id=7):
+        """A card whose only live session is a CLI session on this API host."""
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        monkeypatch.setattr(agents_route, "api_host_name", lambda: "this-box")
+        task = task_manager.create(
+            "Opened via a CLI session", tags=["codex"], status="in_progress",
+        )
+        session_store.record_cli_session_event(
+            engine="codex", event="user_prompt_submit", session_id="live1",
+            host="this-box", prompt="do the thing", task_id=task.id, pane_id=pane_id,
+        )
+        return task
+
+    @staticmethod
+    def _capture_pane_kills(monkeypatch, *, ok=True, detail=""):
+        killed_panes: list[int] = []
+
+        def fake_kill_pane(pane_id, env):
+            killed_panes.append(pane_id)
+            return ok, detail
+
+        monkeypatch.setattr(agents_route, "_kill_pane", fake_kill_pane)
+        return killed_panes
+
+    def test_cancel_tears_down_a_local_cli_session_and_reports_it_as_killed(
+        self, client, stores, monkeypatch,
+    ):
+        task_manager, _sched, session_store, transcript_store = stores
+        task = self._local_cli_card(task_manager, session_store, monkeypatch)
+        killed_panes = self._capture_pane_kills(monkeypatch)
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "cancelled"
+        assert body["killed"] == ["cx:live1"]
+        assert body["failures"] == []
+        # The pane the session runs in, not the wezterm-gui process.
+        assert killed_panes == [7]
+        assert session_store.get_cli_session("cx:live1").status == "ended"
+        kinds = [e.get("kind") or e.get("event") for e in transcript_store.read("cx:live1")]
+        assert "operator_killed" in kinds, kinds
+
+    def test_cancel_marks_the_row_ended_even_when_the_pane_is_already_gone(
+        self, client, stores, monkeypatch,
+    ):
+        """The row says whether work is running. Leaving it live because the
+        process died first would strand the card showing a session that isn't
+        there."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = self._local_cli_card(task_manager, session_store, monkeypatch)
+        self._capture_pane_kills(monkeypatch, ok=False, detail="no such pane")
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200, r.text
+        assert r.json()["killed"] == ["cx:live1"]
+        assert session_store.get_cli_session("cx:live1").status == "ended"
+
+    def test_a_refused_cancel_does_not_touch_the_cli_session(
+        self, client, stores, monkeypatch,
+    ):
+        """Tearing a session down for a card whose cancel is about to be
+        refused would stop work the operator never cancelled."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        monkeypatch.setattr(agents_route, "api_host_name", lambda: "this-box")
+        task = task_manager.create("Already accepted", tags=["codex"], status="done")
+        session_store.record_cli_session_event(
+            engine="codex", event="user_prompt_submit", session_id="live2",
+            host="this-box", task_id=task.id, pane_id=9,
+        )
+        killed_panes = self._capture_pane_kills(monkeypatch)
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409, r.text
+        assert killed_panes == []
+        assert session_store.get_cli_session("cx:live2").status != "ended"
+
+    def test_kill_endpoint_tears_down_a_cli_session_instead_of_404ing(
+        self, client, stores, monkeypatch,
+    ):
+        task_manager, _sched, session_store, _transcript = stores
+        self._local_cli_card(task_manager, session_store, monkeypatch)
+        killed_panes = self._capture_pane_kills(monkeypatch)
+
+        r = client.post("/api/agents/sessions/cx:live1/kill")
+        assert r.status_code == 200, r.text
+        assert r.json()["killed"] == ["cx:live1"]
+        assert killed_panes == [7]
+        assert session_store.get_cli_session("cx:live1").status == "ended"
+
+    def test_kill_skips_an_already_ended_cli_session(self, client, stores, monkeypatch):
+        task_manager, _sched, session_store, _transcript = stores
+        self._local_cli_card(task_manager, session_store, monkeypatch)
+        session_store.record_cli_session_event(
+            engine="codex", event="session_end", session_id="live1", host="this-box",
+        )
+        killed_panes = self._capture_pane_kills(monkeypatch)
+
+        r = client.post("/api/agents/sessions/cx:live1/kill")
+        assert r.status_code == 200, r.text
+        assert r.json()["killed"] == []
+        assert killed_panes == []
+
+    def test_kill_still_404s_for_a_session_in_neither_table(self, client, stores):
+        r = client.post("/api/agents/sessions/cx:nosuch/kill")
+        assert r.status_code == 404
+
+    def test_killing_a_cli_session_leaves_the_worker_session_row_untouched(
+        self, client, stores, monkeypatch,
+    ):
+        """The two tables are separate; a teardown in one must not close the
+        other's row."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = self._local_cli_card(task_manager, session_store, monkeypatch)
+        worker = session_store.create(task_id=task.id, status="running", routing="codex")
+        self._capture_pane_kills(monkeypatch)
+
+        r = client.post("/api/agents/sessions/cx:live1/kill")
+        assert r.status_code == 200, r.text
+        assert session_store.get(task.id).session_id == worker.session_id
+        assert session_store.get(task.id).status == "running"
