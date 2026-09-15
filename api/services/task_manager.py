@@ -178,14 +178,15 @@ def _clear_stale_snooze(t: Task) -> None:
     status or tags (`update`, `swap_tag`) right before the task is
     persisted, so a snoozed Human-queue card resumed via `/swap-tag`
     (`agent-blocked` -> `agent-running`), a status write to
-    `in_progress`/`done`/`cancelled` (including the human-queue resolve
-    path, which calls `update(status="done", ...)`), or any other tag
-    change that lands the card in In progress or Done can never leave a
-    stale future wake-up time behind — one that would otherwise silently
-    re-apply and hide the card again the next time it lands in a
-    snooze-eligible lane (e.g. a resumed card reaching Review before its
-    wake-up time). Mutates `t.fields` in place; a no-op when the field is
-    absent or the natural lane is still snooze-eligible.
+    `in_progress`/`done`/`cancelled`, or any other tag change that lands
+    the card in In progress or Done can never leave a stale future
+    wake-up time behind — one that would otherwise silently re-apply and
+    hide the card again the next time it lands in a snooze-eligible lane
+    (e.g. a resumed card reaching Review before its wake-up time).
+    Mutates `t.fields` in place; a no-op when the field is absent or the
+    natural lane is still snooze-eligible — which is why a `#human` card
+    the human-queue resolve path marks `done` keeps its snooze: the
+    `human` tag alone still puts its natural lane in Human queue.
     """
     if _SNOOZED_UNTIL_FIELD not in t.fields:
         return
