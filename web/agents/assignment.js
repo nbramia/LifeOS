@@ -174,8 +174,8 @@ export function renderAssignmentPickers(container, card, opts = {}) {
   // (#901 round 2, finding A3) Last-known-good values for the three
   // fields every save() sends, seeded from the card and updated on each
   // SUCCESSFUL save. A rejected save reverts the controls to these —
-  // mirroring how every other drawer control (title, notes, context,
-  // tags, the Assignee select in board.js) already snaps back on failure
+  // mirroring how every other drawer control (title, notes, tags, the
+  // Assignee select in board.js) already snaps back on failure
   // — so a host/effort/model change the server REJECTS can never ride
   // along, silently, on the next unrelated save.
   //
@@ -466,8 +466,8 @@ export function renderAssignmentPickers(container, card, opts = {}) {
       // last-known-good values BEFORE surfacing the error, so the rejected
       // choice can't ride along on the next unrelated save with no toast
       // at all. Every other drawer control already does this on failure
-      // (board.js's title/notes/context/tags fields and the Assignee
-      // select); the assignment pickers behave the same way. The engine
+      // (board.js's title/notes/tags fields and the Assignee select);
+      // the assignment pickers behave the same way. The engine
       // select is deliberately NOT reverted here — board.js owns the
       // Assignee select and hides this module's engine row, so there's
       // no user-reachable path that leaves it stale.
