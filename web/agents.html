@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>Agents · LifeOS</title>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
 <script src="https://d3js.org/d3.v7.min.js"></script>
@@ -1615,6 +1615,32 @@
     .board-filters { padding: 0.45rem 0.65rem; gap: 0.4rem; }
     #board-lanes { padding: 0.5rem 0.65rem; gap: 0.5rem; }
     .board-lane { min-width: min(84vw, 280px); }
+    .board-drawer {
+      width: 100vw;
+      max-width: 100vw;
+      overflow-x: hidden;
+    }
+    .drawer-header .panel-close {
+      position: absolute;
+      top: 0;
+      right: 0;
+      float: none;
+      z-index: 1;
+    }
+    .drawer-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .drawer-row > *,
+    .board-drawer select {
+      min-width: 0;
+      max-width: 100%;
+    }
+    .drawer-meta-id { overflow-wrap: anywhere; }
+    .drawer-actions > * { max-width: 100%; }
+    .drawer-actions .panel-kill,
+    .drawer-actions .panel-resume,
+    .drawer-actions .panel-focus {
+      float: none;
+      margin-right: 0;
+    }
     /* The tray wraps at phone width so the assignee row gets the full
        width for itself instead of competing with the label and status
        line on one overflowing line — the label and status go back to
@@ -1622,7 +1648,7 @@
        for the wide tray only) so they each get their own wrapped row. */
     .board-drop-tray { flex-wrap: wrap; justify-content: flex-start; padding: 0.45rem 0.65rem; min-height: 66px; }
     .board-drop-tray-label { position: static; transform: none; }
-    #board-assignee-drops { flex: 1 0 100%; max-width: 100%; order: 1; }
+    #board-assignee-drops { flex: 1 0 100%; max-width: 100%; overflow-x: auto; order: 1; }
     .board-drop-status {
       position: static;
       transform: none;
