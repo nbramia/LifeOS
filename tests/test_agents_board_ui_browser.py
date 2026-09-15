@@ -3533,6 +3533,171 @@ class TestNotesAutosize:
         assert offset_height <= 400 * 0.67, offset_height  # 66vh + a little rounding slack
 
 
+class TestDrawerTitleWrap:
+    """The drawer title field is a `<textarea class="drawer-title"
+    data-field="title">` that wraps and grows with its content instead of
+    scrolling sideways. Saving stays blur-triggered; Enter commits the same
+    save without inserting a newline, and a pasted newline is collapsed to
+    a space before it ever reaches the PUT body."""
+
+    _LONG_TITLE = (
+        "Investigate the recurring outage affecting the checkout service "
+        "during peak traffic and coordinate a fix across every affected region"
+    )
+
+    def test_long_title_wraps_with_no_horizontal_scroll(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["title"] = self._LONG_TITLE
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        expect(title).to_have_value(self._LONG_TITLE)
+        scroll_width = title.evaluate("el => el.scrollWidth")
+        client_width = title.evaluate("el => el.clientWidth")
+        assert scroll_width <= client_width, (scroll_width, client_width)
+        # A single line of this title would need far more than the drawer's
+        # ~400px width — the box only avoids horizontal scroll (asserted
+        # above) by actually wrapping onto more than one line, which shows
+        # up as a multi-line-tall box rather than a single input row.
+        line_height = title.evaluate("el => parseFloat(getComputedStyle(el).lineHeight)")
+        offset_height = title.evaluate("el => el.offsetHeight")
+        assert offset_height > line_height * 1.5, (offset_height, line_height)
+
+    def test_height_grows_as_the_operator_types(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        short_height = title.evaluate("el => el.offsetHeight")
+        title.fill(self._LONG_TITLE)
+        grown_height = title.evaluate("el => el.offsetHeight")
+        assert grown_height > short_height, (short_height, grown_height)
+
+    def test_enter_saves_without_inserting_a_newline(self, page: Page, agents_base_url):
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        title.fill("Retitled via Enter")
+        title.press("Enter")
+        _wait_for(lambda: task_puts == [{"description": "Retitled via Enter"}], page=page)
+        assert "\n" not in title.input_value()
+
+    def test_pasted_newlines_collapse_to_spaces_in_the_put_body(self, page: Page, agents_base_url):
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        # Simulate a paste landing multi-line content in the field —
+        # dispatching `input` mirrors what a real paste triggers for the
+        # autosize + eventual blur-save handlers. `focus()` first, since an
+        # unfocused element's `blur()` call is a no-op that never fires the
+        # blur event this test depends on.
+        title.evaluate(
+            "el => { el.focus(); el.value = 'Line one\\nLine two\\nLine three'; "
+            "el.dispatchEvent(new Event('input', { bubbles: true })); el.blur(); }"
+        )
+        _wait_for(lambda: len(task_puts) == 1, page=page)
+        assert task_puts == [{"description": "Line one Line two Line three"}]
+
+    def test_scheduled_card_title_wraps_and_saves_through_the_scheduler_api(
+        self, page: Page, agents_base_url,
+    ):
+        board_state = _board_fixture()
+        for card in board_state["lanes"]["scheduled"]:
+            if card["id"] == "s1":
+                card["name"] = self._LONG_TITLE
+        schedule_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        page.locator('[data-card-id="s1"]').click()
+        title = page.locator(".drawer-title")
+        expect(title).to_have_value(self._LONG_TITLE)
+        scroll_width = title.evaluate("el => el.scrollWidth")
+        client_width = title.evaluate("el => el.clientWidth")
+        assert scroll_width <= client_width, (scroll_width, client_width)
+
+        title.fill("Evening briefing, renamed")
+        title.press("Enter")
+        _wait_for(lambda: schedule_puts == [{"name": "Evening briefing, renamed"}], page=page)
+        assert "\n" not in title.input_value()
+
+    def test_empty_or_unchanged_title_does_not_save(self, page: Page, agents_base_url):
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        expect(title).to_have_value("Investigate outage")
+
+        # Unchanged: blur without editing.
+        title.click()
+        page.locator(".drawer-notes").click()  # blur the title field
+        page.wait_for_timeout(200)
+        assert task_puts == []
+
+        # Emptied out entirely.
+        title.fill("")
+        page.locator(".drawer-notes").click()  # blur the title field
+        page.wait_for_timeout(200)
+        assert task_puts == []
+        expect(title).to_have_value("")
+
+    def test_failed_save_restores_the_previous_title_and_shows_the_error_toast(
+        self, page: Page, agents_base_url,
+    ):
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts: list = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        title.fill("This will not stick")
+        title.press("Enter")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        release(0, status=500, detail="boom")
+        expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
+        expect(title).to_have_value("Investigate outage")
+
+    def test_close_button_does_not_overlap_the_wrapped_title_text(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["title"] = self._LONG_TITLE
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        close_box = page.locator('[data-action="drawer-close"]').bounding_box()
+        title_box = title.bounding_box()
+        assert close_box and title_box
+        # `.drawer-title`'s right padding reserves a gutter the size of the
+        # close button so text never lays out underneath it — compute the
+        # content box's right edge (the box minus that padding, which is
+        # where wrapped glyphs actually end) and assert the close button
+        # starts at or beyond it.
+        padding_right = title.evaluate("el => parseFloat(getComputedStyle(el).paddingRight)")
+        content_right_edge = title_box["x"] + title_box["width"] - padding_right
+        assert close_box["x"] >= content_right_edge - 1, (close_box, title_box, content_right_edge)
+
+    def test_desktop_and_phone_widths_both_wrap_without_horizontal_scroll(
+        self, page: Page, agents_base_url,
+    ):
+        board_state = _board_fixture()
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["title"] = self._LONG_TITLE
+        for viewport in ({"width": 1280, "height": 800}, {"width": 390, "height": 844}):
+            page.set_viewport_size(viewport)
+            _open_board(page, agents_base_url, board_state=copy.deepcopy(board_state))
+            page.locator('[data-card-id="t1"]').click()
+            title = page.locator(".drawer-title")
+            expect(title).to_have_value(self._LONG_TITLE)
+            scroll_width = title.evaluate("el => el.scrollWidth")
+            client_width = title.evaluate("el => el.clientWidth")
+            assert scroll_width <= client_width, (viewport, scroll_width, client_width)
+
+
 class TestNoConsoleErrorsMainFlow:
     """Exercises the board's lane filter, per-lane add,
     drawer click-outside-close, notes autosize — and asserts the page never

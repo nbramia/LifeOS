@@ -1468,12 +1468,9 @@ export function initBoard() {
     return `Last run: ${at} — ${outcome}${snippet}`;
   }
 
-  // Notes autosize — height tracks content up to 2/3 of the
-  // viewport height, after which `.drawer-notes-autosize`'s
-  // `overflow-y: auto` (web/agents.html) takes over scrolling. Scoped to
-  // the task notes textarea only — the schedule drawer's message-content
-  // textarea keeps its plain fixed/manual-resize box.
-  function autosizeNotesTextarea(el) {
+  // Shared autosize core: grows `el` to fit its content, up to `maxHeight`
+  // (in px) when given, or without limit when omitted/null.
+  function autosizeTextarea(el, maxHeight) {
     if (!el) return;
     el.style.height = 'auto';
     // `* { box-sizing: border-box }` (web/agents.html) means the assigned
@@ -1485,8 +1482,23 @@ export function initBoard() {
     // minimum — clipping and forcing an early internal scroll.
     const cs = getComputedStyle(el);
     const borderY = parseFloat(cs.borderTopWidth || '0') + parseFloat(cs.borderBottomWidth || '0');
-    const maxHeight = window.innerHeight * (2 / 3);
-    el.style.height = Math.min(el.scrollHeight + borderY, maxHeight) + 'px';
+    const target = el.scrollHeight + borderY;
+    el.style.height = (maxHeight == null ? target : Math.min(target, maxHeight)) + 'px';
+  }
+
+  // Notes autosize — height tracks content up to 2/3 of the
+  // viewport height, after which `.drawer-notes-autosize`'s
+  // `overflow-y: auto` (web/agents.html) takes over scrolling. Scoped to
+  // the task notes textarea only — the schedule drawer's message-content
+  // textarea keeps its plain fixed/manual-resize box.
+  function autosizeNotesTextarea(el) {
+    autosizeTextarea(el, window.innerHeight * (2 / 3));
+  }
+
+  // Title autosize — grows with no cap; a title is short enough that it
+  // never needs the notes field's internal-scroll ceiling.
+  function autosizeTitleTextarea(el) {
+    autosizeTextarea(el, null);
   }
 
   const TAG_TOKEN = /^[\w-]+$/;
@@ -1807,7 +1819,7 @@ export function initBoard() {
     drawerEl.innerHTML = `
       <div class="drawer-header">
         <button class="panel-close" data-action="drawer-close">×</button>
-        <input class="drawer-title" data-field="title" value="${escapeHtml(titleValue)}" />
+        <textarea class="drawer-title" data-field="title" rows="1">${escapeHtml(titleValue)}</textarea>
       </div>
       ${isTask ? `
       <div class="drawer-section drawer-meta" data-field="meta">${cardMetaHtml(card)}</div>
@@ -1891,8 +1903,12 @@ export function initBoard() {
     drawerEl.querySelector('[data-action="drawer-close"]').onclick = closeDrawer;
 
     const titleEl = drawerEl.querySelector('[data-field="title"]');
+    // Titles are single-line values in the vault: a pasted or otherwise
+    // typed newline is collapsed to a space before it's ever compared or
+    // saved, so the field never turns a task's description into a
+    // multi-line value.
     titleEl.addEventListener('blur', async () => {
-      const value = titleEl.value.trim();
+      const value = titleEl.value.replace(/\r\n|\r|\n/g, ' ').trim();
       if (!value || value === titleValue) return;
       try {
         if (isTask) await putTask(card.id, { description: value });
@@ -1901,8 +1917,19 @@ export function initBoard() {
       } catch (err) {
         showToast(`Couldn't save title: ${err.message}`, true);
         titleEl.value = titleValue;
+        autosizeTitleTextarea(titleEl);
       }
     });
+    // Enter commits the title (the same result as blurring) instead of
+    // inserting a line break — skipped mid-IME-composition so committing
+    // an East Asian input method's conversion doesn't fire an early save.
+    titleEl.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' || e.isComposing) return;
+      e.preventDefault();
+      titleEl.blur();
+    });
+    titleEl.addEventListener('input', () => autosizeTitleTextarea(titleEl));
+    autosizeTitleTextarea(titleEl);  // size to existing content on open/re-render
 
     if (!isTask) {
       renderScheduleDrawerFields(card);
