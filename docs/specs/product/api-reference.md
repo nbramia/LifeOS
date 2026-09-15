@@ -608,6 +608,10 @@ Get a specific schedule.
 
 List the Telegram bot names a schedule's `bot` field may use: `primary` plus every configured registry bot (an entry in `config/telegram_bots.json` counts only once its `token_env` is set), as `{"bots": [...]}`. Exactly the names `POST`/`PUT` accept. Backs the board drawer's bot picker.
 
+### POST /api/scheduler/preview
+
+Preview the next fire times a trigger produces, without creating a schedule. Body: `schedule_type` (`once` or `cron`), `schedule_value`, and `timezone` (optional, defaults to the configured `LIFEOS_TIMEZONE`). Returns `{"next": [...]}` — up to three ISO-8601 UTC datetimes, using the same cron-in-timezone evaluation the scheduler itself fires on. `once` returns at most one time (the value itself, converted to UTC) when it's still in the future, else an empty list. An unrecognised `schedule_type` returns **400**; an invalid cron expression, ISO datetime, or timezone returns **422** with the same detail wording `POST`/`PUT /api/scheduler` use. Declared ahead of `GET /{id}` so `preview` is never captured as a schedule id. Backs the board's create-schedule composer's live preview.
+
 ### PUT /api/scheduler/{id}
 
 Update a schedule. Only the fields present in the request body are changed, and nothing is written if any check fails. An unrecognised `bot` returns **422** with the accepted names. `schedule_type` (must be `once` or `cron`) and `action` (must be one of `notify`/`prompt`/`endpoint`/`agent`) return **400**, matching `POST /api/scheduler`. `timezone` (must resolve as an IANA zone) and `schedule_value` (must parse as a cron expression for a `cron` schedule, or an ISO datetime for a `once` schedule — using `schedule_type` from the request if given, otherwise the entry's stored type) return **422** with a detail naming what's wrong. A request that sends `schedule_type` **without** `schedule_value` is validated against the entry's stored value under the new type, and returns the same **422** when that value doesn't parse — converting a schedule means sending both fields in one request.
