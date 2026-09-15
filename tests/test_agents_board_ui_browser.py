@@ -437,6 +437,8 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
         undo_match = re.search(r"/api/agents/board/cards/([^/]+)/undo-accept$", url)
         if undo_match and method == "POST":
             card_id = undo_match.group(1)
+            if call_log is not None:
+                call_log.append(("undo_accept", card_id))
             _move_card_in_state(board_state, card_id, "review")
             for card in board_state["lanes"]["review"]:
                 if card["id"] == card_id:
@@ -486,6 +488,20 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                             others = [t for t in card.get("tags", []) if t.lower() not in _ASSIGNEE_TAGS]
                             card["assignee"] = assignee or None
                             card["tags"] = ([assignee] if assignee else []) + others
+                # Mirrors plan_lane_move's target=="done" branch: a
+                # review-pending card (agent-completed without accepted)
+                # landing on Done gets `accepted` added — the same accept
+                # semantics the dedicated /accept endpoint applies — so a
+                # card whose tags already reflect a genuine acceptance has
+                # a natural lane of Done until an undo-accept reverses it.
+                if body.get("lane") == "done":
+                    for cards in board_state["lanes"].values():
+                        for card in cards:
+                            if card["id"] != lane_match.group(1):
+                                continue
+                            tset = {str(t).lstrip("#").lower() for t in card.get("tags", [])}
+                            if "agent-completed" in tset and "accepted" not in tset:
+                                card["tags"] = [*card.get("tags", []), "accepted"]
                 # Every successful lane move clears a stray snooze, the same
                 # way plan_lane_move does server-side — dragging a snoozed
                 # card out of Snoozed always wakes it.
@@ -507,6 +523,8 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                 body = {}
             if snooze_calls is not None:
                 snooze_calls.append({"method": method, "id": card_id, "body": body})
+            if call_log is not None and method == "PUT":
+                call_log.append(("snooze_put", card_id))
             card = next(
                 (candidate for cards in board_state["lanes"].values() for candidate in cards
                  if candidate["id"] == card_id),
@@ -516,6 +534,16 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                 route.fulfill(status=404, content_type="application/json", body=json.dumps({"detail": "card not found"}))
                 return
             if method == "PUT":
+                # Mirrors the server's own eligibility check: refuse (409),
+                # with no write, when the card's NATURAL lane (ignoring any
+                # snooze already in effect) isn't itself snooze-eligible —
+                # e.g. a still-accepted card whose natural lane is Done.
+                if _stub_natural_lane(card) not in _SNOOZABLE_LANES:
+                    route.fulfill(
+                        status=409, content_type="application/json",
+                        body=json.dumps({"detail": "only Unassigned, Assigned, Human queue, and Review cards can be snoozed"}),
+                    )
+                    return
                 card.setdefault("fields", {})["snoozed_until"] = body.get("until")
                 _move_card_in_state(board_state, card_id, "snoozed")
                 landed = "snoozed"
@@ -4113,11 +4141,17 @@ class TestSnoozeUndoAfterDrag:
         which — like Snoozed — can never be set directly. Undo goes
         through the dedicated undo-accept transition (removing the
         `accepted` tag the drag-to-Done write added) rather than a lane
-        move, then re-applies the snooze."""
+        move, then re-applies the snooze. The stub refuses (409) a snooze
+        PUT on a card whose natural lane isn't snooze-eligible — the same
+        way the real server does — so the card genuinely can't reach
+        Snoozed without undo-accept having run first: skipping it isn't
+        just "a lane move happened instead", it's "the re-snooze itself
+        would be refused"."""
         # See the comment in test_undo_after_lane_drop_restores_the_natural_lane_and_re_snoozes.
         page.set_viewport_size({"width": 2400, "height": 900})
         lane_calls = []
         snooze_calls = []
+        call_log = []
         board_state = _board_fixture()
         board_state["lanes"]["snoozed"].append({
             "kind": "task", "id": "t-snoozed-review", "title": "Sleeping review card",
@@ -4128,7 +4162,7 @@ class TestSnoozeUndoAfterDrag:
         })
         _open_board(
             page, agents_base_url, board_state=board_state,
-            lane_calls=lane_calls, snooze_calls=snooze_calls,
+            lane_calls=lane_calls, snooze_calls=snooze_calls, call_log=call_log,
         )
         page.locator("#board-lane-filter-btn").click()
         page.locator("#board-lane-filter-options input[value='snoozed']").check()
@@ -4149,6 +4183,14 @@ class TestSnoozeUndoAfterDrag:
         # (which would be a PUT of "unassigned"/"assigned"/etc., never
         # "review" itself, since that's not a direct target either).
         assert lane_calls == [{"lane": "done"}], lane_calls
+        # undo-accept actually happened — exactly once — and strictly
+        # before the re-snooze PUT, not merely "the card ended up in
+        # Snoozed somehow".
+        undo_indices = [i for i, entry in enumerate(call_log) if entry == ("undo_accept", "t-snoozed-review")]
+        snooze_indices = [i for i, entry in enumerate(call_log) if entry == ("snooze_put", "t-snoozed-review")]
+        assert len(undo_indices) == 1, call_log
+        assert len(snooze_indices) == 1, call_log
+        assert undo_indices[0] < snooze_indices[0], call_log
         expect(page.locator(".toast.error")).to_have_count(0)
         expect(page.locator(".board-lane[data-lane='snoozed'] [data-card-id='t-snoozed-review']")).to_be_visible(timeout=5000)
 
