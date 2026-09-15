@@ -82,9 +82,9 @@ A **New card** button in the filter bar opens a composer — title, optional not
 
 ### Multi-select
 
-Holding Cmd (macOS) or Ctrl (other platforms) while clicking a task card toggles it into a selection instead of opening the drawer; modifier-clicking a selected card removes it. A selected card gets a purple outline. A plain click always clears the selection first, then opens that card's drawer as usual; Escape clears the selection when no drawer or modal is open, deferring to Escape's existing drawer-close behavior when one is. Scheduled cards are never selectable — a modifier-click on one behaves exactly as a plain click does. A modifier-held press never starts a card drag. A card that drops out of the board on a live update (deleted, or moved out from under the filter) drops out of the selection too, and the count updates.
+Holding Cmd (macOS) or Ctrl (other platforms) while clicking a task card toggles it into a selection instead of opening the drawer; modifier-clicking a selected card removes it. A selected card gets a purple outline. A plain click, or keyboard Enter/Space on a focused card, always clears the selection first, then opens that card's drawer as usual; Escape clears the selection when no drawer or modal is open, deferring to Escape's existing drawer-close behavior when one is (including while the drawer's own title field holds focus). Scheduled cards are never selectable — a modifier-click on one behaves exactly as a plain click does. A modifier-held press never starts a card drag. A card that drops out of the board on a live update (deleted, or moved out from under the filter) drops out of the selection too, and the count updates.
 
-While at least one card is selected, a bottom action bar replaces the assignee tray (see [Assignee](#assignee)) and shows the count plus four actions and a clear control:
+While at least one card is selected, a bottom action bar replaces the assignee tray (see [Assignee](#assignee)) — the tray is genuinely hidden, not just covered — and shows the count plus four actions and a clear control:
 
 - **Delete** shows one confirmation naming the number of selected cards, then deletes each one through the same path as the drawer's Delete, including killing a live, killable session first on a card that has one.
 - **Assign** opens a picker with the same assignee list the drawer uses, plus unassigned, and applies the choice to every selected card.
@@ -92,7 +92,7 @@ While at least one card is selected, a bottom action bar replaces the assignee t
 - **Mark Done** moves every selected card to Done: a Review card through the same acceptance transition as **Accept**, every other card through the plain lane-move endpoint. A card already in Done is a no-op.
 - The clear control (and Escape) empties the selection without acting on it.
 
-Each bulk action runs its write once per selected card and reports one summary toast naming how many succeeded; a card the server refuses (a claimed card an operator tries to reassign, for example) is left unchanged and named in the same toast alongside the server's reason, while every other card in the batch still goes through. There is no per-card confirmation and no per-card undo — Delete's one confirmation is the only prompt a bulk action shows.
+Each bulk action runs its write once per selected card, reading each card's current state at the moment the action runs rather than a stale copy captured when it was selected, and reports one summary toast naming how many succeeded; a card the server refuses (a claimed card an operator tries to reassign, for example) is left unchanged and named in the same toast alongside the server's reason, while every other card in the batch still goes through. There is no per-card confirmation and no per-card undo — Delete's one confirmation is the only prompt a bulk action shows. The four bar buttons disable for the duration of whichever action is running — including the time Delete's confirmation sits open awaiting a choice — so a second click can't start a second run of the same action or stack a second confirmation.
 
 ### Pending questions
 
