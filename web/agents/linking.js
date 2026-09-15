@@ -20,11 +20,15 @@ const FILTERS_STORAGE_KEY = 'lifeos.agents.filters.v1';
 // once, for the one-time migration below; board.js writes only to this key.
 const LEGACY_BOARD_LANE_STORAGE_KEY = 'lifeos.agents.board.lanes';
 
-// The board's own default (every lane but Done) — the shared `lanes`
-// filter's default too, so an operator who never touched the lane filter
-// sees the same board they always did, and the graph honours that same
-// default rather than showing every lane unfiltered.
-const DEFAULT_LANE_IDS = LANES.filter(l => l.id !== 'done').map(l => l.id);
+// The board's own default (every lane but Done and Snoozed) — the shared
+// `lanes` filter's default too, so an operator who never touched the lane
+// filter sees the same board they always did, and the graph honours that
+// same default rather than showing every lane unfiltered. `sanitizeLaneIds`
+// below (which intersects a stored selection against the CURRENT set of
+// valid lane ids) is also what keeps a selection saved before Snoozed
+// existed from suddenly showing it: the stored array simply never contains
+// an id it had no way to have written.
+const DEFAULT_LANE_IDS = LANES.filter(l => l.id !== 'done' && l.id !== 'snoozed').map(l => l.id);
 
 // `recency` defaults to `null` — "the operator has never set it" — rather
 // than a concrete value, because the board and the graph disagree on what
