@@ -756,6 +756,52 @@ class TestPerActionSections:
         expect(page.locator('[data-field="action"]')).to_have_value("notify")
         expect(page.locator('[data-field="message-content"]')).to_be_visible()
 
+    def test_server_rejection_of_a_satisfied_switch_shows_action_error_and_keeps_stored_action(self, page: Page, agents_base_url):
+        board_state = _board_fixture()  # notify, no endpoint_config
+        schedule_puts, trigger_calls = [], []
+        _stub_routes(page, board_state, schedule_puts, trigger_calls)
+
+        detail = "endpoint_config.method must be 'GET' or 'POST', got None"
+
+        def failing_put(route):
+            if route.request.method == "PUT" and "/api/scheduler/s1" in route.request.url:
+                try:
+                    body = json.loads(route.request.post_data or "{}")
+                except ValueError:
+                    body = {}
+                if "action" in body:
+                    route.fulfill(status=422, content_type="application/json", body=json.dumps({"detail": detail}))
+                    return
+            route.continue_()
+
+        page.route("**/api/scheduler/s1", failing_put)
+        page.goto(f"{agents_base_url}/agents")
+        page.wait_for_selector('[data-card-id="s1"]')
+        page.locator('[data-card-id="s1"]').click()
+        page.wait_for_selector('[data-field="action"]')
+
+        page.locator('[data-field="action"]').select_option("endpoint")
+        # Method stays at its default (GET) -- filling and blurring a valid
+        # "/api/"-prefixed path satisfies the endpoint action locally, so
+        # this blur is what fires the combined PUT the server rejects here.
+        path = page.locator('[data-field="endpoint-path"]')
+        path.fill("/api/tasks/summary")
+        path.blur()
+
+        error_el = page.locator('[data-field="action-error"]')
+        expect(error_el).to_be_visible(timeout=5000)
+        expect(error_el).to_contain_text(detail)
+        # The operator's own entry stays visible -- nothing reverts it.
+        expect(path).to_have_value("/api/tasks/summary")
+        # The rejected PUT never reached the store -- the card's stored
+        # action is unchanged.
+        assert board_state["lanes"]["scheduled"][0]["action"] == "notify"
+        page.locator('[data-action="drawer-close"]').click()
+        page.locator('[data-card-id="s1"]').click()
+        page.wait_for_selector('[data-field="action"]')
+        expect(page.locator('[data-field="action"]')).to_have_value("notify")
+        expect(page.locator('[data-field="message-content"]')).to_be_visible()
+
 
 class TestEndpointAction:
     def test_params_invalid_json_shows_field_error_and_sends_nothing(self, page: Page, agents_base_url):
