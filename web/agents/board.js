@@ -19,7 +19,7 @@ import {
 } from './panel.js';
 import { renderActionRow } from './session_actions.js';
 import { descendantsOf } from './graph_encoding.js';
-import { acceptCard, cardActionHandlers, cancelCard, openDeleteCardModal } from './card_actions.js';
+import { acceptCard, cardActionHandlers, cancelCard, deleteCard, openDeleteCardModal } from './card_actions.js';
 import { renderAssignmentPickers } from './assignment.js';
 import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
@@ -67,7 +67,7 @@ const LIFECYCLE_TAGS = new Set([
 // Card fields the drawer renders as editable inputs — used to decide
 // whether an SSE tick needs to rebuild the drawer at all (#850 finding 2).
 const DRAWER_EDITABLE_FIELDS = [
-  'title', 'notes', 'tags', 'context', 'assignee', 'lane',
+  'title', 'notes', 'tags', 'assignee', 'lane',
   // The model/effort/host pickers write here. Without it a frame whose only
   // change is a picker value is read as "nothing changed", so a drawer
   // showing a stale picker has no later frame that can converge it.
@@ -135,6 +135,16 @@ export function initBoard() {
   const dropStatusEl = document.getElementById('board-drop-status');
   const drawerBackdrop = document.getElementById('board-drawer-backdrop');
   const drawerEl = document.getElementById('board-drawer');
+  const dropTrayEl = document.getElementById('board-drop-tray');
+  const bulkBarEl = document.getElementById('board-bulk-bar');
+  const bulkCountEl = document.getElementById('board-bulk-count');
+  const bulkTagBtn = document.getElementById('board-bulk-tag');
+  const bulkTagPopover = document.getElementById('board-bulk-tag-popover');
+  const bulkAssignBtn = document.getElementById('board-bulk-assign');
+  const bulkAssignPopover = document.getElementById('board-bulk-assign-popover');
+  const bulkDoneBtn = document.getElementById('board-bulk-done');
+  const bulkDeleteBtn = document.getElementById('board-bulk-delete');
+  const bulkClearBtn = document.getElementById('board-bulk-clear');
 
   let board = { lanes: Object.fromEntries(LANES.map(l => [l.id, []])) };
   let visibleLanes = new Set(getFilters().lanes);
@@ -221,6 +231,104 @@ export function initBoard() {
   let revealedCardId = null;
   let revealHighlightTimer = null;
 
+  // Multi-select — a Set of task-card ids, not a DOM class: `render()`
+  // rebuilds every card node (an SSE tick, a filter change, a lane toggle),
+  // so the selection has to be re-applied at render time the same way
+  // `revealedCardId` is, rather than living on a node that gets discarded.
+  // Only task cards are ever added — scheduled cards are never selectable.
+  let selectedCardIds = new Set();
+
+  function clearSelection() {
+    if (selectedCardIds.size === 0) return;
+    selectedCardIds.clear();
+    closeBulkPopovers();
+    render();
+  }
+
+  function toggleCardSelection(cardId) {
+    if (selectedCardIds.has(cardId)) selectedCardIds.delete(cardId);
+    else selectedCardIds.add(cardId);
+    render();
+  }
+
+  // Drops any selected id absent from the board — called from
+  // `applyBoard` before `render()` so a card that vanished on a live update
+  // (deleted elsewhere, or moved out from under a stale selection) drops out
+  // of the count rather than being fanned out over on the next bulk action.
+  function pruneSelection() {
+    if (selectedCardIds.size === 0) return;
+    const present = new Set(allCards().map(c => c.id));
+    for (const id of [...selectedCardIds]) {
+      if (!present.has(id)) selectedCardIds.delete(id);
+    }
+  }
+
+  function selectedTaskCards() {
+    return allCards().filter(c => c.kind === 'task' && selectedCardIds.has(c.id));
+  }
+
+  function closeBulkPopovers() {
+    if (bulkTagPopover) bulkTagPopover.hidden = true;
+    if (bulkAssignPopover) bulkAssignPopover.hidden = true;
+  }
+
+  // Renders the bottom bulk-action bar and swaps it in for the assignee
+  // tray while at least one card is selected — the tray comes back exactly
+  // when the selection empties. Called from `render()` so the count and
+  // visibility always match `selectedCardIds` after any rebuild.
+  function renderBulkBar() {
+    if (!bulkBarEl) return;
+    const n = selectedCardIds.size;
+    const active = n > 0;
+    bulkBarEl.hidden = !active;
+    if (dropTrayEl) dropTrayEl.hidden = active;
+    if (!active) {
+      closeBulkPopovers();
+      return;
+    }
+    if (bulkCountEl) bulkCountEl.textContent = `${n} selected`;
+  }
+
+  // Summarizes a fan-out's per-card outcomes into the one toast a bulk
+  // action shows — never one toast per card. `results` is
+  // `[{card, ok, reason}]`; a refused/failed card's `reason` is the
+  // server's own `detail` (or a transport error message), never
+  // re-derived client-side.
+  function reportBulkOutcome(verb, results) {
+    const succeeded = results.filter(r => r.ok);
+    const failed = results.filter(r => !r.ok);
+    if (failed.length === 0) {
+      showToast(`${verb} ${succeeded.length} of ${results.length}.`, false);
+      return;
+    }
+    const refusals = failed.map(r => `${r.card.title || r.card.id}: ${r.reason}`).join('; ');
+    showToast(`${verb} ${succeeded.length} of ${results.length} — refused: ${refusals}`, true);
+  }
+
+  // Runs `action(card)` for every card in `cards`, at most `limit` in
+  // flight at once, and resolves with one `{card, ok, reason}` per card —
+  // a rejected `action` is caught here so one card's refusal never stops
+  // the rest of the batch from running.
+  async function fanOut(cards, action, limit = 4) {
+    const results = new Array(cards.length);
+    let next = 0;
+    async function worker() {
+      while (next < cards.length) {
+        const index = next++;
+        const card = cards[index];
+        try {
+          await action(card);
+          results[index] = { card, ok: true };
+        } catch (err) {
+          results[index] = { card, ok: false, reason: (err && err.message) || String(err) };
+        }
+      }
+    }
+    const workers = Array.from({ length: Math.min(limit, cards.length) }, worker);
+    await Promise.all(workers);
+    return results;
+  }
+
   // ------------------------------------------------------------------
   // Data load + live updates
   // ------------------------------------------------------------------
@@ -241,6 +349,7 @@ export function initBoard() {
     board = next;
     boardLoaded = true;
     updateFilterOptions();
+    pruneSelection();
     render();
     if (openCardId) {
       const fresh = findCard(openCardId);
@@ -614,6 +723,7 @@ export function initBoard() {
     // is what keeps the highlight surviving that rebuild rather than a
     // one-time class added to a node that gets discarded.
     if (card.id === revealedCardId) div.classList.add('reveal-highlight');
+    if (selectedCardIds.has(card.id)) div.classList.add('board-card-selected');
     const showAccept = card.lane === 'review';
     div.innerHTML = `
       <div class="board-card-title">${live ? '<span class="live-dot" title="live"></span>' : ''}${escapeHtml(card.title || '(untitled)')}</div>
@@ -621,13 +731,25 @@ export function initBoard() {
       <div class="board-card-chips">${cardChips(card)}</div>
       ${showAccept ? '<button type="button" class="board-card-accept">Accept</button>' : ''}
     `;
-    div.addEventListener('click', () => {
+    div.addEventListener('click', (e) => {
       if (consumeClickSuppression('card', card.id)) return;
+      // A modifier click toggles this card into/out of the selection
+      // instead of opening the drawer, and never touches the tray/filter
+      // state — a plain click is the only thing that clears a selection or
+      // opens the drawer.
+      if (e.metaKey || e.ctrlKey) {
+        toggleCardSelection(card.id);
+        return;
+      }
+      clearSelection();
       openDrawer(card.id);
     });
     div.addEventListener('keydown', e => {
       if (e.target !== div || (e.key !== 'Enter' && e.key !== ' ')) return;
       e.preventDefault();
+      // Mirrors the plain-click branch above: activating a card always
+      // clears any selection before opening its drawer, keyboard or mouse.
+      clearSelection();
       openDrawer(card.id);
     });
     const sessionChip = div.querySelector('.board-chip-session');
@@ -686,6 +808,7 @@ export function initBoard() {
       hint.className = 'board-lanes-empty-hint';
       hint.textContent = 'No lanes selected — use the Lanes filter above to show columns.';
       lanesEl.appendChild(hint);
+      renderBulkBar();
       return;
     }
     for (const lane of LANES) {
@@ -715,6 +838,7 @@ export function initBoard() {
       column.appendChild(cardsEl);
       lanesEl.appendChild(column);
     }
+    renderBulkBar();
   }
 
   // Makes card `cardId` visible and scrolls it into view — the graph tab's
@@ -723,10 +847,10 @@ export function initBoard() {
   // below) all land here. Relaxes EVERY shared filter that currently hides
   // the card (lanes, assignee, host, engine, tag, search, recency) through
   // one batched `setFilters` call, then confirms the card actually rendered
-  // before scrolling/highlighting — a board-local filter (context, include
-  // cancelled) is left as-is, the operator set those on purpose and they
-  // have no shared counterpart to relax. An unknown id is reported rather
-  // than left to fail silently.
+  // before scrolling/highlighting — the board-local "include cancelled"
+  // filter is left as-is, the operator set it on purpose and it has no
+  // shared counterpart to relax. An unknown id is reported rather than
+  // left to fail silently.
   function revealCard(cardId, opts) {
     const openDrawerFlag = !!(opts && opts.openDrawer);
     const card = findCard(cardId);
@@ -879,6 +1003,10 @@ export function initBoard() {
 
   function onPointerDown(e, source) {
     if (e.isPrimary === false || dragState || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    // A modifier-held press on a card is a selection click, never a drag —
+    // bail before any drag state is set so the trailing click reaches the
+    // card's own listener untouched.
+    if (source.kind === 'card' && (e.metaKey || e.ctrlKey)) return;
     if (e.target.closest('button, input, select, textarea, a') && source.kind === 'card') return;
     // A session chip has its own click navigation. Do not let the card's
     // drag handler capture that pointer on the card, or the browser retargets
@@ -1384,13 +1512,19 @@ export function initBoard() {
 
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
-    if (!openCardId) return;
-    if (drawerBackdrop && drawerBackdrop.hidden) return;
-    // A modal (new-card composer, answer prompt) renders on top of the
-    // drawer (.modal-backdrop z-index 100 > .board-drawer-backdrop's 90) —
-    // let it own Escape instead of closing the drawer underneath it.
+    // A modal (new-card composer, answer prompt, bulk delete confirm)
+    // renders on top of both the drawer (.modal-backdrop z-index 100 >
+    // .board-drawer-backdrop's 90) and the selection — let it own Escape
+    // instead of closing/clearing what's underneath it.
     if (document.querySelector('.modal-backdrop')) return;
-    closeDrawer();
+    if (openCardId && !(drawerBackdrop && drawerBackdrop.hidden)) {
+      closeDrawer();
+      return;
+    }
+    // Escape's existing drawer precedence takes priority; only once there's
+    // no drawer to close does it fall through to clearing a selection
+
+    clearSelection();
   });
 
   async function putTask(taskId, patch) {
@@ -1468,12 +1602,9 @@ export function initBoard() {
     return `Last run: ${at} — ${outcome}${snippet}`;
   }
 
-  // Notes autosize — height tracks content up to 2/3 of the
-  // viewport height, after which `.drawer-notes-autosize`'s
-  // `overflow-y: auto` (web/agents.html) takes over scrolling. Scoped to
-  // the task notes textarea only — the schedule drawer's message-content
-  // textarea keeps its plain fixed/manual-resize box.
-  function autosizeNotesTextarea(el) {
+  // Shared autosize core: grows `el` to fit its content, up to `maxHeight`
+  // (in px) when given, or without limit when omitted/null.
+  function autosizeTextarea(el, maxHeight) {
     if (!el) return;
     el.style.height = 'auto';
     // `* { box-sizing: border-box }` (web/agents.html) means the assigned
@@ -1485,8 +1616,23 @@ export function initBoard() {
     // minimum — clipping and forcing an early internal scroll.
     const cs = getComputedStyle(el);
     const borderY = parseFloat(cs.borderTopWidth || '0') + parseFloat(cs.borderBottomWidth || '0');
-    const maxHeight = window.innerHeight * (2 / 3);
-    el.style.height = Math.min(el.scrollHeight + borderY, maxHeight) + 'px';
+    const target = el.scrollHeight + borderY;
+    el.style.height = (maxHeight == null ? target : Math.min(target, maxHeight)) + 'px';
+  }
+
+  // Notes autosize — height tracks content up to 2/3 of the
+  // viewport height, after which `.drawer-notes-autosize`'s
+  // `overflow-y: auto` (web/agents.html) takes over scrolling. Scoped to
+  // the task notes textarea only — the schedule drawer's message-content
+  // textarea keeps its plain fixed/manual-resize box.
+  function autosizeNotesTextarea(el) {
+    autosizeTextarea(el, window.innerHeight * (2 / 3));
+  }
+
+  // Title autosize — grows with no cap; a title is short enough that it
+  // never needs the notes field's internal-scroll ceiling.
+  function autosizeTitleTextarea(el) {
+    autosizeTextarea(el, null);
   }
 
   const TAG_TOKEN = /^[\w-]+$/;
@@ -1807,26 +1953,20 @@ export function initBoard() {
     drawerEl.innerHTML = `
       <div class="drawer-header">
         <button class="panel-close" data-action="drawer-close">×</button>
-        <input class="drawer-title" data-field="title" value="${escapeHtml(titleValue)}" />
+        <textarea class="drawer-title" data-field="title" rows="1">${escapeHtml(titleValue)}</textarea>
       </div>
       ${isTask ? `
       <div class="drawer-section drawer-meta" data-field="meta">${cardMetaHtml(card)}</div>
       <div class="drawer-section">
       <label class="drawer-label">Notes</label>
       <textarea class="drawer-notes drawer-notes-autosize" data-field="notes" placeholder="Notes…">${escapeHtml(card.notes || '')}</textarea>
-      <div class="drawer-row">
-        <div>
-          <label class="drawer-label">Assignee</label>
-          <select class="drawer-assignee" data-field="assignee" ${assigneeDisabled ? 'disabled' : ''}>
-            <option value="">unassigned</option>
-            ${ASSIGNEES.map(a => `<option value="${a}" ${card.assignee === a ? 'selected' : ''}>${a}</option>`).join('')}
-          </select>
-          ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="assignee-reason">${escapeHtml(assigneePolicy.reason || "This card's assignee can't be changed right now.")}</div>` : ''}
-        </div>
-        <div>
-          <label class="drawer-label">Context</label>
-          <input class="drawer-context" data-field="context" value="${escapeHtml(card.context || '')}" />
-        </div>
+      <div>
+        <label class="drawer-label">Assignee</label>
+        <select class="drawer-assignee" data-field="assignee" ${assigneeDisabled ? 'disabled' : ''}>
+          <option value="">unassigned</option>
+          ${ASSIGNEES.map(a => `<option value="${a}" ${card.assignee === a ? 'selected' : ''}>${a}</option>`).join('')}
+        </select>
+        ${assigneeDisabled ? `<div class="drawer-field-reason" data-field="assignee-reason">${escapeHtml(assigneePolicy.reason || "This card's assignee can't be changed right now.")}</div>` : ''}
       </div>
       <label class="drawer-label" id="drawer-tags-label-${escapeHtml(card.id)}">Tags</label>
       <div class="drawer-tags-picker" data-field="tags-picker" role="group" aria-labelledby="drawer-tags-label-${escapeHtml(card.id)}">
@@ -1897,18 +2037,48 @@ export function initBoard() {
     drawerEl.querySelector('[data-action="drawer-close"]').onclick = closeDrawer;
 
     const titleEl = drawerEl.querySelector('[data-field="title"]');
-    titleEl.addEventListener('blur', async () => {
-      const value = titleEl.value.trim();
-      if (!value || value === titleValue) return;
+    // Titles are single-line values in the vault: a pasted or otherwise
+    // typed newline is collapsed to a space before it's ever compared or
+    // saved, so the field never turns a task's description into a
+    // multi-line value. `lastSavedTitle` (not the render-time `titleValue`)
+    // is what a save compares and reverts against, so a second commit of
+    // the same value — Enter followed by a later blur, with no further
+    // typing in between — is a no-op instead of firing a duplicate PUT.
+    let lastSavedTitle = titleValue;
+    async function saveTitle() {
+      const value = titleEl.value.replace(/\r\n|\r|\n/g, ' ').trim();
+      if (!value || value === lastSavedTitle) return;
       try {
         if (isTask) await putTask(card.id, { description: value });
         else await putSchedule(card.id, { name: value });
+        lastSavedTitle = value;
         await fetchBoard();
       } catch (err) {
         showToast(`Couldn't save title: ${err.message}`, true);
-        titleEl.value = titleValue;
+        titleEl.value = lastSavedTitle;
+        autosizeTitleTextarea(titleEl);
       }
+    }
+    titleEl.addEventListener('blur', saveTitle);
+    // Enter commits the title (the same save `blur` uses) instead of
+    // inserting a line break — skipped mid-IME-composition so committing
+    // an East Asian input method's conversion doesn't fire an early save.
+    // This never calls `.blur()`: doing so would move
+    // `document.activeElement` to `<body>`, outside `drawerEl`, which
+    // would drop the field out of `updateOpenDrawer`'s `focused` guard
+    // (board.js's drawer-update path) while the save above is still in
+    // flight — an unrelated live-board tick for the same card could then
+    // repaint the title from the server's still-stale value, flashing the
+    // just-typed text back to the old one on screen. Leaving focus in the
+    // field keeps that guard in effect exactly like it already does for
+    // the notes field while typing.
+    titleEl.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' || e.isComposing) return;
+      e.preventDefault();
+      saveTitle();
     });
+    titleEl.addEventListener('input', () => autosizeTitleTextarea(titleEl));
+    autosizeTitleTextarea(titleEl);  // size to existing content on open/re-render
 
     if (!isTask) {
       renderScheduleDrawerFields(card);
@@ -1996,14 +2166,6 @@ export function initBoard() {
         const fresh = findCard(card.id);
         assigneeEl.value = (fresh || card).assignee || '';
       }
-    });
-
-    const contextEl = drawerEl.querySelector('[data-field="context"]');
-    contextEl.addEventListener('blur', async () => {
-      const value = contextEl.value.trim();
-      if (!value || value === card.context) return;
-      try { await putTask(card.id, { context: value }); await fetchBoard(); }
-      catch (err) { showToast(`Couldn't save context: ${err.message}`, true); contextEl.value = card.context || ''; }
     });
 
     // The drawer's own Assignee select above is the one assignee writer —
@@ -2498,6 +2660,279 @@ export function initBoard() {
         : [...visibleLanes, 'done']);
     });
   }
+
+  // ------------------------------------------------------------------
+  // Bulk actions — fans out over the same per-card endpoints the
+  // drawer and tray already use. Every action collects one {card, ok,
+  // reason} outcome per selected card (`fanOut`, above) and shows exactly
+  // one summary toast — never a toast, and for Delete never a confirmation
+  // modal, per card. No undo toast: unlike a single-card action, a bulk
+  // action has no single prior state to offer restoring.
+  //
+  // In-flight guard: a single `bulkActionInFlight` flag, checked and set
+  // atomically (synchronously, before any `await`) at the top of each of
+  // the four consequential entry points below — the three fan-out runners
+  // and the delete confirmation's own open — so a second click dispatched
+  // before the first has finished (a double-click, or two clicks while a
+  // slow/loaded server holds the first fan-out's requests open) sees the
+  // flag already set and does nothing, rather than starting a second,
+  // fully independent fan-out or stacking a second confirmation modal. The
+  // guard also disables all four bar buttons for its duration — covering
+  // Delete's confirmation modal from the moment it opens through its own
+  // cancel or fan-out, not just the fan-out itself — and always releases
+  // in a `finally`/on every dismissal path, including a thrown error.
+  // ------------------------------------------------------------------
+
+  // Same write shape as the drawer's Assignee select and assignment.js's
+  // own engine picker: drop any existing assignee tag and stamp the new
+  // one (or nothing, for unassigned), keeping every other tag — including
+  // protected lifecycle tags — untouched. Goes through the plain task PUT
+  // (not the lane endpoint), which runs the same assignee-change policy
+  // check (api/routes/tasks.py) so a claimed card still 409s per card.
+  let bulkActionInFlight = false;
+
+  function setBulkButtonsDisabled(disabled) {
+    [bulkTagBtn, bulkAssignBtn, bulkDoneBtn, bulkDeleteBtn].forEach(btn => {
+      if (btn) btn.disabled = disabled;
+    });
+  }
+
+  // Returns `false` (and does nothing) when a bulk action is already
+  // running — the caller must bail immediately without starting any work.
+  // Returns `true` once the flag is claimed, having already disabled the
+  // bar's buttons so a disabled second click can't even reach its own
+  // handler.
+  function beginBulkAction() {
+    if (bulkActionInFlight) return false;
+    bulkActionInFlight = true;
+    setBulkButtonsDisabled(true);
+    return true;
+  }
+
+  function endBulkAction() {
+    bulkActionInFlight = false;
+    setBulkButtonsDisabled(false);
+  }
+
+  async function bulkAssignOne(card, assignee) {
+    const nonAssigneeTags = (card.tags || []).filter(t => !ASSIGNEES.includes(String(t).toLowerCase()));
+    const tags = assignee ? [assignee, ...nonAssigneeTags] : nonAssigneeTags;
+    await putTask(card.id, { tags });
+  }
+
+  async function runBulkAssign(assignee) {
+    const cards = selectedTaskCards();
+    if (cards.length === 0) return;
+    closeBulkPopovers();
+    if (!beginBulkAction()) return;
+    try {
+      const results = await fanOut(cards, (card) => bulkAssignOne(card, assignee));
+      reportBulkOutcome('Assigned', results);
+      await fetchBoard();
+      clearSelection();
+    } finally {
+      endBulkAction();
+    }
+  }
+
+  // Adds one tag through the same endpoint (and merge behavior) as the
+  // drawer's tag picker — `putBoardTags` sends only the editable tag set,
+  // and the server preserves every protected tag already on the card
+  // (update_board_card_tags's `update_tags_preserving`). ADD only, matching
+  // the issue's scope — no bulk untagging.
+  async function bulkTagOne(card, tag) {
+    const current = editableTagsForCard(card);
+    if (current.includes(tag)) return;  // already has it — counts as success
+    await putBoardTags(card.id, [...current, tag]);
+  }
+
+  async function runBulkTag(rawTag) {
+    const tag = normalizeEditableTag(rawTag);
+    if (!tag) return;
+    const cards = selectedTaskCards();
+    if (cards.length === 0) return;
+    closeBulkPopovers();
+    if (!beginBulkAction()) return;
+    try {
+      const results = await fanOut(cards, (card) => bulkTagOne(card, tag));
+      reportBulkOutcome('Tagged', results);
+      await fetchBoard();
+      clearSelection();
+    } finally {
+      endBulkAction();
+    }
+  }
+
+  // Raw per-card writes for the bulk fan-out — unlike `moveCard` (used by
+  // drag/drop and the drawer), these never toast or refresh the board on
+  // their own: a bulk action collects every card's outcome first and shows
+  // exactly one summary toast, then one `fetchBoard()`, so a per-card
+  // helper here must have no side effects beyond the network call itself.
+  async function acceptCardEndpoint(cardId) {
+    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(cardId)}/accept`, { method: 'POST' });
+    if (!r.ok) {
+      const text = await r.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    return r.json();
+  }
+
+  async function moveCardToLaneEndpoint(cardId, lane) {
+    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(cardId)}/lane`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lane }),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+      throw new Error(msg || `HTTP ${r.status}`);
+    }
+    return r.json();
+  }
+
+  // Mark Done: a Review card goes through the same Accept transition as the
+  // inline Accept button and the tray's Done target; every other card goes
+  // through the plain lane-move endpoint, same as dragging it onto Done. A
+  // card already in Done is a no-op that counts as success.
+  async function runBulkMarkDone() {
+    const cards = selectedTaskCards();
+    if (cards.length === 0) return;
+    if (!beginBulkAction()) return;
+    try {
+      const results = await fanOut(cards, async (card) => {
+        if (card.lane === 'done') return;
+        if (card.lane === 'review') await acceptCardEndpoint(card.id);
+        else await moveCardToLaneEndpoint(card.id, 'done');
+      });
+      reportBulkOutcome('Marked done', results);
+      await fetchBoard();
+      clearSelection();
+    } finally {
+      endBulkAction();
+    }
+  }
+
+  // One confirmation naming the count, then the same kill-then-delete core
+  // the single-card Delete modal uses (card_actions.js's `deleteCard`) —
+  // never a modal per card.
+  function openBulkDeleteConfirm() {
+    const cards = selectedTaskCards();
+    if (cards.length === 0) return;
+    // Claimed from the moment the confirmation opens, not just while its
+    // fan-out runs — a second click on Delete while this modal is still
+    // sitting open (awaiting a confirm/cancel) must not stack a second one.
+    if (!beginBulkAction()) return;
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-labelledby="bulk-delete-title">
+        <h2 id="bulk-delete-title">Delete ${cards.length} card${cards.length === 1 ? '' : 's'}?</h2>
+        <div class="descendants">A selected card with a live, killable session is killed first. This can't be undone.</div>
+        <div class="actions">
+          <button id="bulk-delete-cancel">Cancel</button>
+          <button class="danger" id="bulk-delete-confirm">Delete</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(backdrop);
+    const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
+    const cancel = () => { cleanup(); endBulkAction(); };
+    backdrop.addEventListener('click', e => { if (e.target === backdrop) cancel(); });
+    backdrop.querySelector('#bulk-delete-cancel').onclick = cancel;
+    backdrop.querySelector('#bulk-delete-confirm').onclick = async () => {
+      const btn = backdrop.querySelector('#bulk-delete-confirm');
+      btn.disabled = true;
+      btn.textContent = 'Deleting…';
+      try {
+        const results = await fanOut(cards, (card) => deleteCard(card, { findCard }));
+        cleanup();
+        reportBulkOutcome('Deleted', results);
+        await fetchBoard();
+        clearSelection();
+      } finally {
+        endBulkAction();
+      }
+    };
+  }
+
+  function renderBulkAssignPopover() {
+    if (!bulkAssignPopover) return;
+    bulkAssignPopover.innerHTML = `
+      <button type="button" class="board-bulk-popover-option" data-assignee="">unassigned</button>
+      ${ASSIGNEES.map(a => `<button type="button" class="board-bulk-popover-option" data-assignee="${escapeAttr(a)}">${escapeHtml(a)}</button>`).join('')}
+    `;
+    bulkAssignPopover.querySelectorAll('[data-assignee]').forEach(button => {
+      button.addEventListener('click', () => runBulkAssign(button.dataset.assignee || null));
+    });
+  }
+
+  const bulkTagSearchEl = bulkTagPopover && bulkTagPopover.querySelector('[data-field="tag-search"]');
+  const bulkTagOptionsEl = bulkTagPopover && bulkTagPopover.querySelector('[data-field="options"]');
+
+  function renderBulkTagOptions(query) {
+    if (!bulkTagOptionsEl) return;
+    const q = String(query || '').trim().replace(/^#+/, '').toLowerCase();
+    const matches = availableEditableTags().filter(tag => !q || tag.includes(q));
+    const normalizedQuery = normalizeEditableTag(query);
+    const canCreate = !!normalizedQuery && !availableEditableTags().includes(normalizedQuery);
+    bulkTagOptionsEl.innerHTML = matches.map(tag => (
+      `<button type="button" class="board-bulk-popover-option" data-tag="${escapeAttr(tag)}">#${escapeHtml(tag)}</button>`
+    )).join('') + (canCreate
+      ? `<button type="button" class="board-bulk-popover-option board-bulk-popover-create" data-tag="${escapeAttr(normalizedQuery)}">Create new #${escapeHtml(normalizedQuery)}</button>`
+      : '');
+    bulkTagOptionsEl.querySelectorAll('[data-tag]').forEach(button => {
+      button.addEventListener('click', () => runBulkTag(button.dataset.tag));
+    });
+  }
+
+  if (bulkTagSearchEl) {
+    bulkTagSearchEl.addEventListener('input', () => renderBulkTagOptions(bulkTagSearchEl.value));
+    bulkTagSearchEl.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      runBulkTag(bulkTagSearchEl.value);
+    });
+  }
+
+  if (bulkTagBtn) {
+    bulkTagBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (bulkAssignPopover) bulkAssignPopover.hidden = true;
+      if (!bulkTagPopover) return;
+      const opening = bulkTagPopover.hidden;
+      bulkTagPopover.hidden = !opening;
+      if (opening) {
+        if (bulkTagSearchEl) bulkTagSearchEl.value = '';
+        renderBulkTagOptions('');
+        if (bulkTagSearchEl) bulkTagSearchEl.focus();
+      }
+    });
+  }
+  if (bulkAssignBtn) {
+    bulkAssignBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (bulkTagPopover) bulkTagPopover.hidden = true;
+      if (!bulkAssignPopover) return;
+      const opening = bulkAssignPopover.hidden;
+      if (opening) renderBulkAssignPopover();
+      bulkAssignPopover.hidden = !opening;
+    });
+  }
+  document.addEventListener('click', (e) => {
+    if (bulkAssignPopover && !bulkAssignPopover.hidden
+      && !bulkAssignPopover.contains(e.target) && e.target !== bulkAssignBtn) {
+      bulkAssignPopover.hidden = true;
+    }
+    if (bulkTagPopover && !bulkTagPopover.hidden
+      && !bulkTagPopover.contains(e.target) && e.target !== bulkTagBtn) {
+      bulkTagPopover.hidden = true;
+    }
+  });
+  if (bulkDoneBtn) bulkDoneBtn.addEventListener('click', () => runBulkMarkDone());
+  if (bulkDeleteBtn) bulkDeleteBtn.addEventListener('click', () => openBulkDeleteConfirm());
+  if (bulkClearBtn) bulkClearBtn.addEventListener('click', () => clearSelection());
 
   // ------------------------------------------------------------------
   // Wire filters + boot

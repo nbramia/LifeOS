@@ -1211,6 +1211,12 @@
   }
   .board-lane-filter-option:hover { background: var(--bg-elev); }
   .board-lane-filter-option input { margin: 0; }
+  /* board.js's renderBulkBar() sets this element's `hidden` attribute
+     whenever the bulk bar takes its place — without this override the
+     tray's own unconditional `display: flex` below wins over the
+     browser's default `[hidden] { display: none }`, the same reason
+     .board-bulk-bar needs its own such rule. */
+  .board-drop-tray[hidden] { display: none; }
   .board-drop-tray {
     position: relative;
     flex: 0 0 auto;
@@ -1295,6 +1301,102 @@
   }
   .board-drop-status:empty { display: none; }
   .board-drop-status.error { color: var(--failed); }
+  /* Multi-select bulk bar — same slot/sizing as .board-drop-tray
+     (a sibling, toggled by board.js so exactly one of the two shows at a
+     time), never both stacked. */
+  .board-bulk-bar[hidden] { display: none; }
+  .board-bulk-bar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-height: 58px;
+    padding: 0.45rem 1.25rem;
+    border-top: 1px solid var(--accent);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+  .board-bulk-count { font-size: 0.8rem; font-weight: 600; flex: 0 0 auto; }
+  .board-bulk-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; flex: 1 1 auto; }
+  .board-bulk-actions > div { position: relative; }
+  .board-bulk-actions button {
+    min-height: 42px;
+    padding: 0.35rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-size: 0.78rem;
+    cursor: pointer;
+  }
+  .board-bulk-actions button:hover { border-color: var(--accent); }
+  .board-bulk-actions button.danger {
+    background: var(--failed);
+    color: var(--bg-primary);
+    border-color: var(--failed);
+    font-weight: 600;
+  }
+  .board-bulk-actions button.danger:hover { filter: brightness(1.15); }
+  .board-bulk-clear {
+    flex: 0 0 auto;
+    min-height: 32px;
+    min-width: 32px;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .board-bulk-clear:hover { border-color: var(--accent); }
+  .board-bulk-popover {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    margin-bottom: 6px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.5rem;
+    min-width: 180px;
+    max-height: 260px;
+    overflow-y: auto;
+    z-index: 100;
+    box-shadow: 0 -4px 12px rgba(0,0,0,0.3);
+  }
+  .board-bulk-popover input[type="search"] {
+    width: 100%;
+    box-sizing: border-box;
+    margin-bottom: 0.4rem;
+    padding: 0.3rem 0.5rem;
+    background: var(--bg-elev);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.78rem;
+  }
+  .board-bulk-popover-option {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 0.3rem 0.5rem;
+    background: transparent;
+    color: var(--text-primary);
+    border: none;
+    border-radius: 4px;
+    font-size: 0.78rem;
+    cursor: pointer;
+  }
+  .board-bulk-popover-option:hover { background: var(--bg-elev); }
+  .board-bulk-popover-create { color: var(--accent); font-weight: 600; }
+  /* Purple selection outline — .board-card already gets a border/hover
+     treatment from --accent elsewhere on this page, so a selected card
+     reuses the same token rather than introducing a second "purple". */
+  .board-card.board-card-selected {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent);
+  }
   .board-lane-header {
     padding: 0.5rem 0.75rem;
     font-size: 0.78rem;
@@ -1408,13 +1510,18 @@
   }
   .drawer-header { position: relative; margin-bottom: 0.75rem; }
   .drawer-title {
+    display: block;
     width: 100%;
     background: transparent;
     border: none;
     color: var(--text-primary);
+    font-family: inherit;
     font-size: 1rem;
     font-weight: 600;
+    line-height: 1.3;
     padding: 0.2rem 1.75rem 0.2rem 0;
+    resize: none;
+    overflow: hidden;
   }
   .drawer-title:focus { outline: 1px solid var(--accent); border-radius: 4px; }
   .drawer-label {
@@ -1425,7 +1532,7 @@
     color: var(--text-dim);
     margin: 0.6rem 0 0.25rem;
   }
-  .drawer-notes, .drawer-tags, .drawer-context, .drawer-assignee,
+  .drawer-notes, .drawer-tags, .drawer-assignee,
   .drawer-schedule-value, .drawer-timezone, .drawer-select {
     width: 100%;
     background: var(--bg-elev);
@@ -1533,8 +1640,8 @@
   }
   .drawer-meta-value { font-size: 0.78rem; color: var(--text-primary); }
   .drawer-meta-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem; }
-  /* Visible reason text next to a picker or action the board's own
-     policy has disabled — disable-and-explain, never hide. A distinct
+  /* Visible reason text next to a picker or displayed action the board's
+     own policy has disabled. A distinct
      element/style from .assignment-error below: this is a normal
      explanation, not a failed-save error, and must not paint an ordinary
      "can't change this right now" reason the same alarming red as a real
@@ -1726,6 +1833,27 @@
     <div id="board-assignee-drops" role="group" aria-label="Filter board by assignee, or drop a card here to assign it"></div>
     <button type="button" class="board-drop-target board-done-drop" id="board-done-drop">Done</button>
     <span class="board-drop-status" id="board-drop-status" role="status" aria-live="polite"></span>
+  </div>
+  <!-- Multi-select bulk action bar — hidden until a card is
+       selected; board.js hides board-drop-tray above while this shows. -->
+  <div class="board-bulk-bar" id="board-bulk-bar" aria-label="Bulk actions" hidden>
+    <span class="board-bulk-count" id="board-bulk-count"></span>
+    <div class="board-bulk-actions">
+      <div>
+        <button type="button" id="board-bulk-tag">Tag</button>
+        <div class="board-bulk-popover" id="board-bulk-tag-popover" role="group" aria-label="Add a tag to every selected card" hidden>
+          <input type="search" data-field="tag-search" placeholder="Search or add tag…" autocomplete="off" />
+          <div data-field="options"></div>
+        </div>
+      </div>
+      <div>
+        <button type="button" id="board-bulk-assign">Assign</button>
+        <div class="board-bulk-popover" id="board-bulk-assign-popover" role="group" aria-label="Assign every selected card" hidden></div>
+      </div>
+      <button type="button" id="board-bulk-done">Mark Done</button>
+      <button type="button" class="danger" id="board-bulk-delete">Delete</button>
+    </div>
+    <button type="button" class="board-bulk-clear" id="board-bulk-clear" aria-label="Clear selection">×</button>
   </div>
 </div>
 <div class="board-drawer-backdrop" id="board-drawer-backdrop" hidden>

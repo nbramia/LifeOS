@@ -218,8 +218,8 @@ export function decideActions(session, card) {
     // one; Reassign only needs a target assignee and carries whatever
     // prior-run context exists, so it stands on its own. Both stay on the row
     // either way — a Review card with no session reports why Reject is
-    // unavailable, the same disabled-and-explained treatment Kill and Cancel
-    // give their own refusals, rather than leaving the card's own Notes field
+    // unavailable, the same disabled-and-explained treatment Kill gives its
+    // own refusals, rather than leaving the card's own Notes field
     // looking like the place to type feedback.
     out.push({
       id: 'reject', label: 'Reject', enabled: !!s, danger: false,
@@ -240,15 +240,12 @@ export function decideActions(session, card) {
     }
   }
 
-  // Cancel — every task card that carries a policy block, disabled-and-
-  // explained when refused, never hidden. Card-only (a schedule card
-  // never carries `policy`).
-  if (c && c.policy && c.policy.cancel) {
-    const allowed = c.policy.cancel.allowed === true;
-    out.push({
-      id: 'cancel', label: 'Cancel', enabled: allowed, danger: false,
-      reason: allowed ? null : (c.policy.cancel.reason || "Cancel isn't available for this card."),
-    });
+  // Cancel — offered only when the server policy allows it. A refused
+  // Cancel is omitted because the operator cannot act on it; other refused
+  // controls keep their disabled-and-explained treatment. Card-only (a
+  // schedule card never carries `policy`).
+  if (c && c.policy && c.policy.cancel && c.policy.cancel.allowed === true) {
+    out.push({ id: 'cancel', label: 'Cancel', enabled: true, reason: null, danger: false });
   }
 
   // Delete — offered for every card the drawer can open (task or
