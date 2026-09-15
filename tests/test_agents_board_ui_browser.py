@@ -3021,23 +3021,38 @@ class TestLaneFilterMultiSelect:
 
 class TestLaneAddButton:
     """AC 3: a full-width '+' button per visible DIRECT lane opens the
-    composer with that lane preselected; Review and Scheduled get no
-    button (plan_lane_move rejects both — api/services/agent_board.py).
-    Creating from the Assigned lane's '+' carries the chosen assignee tag
-    through both the POST /api/tasks body and the follow-up PUT .../lane."""
+    task composer with that lane preselected; Review gets no button at all
+    (plan_lane_move rejects it directly — api/services/agent_board.py).
+    Scheduled carries its own '+' that opens the schedule composer instead
+    (see tests/test_schedule_composer_ui_browser.py) — neither lane's
+    button ever opens the OTHER composer. Creating from the Assigned lane's
+    '+' carries the chosen assignee tag through both the POST /api/tasks
+    body and the follow-up PUT .../lane."""
 
-    def test_add_button_present_on_direct_lanes_and_absent_on_scheduled_and_review(self, page: Page, agents_base_url):
+    def test_add_button_present_on_direct_lanes_and_scheduled_absent_on_review(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
         for lane_id in ["unassigned", "assigned", "in_progress", "human_queue"]:
             expect(page.locator(f'.board-lane[data-lane="{lane_id}"] .board-lane-add')).to_be_visible()
-        # Guard the absence assertion the same way the Review half below
-        # does — asserting `.to_have_count(0)` alone passes vacuously if the
-        # Scheduled column itself is not rendering at all.
-        expect(page.locator('.board-lane[data-lane="scheduled"]')).to_be_visible()
-        expect(page.locator('.board-lane[data-lane="scheduled"] .board-lane-add')).to_have_count(0)
+        # The task composer's own lane select still excludes both
+        # undroppable lanes — Scheduled getting its own "+" (below) doesn't
+        # change what this select offers.
+        page.locator('.board-lane[data-lane="unassigned"] .board-lane-add').click()
+        expect(page.locator("#new-card-lane")).to_be_visible()
+        expect(page.locator('#new-card-lane option[value="scheduled"]')).to_have_count(0)
+        expect(page.locator('#new-card-lane option[value="review"]')).to_have_count(0)
+        page.locator("#new-card-cancel").click()
+
+        # Scheduled's own "+" opens the schedule composer, not the task
+        # composer this section otherwise covers.
+        expect(page.locator('.board-lane[data-lane="scheduled"] .board-lane-add')).to_be_visible()
+        page.locator('.board-lane[data-lane="scheduled"] .board-lane-add').click()
+        expect(page.locator('[data-field="action"]')).to_be_visible()
+        expect(page.locator("#new-card-desc")).to_have_count(0)
+        page.locator("#new-schedule-cancel").click()
 
         # Review is empty in the fixture and hidden by default — check it so
-        # its absent "+" is actually observable.
+        # its absent "+" is actually observable, not vacuously passing
+        # because the column itself never rendered.
         page.locator("#board-lane-filter-btn").click()
         page.locator("#board-lane-filter-options input[value='review']").check()
         expect(page.locator('.board-lane[data-lane="review"]')).to_be_visible()
