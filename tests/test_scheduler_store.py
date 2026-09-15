@@ -17,6 +17,7 @@ from api.services.scheduler_store import (
     SchedulerScheduler,
     ScheduleEntry,
     compute_next_trigger,
+    compute_next_n_triggers,
     _format_entry_line,
     _parse_entry_line,
     _format_cron_human,
@@ -652,6 +653,52 @@ class TestCronComputation:
         entry = ScheduleEntry(id="t", name="T", schedule_type="cron",
                               schedule_value="invalid cron")
         assert compute_next_trigger(entry) is None
+
+
+class TestComputeNextNTriggers:
+    """`compute_next_n_triggers` is the pure helper `compute_next_trigger`
+    now shares — covered directly here for the multi-trigger case the
+    single-trigger helper never exercises, plus the once/invalid cases
+    `compute_next_trigger`'s own tests above already cover for count=1."""
+
+    def test_cron_returns_count_ascending_utc_times(self):
+        triggers = compute_next_n_triggers("cron", "0 9 * * *", "UTC", count=3)
+        assert len(triggers) == 3
+        parsed = [datetime.fromisoformat(t) for t in triggers]
+        assert parsed == sorted(parsed)
+        assert all(p > datetime.now(timezone.utc) for p in parsed)
+        assert all(p.tzinfo == timezone.utc for p in parsed)
+
+    def test_once_future_returns_single_time(self):
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        triggers = compute_next_n_triggers("once", future, "UTC", count=3)
+        assert len(triggers) == 1
+
+    def test_once_past_returns_empty(self):
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        assert compute_next_n_triggers("once", past, "UTC", count=3) == []
+
+    def test_invalid_cron_returns_empty(self):
+        assert compute_next_n_triggers("cron", "invalid cron", "UTC", count=3) == []
+
+    def test_invalid_timezone_returns_empty(self):
+        assert compute_next_n_triggers("cron", "0 9 * * *", "Nowhere/Fake", count=3) == []
+
+    def test_unknown_schedule_type_returns_empty(self):
+        assert compute_next_n_triggers("weekly", "0 9 * * *", "UTC", count=3) == []
+
+    def test_zero_count_returns_empty_for_cron(self):
+        assert compute_next_n_triggers("cron", "0 9 * * *", "UTC", count=0) == []
+
+    def test_compute_next_trigger_matches_first_of_n(self):
+        """`compute_next_trigger` must keep returning exactly the first
+        element `compute_next_n_triggers` would — the refactor shares logic
+        without changing either function's observable behavior."""
+        entry = ScheduleEntry(id="t", name="T", schedule_type="cron", schedule_value="0 9 * * *",
+                              timezone="America/New_York")
+        single = compute_next_trigger(entry)
+        many = compute_next_n_triggers("cron", "0 9 * * *", "America/New_York", count=1, label="t")
+        assert single == many[0]
 
 
 class TestDueChecking:

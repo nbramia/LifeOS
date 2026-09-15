@@ -21,7 +21,7 @@ import { renderActionRow } from './session_actions.js';
 import { descendantsOf } from './graph_encoding.js';
 import { acceptCard, cardActionHandlers, cancelCard, deleteCard, openDeleteCardModal } from './card_actions.js';
 import { renderAssignmentPickers } from './assignment.js';
-import { SCHEDULE_ACTIONS, renderScheduleActionSections } from './schedule_sections.js';
+import { SCHEDULE_ACTIONS, renderScheduleActionSections, actionInputsSatisfied } from './schedule_sections.js';
 import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
 import { POINTER_SLOP, pointerIsActive, shouldCancelPointerGesture } from './board_gesture.js';
@@ -92,9 +92,13 @@ const DRAWER_EDITABLE_FIELDS = [
 // kept in sync via `subscribeFilters`.
 const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done').map(l => l.id);
 // plan_lane_move (api/services/agent_board.py) rejects `review` and
-// `scheduled` with "cannot be set directly" — no per-lane "+" button for
-// either, and both are excluded from the new-card composer's lane select.
+// `scheduled` with "cannot be set directly" — the task composer's own "+"
+// button and lane select exclude both. Scheduled gets its own "+" below
+// (SCHEDULED_LANE_ID) that opens the schedule composer instead; Review
+// still has none, since a card only reaches Review through the worker's
+// own tags.
 const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled').map(l => l.id));
+const SCHEDULED_LANE_ID = 'scheduled';
 
 function loadSortSelection() {
   return readSortSelection(localStorage, SORT_STORAGE_KEY, SORT_OPTIONS, DEFAULT_SORT);
@@ -846,9 +850,15 @@ export function initBoard() {
       column.innerHTML = `
         <div class="board-lane-header" style="border-top-color:${laneColor(lane.id)}">${escapeHtml(lane.label)} <span class="board-lane-count">${cards.length}</span></div>
         ${DIRECT_LANE_IDS.has(lane.id) ? `<button type="button" class="board-lane-add" data-lane="${lane.id}" title="New card in ${escapeHtml(lane.label)}">+</button>` : ''}
+        ${lane.id === SCHEDULED_LANE_ID ? `<button type="button" class="board-lane-add" data-lane="${lane.id}" title="New schedule">+</button>` : ''}
       `;
       const addBtn = column.querySelector('.board-lane-add');
-      if (addBtn) addBtn.addEventListener('click', () => openNewCardForm(lane.id));
+      if (addBtn) {
+        addBtn.addEventListener('click', () => {
+          if (lane.id === SCHEDULED_LANE_ID) openNewScheduleForm();
+          else openNewCardForm(lane.id);
+        });
+      }
       const cardsEl = document.createElement('div');
       cardsEl.className = 'board-lane-cards';
       for (const card of cards) {
@@ -1453,6 +1463,372 @@ export function initBoard() {
   }
 
   if (newCardBtn) newCardBtn.addEventListener('click', () => openNewCardForm());
+
+  // ------------------------------------------------------------------
+  // New-schedule composer
+  // ------------------------------------------------------------------
+
+  const TRIGGER_MODES = [
+    { id: 'once', label: 'One-time' },
+    { id: 'daily', label: 'Daily' },
+    { id: 'weekdays', label: 'Weekdays' },
+    { id: 'custom', label: 'Custom days' },
+    { id: 'cron', label: 'Cron' },
+  ];
+  // Sunday-first (index 0 = Sun), matching cron's own day-of-week field.
+  const DOW_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const GENERATED_TRIGGER_MODES = new Set(['daily', 'weekdays', 'custom']);
+
+  // Parses a <input type="time"> value ("HH:MM") into cron's minute/hour
+  // fields — `parseInt` drops any leading zero, matching cron convention
+  // (e.g. "09:05" -> minute 5, hour 9).
+  function parseTriggerTime(time) {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(time || '');
+    if (!m) return null;
+    return { hour: parseInt(m[1], 10), minute: parseInt(m[2], 10) };
+  }
+
+  // Builds the cron expression a generated mode (daily/weekdays/custom)
+  // currently represents, or `null` while its own fields are incomplete
+  // (no time yet, or — for custom — no day checked). `once` and `cron`
+  // aren't cron generators and always return `null` here.
+  function buildGeneratedCron(mode, state) {
+    const parts = parseTriggerTime(state.time);
+    if (!parts) return null;
+    if (mode === 'daily') return `${parts.minute} ${parts.hour} * * *`;
+    if (mode === 'weekdays') return `${parts.minute} ${parts.hour} * * 1-5`;
+    if (mode === 'custom') {
+      if (state.days.size === 0) return null;
+      const days = [...state.days].sort((a, b) => a - b).join(',');
+      return `${parts.minute} ${parts.hour} * * ${days}`;
+    }
+    return null;
+  }
+
+  function triggerFieldsHtml(state) {
+    if (state.mode === 'once') {
+      return `
+        <label class="drawer-label">When</label>
+        <input type="datetime-local" class="drawer-input" data-field="trigger-once" value="${escapeHtml(state.onceValue)}" />
+      `;
+    }
+    if (state.mode === 'cron') {
+      return `
+        <label class="drawer-label">Cron expression</label>
+        <input class="drawer-input" data-field="trigger-cron" value="${escapeHtml(state.cronText)}" placeholder="0 9 * * *" />
+      `;
+    }
+    // daily / weekdays / custom all pick a time; custom also picks days.
+    const daysHtml = state.mode === 'custom' ? `
+        <div class="drawer-daypicker" data-field="trigger-days">
+          ${DOW_LABELS.map((label, i) => `
+            <label class="drawer-daycheck"><input type="checkbox" data-field="trigger-day" value="${i}" ${state.days.has(i) ? 'checked' : ''} /> ${label}</label>
+          `).join('')}
+        </div>
+    ` : '';
+    return `
+      ${daysHtml}
+      <label class="drawer-label">Time</label>
+      <input type="time" class="drawer-input" data-field="trigger-time" value="${escapeHtml(state.time)}" />
+    `;
+  }
+
+  // Reads the trigger builder's current state into `{schedule_type,
+  // schedule_value}`, or `null` while it's incomplete — the same shape
+  // `POST /api/scheduler` and `POST /api/scheduler/preview` both take.
+  function readTrigger(state) {
+    if (state.mode === 'once') {
+      return state.onceValue ? { schedule_type: 'once', schedule_value: state.onceValue } : null;
+    }
+    if (state.mode === 'cron') {
+      const text = (state.cronText || '').trim();
+      return text ? { schedule_type: 'cron', schedule_value: text } : null;
+    }
+    const cron = buildGeneratedCron(state.mode, state);
+    return cron ? { schedule_type: 'cron', schedule_value: cron } : null;
+  }
+
+  // Formats a preview ISO datetime in `tz` — the schedule's own timezone,
+  // never the browser's, so the preview matches what the trigger actually
+  // means. Falls back to the browser's own locale formatting for a
+  // datetime whose `tz` didn't resolve (shouldn't happen: the server
+  // already 422s an unresolvable timezone before returning any preview).
+  function formatPreviewTime(iso, tz) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    try {
+      return d.toLocaleString('en-US', { timeZone: tz || undefined, dateStyle: 'medium', timeStyle: 'short' });
+    } catch (_) {
+      return d.toLocaleString();
+    }
+  }
+
+  function openNewScheduleForm() {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-labelledby="new-schedule-title">
+        <h2 id="new-schedule-title">New schedule</h2>
+        <label class="drawer-label">Name</label>
+        <input class="drawer-input" data-field="name" type="text" />
+        <label class="drawer-label"><input type="checkbox" data-field="enabled" checked /> Enabled</label>
+        <label class="drawer-label">Timezone</label>
+        <input class="drawer-input" data-field="timezone" type="text" placeholder="Configured default" />
+        <div class="drawer-field-error" data-field="timezone-error" hidden></div>
+        <label class="drawer-label">Trigger</label>
+        <select class="drawer-select" data-field="trigger-mode">
+          ${TRIGGER_MODES.map(m => `<option value="${m.id}" ${m.id === 'daily' ? 'selected' : ''}>${m.label}</option>`).join('')}
+        </select>
+        <div data-field="trigger-fields"></div>
+        <div class="drawer-field-error" data-field="trigger-error" hidden></div>
+        <div data-field="preview-list"></div>
+        <div class="drawer-field-error" data-field="preview-error" hidden></div>
+        <label class="drawer-label">Action</label>
+        <select class="drawer-select" data-field="action">
+          ${SCHEDULE_ACTIONS.map(a => `<option value="${a}" ${a === 'notify' ? 'selected' : ''}>${a}</option>`).join('')}
+        </select>
+        <div class="drawer-section" data-field="action-sections"></div>
+        <div class="drawer-field-error" data-field="action-error" hidden></div>
+        <div class="drawer-field-error" data-field="general-error" hidden></div>
+        <div class="actions">
+          <button id="new-schedule-cancel">Cancel</button>
+          <button class="danger" id="new-schedule-create" disabled>Create</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(backdrop);
+    const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
+    backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
+    backdrop.querySelector('#new-schedule-cancel').onclick = cleanup;
+
+    const nameEl = backdrop.querySelector('[data-field="name"]');
+    const enabledEl = backdrop.querySelector('[data-field="enabled"]');
+    const tzEl = backdrop.querySelector('[data-field="timezone"]');
+    const tzErrorEl = backdrop.querySelector('[data-field="timezone-error"]');
+    const modeEl = backdrop.querySelector('[data-field="trigger-mode"]');
+    const triggerFieldsEl = backdrop.querySelector('[data-field="trigger-fields"]');
+    const triggerErrorEl = backdrop.querySelector('[data-field="trigger-error"]');
+    const previewListEl = backdrop.querySelector('[data-field="preview-list"]');
+    const previewErrorEl = backdrop.querySelector('[data-field="preview-error"]');
+    const actionEl = backdrop.querySelector('[data-field="action"]');
+    const actionSectionsEl = backdrop.querySelector('[data-field="action-sections"]');
+    const actionErrorEl = backdrop.querySelector('[data-field="action-error"]');
+    const generalErrorEl = backdrop.querySelector('[data-field="general-error"]');
+    const createBtn = backdrop.querySelector('#new-schedule-create');
+
+    const sectionValues = {
+      message_content: '', endpoint_config: null, executor: '', bot: '',
+      persona_id: '', model_id: '', effort: '', host: '', working_dir: '',
+    };
+    const sections = renderScheduleActionSections(actionSectionsEl, actionEl.value, sectionValues);
+
+    const triggerState = { mode: 'daily', onceValue: '', time: '09:00', days: new Set(), cronText: '' };
+
+    function clearFieldErrors() {
+      triggerErrorEl.hidden = true; triggerErrorEl.textContent = '';
+      tzErrorEl.hidden = true; tzErrorEl.textContent = '';
+      actionErrorEl.hidden = true; actionErrorEl.textContent = '';
+      generalErrorEl.hidden = true; generalErrorEl.textContent = '';
+      sections.clearParamsError();
+    }
+
+    function updateCreateEnabled() {
+      createBtn.disabled = !(nameEl.value.trim() && readTrigger(triggerState));
+    }
+
+    function wireTriggerFields() {
+      const onceEl = triggerFieldsEl.querySelector('[data-field="trigger-once"]');
+      if (onceEl) onceEl.addEventListener('input', () => {
+        triggerState.onceValue = onceEl.value;
+        triggerErrorEl.hidden = true;
+        updateCreateEnabled();
+        schedulePreview();
+      });
+      const cronEl = triggerFieldsEl.querySelector('[data-field="trigger-cron"]');
+      if (cronEl) cronEl.addEventListener('input', () => {
+        triggerState.cronText = cronEl.value;
+        triggerErrorEl.hidden = true;
+        updateCreateEnabled();
+        schedulePreview();
+      });
+      const timeEl = triggerFieldsEl.querySelector('[data-field="trigger-time"]');
+      if (timeEl) timeEl.addEventListener('input', () => {
+        triggerState.time = timeEl.value;
+        triggerErrorEl.hidden = true;
+        updateCreateEnabled();
+        schedulePreview();
+      });
+      for (const dayEl of triggerFieldsEl.querySelectorAll('[data-field="trigger-day"]')) {
+        dayEl.addEventListener('change', () => {
+          const value = Number(dayEl.value);
+          if (dayEl.checked) triggerState.days.add(value); else triggerState.days.delete(value);
+          triggerErrorEl.hidden = true;
+          updateCreateEnabled();
+          schedulePreview();
+        });
+      }
+    }
+
+    function renderTriggerFields() {
+      triggerFieldsEl.innerHTML = triggerFieldsHtml(triggerState);
+      wireTriggerFields();
+    }
+
+    let previewTimer = null;
+    let previewSeq = 0;
+    function schedulePreview() {
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(runPreview, 300);
+    }
+    async function runPreview() {
+      const trig = readTrigger(triggerState);
+      if (!trig) {
+        ++previewSeq; // discard any in-flight response from before the trigger was cleared
+        previewListEl.innerHTML = '';
+        previewErrorEl.hidden = true;
+        previewErrorEl.textContent = '';
+        return;
+      }
+      const tz = tzEl.value.trim();
+      const seq = ++previewSeq;
+      try {
+        const r = await fetch('/api/scheduler/preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...trig, timezone: tz || undefined }),
+        });
+        if (!r.ok) {
+          const text = await r.text();
+          let msg = text;
+          try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+          throw new Error(msg || `HTTP ${r.status}`);
+        }
+        const data = await r.json();
+        if (seq !== previewSeq) return; // superseded by a later change
+        previewErrorEl.hidden = true;
+        previewErrorEl.textContent = '';
+        const times = data.next || [];
+        const resolvedTz = data.timezone || tz;
+        previewListEl.innerHTML = times.length
+          ? times.map(t => `<div class="drawer-schedule-info">${escapeHtml(formatPreviewTime(t, resolvedTz))}</div>`).join('')
+          : '<div class="drawer-schedule-info">No upcoming fires.</div>';
+      } catch (err) {
+        if (seq !== previewSeq) return;
+        previewListEl.innerHTML = '';
+        previewErrorEl.textContent = err.message;
+        previewErrorEl.hidden = false;
+      }
+    }
+
+    // Maps the single `detail` string a rejected create returns to the
+    // field it actually names — mirroring the wording
+    // `api/routes/scheduler.py` and `api/services/scheduler_validation.py`
+    // produce — rather than showing every rejection as one generic error.
+    function applyCreateError(detail) {
+      const message = detail || 'Something went wrong.';
+      if (/^Invalid cron expression|^Invalid ISO datetime/.test(message)) {
+        triggerErrorEl.textContent = message;
+        triggerErrorEl.hidden = false;
+        return;
+      }
+      if (/^Unknown timezone/.test(message)) {
+        tzErrorEl.textContent = message;
+        tzErrorEl.hidden = false;
+        return;
+      }
+      if (message.startsWith('endpoint_config.')) {
+        sections.showParamsError(message);
+        return;
+      }
+      if (/^Unknown Telegram bot/.test(message) || message === 'message_content must not be blank') {
+        actionErrorEl.textContent = message;
+        actionErrorEl.hidden = false;
+        return;
+      }
+      generalErrorEl.textContent = message;
+      generalErrorEl.hidden = false;
+    }
+
+    modeEl.addEventListener('change', () => {
+      const newMode = modeEl.value;
+      if (newMode === 'cron' && GENERATED_TRIGGER_MODES.has(triggerState.mode)) {
+        const generated = buildGeneratedCron(triggerState.mode, triggerState);
+        if (generated) triggerState.cronText = generated;
+      }
+      triggerState.mode = newMode;
+      renderTriggerFields();
+      triggerErrorEl.hidden = true;
+      updateCreateEnabled();
+      schedulePreview();
+    });
+    nameEl.addEventListener('input', updateCreateEnabled);
+    tzEl.addEventListener('input', () => {
+      tzErrorEl.hidden = true;
+      schedulePreview();
+    });
+    actionEl.addEventListener('change', () => {
+      // Carries forward whatever the outgoing section's own fields
+      // currently hold, so switching action and back doesn't discard
+      // input the operator already typed (invalid endpoint params JSON
+      // -- `getValues()` returning `null` -- leaves `sectionValues`
+      // untouched rather than losing the section's other fields too).
+      const current = sections.getValues();
+      if (current) Object.assign(sectionValues, current);
+      sections.setAction(actionEl.value);
+      clearFieldErrors();
+    });
+
+    createBtn.addEventListener('click', async () => {
+      const name = nameEl.value.trim();
+      const trig = readTrigger(triggerState);
+      if (!name || !trig) return; // Create stays disabled until both hold
+      const sectionsValues = sections.getValues();
+      if (sectionsValues === null) return; // invalid endpoint params JSON — sections already showed its own error
+
+      clearFieldErrors();
+      const tz = tzEl.value.trim();
+      const body = {
+        name,
+        schedule_type: trig.schedule_type,
+        schedule_value: trig.schedule_value,
+        action: actionEl.value,
+        enabled: enabledEl.checked,
+        ...sectionsValues,
+      };
+      if (tz) body.timezone = tz;
+
+      createBtn.disabled = true;
+      createBtn.textContent = 'Creating…';
+      try {
+        const r = await fetch('/api/scheduler', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          const text = await r.text();
+          let detail = text;
+          try { const j = JSON.parse(text); detail = j.detail || detail; } catch (_) {}
+          applyCreateError(detail);
+          createBtn.disabled = false;
+          createBtn.textContent = 'Create';
+          return;
+        }
+        const created = await r.json().catch(() => null);
+        cleanup();
+        await fetchBoard();
+        if (created && created.id) revealCard(created.id, { openDrawer: false });
+      } catch (err) {
+        applyCreateError(err.message);
+        createBtn.disabled = false;
+        createBtn.textContent = 'Create';
+      }
+    });
+
+    renderTriggerFields();
+    updateCreateEnabled();
+    schedulePreview();
+  }
 
   // ------------------------------------------------------------------
   // Drawer
@@ -2205,29 +2581,6 @@ export function initBoard() {
       endpoint: c.endpoint || '',
       params: c.params === undefined ? null : c.params,
     });
-  }
-
-  // Mirrors the server's per-action requirement (api/services/scheduler_validation.py's
-  // `validate_action_inputs`): an `endpoint` action needs a GET/POST method,
-  // a path starting with `/api/`, and params that are either absent or a
-  // JSON object; notify/prompt/agent need a non-blank message. Used by the
-  // Action select's change handler below to decide whether a target action
-  // can be saved on its own or must wait for its section's own input.
-  function actionInputsSatisfied(action, values) {
-    if (action === 'endpoint') {
-      const cfg = values.endpoint_config || {};
-      const method = String(cfg.method || '').toUpperCase();
-      if (method !== 'GET' && method !== 'POST') return false;
-      const path = cfg.endpoint;
-      if (typeof path !== 'string' || !path.startsWith('/api/')) return false;
-      const params = cfg.params;
-      if (params !== undefined && params !== null && (typeof params !== 'object' || Array.isArray(params))) return false;
-      return true;
-    }
-    if (action === 'notify' || action === 'prompt' || action === 'agent') {
-      return !!(values.message_content || '').trim();
-    }
-    return true;
   }
 
   function renderScheduleDrawerFields(card) {

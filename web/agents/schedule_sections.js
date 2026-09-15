@@ -48,6 +48,32 @@ export function loadBotCatalog(fetchImpl = fetch) {
   return promise;
 }
 
+// Mirrors the server's per-action requirement (api/services/scheduler_validation.py's
+// `validate_action_inputs`): an `endpoint` action needs a GET/POST method,
+// a path starting with `/api/`, and params that are either absent or a
+// JSON object; notify/prompt/agent need a non-blank message. Used by
+// board.js's scheduled-card drawer (deciding whether an Action-select
+// target can be saved on its own or must wait for its section's own input)
+// and by the create-schedule composer (deciding whether the target
+// action's section is already filled in enough to switch to without
+// losing the operator's place).
+export function actionInputsSatisfied(action, values) {
+  if (action === 'endpoint') {
+    const cfg = values.endpoint_config || {};
+    const method = String(cfg.method || '').toUpperCase();
+    if (method !== 'GET' && method !== 'POST') return false;
+    const path = cfg.endpoint;
+    if (typeof path !== 'string' || !path.startsWith('/api/')) return false;
+    const params = cfg.params;
+    if (params !== undefined && params !== null && (typeof params !== 'object' || Array.isArray(params))) return false;
+    return true;
+  }
+  if (action === 'notify' || action === 'prompt' || action === 'agent') {
+    return !!(values.message_content || '').trim();
+  }
+  return true;
+}
+
 function paramsToText(params) {
   if (params === undefined || params === null) return '';
   try { return JSON.stringify(params, null, 2); }

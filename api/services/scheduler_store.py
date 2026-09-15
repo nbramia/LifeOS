@@ -104,6 +104,57 @@ class ScheduleEntry:
         return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
 
 
+def compute_next_n_triggers(
+    schedule_type: str, schedule_value: str, tz_name: str, count: int = 1, *, label: str = "",
+) -> list[str]:
+    """
+    Compute up to ``count`` upcoming UTC trigger times for a schedule_type/
+    schedule_value/timezone, most-imminent first.
+
+    For cron expressions, times are interpreted in ``tz_name`` and converted
+    to UTC, so "daily at 6pm" means 6pm local, not 6pm UTC. For ``once``, at
+    most one time comes back — ``schedule_value`` itself, converted to UTC,
+    when it's still in the future, else an empty list. ``label`` names the
+    schedule in log output only (e.g. its id); an entry with none yet (a
+    preview request that hasn't been saved) passes an empty string.
+    """
+    now_utc = datetime.now(timezone.utc)
+
+    if schedule_type == "once":
+        try:
+            trigger_time = datetime.fromisoformat(schedule_value)
+            if trigger_time.tzinfo is None:
+                tz = ZoneInfo(tz_name)
+                trigger_time = trigger_time.replace(tzinfo=tz)
+            trigger_time_utc = trigger_time.astimezone(timezone.utc)
+            if trigger_time_utc > now_utc:
+                return [trigger_time_utc.isoformat()]
+            return []  # past one-time schedule
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Invalid datetime for schedule {label}: {e}")
+            return []
+
+    elif schedule_type == "cron":
+        try:
+            tz = ZoneInfo(tz_name)
+            cron = croniter(schedule_value, datetime.now(tz))
+            triggers = []
+            for _ in range(max(count, 0)):
+                next_time_local = cron.get_next(datetime)
+                if next_time_local.tzinfo is None:
+                    next_time_local = next_time_local.replace(tzinfo=tz)
+                triggers.append(next_time_local.astimezone(timezone.utc).isoformat())
+            return triggers
+        except (ValueError, KeyError) as e:
+            logger.error(
+                f"Invalid cron expression for schedule {label}: "
+                f"{schedule_value} - {e}"
+            )
+            return []
+
+    return []
+
+
 def compute_next_trigger(entry: ScheduleEntry) -> Optional[str]:
     """
     Compute the next trigger time for a schedule.
@@ -112,39 +163,11 @@ def compute_next_trigger(entry: ScheduleEntry) -> Optional[str]:
     (defaults to settings.timezone) and converted to UTC for storage, so
     "daily at 6pm" means 6pm local, not 6pm UTC.
     """
-    now_utc = datetime.now(timezone.utc)
-
-    if entry.schedule_type == "once":
-        try:
-            trigger_time = datetime.fromisoformat(entry.schedule_value)
-            if trigger_time.tzinfo is None:
-                tz = ZoneInfo(entry.timezone or settings.timezone)
-                trigger_time = trigger_time.replace(tzinfo=tz)
-            trigger_time_utc = trigger_time.astimezone(timezone.utc)
-            if trigger_time_utc > now_utc:
-                return trigger_time_utc.isoformat()
-            return None  # past one-time schedule
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Invalid datetime for schedule {entry.id}: {e}")
-            return None
-
-    elif entry.schedule_type == "cron":
-        try:
-            tz = ZoneInfo(entry.timezone or settings.timezone)
-            now_local = datetime.now(tz)
-            cron = croniter(entry.schedule_value, now_local)
-            next_time_local = cron.get_next(datetime)
-            if next_time_local.tzinfo is None:
-                next_time_local = next_time_local.replace(tzinfo=tz)
-            return next_time_local.astimezone(timezone.utc).isoformat()
-        except (ValueError, KeyError) as e:
-            logger.error(
-                f"Invalid cron expression for schedule {entry.id}: "
-                f"{entry.schedule_value} - {e}"
-            )
-            return None
-
-    return None
+    triggers = compute_next_n_triggers(
+        entry.schedule_type, entry.schedule_value, entry.timezone or settings.timezone,
+        count=1, label=entry.id,
+    )
+    return triggers[0] if triggers else None
 
 
 def _format_cron_human(cron_expr: str, tz_name: str = "") -> str:
