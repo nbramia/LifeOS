@@ -725,7 +725,7 @@ class TestBoardLoad:
         for row in result:
             assert row["actual"] == row["expected"], row
 
-    def test_mobile_tabs_filters_and_hidden_done_target_are_compact_and_reachable(
+    def test_mobile_tabs_filters_and_done_target_are_compact_and_reachable(
         self, page: Page, agents_base_url,
     ):
         page.set_viewport_size({"width": 390, "height": 844})
@@ -742,16 +742,24 @@ class TestBoardLoad:
         expect(page.locator("#board-filter-toggle")).to_have_attribute("aria-expanded", "true")
         expect(page.locator("#board-filter-controls")).to_be_visible()
 
-    def test_assignee_tray_click_then_card_is_an_accessible_assignment_alternative(
+    def test_assignee_tray_click_filters_board_and_no_longer_arms_a_card_tap_assignment(
         self, page: Page, agents_base_url,
     ):
         lane_calls = []
         _open_board(page, agents_base_url, lane_calls=lane_calls)
         page.locator(".board-assignee-drop[data-assignee='codex']").click()
-        expect(page.locator("#board-drop-status")).to_contain_text("codex")
-        page.locator("[data-card-id='t1']").click()
-        expect(page.locator(".board-lane[data-lane='assigned'] [data-card-id='t1']")).to_be_visible(timeout=5000)
-        assert lane_calls == [{"lane": "assigned", "assignee": "codex"}]
+        expect(page.locator("#board-filter-assignee")).to_have_value("codex")
+        expect(page.locator(".board-assignee-drop[data-assignee='codex']")).to_have_class(re.compile(r"\bselected\b"))
+        # t3 already carries assignee codex, so the filter leaves it visible
+        # to tap — a plain drawer open, not an assignment.
+        page.locator("[data-card-id='t3']").click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+        assert lane_calls == []
+        page.keyboard.press("Escape")
+        # Clicking the same button again clears the filter back to `all`.
+        page.locator(".board-assignee-drop[data-assignee='codex']").click()
+        expect(page.locator("#board-filter-assignee")).to_have_value("all")
+        expect(page.locator(".board-assignee-drop[data-assignee='codex']")).not_to_have_class(re.compile(r"\bselected\b"))
 
     def test_touch_pointer_drag_from_assignee_tray_assigns_a_card(self, page: Page, agents_base_url):
         lane_calls = []
@@ -781,11 +789,43 @@ class TestBoardLoad:
         expect(page.locator(".board-lane[data-lane='assigned'] [data-card-id='t1']")).to_be_visible(timeout=5000)
         assert lane_calls == [{"lane": "assigned", "assignee": "codex"}]
 
-    def test_done_target_accepts_a_focused_card_without_dragging(self, page: Page, agents_base_url):
+    def test_done_target_click_toggles_the_done_lane_and_stays_visible_both_ways(
+        self, page: Page, agents_base_url,
+    ):
+        _open_board(page, agents_base_url)
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        expect(page.locator("#board-done-drop")).to_be_visible()
+        expect(page.locator("#board-done-drop")).to_have_attribute("aria-pressed", "false")
+
+        page.locator("#board-done-drop").click()
+        expect(page.locator('.board-lane[data-lane="done"]')).to_be_visible()
+        expect(page.locator("#board-done-drop")).to_be_visible()
+        expect(page.locator("#board-done-drop")).to_have_attribute("aria-pressed", "true")
+
+        page.locator("#board-done-drop").click()
+        expect(page.locator('.board-lane[data-lane="done"]')).to_have_count(0)
+        expect(page.locator("#board-done-drop")).to_be_visible()
+        expect(page.locator("#board-done-drop")).to_have_attribute("aria-pressed", "false")
+
+    def test_done_lane_checkbox_and_tray_button_stay_in_sync(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator("#board-done-drop")).to_have_attribute("aria-pressed", "true")
+        expect(page.locator('.board-lane[data-lane="done"]')).to_be_visible()
+
+        page.locator("#board-done-drop").click()
+        expect(page.locator("#board-lane-filter-options input[value='done']")).not_to_be_checked()
+
+    def test_dropping_a_focused_card_on_done_still_moves_it(self, page: Page, agents_base_url):
         lane_calls = []
         _open_board(page, agents_base_url, lane_calls=lane_calls)
-        page.locator("[data-card-id='t1']").focus()
-        page.locator("#board-done-drop").click()
+        card_box = page.locator('[data-card-id="t1"]').bounding_box()
+        done_box = page.locator("#board-done-drop").bounding_box()
+        page.mouse.move(card_box["x"] + card_box["width"] / 2, card_box["y"] + card_box["height"] / 2)
+        page.mouse.down()
+        page.mouse.move(done_box["x"] + done_box["width"] / 2, done_box["y"] + done_box["height"] / 2, steps=10)
+        page.mouse.up()
         expect(page.locator(".board-lane[data-lane='unassigned'] [data-card-id='t1']")).to_have_count(0, timeout=5000)
         assert lane_calls == [{"lane": "done"}]
 
@@ -840,6 +880,73 @@ class TestDragBetweenLanes:
         _drag_card(page, "t1", "assigned")
         expect(page.locator('.board-lane[data-lane="assigned"] [data-card-id="t1"]')).to_be_visible(timeout=5000)
         assert lane_calls == [{"lane": "assigned", "assignee": "me"}]
+
+
+class TestDragDoesNotSelectText:
+    """A real mouse press-and-drag starting on a card's title text must never
+    anchor a native text selection, however briefly, while still moving the
+    card. `window.getSelection()` starts in a pristine 'None' state (no
+    selection at all) and has to stay there through every sub-slop step of
+    the press — the point where a browser's native selection would
+    otherwise anchor, before board.js's own drag-detection ever runs."""
+
+    def test_pressing_and_dragging_across_the_title_creates_no_selection(
+        self, page: Page, agents_base_url,
+    ):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        title = page.locator('[data-card-id="t1"] .board-card-title')
+        box = title.bounding_box()
+        start_x, start_y = box["x"] + 5, box["y"] + box["height"] / 2
+
+        page.mouse.move(start_x, start_y)
+        page.mouse.down()
+        # Small, sub-POINTER_SLOP (8px) steps across the title text — the
+        # exact window a native selection anchors in before board.js's own
+        # drag-detection (which also clears a selection, but only once the
+        # gesture is recognised as a drag) ever runs.
+        for dx in (1, 2, 3, 4, 5, 6, 7):
+            page.mouse.move(start_x + dx, start_y)
+            assert page.evaluate("window.getSelection().type") == "None"
+
+        # Carry the same gesture into a real card move, to confirm dragging
+        # still works and the selection stays untouched afterward too.
+        lane_cards = page.locator('.board-lane[data-lane="assigned"] .board-lane-cards')
+        lane_box = lane_cards.bounding_box()
+        page.mouse.move(lane_box["x"] + lane_box["width"] / 2, lane_box["y"] + 15, steps=10)
+        page.mouse.up()
+
+        expect(page.locator('.board-lane[data-lane="assigned"] [data-card-id="t1"]')).to_be_visible(timeout=5000)
+        assert lane_calls == [{"lane": "assigned", "assignee": "me"}]
+        assert page.evaluate("window.getSelection().toString()") == ""
+
+    def test_plain_click_still_opens_the_drawer(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+
+    def test_drawer_text_stays_selectable(self, page: Page, agents_base_url):
+        """Selection-suppression is scoped to a live board pointer gesture
+        (`dragState`) — the drawer never sets one, so a press-drag over its
+        own text selects normally."""
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t2"]').click()
+        notes = page.locator('#board-drawer textarea[data-field="notes"]')
+        expect(notes).to_be_visible()
+        box = notes.bounding_box()
+        page.mouse.move(box["x"] + 10, box["y"] + 10)
+        page.mouse.down()
+        page.mouse.move(box["x"] + 80, box["y"] + 10, steps=5)
+        page.mouse.up()
+        selected = page.evaluate(
+            """() => {
+                const el = document.activeElement;
+                return el && typeof el.selectionStart === 'number'
+                    ? el.selectionEnd - el.selectionStart
+                    : 0;
+            }"""
+        )
+        assert selected > 0
 
 
 class TestDrawerNotesEdit:
@@ -1378,6 +1485,32 @@ class TestFilters:
         expect(page.locator('[data-card-id="t2"]')).to_have_count(0)
         expect(page.locator('[data-card-id="t4"]')).to_have_count(0)
 
+    def test_recency_filter_hides_a_card_with_no_timestamp_but_all_time_shows_it(
+        self, page: Page, agents_base_url,
+    ):
+        """A card that has never carried a timestamp can't be shown to fall
+        inside an active recency window, so an active filter hides it —
+        only 'all time' (the board's own default) shows every card
+        regardless of whether it has ever been stamped."""
+        board_state = _board_fixture()
+        board_state["lanes"]["unassigned"].append({
+            "kind": "task", "id": "t-no-ts", "title": "Never touched",
+            "notes": "", "status": "todo", "tags": [], "assignee": None,
+            "fields": {}, "context": "Inbox", "updated_at": None,
+            "session": None, "pending_question": None,
+        })
+        _open_board(page, agents_base_url, board_state=board_state)
+        expect(page.locator('[data-card-id="t-no-ts"]')).to_be_visible()
+
+        page.locator("#board-filter-recency").select_option("3600")
+        expect(page.locator('[data-card-id="t-no-ts"]')).to_have_count(0)
+        # t1's fixture timestamp is old enough to fall outside the window
+        # too — for a different reason (age, not a missing timestamp).
+        expect(page.locator('[data-card-id="t1"]')).to_have_count(0)
+
+        page.locator("#board-filter-recency").select_option("all")
+        expect(page.locator('[data-card-id="t-no-ts"]')).to_be_visible()
+
     def test_context_filter_control_removed(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
         expect(page.locator("#board-filter-context")).to_have_count(0)
@@ -1388,12 +1521,14 @@ class TestFilters:
         page.locator("#board-filter-assignee").select_option("me")
         page.locator("#board-filter-tag").fill("codex")
         page.locator("#board-filter-sort").select_option("created_desc")
+        expect(page.locator(".board-assignee-drop[data-assignee='me']")).to_have_class(re.compile(r"\bselected\b"))
         page.locator("#board-filter-clear").click()
         expect(page.locator("#board-search")).to_have_value("")
         expect(page.locator("#board-filter-assignee")).to_have_value("all")
         expect(page.locator("#board-filter-tag")).to_have_value("")
         expect(page.locator("#board-filter-sort")).to_have_value("modified_desc")
         expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+        expect(page.locator(".board-assignee-drop[data-assignee='me']")).not_to_have_class(re.compile(r"\bselected\b"))
 
     def test_modified_sort_is_default_and_chronological_directions_reverse(self, page: Page, agents_base_url):
         board_state = copy.deepcopy(_board_fixture())
@@ -1478,6 +1613,16 @@ class TestFilters:
             "els => els.map(e => e.value)"
         )
         assert "cloud" in options
+
+    def test_assignee_dropdown_change_marks_the_matching_tray_button_selected(
+        self, page: Page, agents_base_url,
+    ):
+        _open_board(page, agents_base_url)
+        page.locator("#board-filter-assignee").select_option("claude")
+        expect(page.locator(".board-assignee-drop[data-assignee='claude']")).to_have_class(re.compile(r"\bselected\b"))
+        expect(page.locator(".board-assignee-drop[data-assignee='codex']")).not_to_have_class(re.compile(r"\bselected\b"))
+        page.locator("#board-filter-assignee").select_option("unassigned")
+        expect(page.locator(".board-assignee-drop[data-assignee='claude']")).not_to_have_class(re.compile(r"\bselected\b"))
 
     def test_drag_sets_board_dragging_class(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
@@ -4191,39 +4336,37 @@ class TestAssignmentTray:
     """The bottom tray's selection state, its two drag directions, and the
     confirmation-with-undo every assignment path shares."""
 
-    def test_drag_assign_clears_a_pending_tray_selection(self, page: Page, agents_base_url):
-        """Tapping assignee A arms it. Assigning by dragging assignee B onto a
-        card must disarm A too — otherwise A stays highlighted and the next
-        card tap silently assigns to it.
+    def test_drag_assign_does_not_disturb_an_active_assignee_filter(self, page: Page, agents_base_url):
+        """The tray buttons filter the board rather than arm a pending
+        assignment, so dragging a different assignee onto a card assigns
+        that card without touching whichever filter is active, and a plain
+        card tap still just opens the drawer.
         """
         lane_calls = []
         _open_board(page, agents_base_url, lane_calls=lane_calls)
         page.locator('.board-assignee-drop[data-assignee="claude"]').click()
         expect(page.locator('.board-assignee-drop[data-assignee="claude"]')).to_have_class(re.compile(r"selected"))
 
-        _drag_to(page, '.board-assignee-drop[data-assignee="codex"]', '[data-card-id="t1"]')
+        _drag_to(page, '.board-assignee-drop[data-assignee="codex"]', '[data-card-id="t7"]')
         _wait_for(lambda: any(c.get("assignee") == "codex" for c in lane_calls), page)
 
-        expect(page.locator('.board-assignee-drop[data-assignee="claude"]')).not_to_have_class(re.compile(r"selected"))
-        expect(page.locator(".board-assignee-drop.selected")).to_have_count(0)
+        expect(page.locator('.board-assignee-drop[data-assignee="claude"]')).to_have_class(re.compile(r"selected"))
 
-        # The stale selection is really gone, not merely unstyled: a card tap
-        # opens the drawer rather than assigning.
+        # t2 already carries assignee "me", so it's hidden behind the active
+        # claude filter — clear it before tapping, to isolate "a tap never
+        # assigns" from "the filter also hides the card".
+        page.locator('.board-assignee-drop[data-assignee="claude"]').click()
         page.locator('[data-card-id="t2"]').click()
         expect(page.locator("#board-drawer")).to_be_visible()
         assert not any(c.get("assignee") == "claude" for c in lane_calls), lane_calls
 
-    def test_selecting_a_second_assignee_leaves_only_that_one_armed(self, page: Page, agents_base_url):
-        lane_calls = []
-        _open_board(page, agents_base_url, lane_calls=lane_calls)
+    def test_selecting_a_second_assignee_filter_leaves_only_that_one_selected(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
         page.locator('.board-assignee-drop[data-assignee="claude"]').click()
         page.locator('.board-assignee-drop[data-assignee="codex"]').click()
         expect(page.locator(".board-assignee-drop.selected")).to_have_count(1)
         expect(page.locator('.board-assignee-drop[data-assignee="codex"]')).to_have_class(re.compile(r"selected"))
-
-        page.locator('[data-card-id="t1"]').click()
-        _wait_for(lambda: bool(lane_calls), page)
-        assert lane_calls[-1]["assignee"] == "codex", lane_calls
+        expect(page.locator("#board-filter-assignee")).to_have_value("codex")
 
     def test_assignment_confirms_with_a_toast_whose_undo_restores_the_card(
         self, page: Page, agents_base_url,
@@ -4233,8 +4376,7 @@ class TestAssignmentTray:
         """
         lane_calls = []
         _open_board(page, agents_base_url, lane_calls=lane_calls)
-        page.locator('.board-assignee-drop[data-assignee="claude"]').click()
-        page.locator('[data-card-id="t1"]').click()
+        _drag_to(page, '.board-assignee-drop[data-assignee="claude"]', '[data-card-id="t1"]')
         _wait_for(lambda: bool(lane_calls), page)
 
         toast = page.locator(".toast")
@@ -4307,6 +4449,32 @@ class TestAssignmentTray:
         assert max(metrics["widths"]) - min(metrics["widths"]) < 1.5, metrics
         share = metrics["rowWidth"] / metrics["trayWidth"]
         assert 0.5 < share <= 0.67, metrics
+
+    def test_assignee_and_done_buttons_are_centred_in_the_tray_at_1280(
+        self, page: Page, agents_base_url,
+    ):
+        """The buttons (not the label+buttons+status row as a block) sit
+        centred on the tray itself — the label stays pinned to the left
+        edge and the status region to the right, un-overlapped."""
+        page.set_viewport_size({"width": 1280, "height": 900})
+        _open_board(page, agents_base_url)
+        metrics = page.evaluate(
+            """() => {
+                const rect = el => el.getBoundingClientRect();
+                const tray = rect(document.querySelector('.board-drop-tray'));
+                const drops = rect(document.getElementById('board-assignee-drops'));
+                const done = rect(document.getElementById('board-done-drop'));
+                const label = rect(document.querySelector('.board-drop-tray-label'));
+                return { tray, drops, done, label };
+            }"""
+        )
+        tray, drops, done, label = metrics["tray"], metrics["drops"], metrics["done"], metrics["label"]
+        group_left = min(drops["x"], done["x"])
+        group_right = max(drops["x"] + drops["width"], done["x"] + done["width"])
+        group_center = (group_left + group_right) / 2
+        tray_center = tray["x"] + tray["width"] / 2
+        assert abs(group_center - tray_center) < 2, metrics
+        assert label["x"] + label["width"] <= group_left, metrics
 
     def test_assignee_row_spans_the_full_width_on_a_phone(self, page: Page, agents_base_url):
         page.set_viewport_size({"width": 390, "height": 844})

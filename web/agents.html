@@ -1212,9 +1212,11 @@
   .board-lane-filter-option:hover { background: var(--bg-elev); }
   .board-lane-filter-option input { margin: 0; }
   .board-drop-tray {
+    position: relative;
     flex: 0 0 auto;
     display: flex;
     align-items: center;
+    justify-content: center;
     gap: 0.5rem;
     min-height: 58px;
     padding: 0.45rem 1.25rem;
@@ -1223,13 +1225,24 @@
     color: var(--text-secondary);
     touch-action: pan-x;
   }
-  .board-drop-tray-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  /* Pulled out of flex flow and pinned to the tray's own edges so
+     `justify-content: center` above centers just the assignee/Done
+     buttons — the only remaining in-flow children — on the tray itself,
+     rather than centering the whole label+buttons+status row as one block
+     (which would leave the label off-centre instead of pinned left). */
+  .board-drop-tray-label {
+    position: absolute;
+    left: 1.25rem;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em;
+  }
   /* The assignee row is also the drop target for both drag directions, so
      it takes two thirds of the tray and splits that evenly between its
      buttons rather than hugging its labels — a label-width target is hard
      to hit with a dragged card, most of all on a phone. The remaining
-     third leaves room for the tray label, the conditional Done target, and
-     the drop status line. */
+     third leaves room for the tray label, the Done target, and the drop
+     status line. */
   #board-assignee-drops {
     display: flex;
     flex: 1 1 auto;
@@ -1261,9 +1274,25 @@
   .board-done-drop:hover { border-color: var(--accent); }
   .board-assignee-drop.dragging-source { opacity: 0.45; }
   .board-done-drop { border-color: var(--completed); color: var(--text-primary); }
+  /* Reflects that clicking Done has toggled the Done lane visible — the
+     same state the lane multi-select's Done checkbox shows. */
+  .board-done-drop.active { border-color: var(--accent); background: var(--bg-elev); }
   .board-drop-target.drop-allowed { border-color: var(--running); box-shadow: 0 0 0 2px rgba(52, 211, 153, 0.25); }
   .board-drop-target.drop-refused { border-color: var(--failed); box-shadow: 0 0 0 2px rgba(248, 113, 113, 0.2); }
-  .board-drop-status { min-width: 0; margin-left: auto; font-size: 0.74rem; color: var(--text-secondary); }
+  /* Pinned to the tray's right edge — see .board-drop-tray-label above for
+     why this is out of flex flow. `max-width` keeps a longer status
+     message from growing into the centred buttons. */
+  .board-drop-status {
+    position: absolute;
+    right: 1.25rem;
+    top: 50%;
+    transform: translateY(-50%);
+    max-width: 28%;
+    min-width: 0;
+    font-size: 0.74rem;
+    color: var(--text-secondary);
+    text-align: right;
+  }
   .board-drop-status:empty { display: none; }
   .board-drop-status.error { color: var(--failed); }
   .board-lane-header {
@@ -1588,10 +1617,20 @@
     .board-lane { min-width: min(84vw, 280px); }
     /* The tray wraps at phone width so the assignee row gets the full
        width for itself instead of competing with the label and status
-       line on one overflowing line. */
-    .board-drop-tray { flex-wrap: wrap; padding: 0.45rem 0.65rem; min-height: 66px; }
+       line on one overflowing line — the label and status go back to
+       normal flow (the centred-buttons layout above is absolute-positioned
+       for the wide tray only) so they each get their own wrapped row. */
+    .board-drop-tray { flex-wrap: wrap; justify-content: flex-start; padding: 0.45rem 0.65rem; min-height: 66px; }
+    .board-drop-tray-label { position: static; transform: none; }
     #board-assignee-drops { flex: 1 0 100%; max-width: 100%; order: 1; }
-    .board-drop-status { flex: 1 1 100%; margin-left: 0; order: 2; }
+    .board-drop-status {
+      position: static;
+      transform: none;
+      flex: 1 1 100%;
+      max-width: 100%;
+      text-align: left;
+      order: 2;
+    }
   }
 </style>
 </head>
@@ -1684,8 +1723,8 @@
   <div id="board-lanes"></div>
   <div class="board-drop-tray" id="board-drop-tray" aria-label="Board quick actions">
     <span class="board-drop-tray-label">Assign</span>
-    <div id="board-assignee-drops" role="group" aria-label="Assign card to"></div>
-    <button type="button" class="board-drop-target board-done-drop" id="board-done-drop" hidden>Done</button>
+    <div id="board-assignee-drops" role="group" aria-label="Filter board by assignee, or drop a card here to assign it"></div>
+    <button type="button" class="board-drop-target board-done-drop" id="board-done-drop">Done</button>
     <span class="board-drop-status" id="board-drop-status" role="status" aria-live="polite"></span>
   </div>
 </div>
