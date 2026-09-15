@@ -2224,7 +2224,6 @@ export function initBoard() {
     let confirmed = selected.slice();
     let saveChain = Promise.resolve();
     let pendingSaves = 0;
-    let suppressBlur = false;
     let activeOption = -1;
     let showingLegacyValue = true;
     let cancelled = false;
@@ -2237,6 +2236,23 @@ export function initBoard() {
     // (each of which clears the query back to empty) doesn't re-close it
     // between selections.
     let openByRequest = false;
+    // iOS Safari doesn't focus a tapped <button>, so a chip's × or a
+    // suggestion option can be activated by touch with no focus change at
+    // all — the focusout handler below then sees a null `relatedTarget`
+    // and can't tell that apart from a genuine tap outside the picker.
+    // This flag is the fallback signal: true for the lifetime of a pointer
+    // gesture that started on a chip or an option, so the focusout handler
+    // can skip committing a still-typed query out from under that
+    // gesture's own click handler (addTag/removeTag). Cleared on a delay
+    // rather than by the click itself, since a tap that never fires
+    // "click" (e.g. one interrupted by a scroll) must not leave it stuck.
+    let pointerDownInsideChipsOrOptions = false;
+    function markPointerDownInsidePicker() {
+      pointerDownInsideChipsOrOptions = true;
+      setTimeout(() => { pointerDownInsideChipsOrOptions = false; }, 0);
+    }
+    chips.addEventListener('pointerdown', markPointerDownInsidePicker);
+    options.addEventListener('pointerdown', markPointerDownInsidePicker);
 
     function renderChips() {
       chips.innerHTML = selected.map(tag => `
@@ -2274,11 +2290,9 @@ export function initBoard() {
         || (!matches.length && !canCreate);
       activeOption = -1;
       options.querySelectorAll('[data-select-tag], [data-create-tag]').forEach(button => {
-        button.addEventListener('mousedown', () => { suppressBlur = true; });
         button.addEventListener('click', () => {
           if (button.dataset.createTag) addTag(button.dataset.createTag);
           else addTag(button.dataset.selectTag);
-          suppressBlur = false;
           search.focus();
         });
       });
@@ -2399,25 +2413,35 @@ export function initBoard() {
       openByRequest = true;
       renderOptions();
     });
-    search.addEventListener('blur', (event) => {
-      if (suppressBlur) return;
-      // A focus move that stays inside the picker — onto the suggestion
-      // list (ArrowDown/ArrowUp) or onto a chip's remove button — isn't
-      // the operator abandoning the field's text, just momentarily moving
-      // off it; committing here would save a still-in-progress query as
-      // its own tag before Enter even reaches the highlighted option, or
-      // commit-then-rerender the chips out from under an in-flight ×
-      // click. Only a focus move OUTSIDE the picker (or the composer's
-      // own Create handler, via `commitPendingText`, called explicitly)
-      // commits.
-      if (event.relatedTarget && picker.contains(event.relatedTarget)) return;
+    // A picker-level `focusout` (not a `blur` on `search` alone) — this
+    // container holds search, every suggestion option, and every chip's
+    // remove button, and `focusout` bubbles, so one listener here sees
+    // focus leaving ANY of those. That matters because Tab from `search`
+    // lands on a suggestion (a real, focusable element inside the
+    // container) before it ever leaves the picker: a `search`-only blur
+    // would see that as "gone" and either commit too early or (with a
+    // stay-inside guard) never get a second chance to commit once focus
+    // actually does leave, on the option's own Tab-away. Committing here,
+    // gated on the relatedTarget truly landing outside `picker`, fires
+    // exactly once, on whichever element's focus move actually exits the
+    // container — search moving straight out, or search moving onto a
+    // suggestion/chip-remove button and THAT element then moving out.
+    picker.addEventListener('focusout', (event) => {
+      // Focus is still somewhere inside the picker — the operator is
+      // mid-navigation (an option or a chip's remove button now has
+      // focus), not abandoning the field. Wait for the move that actually
+      // clears the container.
+      if (picker.contains(event.relatedTarget)) return;
+      // iOS Safari doesn't focus a tapped <button>, so a genuine tap on a
+      // chip's × or a suggestion can leave `relatedTarget` null exactly
+      // like a real focus-out does — `pointerDownInsideChipsOrOptions`
+      // tells the two apart so that gesture's own click handler
+      // (addTag/removeTag) runs uncontested by a stale-query commit here.
+      if (pointerDownInsideChipsOrOptions) return;
       saveLegacyText();
       openByRequest = false;
-      setTimeout(() => {
-        if (document.activeElement && picker.contains(document.activeElement)) return;
-        options.hidden = true;
-        search.setAttribute('aria-expanded', 'false');
-      }, 0);
+      options.hidden = true;
+      search.setAttribute('aria-expanded', 'false');
     });
     search.addEventListener('keydown', (event) => {
       // ArrowDown/ArrowUp on an empty, not-yet-opened query is itself a

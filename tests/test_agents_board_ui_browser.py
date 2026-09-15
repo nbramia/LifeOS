@@ -1482,6 +1482,77 @@ class TestDrawerTagsEdit:
         page.locator('[data-remove-tag="existing-tag"]').click()
         _wait_for(lambda: len(task_puts) > 0, page=page)
         assert task_puts == [{"tags": []}], task_puts
+
+    def test_typing_then_pressing_tab_twice_commits_and_hides_the_list(self, page: Page, agents_base_url):
+        """Tab from the search field lands on the 'Create new' option —
+        still inside the picker, so nothing commits yet and the list stays
+        open. A second Tab moves focus out of the picker entirely; that's
+        what commits the typed tag and hides the list."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        tags = page.locator(".drawer-tags")
+        tags.fill("tabbed-x")
+        expect(page.locator(".drawer-tag-option-create")).to_contain_text("#tabbed-x")
+        page.keyboard.press("Tab")
+        expect(page.locator(".drawer-tag-option-create")).to_be_focused()
+        expect(page.locator('[data-field="tag-options"]')).to_be_visible()
+        assert task_puts == [], task_puts
+        page.keyboard.press("Tab")
+        _wait_for(lambda: len(task_puts) > 0, page=page)
+        assert task_puts == [{"tags": ["tabbed-x"]}], task_puts
+        expect(page.locator('[data-field="tag-options"]')).to_be_hidden()
+
+    def test_arrow_down_then_click_outside_commits_and_hides_the_list(self, page: Page, agents_base_url):
+        """ArrowDown moves focus onto the first suggestion — still inside
+        the picker, so nothing commits yet. Clicking a control outside the
+        picker entirely is what commits the typed tag and hides the
+        list."""
+        board_state = copy.deepcopy(_board_fixture())
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        tags = page.locator(".drawer-tags")
+        tags.fill("arrowed-y")
+        expect(page.locator(".drawer-tag-option-create")).to_contain_text("#arrowed-y")
+        tags.press("ArrowDown")
+        expect(page.locator(".drawer-tag-option-create")).to_be_focused()
+        page.locator(".drawer-title").click()  # click outside the picker
+        _wait_for(lambda: any("arrowed-y" in (p.get("tags") or []) for p in task_puts), page=page)
+        assert task_puts == [{"tags": ["arrowed-y"]}], task_puts
+        expect(page.locator('[data-field="tag-options"]')).to_be_hidden()
+
+    def test_removing_a_chip_via_a_tap_that_never_focuses_the_button(self, page: Page, agents_base_url):
+        """iOS Safari doesn't focus a tapped <button>, so a real chip
+        removal there fires a pointerdown on the button and a focusout on
+        the search field with `relatedTarget: null` — indistinguishable
+        from a genuine focus-out by relatedTarget alone. Dispatch that
+        exact sequence directly (pointerdown, then a null-relatedTarget
+        focusout, then click) rather than relying on Chromium's own
+        click-focuses-buttons behavior, so this exercises the
+        pointerdown-based guard instead of the relatedTarget check above.
+        A partial query typed first must not be committed as a tag, and
+        the chip must still be removed."""
+        board_state = copy.deepcopy(_board_fixture())
+        t2 = next(card for card in board_state["lanes"]["assigned"] if card["id"] == "t2")
+        t2["tags"] = ["me", "existing-tag"]
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator(".drawer-tag-chip")).to_have_count(1)
+        tags = page.locator(".drawer-tags")
+        tags.fill("partial-tap-query")
+        page.evaluate("""() => {
+          const search = document.querySelector('.drawer-tags');
+          const btn = document.querySelector('[data-remove-tag="existing-tag"]');
+          btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+          search.dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: null }));
+          btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        }""")
+        _wait_for(lambda: len(task_puts) > 0, page=page)
+        assert task_puts == [{"tags": []}], task_puts
+        expect(page.locator(".drawer-tag-chip")).to_have_count(0)
         expect(page.locator(".drawer-tag-chip")).to_have_count(0)
 
     def test_invalid_and_assignee_tokens_are_dropped(self, page: Page, agents_base_url):
