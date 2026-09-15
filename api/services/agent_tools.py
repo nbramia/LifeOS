@@ -950,6 +950,46 @@ TOOL_DEFINITIONS = [
             "required": ["action"],
         },
     },
+    {
+        "name": "pause_internet",
+        "description": (
+            "Cut a household profile or device off the internet via eero, e.g. "
+            "'pause the iPad'. Idempotent — pausing an already-paused target just "
+            "confirms it. `minutes` schedules an automatic resume; omit it for an "
+            "indefinite pause."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Configured target name (matches case-insensitively)."},
+                "minutes": {"type": "integer", "description": "Auto-resume after this many minutes (1-1440). Omit for an indefinite pause."},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "resume_internet",
+        "description": (
+            "Restore a household profile or device's internet access via eero. "
+            "Idempotent — resuming an already-resumed target just confirms it. "
+            "Cancels any pending scheduled auto-resume for the target."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Configured target name (matches case-insensitively)."},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "internet_status",
+        "description": "List every configured eero target with its current paused/resumed state and any pending scheduled resume.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ]
 
 # Cache breakpoint on last tool — everything up to here gets cached
@@ -3735,6 +3775,72 @@ async def _tool_search_finances(inp: dict) -> str:
     return f"Error: Unknown search_finances action '{action}'"
 
 
+# -- Home / eero helpers --
+
+def _eero_unknown_target_message(e) -> str:
+    return f"Error: unknown target {e.name!r}. Configured targets: {e.configured_names}"
+
+
+async def _tool_pause_internet(inp: dict) -> str:
+    from api.services.home import eero
+    if not eero.has_session_token():
+        return "Error: eero is not configured (no session token)."
+    try:
+        result = await eero.pause(inp["name"], inp.get("minutes"))
+    except eero.EeroUnknownTarget as e:
+        return _eero_unknown_target_message(e)
+    except (eero.EeroSessionUnconfigured, eero.EeroSessionDead):
+        return "Error: eero is not reachable right now (session unavailable). Check the Human queue."
+    except eero.EeroAPIError as e:
+        return f"Error: eero rejected the request ({e})."
+    msg = f"{result['name']}: {'paused' if result['paused'] else 'resumed'}"
+    if result["mismatch"]:
+        msg += " — but that doesn't match what was requested; check the eero app."
+    if result["resume_at"]:
+        msg += f" (auto-resumes at {result['resume_at']})"
+    return msg
+
+
+async def _tool_resume_internet(inp: dict) -> str:
+    from api.services.home import eero
+    if not eero.has_session_token():
+        return "Error: eero is not configured (no session token)."
+    try:
+        result = await eero.resume(inp["name"])
+    except eero.EeroUnknownTarget as e:
+        return _eero_unknown_target_message(e)
+    except (eero.EeroSessionUnconfigured, eero.EeroSessionDead):
+        return "Error: eero is not reachable right now (session unavailable). Check the Human queue."
+    except eero.EeroAPIError as e:
+        return f"Error: eero rejected the request ({e})."
+    msg = f"{result['name']}: {'paused' if result['paused'] else 'resumed'}"
+    if result["mismatch"]:
+        msg += " — but that doesn't match what was requested; check the eero app."
+    return msg
+
+
+async def _tool_internet_status(inp: dict) -> str:
+    from api.services.home import eero
+    if not eero.has_session_token():
+        return "Error: eero is not configured (no session token)."
+    try:
+        targets = await eero.list_status()
+    except (eero.EeroSessionUnconfigured, eero.EeroSessionDead):
+        return "Error: eero is not reachable right now (session unavailable). Check the Human queue."
+    except eero.EeroAPIError as e:
+        return f"Error: eero rejected the request ({e})."
+    if not targets:
+        return "No eero targets configured."
+    lines = []
+    for t in targets:
+        state = "paused" if t["paused"] else "resumed"
+        line = f"- {t['name']} ({t['type']}): {state}"
+        if t["resume_at"]:
+            line += f" — auto-resumes at {t['resume_at']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 _TOOL_HANDLERS = {
     "search_vault": _tool_search_vault,
     "read_vault_file": _tool_read_vault_file,
@@ -3758,6 +3864,9 @@ _TOOL_HANDLERS = {
     "delete_calendar_event": _tool_delete_calendar_event,
     "save_memory": _tool_save_memory,
     "search_memories": _tool_search_memories,
+    "pause_internet": _tool_pause_internet,
+    "resume_internet": _tool_resume_internet,
+    "internet_status": _tool_internet_status,
 }
 
 # Status messages for UI feedback when tools execute
@@ -3813,4 +3922,7 @@ TOOL_STATUS_MESSAGES = {
     "delete_calendar_event": "Deleting calendar event...",
     "save_memory": "Saving memory...",
     "search_memories": "Searching memories...",
+    "pause_internet": "Pausing internet access...",
+    "resume_internet": "Resuming internet access...",
+    "internet_status": "Checking internet access status...",
 }

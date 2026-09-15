@@ -372,11 +372,28 @@ CURATED_ENDPOINTS = {
         "description": "Per-turn context: current date/time, timezone, relative-time resolution guidance, persona-scoped personal context, existing task tags, and (with conversation_id) session-to-date cost/token totals. Read at the start of every turn.",
         "method": "GET"
     },
+    "/api/home/eero/{name}/pause:POST": {
+        "name": "lifeos_home_eero_pause",
+        "description": "Pause a household eero profile or device's internet access. Idempotent. Optional minutes (1-1440) schedules an automatic resume.",
+        "method": "POST",
+        "path": "/api/home/eero/{name}/pause"
+    },
+    "/api/home/eero/{name}/resume:POST": {
+        "name": "lifeos_home_eero_resume",
+        "description": "Resume a household eero profile or device's internet access. Idempotent. Cancels any pending scheduled auto-resume.",
+        "method": "POST",
+        "path": "/api/home/eero/{name}/resume"
+    },
+    "/api/home/eero/status": {
+        "name": "lifeos_home_eero_status",
+        "description": "List every configured eero target with its current paused state and any pending scheduled resume time.",
+        "method": "GET"
+    },
 }
 
-# Contract count for the source catalog. The live fallback catalog is 59
-# curated tools plus 9 lifeos_agent_* tools = 68.
-CURATED_TOOL_COUNT = 59
+# Contract count for the source catalog. The live fallback catalog is 62
+# curated tools plus 9 lifeos_agent_* tools = 71.
+CURATED_TOOL_COUNT = 62
 
 
 class LifeOSMCPServer:
