@@ -1,5 +1,5 @@
 """
-eero home-network client (#1081) — pause/resume a household profile or
+eero home-network client — pause/resume a household profile or
 device's internet access through eero's undocumented consumer API.
 
 Session token resolution: the gitignored state file (``STATE_PATH``) first,

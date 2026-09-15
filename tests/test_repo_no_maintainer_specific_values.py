@@ -135,7 +135,18 @@ _HOME_PATH_ALLOWLIST = {
 # not just a literal `/` -- so a bare "/home/nathanramia" at the end of a
 # quoted string (no further path components) is still caught. Codex review
 # flagged the original (mandatory trailing `/`) as missing exactly that case.
-_HOME_PATH_RE = re.compile(r"(?:/home/|/Users/)([A-Za-z0-9_.-]+)(?=/|['\"\s]|$)")
+#
+# The leading `(?<!...)` requires the match to start at an absolute-path
+# boundary: `/home/` or `/Users/` must NOT be immediately preceded by a
+# path-segment character (letter, digit, `_`, `.`, `-`). Without it, a
+# `/home/` segment embedded mid-path in a relative path (`config/home/...`)
+# or a URL path (`/api/home/...`) was flagged as an absolute home-directory
+# path even though it isn't one -- the scan's own stated intent is absolute
+# `/home/<user>` / `/Users/<user>` paths. A real absolute path is still
+# caught: it's preceded by a quote, whitespace, `=`, `(`, start of line, or
+# another `/` (as in `file:///home/...`), none of which are path-segment
+# characters.
+_HOME_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])(?:/home/|/Users/)([A-Za-z0-9_.-]+)(?=/|['\"\s]|$)")
 
 
 def _is_excluded(rel_path: str) -> bool:
@@ -326,6 +337,34 @@ class TestScanFunctionsActuallyDetectViolations:
         violations = find_home_path_violations([allowlisted_file], root=tmp_path)
 
         assert violations == []
+
+    def test_home_path_scan_ignores_a_home_segment_embedded_in_a_relative_or_url_path(self, tmp_path):
+        """A `/home/` segment that isn't at an absolute-path boundary --
+        embedded in a relative path or a URL path -- is not a hardcoded
+        home-directory path and must not be flagged."""
+        ok = tmp_path / "not_a_home_path.py"
+        ok.write_text(
+            'TARGETS_FILE = "config/home/eero_targets.json"\n'
+            'ROUTE = "POST /api/home/eero/status"\n'
+        )
+
+        violations = find_home_path_violations([ok], root=tmp_path)
+
+        assert violations == []
+
+    def test_home_path_scan_still_catches_real_absolute_paths(self, tmp_path):
+        """The boundary check must not swallow genuine absolute paths --
+        quoted, mid-command, or inside a file:// URL."""
+        bad = tmp_path / "bad_config.py"
+        bad.write_text(
+            'SYNC_DIR = "/home/someuser/Code"\n'
+            'cd /home/someuser\n'
+            'URL = "file:///home/someuser/x"\n'
+        )
+
+        violations = find_home_path_violations([bad], root=tmp_path)
+
+        assert len(violations) == 3
 
 
 class TestTrackedFilesHelper:

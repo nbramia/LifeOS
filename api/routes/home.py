@@ -1,5 +1,5 @@
 """
-Home automation routes (#1081) — eero is the first provider.
+Home automation routes — eero is the first provider.
 
 Every route is gated 503 until an eero session token is available (state
 file or LIFEOS_EERO_SESSION_TOKEN), checked before anything else — same

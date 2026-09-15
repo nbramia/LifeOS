@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Two-step, non-interactive eero login (#1081).
+Two-step, non-interactive eero login.
 
 eero's login is a verification-code flow, so it can't be automated headless
 end to end — but it doesn't need a TTY either. Run once by the operator, in

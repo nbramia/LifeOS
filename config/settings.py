@@ -1405,7 +1405,7 @@ class Settings(BaseSettings):
                     "token, separate from LIFEOS_MCP_BEARER_TOKEN/LIFEOS_HEALTH_INGEST_TOKEN."
     )
 
-    # Home automation — eero (#1081). Fallback session token for the eero
+    # Home automation — eero. Fallback session token for the eero
     # vendor client: the gitignored state file data/home/eero_session.json is
     # tried first (so a refreshed token survives a restart), this is the
     # bootstrap/fallback. Empty disables every /api/home/eero/* endpoint (503).

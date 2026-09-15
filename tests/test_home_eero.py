@@ -1,5 +1,5 @@
 """
-Tests for the eero home-network integration (#1081) — pause/resume a
+Tests for the eero home-network integration — pause/resume a
 household profile or device's internet access.
 
 Every vendor HTTP call is mocked via httpx.MockTransport (no test contacts

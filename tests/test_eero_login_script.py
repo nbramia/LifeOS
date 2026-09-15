@@ -1,5 +1,5 @@
 """
-Tests for the two-step, non-interactive eero login script (#1081).
+Tests for the two-step, non-interactive eero login script.
 
 All vendor HTTP calls are mocked (no test contacts the real eero service).
 """

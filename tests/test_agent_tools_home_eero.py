@@ -1,6 +1,6 @@
 """
 Tests for the pause_internet / resume_internet / internet_status agent
-tools (#1081) — the native chat-tool surface over api/services/home/eero.py.
+tools — the native chat-tool surface over api/services/home/eero.py.
 
 The eero service functions are monkeypatched directly; no vendor HTTP call
 is made from this file (that coverage lives in tests/test_home_eero.py).
