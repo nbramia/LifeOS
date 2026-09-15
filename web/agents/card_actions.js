@@ -178,7 +178,33 @@ export function openReviewActionModal(card, action, onChanged, {
   };
 }
 
-// Mark Done is a drop onto Done under the hood.
+async function putTask(taskId, patch) {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!r.ok) {
+    const text = await r.text();
+    let msg = text;
+    try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+    throw new Error(msg || `HTTP ${r.status}`);
+  }
+  return r.json();
+}
+
+// Mark Done is a drop onto Done under the hood. This action only ever
+// fires from Human queue (session_actions.js's `decideActions` offers
+// `resolve` exclusively when `c.lane === 'human_queue'`), so Undo always
+// restores INTO Human queue — replaying the lane endpoint with
+// `{lane: 'human_queue'}` is not safe there: plan_lane_move's human_queue
+// branch only ever forces `status="blocked"` and never touches tags, so it
+// can't bring back a `#human` tag Done's own move just stripped, or a
+// status other than "blocked" the card had before. Restore the
+// exact pre-move status/tags instead, through the general task-update
+// endpoint the drawer's own edits use — its assignee/claim-tag guard
+// refuses the write (leaving the card as the server currently has it)
+// rather than clobbering a reassignment or claim made while it sat in Done.
 export async function resolveCard(card, onChanged) {
   try {
     const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/lane`, {
@@ -198,22 +224,17 @@ export async function resolveCard(card, onChanged) {
     if (data && data.lane && data.lane !== 'done') {
       showToast(`Card landed in ${laneLabelFor(data.lane)}, not Done.`, false);
     } else {
-      const priorLane = card.lane;
+      const priorStatus = card.status;
+      const priorTags = (card.tags || []).slice();
       showUndoableToast(`Marked "${card.title || card.id}" done.`, () => (
-        fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/lane`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ lane: priorLane }),
-        }).then(async (undoResponse) => {
-          if (!undoResponse.ok) {
-            const text = await undoResponse.text();
-            let msg = text;
-            try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
-            showToast(`Couldn't undo: ${msg || `HTTP ${undoResponse.status}`}`, true);
-            throw new Error(msg);
-          }
-          if (onChanged) await onChanged(await undoResponse.json());
-        })
+        putTask(card.id, { status: priorStatus, tags: priorTags })
+          .then(async (undoData) => {
+            if (onChanged) await onChanged(undoData);
+          })
+          .catch((err) => {
+            showToast(`Couldn't undo: ${err.message}`, true);
+            throw err;
+          })
       ));
     }
     if (onChanged) await onChanged(data);

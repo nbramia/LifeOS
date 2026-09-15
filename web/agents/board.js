@@ -514,16 +514,46 @@ export function initBoard() {
   // means undoing that acceptance, not a lane move. `snoozedUntil`, when
   // given and still in the future, re-applies the snooze once the lane (or
   // acceptance) is restored.
-  function undoToLane(cardId, lane, assignee, snoozedUntil) {
+  //
+  // A restore TARGETING Human queue is not safe to do by replaying the lane
+  // endpoint: plan_lane_move's `human_queue` branch only ever forces
+  // `status="blocked"` and never touches tags, so replaying it after the
+  // card's own trip through Done (which strips `#human` on the way in) or
+  // Assigned (which swaps the assignee tag) can't bring back the tag or
+  // status the card actually had before the drag. `snapshot` — the
+  // card's exact status/tags immediately before the drag — restores that
+  // directly instead, through the same general task-update endpoint the
+  // drawer's own edits use (see restoreCardSnapshot below).
+  function undoToLane(cardId, lane, assignee, snoozedUntil, snapshot) {
     const restore = lane === 'review'
       ? undoAcceptedCard(cardId, () => {})
-      : moveCard(cardId, lane, assignee || undefined);
+      : lane === 'human_queue'
+        ? restoreCardSnapshot(cardId, snapshot)
+        : moveCard(cardId, lane, assignee || undefined);
     return restore
       .then(() => {
         const stillFuture = snoozedUntil && new Date(snoozedUntil).getTime() > Date.now();
         return stillFuture ? snoozeCard({ id: cardId }, snoozedUntil, () => {}) : null;
       })
       .then(() => fetchBoard());
+  }
+
+  // Writes the pre-drag status/tags back verbatim via PUT /api/tasks/{id} —
+  // the same endpoint the drawer's own edits use, not the board's tags-only
+  // endpoint (which refuses any payload naming a protected tag, and an
+  // assignee/lifecycle tag is exactly what a full prior-state snapshot can
+  // carry). That endpoint's own assignee/claim-tag guard compares the
+  // snapshot against the card's CURRENT tags and refuses the write (leaving
+  // the card exactly as the server currently has it, with a toast) rather
+  // than silently overwriting a reassignment or claim the worker made while
+  // the card sat outside Human queue — see api/routes/tasks.py's
+  // `update_task`.
+  function restoreCardSnapshot(cardId, snapshot) {
+    if (!snapshot) return Promise.resolve();
+    return putTask(cardId, { status: snapshot.status, tags: snapshot.tags })
+      .catch(() => {
+        showToast("Couldn't undo — the card may have changed since.", true);
+      });
   }
 
   // Every way to assign a card — dragging an assignee onto a card, or
@@ -545,6 +575,8 @@ export function initBoard() {
     // move the card directly into the `snoozed` lane.
     const priorLane = card.lane;
     const priorAssignee = card.assignee || null;
+    const priorStatus = card.status;
+    const priorTags = (card.tags || []).slice();
     const priorSnoozedUntil = priorLane === 'snoozed' ? (card.fields && card.fields.snoozed_until) : null;
     const priorNaturalLane = priorLane === 'snoozed' ? naturalLaneFor(card) : priorLane;
     const title = card.title || card.id;
@@ -557,7 +589,9 @@ export function initBoard() {
         setDropStatus(`Assigned to ${assignee}.`);
         if (data && data.lane && data.lane !== 'assigned') return;
         showUndoableToast(`Assigned "${title}" to ${assignee}.`, () => (
-          undoToLane(card.id, priorNaturalLane, priorAssignee, priorSnoozedUntil)
+          undoToLane(card.id, priorNaturalLane, priorAssignee, priorSnoozedUntil, {
+            status: priorStatus, tags: priorTags,
+          })
         ));
       })
       .catch(() => setDropStatus('Assignment refused.', true));
@@ -1153,6 +1187,8 @@ export function initBoard() {
     // naturalLaneFor/undoToLane.
     const priorLane = card.lane;
     const priorAssignee = card.assignee || null;
+    const priorStatus = card.status;
+    const priorTags = (card.tags || []).slice();
     const priorSnoozedUntil = priorLane === 'snoozed' ? (card.fields && card.fields.snoozed_until) : null;
     const priorNaturalLane = priorLane === 'snoozed' ? naturalLaneFor(card) : priorLane;
     const title = card.title || card.id;
@@ -1165,7 +1201,9 @@ export function initBoard() {
         // A second toast claiming the requested move would contradict it.
         if (data && data.lane && data.lane !== targetLane) return;
         showUndoableToast(`Moved "${title}" to ${laneLabel(targetLane)}.`, () => (
-          undoToLane(cardId, priorNaturalLane, priorAssignee, priorSnoozedUntil)
+          undoToLane(cardId, priorNaturalLane, priorAssignee, priorSnoozedUntil, {
+            status: priorStatus, tags: priorTags,
+          })
         ));
       })
       .catch(() => {});

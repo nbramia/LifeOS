@@ -523,6 +523,45 @@ class TestUpdate:
 
         assert updated.cancelled_date == date.today().isoformat()
 
+    def test_update_status_away_from_done_clears_done_date(self, task_manager):
+        """A status write that leaves done clears done_date, so the date
+        never outlives the status it belongs to."""
+        task = task_manager.create("Done then reopened")
+        task_manager.update(task.id, status="done")
+        updated = task_manager.update(task.id, status="todo")
+
+        assert updated.status == "todo"
+        assert updated.done_date is None
+
+    def test_update_status_away_from_cancelled_clears_cancelled_date(self, task_manager):
+        """A status write that leaves cancelled clears cancelled_date, the
+        same way leaving done clears done_date."""
+        task = task_manager.create("Cancelled then reopened")
+        task_manager.update(task.id, status="cancelled")
+        updated = task_manager.update(task.id, status="todo")
+
+        assert updated.status == "todo"
+        assert updated.cancelled_date is None
+
+    def test_update_status_from_done_to_cancelled_swaps_the_lifecycle_date(self, task_manager):
+        """Moving directly from one terminal status to the other stamps the
+        new date and clears the old one in the same write."""
+        task = task_manager.create("Done then cancelled")
+        task_manager.update(task.id, status="done")
+        updated = task_manager.update(task.id, status="cancelled")
+
+        assert updated.done_date is None
+        assert updated.cancelled_date == date.today().isoformat()
+
+    def test_update_status_to_done_again_does_not_clear_its_own_date(self, task_manager):
+        """A status write that keeps the task at done (no actual status
+        change) must not clear the date it just stamped."""
+        task = task_manager.create("Already done")
+        first = task_manager.update(task.id, status="done")
+        updated = task_manager.update(task.id, status="done", notes="unrelated edit")
+
+        assert updated.done_date == first.done_date
+
     def test_update_nonexistent_task(self, task_manager):
         """Test updating a non-existent task."""
         result = task_manager.update("nonexistent", description="New")
