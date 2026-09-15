@@ -346,6 +346,8 @@ A card's snooze is a wake-up time, `[snoozed_until:: <ISO-8601 with offset>]`, s
 
 `TaskManager.claim_for_agent`'s `is_claimable` check refuses a task whose `fields` make `agent_board.is_snoozed(task.fields)` true, re-evaluated on every compare-and-swap retry exactly like the existing status/pickup-tag/exclusion-tag checks — a claim attempt against a snoozed task fails the same way a claim against an ineligible status does, independent of whatever listing produced the candidate.
 
+`TaskManager` also owns the one central write-time choke point that keeps a stale `snoozed_until` from lingering on a task whose write lands it somewhere the field is irrelevant: `_clear_stale_snooze(t)`, called at the tail of both `update()`'s `apply()` and `swap_tag()`'s `compute()`, drops the field whenever the write's own resulting status/tags land the task in a natural lane outside `agent_board.SNOOZABLE_LANES` (i.e. `in_progress` or `done`) — it checks only field presence and the natural lane, never parses the timestamp itself. This is what keeps the worker's `/swap-tag` resume (`agent-blocked` → `agent-running`), a generic `PUT /api/tasks/{id}` status change, and `human_queue.resolve_card` (which calls `update(status="done", ...)`) from leaving a future wake-up time behind on a card that's now running or finished — see [Agent Viz — Technical § Snooze](agent-viz.md#snooze) for the full write-path picture, including the board-specific writes (lane move, Accept, Cancel, Reject/Reassign) that clear it explicitly.
+
 ## Shared lifecycle projection
 
 `api/services/agent_worker/lifecycle.py` coordinates execution transitions
