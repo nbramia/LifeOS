@@ -1025,6 +1025,28 @@ def _isolate_hermes_persona_thread_store_db(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_hermes_question_thread_store_db(tmp_path, monkeypatch):
+    """Stop tests from opening (and writing to) the production Hermes task
+    question anchor table.
+
+    ``HermesQuestionThreadStore`` is a process-wide singleton
+    (``get_question_thread_store()``) keyed off ``settings.chroma_path`` —
+    the real ``data/hermes_question_threads.db`` on whatever machine runs
+    the suite. Redirect the shared singleton itself to a per-test tmp
+    instance, mirroring ``_isolate_hermes_persona_thread_store_db`` above.
+    """
+    import api.services.hermes_question_thread_store as question_store_mod
+
+    monkeypatch.setattr(
+        question_store_mod,
+        "_question_thread_store",
+        question_store_mod.HermesQuestionThreadStore(
+            str(tmp_path / "hermes_question_threads.db"),
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_session_store_db(tmp_path, monkeypatch):
     """Stop tests from opening (and writing to) the production agent-session
     store (#652).

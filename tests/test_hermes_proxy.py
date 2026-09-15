@@ -3226,3 +3226,144 @@ async def test_resolve_persona_rejects_inherited_journal(
     )
     assert resp.status_code == 400
     assert "journal" in resp.json()["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Answering a task question from the Hermes DM
+# ---------------------------------------------------------------------------
+
+
+def _open_question(store, chat_id="5550001111", message_id="590"):
+    """A blocked session with one open question, anchored to a Hermes message."""
+    from api.services.hermes_question_thread_store import get_question_thread_store
+
+    session = store.create(task_id="task-synthetic", status="blocked", routing="hermes")
+    question_id = store.create_pending_question(
+        session_id=session.session_id,
+        task_id=session.task_id,
+        question="which week?",
+        sent_message_id=int(message_id),
+        bot="hermes",
+    )
+    get_question_thread_store().record(chat_id, message_id, question_id)
+    return session, question_id
+
+
+async def test_deposit_answer_503_when_token_not_configured(monkeypatch):
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
+    app = FastAPI()
+    app.include_router(hp.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        resp = await c.post(
+            "/api/hermes/deposit-answer",
+            json={"chat_id": "1", "reply_to_message_id": "2", "text": "hi"},
+            headers={"Authorization": "Bearer whatever"},
+        )
+    assert resp.status_code == 503
+
+
+async def test_deposit_answer_401_on_wrong_token(resolve_client):
+    resp = await resolve_client.post(
+        "/api/hermes/deposit-answer",
+        json={"chat_id": "1", "reply_to_message_id": "2", "text": "hi"},
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert resp.status_code == 401
+
+
+async def test_deposit_answer_routes_a_reply_to_the_anchored_question(
+    resolve_client, agent_session_store,
+):
+    session, question_id = _open_question(agent_session_store)
+
+    resp = await resolve_client.post(
+        "/api/hermes/deposit-answer",
+        json={"chat_id": "5550001111", "reply_to_message_id": "590", "text": "last week"},
+        headers=_auth(),
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"deposited": True, "question_id": question_id}
+    assert agent_session_store.get_open_question_by_session_id(session.session_id) is None
+
+
+async def test_deposit_answer_unknown_anchor_falls_through_silently(
+    resolve_client, agent_session_store,
+):
+    _open_question(agent_session_store)
+    resp = await resolve_client.post(
+        "/api/hermes/deposit-answer",
+        json={"chat_id": "5550001111", "reply_to_message_id": "never-seen", "text": "hi"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"deposited": False, "question_id": None}
+
+
+async def test_deposit_answer_cross_chat_anchor_falls_through_silently(
+    resolve_client, agent_session_store,
+):
+    _open_question(agent_session_store)
+    resp = await resolve_client.post(
+        "/api/hermes/deposit-answer",
+        json={"chat_id": "some-other-chat", "reply_to_message_id": "590", "text": "hi"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"deposited": False, "question_id": None}
+
+
+async def test_deposit_answer_expired_anchor_falls_through_silently(
+    resolve_client, agent_session_store, monkeypatch,
+):
+    import api.services.hermes_question_thread_store as question_store_mod
+
+    fake_time = [1_000_000.0]
+    monkeypatch.setattr(question_store_mod.time, "time", lambda: fake_time[0])
+    _open_question(agent_session_store)
+    fake_time[0] += question_store_mod._TTL_SECONDS + 1
+
+    resp = await resolve_client.post(
+        "/api/hermes/deposit-answer",
+        json={"chat_id": "5550001111", "reply_to_message_id": "590", "text": "late"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"deposited": False, "question_id": None}
+
+
+async def test_deposit_answer_omitted_anchor_falls_through_silently(resolve_client):
+    resp = await resolve_client.post(
+        "/api/hermes/deposit-answer", json={"text": "hi"}, headers=_auth(),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"deposited": False, "question_id": None}
+
+
+async def test_deposit_answer_409_when_the_question_is_already_closed(
+    resolve_client, agent_session_store,
+):
+    _open_question(agent_session_store)
+    first = await resolve_client.post(
+        "/api/hermes/deposit-answer",
+        json={"chat_id": "5550001111", "reply_to_message_id": "590", "text": "last week"},
+        headers=_auth(),
+    )
+    assert first.status_code == 200
+
+    second = await resolve_client.post(
+        "/api/hermes/deposit-answer",
+        json={"chat_id": "5550001111", "reply_to_message_id": "590", "text": "or the one before"},
+        headers=_auth(),
+    )
+    assert second.status_code == 409
+
+
+async def test_deposit_answer_rejects_an_empty_answer(resolve_client, agent_session_store):
+    _open_question(agent_session_store)
+    resp = await resolve_client.post(
+        "/api/hermes/deposit-answer",
+        json={"chat_id": "5550001111", "reply_to_message_id": "590", "text": "   "},
+        headers=_auth(),
+    )
+    assert resp.status_code == 400

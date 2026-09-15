@@ -1725,6 +1725,13 @@ class SessionStore:
         conversation history and native handles are intentionally retained.
         The worker decides whether a retained handle is usable for the newly
         selected route.
+
+        `bot` is reset alongside `routing`/`host`/`model`/`effort` — all
+        per-assignment fields a reassignment recomputes from the task's
+        current assignee rather than carrying over from the retired claim.
+        This only ever touches a board-claimed session (the caller's own
+        task-id namespace); a persona-conversation-rooted session is never
+        rearmed, so its `bot` is unaffected.
         """
         with self._connect() as conn:
             row = conn.execute(
@@ -1738,7 +1745,7 @@ class SessionStore:
                 SET status = ?, routing = NULL, budget_json = NULL,
                     expected_output = NULL, preset_class = NULL,
                     remote_pgid = NULL,
-                    host = NULL, model = NULL, effort = NULL,
+                    host = NULL, model = NULL, effort = NULL, bot = NULL,
                     last_activity_at = ?
                 WHERE task_id = ?
                 """,
@@ -1937,6 +1944,33 @@ class SessionStore:
                 """,
                 (host, model, effort, persona_id, _now(), task_id),
             )
+
+    def set_bot_if_unset(self, task_id: str, bot: str) -> bool:
+        """Record the channel that owns this session's operator-facing
+        messages, but only when it has none yet. Returns whether a row
+        changed.
+
+        A board-claimed session always reaches this with `bot` still NULL —
+        a fresh claim never sets it at creation, and `rearm_for_claim`
+        clears it on every reassignment alongside `routing`/`host`/`model`/
+        `effort` — so this always takes effect for that caller. The null
+        guard exists for the sessions this call never sees at all: a persona
+        conversation's root session is tagged with its persona at creation,
+        and a spawned child inherits its caller's, in a task-id namespace
+        `_claim()` never claims into, so neither could reach this method
+        with a stale non-null `bot` to protect in practice — the guard is
+        a deliberate belt-and-braces invariant, not one covering an observed
+        call path.
+        """
+        if not task_id or not bot:
+            return False
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE sessions SET bot = ?, last_activity_at = ? "
+                "WHERE task_id = ? AND bot IS NULL",
+                (bot, _now(), task_id),
+            )
+        return cur.rowcount > 0
 
     def set_execution_snapshot(
         self, task_id: str, *, request: dict | None, spec: dict

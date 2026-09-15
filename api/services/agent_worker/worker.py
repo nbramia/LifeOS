@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
 from api.services.agent_worker import doctor_repair
 from api.services.agent_worker.completion_signal import has_positive_completion_signal
-from api.services.agent_worker.assignment import extract_assignment
+from api.services.agent_worker.assignment import ENGINE_HERMES, extract_assignment
 from api.services.agent_worker.executor_lifecycle import (
     CancelResult,
     ExecutorRegistry,
@@ -71,6 +71,7 @@ from api.services.agent_board import (
     AGENT_PICKUP_TAGS,
     MANAGED_AGENT_ASSIGNEES,
     REASSIGNED_TAG,
+    derive_assignee,
 )
 from api.services.agent_worker.preflight import (
     ROUTE_ASK,
@@ -102,6 +103,9 @@ from api.services.agent_worker.usage_ledger import UsageLedger
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.agent_worker.lifecycle import LifecycleEvent, LifecycleProjector
 from api.services.conversation_store import ConversationStore
+from api.services import hermes_notify
+from api.services.hermes_notify import HERMES_CHANNEL
+from api.services.hermes_question_thread_store import get_question_thread_store
 from api.services.interaction_store import build_obsidian_link
 from api.services.log_redaction import configure_telegram_log_redaction
 from api.services.runtime_identity import (
@@ -417,6 +421,29 @@ _ENGINE_LABELS = {
 }
 
 
+def _reporting_channel_for_task(task: dict[str, Any] | None) -> str | None:
+    """The channel a claimed card's operator-facing messages belong on,
+    derived from its board assignee.
+
+    A Hermes-assigned card is executed by Hermes, so the operator follows it
+    in the Hermes Telegram DM; every other assignee reports on LifeOS's own
+    Telegram bots, which `None` selects (see `Session.bot`).
+    """
+    if derive_assignee((task or {}).get("tags") or []) == ENGINE_HERMES:
+        return HERMES_CHANNEL
+    return None
+
+
+def _reporting_channel(session) -> str | None:
+    """The Hermes channel when this session reports through it, else `None`.
+
+    Only the Hermes channel needs a delivery path of its own; every other
+    value of `Session.bot` is a Telegram bot name the existing senders
+    already resolve.
+    """
+    return HERMES_CHANNEL if getattr(session, "bot", None) == HERMES_CHANNEL else None
+
+
 def _format_token_buckets(
     tokens_in: int,
     cache_creation: int,
@@ -592,10 +619,15 @@ class Worker:
             return False
         def _noop_with_id(text, chat_id=None, bot=None):
             return []
-        self._telegram_send = telegram_send if telegram_send is not None else _noop_telegram
-        self._telegram_send_with_id = (
+        self._raw_telegram_send = telegram_send if telegram_send is not None else _noop_telegram
+        self._raw_telegram_send_with_id = (
             telegram_send_with_id if telegram_send_with_id is not None else _noop_with_id
         )
+        # Every operator-facing send passes through the channel dispatchers
+        # below, so a session on the Hermes channel reaches the Hermes DM
+        # from every notification path without each one branching itself.
+        self._telegram_send = self._send_on_channel
+        self._telegram_send_with_id = self._send_on_channel_with_id
         self._owns_http_client = http_client is None
         self._http = http_client or httpx.Client(timeout=10.0)
         # All worker-owned terminal status writes pass through this projector
@@ -2643,6 +2675,51 @@ class Worker:
         })
         return sent_ids[0]
 
+    def _ask_user_via_hermes(self, session: Session, question: str) -> bool:
+        """Deliver a clarification question on the Hermes channel and anchor
+        it, so a threaded reply in that DM routes back to this question via
+        `POST /api/hermes/deposit-answer`.
+
+        Returns whether the question was delivered AND anchored. Anything
+        short of both is `False`, and the caller asks on LifeOS's own
+        Telegram instead — an unanchored question in the Hermes DM would
+        look answerable while stalling the task forever.
+
+        Gated by `settings.hermes_task_questions`: the Hermes-side Telegram
+        plugin that forwards a reply here ships separately, and until it
+        does the reply half of this path does not exist.
+        """
+        delivery = self._deliver_on_hermes(question)
+        if delivery is None:
+            return False
+        try:
+            anchor_id = int(delivery.message_id)
+        except (TypeError, ValueError):
+            logger.warning("hermes delivery reported a non-numeric message id; cannot anchor")
+            return False
+        question_id = self.session_store.create_pending_question(
+            session_id=session.session_id,
+            task_id=session.task_id,
+            question=question,
+            sent_message_id=anchor_id,
+            bot=HERMES_CHANNEL,
+        )
+        if not question_id:
+            return False
+        try:
+            get_question_thread_store().record(
+                delivery.chat_id, delivery.message_id, question_id,
+            )
+        except Exception as exc:
+            logger.warning("hermes question anchor failed: %s", type(exc).__name__)
+            return False
+        self.transcript_store.append(session.session_id, "clarification_sent", {
+            "channel": HERMES_CHANNEL,
+            "question_id": question_id,
+            "question_chars": len(question),
+        })
+        return True
+
     def _wake_sleeping_sessions(self) -> None:
         """Resume any sessions whose `sleeps` row has expired."""
 
@@ -3056,6 +3133,13 @@ class Worker:
                     status=STATUS_CLAIMED,
                 )
                 claim_kind = "claim"
+            # Record which channel this card's operator-facing messages go
+            # out on, derived from its assignee. Only when the row carries
+            # none: a rearmed session keeps the channel it already reported
+            # through, exactly as a persona-rooted session does.
+            channel = _reporting_channel_for_task(self._fetch_task(task_id))
+            if channel is not None:
+                self.session_store.set_bot_if_unset(task_id, channel)
             # Scheduled handoffs create the task before a worker session exists;
             # attach the real session identity as soon as the claim wins.
             self.session_store.link_occurrence_session(task_id, session.session_id)
@@ -5298,7 +5382,10 @@ class Worker:
             return
         self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
         self._set_task_status(session.task_id, "cancelled")
-        self._notify(f"⚠️ {_worker_label(session.routing)}: task '{title}' failed: {reason}")
+        self._notify(
+            f"⚠️ {_worker_label(session.routing)}: task '{title}' failed: {reason}",
+            bot=_reporting_channel(session),
+        )
 
     def _mark_blocked(self, session: Session, task: dict[str, Any], question: str) -> None:
         title = task.get("description", session.task_id)
@@ -5359,6 +5446,12 @@ class Worker:
             f"{question}\n\n"
             "Reply to this message to answer."
         )
+        if (
+            _reporting_channel(session) is not None
+            and settings.hermes_task_questions
+            and self._ask_user_via_hermes(session, body)
+        ):
+            return
         sent_id = self.ask_user_via_telegram(
             session.session_id, session.task_id, body,
         )
@@ -5367,9 +5460,57 @@ class Worker:
             # message so the operator at least sees the question.
             self._notify(body)
 
-    def _notify(self, text: str) -> None:
+    def _deliver_on_hermes(self, text: str):
+        """Hand one operator-facing message to the Hermes channel, returning
+        its delivered identity or `None` when the channel could not take it.
+
+        A missing or failing `hermes` binary is a logged degradation, never
+        an exception out of the worker tick: the caller falls back to
+        LifeOS's own Telegram bots so the task still reports somewhere.
+        """
         try:
-            self._telegram_send(text)
+            delivery = hermes_notify.send_via_hermes(text)
+        except Exception as exc:
+            logger.warning("hermes channel send raised %s", type(exc).__name__)
+            delivery = None
+        if delivery is None:
+            logger.warning("hermes channel could not deliver; using the primary bot instead")
+        return delivery
+
+    def _send_on_channel(self, text: str, chat_id=None, bot: str | None = None):
+        """Deliver one operator-facing message on `bot`'s channel.
+
+        `HERMES_CHANNEL` goes out through `hermes send`; every other value is
+        a Telegram bot name the injected sender resolves, and `None` is the
+        primary bot.
+        """
+        if bot == HERMES_CHANNEL:
+            if self._deliver_on_hermes(text) is not None:
+                return True
+            return self._raw_telegram_send(text)
+        if bot:
+            return self._raw_telegram_send(text, bot=bot)
+        return self._raw_telegram_send(text)
+
+    def _send_on_channel_with_id(self, text: str, chat_id=None, bot: str | None = None):
+        """Deliver one operator-facing message and return the ids a reply can
+        be matched against.
+
+        The Hermes channel is one-way from LifeOS's side: its message ids
+        live in Hermes's own chat, so matching a LifeOS reply against them
+        would be wrong. It therefore yields no ids here, and the caller's
+        existing no-anchor path delivers the plain body through
+        `_send_on_channel`.
+        """
+        if bot == HERMES_CHANNEL:
+            return []
+        if bot:
+            return self._raw_telegram_send_with_id(text, bot=bot)
+        return self._raw_telegram_send_with_id(text)
+
+    def _notify(self, text: str, bot: str | None = None) -> None:
+        try:
+            self._telegram_send(text, bot=bot) if bot else self._telegram_send(text)
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning("telegram notify failed: %s", exc)
 
@@ -5382,7 +5523,15 @@ class Worker:
         window) reopens the session as a follow-up turn. Falls back to the
         plain one-way `_notify` when the with-id sender is unavailable (bot not
         configured, or a test stub that captures no ids).
+
+        A session reporting through the Hermes channel takes the one-way path
+        instead: that channel exposes no id LifeOS can match a reply against,
+        so the notice carries no reply footer and registers no follow-up.
         """
+        channel = _reporting_channel(session)
+        if channel is not None:
+            self._notify(body, bot=channel)
+            return
         sent_ids: list[int] = []
         try:
             sent_ids = self._telegram_send_with_id(_with_reply_footer(body)) or []
