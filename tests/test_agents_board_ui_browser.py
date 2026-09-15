@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Browser, Page, expect
 
 from api.services import agent_board
 
@@ -683,6 +683,156 @@ def _drag_card(page: Page, card_id: str, target_lane: str):
     page.mouse.move(lane_box["x"] + lane_box["width"] / 2, lane_box["y"] + 15, steps=10)
     page.mouse.move(lane_box["x"] + lane_box["width"] / 2, lane_box["y"] + 15, steps=1)
     page.mouse.up()
+
+
+def _drawer_overflow(page: Page):
+    return page.locator("#board-drawer").evaluate(
+        """drawer => ({
+            drawerClientWidth: drawer.clientWidth,
+            drawerScrollWidth: drawer.scrollWidth,
+            drawerRight: drawer.getBoundingClientRect().right,
+            documentScrollWidth: document.documentElement.scrollWidth,
+        })"""
+    )
+
+
+def _assert_drawer_fits(page: Page):
+    dimensions = _drawer_overflow(page)
+    assert dimensions["drawerScrollWidth"] <= dimensions["drawerClientWidth"], dimensions
+    assert dimensions["drawerRight"] <= 390, dimensions
+    assert dimensions["documentScrollWidth"] <= 390, dimensions
+
+
+class TestMobileDrawerLayout:
+    def test_agents_viewport_locks_scale(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        content = page.locator('meta[name="viewport"]').get_attribute("content")
+        assert content is not None
+        settings = {part.strip() for part in content.split(",")}
+        assert {"initial-scale=1", "maximum-scale=1", "user-scalable=no"} <= settings
+
+    @pytest.mark.parametrize("card_kind", ["plain", "running", "resumable", "schedule"])
+    def test_drawer_fits_a_phone_for_each_card_kind(
+        self, browser: Browser, agents_base_url, card_kind,
+    ):
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+        )
+        page = context.new_page()
+        try:
+            board_state = _board_fixture()
+            card_id = {"plain": "t1", "schedule": "s1"}.get(card_kind, f"t-{card_kind}")
+            if card_kind in {"running", "resumable"}:
+                board_state["lanes"]["in_progress"].append({
+                    "kind": "task", "id": card_id, "title": "Run synthetic checks",
+                    "notes": "", "status": "in_progress",
+                    "tags": ["codex", "agent-running"], "assignee": "codex",
+                    "fields": {}, "context": "Synthetic",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                    "session": {
+                        "session_id": f"cx:synthetic-{card_kind}",
+                        "status": "running" if card_kind == "running" else "completed",
+                        "source": "codex", "engine": "codex", "host": "desktop-box",
+                    },
+                    "pending_question": None,
+                })
+            _open_board(page, agents_base_url, board_state=board_state)
+            page.locator(f'[data-card-id="{card_id}"]').click()
+            expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+            _assert_drawer_fits(page)
+            if card_kind == "running":
+                expect(page.locator("#board-drawer .panel-kill")).to_be_visible()
+                expect(page.locator("#board-drawer .panel-focus")).to_be_visible()
+            if card_kind == "resumable":
+                expect(page.locator("#board-drawer .panel-resume")).to_be_visible()
+        finally:
+            context.close()
+
+    def test_long_model_label_and_card_id_do_not_overflow_phone_drawer(
+        self, browser: Browser, agents_base_url,
+    ):
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+        )
+        page = context.new_page()
+        try:
+            board_state = _board_fixture()
+            card = board_state["lanes"]["assigned"][1]
+            card["id"] = "synthetic-card-" + "identifier-" * 12
+            card["fields"] = {"engine": "codex", "model": "gpt-5.5"}
+            _open_board(page, agents_base_url, board_state=board_state)
+            page.locator(f'[data-card-id="{card["id"]}"]').click()
+            page.locator(".assignment-model").evaluate(
+                """select => {
+                    const option = document.createElement('option');
+                    option.value = 'synthetic-long-model';
+                    option.textContent = 'Synthetic engine and model label '.repeat(12);
+                    option.selected = true;
+                    select.appendChild(option);
+                }"""
+            )
+            _assert_drawer_fits(page)
+        finally:
+            context.close()
+
+    def test_close_button_shares_title_row_and_is_fully_visible(
+        self, browser: Browser, agents_base_url,
+    ):
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+        )
+        page = context.new_page()
+        try:
+            _open_board(page, agents_base_url)
+            page.locator('[data-card-id="t1"]').click()
+            boxes = page.locator(".drawer-header").evaluate(
+                """header => {
+                    const title = header.querySelector('.drawer-title').getBoundingClientRect();
+                    const close = header.querySelector('.panel-close').getBoundingClientRect();
+                    return {title, close, viewportWidth: window.innerWidth};
+                }"""
+            )
+            assert boxes["close"]["left"] >= 0, boxes
+            assert boxes["close"]["right"] <= boxes["viewportWidth"], boxes
+            assert boxes["close"]["top"] < boxes["title"]["bottom"], boxes
+            assert boxes["close"]["bottom"] > boxes["title"]["top"], boxes
+        finally:
+            context.close()
+
+    def test_mobile_board_chrome_stays_inside_viewport(
+        self, browser: Browser, agents_base_url,
+    ):
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+        )
+        page = context.new_page()
+        try:
+            _open_board(page, agents_base_url)
+            page.locator("#board-filter-toggle").click()
+            measurements = page.evaluate(
+                """() => ['header', '.board-filters', '#board-lanes', '.board-drop-tray']
+                    .map(selector => {
+                        const rect = document.querySelector(selector).getBoundingClientRect();
+                        return {selector, left: rect.left, right: rect.right};
+                    })"""
+            )
+            assert all(row["left"] >= 0 and row["right"] <= 390 for row in measurements), measurements
+            document_scroll_width = page.evaluate("document.documentElement.scrollWidth")
+            assert document_scroll_width <= 390
+        finally:
+            context.close()
+
+    def test_drawer_width_change_is_scoped_to_phone_width(self, page: Page, agents_base_url):
+        page.set_viewport_size({"width": 1280, "height": 800})
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t1"]').click()
+        assert page.locator("#board-drawer").evaluate(
+            "drawer => drawer.getBoundingClientRect().width"
+        ) == 440
+        page.set_viewport_size({"width": 390, "height": 844})
+        assert page.locator("#board-drawer").evaluate(
+            "drawer => drawer.getBoundingClientRect().width"
+        ) == 390
 
 
 class TestBoardLoad:
@@ -4814,4 +4964,3 @@ class TestDrawerFieldHooks:
         page.locator("#board-drawer .drawer-assignee").select_option("hermes")
         _wait_for(lambda: bool(lane_calls), page)
         assert lane_calls[0] == {"lane": "assigned", "assignee": "hermes"}, lane_calls
-
