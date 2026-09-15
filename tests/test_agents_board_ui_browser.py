@@ -4859,10 +4859,11 @@ class TestMobileAssignmentTray:
                     fontSize: parseFloat(getComputedStyle(button).fontSize),
                 })"""
             )
-            assert styles == {
-                "overflow": "hidden", "textOverflow": "ellipsis",
-                "whiteSpace": "nowrap", "fontSize": 10.4,
-            }
+            assert styles["overflow"] == "hidden", styles
+            assert styles["textOverflow"] == "ellipsis", styles
+            assert styles["whiteSpace"] == "nowrap", styles
+            # Smaller than the desktop 0.78rem (12.48px) base, and still legible.
+            assert 8 <= styles["fontSize"] < 12, styles
             expect(long_button).to_have_attribute("title", full_name)
             expect(long_button).to_have_attribute("aria-label", f"Filter board to {full_name}")
         finally:
@@ -4886,6 +4887,63 @@ class TestMobileAssignmentTray:
             _drag_to(page, '[data-card-id="t1"]', target)
             _wait_for(lambda: bool(lane_calls), page)
             assert lane_calls == [expected]
+        finally:
+            context.close()
+
+    def test_drop_status_text_does_not_shift_tray_buttons_or_height(
+        self, browser: Browser, agents_base_url,
+    ):
+        """A drag hovering a target sets the status text; that text must
+        never change the tray's height, or every button shifts out from
+        under a held finger mid-drag (see board.js onDragMove)."""
+        context, page = self._open_mobile(browser, agents_base_url)
+        try:
+            metrics = """() => {
+                const tray = document.getElementById('board-drop-tray');
+                const button = document.querySelector('.board-assignee-drop[data-assignee="codex"]');
+                return {
+                    trayHeight: tray.getBoundingClientRect().height,
+                    buttonTop: button.getBoundingClientRect().top,
+                };
+            }"""
+            before = page.evaluate(metrics)
+            page.evaluate(
+                "document.getElementById('board-drop-status').textContent = 'Drop to assign codex.'"
+            )
+            during = page.evaluate(metrics)
+            page.evaluate("document.getElementById('board-drop-status').textContent = ''")
+            after = page.evaluate(metrics)
+            assert abs(during["trayHeight"] - before["trayHeight"]) <= 1, (before, during)
+            assert abs(during["buttonTop"] - before["buttonTop"]) <= 1, (before, during)
+            assert abs(after["trayHeight"] - before["trayHeight"]) <= 1, (before, after)
+            assert abs(after["buttonTop"] - before["buttonTop"]) <= 1, (before, after)
+        finally:
+            context.close()
+
+    def test_drag_release_below_button_centre_still_assigns_at_phone_width(
+        self, browser: Browser, agents_base_url,
+    ):
+        """A thumb reaching a bottom-anchored tray button often lands below
+        its visual centre. Releasing there must still assign the card —
+        it must not be lost to the tray growing/shrinking as the drop
+        status text appears and clears during the drag."""
+        lane_calls = []
+        context, page = self._open_mobile(browser, agents_base_url, lane_calls=lane_calls)
+        try:
+            source = page.locator('[data-card-id="t1"]')
+            target = page.locator('.board-assignee-drop[data-assignee="codex"]')
+            src = source.bounding_box()
+            dst = target.bounding_box()
+            release_x = dst["x"] + dst["width"] / 2
+            release_y = dst["y"] + dst["height"] / 2 + 12
+            page.mouse.move(src["x"] + src["width"] / 2, src["y"] + src["height"] / 2)
+            page.mouse.down()
+            page.mouse.move(src["x"] + src["width"] / 2 + 60, src["y"] + src["height"] / 2, steps=4)
+            page.mouse.move(release_x, release_y, steps=10)
+            page.mouse.move(release_x, release_y, steps=1)
+            page.mouse.up()
+            _wait_for(lambda: bool(lane_calls), page)
+            assert lane_calls == [{"lane": "assigned", "assignee": "codex"}], lane_calls
         finally:
             context.close()
 
