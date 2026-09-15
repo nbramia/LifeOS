@@ -318,6 +318,16 @@ class Settings(BaseSettings):
                     "POST /api/hermes/resolve-persona (#644) — empty disables that endpoint."
     )
 
+    hermes_task_questions: bool = Field(
+        default=False,
+        alias="LIFEOS_HERMES_TASK_QUESTIONS",
+        description="Deliver a Hermes-assigned task's clarification questions to the Hermes "
+                    "Telegram DM instead of LifeOS's primary bot. Off until Hermes's own "
+                    "Telegram plugin forwards a threaded reply to POST /api/hermes/deposit-answer; "
+                    "without that, a question sent there has no path back and the task stalls. "
+                    "Progress and terminal notices use the Hermes channel regardless."
+    )
+
     agent_hook_token: str = Field(
         default="",
         alias="LIFEOS_AGENT_HOOK_TOKEN",

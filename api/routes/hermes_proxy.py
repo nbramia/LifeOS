@@ -53,7 +53,7 @@ from typing import Optional
 
 import httpx
 from fastapi import HTTPException, Request
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 # Imported (not just re-exported through _proxy.py) so tests can monkeypatch
 # `hermes_proxy.settings.hermes_backend_url` / `hermes_backend_token` directly —
@@ -68,6 +68,7 @@ from api.services.chat_turns import TRUNCATION_MARKER, get_turn_registry, trunca
 from api.services.conversation_store import get_store
 from api.services.conversation_titler import schedule_retitle
 from api.services.hermes_persona_thread_store import get_persona_thread_store
+from api.services.hermes_question_thread_store import get_question_thread_store
 from api.services.journal_capture import JOURNAL_PERSONA_ID
 from api.services.model_readout import record_hermes_chat_turn_model
 from api.services.persona_capabilities import project_persona_tool_capabilities
@@ -1092,3 +1093,67 @@ async def register_persona_message(request: Request):
 
     get_persona_thread_store().record(parsed.chat_id, parsed.message_id, parsed.persona_id)
     return {"ok": True}
+
+
+class HermesDepositAnswerRequest(BaseModel):
+    """Body for `POST /api/hermes/deposit-answer` — a Hermes-Telegram reply
+    that may answer a task question delivered on the Hermes channel
+    (agent-worker Tier 2, mirroring the reply-thread mechanism above).
+
+    `chat_id`/`reply_to_message_id` anchor the reply to a pending question
+    via `HermesQuestionThreadStore`, the same `(chat_id, message_id)` shape
+    `/resolve-persona`'s reply-thread inheritance already uses. Both are
+    optional: Hermes forwards every reply it sees regardless of whether this
+    endpoint actually asked the question, so an anchor that's missing or
+    doesn't resolve is an ordinary "not for us" outcome, not a client error.
+    """
+    text: str = Field(..., min_length=1, max_length=4096)
+    chat_id: Optional[str] = None
+    reply_to_message_id: Optional[str] = None
+
+
+@router.post("/deposit-answer")
+async def deposit_answer(request: Request):
+    """Deposit a Hermes-DM reply onto the task question it answers, if any.
+
+    Resolution is `(chat_id, reply_to_message_id)` looked up in
+    `HermesQuestionThreadStore`. A miss — never recorded, expired, or from a
+    different chat — is NOT an error: it falls through to
+    `{"deposited": false, "question_id": null}`, exactly as an unrecognized
+    `reply_to_message_id` falls through on `/resolve-persona`, since a reply
+    Hermes forwards is not necessarily an answer to a question this endpoint
+    ever sent. A resolved anchor whose question is already answered or timed
+    out is a genuine conflict (409) — the anchor was real, there is just
+    nothing left to deposit onto. Deposits through
+    `SessionStore.deposit_answer_by_id`, the same sink the board drawer's own
+    answer route uses, so the waiting session resumes on the worker's next
+    tick exactly as it would from a board or Telegram answer.
+    """
+    _check_hermes_inbound_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    try:
+        parsed = HermesDepositAnswerRequest.model_validate(body)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid request: {exc}")
+
+    answer = parsed.text.strip()
+    if not answer:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    if not parsed.chat_id or not parsed.reply_to_message_id:
+        return {"deposited": False, "question_id": None}
+
+    question_id = get_question_thread_store().lookup(parsed.chat_id, parsed.reply_to_message_id)
+    if question_id is None:
+        return {"deposited": False, "question_id": None}
+
+    # Imported locally so tests can patch `SessionStore` in place — the same
+    # isolation pattern `_resolve_caller_session_id` above uses.
+    from api.services.agent_worker.session_store import SessionStore
+
+    if not SessionStore().deposit_answer_by_id(question_id, answer):
+        raise HTTPException(status_code=409, detail="question already answered or timed out")
+    return {"deposited": True, "question_id": question_id}

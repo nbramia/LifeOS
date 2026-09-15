@@ -302,6 +302,27 @@ Same auth as `/resolve-persona`. `persona_id` must be a currently-configured per
 
 **The honest boundary of "independent of LifeOS":** a Telegram message that needs LifeOS to resolve its persona — whether via an explicit `@tag` or by inheriting one from its reply-to — genuinely needs LifeOS reachable, while a message with neither does not and behaves exactly as if #644 had never shipped. #658's "keeps working when LifeOS is down" guarantee therefore applies only to that untagged, non-inheriting path; a persona-tagged or persona-inheriting message during a LifeOS outage should fail (or fall back to no-persona) rather than silently pretend to apply a preamble it couldn't fetch — that failure mode is Hermes's call to make, not LifeOS's, since Hermes owns what happens when either endpoint above is unreachable.
 
+#### Reporting an agent-worker task through the Hermes channel
+
+A board card assigned to the Hermes engine (`#hermes`) is executed by Hermes, so the agent worker records that card's session as reporting through the Hermes Telegram DM rather than LifeOS's own primary bot — derived from the card's assignee at claim time (`api/services/agent_worker/worker.py`), and cleared back to the primary bot on a reassignment away from Hermes. Delivery goes out through the `hermes send` CLI (`api/services/hermes_notify.py`), not this proxy — that command needs no running Hermes gateway for a bot-token platform like Telegram. A missing or failing `hermes` binary degrades to LifeOS's primary bot, logged, never raised.
+
+Only one-way notices (progress, completion, failure) go out on the Hermes channel by default. A task question stays on LifeOS's primary bot unless `LIFEOS_HERMES_TASK_QUESTIONS` is set: Hermes's own Telegram plugin recognizing a reply to one of these questions and forwarding it to the endpoint below is a change to the separate `nbramia/hermes` repository, so a question sent to the Hermes DM before that plugin exists would have no path back — the setting stays off until it does.
+
+**Endpoint contract — `POST /api/hermes/deposit-answer`:** deposits a Hermes-DM reply onto the task question it answers, mirroring the reply-thread anchor `/resolve-persona` uses but for task questions rather than persona threads (`HermesQuestionThreadStore`, `api/services/hermes_question_thread_store.py`, same `(chat_id, message_id)` shape and bounds as `HermesPersonaThreadStore`).
+
+```json
+// Request
+{ "chat_id": "12345", "reply_to_message_id": "990", "text": "next Tuesday" }
+
+// Response (anchor resolved and deposited)
+{ "deposited": true, "question_id": 42 }
+
+// Response (no anchor — never recorded, expired, or a different chat)
+{ "deposited": false, "question_id": null }
+```
+
+Same auth as `/resolve-persona`. An anchor that doesn't resolve is **not** an error — `chat_id`/`reply_to_message_id` are optional, and Hermes forwards every reply it sees regardless of whether this endpoint ever asked a question on it, so a miss returns `200` with `deposited: false`, exactly as an unrecognized `reply_to_message_id` falls through on `/resolve-persona`. An anchor that *does* resolve but whose question is already answered or timed out is a genuine conflict (`409`) — the anchor was real, there is just nothing left to deposit onto. `text` blank or whitespace-only is `400`. A successful deposit calls the same `SessionStore.deposit_answer_by_id` sink the `/agents` board drawer's own answer route uses, so the waiting session resumes on the worker's next tick exactly as it would from a board or Telegram answer.
+
 #### Hermes turn persistence (#592, survives disconnect since #611) and usage capture (#595)
 
 Unlike the Agent backend, whose history genuinely lives elsewhere, Hermes turns are persisted into the same conversation store the native path uses, and their usage/cost is recorded into the same usage store. `make_backend_router()`'s relay loop (`api/routes/_proxy.py`) accepts an optional `make_observer` hook: given the same raw request body `transform_body` already buffers, it returns a `_HermesTurnPersister` (`api/routes/hermes_proxy.py`) whose `observe(chunk)` is called with a copy of each chunk immediately *before* that chunk is handed onward (never altered — the byte sequence a connected client sees is unaffected), and whose `finalize()` runs once, when the turn truly ends. **Since #611**, `make_observer` being set also gates a second behavior: the upstream drain runs as a registry-owned background pump (`api/services/chat_turns.py`) rather than the browser-facing generator itself, so a client disconnect no longer cuts the drain short — `finalize()` now fires on the pump's own real end, not on whatever the browser happened to still be attached for. The Agent proxy passes neither `transform_body` nor `make_observer`, so it's untouched by this — it never detaches, and its relay stays byte-for-byte what it was before either hook existed.
