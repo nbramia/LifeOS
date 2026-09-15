@@ -3697,6 +3697,80 @@ class TestDrawerTitleWrap:
             client_width = title.evaluate("el => el.clientWidth")
             assert scroll_width <= client_width, (viewport, scroll_width, client_width)
 
+    def test_enter_keeps_focus_in_the_title_field_and_saves_exactly_once(
+        self, page: Page, agents_base_url,
+    ):
+        """Enter must commit the title by calling the same save logic the
+        blur handler uses, directly — never by calling `.blur()` on the
+        field itself, which would move `document.activeElement` all the
+        way to `<body>`, outside `.board-drawer`, and drop the title out of
+        `updateOpenDrawer`'s `focused` guard while the save is still in
+        flight. A later, ordinary blur with no further edit — the ONLY
+        other event still wired to the same save function — must not
+        re-save the identical value a second time."""
+        task_puts = []
+        _open_board(page, agents_base_url, task_puts=task_puts)
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        title.fill("Retitled via Enter, focus stays")
+        title.press("Enter")
+        _wait_for(lambda: task_puts == [{"description": "Retitled via Enter, focus stays"}], page=page)
+        assert title.evaluate("el => el === document.activeElement")
+
+        page.locator(".drawer-notes").click()  # blurs the title field
+        page.wait_for_timeout(200)
+        assert task_puts == [{"description": "Retitled via Enter, focus stays"}]
+
+    def test_title_edit_survives_an_unrelated_board_frame_while_the_save_is_in_flight(
+        self, page: Page, agents_base_url,
+    ):
+        """Holds the title's own PUT in flight (`_hold_task_field_puts`),
+        then delivers an SSE `board` frame — withheld behind `stream_gate`
+        until this exact point, same technique as `TestLiveUpdates`'s notes
+        tests — that changes an UNRELATED field (a tag) on the SAME open
+        card. Enter's commit keeps focus in the title field rather than
+        calling `.blur()`, so `updateOpenDrawer`'s `focused` guard still
+        covers the field while its save is in flight, exactly as it
+        already does for the notes field mid-edit: the frame's stale title
+        never repaints over the operator's just-typed, already-saving
+        text."""
+        stream_gate = threading.Event()
+        board_state = copy.deepcopy(_board_fixture())
+        board_stream_frames: list[str] = []
+        task_puts: list = []
+        _open_board(
+            page, agents_base_url, board_state=board_state, task_puts=task_puts,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        held, release = _hold_task_field_puts(page, task_puts, board_state)
+
+        page.locator('[data-card-id="t1"]').click()
+        title = page.locator(".drawer-title")
+        title.fill("Renamed while a tick arrives")
+        title.press("Enter")
+        _wait_for(lambda: len(held) == 1, page=page)
+
+        # An unrelated field changes on the SAME card (t1) while the
+        # title's own save is still held.
+        for card in board_state["lanes"]["unassigned"]:
+            if card["id"] == "t1":
+                card["tags"] = ["urgent"]
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(board_state)}\n\n")
+        stream_gate.set()
+
+        # Proof the frame was actually applied: the tag chip shows up in
+        # the lane view, which render() always rebuilds regardless of
+        # drawer focus.
+        expect(page.locator('[data-card-id="t1"] .board-chip-tag')).to_contain_text(
+            "urgent", timeout=5000,
+        )
+        # The title must still show the operator's just-typed value, not
+        # the frame's stale one.
+        expect(title).to_have_value("Renamed while a tick arrives")
+
+        release(0)
+        _wait_for(lambda: task_puts == [{"description": "Renamed while a tick arrives"}], page=page)
+
 
 class TestNoConsoleErrorsMainFlow:
     """Exercises the board's lane filter, per-lane add,

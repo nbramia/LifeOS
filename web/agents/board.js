@@ -1906,27 +1906,42 @@ export function initBoard() {
     // Titles are single-line values in the vault: a pasted or otherwise
     // typed newline is collapsed to a space before it's ever compared or
     // saved, so the field never turns a task's description into a
-    // multi-line value.
-    titleEl.addEventListener('blur', async () => {
+    // multi-line value. `lastSavedTitle` (not the render-time `titleValue`)
+    // is what a save compares and reverts against, so a second commit of
+    // the same value — Enter followed by a later blur, with no further
+    // typing in between — is a no-op instead of firing a duplicate PUT.
+    let lastSavedTitle = titleValue;
+    async function saveTitle() {
       const value = titleEl.value.replace(/\r\n|\r|\n/g, ' ').trim();
-      if (!value || value === titleValue) return;
+      if (!value || value === lastSavedTitle) return;
       try {
         if (isTask) await putTask(card.id, { description: value });
         else await putSchedule(card.id, { name: value });
+        lastSavedTitle = value;
         await fetchBoard();
       } catch (err) {
         showToast(`Couldn't save title: ${err.message}`, true);
-        titleEl.value = titleValue;
+        titleEl.value = lastSavedTitle;
         autosizeTitleTextarea(titleEl);
       }
-    });
-    // Enter commits the title (the same result as blurring) instead of
+    }
+    titleEl.addEventListener('blur', saveTitle);
+    // Enter commits the title (the same save `blur` uses) instead of
     // inserting a line break — skipped mid-IME-composition so committing
     // an East Asian input method's conversion doesn't fire an early save.
+    // This never calls `.blur()`: doing so would move
+    // `document.activeElement` to `<body>`, outside `drawerEl`, which
+    // would drop the field out of `updateOpenDrawer`'s `focused` guard
+    // (board.js's drawer-update path) while the save above is still in
+    // flight — an unrelated live-board tick for the same card could then
+    // repaint the title from the server's still-stale value, flashing the
+    // just-typed text back to the old one on screen. Leaving focus in the
+    // field keeps that guard in effect exactly like it already does for
+    // the notes field while typing.
     titleEl.addEventListener('keydown', (e) => {
       if (e.key !== 'Enter' || e.isComposing) return;
       e.preventDefault();
-      titleEl.blur();
+      saveTitle();
     });
     titleEl.addEventListener('input', () => autosizeTitleTextarea(titleEl));
     autosizeTitleTextarea(titleEl);  // size to existing content on open/re-render
