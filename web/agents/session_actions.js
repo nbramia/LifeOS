@@ -664,9 +664,18 @@ export function nextWeekPreset(now) {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate() + daysAhead, 9, 0, 0, 0);
 }
 
+// Hours are exact elapsed time; days are calendar days (`setDate`, local
+// wall clock) rather than a fixed 24h multiple, so "2 days" lands at the
+// same wall-clock time it started at even across a DST change in between
+// — the same reasoning the presets above already use for "tomorrow" and
+// "next Monday".
 export function customDurationUntil(now, amount, unit) {
-  const msPerUnit = unit === 'days' ? 24 * 60 * 60 * 1000 : 60 * 60 * 1000;
-  return new Date(now.getTime() + amount * msPerUnit);
+  if (unit === 'days') {
+    const until = new Date(now);
+    until.setDate(until.getDate() + amount);
+    return until;
+  }
+  return new Date(now.getTime() + amount * 60 * 60 * 1000);
 }
 
 // ---------------------------------------------------------------------

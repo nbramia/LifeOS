@@ -3215,6 +3215,12 @@ class TestLaneFilterMultiSelect:
             else:
                 expect(box).to_be_checked()
 
+    def test_clear_button_tooltip_names_snoozed_alongside_done(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        title = page.locator("#board-lane-filter-clear").get_attribute("title") or ""
+        assert "done" in title.lower(), title
+        assert "snoozed" in title.lower(), title
+
     def test_unchecking_all_lanes_shows_empty_state_hint_not_a_blank_board(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
         self._open_lane_dropdown(page)
@@ -3858,6 +3864,30 @@ class TestSnoozeCustom:
         finally:
             context.close()
 
+    def test_custom_duration_in_days_keeps_wall_clock_time_across_a_dst_spring_forward(
+        self, browser: Browser, agents_base_url,
+    ):
+        """A day duration is calendar days (`setDate`, local wall clock),
+        not a fixed 24h multiple — 2026-03-08 is America/New_York's
+        spring-forward (clocks jump 02:00 -> 03:00, EST -> EDT). Starting
+        at 10:00 EST and adding 2 days must land at 10:00 EDT two days
+        later, not 09:00 or 11:00."""
+        context = browser.new_context(timezone_id="America/New_York")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            # 15:00 UTC = 10:00 local EST (no DST yet on March 7).
+            page.clock.pause_at(datetime(2026, 3, 7, 15, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('#board-drawer [data-field="snooze-duration-value"]').fill("2")
+            page.locator('#board-drawer [data-field="snooze-duration-unit"]').select_option("days")
+            page.locator('#board-drawer [data-action="snooze-duration-confirm"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0]["body"]["until"] == "2026-03-09T10:00:00-04:00"
+        finally:
+            context.close()
+
     def test_custom_date_time(self, browser: Browser, agents_base_url):
         context = browser.new_context(timezone_id="UTC")
         page = context.new_page()
@@ -3981,6 +4011,141 @@ class TestSnoozeDraggingClearsTheField:
         _wait_for(lambda: len(lane_calls) == 1, page=page)
         expect(page.locator('.board-lane[data-lane="in_progress"] [data-card-id="t-snoozed"]')).to_be_visible()
         expect(page.locator('.board-lane[data-lane="snoozed"] [data-card-id="t-snoozed"]')).to_have_count(0)
+
+
+class TestSnoozeUndoAfterDrag:
+    """Undo after dragging a snoozed card out must never try to move it
+    directly back into `snoozed` — the server refuses that as a direct
+    target the same way it refuses `review`/`scheduled`. Undo instead
+    restores the card's NATURAL lane
+    (what it would derive to ignoring the snooze) and re-applies the
+    captured `snoozed_until` if it's still in the future. Covers both drop
+    paths that offer Undo (the lane drop and the tray-assignee drop), plus
+    the one natural lane — Review — that also isn't directly settable, so
+    its restore goes through undo-accept instead of a lane move."""
+
+    def test_undo_after_lane_drop_restores_the_natural_lane_and_re_snoozes(
+        self, page: Page, agents_base_url,
+    ):
+        # Wide viewport so every visible lane (Snoozed makes seven) fits
+        # without horizontal scroll — `_drag_card` reads raw bounding
+        # boxes, which are meaningless for a column scrolled out of view.
+        page.set_viewport_size({"width": 2400, "height": 900})
+        lane_calls = []
+        snooze_calls = []
+        board_state = _board_fixture()
+        board_state["lanes"]["snoozed"].append({
+            "kind": "task", "id": "t-snoozed", "title": "Sleeping card",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"snoozed_until": "2099-01-01T00:00:00+00:00"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            lane_calls=lane_calls, snooze_calls=snooze_calls,
+        )
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
+        expect(page.locator('[data-card-id="t-snoozed"]')).to_be_visible()
+
+        _drag_card(page, "t-snoozed", "unassigned")
+        expect(page.locator(".board-lane[data-lane='unassigned'] [data-card-id='t-snoozed']")).to_be_visible(timeout=5000)
+        assert lane_calls[0] == {"lane": "unassigned"}, lane_calls
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: len(snooze_calls) == 1, page=page)
+        assert snooze_calls[0]["method"] == "PUT"
+        assert snooze_calls[0]["id"] == "t-snoozed"
+        assert snooze_calls[0]["body"]["until"] == "2099-01-01T00:00:00+00:00"
+        # The restore lands on the card's NATURAL lane (assigned — it
+        # carries #me), never a direct PUT of "snoozed" itself.
+        assert lane_calls[-1] == {"lane": "assigned", "assignee": "me"}, lane_calls
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='snoozed'] [data-card-id='t-snoozed']")).to_be_visible(timeout=5000)
+
+    def test_undo_after_tray_assignee_drop_restores_the_natural_lane_and_re_snoozes(
+        self, page: Page, agents_base_url,
+    ):
+        # See the comment in test_undo_after_lane_drop_restores_the_natural_lane_and_re_snoozes.
+        page.set_viewport_size({"width": 2400, "height": 900})
+        lane_calls = []
+        snooze_calls = []
+        board_state = _board_fixture()
+        board_state["lanes"]["snoozed"].append({
+            "kind": "task", "id": "t-snoozed", "title": "Sleeping card",
+            "notes": "", "status": "todo", "tags": [], "assignee": None,
+            "fields": {"snoozed_until": "2099-01-01T00:00:00+00:00"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            lane_calls=lane_calls, snooze_calls=snooze_calls,
+        )
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
+        expect(page.locator('[data-card-id="t-snoozed"]')).to_be_visible()
+
+        _drag_to(page, '[data-card-id="t-snoozed"]', '.board-assignee-drop[data-assignee="claude"]')
+        _wait_for(lambda: bool(lane_calls), page)
+        assert lane_calls[0] == {"lane": "assigned", "assignee": "claude"}, lane_calls
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: len(snooze_calls) == 1, page=page)
+        assert snooze_calls[0]["body"]["until"] == "2099-01-01T00:00:00+00:00"
+        # The card carried no assignee tag before the drag, so its natural
+        # lane is Unassigned.
+        assert lane_calls[-1] == {"lane": "unassigned"}, lane_calls
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='snoozed'] [data-card-id='t-snoozed']")).to_be_visible(timeout=5000)
+
+    def test_undo_after_dragging_a_snoozed_review_card_to_done_reverts_the_accept_and_re_snoozes(
+        self, page: Page, agents_base_url,
+    ):
+        """The natural lane for a snoozed Review card is Review itself,
+        which — like Snoozed — can never be set directly. Undo goes
+        through the dedicated undo-accept transition (removing the
+        `accepted` tag the drag-to-Done write added) rather than a lane
+        move, then re-applies the snooze."""
+        # See the comment in test_undo_after_lane_drop_restores_the_natural_lane_and_re_snoozes.
+        page.set_viewport_size({"width": 2400, "height": 900})
+        lane_calls = []
+        snooze_calls = []
+        board_state = _board_fixture()
+        board_state["lanes"]["snoozed"].append({
+            "kind": "task", "id": "t-snoozed-review", "title": "Sleeping review card",
+            "notes": "", "status": "done", "tags": ["agent-completed", "claude"], "assignee": "claude",
+            "fields": {"snoozed_until": "2099-01-01T00:00:00+00:00"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
+        _open_board(
+            page, agents_base_url, board_state=board_state,
+            lane_calls=lane_calls, snooze_calls=snooze_calls,
+        )
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        expect(page.locator('[data-card-id="t-snoozed-review"]')).to_be_visible()
+
+        _drag_card(page, "t-snoozed-review", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t-snoozed-review']")).to_be_visible(timeout=5000)
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: len(snooze_calls) == 1, page=page)
+        assert snooze_calls[0]["body"]["until"] == "2099-01-01T00:00:00+00:00"
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='snoozed'] [data-card-id='t-snoozed-review']")).to_be_visible(timeout=5000)
 
 
 class TestComposerTagsPicker:

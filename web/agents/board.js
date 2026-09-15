@@ -20,7 +20,9 @@ import {
 } from './panel.js';
 import { renderActionRow } from './session_actions.js';
 import { descendantsOf } from './graph_encoding.js';
-import { acceptCard, cardActionHandlers, cancelCard, openDeleteCardModal } from './card_actions.js';
+import {
+  acceptCard, cardActionHandlers, cancelCard, openDeleteCardModal, snoozeCard, undoAcceptedCard,
+} from './card_actions.js';
 import { renderAssignmentPickers } from './assignment.js';
 import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
@@ -477,6 +479,53 @@ export function initBoard() {
     return { allowed: true, reason: '' };
   }
 
+  // Mirrors api/services/agent_board.py's natural_lane(status, tags) — the
+  // lane a card would derive to ignoring any snooze. Used only to compute
+  // Undo's restore target for a card captured mid-snooze, since the
+  // server's own `snoozed` lane can never be set directly (plan_lane_move
+  // refuses it the same way review/scheduled are refused). Deliberately
+  // omits the machine-wait-tag branch production's natural_lane has: a
+  // card this function is ever called on was successfully snoozed, which
+  // the drawer only ever offers from Unassigned, Assigned, Human queue, or
+  // Review (session_actions.js's SNOOZE_ELIGIBLE_LANES), so its natural
+  // lane can never actually be the machine-wait flavor of In progress.
+  function naturalLaneFor(card) {
+    const tags = new Set((card.tags || []).map(t => String(t).replace(/^#+/, '').toLowerCase()));
+    const status = (card.status || 'todo').toLowerCase();
+    if (tags.has('agent-completed') && !tags.has('accepted')) return 'review';
+    if (tags.has('agent-blocked') || tags.has('human') || status === 'blocked') return 'human_queue';
+    if (status === 'in_progress' || tags.has('agent-running')) return 'in_progress';
+    if (status === 'done' || status === 'cancelled') return 'done';
+    return card.assignee ? 'assigned' : 'unassigned';
+  }
+
+  // The shared Undo restore target for both the lane-drop (onCardDropped)
+  // and the tray-assignee-drop (assignCardTo) paths. `lane` is the card's
+  // NATURAL lane at capture time (see naturalLaneFor) — for a card that
+  // was snoozed, `card.lane` itself was `snoozed`, which plan_lane_move
+  // always refuses as a direct target, so callers resolve the natural
+  // lane first rather than ever passing `snoozed` through here. Review is
+  // ALSO not directly settable; the only way a snoozed Review card's Undo
+  // is ever actually offered is after a drag to Done added `accepted`
+  // (agent-completed alone already wins the derived lane back to Review
+  // the instant it's written anywhere else, which short-circuits the
+  // undoable toast entirely, without this function ever being called —
+  // see onCardDropped's "landed elsewhere" check) — so restoring Review always
+  // means undoing that acceptance, not a lane move. `snoozedUntil`, when
+  // given and still in the future, re-applies the snooze once the lane (or
+  // acceptance) is restored.
+  function undoToLane(cardId, lane, assignee, snoozedUntil) {
+    const restore = lane === 'review'
+      ? undoAcceptedCard(cardId, () => {})
+      : moveCard(cardId, lane, assignee || undefined);
+    return restore
+      .then(() => {
+        const stillFuture = snoozedUntil && new Date(snoozedUntil).getTime() > Date.now();
+        return stillFuture ? snoozeCard({ id: cardId }, snoozedUntil, () => {}) : null;
+      })
+      .then(() => fetchBoard());
+  }
+
   // Every way to assign a card — dragging an assignee onto a card, or
   // dragging a card onto an assignee — lands here, so neither path can
   // report or offer undo differently from the other.
@@ -489,9 +538,15 @@ export function initBoard() {
       return;
     }
     // Captured before the write so Undo restores where the card actually
-    // was, not wherever the board has drifted to by the time it is clicked.
+    // was, not wherever the board has drifted to by the time it is
+    // clicked. A card dragged while snoozed resolves its Undo target to
+    // the NATURAL lane it was snoozed from, plus the wake-up time, so
+    // Undo restores the snooze too instead of trying (and failing) to
+    // move the card directly into the `snoozed` lane.
     const priorLane = card.lane;
     const priorAssignee = card.assignee || null;
+    const priorSnoozedUntil = priorLane === 'snoozed' ? (card.fields && card.fields.snoozed_until) : null;
+    const priorNaturalLane = priorLane === 'snoozed' ? naturalLaneFor(card) : priorLane;
     const title = card.title || card.id;
     setDropStatus(`Assigning ${assignee}…`);
     // Keep this on the same lane endpoint and request shape as the drawer's
@@ -502,7 +557,7 @@ export function initBoard() {
         setDropStatus(`Assigned to ${assignee}.`);
         if (data && data.lane && data.lane !== 'assigned') return;
         showUndoableToast(`Assigned "${title}" to ${assignee}.`, () => (
-          moveCard(card.id, priorLane, priorAssignee || undefined)
+          undoToLane(card.id, priorNaturalLane, priorAssignee, priorSnoozedUntil)
         ));
       })
       .catch(() => setDropStatus('Assignment refused.', true));
@@ -1092,9 +1147,14 @@ export function initBoard() {
       assignee = card.assignee || 'me';
     }
     // Captured before the write so Undo restores where the card actually
-    // was, not wherever the board has drifted to by the time it is clicked.
+    // was, not wherever the board has drifted to by the time it is
+    // clicked. A card dragged out of Snoozed resolves its Undo target to
+    // the NATURAL lane it was snoozed from, plus the wake-up time — see
+    // naturalLaneFor/undoToLane.
     const priorLane = card.lane;
     const priorAssignee = card.assignee || null;
+    const priorSnoozedUntil = priorLane === 'snoozed' ? (card.fields && card.fields.snoozed_until) : null;
+    const priorNaturalLane = priorLane === 'snoozed' ? naturalLaneFor(card) : priorLane;
     const title = card.title || card.id;
     // moveCard already toasts and re-renders on failure — nothing more to
     // do there, just avoid an unhandled rejection given that it re-throws.
@@ -1105,7 +1165,7 @@ export function initBoard() {
         // A second toast claiming the requested move would contradict it.
         if (data && data.lane && data.lane !== targetLane) return;
         showUndoableToast(`Moved "${title}" to ${laneLabel(targetLane)}.`, () => (
-          moveCard(cardId, priorLane, priorAssignee || undefined)
+          undoToLane(cardId, priorNaturalLane, priorAssignee, priorSnoozedUntil)
         ));
       })
       .catch(() => {});
