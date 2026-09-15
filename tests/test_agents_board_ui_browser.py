@@ -5880,11 +5880,11 @@ class TestMutationUndo:
     def test_dragging_an_unassigned_card_to_in_progress_and_undo_restores_it(
         self, page: Page, agents_base_url,
     ):
-        """The same invariant, asserted as its own falsifying test
-        (round-2 review Action Required 1): a lossy replay of
-        `{lane: 'unassigned'}` never touches `status`, so it would leave
-        the card at `status="in_progress"` — still deriving to In progress
-        — while the toast claims it moved back to Unassigned."""
+        """The same invariant, asserted as its own falsifying test: a
+        lossy replay of `{lane: 'unassigned'}` never touches `status`, so
+        it would leave the card at `status="in_progress"` — still
+        deriving to In progress — while the toast claims it moved back to
+        Unassigned."""
         lane_calls = []
         task_puts = []
         _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
@@ -6194,13 +6194,13 @@ class TestMutationUndo:
     def test_a_refused_undo_restore_reports_failure_and_does_not_leave_the_card_in_done(
         self, page: Page, agents_base_url,
     ):
-        """restoreCardSnapshot must rethrow on a refused restore (e.g. a
-        409 because the card changed in the meantime) rather than swallow
-        it — swallowing let the Undo toast dismiss itself as though the
-        restore had succeeded, while the card actually stayed exactly
-        where it was. Uses a snoozed card so "no re-snooze is attempted on
-        a refused restore" is itself an automated assertion (`snooze_calls
-        == []`), not just something checked by hand."""
+        """A refused restore (e.g. a 409 because the card changed in the
+        meantime) reports failure rather than reading as a success: an
+        error toast appears, the original toast's own Undo action stays
+        available, and the card is left exactly where the server has it.
+        Uses a snoozed card so "no re-snooze is attempted on a refused
+        restore" is itself an automated assertion (`snooze_calls == []`),
+        not just something checked by hand."""
         page.set_viewport_size({"width": 2400, "height": 900})
         board = _board_fixture()
         board["lanes"]["snoozed"].append({
