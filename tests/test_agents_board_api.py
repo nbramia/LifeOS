@@ -12,6 +12,7 @@ import asyncio
 import copy
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -80,7 +81,7 @@ class TestGetBoard:
         body = r.json()
         assert set(body["lanes"].keys()) == {
             "unassigned", "assigned", "in_progress", "human_queue",
-            "scheduled", "review", "done",
+            "scheduled", "review", "done", "snoozed",
         }
         assert "generated_at" in body
 
@@ -176,14 +177,15 @@ class TestGetBoard:
             "reason": "cancel is only available for agent-assigned cards",
         }
         # Positive case: every SETTABLE lane is allowed for a plain `me`
-        # card, so only the two every-card-unconditional 400s ("review"
-        # and "scheduled") appear — not `{lane: {allowed: true}}` for the
-        # other five. This is the direct proof of the "absence means
-        # allowed" contract on the one card type where every real move
-        # really is allowed.
+        # card, so only the three every-card-unconditional 400s ("review",
+        # "scheduled", "snoozed") appear — not `{lane: {allowed: true}}`
+        # for the other five. This is the direct proof of the "absence
+        # means allowed" contract on the one card type where every real
+        # move really is allowed.
         assert policy["lanes"] == {
             "review": {"allowed": False, "reason": "lane 'review' cannot be set directly"},
             "scheduled": {"allowed": False, "reason": "lane 'scheduled' cannot be set directly"},
+            "snoozed": {"allowed": False, "reason": "lane 'snoozed' cannot be set directly"},
         }
 
     def test_claimed_card_policy_block_refuses_everything_but_cancel(self, client, stores):
@@ -464,6 +466,26 @@ class TestReviewActions:
         assert queued[0]["session_id"] == session.session_id
         assert queued[0]["answer"] == "Please add a synthetic edge-case check."
 
+    def test_reject_clears_a_stale_snooze(self, client, stores):
+        """A snoozed Review card rejected back to In progress must not
+        carry a future `snoozed_until` forward — In progress is never
+        snooze-eligible, and a lingering value would silently re-hide the
+        card the next time it lands back in Review."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Snoozed review, rejected", tags=["codex", "agent-completed"], status="done")
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="local")
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry the synthetic case."},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["lane"] == "in_progress"
+        updated = task_manager.get(task.id)
+        assert updated.status == "in_progress"
+        assert "snoozed_until" not in updated.fields
+
     def test_reassign_preserves_session_context_and_moves_to_assigned(self, client, stores):
         task_manager, _sched, session_store, _transcript = stores
         task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done", notes="Prior output")
@@ -484,6 +506,26 @@ class TestReviewActions:
         assert "Try a second synthetic approach." in (updated.notes or "")
         assert session_store.get(task.id).session_id == session.session_id
         assert session_store.get_messages(session.session_id)[0]["content"] == "Prior synthetic result"
+
+    def test_reassign_clears_a_stale_snooze(self, client, stores):
+        """Assigned IS a snooze-eligible natural lane, so the write-path
+        natural-lane guard alone would not clear this — the reassignment
+        must clear it explicitly, since reassigning a card is an operator
+        action that wakes it, the same as a lane-move drag."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Snoozed review, reassigned", tags=["codex", "agent-completed"], status="done")
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["lane"] == "assigned"
+        updated = task_manager.get(task.id)
+        assert updated.tags == ["claude", "agent-reassigned"]
+        assert "snoozed_until" not in updated.fields
 
     def test_reassign_without_a_prior_session_moves_the_card_and_reports_no_context(
         self, client, stores,
@@ -749,6 +791,56 @@ class TestBoardStream:
                 await asyncio.gather(next_task, return_exceptions=True)
             await gen.aclose()
 
+    async def test_snoozed_card_leaves_its_lane_once_the_wake_time_passes(
+        self, stores, monkeypatch,
+    ):
+        """A snooze expiring is a wall-clock change, not a vault edit — a
+        content-hash/mtime cache would never notice it. Proves the
+        stream's own tick recomputes lane derivation against the current
+        time on every rebuild by injecting `agents_route._now` (no sleep):
+        the task file is never touched between the two frames, only the
+        injected clock moves past the wake-up time.
+        """
+        task_manager, *_ = stores
+        task = task_manager.create("Wakes up on its own", tags=["me"])
+        wake_at = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+        task_manager.update(task.id, fields={"snoozed_until": wake_at.isoformat()})
+        monkeypatch.setattr(agents_route, "_now", lambda: wake_at - timedelta(seconds=1))
+
+        resp = await agents_route.stream_board()
+        gen = resp.body_iterator
+        next_task = None
+        try:
+            first = await gen.__anext__()
+            assert first == ": ok\n\n"
+
+            second = await gen.__anext__()
+            first_board = json.loads(second.split("data: ", 1)[1])
+            assert task.id in [c["id"] for c in first_board["lanes"]["snoozed"]]
+            assert task.id not in [c["id"] for c in first_board["lanes"]["assigned"]]
+
+            # Move only the injected clock past the wake-up time — the task
+            # itself is never written again.
+            monkeypatch.setattr(agents_route, "_now", lambda: wake_at + timedelta(seconds=1))
+
+            next_task = asyncio.ensure_future(gen.__anext__())
+            done, _pending = await asyncio.wait(
+                {next_task}, timeout=2 * agents_route._BOARD_STREAM_INTERVAL,
+            )
+            assert next_task in done, (
+                "stream did not emit a frame after the injected clock passed "
+                "the card's wake-up time"
+            )
+            third = await next_task
+            second_board = json.loads(third.split("data: ", 1)[1])
+            assert task.id in [c["id"] for c in second_board["lanes"]["assigned"]]
+            assert task.id not in [c["id"] for c in second_board["lanes"]["snoozed"]]
+        finally:
+            if next_task is not None and not next_task.done():
+                next_task.cancel()
+                await asyncio.gather(next_task, return_exceptions=True)
+            await gen.aclose()
+
 
 # ---------------------------------------------------------------------------
 # PUT /api/agents/board/cards/{id}/lane
@@ -954,6 +1046,184 @@ class TestMoveBoardCard:
 
 
 # ---------------------------------------------------------------------------
+# PUT / DELETE /api/agents/board/cards/{id}/snooze
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestSnoozeBoardCard:
+    FUTURE = "2099-01-01T00:00:00+00:00"
+
+    def test_missing_card_is_404(self, client, stores):
+        r = client.put(
+            "/api/agents/board/cards/does-not-exist/snooze", json={"until": self.FUTURE},
+        )
+        assert r.status_code == 404
+
+    @pytest.mark.parametrize("status,tags", [
+        ("todo", []),                      # unassigned
+        ("todo", ["codex"]),               # assigned
+        ("blocked", []),                   # human_queue
+        ("done", ["agent-completed"]),     # review
+    ])
+    def test_eligible_card_persists_the_wake_up_time(self, client, stores, status, tags):
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Snoozable card", status=status, tags=tags, notes="original notes",
+        )
+        before = task_manager.get(task.id)
+        r = client.put(
+            f"/api/agents/board/cards/{task.id}/snooze", json={"until": self.FUTURE},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["lane"] == "snoozed"
+        assert body["snoozed_until"] == self.FUTURE
+
+        after = task_manager.get(task.id)
+        assert after.status == before.status
+        assert after.tags == before.tags
+        assert after.notes == before.notes
+        assert after.fields.get("snoozed_until") == self.FUTURE
+
+        board = client.get("/api/agents/board").json()
+        assert task.id in [c["id"] for c in board["lanes"]["snoozed"]]
+
+    @pytest.mark.parametrize("until,expected", [
+        ("20990101T000000+0000", "2099-01-01T00:00:00+00:00"),  # compact form
+        ("2099-01-01T00:00:00Z", "2099-01-01T00:00:00+00:00"),  # Z suffix
+    ])
+    def test_until_is_stored_normalized_not_verbatim(self, client, stores, until, expected):
+        """`fromisoformat` accepts compact and `Z`-suffixed forms, but a
+        browser's `Date` constructor doesn't parse them all uniformly —
+        the vault stores the canonical `parsed.isoformat()` form instead of
+        echoing whatever was sent."""
+        task_manager, *_ = stores
+        task = task_manager.create("Snooze normalization card")
+        r = client.put(f"/api/agents/board/cards/{task.id}/snooze", json={"until": until})
+        assert r.status_code == 200, r.text
+        assert r.json()["snoozed_until"] == expected
+
+        after = task_manager.get(task.id)
+        assert after.fields.get("snoozed_until") == expected
+        content = (task_manager.tasks_dir / "Inbox.md").read_text(encoding="utf-8")
+        assert f"[snoozed_until:: {expected}]" in content
+
+    @pytest.mark.parametrize("status,tags", [
+        ("in_progress", []),
+        ("todo", ["agent", "agent-running"]),
+        ("done", []),
+        ("cancelled", []),
+    ])
+    def test_in_progress_or_done_card_is_refused_and_unmodified(
+        self, client, stores, status, tags,
+    ):
+        task_manager, *_ = stores
+        task = task_manager.create("Not snoozable", status=status, tags=tags)
+        before = task_manager.get(task.id)
+        r = client.put(
+            f"/api/agents/board/cards/{task.id}/snooze", json={"until": self.FUTURE},
+        )
+        assert 400 <= r.status_code < 500, r.text
+        after = task_manager.get(task.id)
+        assert after.status == before.status
+        assert after.tags == before.tags
+        assert "snoozed_until" not in after.fields
+
+    def test_missing_until_is_refused(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Card")
+        r = client.put(f"/api/agents/board/cards/{task.id}/snooze", json={})
+        assert 400 <= r.status_code < 500
+        assert "snoozed_until" not in task_manager.get(task.id).fields
+
+    @pytest.mark.parametrize("until", [
+        "not-a-date",
+        "2099-01-01T00:00:00",          # no UTC offset
+        "2000-01-01T00:00:00+00:00",    # parseable, not a future time
+    ])
+    def test_bad_until_is_refused_and_unmodified(self, client, stores, until):
+        task_manager, *_ = stores
+        task = task_manager.create("Card")
+        r = client.put(f"/api/agents/board/cards/{task.id}/snooze", json={"until": until})
+        assert 400 <= r.status_code < 500, r.text
+        assert "snoozed_until" not in task_manager.get(task.id).fields
+
+    def test_scheduler_entry_is_refused(self, client, stores):
+        _task_manager, scheduler_store, *_ = stores
+        entry = scheduler_store.create(
+            name="Nightly digest", schedule_type="cron", schedule_value="0 9 * * *",
+            message_type="static", message_content="digest",
+        )
+        r = client.put(
+            f"/api/agents/board/cards/{entry.id}/snooze", json={"until": self.FUTURE},
+        )
+        assert 400 <= r.status_code < 500
+
+
+@pytest.mark.unit
+class TestUnsnoozeBoardCard:
+    def test_missing_card_is_404(self, client, stores):
+        r = client.delete("/api/agents/board/cards/does-not-exist/snooze")
+        assert r.status_code == 404
+
+    def test_removes_the_field_and_restores_the_natural_lane(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Snoozed card", tags=["codex"])
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+
+        r = client.delete(f"/api/agents/board/cards/{task.id}/snooze")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["lane"] == "assigned"
+        assert body["snoozed_until"] is None
+        after = task_manager.get(task.id)
+        assert "snoozed_until" not in after.fields
+
+        board = client.get("/api/agents/board").json()
+        assert task.id in [c["id"] for c in board["lanes"]["assigned"]]
+        assert task.id not in [c["id"] for c in board["lanes"]["snoozed"]]
+
+    def test_non_snoozed_card_is_a_no_op_success(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Never snoozed", tags=["me"])
+        before = task_manager.get(task.id)
+        r = client.delete(f"/api/agents/board/cards/{task.id}/snooze")
+        assert r.status_code == 200
+        after = task_manager.get(task.id)
+        # A true no-op — no write at all, not merely an idempotent-looking one.
+        assert after.updated_at == before.updated_at
+        assert after.status == before.status
+        assert after.tags == before.tags
+
+
+# ---------------------------------------------------------------------------
+# Lane move / snooze interaction
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestLaneMoveSnoozeInteraction:
+    def test_snoozed_lane_cannot_be_set_directly(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Card")
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "snoozed"})
+        assert r.status_code == 400
+
+    def test_moving_a_snoozed_card_out_clears_the_snooze_and_applies_the_move(
+        self, client, stores,
+    ):
+        task_manager, *_ = stores
+        task = task_manager.create("Snoozed and dragged", tags=["codex"])
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "unassigned"})
+        assert r.status_code == 200, r.text
+        assert r.json()["lane"] == "unassigned"
+        after = task_manager.get(task.id)
+        assert "snoozed_until" not in after.fields
+        assert after.tags == []
+
+
+# ---------------------------------------------------------------------------
 # POST /api/agents/board/cards/{id}/cancel
 # ---------------------------------------------------------------------------
 
@@ -977,6 +1247,29 @@ class TestCancelBoardCard:
         board = client.get("/api/agents/board").json()
         done_ids = [c["id"] for c in board["lanes"]["done"]]
         assert task.id in done_ids
+
+    def test_cancel_clears_a_stale_snooze_so_the_card_lands_in_done(
+        self, client, stores, monkeypatch,
+    ):
+        """Cancel is available on an Assigned card, and Assigned is
+        snooze-eligible — a cancelled card must land in Done immediately,
+        not stay hidden in Snoozed until an unrelated future wake-up time
+        passes."""
+        task_manager, *_ = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Snoozed then cancelled", tags=["codex"])
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200, r.text
+        assert r.json()["lane"] == "done"
+        after = task_manager.get(task.id)
+        assert after.status == "cancelled"
+        assert "snoozed_until" not in after.fields
+
+        board = client.get("/api/agents/board").json()
+        assert task.id in [c["id"] for c in board["lanes"]["done"]]
+        assert task.id not in [c["id"] for c in board["lanes"]["snoozed"]]
 
     def test_cancel_claimed_card_kills_session_and_descendants(self, client, stores, monkeypatch):
         """A claimed card's live session (and its whole subtree) is torn
@@ -1341,6 +1634,22 @@ class TestAcceptBoardCard:
         assert "accepted" in updated.tags
         assert updated.status == "done"
 
+    def test_accept_works_on_a_snoozed_review_card_and_clears_the_snooze(self, client, stores):
+        """A snoozed Review card is still a Review card as far as Accept is
+        concerned — it uses the natural (status/tag-only) lane, not the
+        snoozed one, so accepting it both moves it to Done and wakes it."""
+        task_manager, *_ = stores
+        task = task_manager.create("Snoozed review, accepted", tags=["agent-completed"], status="done")
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert r.status_code == 200, r.text
+        assert r.json()["lane"] == "done"
+        updated = task_manager.get(task.id)
+        assert "accepted" in updated.tags
+        assert updated.status == "done"
+        assert "snoozed_until" not in updated.fields
+
     def test_accept_is_idempotent(self, client, stores):
         task_manager, *_ = stores
         task = task_manager.create("Refactor the parser", tags=["agent-completed"], status="done")
@@ -1623,6 +1932,33 @@ class TestPendingQuestions:
 # ---------------------------------------------------------------------------
 # Hermes label fix + Codex stream dispatch (#850)
 # ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestSnapshotLaneMatchesBoardForSnoozedCard:
+    def test_snapshot_session_lane_matches_board_lane_when_snoozed(self, client, stores):
+        """`lane_for_session` must pass the task's fields through to
+        `derive_lane`, the same as every other lane-derivation call site in
+        `agents.py` — otherwise the Graph tab's node colour disagrees with
+        the card's own board column for a snoozed Review card, which
+        always has a linked session."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create(
+            "Snoozed review with a session", tags=["codex", "agent-completed"], status="done",
+        )
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+        session = session_store.create(task_id=task.id, status="completed", routing="codex")
+
+        board = client.get("/api/agents/board").json()
+        board_lane = next(
+            lane for lane, cards in board["lanes"].items()
+            if task.id in [c["id"] for c in cards]
+        )
+        assert board_lane == "snoozed"
+
+        snapshot = client.get("/api/agents/snapshot").json()
+        sessions = {sd["session_id"]: sd for sd in snapshot["sessions"]}
+        assert sessions[session.session_id]["lane"] == "snoozed"
+
 
 @pytest.mark.unit
 class TestHermesLabelAndCodexStream:

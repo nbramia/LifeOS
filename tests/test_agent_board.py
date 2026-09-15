@@ -2,6 +2,8 @@
 lane-move planning (#850). One test per row of the lane table in the issue,
 plus the scheduler-entry bucketing rule.
 """
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from api.services import agent_board
@@ -97,6 +99,81 @@ class TestDeriveLaneTable:
 
     def test_done_status_cancelled(self):
         assert agent_board.derive_lane("cancelled", []) == "done"
+
+
+# ---------------------------------------------------------------------------
+# derive_lane — snooze. A future `snoozed_until` field wins over every
+# status/tag rule above; a past or missing one is ignored entirely.
+# ---------------------------------------------------------------------------
+
+class TestDeriveLaneSnooze:
+    FUTURE = "2099-01-01T00:00:00+00:00"
+    PAST = "2000-01-01T00:00:00+00:00"
+
+    # One row each for unassigned, assigned, human_queue, and review — the
+    # four lanes the snooze endpoint accepts.
+    ROWS = {
+        "unassigned": ("todo", []),
+        "assigned": ("todo", ["codex"]),
+        "human_queue": ("blocked", []),
+        "review": ("done", ["agent-completed"]),
+    }
+
+    @pytest.mark.parametrize("name,row", list(ROWS.items()))
+    def test_future_wake_up_time_wins_regardless_of_status_and_tags(self, name, row):
+        status, tags = row
+        fields = {"snoozed_until": self.FUTURE}
+        assert agent_board.derive_lane(status, tags, fields) == "snoozed", name
+
+    @pytest.mark.parametrize("name,row", list(ROWS.items()))
+    def test_past_wake_up_time_derives_exactly_as_without_the_field(self, name, row):
+        status, tags = row
+        without_field = agent_board.derive_lane(status, tags)
+        with_past_field = agent_board.derive_lane(status, tags, {"snoozed_until": self.PAST})
+        assert with_past_field == without_field, name
+
+    def test_missing_or_empty_fields_is_unaffected(self):
+        assert agent_board.derive_lane("todo", [], {}) == "unassigned"
+        assert agent_board.derive_lane("todo", [], None) == "unassigned"
+
+    def test_unparseable_value_is_treated_as_absent(self):
+        assert agent_board.derive_lane("todo", [], {"snoozed_until": "not-a-date"}) == "unassigned"
+
+    def test_offset_less_value_is_treated_as_absent(self):
+        # An offset-less ISO string parses, but a naive local time must
+        # never be treated as a wake-up time.
+        assert agent_board.derive_lane("todo", [], {"snoozed_until": "2099-01-01T00:00:00"}) == "unassigned"
+
+    def test_now_is_injectable(self):
+        wake = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        before = wake - timedelta(seconds=1)
+        after = wake + timedelta(seconds=1)
+        fields = {"snoozed_until": wake.isoformat()}
+        assert agent_board.derive_lane("todo", [], fields, before) == "snoozed"
+        assert agent_board.derive_lane("todo", [], fields, after) == "unassigned"
+
+    def test_in_progress_and_done_ignore_a_future_snooze_field(self):
+        # A snooze can never hide a running or finished card — the override
+        # only ever applies when the natural (status/tag-only) lane is
+        # itself snooze-eligible (SNOOZABLE_LANES). A future `snoozed_until`
+        # on an in_progress or done task is simply ignored.
+        fields = {"snoozed_until": self.FUTURE}
+        assert agent_board.derive_lane("in_progress", [], fields) == "in_progress"
+        assert agent_board.derive_lane("done", [], fields) == "done"
+        assert agent_board.derive_lane("cancelled", [], fields) == "done"
+        assert agent_board.derive_lane("todo", ["agent-running"], fields) == "in_progress"
+
+    def test_natural_lane_matches_derive_lane_with_no_fields(self):
+        cases = [
+            ("todo", []), ("todo", ["me"]), ("in_progress", []),
+            ("blocked", ["human"]), ("done", ["agent-completed"]),
+            ("done", ["agent-completed", "accepted"]), ("cancelled", []),
+        ]
+        for status, tags in cases:
+            assert agent_board.natural_lane(status, tags) == agent_board.derive_lane(status, tags), (status, tags)
+
+    def test_snoozable_lanes_matches_the_eligible_set(self):
+        assert agent_board.SNOOZABLE_LANES == {"unassigned", "assigned", "human_queue", "review"}
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +307,27 @@ class TestPlanLaneMove:
         plan = agent_board.plan_lane_move("todo", [], "scheduled", None)
         assert plan.error is not None
         assert plan.error[0] == 400
+
+    def test_snoozed_cannot_be_set_directly(self):
+        # Dragging a card into Snoozed is refused — snoozing only ever
+        # happens through PUT .../snooze.
+        plan = agent_board.plan_lane_move("todo", [], "snoozed", None)
+        assert plan.error is not None
+        assert plan.error[0] == 400
+
+    @pytest.mark.parametrize("target_lane,assignee", [
+        ("unassigned", None),
+        ("assigned", "codex"),
+        ("in_progress", None),
+        ("human_queue", None),
+        ("done", None),
+    ])
+    def test_every_successful_move_clears_snoozed_until(self, target_lane, assignee):
+        # A lane move always wakes the card — clearing an absent field is
+        # a no-op, so this holds whether or not it was snoozed.
+        plan = agent_board.plan_lane_move("todo", [], target_lane, assignee)
+        assert plan.error is None, (target_lane, plan.error)
+        assert plan.fields == {"snoozed_until": None}
 
 
 # ---------------------------------------------------------------------------
