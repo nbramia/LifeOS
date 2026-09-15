@@ -2343,9 +2343,13 @@ export function initBoard() {
           const key = endpointConfigKey(cfg);
           if (key === lastSavedEndpointConfigKey) return;
           // See the message handler above: a pending action switch rides
-          // along in this same PUT rather than being sent (and rejected)
-          // on its own.
+          // along in this same PUT once these fields actually satisfy the
+          // target action's requirement. Until then (e.g. the method is
+          // picked before a path is entered), hold the edit locally same
+          // as the switch itself, rather than sending a combined PUT the
+          // server would reject for a field the operator hasn't finished.
           const savingAction = pendingAction;
+          if (savingAction && !actionInputsSatisfied(savingAction, { endpoint_config: cfg })) return;
           const patch = { endpoint_config: cfg };
           if (savingAction) patch.action = savingAction;
           try {

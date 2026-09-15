@@ -12,11 +12,12 @@ bot select offering only the names `GET /api/scheduler/bots` returns (plus
 an empty "primary" option) and disabling with a visible reason when that
 fetch fails; the executor/bot swap when the action select changes; an
 action switch whose target section isn't yet satisfied (no endpoint config,
-a blank message) holding locally instead of saving until the section's own
-input is filled, then saving both together, with a rejection shown inline
-next to the Action select rather than as a toast; the next-fire preview
-updating from the PUT response; and Trigger now calling the trigger
-endpoint and refreshing the last-run line.
+a blank message, a path that doesn't start with "/api/") holding locally
+instead of saving — through both the Action select's own change and every
+subsequent edit to the section's fields — until the section's own input
+satisfies the target action, then saving both together in one PUT; the
+next-fire preview updating from the PUT response; and Trigger now calling
+the trigger endpoint and refreshing the last-run line.
 """
 import http.server
 import json
@@ -678,6 +679,34 @@ class TestPerActionSections:
         chip = page.locator('[data-card-id="s1"] .board-chip').first
         expect(chip).to_have_text("endpoint: GET /api/tasks/summary")
 
+    def test_choosing_method_before_a_path_holds_the_switch_and_shows_no_error(self, page: Page, agents_base_url):
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)  # fixture: notify, no endpoint_config
+        page.locator('[data-field="action"]').select_option("endpoint")
+        page.wait_for_timeout(200)
+        assert schedule_puts == []
+
+        # Choosing POST alone doesn't satisfy the endpoint action -- there's
+        # still no path -- so the edit is held locally same as the switch
+        # itself: no PUT sent, and no error shown for an edit still in
+        # progress.
+        page.locator('[data-field="endpoint-method"]').select_option("POST")
+        page.wait_for_timeout(200)
+        assert schedule_puts == []
+        expect(page.locator('[data-field="action-error"]')).to_be_hidden()
+
+        path = page.locator('[data-field="endpoint-path"]')
+        path.fill("/api/tasks/summary")
+        path.blur()
+        _wait_for(
+            lambda: {
+                "action": "endpoint",
+                "endpoint_config": {"method": "POST", "endpoint": "/api/tasks/summary"},
+            } in schedule_puts,
+            page=page,
+        )
+        assert len(schedule_puts) == 1
+
     def test_switching_to_notify_with_blank_message_sends_nothing_until_typed(self, page: Page, agents_base_url):
         schedule_puts = []
         board_state = _board_fixture()
@@ -697,27 +726,29 @@ class TestPerActionSections:
         )
         assert len(schedule_puts) == 1
 
-    def test_action_change_rejection_shown_inline_and_keeps_entered_inputs(self, page: Page, agents_base_url):
+    def test_invalid_path_holds_the_switch_locally_and_keeps_entered_inputs(self, page: Page, agents_base_url):
         schedule_puts = []
         board_state = _board_fixture()
         _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)  # notify, no endpoint_config
         page.locator('[data-field="action"]').select_option("endpoint")
-        # Method stays at its default (GET, already valid) -- only the path
-        # is wrong, so filling and blurring it alone fires the combined PUT.
+        # Method stays at its default (GET, already valid) -- the path
+        # alone still doesn't satisfy the endpoint action (it doesn't start
+        # with "/api/"), so filling and blurring it holds the switch
+        # locally rather than sending a combined PUT the server would
+        # reject.
         path = page.locator('[data-field="endpoint-path"]')
         path.fill("not-a-route")
-        path.blur()  # combined PUT (action + endpoint_config), rejected by the stub
+        path.blur()
+        page.wait_for_timeout(200)
+        assert schedule_puts == []
 
-        error_el = page.locator('[data-field="action-error"]')
-        expect(error_el).to_be_visible(timeout=5000)
-        expect(error_el).to_contain_text("must start with '/api/'")
-        # The operator's own entry stays visible -- not reverted, unlike an
-        # ordinary (non-action-carrying) endpoint_config save rejection.
+        expect(page.locator('[data-field="action-error"]')).to_be_hidden()
+        # The operator's own entry stays visible -- nothing reverts it.
         expect(path).to_have_value("not-a-route")
         expect(page.locator('[data-field="endpoint-params-error"]')).to_be_hidden()
-        # The rejected write never reached board_state -- closing and
-        # reopening the drawer (a fresh render from the card's actual
-        # stored data) still shows the original action, not "endpoint".
+        # Nothing was ever written -- closing and reopening the drawer (a
+        # fresh render from the card's actual stored data) still shows the
+        # original action, not "endpoint".
         assert board_state["lanes"]["scheduled"][0]["action"] == "notify"
         page.locator('[data-action="drawer-close"]').click()
         page.locator('[data-card-id="s1"]').click()
