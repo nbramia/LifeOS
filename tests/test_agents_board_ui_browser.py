@@ -4120,6 +4120,7 @@ class TestSnoozeUndoAfterDrag:
         page.set_viewport_size({"width": 2400, "height": 900})
         lane_calls = []
         snooze_calls = []
+        task_puts = []
         board_state = _board_fixture()
         board_state["lanes"]["snoozed"].append({
             "kind": "task", "id": "t-snoozed", "title": "Sleeping card",
@@ -4130,7 +4131,7 @@ class TestSnoozeUndoAfterDrag:
         })
         _open_board(
             page, agents_base_url, board_state=board_state,
-            lane_calls=lane_calls, snooze_calls=snooze_calls,
+            lane_calls=lane_calls, snooze_calls=snooze_calls, task_puts=task_puts,
         )
         page.locator("#board-lane-filter-btn").click()
         page.locator("#board-lane-filter-options input[value='snoozed']").check()
@@ -4148,9 +4149,12 @@ class TestSnoozeUndoAfterDrag:
         assert snooze_calls[0]["method"] == "PUT"
         assert snooze_calls[0]["id"] == "t-snoozed"
         assert snooze_calls[0]["body"]["until"] == "2099-01-01T00:00:00+00:00"
-        # The restore lands on the card's NATURAL lane (assigned — it
-        # carries #me), never a direct PUT of "snoozed" itself.
-        assert lane_calls[-1] == {"lane": "assigned", "assignee": "me"}, lane_calls
+        # The restore goes through the general task-update endpoint with
+        # the card's exact pre-drag status/tags (which land it back on its
+        # natural lane, Assigned — it carries #me), never a second
+        # lane-endpoint call, and never a direct PUT of "snoozed" itself.
+        assert task_puts == [{"status": "todo", "tags": ["me"]}], task_puts
+        assert lane_calls == [{"lane": "unassigned"}], lane_calls
         expect(page.locator(".toast.error")).to_have_count(0)
         expect(page.locator(".board-lane[data-lane='snoozed'] [data-card-id='t-snoozed']")).to_be_visible(timeout=5000)
 
@@ -4161,6 +4165,7 @@ class TestSnoozeUndoAfterDrag:
         page.set_viewport_size({"width": 2400, "height": 900})
         lane_calls = []
         snooze_calls = []
+        task_puts = []
         board_state = _board_fixture()
         board_state["lanes"]["snoozed"].append({
             "kind": "task", "id": "t-snoozed", "title": "Sleeping card",
@@ -4171,7 +4176,7 @@ class TestSnoozeUndoAfterDrag:
         })
         _open_board(
             page, agents_base_url, board_state=board_state,
-            lane_calls=lane_calls, snooze_calls=snooze_calls,
+            lane_calls=lane_calls, snooze_calls=snooze_calls, task_puts=task_puts,
         )
         page.locator("#board-lane-filter-btn").click()
         page.locator("#board-lane-filter-options input[value='snoozed']").check()
@@ -4187,9 +4192,11 @@ class TestSnoozeUndoAfterDrag:
 
         _wait_for(lambda: len(snooze_calls) == 1, page=page)
         assert snooze_calls[0]["body"]["until"] == "2099-01-01T00:00:00+00:00"
-        # The card carried no assignee tag before the drag, so its natural
-        # lane is Unassigned.
-        assert lane_calls[-1] == {"lane": "unassigned"}, lane_calls
+        # The card carried no tags before the drag, so its exact pre-drag
+        # snapshot (restored via the general task-update endpoint, never a
+        # second lane-endpoint call) lands it back on Unassigned.
+        assert task_puts == [{"status": "todo", "tags": []}], task_puts
+        assert lane_calls == [{"lane": "assigned", "assignee": "claude"}], lane_calls
         expect(page.locator(".toast.error")).to_have_count(0)
         expect(page.locator(".board-lane[data-lane='snoozed'] [data-card-id='t-snoozed']")).to_be_visible(timeout=5000)
 
@@ -5467,10 +5474,13 @@ class TestAssignmentTray:
         self, page: Page, agents_base_url,
     ):
         """Every assignment path reports through one confirm-with-undo toast.
-        Undo returns the card to the lane and assignee it had beforehand.
+        Undo returns the card to the exact status and tags it had
+        beforehand, through the general task-update endpoint rather than a
+        second lane-endpoint call.
         """
         lane_calls = []
-        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        task_puts = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
         _drag_to(page, '.board-assignee-drop[data-assignee="claude"]', '[data-card-id="t1"]')
         _wait_for(lambda: bool(lane_calls), page)
 
@@ -5480,12 +5490,12 @@ class TestAssignmentTray:
         expect(toast.locator(".toast-action")).to_have_text("Undo")
 
         toast.locator(".toast-action").click()
-        _wait_for(lambda: len(lane_calls) >= 2, page)
-        # t1 started unassigned in the unassigned lane; undo restores exactly
-        # that rather than leaving it assigned.
-        assert lane_calls[0] == {"lane": "assigned", "assignee": "claude"}, lane_calls
-        assert lane_calls[1]["lane"] == "unassigned", lane_calls
-        assert not lane_calls[1].get("assignee"), lane_calls
+        _wait_for(lambda: bool(task_puts), page)
+        # t1 started unassigned with no tags; undo restores exactly that
+        # rather than leaving it assigned.
+        assert lane_calls == [{"lane": "assigned", "assignee": "claude"}], lane_calls
+        assert task_puts == [{"status": "todo", "tags": []}], task_puts
+        expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_be_visible()
 
     def test_card_dragged_onto_an_assignee_button_assigns_it(self, page: Page, agents_base_url):
         """The reverse of the existing assignee-onto-card drag. Both directions
@@ -5844,8 +5854,16 @@ class TestMutationUndo:
     def test_lane_drag_confirms_with_an_undo_that_restores_the_prior_lane(
         self, page: Page, agents_base_url,
     ):
+        """Undo restores the card's exact pre-drag status, not just its
+        lane — dragging Unassigned into In progress sets status
+        "in_progress" (plan_lane_move's own branch), and replaying
+        `{lane: 'unassigned'}` to undo it would leave status stuck at
+        "in_progress" (that branch only ever touches tags), so the card
+        would stay derived to In progress regardless of the toast claiming
+        it landed back in Unassigned."""
         lane_calls = []
-        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        task_puts = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
         _drag_card(page, "t1", "in_progress")
         _wait_for(lambda: bool(lane_calls), page)
         toast = page.locator(".toast")
@@ -5853,9 +5871,55 @@ class TestMutationUndo:
         expect(toast.locator(".toast-action")).to_have_text("Undo")
 
         toast.locator(".toast-action").click()
-        _wait_for(lambda: len(lane_calls) >= 2, page)
-        assert lane_calls[-1]["lane"] == "unassigned", lane_calls
+        _wait_for(lambda: bool(task_puts), page)
+        assert lane_calls == [{"lane": "in_progress"}], lane_calls
+        assert task_puts == [{"status": "todo", "tags": []}], task_puts
+        expect(page.locator(".toast.error")).to_have_count(0)
         expect(page.locator('.board-lane[data-lane="unassigned"] [data-card-id="t1"]')).to_be_visible()
+
+    def test_dragging_an_unassigned_card_to_in_progress_and_undo_restores_it(
+        self, page: Page, agents_base_url,
+    ):
+        """The same invariant, asserted as its own falsifying test
+        (round-2 review Action Required 1): a lossy replay of
+        `{lane: 'unassigned'}` never touches `status`, so it would leave
+        the card at `status="in_progress"` — still deriving to In progress
+        — while the toast claims it moved back to Unassigned."""
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
+        _drag_card(page, "t1", "in_progress")
+        expect(page.locator(".board-lane[data-lane='in_progress'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        assert task_puts[-1] == {"status": "todo", "tags": []}, task_puts
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='unassigned'] [data-card-id='t1']")).to_be_visible(timeout=5000)
+
+    def test_dragging_an_assigned_me_card_to_in_progress_and_undo_restores_it(
+        self, page: Page, agents_base_url,
+    ):
+        """The Assigned half of the same invariant — a `#me` card dragged
+        into In progress and undone must come back `status="todo"`, not
+        stuck at `"in_progress"`."""
+        lane_calls = []
+        task_puts = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts)
+        _drag_card(page, "t2", "in_progress")
+        expect(page.locator(".board-lane[data-lane='in_progress'] [data-card-id='t2']")).to_be_visible(timeout=5000)
+
+        toast = page.locator(".toast")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        toast.locator(".toast-action").click()
+
+        _wait_for(lambda: bool(task_puts), page)
+        assert task_puts[-1] == {"status": "todo", "tags": ["me"]}, task_puts
+        expect(page.locator(".toast.error")).to_have_count(0)
+        expect(page.locator(".board-lane[data-lane='assigned'] [data-card-id='t2']")).to_be_visible(timeout=5000)
 
     @staticmethod
     def _human_todo_card():
@@ -5987,16 +6051,18 @@ class TestMutationUndo:
     def test_undo_after_marking_done_keeps_a_tag_added_in_the_drawer(
         self, page: Page, agents_base_url,
     ):
-        """Round-1 review, Action Required 1: resolveCard's snapshot must
-        reflect the card's LIVE board state at the moment Mark Done is
-        clicked, not the `card` object `cardActionHandlers(card)` closed
-        over when the drawer's action row was last (re)built.
-        `renderDrawerActions(fresh)` only fires from a full drawer rebuild,
-        which `updateOpenDrawer` (board.js) skips while focus sits inside
-        the drawer — and picking a tag from the Tags picker's "Create new"
-        option leaves focus in the tags search box, so a tag added there
-        and then Mark Done clicked without ever refocusing outside the
-        drawer must still survive Undo."""
+        """resolveCard's snapshot must reflect the card's LIVE board state
+        at the moment Mark Done is clicked, not the `card` object the
+        button's own click listener closed over. `renderDrawerActions`
+        (board.js) runs with a fresh card on every board tick, but
+        `renderActionRow` (session_actions.js) only rebinds the actual DOM
+        listeners when the decided action set's signature (which actions
+        are enabled, and why) changes — a tag edit never changes that, so
+        the listener stays bound to whichever card object was current the
+        last time the signature itself changed. Picking a tag from the
+        Tags picker's "Create new" option also leaves focus in the tags
+        search box, so a tag added there and Mark Done clicked without
+        ever refocusing elsewhere must still survive Undo."""
         board_state = _board_fixture()
         lane_calls = []
         task_puts = []
@@ -6128,24 +6194,36 @@ class TestMutationUndo:
     def test_a_refused_undo_restore_reports_failure_and_does_not_leave_the_card_in_done(
         self, page: Page, agents_base_url,
     ):
-        """Round-1 review, Action Required 4: restoreCardSnapshot must
-        rethrow on a refused restore (e.g. a 409 because the card changed
-        in the meantime) rather than swallow it — swallowing let the Undo
-        toast dismiss itself as though the restore had succeeded, while
-        the card actually stayed exactly where it was."""
+        """restoreCardSnapshot must rethrow on a refused restore (e.g. a
+        409 because the card changed in the meantime) rather than swallow
+        it — swallowing let the Undo toast dismiss itself as though the
+        restore had succeeded, while the card actually stayed exactly
+        where it was. Uses a snoozed card so "no re-snooze is attempted on
+        a refused restore" is itself an automated assertion (`snooze_calls
+        == []`), not just something checked by hand."""
         page.set_viewport_size({"width": 2400, "height": 900})
+        board = _board_fixture()
+        board["lanes"]["snoozed"].append({
+            "kind": "task", "id": "t-snoozed-refused", "title": "Sleeping card",
+            "notes": "", "status": "todo", "tags": ["me"], "assignee": "me",
+            "fields": {"snoozed_until": "2099-01-01T00:00:00+00:00"}, "context": "Inbox",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        })
         lane_calls = []
         task_puts = []
+        snooze_calls = []
         _open_board(
-            page, agents_base_url, lane_calls=lane_calls, task_puts=task_puts,
-            task_put_status_code=[409],
+            page, agents_base_url, board_state=board, lane_calls=lane_calls,
+            task_puts=task_puts, snooze_calls=snooze_calls, task_put_status_code=[409],
         )
         page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='snoozed']").check()
         page.locator("#board-lane-filter-options input[value='done']").check()
-        expect(page.locator('[data-card-id="t4"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t-snoozed-refused"]')).to_be_visible()
 
-        _drag_card(page, "t4", "done")
-        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t4']")).to_be_visible(timeout=5000)
+        _drag_card(page, "t-snoozed-refused", "done")
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t-snoozed-refused']")).to_be_visible(timeout=5000)
 
         undo_toast = page.locator(".toast:not(.error)")
         expect(undo_toast.locator(".toast-action")).to_have_text("Undo")
@@ -6155,10 +6233,12 @@ class TestMutationUndo:
         # The restore was attempted (and refused) — a fresh error toast
         # reports it, the original toast's own Undo action is restored
         # rather than silently dismissed as if the restore had succeeded,
-        # and the card is still sitting in Done.
+        # the card is still sitting in Done, and no re-snooze was ever
+        # attempted on a card the restore never actually touched.
         expect(page.locator(".toast.error")).to_be_visible(timeout=5000)
         expect(undo_toast.locator(".toast-action")).to_have_text("Undo")
-        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t4']")).to_be_visible()
+        expect(page.locator(".board-lane[data-lane='done'] [data-card-id='t-snoozed-refused']")).to_be_visible()
+        assert snooze_calls == [], snooze_calls
 
     def test_cancel_says_it_cannot_be_undone_instead_of_offering_a_dead_link(
         self, page: Page, agents_base_url,
