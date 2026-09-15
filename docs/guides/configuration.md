@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-09-09
+**Last Updated:** 2026-09-15
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -347,6 +347,14 @@ Apple Health/Fitness ingestion. See [apple-health.md](apple-health.md) for the e
 | `LIFEOS_HEALTH_EXPORT_PATH` | path | `data/apple-imports/health.json` | Path to the Apple Health export JSON written by the iOS Shortcut. Imported nightly. Point at a synced location (e.g. `~/Code/Sync/health/health.json`) for automation. |
 | `LIFEOS_HEALTH_INGEST_TOKEN` | str | — | Bearer token for `POST /api/fitness/health/ingest` (the HealthBridge app's POST delivery mode). Empty disables the endpoint (503). Generate with `openssl rand -hex 32`. |
 | `LIFEOS_FITNESS_SHEET_ID` | str | — | Google Sheet ID to mirror the workout log into (optional; mirror is off if unset). Requires the read-write Sheets OAuth scope — re-run the Google auth flow after enabling. |
+
+## Home — eero
+
+Pause/resume household internet access. See [home-eero.md](home-eero.md) for the end-to-end flow.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_EERO_SESSION_TOKEN` | str | — | eero session token, used when the gitignored `data/home/eero_session.json` state file is absent or empty. The state file takes precedence and is what a refreshed token is persisted back to (`scripts/eero_login.py` seeds it). Every `/api/home/eero/*` route returns 503 until a token is available from either source. |
 
 ## Journal Ring Ingest
 

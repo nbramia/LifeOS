@@ -100,6 +100,24 @@ class TestPauseInternet:
         out = await _tool_pause_internet({"name": "kid's ipad"})
         assert out.startswith("Error:")
 
+    @pytest.mark.asyncio
+    async def test_minutes_as_string_is_rejected_without_vendor_call(self, monkeypatch):
+        def fail_resolve(name):
+            raise AssertionError("must not resolve target before validating minutes")
+        monkeypatch.setattr(eero, "_resolve_target", fail_resolve)
+
+        out = await _tool_pause_internet({"name": "kid's ipad", "minutes": "30"})
+        assert out.startswith("Error:")
+
+    @pytest.mark.asyncio
+    async def test_minutes_zero_is_rejected_without_vendor_call(self, monkeypatch):
+        def fail_resolve(name):
+            raise AssertionError("must not resolve target before validating minutes")
+        monkeypatch.setattr(eero, "_resolve_target", fail_resolve)
+
+        out = await _tool_pause_internet({"name": "kid's ipad", "minutes": 0})
+        assert out.startswith("Error:")
+
 
 class TestResumeInternet:
     @pytest.mark.asyncio

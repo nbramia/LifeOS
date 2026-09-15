@@ -477,6 +477,52 @@ class TestScheduledResumeRetry:
         target_name = "Kid's iPad"
         assert kwargs["key"] == f"eero-resume-failed:{eero._normalize(target_name)}"
 
+    @pytest.mark.asyncio
+    async def test_scheduled_resume_transport_error_retries_and_alerts(self, env, monkeypatch):
+        _write_targets(env, PROFILE_TARGETS)
+        _write_token(env, "tok")
+        attempts = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "PUT":
+                attempts["n"] += 1
+                raise httpx.ConnectError("connection refused")
+            return httpx.Response(200, json={"data": {"paused": False}})
+
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(handler))
+        with pytest.raises(eero.EeroResumeFailed):
+            await eero.resume("kid's ipad", scheduled=True)
+
+        assert attempts["n"] == eero._RESUME_RETRY_ATTEMPTS
+        env["human_queue"].assert_called_once()
+        _, kwargs = env["human_queue"].call_args
+        target_name = "Kid's iPad"
+        assert kwargs["key"] == f"eero-resume-failed:{eero._normalize(target_name)}"
+
+    @pytest.mark.asyncio
+    async def test_scheduled_resume_session_dead_stops_after_one_attempt(self, env, monkeypatch):
+        _write_targets(env, PROFILE_TARGETS)
+        _write_token(env, "tok")
+        attempts = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "PUT":
+                attempts["n"] += 1
+            # Every call (including the refresh attempt) is rejected, so the
+            # session is decided dead on the very first attempt.
+            return httpx.Response(401, json={"error": "unauthorized"})
+
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(handler))
+        with pytest.raises(eero.EeroResumeFailed):
+            await eero.resume("kid's ipad", scheduled=True)
+
+        assert attempts["n"] == 1
+        target_name = "Kid's iPad"
+        keys = [kwargs["key"] for _, kwargs in env["human_queue"].call_args_list]
+        assert keys.count("eero-session") == 1
+        assert keys.count(f"eero-resume-failed:{eero._normalize(target_name)}") == 1
+        assert len(keys) == 2
+
 
 # ---------------------------------------------------------------------------
 # Status
@@ -563,6 +609,29 @@ class TestRoutes:
         monkeypatch.setattr(eero, "_new_http_client", _client_factory(handler))
         resp = app_client.post("/api/home/eero/kid's ipad/pause")
         assert resp.status_code == 502
+
+    def test_pause_transport_error_returns_502(self, env, app_client, monkeypatch):
+        _write_targets(env, PROFILE_TARGETS)
+        _write_token(env, "tok")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused")
+
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(handler))
+        resp = app_client.post("/api/home/eero/kid's ipad/pause")
+        assert resp.status_code == 502
+
+    def test_resume_404_for_unknown_target(self, env, app_client, monkeypatch):
+        _write_targets(env, PROFILE_TARGETS)
+        _write_token(env, "tok")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("vendor must not be contacted for an unknown target")
+
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(handler))
+        resp = app_client.post("/api/home/eero/nope/resume")
+        assert resp.status_code == 404
+        assert "Kid's iPad" in resp.json()["detail"]
 
     def test_resume_scheduled_failure_returns_502(self, env, app_client, monkeypatch):
         _write_targets(env, PROFILE_TARGETS)

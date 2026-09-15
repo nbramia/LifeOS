@@ -28,8 +28,11 @@ A pause given a duration hands the resume off to the scheduler
 (``api/services/scheduler_store.py``) as a one-off ``endpoint`` action keyed
 ``eero-resume:<normalized-name>`` — durable across a restart, since the
 scheduler's source of truth is the vault. A scheduler-fired resume
-(``scheduled=True``) retries the vendor write up to 3 times with backoff
-inside the request; exhausting every attempt alerts loudly (human-queue key
+(``scheduled=True``) retries a vendor-level failure (``EeroAPIError``,
+including a transport failure) up to 3 times with backoff inside the
+request; a dead session stops after one attempt, since ``_authed_request``
+already alerts once when it decides the session is dead and every retry
+would fail the same way. Either outcome alerts loudly (human-queue key
 ``eero-resume-failed:<normalized-name>``) and returns 502, since the
 scheduler marks a one-off entry fired *before* calling the endpoint and
 never re-fires it — this route is the only chance to retry or alert.
@@ -160,10 +163,17 @@ def _new_http_client() -> httpx.AsyncClient:
 async def _vendor_request(
     method: str, path: str, token: str, *, json: Optional[dict] = None
 ) -> httpx.Response:
-    """One vendor call, carrying the session as `Cookie: s=<token>`."""
+    """One vendor call, carrying the session as `Cookie: s=<token>`. A
+    transport failure (connection refused, timeout, DNS, ...) is raised as
+    EeroAPIError — never the raw httpx exception, which can otherwise embed
+    connection detail up the call stack unfiltered — so every caller's
+    existing EeroAPIError handling (retry, alert, 502) covers it too."""
     headers = {"Cookie": f"s={token}"}
-    async with _new_http_client() as client:
-        return await client.request(method, path, json=json, headers=headers)
+    try:
+        async with _new_http_client() as client:
+            return await client.request(method, path, json=json, headers=headers)
+    except httpx.HTTPError as e:
+        raise EeroAPIError(f"eero vendor request to {path} failed: {type(e).__name__}") from e
 
 
 async def _refresh_token(old_token: str) -> Optional[str]:
@@ -171,7 +181,7 @@ async def _refresh_token(old_token: str) -> Optional[str]:
     success, None on any failure — never raises."""
     try:
         resp = await _vendor_request("POST", "/2.2/login/refresh", old_token)
-    except httpx.HTTPError:
+    except EeroAPIError:
         return None
     if resp.status_code != 200:
         return None
@@ -448,7 +458,14 @@ def _result(target: Target, *, requested_paused: bool, paused: bool, resume_at: 
 async def pause(name: str, minutes: Optional[int] = None) -> dict:
     """Pause a target's internet access. `minutes` (1-1440) schedules an
     automatic resume via the scheduler; omitted, the pause is indefinite and
-    any existing pending resume is cleared."""
+    any existing pending resume is cleared.
+
+    `minutes` is validated before any vendor call — the route gets this for
+    free from pydantic, but a caller that skips pydantic (the agent tool,
+    fed loosely-typed JSON from a tool call) does not."""
+    if minutes is not None:
+        if isinstance(minutes, bool) or not isinstance(minutes, int) or not (1 <= minutes <= 1440):
+            raise ValueError(f"minutes must be an integer in 1..1440, got {minutes!r}")
     target = _resolve_target(name)
     await _authed_write("PUT", target.vendor_path, {"paused": True})
     paused = await _authed_read(target.vendor_path)
@@ -484,7 +501,10 @@ async def resume(name: str, *, scheduled: bool = False) -> dict:
     """Resume a target's internet access. `scheduled=True` (the scheduler's
     own fire) retries up to 3 times with backoff and alerts loudly on
     exhaustion instead of failing silently — the scheduler already marked
-    this one-off entry fired and will never call it again."""
+    this one-off entry fired and will never call it again. A dead session
+    stops after one attempt: `_authed_request` already alerts once per call
+    when it decides a session is dead, and a token that's dead once will be
+    dead on every retry, so retrying would only pile up duplicate alerts."""
     target = _resolve_target(name)
     store = get_scheduler_store()
     op_key = _operation_key(target.name)
@@ -497,7 +517,10 @@ async def resume(name: str, *, scheduled: bool = False) -> dict:
                 _check_vendor_write_ok(resp)
                 last_error = None
                 break
-            except (EeroSessionDead, EeroAPIError) as e:
+            except EeroSessionDead as e:
+                last_error = e
+                break
+            except EeroAPIError as e:
                 last_error = e
                 if attempt < _RESUME_RETRY_ATTEMPTS - 1:
                     await asyncio.sleep(_RESUME_RETRY_BACKOFF[attempt])

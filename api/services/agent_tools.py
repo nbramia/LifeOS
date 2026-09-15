@@ -3793,6 +3793,8 @@ async def _tool_pause_internet(inp: dict) -> str:
         return "Error: eero is not reachable right now (session unavailable). Check the Human queue."
     except eero.EeroAPIError as e:
         return f"Error: eero rejected the request ({e})."
+    except ValueError as e:
+        return f"Error: {e}"
     msg = f"{result['name']}: {'paused' if result['paused'] else 'resumed'}"
     if result["mismatch"]:
         msg += " — but that doesn't match what was requested; check the eero app."
