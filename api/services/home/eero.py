@@ -253,9 +253,13 @@ def _extract_paused(resp: httpx.Response) -> bool:
 async def _authed_write(method: str, path: str, body: dict) -> None:
     """An authenticated write, alerting (eero-api-error) and re-raising on
     a bad response — the shared path for both a manual write and a status
-    read hitting an API-shaped (not session-shaped) failure."""
-    resp = await _authed_request(method, path, json=body)
+    read hitting an API-shaped (not session-shaped) failure. The request
+    itself is inside the try so a transport failure (which `_vendor_request`
+    already wraps as `EeroAPIError`) alerts too, not just a bad status code
+    or response shape; `EeroSessionDead` is a distinct exception type and is
+    unaffected."""
     try:
+        resp = await _authed_request(method, path, json=body)
         _check_vendor_write_ok(resp)
     except EeroAPIError:
         await _alert_api_error()
@@ -263,8 +267,10 @@ async def _authed_write(method: str, path: str, body: dict) -> None:
 
 
 async def _authed_read(path: str) -> bool:
-    resp = await _authed_request("GET", path)
+    """See `_authed_write` — same alert-on-`EeroAPIError` coverage,
+    including a transport failure raised from inside the request."""
     try:
+        resp = await _authed_request("GET", path)
         return _extract_paused(resp)
     except EeroAPIError:
         await _alert_api_error()
@@ -504,15 +510,22 @@ async def pause(
     that skips pydantic (the agent tool, fed loosely-typed JSON from a tool
     call) does not. `scheduled=True` (a cron or one-off scheduler fire)
     suppresses `scheduler_message` on an unremarkable success — see
-    `_result`."""
+    `_result`.
+
+    The pending-resume scheduler entry is created (or cleared, for an
+    indefinite pause) *before* the vendor write/read-back, not after —
+    so a write that actually takes effect but a subsequent vendor
+    write/read failure (which raises before returning) still leaves a
+    durable resume behind rather than pausing the target with no way
+    back except manual intervention. Resume is idempotent, so a resume
+    entry left behind by a write that didn't actually take effect is
+    harmless — it just resumes an already-resumed target."""
     if indefinite and minutes is not None:
         raise ValueError("cannot pass both `indefinite` and `minutes`")
     if minutes is not None:
         if isinstance(minutes, bool) or not isinstance(minutes, int) or not (1 <= minutes <= 1440):
             raise ValueError(f"minutes must be an integer in 1..1440, got {minutes!r}")
     target = _resolve_target(name)
-    await _authed_write("PUT", target.vendor_path, {"paused": True})
-    paused = await _authed_read(target.vendor_path)
 
     effective_minutes = None if indefinite else (minutes if minutes is not None else target.default_minutes)
 
@@ -539,6 +552,9 @@ async def pause(
         )
     else:
         _delete_pending(store, op_key)
+
+    await _authed_write("PUT", target.vendor_path, {"paused": True})
+    paused = await _authed_read(target.vendor_path)
 
     return _result(target, requested_paused=True, paused=paused, resume_at=resume_at, scheduled=scheduled)
 

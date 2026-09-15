@@ -440,6 +440,26 @@ class TestScheduledResumeEntry:
         assert entries[0].enabled is True
         assert entries[0].id != fired.id
 
+    @pytest.mark.asyncio
+    async def test_readback_failure_after_successful_write_keeps_pending_resume(self, env, monkeypatch):
+        _write_targets(env, PROFILE_TARGETS)
+        _write_token(env, "tok")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "PUT":
+                return httpx.Response(200, json={"data": {"paused": True}})
+            raise httpx.ConnectError("connection refused")
+
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(handler))
+        with pytest.raises(eero.EeroAPIError):
+            await eero.pause("kid's ipad", minutes=60)
+
+        op_key = eero._operation_key("Kid's iPad")
+        entries = eero._entries_for_operation(env["store"], op_key)
+        assert len(entries) == 1
+        assert entries[0].enabled is True
+        assert entries[0].operation_key == op_key
+
 
 # ---------------------------------------------------------------------------
 # Per-target default duration
@@ -809,6 +829,22 @@ class TestRoutes:
         monkeypatch.setattr(eero, "_new_http_client", _client_factory(handler))
         resp = app_client.post("/api/home/eero/kid's ipad/pause")
         assert resp.status_code == 502
+
+    def test_pause_transport_error_files_eero_api_error_card(self, env, app_client, monkeypatch):
+        _write_targets(env, PROFILE_TARGETS)
+        _write_token(env, "tok")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused")
+
+        monkeypatch.setattr(eero, "_new_http_client", _client_factory(handler))
+        resp = app_client.post("/api/home/eero/kid's ipad/pause")
+        assert resp.status_code == 502
+
+        env["human_queue"].assert_called_once()
+        _, kwargs = env["human_queue"].call_args
+        assert kwargs["key"] == "eero-api-error"
+        env["telegram"].assert_called_once()
 
     def test_resume_404_for_unknown_target(self, env, app_client, monkeypatch):
         _write_targets(env, PROFILE_TARGETS)
