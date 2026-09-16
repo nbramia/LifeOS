@@ -1,4 +1,4 @@
-"""Tests for GET /api/chat/turn-context (#591).
+"""Tests for GET /api/chat/turn-context.
 
 Covers the endpoint's literal response shape, persona-scoped
 `personal_context`, the unknown-persona 400, and the empty-tags degradation
@@ -40,8 +40,8 @@ def test_shape_and_literal_keys(client):
     resp = client.get("/api/chat/turn-context")
     assert resp.status_code == 200
     body = resp.json()
-    # Exact key set, not a subset check — matches the literal contract pinned
-    # on #590 for lifeos_context.turn.
+    # Exact key set, not a subset check — matches the literal contract for
+    # lifeos_context.turn.
     assert set(body.keys()) == _TURN_KEYS
     assert isinstance(body["current_datetime"], str) and body["current_datetime"]
     assert isinstance(body["current_datetime_iso"], str) and body["current_datetime_iso"]
@@ -77,9 +77,9 @@ def _register_therapist(tmp_path, monkeypatch):
     entry plus a real TELEGRAM_THERAPIST_BOT_TOKEN happening to be set in
     the environment -- settings.telegram_bots() drops any entry whose token
     env var is unset, so "therapist" silently isn't a recognized persona at
-    all without this (see #598: relying on ambient real config for a
-    persona to resolve is exactly the kind of test-isolation gap that issue
-    is about, even though this particular resolution isn't cached).
+    all without this: relying on ambient real config for a persona to
+    resolve is a test-isolation gap, even though this particular
+    resolution isn't cached.
     """
     reg = _registry(tmp_path, [{"name": "therapist", "token_env": "TG_THERAPIST_TEST_TOKEN"}])
     monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
@@ -157,7 +157,7 @@ def test_existing_tags_with_counts(client, tmp_path, monkeypatch):
 def test_modality_accepted_but_does_not_change_response(client):
     """`modality` is accepted for shape symmetry with /api/ask/stream, but no
     field in `turn` varies with it (voice-specific material lives in
-    `persona`, not `turn` — see the #590 pinned schema)."""
+    `persona`, not `turn`)."""
     text_body = client.get("/api/chat/turn-context", params={"modality": "text"}).json()
     voice_body = client.get("/api/chat/turn-context", params={"modality": "voice"}).json()
     # current_datetime(_iso) may tick a fraction of a second between calls —
@@ -185,7 +185,7 @@ def test_read_only_does_not_mutate_tags(client, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Session-to-date cost (#610) — `conversation_id` scopes `session_cost_usd`
+# Session-to-date cost — `conversation_id` scopes `session_cost_usd`
 # and friends to one conversation's already-recorded usage.
 # ---------------------------------------------------------------------------
 
@@ -253,7 +253,7 @@ def test_session_cost_zero_cost_turn_still_reports_a_truthful_sum(client):
 
 
 def test_session_cost_unpriced_turn_marks_the_response_as_a_lower_bound(client):
-    """#613: a conversation containing a turn recorded `unpriced=True`
+    """A conversation containing a turn recorded `unpriced=True`
     (its provider reported no cost) must surface `session_cost_is_lower_
     bound=True` in the standalone endpoint's response too, since it shares
     `build_turn_context()` with the Hermes envelope."""
