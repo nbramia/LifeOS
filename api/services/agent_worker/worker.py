@@ -3198,9 +3198,14 @@ class Worker:
             )
 
         if resumable:
+            # project=False: the vault tag stays at the running tag here —
+            # only the session row moves to BLOCKED. The claimed-card guard
+            # would otherwise let this write swap the tag to blocked, which
+            # is not this path's contract.
             self.session_store.update_status(
                 task_id, STATUS_BLOCKED,
                 attempt_id=session.attempt_id, turn_id=session.turn_id,
+                project=False,
             )
             sent_ids: list = []
             try:
