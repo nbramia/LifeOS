@@ -156,7 +156,7 @@ class TestPersonEndpoints:
         assert response.status_code == 404
 
     def test_update_person_not_found(self, client):
-        """#609: PATCH /people/{id} for a missing person is a 404, never a
+        """PATCH /people/{id} for a missing person is a 404, never a
         200 that merely omits the update."""
         response = client.patch(
             "/api/crm/people/invalid-id-12345", json={"notes": "test"}
@@ -303,7 +303,7 @@ class TestPersonFacts:
         assert "facts" in data
 
     def test_update_fact_not_found(self, client, sample_person_id):
-        """#609: PUT .../facts/{id} for a missing fact is a 404, never a
+        """PUT .../facts/{id} for a missing fact is a 404, never a
         200 that merely omits the update."""
         response = client.put(
             f"/api/crm/people/{sample_person_id}/facts/invalid-fact-12345",
@@ -312,14 +312,14 @@ class TestPersonFacts:
         assert response.status_code == 404
 
     def test_confirm_fact_not_found(self, client, sample_person_id):
-        """#609: POST .../facts/{id}/confirm for a missing fact is a 404."""
+        """POST .../facts/{id}/confirm for a missing fact is a 404."""
         response = client.post(
             f"/api/crm/people/{sample_person_id}/facts/invalid-fact-12345/confirm"
         )
         assert response.status_code == 404
 
     def test_delete_fact_not_found(self, client, sample_person_id):
-        """#609: DELETE .../facts/{id} for a missing fact is a 404, never a
+        """DELETE .../facts/{id} for a missing fact is a 404, never a
         200 'deleted' for a fact that was never there."""
         response = client.delete(
             f"/api/crm/people/{sample_person_id}/facts/invalid-fact-12345"

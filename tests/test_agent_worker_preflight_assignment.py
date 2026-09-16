@@ -1,4 +1,4 @@
-"""Tests for #851's preflight surface: the new `#hermes` route/tag, and the
+"""Tests for the preflight surface: the `#hermes` route/tag, and the
 board-assignment routing-bypass acceptance criterion — "a task carrying
 `[assigned_by:: board]` keeps its assignee tag's route".
 
@@ -62,7 +62,7 @@ def test_claude_tag_survives_default_route_and_uncorroborating_title(monkeypatch
     """AC: `[assigned_by:: board]` + `#claude` -> claude_code even with a
     title that names another engine. The default-route setting and an
     uncorroborating title are exactly the two levers that demote an
-    LLM-guessed route (#757) — proving a `#claude`-tagged task survives
+    LLM-guessed route — proving a `#claude`-tagged task survives
     both proves the tag itself, not luck, is what protects it."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "codex", raising=False)
@@ -89,8 +89,8 @@ def test_hermes_tag_survives_default_route_and_uncorroborating_title(monkeypatch
 
 
 def test_cloud_tag_still_yields_remote_route():
-    """AC: `#cloud` still yields ROUTE_REMOTE — unaffected by the #851
-    additions to `_apply_tag_overrides`/`KNOWN_ROUTES`."""
+    """AC: `#cloud` still yields ROUTE_REMOTE — unaffected by
+    the board-assignment additions to `_apply_tag_overrides`/`KNOWN_ROUTES`."""
     result = pf.run_preflight(title="summarize this", tags=["agent", "cloud"], caller=_stub(_golden_reply()))
     assert result.routing == pf.ROUTE_REMOTE
 
@@ -98,7 +98,8 @@ def test_cloud_tag_still_yields_remote_route():
 def test_untagged_task_precedence_unchanged(monkeypatch):
     """AC: existing routing-tag precedence for tasks WITHOUT board
     assignment is unchanged — an untagged, uncorroborated LLM route still
-    demotes to the configured default exactly as before #851."""
+    demotes to the configured default exactly as it did without board
+    assignment."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "codex", raising=False)
     reply = _golden_reply(routing="local", routing_reason="model guessed local", routing_explicit=True)

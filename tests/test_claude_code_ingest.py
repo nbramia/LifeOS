@@ -1,8 +1,8 @@
-"""Tests for the Claude Code CLI session ingest adapter (issue #144).
+"""Tests for the Claude Code CLI session ingest adapter.
 
 All fixtures are synthetic — real Claude Code transcripts can contain
 secrets, code, and PII, and are explicitly out of scope for the test
-suite per the privacy section of #144.
+suite for privacy reasons.
 """
 from __future__ import annotations
 
@@ -277,7 +277,7 @@ def test_parse_session_unknown_model_marks_unpriced_not_fallback_rate(tmp_path: 
     """This ingest path costs whatever model string Claude Code reports, so
     it's the call site most likely to meet a genuinely new/unrecognized
     model id first. A **record** path must not invent a number for it —
-    it should cost $0.00 and flag the session `unpriced` (#669), unlike a
+    it should cost $0.00 and flag the session `unpriced`, unlike a
     budget-estimate path which is allowed to fall back to the priciest
     known tier."""
     proj = tmp_path / "-home-syn-Code-B"
@@ -334,7 +334,7 @@ def test_parse_session_mixed_known_and_unknown_models_flags_unpriced(tmp_path: P
     ("claude-haiku-3-5", 0.8e-6, 4.0e-6),
 ])
 def test_retired_models_price_correctly_not_fallback(tmp_path: Path, model, input_rate, output_rate):
-    """The three retired-but-still-served models added in #669 must price
+    """The three retired-but-still-served models must price
     at their real (higher) rate, not silently understate via the $10/$50
     fallback (which is cheaper than the Opus pair's real $15/$75)."""
     proj = tmp_path / "-home-syn-Code-D"

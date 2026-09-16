@@ -1,29 +1,26 @@
-"""Golden baseline for the #591 build_system_prompt extraction.
+"""Golden baseline for build_system_prompt().
 
-Captured by calling ``build_system_prompt()`` on the code as it stood on
-commit 6ec9e22 (immediately before the #591 extraction), with the process
+Captured by calling ``build_system_prompt()`` with the process
 clock, the task manager, AND every config-derived value the prompt
 interpolates pinned to explicit synthetic inputs — not whatever a real
 ``.env`` on the capturing machine happened to contain. See
 ``tests/test_agent_system_prompt_golden.py`` for the exact capture/comparison
 harness.
 
-**Why every config-derived value is pinned, not just the clock:** an earlier
-version of this fixture was captured with `settings.user_name` reading
-whatever the ambient environment provided, on the assumption that no ``.env``
-was in scope. That assumption was wrong: `api/main.py` calls the bare
-``load_dotenv()`` (upward-searching) at import time, and any test that
-imports ``api.main`` before ``agent_system_prompt`` is first imported causes
-python-dotenv to walk up from a nested worktree and load the REAL machine
-``~/Code/LifeOS/.env`` (a symlink to ``~/Code/Sync/envs/LifeOS/.env``) —
-which contains the actual operator's name. `agent_system_prompt._STATIC_PROMPT`
-bakes `settings.user_name` in once, at first import, so whichever test file
-happens to trigger that first import (an ordering accident, not a
-deliberate choice) decided what name ended up in this fixture. Running the
-golden test in isolation "worked" only because no other file had triggered
-that import first; running the full suite did not, and would have committed
-the operator's real name to this public repository. See PR #591 for the
-research trail.
+**Why every config-derived value is pinned, not just the clock:**
+`api/main.py` calls the bare ``load_dotenv()`` (upward-searching) at import
+time, and any test that imports ``api.main`` before ``agent_system_prompt``
+is first imported causes python-dotenv to walk up from a nested worktree and
+load the REAL machine ``~/Code/LifeOS/.env`` (a symlink to
+``~/Code/Sync/envs/LifeOS/.env``) — which contains the actual operator's
+name. `agent_system_prompt._STATIC_PROMPT` bakes `settings.user_name` in
+once, at first import, so whichever test file happens to trigger that first
+import (an ordering accident, not a deliberate choice) decides what name
+ends up in this fixture unless every config-derived value is pinned
+explicitly. Pinning removes that dependency entirely, so the golden test
+stays safe whether it runs in isolation or as part of the full suite,
+without ever committing the operator's real name to this public
+repository.
 
 Pinned inputs for THIS capture (all synthetic, chosen precisely so nothing
 here could be mistaken for real personal data):
@@ -48,7 +45,7 @@ with the SAME pinned synthetic inputs listed above (see
 ``tests/test_agent_system_prompt_golden.py`` for the pinning fixture and the
 capture recipe in its module docstring).
 
-STATIC_TEXT is the (unchanged-by-#591) cached static block, captured once.
+STATIC_TEXT is the cached static block, captured once.
 Each ``*_TAIL`` is the list of dynamic blocks that follow it for one case.
 """
 PINNED_NAME = 'Test User'

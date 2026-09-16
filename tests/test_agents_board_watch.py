@@ -1,4 +1,4 @@
-"""Watcher -> board publish path for the /agents Kanban board (#850).
+"""Watcher -> board publish path for the /agents Kanban board.
 
 Acceptance criterion: "The board updates within three seconds of an external
 vault edit without a page reload." The task watcher's debounce is 2.0s (see
@@ -9,7 +9,7 @@ production debounce (not sped up) so the 3s claim is actually exercised end
 to end: real filesystem watcher -> TaskManager.reindex_file ->
 _get_board_cached() reading the same TaskManager instance through the same
 cache the stream's own tick reads. This exercises the debounce leg and the
-cache leg (round-2 finding 7) — it does NOT add the stream's separate
+cache leg — it does NOT add the stream's separate
 `_BOARD_STREAM_INTERVAL` (0.5s) tick delay, which only applies to an actual
 SSE connection (covered by `TestBoardStream` in
 tests/test_agents_board_api.py) and is accounted for arithmetically in the
@@ -53,7 +53,7 @@ def stores(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(agents_route, "_transcript_store", TranscriptStore(transcripts_dir=tmp_path / "transcripts"))
     monkeypatch.setattr(agents_route, "_claude_code_snapshot", lambda: ([], []))
     monkeypatch.setattr(agents_route, "_codex_snapshot", lambda: ([], []))
-    # The board cache (round-2 finding 6) is module-level and TTL'd — reset
+    # The board cache is module-level and TTL'd — reset
     # it so an earlier test's cached board can't leak into this one.
     monkeypatch.setattr(agents_route, "_board_cache", None)
 
@@ -86,8 +86,8 @@ class TestBoardReflectsExternalVaultEditWithinThreeSeconds:
             lane = None
             while time.monotonic() < deadline:
                 # Read through the same cached path the stream's own tick
-                # uses, not the raw builder — this is the leg round-2
-                # finding 7 asked the test to actually exercise.
+                # uses, not the raw builder — this is the leg that needs
+                # to actually be exercised.
                 board = await agents_route._get_board_cached()
                 assigned_ids = [c["id"] for c in board["lanes"]["assigned"]]
                 if task.id in assigned_ids:

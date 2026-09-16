@@ -136,7 +136,7 @@ def test_record_spend_accumulates_tokens_and_dollars(tmp_path: Path):
 @pytest.mark.unit
 def test_record_spend_unpriced_flag_is_sticky(tmp_path: Path):
     """Once a session has recorded any unpriced turn, later priced turns
-    don't clear the flag (#669) — the reader needs to know the session's
+    don't clear the flag — the reader needs to know the session's
     total is a lower bound for its whole lifetime, not just its last call."""
     store = SessionStore(db_path=tmp_path / "sessions.db")
     store.create(task_id="t1")
@@ -150,7 +150,7 @@ def test_record_spend_unpriced_flag_is_sticky(tmp_path: Path):
 
 @pytest.mark.unit
 def test_unpriced_migration_is_idempotent_and_preserves_existing_rows(tmp_path: Path):
-    """Simulates opening a pre-#669 DB (no `unpriced` column) with the new
+    """Simulates opening a legacy DB (no `unpriced` column) with the new
     code. The migration must add the column without touching existing data,
     and running it again (a second SessionStore against the same file) must
     not error or reset anything — this is exactly the shape of the real
@@ -158,10 +158,10 @@ def test_unpriced_migration_is_idempotent_and_preserves_existing_rows(tmp_path: 
     import sqlite3
 
     db_path = tmp_path / "legacy_sessions.db"
-    # Pre-#669 schema: the real `sessions` table shape (every column that
+    # Legacy schema: the real `sessions` table shape (every column that
     # exists today) minus `unpriced`, carrying one pre-existing row with
     # real data — this is the actual shape of production `agent_sessions.db`
-    # before this migration runs.
+    # prior to this column's migration.
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute(
             """

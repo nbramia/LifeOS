@@ -1,9 +1,9 @@
 """Tests for the investments snapshot route helpers.
 
-Focus: the freshness check (#448) that warns when the Schwab-pipeline snapshot
+Focus: the freshness check that warns when the Schwab-pipeline snapshot
 (delivered via Syncthing) goes stale, with stale-but-present semantics — a
 missing file is never an error, and a normal weekend cadence never warns.
-Also covers the search_finances 'investments' digest (#452): every holding is
+Also covers the search_finances 'investments' digest: every holding is
 listed, so a beyond-top-15 position is never silently dropped.
 """
 import json
@@ -45,8 +45,8 @@ def _snapshot_with_many_positions():
 
 
 async def test_search_finances_investments_lists_all_positions(tmp_path, monkeypatch):
-    """The investments digest must include a beyond-top-15 holding (regression
-    for #452, where SPCX at rank 44 was silently dropped by a [:15] cap)."""
+    """The investments digest must include a beyond-top-15 holding (e.g.
+    SPCX at rank 44, which a [:15] cap would silently drop)."""
     home = tmp_path / "home"
     inv_dir = home / "Code" / "Sync" / "investments"
     inv_dir.mkdir(parents=True)
@@ -231,7 +231,7 @@ def test_held_tickers_empty_when_not_synced_or_malformed(tmp_path, monkeypatch):
 def test_scheduler_endpoint_prefers_scheduler_message_field():
     """The endpoint action sends a ready {'scheduler_message': ...} verbatim
     (empty => suppressed), and does NOT hijack a generic {message} response
-    from other routes (#463)."""
+    from other routes."""
     from api.services.scheduler_store import _format_endpoint_result
     assert _format_endpoint_result({"scheduler_message": "AMD -7%", "count": 1}) == "AMD -7%"
     assert _format_endpoint_result({"scheduler_message": "", "count": 0}) == ""

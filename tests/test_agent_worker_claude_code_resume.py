@@ -55,8 +55,8 @@ class _StubClaudeCodeExecutor:
 
 def _make_worker(tmp_path: Path, claude_code_executor, monkeypatch=None):
     # monkeypatch retained as an optional arg for forward-compat with
-    # tests that still pass it; the LIFEOS_CODE_ROUTING flag was removed
-    # so there's nothing to set anymore.
+    # tests that still pass it; there is no LIFEOS_CODE_ROUTING flag
+    # to set.
     del monkeypatch
     transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"tasks": []}))
     client = httpx.Client(transport=transport, base_url="http://api")
@@ -199,7 +199,7 @@ def test_resume_as_followup_for_code_session_flips_to_claimed(tmp_path: Path, mo
 
 
 def test_web_session_keyed_clarify_answer_resumes_via_existing_path(tmp_path: Path, monkeypatch):
-    """#403: a web/voice-spawned session's open [CLARIFY] (kind='followup') can be
+    """A web/voice-spawned session's open [CLARIFY] (kind='followup') can be
     answered with NO Telegram message_id — the session-keyed deposit feeds the
     SAME `_process_clarification_answers` tick, flipping the session to CLAIMED
     and queuing the answer for resume. No second resume mechanism."""
@@ -235,7 +235,7 @@ def test_web_session_keyed_clarify_answer_resumes_via_existing_path(tmp_path: Pa
 
 
 def test_web_session_keyed_goal_answer_resumes_via_existing_path(tmp_path: Path, monkeypatch):
-    """#403: a web/voice-spawned session's [GOAL] (kind='goal_approval') answered
+    """A web/voice-spawned session's [GOAL] (kind='goal_approval') answered
     by session deposits onto the *existing* row, so the worker routes it through
     `_resume_goal` (which injects `/goal <condition>` on a yes)."""
     stub = _StubClaudeCodeExecutor(execute_outcome=ExecutorOutcome(
@@ -288,7 +288,7 @@ def test_session_keyed_deposit_ignores_no_open_question(tmp_path: Path, monkeypa
     )
     assert w.session_store.deposit_answer_by_session_id(session.session_id, "first") is True
     assert w.session_store.deposit_answer_by_session_id(session.session_id, "second") is False
-    # The first answer stuck; the second was dropped.
+    # The first answer stuck; the second is dropped.
     q = w.session_store.get_question_by_message_id(8800)
     assert q["answer"] == "first"
 
