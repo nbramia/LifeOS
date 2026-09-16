@@ -73,15 +73,19 @@ Restart the API after editing `.env`:
 
 ### Installing to a Home Screen (iOS/Android)
 
-`/`, `/chat`, and `/crm` are all standalone-capable and share a web app
-manifest (`display: "standalone"`), so adding any of them to a phone's
-Home Screen launches without browser chrome instead of opening in the
-device's default browser. This matters for voice specifically: a page
-running inside the standalone container gets its own microphone-permission
-grant, separate from — and not inherited from — the regular browser tab.
-On iOS, add the shortcut from Safari (not another default browser) via
-Share → Add to Home Screen, from the tailnet HTTPS URL above. An existing Home Screen shortcut
-added earlier won't upgrade itself to pick this up automatically — re-add it.
+Every page — `/`, `/chat`, `/crm`, `/agents`, `/journal`, and
+`/journal/trends` — is standalone-capable (`display: "standalone"`), so
+adding one to a phone's Home Screen launches it without browser chrome
+instead of opening in the device's default browser. Each page carries its
+own manifest under `/manifests/`, naming that page as its `start_url`, so
+each icon opens its own page and carries its own label (Chat, CRM, Agents,
+…) rather than every icon sharing one name and one destination. This
+matters for voice specifically: a page running inside the standalone
+container gets its own microphone-permission grant, separate from — and not
+inherited from — the regular browser tab. On iOS, add the shortcut from Safari (not another
+default browser) via Share → Add to Home Screen, from the tailnet HTTPS URL
+above. An icon keeps whatever manifest it was installed with, so re-add it
+to pick up a change.
 
 ### Action Button deep link (iPhone Shortcuts)
 

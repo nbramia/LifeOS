@@ -28,7 +28,7 @@ import { renderAssignmentPickers } from './assignment.js';
 import { SCHEDULE_ACTIONS, renderScheduleActionSections, actionInputsSatisfied } from './schedule_sections.js';
 import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
-import { POINTER_SLOP, pointerIsActive, shouldCancelPointerGesture } from './board_gesture.js';
+import { POINTER_SLOP, pointerCanDrag, pointerIsActive, shouldCancelPointerGesture } from './board_gesture.js';
 import {
   compareSortValues, loadSortSelection as readSortSelection,
   saveSortSelection as writeSortSelection, sortCards,
@@ -1073,14 +1073,16 @@ export function initBoard() {
   onTabActivate((name) => { if (name === 'board') drainBoardFocus(); });
 
   // ------------------------------------------------------------------
-  // Drag and drop — one Pointer Events model for mouse, pen, and touch. CSS
-  // reserves the horizontal axis on draggable sources (`pan-y`), so the UA
-  // cannot negotiate away a horizontal drag after pointerdown; vertical
-  // movement remains native scrolling. This avoids the native HTML5 DnD path,
-  // which is not available to touch users.
+  // Drag and drop — a Pointer Events model for mouse and pen only. Touch is
+  // excluded (`pointerCanDrag`) so the UA keeps both axes: the lane strip's
+  // horizontal scroll is the one way to reach another lane on a phone, and a
+  // custom drag can only claim that axis by taking it from the scroller.
+  // Touch users move cards through the drawer's actions instead. Mouse and
+  // pen avoid the native HTML5 DnD path, which gives no consistent ghost or
+  // drop-target feedback.
   // ------------------------------------------------------------------
 
-  let dragState = null;   // { kind, card, assignee, sourceEl, pointerId, pointerType, ghost, startX, startY, moved }
+  let dragState = null;   // { kind, card, assignee, sourceEl, pointerId, ghost, startX, startY, moved }
   let suppressNextClick = null;
   let suppressNextTrayClick = null;
 
@@ -1141,6 +1143,7 @@ export function initBoard() {
 
   function onPointerDown(e, source) {
     if (e.isPrimary === false || dragState || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    if (!pointerCanDrag(e.pointerType)) return;
     // A modifier-held press on a card is a selection click, never a drag —
     // bail before any drag state is set so the trailing click reaches the
     // card's own listener untouched.
@@ -1151,19 +1154,15 @@ export function initBoard() {
     // the trailing pointerup/click to the card and opens its drawer instead
     // of running the chip's graph jump.
     if (source.kind === 'card' && e.target.closest('.board-chip-session')) return;
-    const pointerType = e.pointerType || 'mouse';
     const state = {
       ...source, sourceEl: source.sourceEl || e.currentTarget,
-      pointerId: e.pointerId, pointerType,
+      pointerId: e.pointerId,
       startX: e.clientX, startY: e.clientY, moved: false, cancelled: false, ghost: null,
       holdReady: true,
     };
     dragState = state;
-    // Capturing a touch pointer at pointerdown can make the UA's scroll
-    // negotiation race the custom drag. Let the browser retain the touch
-    // target until a horizontal drag has actually started; mouse/pen still
-    // capture immediately so leaving the source does not lose the gesture.
-    if (pointerType !== 'touch' && state.sourceEl && state.sourceEl.setPointerCapture && e.pointerId != null) {
+    // Capture at pointerdown so leaving the source does not lose the gesture.
+    if (state.sourceEl && state.sourceEl.setPointerCapture && e.pointerId != null) {
       try { state.sourceEl.setPointerCapture(e.pointerId); } catch (_) {}
     }
     document.addEventListener('pointermove', onDragMove);
@@ -1182,8 +1181,7 @@ export function initBoard() {
     const dy = e.clientY - dragState.startY;
     if (!dragState.moved && Math.hypot(dx, dy) < POINTER_SLOP) return;
     // Let the browser own vertical scrolling from a card. Once cancelled,
-    // pointerup is ignored and the card still receives its ordinary click
-    // only when the browser decides this was a tap rather than a scroll.
+    // pointerup is ignored and the card still receives its ordinary click.
     if (!dragState.moved && shouldCancelPointerGesture(dragState, dx, dy)) {
       dragState.cancelled = true;
       endPointerDrag();
@@ -1196,9 +1194,6 @@ export function initBoard() {
       document.body.classList.add('board-dragging');
       clearDragSelection();
       dragState.sourceEl.classList.add('dragging-source');
-      if (dragState.pointerType === 'touch' && dragState.sourceEl.setPointerCapture && e.pointerId != null) {
-        try { dragState.sourceEl.setPointerCapture(e.pointerId); } catch (_) {}
-      }
       const rect = dragState.sourceEl.getBoundingClientRect();
       const ghost = dragState.sourceEl.cloneNode(true);
       ghost.classList.add('board-card-ghost');

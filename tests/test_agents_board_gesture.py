@@ -48,30 +48,34 @@ def _import_test(module: str, assertions: str) -> None:
     assert result.returncode == 0, result.stderr or result.stdout
 
 
-def test_touch_gesture_reserves_horizontal_drag_and_preserves_native_scroll():
+def test_touch_never_drags_while_mouse_and_pen_still_do():
+    """Touch keeps both axes so the lane strip can scroll horizontally on a
+    phone; the drag is a mouse/pen gesture only."""
     module = str(Path("web/agents/board_gesture.js"))
     _import_test(
         module,
         """
-        const touch = { pointerType: 'touch', kind: 'card' };
-        if (m.shouldCancelPointerGesture(touch, 20, 1)) throw new Error('held horizontal drag cancelled');
-        if (!m.shouldCancelPointerGesture(touch, 1, 20)) throw new Error('vertical touch scroll was not cancelled');
-        if (m.shouldCancelPointerGesture(touch, 1, 1)) throw new Error('touch slop too small');
+        if (m.pointerCanDrag('touch')) throw new Error('touch can still start a drag');
+        if (!m.pointerCanDrag('mouse')) throw new Error('mouse drag was disabled');
+        if (!m.pointerCanDrag('pen')) throw new Error('pen drag was disabled');
+        if (!m.pointerCanDrag(undefined)) throw new Error('an unreported pointer type must drag');
         """,
     )
 
 
-def test_pointer_identity_and_desktop_direction_rules():
+def test_pointer_identity_and_direction_rules():
     module = str(Path("web/agents/board_gesture.js"))
     _import_test(
         module,
         """
-        const state = { pointerId: 7, pointerType: 'touch', holdReady: true, kind: 'card' };
+        const state = { pointerId: 7, kind: 'card' };
         if (m.pointerIsActive(state, { pointerId: 8, isPrimary: true })) throw new Error('foreign pointer accepted');
         if (m.pointerIsActive(state, { pointerId: 7, isPrimary: false })) throw new Error('secondary pointer accepted');
         if (!m.pointerIsActive(state, { pointerId: 7, isPrimary: true })) throw new Error('active pointer rejected');
-        if (m.shouldCancelPointerGesture({ pointerType: 'mouse', kind: 'assignee' }, 1, 20)) throw new Error('desktop tray behavior changed');
-        if (!m.shouldCancelPointerGesture({ pointerType: 'mouse', kind: 'card' }, 1, 20)) throw new Error('desktop card scroll behavior changed');
+        if (m.shouldCancelPointerGesture({ kind: 'card' }, 1, 1)) throw new Error('slop too small');
+        if (m.shouldCancelPointerGesture({ kind: 'card' }, 20, 1)) throw new Error('horizontal card drag cancelled');
+        if (!m.shouldCancelPointerGesture({ kind: 'card' }, 1, 20)) throw new Error('vertical card scroll was not cancelled');
+        if (m.shouldCancelPointerGesture({ kind: 'assignee' }, 1, 20)) throw new Error('tray direction behavior changed');
         """,
     )
 
