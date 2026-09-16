@@ -8,8 +8,8 @@ fallback or for offline use.
 The local model server runs at LIFEOS_LOCAL_LLM_URL (default http://localhost:8080)
 and speaks the OpenAI chat completions API. LocalLLMClient itself is generic
 OpenAI-compatible-server plumbing (base URL, model id, optional bearer auth);
-#654 reuses it for a paid remote provider (e.g. Fireworks) as an explicit
-per-turn model pick, configured entirely in config/settings.py.
+the same plumbing serves a paid remote provider (e.g. Fireworks) via an
+explicit per-turn model pick, configured entirely in config/settings.py.
 """
 import json
 import logging
@@ -132,8 +132,7 @@ def _reasoning_control_payload(
     ``"none"`` as its own way to disable reasoning, separate from
     ``enable_thinking``. Both are ``None`` by default, in which case this
     returns ``{}`` — no new keys appear in the request body unless a caller
-    explicitly asks, so an unset call stays byte-identical to the payload
-    before this existed.
+    explicitly asks.
     """
     extra: dict[str, Any] = {}
     if enable_thinking is not None:
@@ -285,11 +284,10 @@ class LocalLLMClient:
     Not llama-server-specific despite the name (kept for the common case —
     most callers still mean "the local llama-server"): `base_url`, `model`,
     and `api_key` are all constructor overrides, so the same class also
-    drives a paid OpenAI-compatible remote (e.g. Fireworks, #654) by
+    drives a paid OpenAI-compatible remote (e.g. Fireworks) by
     pointing it at that provider's URL/model and passing an API key. Every
     default (`model="local"`, `api_key=None` — no auth header) reproduces
-    the exact llama-server behavior this class had before those parameters
-    existed, so an existing local-only call site is unaffected.
+    plain llama-server behavior, so a local-only call site is unaffected.
     """
 
     def __init__(
@@ -306,7 +304,7 @@ class LocalLLMClient:
         # default has none — and every call site below already appends
         # "/v1/chat/completions" itself. Strip exactly one trailing /v1
         # segment so both conventions land on the same wire path instead of
-        # doubling up into ".../v1/v1/chat/completions" (#706). Segment-exact
+        # doubling up into ".../v1/v1/chat/completions". Segment-exact
         # match only — "/av1" or "/v10" must NOT be stripped.
         if self.base_url.endswith("/v1"):
             self.base_url = self.base_url[: -len("/v1")]
@@ -327,14 +325,14 @@ class LocalLLMClient:
     @property
     def model(self) -> str:
         """The model identifier a usage-recording caller should attribute
-        this client's turns to (#661), and what's actually sent on the wire.
+        this client's turns to, and what's actually sent on the wire.
 
         For plain llama-server usage this is the constructor default,
         "local" — llama-server is configured with a single model at process
         start, not chosen per-request, and the pricing table keys the free
         local rate under that literal sentinel (see agent_worker/pricing.py)
         rather than under a specific gguf name. A configured remote provider
-        (#654) passes its real model id at construction instead, since there
+        passes its real model id at construction instead, since there
         the id both goes on the wire and is what a caller needs to price
         and attribute the turn correctly — read-only so nothing downstream
         of construction can drift it out of sync with what was sent."""
@@ -559,7 +557,7 @@ class LocalLLMClient:
             {"type": "tool_calls", "calls": [...]}  — tool calls (complete)
             {"type": "done", "usage": LLMUsage, "finish_reason": "..."}
 
-        No ``{"type": "usage_update", ...}`` event (#629): unlike
+        No ``{"type": "usage_update", ...}`` event: unlike
         AnthropicLLMClient.astream, this backend's OpenAI-compatible
         streaming protocol carries no mid-stream usage signal at all, so
         there's nothing to surface incrementally — usage is only ever known
@@ -612,7 +610,7 @@ class LocalLLMClient:
             tool_calls_acc: dict[int, dict] = {}  # index -> accumulated tool call
             think_buffer = ""  # holds text not yet resolved against the reasoning-prefix rule
             think_phase = "undetermined"
-            # Starvation tracking (#567): reasoning_content deltas are never
+            # Starvation tracking: reasoning_content deltas are never
             # surfaced as a "text" event (see docstring), which made the
             # failure mode silent — a reasoning model can burn its entire
             # max_tokens budget on chain-of-thought and stream nothing back.
@@ -745,12 +743,12 @@ class LocalLLMClient:
         """Check if the local LLM server is reachable.
 
         GET /health is a llama-server-ism, not part of the OpenAI-compatible
-        surface this class otherwise speaks — a remote provider (#654,
-        e.g. Fireworks) would 404 here regardless of the /v1 base-url
+        surface this class otherwise speaks — a remote provider
+        (e.g. Fireworks) would 404 here regardless of the /v1 base-url
         normalization above. That's fine: every caller (`local_executor`,
         `preflight`) only ever calls this on the default, local-pointed
         client to decide whether to fall back to the remote one; the
-        remote client itself is used unprobed, by design (#706)."""
+        remote client itself is used unprobed, by design."""
         try:
             resp = self.sync_client.get("/health", timeout=3.0)
             return resp.status_code == 200
@@ -785,7 +783,7 @@ class AnthropicLLMClient:
 
     @property
     def model(self) -> str:
-        """The model id this client actually sends on every request (#661)
+        """The model id this client actually sends on every request
         -- the resolved default (`settings.anthropic_model`) or the
         per-turn override passed to `__init__` (escalation, an explicit
         picker choice). A usage-recording caller needs this, not a
@@ -868,7 +866,7 @@ class AnthropicLLMClient:
         """Async streaming via Anthropic API.
 
         Yields the same event format as LocalLLMClient.astream(), plus one
-        this backend alone can produce (#629):
+        this backend alone can produce:
 
             {"type": "usage_update", "usage": LLMUsage}  — cumulative
             usage-so-far for the in-flight response, not a per-event delta.
@@ -904,7 +902,7 @@ class AnthropicLLMClient:
             kwargs["timeout"] = timeout
 
         async with self._async_client.messages.stream(**kwargs) as stream:
-            # (#629) message_start's usage always carries all four fields
+            # message_start's usage always carries all four fields
             # (Anthropic's `Usage` type), but message_delta's usage has
             # input_tokens/cache_* typed Optional and frequently absent —
             # only output_tokens is guaranteed there. Carry the last-known
@@ -1036,7 +1034,7 @@ class LLMBackendNotConfiguredError(RuntimeError):
     Exists so a keyless or partially-configured install fails with a
     human-readable reason naming exactly what's missing and which setting
     fixes it, instead of the raw SDK/HTTP exception that would otherwise
-    surface later, at first use, from deep inside a chat turn (#771/#787).
+    surface later, at first use, from deep inside a chat turn.
     """
 
 
@@ -1044,7 +1042,7 @@ def get_local_llm() -> LocalLLMClient | AnthropicLLMClient:
     """Get or create the LLM client singleton.
 
     Returns AnthropicLLMClient, LocalLLMClient (local llama-server), or
-    LocalLLMClient pointed at the configured paid remote provider (#771),
+    LocalLLMClient pointed at the configured paid remote provider,
     based on LIFEOS_LLM_BACKEND ("anthropic" default, "local", or "remote").
     """
     global _llm_client
@@ -1090,18 +1088,13 @@ def get_anthropic_llm() -> "AnthropicLLMClient | LocalLLMClient":
     extraction, and CRM tone analysis, where frontier model quality
     provides clear value.
 
-    When ANTHROPIC_API_KEY is set: unchanged from before #772 — always the
+    When ANTHROPIC_API_KEY is set: always the
     Claude API, regardless of LIFEOS_LLM_BACKEND. Sonnet-tier for quality,
     resolved from LIFEOS_ANTHROPIC_SPECIALIST_MODEL (default
     claude-sonnet-5), independent of the orchestrator model
-    (LIFEOS_ANTHROPIC_MODEL). Was previously hardcoded to the dated
-    snapshot claude-sonnet-4-20250514, which retired and 404'd every
-    caller (#470).
+    (LIFEOS_ANTHROPIC_MODEL).
 
-    When no key is set (#772): these calls used to silently produce
-    nothing on a keyless install (no insights, no facts, no tone scores),
-    because they always built an AnthropicLLMClient regardless of
-    LIFEOS_LLM_BACKEND. Falls back in the same priority order the agent
+    When no key is set, falls back in the same priority order the agent
     worker's preflight caller already uses
     (agent_worker/preflight.py:_default_llm_caller): the local
     llama-server if reachable, else the configured remote provider, else
@@ -1162,12 +1155,10 @@ def reset_local_llm() -> None:
 # Routing / validation helpers — never Anthropic, regardless of LIFEOS_LLM_BACKEND.
 #
 # Query routing, conversation titling, agent-activity summaries, and fact
-# filtering used to call Ollama directly (separate runtime at :11434). They
-# were never sent to the cloud and they're cheap enough to keep off the paid
+# filtering stay off the cloud and are cheap enough to keep off the paid
 # API even when the main orchestrator is on Anthropic. These helpers wrap
 # LocalLLMClient with the small text / JSON helpers those callers actually
-# need so the rest of the codebase doesn't need to think about Ollama vs
-# llama-server. Since #773, "local" is the preferred target but not the only
+# need. "local" is the preferred target but not the only
 # one — generate_text()/generate_json() retry once against the configured
 # remote provider when the local call itself fails (never Anthropic either
 # way); see generate_text's docstring.
@@ -1183,11 +1174,11 @@ def _get_local_routing_client() -> LocalLLMClient:
     Distinct from ``get_local_llm`` because that one switches to Anthropic
     when the backend is set to ``anthropic``; routing/validation should stay
     off the paid API even then. This is only the *local* candidate — see
-    ``generate_text`` (#773) for the try-local-then-remote fallback the
+    ``generate_text`` for the try-local-then-remote fallback the
     actual callers below go through.
 
     Cached per resolved URL rather than unconditionally: settings.routing_llm_url
-    is configurable (#566), so if it changes after the first call — an operator
+    is configurable, so if it changes after the first call — an operator
     edits LIFEOS_LOCAL_ROUTING_LLM_URL, or a test monkeypatches settings mid-process
     — the client is rebuilt against the new target instead of silently keeping
     traffic pinned to wherever it first resolved.
@@ -1201,7 +1192,7 @@ def _get_local_routing_client() -> LocalLLMClient:
 
 
 def _remote_routing_client(timeout: float | None = None) -> LocalLLMClient:
-    """Build the fallback client for a routing-tier call (#773): a
+    """Build the fallback client for a routing-tier call: a
     LocalLLMClient pointed at the configured remote provider. Callers must
     check ``settings.remote_llm_configured`` first — this always
     constructs a client, even against empty settings."""
@@ -1272,16 +1263,15 @@ async def generate_text(
 ) -> str:
     """Generate raw text from a routing-tier LLM.
 
-    Replaces ``OllamaClient.generate(...)`` for routing / validation callers.
-    Tries the local llama-server (``settings.routing_llm_url``, still the
-    #566 override point) first — on a reachable local server this is
-    byte-for-byte the same single request as before #773, no added probe or
+    Tries the local llama-server (``settings.routing_llm_url``, the
+    override point ``_get_local_routing_client`` also uses) first — on a
+    reachable local server this is a single request, no added probe or
     round trip. Only if that call itself fails does it retry once against
-    the configured remote provider (#773); if remote isn't configured
-    either, the local failure propagates exactly as it did before this
-    fallback existed, so every existing caller's own no-op/default handling
+    the configured remote provider; if remote isn't configured
+    either, the local failure propagates, so every existing caller's own
+    no-op/default handling
     (`route()`'s keyword fallback, the titler's `except Exception`, etc.)
-    still applies unchanged. Never Anthropic, regardless of
+    still applies. Never Anthropic, regardless of
     ``LIFEOS_LLM_BACKEND`` — same invariant ``_get_local_routing_client``
     already documents for these calls.
 
@@ -1335,8 +1325,7 @@ async def generate_json(
 ) -> dict:
     """Generate a JSON dict from the local LLM.
 
-    Replaces ``OllamaClient.generate_json(...)`` for routing / validation
-    callers. Uses a low temperature by default for structured output.
+    Uses a low temperature by default for structured output.
     ``enable_thinking``/``reasoning_effort`` are forwarded to
     ``generate_text`` unchanged; both default to ``None`` (unset).
     """
@@ -1355,7 +1344,7 @@ def is_local_routing_llm_available() -> bool:
     """Sync availability check for routing/validation callers.
 
     True if either the local llama-server is reachable or the remote
-    provider is configured (#773), so a caller gating on this doesn't skip
+    provider is configured, so a caller gating on this doesn't skip
     straight to its no-op fallback while ``generate_text``'s own
     local-then-remote retry has a working remote provider to fall back to.
     Remote is checked by configuration, not a live probe — see

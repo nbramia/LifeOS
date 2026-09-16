@@ -19,7 +19,7 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 # The operator's local timezone, from `LIFEOS_TIMEZONE` (defaults to
-# America/New_York). Used to anchor relative date parsing — "today" /
+# America/New_York). Anchors relative date parsing — "today" /
 # "tomorrow" / "this week" must be interpreted in the operator's zone.
 LOCAL_TZ = ZoneInfo(settings.timezone)
 

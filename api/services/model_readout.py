@@ -1,12 +1,11 @@
-"""Model readout (#658) — which model is actually serving each chat surface,
+"""Model readout — which model is actually serving each chat surface,
 right now.
 
-Two upstream failures motivated this: hermes#49 mistook a stale tracked
-config snapshot for the live value, and hermes#50 had two surfaces answering
-with materially different competence and nobody told. Both were
-**invisibility**, not disagreement — this module answers "what's live" by
-asking the actual running process, or observing what actually happened,
-never by re-reading a config file:
+A stale tracked config snapshot can diverge from the live value, and two
+surfaces can end up answering with materially different competence without
+anyone being told. Both are **invisibility**, not disagreement — this
+module answers "what's live" by asking the actual running process, or
+observing what actually happened, never by re-reading a config file:
 
 - LifeOS native picker, Anthropic backend: `settings.anthropic_model` IS the
   live value here — it's read straight out of this process's own in-memory
@@ -15,16 +14,16 @@ never by re-reading a config file:
   running a different model out from under that setting.
 - LifeOS native picker, local backend: `settings.local_llm_model` is only a
   declared intent — llama-server serves one model per process and can be
-  restarted against a different one without this setting changing (exactly
-  the tracked-snapshot-vs-live mismatch hermes#49 hit), so it's confirmed
+  restarted against a different one without this setting changing (a
+  tracked-snapshot-vs-live mismatch), so it's confirmed
   with a live probe instead of trusted.
-- LifeOS native picker, remote backend (#771): `settings.remote_llm_model`
+- LifeOS native picker, remote backend: `settings.remote_llm_model`
   IS the live value, same reasoning as the Anthropic bullet above — it's
   the exact model id `get_local_llm()` builds the singleton client with,
   not a value that could drift out from under this process the way a
   restarted external llama-server could.
-- Hermes chat: `LIFEOS_HERMES_BACKEND_URL` (confirmed live on the real host,
-  #658 review) points at LifeOS's own hermes-lifeos-adapter, not the Hermes
+- Hermes chat: `LIFEOS_HERMES_BACKEND_URL` (confirmed live on the real host)
+  points at LifeOS's own hermes-lifeos-adapter, not the Hermes
   gateway itself — the adapter has no `/v1/models` (or any capability
   endpoint) to probe, and even if it did, a capability probe answers "what
   COULD serve a turn", not "what DID": the adapter's `hermes_model` config
@@ -45,14 +44,14 @@ never by re-reading a config file:
   no attempt to fail here, only an acknowledged structural blind spot. A
   borrowed value from hermes_chat would be dishonest: the adapter's
   `hermes_model`/`model_hint` machinery means the two CAN genuinely differ
-  per turn (this is exactly the hermes#50 shape — two surfaces, potentially
-  different competence — so asserting they match would recreate the same
-  invisibility this readout exists to end, just with more confidence).
+  per turn (two surfaces potentially answering with different competence —
+  so asserting they match would recreate the same invisibility this
+  readout exists to end, just with more confidence).
 
 Every surface reports `{"status": "ok" | "unknown" | "not_configured" |
 "not_observable", "model": str | None, ...}`. "unknown" is the deliberate
 answer when a surface can't be confirmed — never falling back to whatever's
-configured, which would repeat hermes#49's mistake in a different place.
+configured, which would recreate the same stale-config mismatch in a different place.
 
 Never returns a credential. `_probe_live_model` sends the bearer token it's
 given (used only for the local-backend probe path today, which has no
@@ -86,7 +85,7 @@ async def _probe_live_model(base_url: str, token: str = "") -> Optional[str]:
     """GET {base_url}/v1/models and return the first advertised model id, or
     None if unreachable, unauthorized, or the response is unparseable.
 
-    Used today only for the LifeOS native picker's local backend
+    Used only for the LifeOS native picker's local backend
     (llama-server) — see module docstring for why Hermes is read via
     observation instead.
     """
@@ -130,7 +129,7 @@ async def get_lifeos_native_model() -> dict:
 # In-memory only, deliberately: it resets to "nothing observed" on every
 # restart rather than persisting a last-known value across one, which is
 # the correct behavior — a value from before a restart is exactly the kind
-# of stale-but-plausible reading hermes#49 got burned by. A single process
+# of stale-but-plausible reading this module is built to avoid. A single process
 # is this repo's deployment model today (server.sh runs one), matching
 # every other in-memory singleton here (e.g. ServiceHealthRegistry in
 # service_health.py); the lock guards against a future multi-worker
@@ -143,7 +142,7 @@ _hermes_chat_last_observed_at: Optional[str] = None
 def record_hermes_chat_turn_model(model: str) -> None:
     """Called by `api/routes/hermes_proxy.py`'s `_HermesTurnPersister` the
     moment a real Hermes chat turn's `usage` event validates and reports a
-    model (#658). See module docstring: this is the only trustworthy
+    model. See module docstring: this is the only trustworthy
     "what's live" signal for Hermes chat, because Hermes can serve a
     different model per turn. Ignores a falsy model rather than clobbering
     a real prior observation with nothing.
@@ -192,7 +191,7 @@ async def get_hermes_models() -> dict:
 
 
 async def get_model_readout() -> dict:
-    """Per-surface live model readout (#658): LifeOS native picker, Hermes
+    """Per-surface live model readout: LifeOS native picker, Hermes
     chat, Hermes Telegram. See module docstring."""
     native = await get_lifeos_native_model()
     hermes = await get_hermes_models()

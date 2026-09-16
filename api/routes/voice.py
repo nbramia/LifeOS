@@ -1,4 +1,4 @@
-"""Reverse proxy for the voice gateway (whisper-relay) — #361.
+"""Reverse proxy for the voice gateway (whisper-relay).
 
 LifeOS owns the unified `/chat` client; voice *transport* lives in the separate
 whisper-relay app (STT → backend → TTS). We reverse-proxy ``/api/voice/*`` to
@@ -12,7 +12,7 @@ unbuffered. The gateway is trusted (localhost) and its URL is server config (not
 user-controllable, so no SSRF); LifeOS is the access-control front, consistent
 with the rest of the API's localhost/Tailscale trust model.
 
-The ONE exception (#711, see ADR-021): ``POST turn/stream`` is additionally
+The ONE exception, per ADR-021: ``POST turn/stream`` is additionally
 tee'd into the same conversation store the Hermes text route uses, since a
 Hermes-backend voice turn otherwise never touches a LifeOS persister at all —
 see ``_VoiceTurnPersister`` below for why and its double-write guard. Every
@@ -40,19 +40,19 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/voice", tags=["voice"])
 
 # Same bound `hermes_proxy.py` applies to an externally-minted conversation id
-# before it reaches a SQL INSERT (#592) — the gateway is trusted, but its
+# before it reaches a SQL INSERT — the gateway is trusted, but its
 # stream (and, transitively, whatever backend it relayed) is still untrusted
 # input crossing a process boundary.
 _MAX_CONVERSATION_ID_LEN = 200
 
 
 def _client() -> httpx.AsyncClient:
-    """The httpx client used to reach the gateway (a seam for tests)."""
+    """The httpx client for reaching the gateway (a seam for tests)."""
     return httpx.AsyncClient(timeout=TIMEOUT)
 
 
 class _VoiceTurnPersister:
-    """Read-only tee (#711) on ``POST turn/stream``'s relayed SSE response,
+    """Read-only tee on ``POST turn/stream``'s relayed SSE response,
     persisting a Hermes-backend voice turn to the same conversation store the
     Hermes text route uses (``api/services/conversation_store.py``, via
     ``api/routes/hermes_proxy.py``'s own tee for the text path).
@@ -88,7 +88,7 @@ class _VoiceTurnPersister:
     contract's one **authoritative** field (client-surfaces.md, "Voice turn
     contract"). A turn that errors, is cancelled, or whose upstream
     connection ends before ``done`` arrives — including a future bare-
-    transcribe/wake-check call (#710) that never reaches a real answer —
+    transcribe/wake-check call that never reaches a real answer —
     never has a ``done`` event observed, so ``finalize()`` writes nothing:
     no junk conversation for a turn that produced no real response.
 
@@ -188,7 +188,7 @@ class _VoiceTurnPersister:
 
 async def _build_persister(request: Request) -> "_VoiceTurnPersister":
     """Best-effort read of the turn/stream request's `backend`/`persona_id`
-    form fields (#711), for the persister's double-write guard.
+    form fields, for the persister's double-write guard.
 
     Requires the request body already buffered (`await request.body()`) by
     the caller — Starlette's `Request.form()` then parses the cached bytes
@@ -231,7 +231,7 @@ async def voice_proxy(path: str, request: Request):
     base = settings.voice_gateway_url.rstrip("/")
     url = f"{base}/api/voice/{path}"
 
-    # #711: only `POST turn/stream` is tee'd for persistence — every other
+    # Only `POST turn/stream` is tee'd for persistence — every other
     # path (cancel, audio clips, any future gateway route) stays the
     # unbuffered pass-through this proxy always was. Buffering the request
     # body only for this one, well-known endpoint (rather than streaming it,

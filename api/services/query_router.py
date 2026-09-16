@@ -420,8 +420,8 @@ class QueryRouter:
         prompt = ROUTER_PROMPT.format(query=query)
         # settings.router_enable_thinking defaults True (current behaviour) —
         # translated to enable_thinking=None so the request body stays
-        # byte-identical to before this setting existed. Flipping the
-        # default to False (once the correctness A/B in #566 confirms no
+        # byte-identical to omitting the kwarg entirely. Flipping the
+        # default to False (once a correctness A/B confirms no
         # regression) is then a one-line config change.
         enable_thinking = None if settings.router_enable_thinking else False
         response = await generate_text(prompt, enable_thinking=enable_thinking)

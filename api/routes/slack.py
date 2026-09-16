@@ -496,8 +496,8 @@ async def get_channel_messages(
     Args:
         channel_id: Slack channel ID
         limit: Max messages to return
-        oldest: Only return messages after this ISO timestamp
-        latest: Only return messages before this ISO timestamp
+        oldest: Only return messages newer than this ISO timestamp
+        latest: Only return messages older than this ISO timestamp
     """
     _require_slack_enabled()
 

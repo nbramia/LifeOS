@@ -409,7 +409,7 @@ class EntityResolver:
                     # Entity has initial, query has full name ("J Smith" <- "John Smith").
                     # Requires a last name in the query to corroborate: without one the
                     # whole match rests on a single shared letter, so an entity stored
-                    # as "A Reader" swallowed every name starting with "a" (#551).
+                    # as "A Reader" swallowed every name starting with "a".
                     score += 10
                     first_matched = True
                 elif are_name_variants(query_first_lower, entity_first_lower):
@@ -792,7 +792,7 @@ class EntityResolver:
         4. Fuzzy name match with context boost
         5. Create new entity from email or name (if create_if_missing)
 
-        Phone-only never creates a PersonEntity — see issue #226. A raw phone
+        Phone-only never creates a PersonEntity. A raw phone
         observation with no name or email tells you very little about who the
         caller is, and auto-creating a person per observation would pollute
         the People graph with one row per spam call. ``apple_data_import``

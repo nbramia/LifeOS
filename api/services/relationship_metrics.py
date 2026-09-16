@@ -187,7 +187,7 @@ def compute_diversity_score(sources: list[str]) -> float:
     """
     Compute diversity score (0.0-1.0).
 
-    Score is the ratio of unique sources used to total possible sources.
+    Score is the ratio of unique sources relative to total possible sources.
 
     Args:
         sources: List of source types used for interactions

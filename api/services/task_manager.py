@@ -15,7 +15,7 @@ number — a write locates its task's block by id on every mutation, exactly
 like ``scheduler_store.py`` locates schedule blocks. This is what lets a task
 survive an external edit that inserts lines above it before the file watcher
 reindexes. ``line_number``/``source_file`` on ``Task`` remain informational
-(refreshed after every write) but are never used to address a write.
+(refreshed after every write) but never serve to address a write.
 
 See docs/specs/technical/task-management.md for the full design.
 """
@@ -128,7 +128,7 @@ class TaskConflictError(Exception):
 
 
 class _TagAbsentError(Exception):
-    """Internal signal: swap_tag's `from_tag` is no longer present after a
+    """Internal signal: swap_tag's `from_tag` is absent after a
     CAS retry re-read the task (e.g. someone else already swapped it)."""
 
 
@@ -275,8 +275,8 @@ class TaskManager:
         # Exact raw main-line text last written or seen for each task id,
         # this process's lifetime only (never persisted — see docs/specs/
         # technical/task-management.md "External-edit detection" for why a
-        # sidecar file isn't needed). Used to tell a genuine external edit
-        # apart from our own prior write echoing back through the watcher;
+        # sidecar file isn't needed). Distinguishes a genuine external edit
+        # from our own prior write echoing back through the watcher;
         # comparing against this exact string (rather than reformatting the
         # prior Task and hoping it matches) is what keeps a hand-authored
         # line's exact formatting — no "TODO", no created date — stable
@@ -560,7 +560,7 @@ class TaskManager:
                 task = apply(current)
                 moved = self._move_task_between_files(task, old_context, new_context)
                 if not moved:
-                    # Task's block is no longer in its source file (an
+                    # Task's block is absent from its source file (an
                     # external delete raced us) — reconcile like the
                     # same-context branch does for `found=False` below,
                     # rather than raising.
@@ -889,7 +889,7 @@ class TaskManager:
         Also performs id write-back (a task line lacking `<!-- id:.. -->`
         gets one appended, minimally, with every other byte of the line and
         every non-task line untouched) and external-edit detection (a task
-        line that no longer matches what the API last wrote gets a fresh
+        line that differs from what the API last wrote gets a fresh
         `[updated::]` stamp; every other line is left alone). The write-back
         (if any) is itself CAS-protected on the file's mtime, bounded to
         `_CAS_MAX_RETRIES` re-read-and-reparse attempts; on persistent
@@ -927,7 +927,7 @@ class TaskManager:
                     logger.warning(f"Could not read {file_path}: {e}")
                     return
 
-                # Snapshot before this attempt's parse so an abandoned
+                # Snapshot captured prior to this attempt's parse so an abandoned
                 # attempt (retry or final skip below) can't leave behind
                 # `_last_written_line` entries seeded from a parse that
                 # never reached disk — those would let a later CAS check
@@ -1171,8 +1171,8 @@ class TaskManager:
     def _external_edit_pending(self, lines: list[str], start: int, task_id: str) -> bool:
         """True if the on-disk block at `lines[start]` carries an edit
         `_cas_rewrite` hasn't absorbed into `self._tasks` yet: the raw line
-        text no longer matches the last line the API wrote or saw for this
-        id, or the on-disk notes body no longer matches the in-memory
+        text differs from the last line the API wrote or saw for this
+        id, or the on-disk notes body differs from the in-memory
         task's. Must be called with `self._lock` held."""
         last_written = self._last_written_line.get(task_id)
         if last_written is not None and lines[start] != last_written:
@@ -1265,7 +1265,7 @@ class TaskManager:
     def _move_task_between_files(self, task: Task, old_context: str, new_context: str) -> bool:
         """Move `task`'s block from its old context file to `new_context`'s.
 
-        Returns False if the task's block is no longer present in the
+        Returns False if the task's block is absent from the
         source file (externally deleted) — the caller should reconcile like
         `update` does for `found=False`, not treat it as a conflict.
 

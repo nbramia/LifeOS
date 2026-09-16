@@ -189,7 +189,7 @@ class PersonEntity:
         Add an email if not already present (case-insensitive check).
 
         Returns:
-            True if email was added, False if already exists
+            True on success, False if already exists
         """
         if not email:
             return False
@@ -212,7 +212,7 @@ class PersonEntity:
             phone: Phone number in any format (will be normalized to E.164)
 
         Returns:
-            True if phone was added, False if already exists or unnormalizable
+            True on success, False if already exists or unnormalizable
         """
         if not phone:
             return False
@@ -908,9 +908,9 @@ class PersonEntityStore:
         """
         No-op: SQLite persists changes immediately on each operation.
 
-        Retained for backward compatibility with code that calls save()
-        after batch add/update operations. With SQLite, each add/update/delete
-        is committed immediately, so explicit save() is no longer needed.
+        Retained for callers that call save() after batch add/update
+        operations. With SQLite, each add/update/delete is committed
+        immediately, so calling save() is optional.
         """
         self._bump_get_all_cache_generation()
 

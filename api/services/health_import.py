@@ -1,5 +1,5 @@
 """
-Apple Health ingest core (issue #333).
+Apple Health ingest core.
 
 Shared by both delivery paths: the file importer (`scripts/apple_data_import.py`,
 nightly `apple_import` step) and the authenticated `POST /api/fitness/health/ingest`

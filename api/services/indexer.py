@@ -429,7 +429,7 @@ class IndexerService:
             "granola_id": frontmatter.get("granola_id"),  # For context generation
         }
 
-        # Add contextual prefixes to chunks (P9.1 - improves retrieval by 35-50%)
+        # Add contextual prefixes to chunks (P9.1 - boosts retrieval accuracy)
         chunks = add_context_to_chunks(chunks, path, metadata)
 
         # Update in vector store (handles deletion of old chunks)

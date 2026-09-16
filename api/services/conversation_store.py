@@ -33,17 +33,17 @@ class Conversation:
     updated_at: datetime
     message_count: int = 0
     persona_id: str = "primary"
-    # Agent-worker session this web/voice conversation spawned, if any (#403).
+    # Agent-worker session this web/voice conversation spawned, if any.
     # Set when an orchestrating persona (e.g. doctor) is selected and the turn
     # spawns a background Claude Code session. Lets the conversation answer that
     # session's [CLARIFY]/[GOAL] without a Telegram message id. NULL for normal
     # inline conversations.
     agent_session_id: Optional[str] = None
-    # Text backend the conversation is tagged with, for sidebar filtering
-    # (#596). "lifeos" is the native default; an orchestrating-persona turn
+    # Text backend the conversation is tagged with, for sidebar filtering.
+    # "lifeos" is the native default; an orchestrating-persona turn
     # sent while Hermes is selected tags its (LifeOS-native) conversation
     # "hermes" instead, so it doesn't vanish from the thread list the user
-    # started it in. Purely a label — never used to route a turn.
+    # started it in. Purely a label — never consulted to route a turn.
     backend: str = "lifeos"
 
 
@@ -79,9 +79,9 @@ class ConversationStore:
     def _connect(self) -> sqlite3.Connection:
         """Open a connection with a generous busy timeout.
 
-        This PR adds the agent worker as a SECOND concurrent writer to
-        conversations.db (it mirrors a spawned session's output into the linked
-        thread, #311) alongside the web /chat process. Under WAL two writers can
+        The agent worker is a SECOND concurrent writer to conversations.db
+        (it mirrors a spawned session's output into the linked thread)
+        alongside the web /chat process. Under WAL two writers can
         still collide on the single write lock; without a busy timeout the loser
         gets an immediate "database is locked", and the mirror's best-effort
         try/except would silently drop the message. A 10s busy timeout (matching
@@ -107,7 +107,7 @@ class ConversationStore:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            # Additive migration for pre-existing databases (#351): tag each
+            # Additive migration for pre-existing databases: tag each
             # conversation with the persona that owns it. Existing rows backfill
             # to 'primary' so web/Telegram history is unaffected.
             existing_cols = {
@@ -118,13 +118,13 @@ class ConversationStore:
                     "ALTER TABLE conversations "
                     "ADD COLUMN persona_id TEXT NOT NULL DEFAULT 'primary'"
                 )
-            # Additive migration for the spawned agent-worker session link
-            # (#403). Existing rows backfill to NULL (no spawned session).
+            # Additive migration for the spawned agent-worker session link.
+            # Existing rows backfill to NULL (no spawned session).
             if "agent_session_id" not in existing_cols:
                 conn.execute(
                     "ALTER TABLE conversations ADD COLUMN agent_session_id TEXT"
                 )
-            # Additive migration for the backend tag (#596). Existing rows
+            # Additive migration for the backend tag. Existing rows
             # backfill to 'lifeos' so pre-existing history is unaffected.
             if "backend" not in existing_cols:
                 conn.execute(
@@ -166,11 +166,11 @@ class ConversationStore:
             title: Optional title (default "New Conversation")
             persona_id: Persona that owns the thread (default "primary")
             backend: Text backend to tag the thread with (default "lifeos"),
-                purely a sidebar-filtering label (#596) — never used to route.
+                purely a sidebar-filtering label — never consulted to route.
             conv_id: Optional caller-supplied id, used verbatim when given
-                (#592 — the Hermes proxy adopts the id its upstream backend
+                (the Hermes proxy adopts the id its upstream backend
                 already minted for the thread). Omitted (the default), a
-                uuid4 is minted exactly as before. If the id already exists,
+                uuid4 is minted. If the id already exists,
                 the existing conversation is returned rather than raising or
                 duplicating the row — the proxy calls this on every turn of a
                 thread it already created, not just the first.
@@ -264,9 +264,9 @@ class ConversationStore:
             limit: Maximum number of conversations to return
             persona_id: When set, return only threads owned by that persona.
                 When None, return all personas' threads.
-            backend: When set, return only threads tagged with that backend
-                (#596). When None, return threads from every backend —
-                preserving today's unfiltered behavior for existing callers.
+            backend: When set, return only threads tagged with that backend.
+                When None, return threads from every backend — preserving
+                the unfiltered behavior for existing callers.
 
         Returns:
             List of conversations
@@ -420,7 +420,7 @@ class ConversationStore:
 
         `created_at` alone doesn't guarantee order: a user message and its
         assistant reply are two separate `add_message()` calls, and
-        `datetime.now()` can tie between them (#592 review). `rowid` (the
+        `datetime.now()` can tie between them. `rowid` (the
         table's implicit insertion-order column) breaks that tie, since it
         reflects the order rows were actually written rather than their
         clock reading.
@@ -492,7 +492,7 @@ class ConversationStore:
             conn.close()
 
     def set_agent_session_id(self, conv_id: str, session_id: Optional[str]) -> bool:
-        """Link a conversation to the agent-worker session it spawned (#403).
+        """Link a conversation to the agent-worker session it spawned.
 
         Set after an orchestrating persona spawns a background Claude Code
         session, so the conversation can later answer that session's
@@ -514,7 +514,7 @@ class ConversationStore:
 
     def get_conversation_id_by_agent_session_id(self, session_id: str) -> Optional[str]:
         """Reverse of set_agent_session_id: the conversation linked to a spawned
-        session, or None (#311).
+        session, or None.
 
         The agent worker runs out-of-process and only knows a session_id; this
         lets it resolve the web/voice conversation thread that spawned the

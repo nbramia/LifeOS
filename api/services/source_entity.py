@@ -50,7 +50,7 @@ def _is_blocklisted_entity(entity: "SourceEntity") -> bool:
     Such entities can never resolve to a person, so re-attempting them is pure
     waste — and because the linking script recorded a match attempt on every
     skip, they were re-queued under backoff forever and permanently inflated
-    the reported capped backlog (#550). Entities with no observed_email are
+    the reported capped backlog. Entities with no observed_email are
     never blocklisted; they may still be matchable by name or phone.
     """
     return bool(entity.observed_email) and is_blocklisted_domain(entity.observed_email)
@@ -1033,7 +1033,7 @@ class SourceEntityStore:
         Record a failed match attempt for a source entity.
 
         Increments match_attempt_count and updates match_attempted_at timestamp.
-        Used to track entities that have been processed but couldn't be matched.
+        Tracks entities that have been processed but couldn't be matched.
 
         Args:
             entity_id: Source entity ID
@@ -1077,8 +1077,9 @@ class SourceEntityStore:
 
         At or above ``max_attempts`` ("capped" entities), a hard stop would
         permanently lock an entity out even as the CRM it failed to match
-        against keeps growing (#507 — 1,678 of 1,729 unlinked entities were
-        stuck this way, forever reporting 0 eligible). Instead we apply
+        against keeps growing — at scale, the vast majority of unlinked
+        entities can end up stuck this way, forever reporting 0 eligible.
+        Instead we apply
         exponential backoff: the wait before the next attempt grows as
         ``min_days_since_attempt * backoff_multiplier ** (match_attempt_count
         - max_attempts)``. With the defaults (30 days, multiplier 3) that's
@@ -1112,7 +1113,7 @@ class SourceEntityStore:
             exclude_blocklisted: Drop entities whose observed_email is on a
                 blocklisted (marketing) domain. Being blocklisted is a permanent
                 property of the address, not a match that failed and deserves a
-                retry, so these are never eligible (#550).
+                retry, so these are never eligible.
 
         Returns:
             List of SourceEntity objects eligible for re-matching
@@ -1228,13 +1229,13 @@ class SourceEntityStore:
         Count unlinked entities that have hit ``max_attempts`` or more.
 
         This is the total capped population regardless of whether backoff
-        currently makes them eligible — used to surface the backlog size in
-        sync stats so a saturated backlog is visible (#507) instead of
+        currently makes them eligible — it surfaces the backlog size in
+        sync stats so a saturated backlog is visible instead of
         looking identical to "nothing to do".
 
         Blocklisted entities are excluded by default so the number tracks work
         that can actually drain. Counting them made the metric useless: they
-        were 70% of the reported backlog and could never be linked (#550).
+        were 70% of the reported backlog and could never be linked.
 
         Args:
             source_type: Optional filter by source type
@@ -1453,8 +1454,8 @@ def create_phone_source_entity(
     here keeps the two phone-call import paths
     (``scripts/apple_data_import.import_phone_calls`` on Linux and
     ``scripts/sync_phone_calls.py`` native on macOS) from drifting if the
-    format ever changes — silent duplicates were the failure mode that
-    motivated issue #228.
+    format ever changes — silent duplicates are the failure mode this
+    centralization guards against.
     """
     return SourceEntity(
         source_type="phone",

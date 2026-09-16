@@ -1,5 +1,5 @@
 """
-Idempotency store for the journal ring ingestion endpoint (#660).
+Idempotency store for the journal ring ingestion endpoint.
 
 A capture device (e.g. the Pebble Index ring) may retry a delivery on a flaky
 connection; this store lets `POST /api/journal/ingest` recognize a retried

@@ -128,7 +128,7 @@ class CalendarIndexer:
         Fetches events from the specified date range and indexes them.
 
         Args:
-            days_past: Number of days in the past to fetch
+            days_past: Number of days before today to fetch
             days_future: Number of days in the future to fetch
 
         Returns:

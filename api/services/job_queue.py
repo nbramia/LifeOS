@@ -44,7 +44,7 @@ def register_job_handler(job_type: str, handler: Callable):
 
 
 def is_stale_running_job(job: "Job", process_start_time: str) -> bool:
-    """Whether a `RUNNING` job predates this process (#768).
+    """Whether a `RUNNING` job predates this process.
 
     `JobQueue.start_worker()` reconciles rows like this to `FAILED` at
     startup, but a caller reading a job's status (e.g. `GET
@@ -58,7 +58,7 @@ def is_stale_running_job(job: "Job", process_start_time: str) -> bool:
     A missing `started_at` on a `RUNNING` row counts as stale too: `_claim_next`
     always sets it in the same atomic UPDATE that sets status to `RUNNING`, so
     a real, currently-executing job always has one — a `RUNNING` row without
-    it cannot be this process's own live job (Codex review of #768).
+    it cannot be this process's own live job.
     """
     return job.status == RUNNING and (job.started_at is None or job.started_at < process_start_time)
 
@@ -104,10 +104,10 @@ class JobQueue:
         self._worker_thread: threading.Thread | None = None
         self._last_cleanup: float = 0.0
         # This instance's construction time, used as a proxy for "this
-        # process's start time" (#768): JobQueue is a per-process singleton
+        # process's start time": JobQueue is a per-process singleton
         # (see get_job_queue()), created once during API startup, so a job
-        # row still RUNNING with a started_at before this timestamp cannot
-        # have been claimed by this process — the process that claimed it
+        # row still RUNNING with a started_at earlier than this timestamp
+        # cannot have been claimed by this process — the process that claimed it
         # is gone. Exposed so callers outside this class (admin/jobs routes)
         # can flag staleness even before start_worker()'s reconciliation
         # below has had a chance to run.
@@ -268,7 +268,7 @@ class JobQueue:
     def start_worker(self):
         """Start the background worker thread.
 
-        Reconciles orphaned jobs first (#768): a job can be left `RUNNING`
+        Reconciles orphaned jobs first: a job can be left `RUNNING`
         in the database by a process that was killed or restarted mid-job
         (e.g. an unrelated auto-deploy), and nothing else ever revisits a
         `RUNNING` row to notice the process that owned it is gone. Since
@@ -297,7 +297,7 @@ class JobQueue:
         (or a missing `started_at`, which `_claim_next` never actually leaves
         null on a real claim) rather than every `RUNNING` row unconditionally,
         so this can never touch a job genuinely owned by a still-alive process
-        sharing the same database (Codex review of #768). Retries are
+        sharing the same database. Retries are
         intentionally not offered here (unlike `_mark_failed`): the job's own
         process is gone, not merely a single attempt, so whether to re-enqueue
         is a separate decision.
@@ -398,7 +398,7 @@ def _handle_sync_source(params: dict) -> dict:
         raise ValueError("Missing 'source' parameter")
 
     # Map source names to sync scripts.
-    # WhatsApp is intentionally absent — it now ships via the Mac Mini Apple
+    # WhatsApp is intentionally absent — it ships via the Mac Mini Apple
     # Data Agent (apple_data_export.py → apple_data_import.py).
     script_map = {
         "gmail": "scripts/sync_gmail.py",

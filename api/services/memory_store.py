@@ -394,7 +394,7 @@ class MemoryStore:
 
     @staticmethod
     def _content_hash(content: str) -> str:
-        """Stable hash of a memory's content, used to invalidate cached vectors."""
+        """Stable hash of a memory's content, for invalidating cached vectors."""
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     def _load_embedding_cache(self) -> dict:
@@ -464,7 +464,7 @@ class MemoryStore:
                 for memory, vector in zip(pending, fresh):
                     vectors[memory.id] = {"hash": self._content_hash(memory.content), "vector": vector}
 
-            # Drop vectors for memories that no longer exist (e.g. deleted).
+            # Drop vectors for memories that don't currently exist (e.g. deleted).
             active_ids = {m.id for m in memories}
             pruned = {mid: v for mid, v in vectors.items() if mid in active_ids}
 

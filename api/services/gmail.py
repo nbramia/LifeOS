@@ -103,8 +103,8 @@ def build_gmail_query(
         from_email: Filter by sender
         to_email: Filter by recipient
         subject: Search in subject only
-        after: Emails after this date
-        before: Emails before this date
+        after: Only emails sent on or after the given date
+        before: Only emails sent on or before the given date
         has_attachment: Filter for emails with attachments
         is_unread: Filter by read status
 
@@ -231,8 +231,8 @@ class GmailService:
             keywords: Keywords to search
             from_email: Filter by sender
             to_email: Filter by recipient
-            after: Emails after this date
-            before: Emails before this date
+            after: Only emails sent on or after the given date
+            before: Only emails sent on or before the given date
             max_results: Maximum messages to return
 
         Returns:
@@ -357,11 +357,11 @@ class GmailService:
         instead of one, and one pause covers the whole batch rather than each
         message. The pause matters most: at the default 0.1s per-call delay,
         fetching 13k messages individually spends ~22 minutes asleep before
-        any network time counts (#552).
+        any network time counts.
 
-        Pacing is deliberate. The per-call sleep this replaces was also, by
-        accident, the thing keeping us under Gmail's per-user quota. Removing
-        it without a replacement exhausts the quota partway through a large
+        Pacing is deliberate. Per-call sleeps between individual fetches are,
+        by accident, what keeps calls under Gmail's per-user quota; skipping
+        that without a replacement exhausts the quota partway through a large
         mailbox, so batches are paced to ``seconds_per_message`` per message.
 
         Rate-limit errors back off and retry the whole chunk rather than

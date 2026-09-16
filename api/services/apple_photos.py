@@ -291,7 +291,7 @@ class ApplePhotosReader:
         Useful for incremental sync.
 
         Args:
-            since: Only return faces from photos after this timestamp
+            since: Only return faces from photos captured after the given timestamp
             limit: Maximum faces to return
 
         Yields:

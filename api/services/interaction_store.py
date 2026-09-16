@@ -244,9 +244,9 @@ def build_calendar_link(event_id: str, calendar_id: str = "primary") -> str:
 
 # Backup retention is owned by ``api.services.backup_retention`` so other
 # SQLite stores (crm.db, sync_health.db, …) can adopt the same policy
-# without copy-pasting the bucket math. See issue #227. The wrappers
-# below are kept so legacy test code that imported the private helpers
-# from this module keeps working.
+# without copy-pasting the bucket math. The wrappers below are kept so
+# legacy test code that imported the private helpers from this module
+# keeps working.
 _BACKUP_DB_BASENAME = "interactions.db"
 
 
@@ -1332,7 +1332,7 @@ class InteractionStore:
         dashboard's heatmap window) span back to 1970 regardless of when
         real interactions actually started.
 
-        Used to size the Me dashboard's default heatmap window from the
+        Sizes the Me dashboard's default heatmap window from the
         actual span of data instead of requesting a fixed 10 years and
         shrinking the display afterward.
 
@@ -1807,7 +1807,7 @@ class InteractionStore:
         """
         Delete all interactions of a specific source type.
 
-        Useful for cleanup before re-indexing vault notes with improved
+        Useful for cleanup ahead of re-indexing vault notes with updated
         date extraction logic.
 
         Args:

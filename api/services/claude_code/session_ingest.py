@@ -151,7 +151,7 @@ class SessionMeta:
     total_dollars: float = 0.0
     # True once any assistant turn in this session priced against an
     # unrecognized model (pricing.is_known_model() == False) -- see
-    # `_cost_from_usage` (#669). Sticky for the session: distinguishes a
+    # `_cost_from_usage`. Sticky for the session: distinguishes a
     # genuine $0.00 from "some turns couldn't be priced".
     unpriced: bool = False
     tool_call_count: int = 0
@@ -394,17 +394,16 @@ def _cost_from_usage(usage: dict[str, Any], model: str) -> tuple[float, bool]:
 
     Sums all four Anthropic token buckets — uncached input, output,
     cache_creation (1.25× input), cache_read (0.10× input) — matching
-    the agent worker's cost accounting after #145 / #157 landed
-    cache-aware pricing in `pricing.cost_for`. This keeps API spend
-    numbers apples-to-apples across LifeOS agent and Claude Code
-    sources.
+    the agent worker's cache-aware cost accounting in `pricing.cost_for`.
+    This keeps API spend numbers apples-to-apples across LifeOS agent and
+    Claude Code sources.
 
     Returns `(cost, unpriced)`. This is a **record** path -- it prices
     whatever real historical model id Claude Code reports, which makes it
     the call site most likely to meet a genuinely new model id first. An
     unrecognized model is **not** billed at cost_for's conservative
     fallback rate (right for a budget estimate, wrong for a real spend
-    record): it costs $0.00 and `unpriced=True` is returned instead (#669).
+    record): it costs $0.00 and `unpriced=True` is returned instead.
     """
     from api.services.agent_worker.pricing import cost_for, is_known_model
 
@@ -969,7 +968,7 @@ def build_snapshot(
                 edges=list(edges),
             )
     # Per-row copies on the cache-write path too: the returned rows are
-    # distinct objects from the ones the cache entry now owns, so a caller
+    # distinct objects from the ones the cache entry owns, so a caller
     # mutating a returned row can never corrupt a warm cache.
     return [dict(row) for row in sessions], list(edges)
 

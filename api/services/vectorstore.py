@@ -18,7 +18,7 @@ from config.settings import settings
 # note_type values written by non-vault sources (api/services/calendar_indexer.py,
 # api/services/slack_indexer.py). These index real content under a relative
 # pseudo-path (e.g. "calendar/<event-id>"), not a vault document, so they must
-# never be mistaken for a vault-root sample (#762 follow-up).
+# never be mistaken for a vault-root sample.
 _NON_VAULT_NOTE_TYPES = ["calendar_event", "slack_message"]
 
 
@@ -329,7 +329,7 @@ class VectorStore:
 
     def sample_file_paths(self, limit: int = 5) -> list[str]:
         """Return up to `limit` distinct indexed *vault* file paths, without
-        scanning the whole collection (#762). Used by the vault_search
+        scanning the whole collection. Used by the vault_search
         health check's vault-root sanity check — `get_all_file_paths()`
         above is the right tool when every path is actually needed, but is
         too expensive to call on every health-check request against a large
@@ -340,8 +340,8 @@ class VectorStore:
         documents. On a real vault these can dominate the front of insertion
         order (e.g. thousands of calendar-event rows), so a plain unfiltered
         fetch can return nothing but non-vault rows — every one of them
-        trivially "outside the vault root" and a false `degraded` (#762
-        follow-up). Push the exclusion down to ChromaDB via `where` so the
+        trivially "outside the vault root" and a false `degraded`. Push the
+        exclusion down to ChromaDB via `where` so the
         fetch still targets real vault rows regardless of how many non-vault
         rows precede them, instead of over-fetching further and further to
         try to skip past them client-side.
@@ -387,9 +387,9 @@ def sample_paths_match_vault_root(
     paths: "list[str] | set[str]", vault_root: Path
 ) -> "tuple[bool, list[str]]":
     """Classify a sample of indexed file paths against the configured vault
-    root (#762). `file_path` metadata is always stored as `str(path.resolve())`
+    root. `file_path` metadata is always stored as `str(path.resolve())`
     (see indexer.py), so a resolved-prefix check is sufficient — no need to
-    touch the filesystem for paths that no longer exist (`Path.is_relative_to`
+    touch the filesystem for paths that don't currently exist on disk (`Path.is_relative_to`
     does no I/O; only `vault_root.resolve()` below might, and that's on the
     live configured root, not on the — possibly vanished — indexed paths).
 

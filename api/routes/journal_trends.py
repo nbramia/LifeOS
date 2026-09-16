@@ -1,6 +1,5 @@
 """
-Journal trend views: the strip, the unexplored wheel, and the scalar stack
-(issue follow-up to #212).
+Journal trend views: the strip, the unexplored wheel, and the scalar stack.
 
 The original emotion wheel (`api/routes/journal.py`) answers "what did I
 feel most often" for a single window. Operator feedback on that view was
@@ -11,22 +10,20 @@ this, actually" before anything else. These views are the response; see
 docs/specs/product/journal-analytics.md for the full writeup, including
 options considered and rejected.
 
-A fourth view — felt-vs-recorded connection, which cross-referenced
-`connection_<name>` self-reports against `data/interactions.db` via
-`api.services.entity_resolver` — was removed after operator feedback that
-it wasn't useful (see the spec's Removed section). Removing it also
-dropped this module's only reason to import the entity resolver or touch
-the interactions database, which shrinks this module's privacy surface —
-a real gain, not just a line-count one.
+This module does not cross-reference `connection_<name>` self-reports
+against `data/interactions.db` via `api.services.entity_resolver`; a
+felt-vs-recorded connection view was considered and rejected as not useful
+(see the spec's Removed section). Keeping that cross-reference out means
+this module has no reason to import the entity resolver or touch the
+interactions database, which keeps its privacy surface small.
 
 This is a separate module from `journal.py` rather than an extension of it
 because the unexplored wheel pulls in a data source the original wheel
-never needed — `data/gsheet_sync.db` — and `journal.py` at 372 lines
-before this file existed was already a full unit on its own. Splitting
-keeps the wheel's import surface untouched.
+never needed — `data/gsheet_sync.db` — and `journal.py` at 372 lines is
+already a full unit on its own. Splitting keeps the wheel's import surface
+untouched.
 
-Deliberately reuses rather than reimplements, per the issue's explicit
-instruction:
+Deliberately reuses rather than reimplements:
 - `api.routes.journal.window_bounds` / `_canonical_window` — the same
   day/week/month/quarter/all-time semantics as the wheel.
 - `api.routes.journal._iter_valid_journal_files` / `collect_window` — the
@@ -43,7 +40,7 @@ instruction:
 None of these are re-exported as a public API of this module; the imports
 below are intentionally of the underscore-prefixed originals, because
 duplicating the logic under a second name would be exactly the
-reinvention the issue asked to avoid.
+kind of reinvention this design avoids.
 
 `resonant_moment` (free-text, the most sensitive field in the file) and
 `one_word` are never read here, matching the wheel's existing boundary.
@@ -339,11 +336,11 @@ async def get_journal_strip() -> JournalStripResponse:
     explicit: the strip should auto-scale to the full history available —
     leftmost cell is the earliest recorded observation, rightmost is today
     — not whatever window happens to be selected elsewhere on the page.
-    An earlier version took `window` and used the wheel's day/week/month/
-    quarter/all-time bounds like every other view here; that parameter is
-    gone rather than kept-but-ignored, because a query parameter a caller
-    can set with no effect on the response is exactly the silent-defect
-    shape this codebase has spent real effort removing elsewhere (see
+    Unlike the wheel's day/week/month/quarter/all-time bounds used by
+    every other view here, this endpoint accepts no `window` parameter
+    at all — kept-but-ignored is not an option, because a query parameter
+    a caller can set with no effect on the response is exactly the
+    silent-defect shape this codebase avoids elsewhere (see
     docs/specs/product/journal-analytics.md's note on this view). The
     frontend (`web/journal-trends.html`) labels this view "full history"
     explicitly and never sends `?window=` to this endpoint, so a reader
@@ -446,7 +443,7 @@ def _derive_taxonomy_labels(db_path: str) -> list[str]:
     personal-value hardcoding this project's own contribution guidelines
     rule out for a codebase other people run against their own forms.
     Every row ever synced is scanned (not just the latest), so a branch
-    the form used to have but later removed still shows up as "available,
+    removed from the current form definition still shows up as "available,
     unused" rather than disappearing.
 
     Opens the database read-only (`mode=ro`) so a missing file is a clean

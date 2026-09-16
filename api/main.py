@@ -28,9 +28,9 @@ See CLAUDE.md for full instructions for AI coding agents.
 # imported from with no `.env` of its own (a git worktree, notably): the
 # search keeps climbing past that directory and can load an unrelated,
 # real `.env` from a parent — including another checkout's machine-specific
-# config (see #598). Anchoring to `Path(__file__).parent.parent / ".env"`
-# loads the exact same file as today for the real checkout (that first
-# candidate IS the repo root there), so server behavior is unchanged, while
+# config. Anchoring to `Path(__file__).parent.parent / ".env"`
+# loads the exact same file for the real checkout (that first
+# candidate IS the repo root there), while
 # a nested import (worktree, tests) only loads a `.env` that actually lives
 # in that same checkout — never a parent's.
 #
@@ -74,7 +74,7 @@ from config.settings import settings
 # level/format, so this is a no-op for existing log output — but doing it up
 # front, and pairing it with `configure_telegram_log_redaction()`, is what
 # keeps httpx's request logger (which logs full URLs, and the Telegram Bot
-# API embeds the bot token in the URL) from ever logging at INFO here (#519).
+# API embeds the bot token in the URL) from ever logging at INFO here.
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 configure_telegram_log_redaction()
 # uvicorn's own access logger writes every request's raw query string
@@ -104,14 +104,13 @@ _job_queue = None
 _task_watcher = None
 _pebble_capture_watcher = None
 
-# Health monitoring (previously _health_check_loop) is now an out-of-band
-# watcher in nbramia/local-processing that polls /health/raw-state. Moving it
-# out-of-process means a LifeOS outage produces an alert instead of silencing
-# the alerts themselves.
+# Health monitoring runs as an out-of-band watcher in nbramia/local-processing
+# that polls /health/raw-state. Running it out-of-process means a LifeOS
+# outage produces an alert instead of silencing the alerts themselves.
 
 
 def check_server_host_guard() -> None:
-    """Refuse to start unless this machine is the designated LifeOS host (#506).
+    """Refuse to start unless this machine is the designated LifeOS host.
 
     The LifeOS API is architecturally supposed to run on exactly one machine
     — every other machine is a client or export agent. A second live server
@@ -148,7 +147,7 @@ async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown."""
     global _calendar_indexer, _telegram_listeners, _reminder_scheduler, _scheduler_watcher, _job_queue, _task_watcher, _pebble_capture_watcher
 
-    # Startup: refuse to run a second server on a non-designated machine (#506).
+    # Startup: refuse to run a second server on a non-designated machine.
     # Deliberately not wrapped in try/except — unlike the best-effort blocks
     # below, this must actually stop startup on a mismatch.
     check_server_host_guard()
@@ -183,8 +182,8 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Failed to start Calendar indexer: {e}")
 
-        # Health monitoring (previously an in-process 2:30/7:00 scheduler) now runs
-        # out-of-band in nbramia/local-processing via the lifeos_health watcher.
+        # Health monitoring runs out-of-band in nbramia/local-processing via
+        # the lifeos_health watcher.
 
         # Startup: Start Telegram bot listeners (primary + any specialized bots)
         try:
@@ -289,9 +288,9 @@ async def lifespan(app: FastAPI):
 
     yield  # Application runs here
 
-    # Shutdown: drain in-flight chat turns (#611). A turn's task now runs
+    # Shutdown: drain in-flight chat turns. A turn's task runs
     # independently of its SSE reader, so a shutdown here (e.g. a mid-turn
-    # auto-redeploy, #437) would otherwise just kill it via task
+    # auto-redeploy) would otherwise just kill it via task
     # cancellation at process exit with no chance to persist anything —
     # this cancels every turn explicitly and awaits its own partial-persist
     # handling first, so a redeploy stores an honest partial instead of
@@ -519,7 +518,7 @@ async def health_check():
     from config.settings import settings
 
     checks = {
-        # Literally "is ANTHROPIC_API_KEY set" (#697's acceptance criteria),
+        # Literally "is ANTHROPIC_API_KEY set",
         # not "is an LLM available" — an install running fully on
         # LIFEOS_LLM_BACKEND=local with no Anthropic key at all is a
         # supported configuration that will still report degraded here,
@@ -529,8 +528,7 @@ async def health_check():
         # Distinct from reminder_scheduler (the delivery thread, gated on
         # Telegram being configured): this is the file watcher that picks up
         # vault edits (e.g. via Obsidian) and re-indexes them, starts
-        # unconditionally, and previously had no liveness signal of its own
-        # (#766).
+        # unconditionally, and is tracked here as its own liveness signal.
         "scheduler_watcher": _scheduler_watcher.is_alive() if _scheduler_watcher else False,
         "pebble_capture_watcher": (
             _pebble_capture_watcher.is_alive() if _pebble_capture_watcher else not settings.pebble_capture_enabled
@@ -568,9 +566,8 @@ async def health_raw_state(clear: bool = False):
     Raw health state for out-of-band monitors (the lifeos_health watcher in
     nbramia/local-processing).
 
-    Returns the same data the removed `_health_check_loop` used to aggregate:
-    processor failures, stale/failed syncs, service degradation events, and
-    critical service issues — all from the last 24h.
+    Returns processor failures, stale/failed syncs, service degradation
+    events, and critical service issues — all from the last 24h.
 
     If `clear=true`, atomically clears the transient in-memory counters
     (processor failures + degradation events) after reading. Intended for the
@@ -628,8 +625,8 @@ async def health_raw_state(clear: bool = False):
 
 
 def _check_vault_root_sanity(vault_search_check: "dict | None", vault_path) -> None:
-    """Additive sanity check for the `vault_search` row in `GET /health/full`
-    (#762). Sample a handful of indexed file paths and confirm they still
+    """Additive sanity check for the `vault_search` row in `GET /health/full`.
+    Sample a handful of indexed file paths and confirm they still
     fall under the currently configured vault root, catching a moved/deleted
     vault whose index keeps serving stale content from the old location — a
     drift the base request/response probe (does search return results at
@@ -647,9 +644,9 @@ def _check_vault_root_sanity(vault_search_check: "dict | None", vault_path) -> N
     If the sample comes back empty (no vault documents were sampled — e.g.
     a collection that is currently all non-vault content), that is absence
     of signal, not evidence of a moved vault, so the check stays "ok" with a
-    neutral note instead of downgrading (#762 follow-up).
+    neutral note instead of downgrading.
 
-    Degrade rule (#762 second follow-up): the failure this check exists to
+    Degrade rule: the failure this check exists to
     catch is a vault that *moved* — in that case NO sampled vault path is
     under the configured root. A sample where some paths match and some
     don't isn't that failure; it's more likely stray debris (e.g. a test
@@ -674,7 +671,7 @@ def _check_vault_root_sanity(vault_search_check: "dict | None", vault_path) -> N
         # itself in both branches below — this is an unauthenticated
         # endpoint, a real indexed file path can reveal personal
         # folder/file names, and the vault root is typically an absolute
-        # path under the user's home directory (#697 review). The counts
+        # path under the user's home directory. The counts
         # alone are enough for an operator to act on.
         if matched == 0:
             vault_search_check["status"] = "degraded"
@@ -779,7 +776,7 @@ async def full_health_check():
     # 1. Local LLM — `local_llm_url` has a non-empty default regardless of
     # whether the local backend is actually in use, so a bare "is the URL
     # string set" check always said "ok" even on an install that talks only
-    # to Anthropic and has nothing listening on that port (#697). Report
+    # to Anthropic and has nothing listening on that port. Report
     # not-in-use when the backend isn't "local" (truthful and not a
     # failure — excluded from the `failed` count below same as "ok"); only
     # when the backend is "local" do we actually probe reachability.
@@ -855,7 +852,7 @@ async def full_health_check():
         json_body={"query": "test", "top_k": 1}
     )
 
-    # 3b. Vault-root sanity check (#762) — the request/response check above
+    # 3b. Vault-root sanity check — the request/response check above
     # only confirms search returns *something*, not that what it returns
     # still lives where the vault is currently configured. A moved/deleted
     # vault can leave the index serving stale content from the old location
@@ -883,7 +880,7 @@ async def full_health_check():
     # Google credentials configured — unlike calendar/drive below, whose
     # routes let a missing-credentials FileNotFoundError surface as a 401.
     # Preflight a plain file-existence check for the account this probe uses
-    # so all three Google rows report the same not-configured shape (#697).
+    # so all three Google rows report the same not-configured shape.
     from api.services.google_auth import get_google_auth, GoogleAccount
     if not get_google_auth(GoogleAccount.PERSONAL).credentials_path.exists():
         # Same shape as test_endpoint()'s error rows below (status/latency_ms/
@@ -944,7 +941,7 @@ async def full_health_check():
         "GET", "/api/imessage/statistics",
     )
 
-    # 12. Model readout (#658) — which model is actually serving each chat
+    # 12. Model readout — which model is actually serving each chat
     # surface right now. Informational, not a pass/fail check: kept out of
     # `results["checks"]` (and its "ok"/"error" degraded/unhealthy counting
     # below) because an "unknown" Hermes readout doesn't mean LifeOS itself
@@ -1053,7 +1050,7 @@ def data_integrity_check():
 
 @app.get("/manifest.webmanifest")
 async def web_manifest():
-    """Serve the web app manifest (#727).
+    """Serve the web app manifest.
 
     Served from its own route rather than through /static so the
     Content-Type is guaranteed to be application/manifest+json — some
@@ -1152,7 +1149,7 @@ async def agents_page():
 
 @app.get("/journal")
 async def journal_page():
-    """Serve the journal emotion-wheel visualization UI (#212)."""
+    """Serve the journal emotion-wheel visualization UI."""
     journal_path = Path(__file__).parent.parent / "web" / "journal.html"
     if journal_path.exists():
         return FileResponse(str(journal_path))

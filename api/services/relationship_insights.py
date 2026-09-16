@@ -35,7 +35,7 @@ INSIGHT_CATEGORIES = {
     "for_me": "🎯",  # Things partner asked for, or things user committed to
     "for_partner": "💜",  # Things user asked for, or things partner committed to
     # Analysis categories
-    "growth_patterns": "📈",  # How the relationship has improved
+    "growth_patterns": "📈",  # Positive change in the relationship over time
     "recurring_themes": "🔄",  # Topics that come up repeatedly
     "relationship_strengths": "💪",  # Positive patterns to reinforce
     # AI-generated novel suggestions
@@ -43,7 +43,7 @@ INSIGHT_CATEGORIES = {
 }
 
 # Therapy notes path - relative to vault_path
-# Configure via LIFEOS_THERAPY_PATH or defaults to Personal/Self-Improvement/Therapy and coaching
+# Configure via LIFEOS_THERAPY_PATH; see THERAPY_VAULT_SUBPATH below for the default
 THERAPY_VAULT_SUBPATH = os.environ.get(
     "LIFEOS_THERAPY_PATH",
     "Personal/Self-Improvement/Therapy and coaching"

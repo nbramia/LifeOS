@@ -6,7 +6,7 @@ second message in a thread has been persisted, replacing whatever placeholder
 conversation_store.py) currently sits there. This is the one shared seam for
 all three surfaces that persist chat turns — the native `/api/ask/stream`
 turn (api/routes/chat.py), the Hermes proxy tee (api/routes/hermes_proxy.py),
-and the #711 voice tee (api/routes/voice.py) — each calls `schedule_retitle()`
+and the voice tee (api/routes/voice.py) — each calls `schedule_retitle()`
 once its turn is done, instead of three separate titling implementations.
 
 LLM selection mirrors `query_router.py` / `agent_viz_summary.py` / person-fact
@@ -15,9 +15,7 @@ llama-server and never touches the paid Claude API, regardless of
 `LIFEOS_LLM_BACKEND` — the established pattern in this codebase for cheap,
 auxiliary, non-user-facing LLM calls. When the local server is unreachable,
 `generate_text()` falls back to the configured remote provider instead of
-silently doing nothing (`generate_text`'s local-then-remote retry, #773 —
-this used to be pinned to local only, #716's original bug for this exact
-caller). That means
+silently doing nothing (`generate_text`'s local-then-remote retry). That means
 titling works on a no-Anthropic-key install (local, remote, or Hermes-backend
 chat) and never touches the paid API path. Thinking is explicitly disabled
 (`enable_thinking=False`), matching query_router's routing call — titling is

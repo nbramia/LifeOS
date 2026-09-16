@@ -1,7 +1,7 @@
 """
-Google Sheet mirror for the fitness workout log (issue #321).
+Google Sheet mirror for the fitness workout log.
 
-The SQLite fitness store (#320) is the source of truth; this mirrors it into a
+The SQLite fitness store is the source of truth; this mirrors it into a
 Google Sheet so the log is viewable/editable on a phone. Opt-in via
 LIFEOS_FITNESS_SHEET_ID — a no-op when unset, so a fresh clone is unaffected.
 
