@@ -152,6 +152,16 @@ class UpdateTaskRequest(BaseModel):
                     "a string value sets that field, a null value removes it. "
                     "Fields not mentioned are left alone.",
     )
+    actor: Optional[str] = Field(
+        default=None,
+        description="Caller identity for the claimed-card guard below. The only "
+                    "recognized value is 'worker', asserted by the agent worker's "
+                    "own lifecycle projector so its writes on a card it already "
+                    "claims are not read as a human reassigning that card. Not "
+                    "persisted — stripped from the patch before it reaches the "
+                    "task store. Caller-asserted, not authenticated: the same "
+                    "trust `fields.assigned_by` already relies on.",
+    )
 
 
 class TaskResponse(BaseModel):
@@ -602,6 +612,7 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
     _require_valid_status(request.status)
     manager = get_task_manager()
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
+    actor = updates.pop("actor", None)
 
     # The board's assignment pickers stamp `fields.assigned_by: "board"` on
     # every write (see web/agents/assignment.js) — that marker routes a
@@ -662,7 +673,10 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
             # all, so a marker-gated guard here could never fire for the
             # request the product actually sends. The guard keys on the
             # card's own claim state (computed from ITS OWN tags/status,
-            # never trusted from the request), not on who's asking.
+            # never trusted from the request) — the one exception is the
+            # worker-actor carve-out below, which is keyed on the request's
+            # `actor` field precisely because it exists to tell the
+            # worker's own write apart from everyone else's.
             old_tags = agent_board.normalize_tags(current.tags)
             new_tags = agent_board.normalize_tags(updates["tags"])
             # Managed Agents consent tags are executor assignments too. They
@@ -688,18 +702,39 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
                 agent_board.COMPLETED_TAG, agent_board.ACCEPTED_TAG,
             }
 
+            # The agent worker's own lifecycle projector (`LifecycleProjector`,
+            # api/services/agent_worker/lifecycle.py) is the one caller allowed
+            # to change a claim/lifecycle tag on a card it already claims: it
+            # asserts `actor: "worker"` on a write that leaves the assignee-tag
+            # set untouched, targets a card `is_claimed` already sees as
+            # claimed, and carries a `status` actually changing away from the
+            # one on file — recording its own session's status transition, not
+            # reassigning the card. `actor` is caller-asserted, not
+            # authenticated (the same trust `fields.assigned_by` already
+            # relies on), so every other condition here narrows the carve-out
+            # to a shape a reassignment can never take: changing the assignee
+            # tag, or asserting the marker against a card that was never
+            # actually claimed, still falls through to the refusals below.
+            worker_lifecycle_write = (
+                actor == "worker"
+                and (old_tags & assignee_tag_set) == (new_tags & assignee_tag_set)
+                and agent_board.is_claimed(current.status, current.tags)
+                and updates.get("status") not in (None, current.status)
+            )
+
             added_claim_tags = (new_tags & claim_tag_set) - (old_tags & claim_tag_set)
-            if added_claim_tags:
+            if added_claim_tags and not worker_lifecycle_write:
                 # A claim/lifecycle tag (`agent-running`/`agent-blocked`/
-                # `agent-completed`/`accepted`) is written only by the
-                # worker (through `/swap-tag`) or the accept endpoint — no
-                # other HTTP caller in this codebase adds one via a plain
-                # PUT. Refuse it here unconditionally rather than only when
-                # the card is already claimed: an unclaimed (including
-                # `me`) card gaining one of these through this path would
-                # fake a claim or a review state on the very next policy
-                # read, which is a false state this endpoint must never
-                # manufacture.
+                # `agent-completed`/`accepted`) is added via a plain PUT only
+                # by the worker's own lifecycle projector recording its
+                # session's transition on a card it already claims (see the
+                # carve-out above) — every other caller, and the same
+                # projector write aimed at a card it does not already claim,
+                # is refused unconditionally rather than only when the card
+                # is already claimed: an unclaimed (including `me`) card
+                # gaining one of these through this path would fake a claim
+                # or a review state on the very next policy read, which is a
+                # false state this endpoint must never manufacture.
                 raise HTTPException(
                     status_code=agent_board.WORKER_OWNED_ERROR[0],
                     detail=agent_board.WORKER_OWNED_ERROR[1],
@@ -708,7 +743,7 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
             if (
                 (old_tags & assignee_tag_set) != (new_tags & assignee_tag_set)
                 or (old_tags & claim_tag_set) != (new_tags & claim_tag_set)
-            ):
+            ) and not worker_lifecycle_write:
                 has_live = _get_session_store().has_live_session(
                     task_id, status=current.status, tags=current.tags,
                 )

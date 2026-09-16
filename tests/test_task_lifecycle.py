@@ -931,3 +931,129 @@ class TestReconcileLifecycleDriftHasVaultTaskGate:
         refreshed = manager.get(task.id)
         assert healed == 1
         assert FAILED_TAG in refreshed.tags
+
+
+class TestLifecycleProjectorRealHTTPRoute:
+    """`LifecycleProjector.transition` writes through `PUT /api/tasks/{id}`
+    via `_WorkerLifecycleTaskManager` (api/services/agent_worker/worker.py).
+    A projector wired to an in-process `TaskManager` never meets that
+    route's claimed-card guard at all, so these drive the projector against
+    the real FastAPI route over a temp vault, exactly as
+    `test_drift_sweep_heals_through_the_real_task_routes` does for the
+    drift sweep's own `/swap-tag` writes."""
+
+    def _claimed_task_and_session(self, manager, sessions, *, tag=RUNNING_TAG, session_status=STATUS_RUNNING):
+        task = manager.create(
+            "Synthetic route-level lifecycle task", status="in_progress",
+            tags=["claude", tag],
+        )
+        session = sessions.create(task.id, status=session_status, routing="claude_code")
+        return task, session
+
+    def test_worker_completed_transition_on_claimed_card_reaches_applied(self, tmp_path, monkeypatch):
+        worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+        task, session = self._claimed_task_and_session(manager, sessions)
+        event = LifecycleEvent(
+            event_id="event-completed", task_id=task.id,
+            session_id=session.session_id, attempt_id=session.attempt_id,
+            target_status=STATUS_COMPLETED, expected_version=task.updated_at,
+        )
+        assert worker.lifecycle_projector.transition(event) is True
+        refreshed = manager.get(task.id)
+        assert refreshed.status == "done"
+        assert COMPLETED_TAG in refreshed.tags
+        assert RUNNING_TAG not in refreshed.tags
+        assert sessions.projection_applied(event.event_id)
+
+    def test_worker_failed_transition_on_claimed_card_reaches_applied(self, tmp_path, monkeypatch):
+        worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+        task, session = self._claimed_task_and_session(manager, sessions)
+        event = LifecycleEvent(
+            event_id="event-failed", task_id=task.id,
+            session_id=session.session_id, attempt_id=session.attempt_id,
+            target_status=STATUS_FAILED, expected_version=task.updated_at,
+        )
+        assert worker.lifecycle_projector.transition(event) is True
+        refreshed = manager.get(task.id)
+        assert refreshed.status == "cancelled"
+        assert FAILED_TAG in refreshed.tags
+        assert RUNNING_TAG not in refreshed.tags
+        assert sessions.projection_applied(event.event_id)
+
+    def test_worker_blocked_transition_on_claimed_card_reaches_applied(self, tmp_path, monkeypatch):
+        worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+        task, session = self._claimed_task_and_session(manager, sessions)
+        event = LifecycleEvent(
+            event_id="event-blocked", task_id=task.id,
+            session_id=session.session_id, attempt_id=session.attempt_id,
+            target_status=STATUS_BLOCKED, expected_version=task.updated_at,
+            wait_type=WAIT_OPERATOR,
+        )
+        assert worker.lifecycle_projector.transition(event) is True
+        refreshed = manager.get(task.id)
+        assert refreshed.status == "blocked"
+        assert BLOCKED_TAG in refreshed.tags
+        assert RUNNING_TAG not in refreshed.tags
+        assert sessions.projection_applied(event.event_id)
+
+    def test_human_assignee_reassignment_on_claimed_card_is_still_refused(self, tmp_path, monkeypatch):
+        """The worker-actor marker only ever covers the projector's own
+        lifecycle-tag transition — an actual assignee/engine change on a
+        claimed card, even carrying the same marker, is the human-
+        reassignment move this guard exists to block."""
+        worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+        task, _session = self._claimed_task_and_session(manager, sessions)
+        response = worker._http.put(f"/api/tasks/{task.id}", json={
+            "tags": ["codex", RUNNING_TAG], "actor": "worker",
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        assert manager.get(task.id).tags == task.tags
+
+    def test_worker_actor_marker_does_not_exempt_an_engine_reassignment(self, tmp_path, monkeypatch):
+        """The worker-actor carve-out never applies to a request that also
+        changes the assignee-tag set — even one that otherwise looks
+        exactly like the worker's own terminal transition (claimed card,
+        status actually changing, a tracked claim tag replacing the
+        one on file). Changing the assignee tag is what a reassignment
+        is; the carve-out must never cover it, marker or not."""
+        worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+        task, _session = self._claimed_task_and_session(manager, sessions)
+        response = worker._http.put(f"/api/tasks/{task.id}", json={
+            "status": "done", "tags": ["codex", COMPLETED_TAG], "actor": "worker",
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        refreshed = manager.get(task.id)
+        assert refreshed.tags == task.tags
+        assert refreshed.status == task.status
+
+    def test_worker_actor_marker_requires_an_actual_status_change(self, tmp_path, monkeypatch):
+        """The worker-actor carve-out never applies to a request whose
+        `status` doesn't actually move off the task's current one — a
+        claim tag can never be added on the strength of the marker alone
+        without the status transition it's supposed to accompany, even
+        though the assignee-tag set and the claimed state both look
+        exactly like the worker's own write."""
+        worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+        task, _session = self._claimed_task_and_session(manager, sessions)
+        response = worker._http.put(f"/api/tasks/{task.id}", json={
+            "status": task.status, "tags": ["claude", COMPLETED_TAG], "actor": "worker",
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        refreshed = manager.get(task.id)
+        assert refreshed.tags == task.tags
+
+    def test_worker_actor_marker_cannot_manufacture_a_claim_on_an_unclaimed_card(self, tmp_path, monkeypatch):
+        """A worker-actor marker on a card the worker never actually
+        claimed must not add a claim tag — the exemption only ever applies
+        to a card that is already claimed."""
+        worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+        task = manager.create("Synthetic unclaimed task", status="todo", tags=["me"])
+        response = worker._http.put(f"/api/tasks/{task.id}", json={
+            "status": "done", "tags": ["me", COMPLETED_TAG], "actor": "worker",
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        assert manager.get(task.id).status == "todo"
