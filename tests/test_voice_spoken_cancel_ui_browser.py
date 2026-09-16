@@ -1,15 +1,15 @@
-"""Browser tests for the spoken-cancel discard while recording (#722).
+"""Browser tests for the spoken-cancel discard while recording.
 
-Rides on #718's smart-turn endpointing candidate-pause transcript rather than
+Rides on the smart-turn endpointing candidate-pause transcript rather than
 opening a second detection path, timer, or STT call: `checkEndpointCandidate()`
-in `web/chat/voice.js` now checks the SAME transcript it already fetches from
+in `web/chat/voice.js` checks the SAME transcript it already fetches from
 `POST /api/voice/transcribe` for a cancel utterance BEFORE the completeness
 decision (`isTranscriptComplete()`). A cancel verdict discards the recording
 through `stopRecordingAndSend({ discard: true })` -- the same teardown
 `finalizeEndpointing()` uses for a normal complete verdict, just routed past
 `submitTurn()` into `handleSkippedEmptyRecording()`, the existing no-submit
 path a silent/empty recording already uses. That's also why a spoken cancel
-never re-arms auto-continue (#721): the only re-arm trigger is
+never re-arms auto-continue: the only re-arm trigger is
 `submitTurn()`'s own `maybeAutoContinue()` call after a reply plays, which a
 discarded recording never reaches.
 
@@ -157,7 +157,7 @@ def _open_voice_chat(page: Page, base_url):
     page.wait_for_selector("#voiceListen")
 
 
-# Listening (#710) ships on by default and acquires its own mic stream the
+# Listening ships on by default and acquires its own mic stream the
 # instant voice mode is entered -- seeded off here so the only recording in
 # play is the one _start_recording() below starts, mirroring
 # tests/test_voice_endpointing_ui_browser.py's identical helper.
@@ -191,7 +191,7 @@ def _check_candidate(page: Page, transcript):
     checkEndpointCandidate() pipeline with a throwaway synthetic clip --
     content doesn't matter, the network response is stubbed regardless.
     Returns the verdict: True/False (completeness), None (suspended/stale/
-    unreachable), or 'cancelled' (a spoken-cancel discard, #722)."""
+    unreachable), or 'cancelled' (a spoken-cancel discard)."""
     page.evaluate("(t) => { window.__transcribeResponse = t; }", transcript)
     return page.evaluate(
         "() => window.lifeChatVoice.checkEndpointCandidate(new Float32Array(160), 16000)"
@@ -282,8 +282,8 @@ class TestCancelDiscardsRecording:
         """No lingering timer/graph after a discard -- the talk button
         starts a fresh recording normally afterward, the same signal
         tests/test_voice_endpointing_ui_browser.py's stale-check test uses.
-        Also checked directly via isEndpointTapActive() (#734's tap
-        inventory) rather than only inferred through the restart."""
+        Also checked directly via isEndpointTapActive() rather than only
+        inferred through the restart."""
         _open_voice_chat_listening_off(page, chat_base_url)
         _start_recording(page)
         assert page.evaluate("window.lifeChatVoice.isEndpointTapActive()") is True
@@ -299,7 +299,7 @@ class TestCancelDiscardsRecording:
 
 
 class TestCancelDoesNotReArmAutoContinue:
-    """A spoken cancel is a user-initiated stop (#721's rationale) -- it must
+    """A spoken cancel is a user-initiated stop -- it must
     not immediately restart recording, even with Auto on."""
 
     def test_cancel_does_not_restart_recording(self, page: Page, chat_base_url):
@@ -405,7 +405,7 @@ class TestStaleTokenCancel:
         page.locator("#voiceTalkBtn").click(force=True)
         page.wait_for_function("window.__recorderStopCalls === 1")
 
-        # A manual stop stays stopped, even with Auto on (#721) -- so start
+        # A manual stop stays stopped, even with Auto on -- so start
         # the next recording the way a user would, by tapping again. This is
         # the case the token guard exists for: a *different* recording is
         # now live than the one the in-flight check transcribed.
