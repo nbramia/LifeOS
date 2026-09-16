@@ -563,6 +563,11 @@ class _WorkerLifecycleTaskManager:
         return SimpleNamespace(**task) if task else None
 
     def update(self, task_id: str, **kwargs):
+        # Identifies this write to `PUT /api/tasks/{id}`'s claimed-card guard
+        # as the worker's own lifecycle projector rather than a human
+        # reassigning the card — see the `actor` field on `UpdateTaskRequest`
+        # (api/routes/tasks.py).
+        kwargs.setdefault("actor", "worker")
         response = self.worker._http.put(
             f"{self.worker.api_base}/api/tasks/{task_id}", json=kwargs,
         )

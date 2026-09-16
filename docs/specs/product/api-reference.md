@@ -394,7 +394,12 @@ tags (`agent-running`, `agent-blocked`, `agent-completed`, `accepted`)
 returns **409** no matter the card's current claim state, and a patch that
 changes the normalized assignee-tag set or the claim-tag set on an
 already-claimed card returns **409** with the same claimed-card reason the
-board's lane endpoint uses. When `fields.assigned_by` is `"board"` (the
+board's lane endpoint uses. Both of those refusals are skipped for a patch
+that asserts `actor: "worker"`, leaves the assignee-tag set unchanged,
+targets an already-claimed card, and carries a `status` different from the
+one on file — the shape of the agent worker's own lifecycle projector
+recording its session's status transition, not a reassignment. `actor` is
+caller-asserted and not persisted. When `fields.assigned_by` is `"board"` (the
 marker the `/agents` board's own pickers stamp on every write) and the
 patch changes `model`, `effort`, or `host` in `fields`, or carries a raw
 `status` key, this endpoint enforces the claimed-card rule on that
