@@ -1,11 +1,11 @@
-"""Regression coverage for the #828 conftest guard
+"""Regression coverage for the conftest guard
 (``_guard_live_vectorstore_collections``) and its interaction with the
-existing #288 vault-indexer isolation (``_isolate_vault_indexer_stores``).
+existing vault-indexer isolation (``_isolate_vault_indexer_stores``).
 
-Mirrors ``tests/test_session_store_test_isolation.py``'s approach for #652:
+Mirrors ``tests/test_session_store_test_isolation.py``'s approach:
 nothing here exercises the guard fixture explicitly (it's autouse), so
-these tests are already running under it. What's asserted is the thing
-#828 was actually about — a bare ``VectorStore(collection_name=...)``
+these tests are already running under it. What's asserted: a bare
+``VectorStore(collection_name=...)``
 pointed at a real production collection name must fail loudly instead of
 silently opening a connection to the live server.
 """
@@ -18,8 +18,8 @@ import pytest
 def test_bare_vectorstore_against_production_collection_fails_loudly():
     """A test that (accidentally or otherwise) constructs a ``VectorStore``
     pointed at the real ``lifeos_vault`` collection must be stopped before
-    it ever opens a connection — this is the exact shape of bug #828 found:
-    stray `/tmp/tmpXXXXXXXX/vault/...` rows in the live collection."""
+    it ever opens a connection — otherwise it leaves stray
+    `/tmp/tmpXXXXXXXX/vault/...` rows in the live collection."""
     from api.services.vectorstore import VectorStore
 
     with pytest.raises(pytest.fail.Exception, match="uses_live_vectorstore"):
@@ -65,14 +65,14 @@ def test_isolated_collection_name_is_not_guarded():
 
 @pytest.mark.unit
 def test_bare_indexer_service_never_reaches_a_production_collection_name(tmp_path):
-    """Regression guard for the #288 fixture's actual job: a bare
+    """Regression guard for the isolation fixture's actual job: a bare
     ``IndexerService()`` construction (the shape ``test_indexer.py``,
     ``test_integration.py``, and ``test_people.py`` all use) must resolve
-    to a throwaway collection, never the live ``lifeos_vault`` — this is
-    what #828's stray rows imply happened at some point in the past. If
-    ``_isolate_vault_indexer_stores`` ever regressed, the guard fixture
-    above would fail this test loudly rather than let it silently open a
-    real connection.
+    to a throwaway collection, never the live ``lifeos_vault`` — a bare
+    construction reaching production is exactly how stray rows end up
+    there. If ``_isolate_vault_indexer_stores`` ever regressed, the guard
+    fixture above would fail this test loudly rather than let it silently
+    open a real connection.
 
     ``chromadb.HttpClient`` and the embedding service are mocked so this
     exercises the isolation/guard wiring without becoming a ``slow`` test.
@@ -93,7 +93,7 @@ def test_bare_indexer_service_never_reaches_a_production_collection_name(tmp_pat
 
 @pytest.mark.unit
 def test_vectorstore_singletons_are_reset_before_every_test():
-    """#828 follow-up: every process-wide singleton that can hold a live
+    """Every process-wide singleton that can hold a live
     VectorStore/HybridSearch/*Indexer instance must be `None` at the start
     of any test, regardless of what ran before it in this worker process
     (xdist reuses one process across many tests). This is what
