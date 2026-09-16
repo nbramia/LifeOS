@@ -9,8 +9,8 @@ merged into whichever entries they cover as a `pricing` hint.
 
 Sources, one per engine:
   - **claude**: the Anthropic SDK's own `models.list()` — never a
-    hand-maintained table (that's exactly what went stale in pricing.py
-    before #655/#656). Skipped (empty list, not an error) when no API key
+    hand-maintained table (that's exactly what went stale in pricing.py).
+    Skipped (empty list, not an error) when no API key
     is configured.
   - **codex**: the Codex CLI's own `~/.codex/models_cache.json`
     (`settings.codex_models_cache_path`), falling back to a live OpenAI

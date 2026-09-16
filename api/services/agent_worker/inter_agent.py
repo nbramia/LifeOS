@@ -11,7 +11,7 @@ core primitives are:
     sessions, the message is queued for the next resume. Sending to your own
     completed CLI child reopens it (the message becomes its next turn, resumed
     with full prior context) — the answer path for a child that completed with
-    a "[needs clarification]" question (#356 follow-up).
+    a "[needs clarification]" question (follow-up).
   - **check**: non-blocking status snapshot of any session.
   - **yield_until**: terminate the caller's session until specified children
     reach a terminal state; on resume, children's outputs are injected as a
@@ -90,7 +90,7 @@ SPAWN_MODELS = ("claude", "local", "remote", "hermes", *CLI_ROUTINGS)
 # harness, not a CLI child this worker manages. Hermes belongs here for the
 # same reason claude_code/codex do: it's not billed via the Anthropic API,
 # so a Hermes-rooted lineage opening `model="claude"` would be an
-# undisclosed API-billed side door (#640, extending #578 / ADR-018).
+# undisclosed API-billed side door (see ADR-018).
 NON_API_BILLED_ROOT_ROUTINGS = CLI_ROUTINGS + (HERMES_ROUTING,)
 
 
@@ -395,7 +395,7 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
             "model or execution.executor must name a supported executor",
             code="invalid_arg",
         )
-    # Optional Claude tier for claude_code children (#349). Ignored for other
+    # Optional Claude tier for claude_code children. Ignored for other
     # engines so the caller can pass it uniformly without an error.
     tier = (args.get("tier") or "").strip().lower() or None
     if tier and tier not in ("haiku", "sonnet", "opus"):
@@ -423,7 +423,7 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
     # A subscription-billed lineage must not be able to open an API-billed side
     # door. `model="claude"` runs the child on Managed Agents — the Anthropic
     # API — so a lineage rooted in a CLI session (the doctor, and every other
-    # orchestrator the worker drives through Claude Code) is refused it (#578).
+    # orchestrator the worker drives through Claude Code) is refused it.
     # Read from the ROOT, not the caller, so an intermediate local child can't
     # launder the spawn. This is what makes "CLI routes are subscription-billed"
     # above a fact rather than an assumption — the sibling half is the
@@ -559,13 +559,13 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
         root_session_id=root,
         spawn_depth=new_depth,
         claude_code_model=claude_code_model,
-        # #684 review: inherit the caller's bot ownership (e.g. "doctor" for
+        # Inherit the caller's bot ownership (e.g. "doctor" for
         # a Hermes doctor-persona conversation, via hermes_session.py) so the
         # worker's own status/blocked/completion notices for this child
         # route to the same Telegram bot the caller answers on, and that
         # bot's threaded-reply resume (scoped to its own `bot`) can find
         # them. `caller.bot` is already `None` for a primary-rooted lineage
-        # and for every pre-existing (pre-#684) Hermes/CLI root, so this is
+        # and for every pre-existing Hermes/CLI root, so this is
         # additive — a lineage that never had bot ownership still doesn't.
         bot=caller.bot,
         model=(caller.model if caller.routing == provisional_routing else None),
@@ -693,7 +693,7 @@ def send(ctx: InterAgentContext, args: dict) -> dict:
     target = ctx.session_store.get_by_session_id(target_id)
     if target is None:
         return _err(f"session {target_id} not found", code="not_found")
-    # Reopen-on-send (#356 follow-up): a spawned CLI child that hits a genuine
+    # Reopen-on-send (follow-up): a spawned CLI child that hits a genuine
     # fork folds "[needs clarification] …" into its output and COMPLETES (a
     # BLOCKED child would strand its yielded parent). But its CLI session
     # persists on disk under claude_code_session_id, so the direct parent can
@@ -892,7 +892,7 @@ def yield_until(ctx: InterAgentContext, args: dict) -> dict:
 
 
 # How long to wait between a SIGTERM and the follow-up SIGKILL when reaping a
-# local CLI subprocess (#379) — a brief grace for the process to exit cleanly.
+# local CLI subprocess — a brief grace for the process to exit cleanly.
 _LOCAL_KILL_GRACE_S = 2.0
 _LOCAL_KILL_POLL_S = 0.1
 
@@ -900,7 +900,7 @@ _LOCAL_KILL_POLL_S = 0.1
 def _kill_remote_subprocess(
     transcript_store: TranscriptStore, target: Session, *, remote_kill_runner=None,
 ) -> None:
-    """(#851) Best-effort terminate a CLI subprocess a `claude_code`/`codex`
+    """Best-effort terminate a CLI subprocess a `claude_code`/`codex`
     executor spawned on a board-assigned HOST other than the API host.
 
     Signalling a local pid/pgid (as `_kill_local_subprocess` does) can't
@@ -937,7 +937,7 @@ def _kill_local_subprocess(
     transcript_store: TranscriptStore, target: Session, *, remote_kill_runner=None,
 ) -> None:
     """Best-effort terminate the CLI subprocess owned by a LOCAL or
-    (#851) REMOTE session.
+    REMOTE session.
 
     The `claude_code` / `codex` executors run a `subprocess.Popen` in the
     *worker* process and record its pid/process-group id via a `claude_code_pid`
@@ -950,7 +950,7 @@ def _kill_local_subprocess(
     ran a local subprocess at all — its argv was wrapped in `ssh` instead
     (see `remote_spawn.build_remote_argv`), so it's dispatched to
     `_kill_remote_subprocess` instead of the local killpg path below —
-    UNLESS no `remote_pgid` was ever recorded (round 1, finding #3): the
+    UNLESS no `remote_pgid` was ever recorded: the
     executor's pgid read can itself hang (a stalled ssh client that
     connected but never answered), in which case there's no remote process
     to signal yet and the only thing this operator kill CAN reach is the
@@ -1056,14 +1056,14 @@ def teardown_session(
 ) -> dict[str, Any]:
     """Tear down a single session: kill the managed remote (best-effort),
     flip the local DB status to FAILED, append a transcript event, and
-    (for local or #851 remote-host CLI sessions) terminate the worker-owned
+    (for local or remote-host CLI sessions) terminate the worker-owned
     subprocess.
 
     Shared between agent-initiated `kill()` (this module) and the operator
     HTTP kill endpoint (`api/routes/agents.py`). Authorization is the
     caller's responsibility — this helper just runs the mechanics.
 
-    `remote_kill_runner` (#851) is a test seam forwarded to
+    `remote_kill_runner` is a test seam forwarded to
     `_kill_remote_subprocess`/`remote_spawn.kill_remote_process_group` for a
     session whose `host` names a machine other than the API host — None
     (the default) uses a real `subprocess.run` over ssh.
@@ -1106,7 +1106,7 @@ def teardown_session(
     if not result.cancelled and not result.idempotent:
         logger.warning("cancel registry rejected %s: %s", target.session_id, result.reason)
     transcript_store.append(target.session_id, transcript_kind, transcript_payload)
-    # #379: flipping the DB to FAILED is what the executor's silent-guard keys on,
+    # flipping the DB to FAILED is what the executor's silent-guard keys on,
     # so the row is updated *before* we signal the subprocess. The status flip
     # alone doesn't stop the OS process (the worker's `claude -p` keeps running
     # until the next poll) — this reaps it promptly so an operator kill actually

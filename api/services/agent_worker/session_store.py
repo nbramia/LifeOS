@@ -17,13 +17,13 @@ from typing import Iterable
 
 
 # Anchored to the repo root (this file's own location), NOT the caller's
-# cwd (#640 review). A bare relative `Path("data/agent_sessions.db")`
+# cwd. A bare relative `Path("data/agent_sessions.db")`
 # resolves against whatever process opens it — fine for the API and worker,
 # which both run from the repo root, but Hermes runs `mcp_server.py` as a
 # stdio child from ITS OWN cwd (`~/.hermes`), so a caller relying on this
 # default would silently create and read an empty sibling DB there instead
 # of the real one, defeating the whole point of a shared caller_session_id.
-# Same fix, same reason, as `load_dotenv()` in `api/main.py` (#598) and
+# Same fix, same reason, as `load_dotenv()` in `api/main.py` and
 # `job_queue.py`'s `_DEFAULT_DB_PATH` — anchor to `__file__`, not cwd. Only
 # the DEFAULT changes: a caller that passes its own (even relative) db_path
 # explicitly still resolves that path against its own cwd, unchanged.
@@ -144,7 +144,7 @@ class Session:
     expected_output: str | None = None
     parent_session_id: str | None = None
     managed_agent_session_id: str | None = None
-    # Preset class for per-session tool filtering (#139 §3). When set,
+    # Preset class for per-session tool filtering (§3). When set,
     # ManagedExecutor.start() calls driver.update_session() with the
     # class's filtered tool list between create and the first user
     # message — scoping cache_creation to the smaller tool set.
@@ -165,7 +165,7 @@ class Session:
     # Provenance of the session. NULL/"agent" = claimed from an #agent vault
     # task; "operator" = root-spawned on demand from Telegram/chat with no
     # backing task. The worker's spawned-session dispatch picks up operator
-    # sessions even though they have no parent (#235).
+    # sessions even though they have no parent.
     origin: str | None = None
     # Claude Code CLI session UUID, captured from the subprocess's init
     # stream-json event. Set only for routing="claude_code" sessions and used
@@ -189,11 +189,11 @@ class Session:
     # an unrecognized model (pricing.is_known_model() == False). Sticky for
     # the life of the session -- unlike total_dollars, which only ever
     # accrues real priced spend, this flag exists so a reader can tell
-    # "$0.00 total" apart from "some turns couldn't be priced" (#669, same
-    # motivation as usage_store's per-row `unpriced` column from #613/#661,
-    # adapted here to an accumulating total rather than one row per turn).
+    # "$0.00 total" apart from "some turns couldn't be priced" (same
+    # motivation as usage_store's per-row `unpriced` column, adapted here
+    # to an accumulating total rather than one row per turn).
     unpriced: bool = False
-    # (#851) Board-assignment fields. `host` is a name from
+    # Board-assignment fields. `host` is a name from
     # `settings.agent_hosts` ("" / None = the API host); `model` and
     # `effort` are the board's own picker values, threaded into the
     # executor's argv at spawn time. `conversation_id` is set only for
@@ -252,7 +252,7 @@ class Occurrence:
     updated_at: int = 0
 
 
-# Engine -> storage id prefix for the `cli_sessions` table (#849). Matches
+# Engine -> storage id prefix for the `cli_sessions` table. Matches
 # the `cc:` / `cx:` convention `CCWezTermStore` and the transcript-scan
 # snapshot already use, so a cli_sessions row and its transcript-derived
 # counterpart share one id in the /agents snapshot union.
@@ -269,7 +269,7 @@ CLI_STATUS_RUNNING = "running"
 CLI_STATUS_ENDED = "ended"
 
 # Prompt previews are truncated to this many characters before storage
-# (issue #849 acceptance criteria).
+# (issue acceptance criteria).
 CLI_PROMPT_PREVIEW_MAX = 200
 
 
@@ -681,7 +681,7 @@ class SessionStore:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), isolation_level=None, timeout=10.0)
         conn.row_factory = sqlite3.Row
-        # WAL improves concurrent reader/writer behavior; safe to re-set.
+        # WAL allows concurrent readers/writers; safe to re-set.
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
@@ -711,7 +711,7 @@ class SessionStore:
                 conn.execute(
                     "ALTER TABLE pending_questions ADD COLUMN sent_message_ids TEXT"
                 )
-            # Idempotent migration for `pending_questions.bot` (#348) — scopes
+            # Idempotent migration for `pending_questions.bot` — scopes
             # reply matching to the sending bot. Legacy rows stay NULL = primary.
             if "bot" not in pq_cols:
                 conn.execute("ALTER TABLE pending_questions ADD COLUMN bot TEXT")
@@ -735,12 +735,12 @@ class SessionStore:
                     "INTEGER NOT NULL DEFAULT 0"
                 )
             # Idempotent migration for the per-session preset_class column
-            # (#139 §3 worker wiring). Old rows stay NULL → fullstack.
+            # (§3 worker wiring). Old rows stay NULL → fullstack.
             if "preset_class" not in sess_cols:
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN preset_class TEXT"
                 )
-            # Idempotent migration for the per-session origin column (#235).
+            # Idempotent migration for the per-session origin column.
             # Old rows stay NULL (treated as "agent").
             if "origin" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN origin TEXT")
@@ -758,11 +758,11 @@ class SessionStore:
                         "UPDATE sessions SET claude_code_session_id = code_session_id "
                         "WHERE claude_code_session_id IS NULL AND code_session_id IS NOT NULL"
                     )
-            # Idempotent migration for the per-session Claude Code tier (#349).
+            # Idempotent migration for the per-session Claude Code tier.
             # Old rows stay NULL → omit --model and use the CLI default.
             if "claude_code_model" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN claude_code_model TEXT")
-            # Idempotent migration for the sticky `unpriced` flag (#669). Old
+            # Idempotent migration for the sticky `unpriced` flag. Old
             # rows default to 0 (not retroactively flagged) -- a pre-existing
             # row's cost is what it is; we don't reclassify history.
             if "unpriced" not in sess_cols:
@@ -793,7 +793,7 @@ class SessionStore:
                 "WHERE kind = 'code_followup' AND processed = 0"
             )
             # Idempotent migrations for the runaway detection counters on
-            # managed_cursor (#139 Section 5).
+            # managed_cursor (Section 5).
             mc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(managed_cursor)")}
             if "tool_loop_signature" not in mc_cols:
                 conn.execute("ALTER TABLE managed_cursor ADD COLUMN tool_loop_signature TEXT")
@@ -809,9 +809,9 @@ class SessionStore:
                 )
             if "usage_snapshot_json" not in mc_cols:
                 conn.execute("ALTER TABLE managed_cursor ADD COLUMN usage_snapshot_json TEXT")
-            # Idempotent migration block for card assignment (#851): host,
+            # Idempotent migration block for card assignment: host,
             # model, effort, conversation_id, remote_pgid. Old rows stay
-            # NULL — "no assignment recorded" for a pre-#851 session.
+            # NULL — "no assignment recorded" for a pre-session.
             sess_cols = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
             if "host" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN host TEXT")
@@ -934,9 +934,9 @@ class SessionStore:
         lineage queries can find an entire family with one indexed lookup.
 
         `origin="operator"` marks a root-spawned session (no #agent task) so
-        the worker's spawned-session dispatch claims it (#235).
+        the worker's spawned-session dispatch claims it.
 
-        `host`/`model`/`effort` (#851) are the board-assignment fields
+        `host`/`model`/`effort` are the board-assignment fields
         extracted from the task's `[key:: value]` fields — see
         `assignment.extract_assignment()`. All three default to None
         ("no assignment" — the routing/executor default applies).
@@ -1897,7 +1897,7 @@ class SessionStore:
         sees plain input/output) doesn't need to update; managed sessions
         always pass all four buckets.
 
-        `unpriced` (#669) marks that `dollars` for this call came from an
+        `unpriced` marks that `dollars` for this call came from an
         unrecognized model rather than a real rate -- a **record** caller
         (the local executor, Claude Code ingest) should pass `dollars=0.0`
         and `unpriced=True` in that case rather than inventing a number. An
@@ -1941,7 +1941,7 @@ class SessionStore:
         effort: str | None = None,
         persona_id: str | None = None,
     ) -> None:
-        """Record the board-assignment fields (#851) onto a session row.
+        """Record the board-assignment fields onto a session row.
         Called once at dispatch time, right after routing/budget are set,
         so the executor reads `session.host`/`.model`/`.effort` the same
         way it already reads `session.claude_code_model`."""
@@ -2124,7 +2124,7 @@ class SessionStore:
         self, task_id: str, conversation_id: str, *,
         attempt_id: str | None = None, turn_id: str | None = None,
     ) -> bool:
-        """Attach a Hermes conversation id (#851, routing='hermes') to a
+        """Attach a Hermes conversation id (routing='hermes') to a
         session — mirrors `set_managed_session_id`."""
         where = ["task_id = ?"]
         params: list[object] = [task_id]
@@ -2185,7 +2185,7 @@ class SessionStore:
         attempt_id: str | None = None, turn_id: str | None = None,
     ) -> bool:
         """Record the process-group id a remote-spawned subprocess echoed
-        back on its first stdout line (#851) — read by the operator kill
+        back on its first stdout line — read by the operator kill
         endpoint to reach it over ssh (see `remote_spawn.py`)."""
         where = ["task_id = ?"]
         params: list[object] = [task_id]
@@ -2417,7 +2417,7 @@ class SessionStore:
         return row["final_text"]
 
     # ------------------------------------------------------------------
-    # Runaway detection state (#139 Section 5)
+    # Runaway detection state (Section 5)
     # ------------------------------------------------------------------
 
     def get_runaway_state(
@@ -2871,7 +2871,7 @@ class SessionStore:
         is the full chunk list for a split notification (defaults to just the
         first chunk). `deposit_answer` matches a reply to any chunk in the list.
         `bot` is the Telegram bot that sent the message (NULL = primary); reply
-        matching is scoped by it so bots can't collide on numeric ids (#348).
+        matching is scoped by it so bots can't collide on numeric ids.
         """
         ids = sent_message_ids or [int(sent_message_id)]
         with self._connect() as conn:
@@ -3004,7 +3004,7 @@ class SessionStore:
 
         ``bot=None`` → no scoping (legacy behavior). ``bot="primary"`` matches
         both explicit 'primary' rows and legacy NULL-bot rows; any other name
-        matches only its own rows (#348).
+        matches only its own rows.
         """
         if bot is None:
             return "", []
@@ -3047,8 +3047,8 @@ class SessionStore:
 
         The session-keyed sibling of `get_open_question_by_message_id`: a
         web/voice surface has no Telegram `sent_message_id` to match a reply
-        against, but it does know which agent session its conversation spawned
-        (#403). Returns the oldest open question so the caller can inspect its
+        against, but it does know which agent session its conversation spawned.
+        Returns the oldest open question so the caller can inspect its
         `kind` (clarification / goal_approval / followup) before depositing an
         answer onto it.
         """
@@ -3065,7 +3065,7 @@ class SessionStore:
     def deposit_answer_by_session_id(self, session_id: str, answer: str) -> bool:
         """Record an answer for `session_id`'s open question, keyed by session.
 
-        The session-keyed sibling of `deposit_answer` (#403). A web/voice
+        The session-keyed sibling of `deposit_answer`. A web/voice
         surface deposits onto the *existing* open `pending_questions` row for the
         session rather than creating a new one, so the row's `kind` is preserved
         and the worker's existing tick resumes it through the right path
@@ -3090,7 +3090,7 @@ class SessionStore:
         return True
 
     def deposit_answer_by_id(self, question_id: int, answer: str) -> bool:
-        """Record an answer for an open question by its own row id (#850).
+        """Record an answer for an open question by its own row id.
 
         Board-drawer sibling of `deposit_answer` (keyed by Telegram message
         id) and `deposit_answer_by_session_id` (keyed by session): the
@@ -3118,7 +3118,7 @@ class SessionStore:
         return True
 
     def list_open_questions(self) -> list[dict]:
-        """List unanswered, unprocessed, not-timed-out questions (#850).
+        """List unanswered, unprocessed, not-timed-out questions.
 
         Powers `GET /api/agents/pending-questions` — the board's "waiting on
         an answer" list. Scoped to `kind IN ('clarification', 'goal_approval')`
@@ -3141,7 +3141,7 @@ class SessionStore:
     def delete_session(self, session_id: str) -> None:
         """Hard-delete a session and its queued messages/questions/turns.
 
-        Used to clean up an operator spawn that couldn't be routed (preflight
+        Cleans up an operator spawn that couldn't be routed (preflight
         returned `ask` but the calling surface has no clarification flow), so it
         doesn't linger as a permanently-blocked thread.
         """
@@ -3192,7 +3192,7 @@ class SessionStore:
             )
 
     def enqueue_web_followup(self, session_id: str, task_id: str, answer: str) -> int:
-        """Queue a follow-up turn from a non-Telegram surface (web /chat, #236).
+        """Queue a follow-up turn from a non-Telegram surface (web /chat).
 
         Inserts a pre-answered `kind='followup'` row so the worker's
         `_process_clarification_answers` tick picks it up and reopens the
@@ -3275,8 +3275,8 @@ class SessionStore:
         self, bot: str | None = None, kind: str | None = None
     ) -> dict | None:
         """The most recent open (unanswered, not-timed-out) question, optionally
-        filtered by owning bot and kind. Used to route a bare affirmative sent
-        as a plain message to the goal gate it almost certainly answers (#453)
+        filtered by owning bot and kind. Routes a bare affirmative sent
+        as a plain message to the goal gate it almost certainly answers
         instead of spawning a context-free session."""
         bot_clause, bot_params = self._bot_scope_clause(bot)
         kind_clause = " AND kind = ?" if kind else ""
@@ -3856,7 +3856,7 @@ class SessionStore:
         return cur.rowcount == 1
 
     # ------------------------------------------------------------------
-    # Cross-machine CLI sessions (#849)
+    # Cross-machine CLI sessions
     # ------------------------------------------------------------------
 
     def record_cli_session_event(

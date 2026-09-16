@@ -17,7 +17,7 @@ from typing import Any, Iterable
 
 
 # Anchored to the repo root, not the caller's cwd — same reasoning as
-# `session_store.DEFAULT_DB_PATH` (#640 review): Hermes runs `mcp_server.py`
+# `session_store.DEFAULT_DB_PATH`: Hermes runs `mcp_server.py`
 # as a stdio child from its own cwd, and a bare relative default here would
 # have it write/read transcripts under that cwd instead of the real
 # `data/agent_transcripts/`.

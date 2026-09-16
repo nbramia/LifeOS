@@ -1,11 +1,11 @@
 """Single source of the inter-agent delegation guidance injected into worker
 executor system prompts (claude_code, codex, local).
 
-Before this module the same spawn → monitor → read mechanic was copy-pasted
-into three executors with slightly different wording, so renaming a
-``lifeos_agent_*`` tool meant editing three files. The tool names and the
-shared blurb now live here; each executor still composes its own framing
-(recommended model, trigger, surrounding context) around the shared core.
+The tool names and the shared blurb live here as a single source of truth,
+so renaming a ``lifeos_agent_*`` tool means editing one file instead of
+duplicating the spawn → monitor → read mechanic's wording across the three
+executors. Each executor still composes its own framing (recommended
+model, trigger, surrounding context) around the shared core.
 """
 
 # lifeos_agent_* tool names — the rename-fragile surface the three executors

@@ -90,7 +90,7 @@ def _delegation_header(session_id: str) -> str:
 # Reason codes returned in ``ExecutorOutcome.reason``.
 REASON_TIMEOUT = "timeout"
 REASON_BINARY_NOT_FOUND = "binary_not_found"
-# #379: parity with ClaudeCodeExecutor — an operator kill flips the row to
+# parity with ClaudeCodeExecutor — an operator kill flips the row to
 # FAILED and signals this subprocess; we exit silently under this reason so the
 # worker skips the spurious "session failed" notice.
 REASON_KILLED = "killed"
@@ -206,7 +206,7 @@ class CodexExecutor:
         ))
 
     def resume(self, session, message: str, working_dir: Optional[str] = None) -> ExecutorOutcome:
-        """Resume a previously-completed /codex session via
+        """Resume an already-completed /codex session via
         ``codex exec resume <thread_id> [PROMPT]``.
         """
         # Reuses the claude_code_session_id column; routing='codex' disambiguates.
@@ -253,10 +253,10 @@ class CodexExecutor:
             "-C", working_dir,
             "-o", last_message_file,
         ]
-        # (#851) Board-assigned model/effort. Neither flag was previously
-        # passed at all — codex took whatever `~/.codex/config.toml` said.
+        # Board-assigned model/effort. When neither flag is passed, codex
+        # falls back to whatever `~/.codex/config.toml` says.
         # `--model` only when set (an unset board model keeps that
-        # behavior); effort is mapped to Codex's own
+        # fallback); effort is mapped to Codex's own
         # minimal|low|medium|high|xhigh vocabulary via the config override.
         if model:
             common = ["--model", model, *common]
@@ -303,7 +303,7 @@ class CodexExecutor:
         operator's interactive Codex context — keep CODEX_HOME so auth
         (`~/.codex/auth.json`) is preserved.
 
-        Anthropic credentials go too (#578). Codex doesn't use them itself, but
+        Anthropic credentials go too. Codex doesn't use them itself, but
         it has a shell and `claude` is on the PATH: an inherited
         ANTHROPIC_API_KEY would let a codex session start an API-billed Claude
         Code session, which — like codex itself — is exempt from the per-task
@@ -321,7 +321,7 @@ class CodexExecutor:
 
     @staticmethod
     def _remote_unset_env_names() -> list[str]:
-        """(#851) Env var names to `env -u` on a remote-spawned subprocess —
+        """Env var names to `env -u` on a remote-spawned subprocess —
         mirrors `_clean_env`'s own strip (CODEX_* except CODEX_HOME, plus
         the alternate-auth prefixes), applied to the remote command instead
         of the local one."""
@@ -349,7 +349,7 @@ class CodexExecutor:
             effort=getattr(session, "effort", None),
         )
 
-        # (#851) Board-assigned host: resolve BEFORE any spawn call. An
+        # Board-assigned host: resolve BEFORE any spawn call. An
         # unknown host name fails the task closed with no ssh invocation.
         # NOTE: the `-o last_msg_path` fallback (below) reads a LOCAL temp
         # file, which a remote CLI never writes to — remote sessions rely
@@ -388,11 +388,11 @@ class CodexExecutor:
                 cwd=working_dir,
                 text=True,
                 env=self._clean_env(sid),
-                # #379: own process-group leader so the operator kill can
+                # own process-group leader so the operator kill can
                 # `os.killpg(pgid, ...)` codex + its children without touching
                 # the worker process. Mirrors ClaudeCodeExecutor. For a remote
                 # spawn this is the local `ssh` client's own group — the
-                # remote kill path (#851) reaches the real CLI over ssh.
+                # remote kill path reaches the real CLI over ssh.
                 start_new_session=True,
             )
         except FileNotFoundError as exc:
@@ -406,15 +406,15 @@ class CodexExecutor:
         )
 
         if is_remote:
-            # (#851) Strip the remote wrapper's `PGID:<n>` first stdout line
+            # Strip the remote wrapper's `PGID:<n>` first stdout line
             # — see ClaudeCodeExecutor._run for the identical mechanism.
             #
-            # (round 1, finding #3) Bounded wait: see ClaudeCodeExecutor._run
+            # Bounded wait: see ClaudeCodeExecutor._run
             # for why this read needs a deadline of its own, ahead of the
             # wall-clock watchdog below.
             #
-            # (round 2, finding #2) Record the pid event immediately after
-            # Popen — BEFORE this deadline-bounded read — see
+            # Record the pid event immediately after
+            # Popen — ahead of this deadline-bounded read — see
             # ClaudeCodeExecutor._run for why: it's what lets the operator-
             # kill fallback reach a stalled local ssh client during the
             # read's own deadline window rather than finding no pid event.
@@ -449,7 +449,7 @@ class CodexExecutor:
                     "pid": proc.pid, "pgid": pgid, "remote": True, "host": host,
                 })
         else:
-            # #379: record the subprocess pid + pgid so the operator kill endpoint
+            # record the subprocess pid + pgid so the operator kill endpoint
             # (a separate process) can signal it via the transcript. Mirrors the
             # claude_code path; teardown scans for `codex_pid` too.
             try:
@@ -502,7 +502,7 @@ class CodexExecutor:
         state.final_text = state.final_text.strip()
         self._record_usage(session, state)
 
-        # #379: operator-kill silent guard (parity with ClaudeCodeExecutor). If
+        # operator-kill silent guard (parity with ClaudeCodeExecutor). If
         # the row is already FAILED *and the subprocess did not exit cleanly*, the
         # operator killed us mid-run — exit silently so the worker skips the
         # spurious "session failed" notice (the killpg'd subprocess returns a
@@ -573,10 +573,10 @@ class CodexExecutor:
                 "final_chars": len(state.final_text),
                 # Persist the text itself so a parent that spawned this session
                 # can read it via _child_final_text — a child's completion never
-                # streams to the operator (#429), so this is its only path out
-                # (parity with claude_code_completed, #349).
+                # streams to the operator, so this is its only path out
+                # (parity with claude_code_completed).
                 "final_text": state.final_text,
-                # #760: how the subprocess ended, parity with claude_code_completed.
+                # how the subprocess ended, parity with claude_code_completed.
                 "exit_meta": exit_meta,
             })
             return ExecutorOutcome(
@@ -602,7 +602,7 @@ class CodexExecutor:
             "returncode": proc.returncode,
             "stderr_tail": stderr_tail[-500:],
         })
-        # (round 1, finding #4) Fold the ssh failure's stderr into the
+        # Fold the ssh failure's stderr into the
         # reason on the remote path — see ClaudeCodeExecutor._run for why.
         reason = f"codex exited with code {proc.returncode}"
         if is_remote:
@@ -616,7 +616,7 @@ class CodexExecutor:
 
     @staticmethod
     def _exit_metadata(proc, timed_out: threading.Event, state: "_RunState") -> dict:
-        """Best-effort description of how the subprocess ended (#760).
+        """Best-effort description of how the subprocess ended.
         Mirrors ClaudeCodeExecutor._exit_metadata; ``stream_terminal_event_seen``
         is True only when a `turn.completed` event was actually parsed, not
         merely inferred from a clean returncode."""
@@ -758,7 +758,7 @@ class CodexExecutor:
     @staticmethod
     def _terminate_unresponsive(proc) -> None:
         """Best-effort terminate an ssh client that never answered the
-        `PGID:` read within its deadline (round 1, finding #3). Mirrors
+        `PGID:` read within its deadline. Mirrors
         `_on_timeout`'s terminate/wait/kill sequence minus the timed_out
         flag (there is no watchdog running yet at this point — this read
         happens BEFORE it starts). Mirrors ClaudeCodeExecutor's identical
@@ -775,7 +775,7 @@ class CodexExecutor:
 
     @staticmethod
     def _on_timeout(proc, timed_out: threading.Event) -> None:
-        # MUST NOT write a terminal status to the session row. The #379 kill-guard
+        # MUST NOT write a terminal status to the session row. The kill-guard
         # (in execute(), after proc.wait()) keys on the row being FAILED to detect
         # an operator kill; a timed-out session must still be RUNNING when the
         # guard checks so the timeout path — not REASON_KILLED — claims it. This

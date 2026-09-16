@@ -47,7 +47,7 @@ from api.services.agent_worker.usage_ledger import (
 logger = logging.getLogger(__name__)
 
 
-# Runaway detection thresholds (#139 Section 5). Picked behaviorally, not
+# Runaway detection thresholds (Section 5). Picked behaviorally, not
 # from cost/wall time, because thresholds based on tokens or seconds vary
 # with task class; tool-call counts scale uniformly across task types.
 TOOL_LOOP_KILL_THRESHOLD = 4
@@ -245,7 +245,7 @@ class ManagedExecutor:
         """Create the remote session, apply the per-class tool filter (if any),
         and post the initial user message.
 
-        Flow (#139 §3):
+        Flow (§3):
           1. POST /v1/sessions — container provisioned, no LLM cost yet.
           2. POST /v1/sessions/{id} with the per-class tool filter (full
              agent.tools replacement). Skipped for `preset_class=fullstack`
@@ -413,7 +413,7 @@ class ManagedExecutor:
             stored = _truncate_oversized_tool_result(event)
             self.transcript_store.append(sid, f"managed_event_{stored.get('type', 'unknown')}", stored)
 
-        # Update runaway counters from the new events (#139 Section 5).
+        # Update runaway counters from the new events (Section 5).
         runaway_kind = self._detect_runaway(
             session.task_id, state.new_events,
             attempt_id=session.attempt_id, turn_id=session.turn_id,

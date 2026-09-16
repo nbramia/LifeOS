@@ -1,4 +1,4 @@
-"""Hermes turn -> agent-worker session identity (#640).
+"""Hermes turn -> agent-worker session identity.
 
 Hermes runs `mcp_server.py` as a stdio MCP server and gets the whole
 `lifeos_agent_*` family advertised to it (see `inter_agent.py`), but every
@@ -98,7 +98,7 @@ def resolve_hermes_caller_session_id(
     of a brand-new conversation — see module docstring) always mints a
     fresh, one-off session instead.
 
-    `bot` (#684 review) tags this root session with the persona it was
+    `bot` tags this root session with the persona it was
     resolved for — the same `bot` a Telegram-spawned session carries (e.g.
     ``"doctor"``; ``None``/``"primary"`` for the default persona). Without
     this, every `lifeos_agent_spawn` descendant of a Hermes turn inherited no
