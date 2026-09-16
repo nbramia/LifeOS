@@ -1484,6 +1484,11 @@ class Settings(BaseSettings):
         alias="LIFEOS_CLAUDE_BINARY",
         description="Path to claude CLI binary (or just 'claude' if on PATH)"
     )
+    codex_binary: str = Field(
+        default="codex",
+        alias="LIFEOS_CODEX_BINARY",
+        description="Path to codex CLI binary (or just 'codex' if on PATH)"
+    )
     claude_timeout_seconds: int = Field(
         default=3600,
         alias="LIFEOS_CLAUDE_TIMEOUT",

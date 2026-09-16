@@ -22,7 +22,6 @@ import logging
 import os
 import re
 import signal
-import shutil
 import inspect
 import sys
 import threading
@@ -41,6 +40,7 @@ if TYPE_CHECKING:
 from api.services.agent_worker import doctor_repair
 from api.services.agent_worker.completion_signal import has_positive_completion_signal
 from api.services.agent_worker.assignment import ENGINE_HERMES, extract_assignment
+from api.services.agent_worker.binary_resolver import describe_candidates, resolve_binary
 from api.services.agent_worker.executor_lifecycle import (
     CancelResult,
     ExecutorRegistry,
@@ -4141,11 +4141,20 @@ class Worker:
             if settings.agent_remote_executor and settings.remote_llm_configured
             else BillingClass.LOCAL_FREE
         )
-        def command_state(command: str) -> ReadinessState:
-            expanded = os.path.expanduser(command)
-            if os.path.isabs(expanded):
-                return ReadinessState.READY if os.path.isfile(expanded) and os.access(expanded, os.X_OK) else ReadinessState.UNAVAILABLE
-            return ReadinessState.READY if shutil.which(expanded) else ReadinessState.UNAVAILABLE
+        def cli_readiness(command: str) -> tuple[ReadinessState, str | None]:
+            resolution = resolve_binary(command)
+            if resolution.ready:
+                return ReadinessState.READY, None
+            return ReadinessState.UNAVAILABLE, f"searched: {describe_candidates(resolution)}"
+
+        claude_code_state, claude_code_detail = (
+            (ReadinessState.READY, None) if self._claude_code_executor is not None
+            else cli_readiness(settings.claude_binary)
+        )
+        codex_state, codex_detail = (
+            (ReadinessState.READY, None) if self._codex_executor is not None
+            else cli_readiness(settings.codex_binary)
+        )
 
         from api.services.agent_worker.remote_spawn import api_host_name
 
@@ -4168,10 +4177,10 @@ class Worker:
                               catalog=CatalogFacts(CatalogState.UNKNOWN), billing=BillingClass.METERED),
                 ExecutorFacts("hermes", readiness=(ReadinessState.READY if self._hermes_executor is not None or settings.hermes_backend_url else ReadinessState.UNCONFIGURED),
                               catalog=CatalogFacts(CatalogState.UNCONFIGURED), billing=BillingClass.UNKNOWN),
-                ExecutorFacts("claude_code", readiness=(ReadinessState.READY if self._claude_code_executor is not None else command_state(settings.claude_binary)),
+                ExecutorFacts("claude_code", readiness=claude_code_state, unavailable_detail=claude_code_detail,
                               capabilities=("filesystem", "shell", "browser", "lifeos_mcp"),
                               catalog=CatalogFacts(CatalogState.UNKNOWN), billing=BillingClass.SUBSCRIPTION),
-                ExecutorFacts("codex", readiness=(ReadinessState.READY if self._codex_executor is not None else command_state(getattr(settings, "codex_binary", "codex"))),
+                ExecutorFacts("codex", readiness=codex_state, unavailable_detail=codex_detail,
                               capabilities=("filesystem", "shell", "lifeos_mcp"),
                               catalog=CatalogFacts(CatalogState.UNKNOWN), billing=BillingClass.SUBSCRIPTION),
             ),

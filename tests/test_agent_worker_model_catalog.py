@@ -6,6 +6,8 @@ Every provider is a stub — no network call is ever made.
 from __future__ import annotations
 
 import json
+import shutil
+import stat
 from pathlib import Path
 
 import pytest
@@ -327,7 +329,7 @@ async def test_empty_valid_unconfigured_and_unknown_are_distinct(tmp_path, monke
         clock=_FrozenClock(1),
     ).get(ttl_seconds=100)
     assert result["engine_states"]["claude"]["state"] == "unconfigured"
-    monkeypatch.setattr("api.services.agent_worker.model_catalog.shutil.which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr("api.services.agent_worker.binary_resolver.shutil.which", lambda _: "/usr/bin/codex")
     result = await ModelCatalog(
         codex_cache_path=str(tmp_path / "missing.json"),
         local_probe=_noop_local_probe,
@@ -386,7 +388,7 @@ async def test_keyless_codex_cli_is_ready_without_discovery_or_quota(tmp_path, m
 
     monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
     monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
-    monkeypatch.setattr("api.services.agent_worker.model_catalog.shutil.which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr("api.services.agent_worker.binary_resolver.shutil.which", lambda _: "/usr/bin/codex")
     result = await ModelCatalog(
         codex_cache_path=str(tmp_path / "missing.json"),
         local_probe=_noop_local_probe,
@@ -406,7 +408,7 @@ async def test_facts_adapter_and_legacy_fields_are_stable(tmp_path, monkeypatch)
     monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
     # Every CLI engine's catalog state is derived from whether its binary
     # resolves on PATH, so pin that rather than inheriting the host's.
-    monkeypatch.setattr("api.services.agent_worker.model_catalog.shutil.which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr("api.services.agent_worker.binary_resolver.shutil.which", lambda _: "/usr/bin/codex")
     result = await ModelCatalog(
         codex_cache_path=str(tmp_path / "missing.json"),
         local_probe=_noop_local_probe,
@@ -421,3 +423,47 @@ async def test_facts_adapter_and_legacy_fields_are_stable(tmp_path, monkeypatch)
     assert isinstance(facts["codex"]["model_ids"], tuple)
     assert facts["claude_code"]["catalog_state"] == "unknown"
     assert facts["remote"]["catalog_state"] == "unknown"
+
+
+def _make_fallback_only_executable(tmp_path: Path, command: str) -> Path:
+    """Place an executable only under a fake ``~/.local/bin`` — the shared
+    resolver's fallback search location, not PATH."""
+    fake_home = tmp_path / "home"
+    target = fake_home / ".local" / "bin" / command
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(target.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return fake_home
+
+
+def test_codex_readiness_resolves_via_fallback_search_not_which_alone(monkeypatch, tmp_path):
+    """`ModelCatalog._codex_readiness()` must use the full resolver (PATH,
+    then the known fallback install directories), not `shutil.which` alone.
+    A bare configured command, a process PATH that doesn't resolve it, and
+    the executable present only in `~/.local/bin` — this must read as
+    ready. A `_codex_readiness()` that degrades to `shutil.which` alone
+    reports unavailable here and fails this test."""
+    from config.settings import settings
+
+    fake_home = _make_fallback_only_executable(tmp_path, "codex")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(shutil, "which", lambda _cmd: None)
+    monkeypatch.setattr(settings, "codex_binary", "codex", raising=False)
+
+    assert ModelCatalog._codex_readiness() == "ready"
+
+
+def test_claude_binary_presence_probe_resolves_via_fallback_search(monkeypatch, tmp_path):
+    """The `claude_binary_presence` readiness emitted by `facts_from_catalog`
+    must likewise use the full resolver rather than `shutil.which` alone,
+    for the same bare-command/blocked-PATH/fallback-only shape."""
+    from config.settings import settings
+
+    fake_home = _make_fallback_only_executable(tmp_path, "claude")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(shutil, "which", lambda _cmd: None)
+    monkeypatch.setattr(settings, "claude_binary", "claude", raising=False)
+
+    facts = facts_from_catalog({})
+    assert facts["claude_code"]["readiness"] == "ready"
+    assert facts["claude_code"]["readiness_source"] == "claude_binary_presence"
