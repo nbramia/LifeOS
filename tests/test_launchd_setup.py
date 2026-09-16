@@ -608,7 +608,7 @@ def _make_main_sandbox(tmp_path: Path, template_body: str) -> tuple[Path, Path, 
     (repo / "config" / "launchd" / "com.lifeos.api.plist.template").write_text(
         template_body, encoding="utf-8"
     )
-    # _GOOD_TEMPLATE's ProgramArguments routes through this wrapper (#776) —
+    # _GOOD_TEMPLATE's ProgramArguments routes through this wrapper —
     # check_paths_exist validates it exists and is executable.
     wrapper = repo / "scripts" / "launchd-env-wrapper.sh"
     wrapper.write_text("#!/bin/bash\n")
@@ -754,7 +754,7 @@ def test_main_does_not_abort_over_the_never_installed_chromadb_template(tmp_path
 
 
 # ---------------------------------------------------------------------------
-# #774 — conditionally-installed agent-worker and mcp-http services
+# Conditionally-installed agent-worker and mcp-http services
 # ---------------------------------------------------------------------------
 _AGENT_WORKER_TEMPLATE = (
     REPO_ROOT / "config" / "launchd" / "com.lifeos.agent-worker.plist.template"
@@ -888,7 +888,7 @@ def test_main_rerun_with_autostart_still_enabled_leaves_agent_worker_untouched(t
 
 
 # ---------------------------------------------------------------------------
-# #830 — conditionally-installed local LLM (llama-server) service
+# Conditionally-installed local LLM (llama-server) service
 # ---------------------------------------------------------------------------
 _LLM_TEMPLATE = REPO_ROOT / "config" / "launchd" / "com.lifeos.llm.plist.template"
 

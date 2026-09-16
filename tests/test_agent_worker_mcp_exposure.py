@@ -25,7 +25,7 @@ def server(monkeypatch, tmp_path: Path):
     test that also wants a bare `SessionStore()`/`TranscriptStore()` to land
     in this sandbox must still pass the monkeypatched constant explicitly
     (see `test_call_api_dispatches_to_inter_agent_handler`), since both
-    classes' own defaults are now repo-root-anchored too (#640 review), not
+    classes' own defaults are repo-root-anchored too, not
     cwd-relative.
     """
     monkeypatch.setenv("LIFEOS_AGENT_VAULT_ID", "")
@@ -155,8 +155,8 @@ def test_call_api_dispatches_to_inter_agent_handler(server):
     """End-to-end MCP → inter_agent.dispatch path."""
     # Must point at the SAME db `_handle_inter_agent` resolves to -- the
     # fixture's monkeypatched `mcp_server.AGENT_SESSIONS_DB`, not a bare
-    # `SessionStore()`. `SessionStore`'s own default is now repo-root-anchored
-    # (#640 review), so a bare default here would (correctly) resolve to the
+    # `SessionStore()`. `SessionStore`'s own default is repo-root-anchored,
+    # so a bare default here would (correctly) resolve to the
     # real repo db regardless of the fixture's `monkeypatch.chdir(tmp_path)`,
     # missing the session this test just created.
     from api.services.agent_worker.session_store import (

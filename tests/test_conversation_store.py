@@ -905,7 +905,7 @@ class TestConversationWorkflow:
 
 
 # =============================================================================
-# Agent-session reverse lookup (#311)
+# Agent-session reverse lookup
 # =============================================================================
 
 @pytest.mark.unit

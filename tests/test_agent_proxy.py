@@ -112,7 +112,7 @@ async def test_503_when_not_configured(monkeypatch):
 
 
 async def test_malformed_json_is_forwarded_unmodified(proxy_client):
-    # Unlike the Hermes route (#590), the Agent route has no transform_body —
+    # Unlike the Hermes route, the Agent route has no transform_body —
     # it stays a pure byte relay and never parses the body as JSON, so even a
     # malformed body is forwarded as-is rather than rejected.
     resp = await proxy_client.post(

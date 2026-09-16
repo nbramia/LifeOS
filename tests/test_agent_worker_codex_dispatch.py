@@ -99,7 +99,7 @@ def _make_worker(tmp_path: Path, codex_executor, *, plain_sends, withid_sends):
 def test_codex_completion_sends_final_once_and_registers_anchor(tmp_path: Path):
     plain_sends: list[str] = []
     withid_sends: list[str] = []
-    # Long enough and non-fragment-shaped to earn completion (#760) — codex
+    # Long enough and non-fragment-shaped to earn completion — codex
     # has no [NOTIFY] convention, so this test's final text must itself read
     # as a finished summary rather than exercise the earned-completion gate.
     final_text = "Done: found 3 events on the calendar for today."
@@ -309,7 +309,7 @@ def test_codex_child_failure_sends_no_operator_notice(tmp_path: Path):
     assert not any("failed" in s.lower() for s in plain_sends)
     assert withid_sends == []
     assert worker.session_store.get("cx-child").status == STATUS_FAILED
-    # #433: the reason is persisted for the parent's resume turn.
+    # The reason is persisted for the parent's resume turn.
     events = worker.transcript_store.read(child.session_id)
     reasons = [e["payload"]["reason"] for e in events if e["kind"] == "child_failed_internal"]
     assert reasons == ["boom"]
@@ -332,7 +332,7 @@ def test_codex_child_budget_notice_gated(tmp_path: Path):
 
     assert not any("budget" in s.lower() for s in plain_sends)
     assert worker.session_store.get("cx-child").status == STATUS_BUDGET_EXCEEDED
-    # #433: the reason is persisted for the parent's resume turn.
+    # The reason is persisted for the parent's resume turn.
     events = worker.transcript_store.read(child.session_id)
     reasons = [e["payload"]["reason"]
                for e in events if e["kind"] == "child_budget_exceeded_internal"]
@@ -403,7 +403,7 @@ def test_codex_operator_killed_does_not_mirror_to_web(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Web-thread result mirroring (#311). Codex has no rich [NOTIFY] stream, so the
+# Web-thread result mirroring. Codex has no rich [NOTIFY] stream, so the
 # terminal completion/failure mirror is the whole web round-trip for it.
 # ---------------------------------------------------------------------------
 
@@ -524,7 +524,7 @@ def test_codex_clean_env_drops_anthropic_credentials(monkeypatch):
 
 
 # =============================================================================
-# #760 — earned completion / interrupted CLI sessions (codex parity)
+# Earned completion / interrupted CLI sessions (codex parity)
 # =============================================================================
 
 FIELD_FRAGMENT = "Now update the cancel test to drop the no-longer-needed release:"

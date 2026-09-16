@@ -330,7 +330,7 @@ def test_env_stale_false_when_no_env_mtime_at_all(tmp_path: Path):
 
 # ---------------------------------------------------------------------------
 # sync_in_progress_lock_acquire/_release — shared with scripts/auto-deploy.sh
-# and scripts/run_all_syncs.py (#793); also gives this script mutual
+# and scripts/run_all_syncs.py; also gives this script mutual
 # exclusion between two overlapping invocations of itself.
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
@@ -885,7 +885,7 @@ def test_main_skips_when_api_service_not_running(tmp_path: Path):
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo, _origin, _code_epoch = _make_policy_repo_macos(tmp_path)
-    # Found on review (#833): unlike every sibling test here, this one used a
+    # Found on review: unlike every sibling test here, this one used a
     # bare subprocess.run() with no `env=` override, so main()'s
     # sync_in_progress_lock_acquire resolved SYNC_LOCK_FILE against the REAL
     # $HOME — a shared machine's actual `~/.lifeos/sync.lock`, contended by

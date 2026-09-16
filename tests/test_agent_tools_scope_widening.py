@@ -1205,7 +1205,7 @@ class TestCalendarAccountFailureDisclosure:
         assert "returned an error" in out
         assert any(word in out.lower() for word in FAULT_WORDS)
 
-    # -- API failures, not just credential failures (issue #536) -------------
+    # -- API failures, not just credential failures -------------
     # The credential path was fixed first, so an expired token surfaced. A 403, a
     # 429, a 500 or a quota event still died in
     # `CalendarService._fetch_events`'s `except Exception: return []` and came

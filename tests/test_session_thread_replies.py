@@ -177,7 +177,7 @@ class TestCompletedWithPendingReopens:
                         session.session_id, "operator", "(operator note) also check X",
                     )
                 self.store.update_status(session.task_id, STATUS_COMPLETED)
-                # notifications_sent=1 earns the completion (#760) — these
+                # notifications_sent=1 earns the completion — these
                 # tests are about the reopen-for-pending-messages tail, not
                 # the earned-completion gate itself.
                 return ExecutorOutcome(

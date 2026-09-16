@@ -216,7 +216,7 @@ def _open_voice_chat_short_idle_timeout(page: Page, base_url, ms):
     page.wait_for_selector("#voiceListen")
 
 
-# Listening (#710) ships on by default and acquires its own mic stream the
+# Listening ships on by default and acquires its own mic stream the
 # instant voice mode is entered -- before a test's first `page.evaluate()`/
 # `.uncheck()` call could possibly race it off. Tests that assert on
 # `__gumCalls` (endpointing must never be a SECOND getUserMedia call) seed
@@ -426,7 +426,7 @@ class TestCancelledDuringCheck:
         page.locator("#voiceTalkBtn").click(force=True)
         page.wait_for_function("window.__recorderStopCalls === 1")
 
-        # A manual stop stays stopped, even with Auto on (#721) -- so start
+        # A manual stop stays stopped, even with Auto on -- so start
         # the next recording the way a user would, by tapping again. This is
         # the case the token guard exists for: a *different* recording is now
         # live than the one the in-flight check transcribed.

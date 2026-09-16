@@ -67,7 +67,7 @@ async def test_search_finances_investments_lists_all_positions(tmp_path, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# Configurable sync directory (#767) — default-matches-hardcoded-path is
+# Configurable sync directory — default-matches-hardcoded-path is
 # covered by tests/test_settings.py; these cover the two call sites.
 # ---------------------------------------------------------------------------
 
@@ -167,7 +167,7 @@ def test_freshness_just_over_threshold_warns(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Big-mover alert (#463)
+# Big-mover alert
 # ---------------------------------------------------------------------------
 
 async def test_movers_reports_positions_past_threshold(monkeypatch):
@@ -241,7 +241,7 @@ def test_scheduler_endpoint_prefers_scheduler_message_field():
 
 
 # ---------------------------------------------------------------------------
-# On-demand movers via search_finances (#468)
+# On-demand movers via search_finances
 # ---------------------------------------------------------------------------
 
 async def test_search_finances_movers_action(monkeypatch):

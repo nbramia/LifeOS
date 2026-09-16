@@ -53,7 +53,7 @@ class TestRegistryLoader:
         assert (bot.name, bot.token, bot.chat_id, bot.persona) == (
             "fitness", "fit-token-123", "555", "FIT PERSONA"
         )
-        # #684: every registry entry defaults to the Hermes backend.
+        # Every registry entry defaults to the Hermes backend.
         assert bot.backend == "hermes"
 
     def test_backend_defaults_to_hermes(self, tmp_path, monkeypatch):
@@ -482,7 +482,7 @@ class TestChatViaApiPersona:
 
 
 # ---------------------------------------------------------------------------
-# chat_via_api's backend selection (#684): persona_id, target URL, and the
+# chat_via_api's backend selection: persona_id, target URL, and the
 # HermesUnavailable signal a hermes-backend caller retries on.
 # ---------------------------------------------------------------------------
 
@@ -611,7 +611,7 @@ class TestChatViaApiBackendSelection:
 
 
 # ---------------------------------------------------------------------------
-# Listener-level Hermes fallback + one-time disclosure (#684)
+# Listener-level Hermes fallback + one-time disclosure
 # ---------------------------------------------------------------------------
 
 class TestHermesFallback:

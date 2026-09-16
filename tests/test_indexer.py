@@ -272,7 +272,7 @@ This is freshly created content about testing.
 """)
 
         # Wait for the watcher's batch debounce to flush and index the file,
-        # rather than sleeping a fixed duration that can undershoot it (#839).
+        # rather than sleeping a fixed duration that can undershoot it.
         def _indexed():
             return any(fp.endswith("new_note.md") for fp in indexer.vector_store.get_all_file_paths())
 
@@ -330,7 +330,7 @@ This is freshly created content about testing.
         test_file.unlink()
 
         # Wait for the watcher's batch debounce to flush and remove the file,
-        # rather than sleeping a fixed duration that can undershoot it (#839).
+        # rather than sleeping a fixed duration that can undershoot it.
         def _removed():
             return not any(fp.endswith("to_delete.md") for fp in indexer.vector_store.get_all_file_paths())
 

@@ -157,7 +157,7 @@ def test_remote_host_wraps_argv_in_ssh_and_captures_pgid(tmp_path, monkeypatch):
     session = store.create(task_id="t1", routing="claude_code", host="studio", claude_code_model="opus")
     outcome = executor.execute(session, {"description": "do the thing"})
     assert outcome.status != STATUS_FAILED
-    # Round 1, finding #9: prove the pgid-line strip leaves the JSON stream
+    # Prove the pgid-line strip leaves the JSON stream
     # aligned — the `_RESULT_EVENT`'s own text must still reach `final_text`
     # unscathed, not just status/argv/pgid.
     assert outcome.final_text == "done"

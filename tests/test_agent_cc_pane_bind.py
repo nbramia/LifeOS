@@ -423,7 +423,7 @@ def test_focus_resolves_session_without_calling_discover_sessions(
 
 
 # ---------------------------------------------------------------------------
-# #257 — cache invalidation across wezterm restart
+# Cache invalidation across wezterm restart
 # ---------------------------------------------------------------------------
 
 

@@ -163,7 +163,7 @@ class TestAgentThreadsUI:
 
     def test_small_thread_renders_without_load_earlier(self, page: Page):
         # The 2-turn fixture is below the cap, so no "load earlier" control
-        # appears and both turns render — small threads stay unchanged (#270).
+        # appears and both turns render — small threads stay unchanged.
         page.locator("#agentsThreadsList .agent-thread").first.click()
         expect(page.locator(".agent-thread-banner")).to_be_visible(timeout=8000)
         expect(page.locator(".thread-load-earlier")).to_have_count(0)

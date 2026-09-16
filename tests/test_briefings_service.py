@@ -20,7 +20,7 @@ from api.services.entity_resolver import EntityResolver
 # with its default (real, unmocked) entity_resolver/interaction_store
 # singletons rather than isolated fixtures — they happen to tolerate an
 # empty DB gracefully in this worktree, but they're not isolated, so
-# `integration` is the accurate label (#682).
+# `integration` is the accurate label.
 
 
 @pytest.fixture

@@ -1054,7 +1054,7 @@ def test_dispatch_handles_handler_exception(store, transcript, parent, monkeypat
 
 
 # ---------------------------------------------------------------------------
-# #379 — teardown_session reaps the local CLI subprocess
+# teardown_session reaps the local CLI subprocess
 # ---------------------------------------------------------------------------
 
 
@@ -1284,7 +1284,7 @@ def test_teardown_managed_session_skips_local_kill_but_does_managed(
 
 
 # ---------------------------------------------------------------------------
-# spawn — a subscription-billed lineage cannot spawn an API-billed child (#578)
+# spawn — a subscription-billed lineage cannot spawn an API-billed child
 # ---------------------------------------------------------------------------
 
 def _cli_root(store: SessionStore, routing: str = "claude_code"):

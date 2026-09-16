@@ -661,7 +661,7 @@ def test_managed_session_cost_partial_hour():
 
 
 # ---------------------------------------------------------------------------
-# Prompt-cache token buckets (#137)
+# Prompt-cache token buckets
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit

@@ -17,7 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 # In-process TestClient against real production data (no mocks) — needs a
-# populated CRM DB, so this is integration, not unit (#682).
+# populated CRM DB, so this is integration, not unit.
 pytestmark = pytest.mark.integration
 
 

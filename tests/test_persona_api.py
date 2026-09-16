@@ -271,7 +271,7 @@ class TestListHttpPersonas:
         by_id = {p.id: p for p in settings.list_http_personas()}
         assert by_id["doctor"].capabilities == ["handoff", "agent"]
         assert by_id["fitness"].capabilities == []
-        # #643: orchestrates is real, not inferred from capabilities — doctor
+        # Orchestrates is real, not inferred from capabilities — doctor
         # and primary share identical capabilities but only doctor orchestrates.
         assert by_id["doctor"].orchestrates is True
         assert by_id["fitness"].orchestrates is False
@@ -369,7 +369,7 @@ class TestResolvePersona:
 
 
 # ---------------------------------------------------------------------------
-# Surface-specific persona variants (#641): doctor's execution model differs
+# Surface-specific persona variants: doctor's execution model differs
 # on Hermes (MCP tools, no shell) from Telegram/web (a headless Claude Code
 # session) — resolve_persona(surface=...) picks a sibling `<stem>.<surface>
 # <suffix>` file when one exists and falls back to the default body otherwise.
@@ -473,7 +473,7 @@ class TestSurfaceVariantPersona:
 
 
 # ---------------------------------------------------------------------------
-# Persona frontmatter loader (#390 Phase 1)
+# Persona frontmatter loader
 # ---------------------------------------------------------------------------
 
 class TestPersonaFrontmatter:
@@ -550,7 +550,7 @@ class TestPersonaFrontmatter:
 
 
 # ---------------------------------------------------------------------------
-# Voice-awareness (#390 Phase 3)
+# Voice-awareness
 # ---------------------------------------------------------------------------
 
 class TestVoiceAwareness:
@@ -632,7 +632,7 @@ class TestVoiceAwareness:
 
 
 # ---------------------------------------------------------------------------
-# Personal-context resolution (#390 Phase 4)
+# Personal-context resolution
 # ---------------------------------------------------------------------------
 
 class TestPersonalContext:
@@ -694,7 +694,7 @@ class TestPersonalContext:
 
 
 # ---------------------------------------------------------------------------
-# Web-spawn for orchestrating personas (#390 Phase 5)
+# Web-spawn for orchestrating personas
 # ---------------------------------------------------------------------------
 
 class TestOrchestratingPersonaSpawn:
@@ -865,7 +865,7 @@ class TestPersonasEndpoint:
 
 class TestChatConfigEndpoint:
     def test_default_voice_reflects_setting(self, client, monkeypatch):
-        # remote_llm_* left at their unconfigured defaults (#654) — this test
+        # remote_llm_* left at their unconfigured defaults — this test
         # only cares about default_voice/secure_url.
         monkeypatch.setattr("api.routes.chat.settings.tailnet_https_url", "", raising=False)
         monkeypatch.setattr("api.routes.chat.settings.remote_llm_base_url", "", raising=False)
@@ -882,7 +882,7 @@ class TestChatConfigEndpoint:
             "voice_endpoint_silence_ms": 1600, "voice_endpoint_hard_cap_ms": 3000,
             "voice_endpoint_semantic": False, "voice_idle_timeout_ms": 10000}
 
-    # voice_endpoint_* (#718) drive the web client's smart turn endpointing
+    # voice_endpoint_* drive the web client's smart turn endpointing
     # VAD timing in auto-mode voice recording — see web/chat/voice.js.
     def test_voice_endpoint_settings_reflect_config(self, client, monkeypatch):
         monkeypatch.setattr("api.routes.chat.settings.voice_endpoint_silence_ms", 2200, raising=False)
@@ -893,7 +893,7 @@ class TestChatConfigEndpoint:
         assert data["voice_endpoint_hard_cap_ms"] == 4500
         assert data["voice_endpoint_semantic"] is True
 
-    # voice_idle_timeout_ms (#723): disjoint from voice_endpoint_* above --
+    # voice_idle_timeout_ms: disjoint from voice_endpoint_* above --
     # governs a recording that captured no speech at all, not trailing
     # silence after speech.
     def test_voice_idle_timeout_setting_reflects_config(self, client, monkeypatch):
@@ -902,7 +902,7 @@ class TestChatConfigEndpoint:
         assert data["voice_idle_timeout_ms"] == 7500
 
     # secure_url is the web client's one-tap escape from an insecure context to
-    # the HTTPS origin the mic needs (#516).
+    # the HTTPS origin the mic needs.
     def test_secure_url_reflects_tailnet_setting(self, client, monkeypatch):
         monkeypatch.setattr(
             "api.routes.chat.settings.tailnet_https_url",
@@ -1080,7 +1080,7 @@ class TestConversationsListPersonaParam:
 
 
 # ---------------------------------------------------------------------------
-# Finance persona (#458, renamed from "advisor") — validate the shipped config directly (the
+# Finance persona — validate the shipped config directly (the
 # live registry depends on the token being set, which a fresh clone won't have).
 # ---------------------------------------------------------------------------
 
@@ -1128,7 +1128,7 @@ def test_finance_registered_in_bot_registry():
 
 
 # ---------------------------------------------------------------------------
-# doctor.hermes.md — repo-scoping section stays generic (#744 revision)
+# doctor.hermes.md — repo-scoping section stays generic
 # ---------------------------------------------------------------------------
 
 _DOCTOR_HERMES_FILE = Path(__file__).parent.parent / "config" / "personas" / "doctor.hermes.md"
@@ -1157,7 +1157,7 @@ def test_doctor_hermes_still_scopes_every_spawn_goal_to_a_repo():
 
 
 # ---------------------------------------------------------------------------
-# primary.md — hands LifeOS-repair requests to doctor (#746)
+# primary.md — hands LifeOS-repair requests to doctor
 # ---------------------------------------------------------------------------
 
 _PRIMARY_FILE = Path(__file__).parent.parent / "config" / "personas" / "primary.md"

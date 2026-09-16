@@ -110,7 +110,7 @@ async def test_admin_usage_endpoint_includes_external_backend_totals(monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# `get_conversation_usage()` (#610) and the `unpriced` column (#613) —
+# `get_conversation_usage()` and the `unpriced` column —
 # session-to-date cost, and a marker distinguishing a row whose upstream
 # sent no `cost_usd` (recorded as 0.0, never invented) from a row that
 # reported a real cost of zero. Both otherwise land in this table

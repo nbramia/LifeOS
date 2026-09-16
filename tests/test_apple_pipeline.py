@@ -13,7 +13,7 @@ pytestmark = pytest.mark.unit
 
 
 # ---------------------------------------------------------------------------
-# Export/import directory name reconciliation — issue #785
+# Export/import directory name reconciliation
 # ---------------------------------------------------------------------------
 
 class TestExportImportDirectoryNamesAgree:
@@ -258,7 +258,7 @@ class TestContactsExport:
 
 
 # ---------------------------------------------------------------------------
-# Contacts .abcddb (SQLite AddressBook) parsing — issue #514
+# Contacts .abcddb (SQLite AddressBook) parsing
 # ---------------------------------------------------------------------------
 
 def _build_abcddb(
@@ -429,7 +429,7 @@ class TestAbcddbContactsParsing:
 
 
 class TestContactsDedup:
-    """Test _dedupe_contacts, the cross-source merge logic for #514."""
+    """Test _dedupe_contacts, the cross-source merge logic for contacts."""
 
     def _contact(self, full_name="", org="", emails=None, phones=None, **extra):
         c = {
@@ -534,7 +534,7 @@ class TestContactsDedup:
 
 class TestContactsExportAbcddbIntegration:
     """End-to-end export_contacts() coverage for the .abcddb path, including
-    the .abcdp fallback and the both-empty error case (issue #514)."""
+    the .abcdp fallback and the both-empty error case."""
 
     def _lib_ab(self, tmp_path: Path) -> Path:
         return tmp_path / "Library" / "Application Support" / "AddressBook"
@@ -654,7 +654,7 @@ class TestContactsExportAbcddbIntegration:
 
 class TestExportResultFinalization:
     """_finalize_result guards against a source reporting "ok" with no
-    actual output. Issue #505's secondary finding: export_contacts returned
+    actual output: export_contacts can return
     {"status": "ok", "count": 0, "path": ""} when no .abcdp files existed —
     indistinguishable from a genuinely healthy empty result."""
 
@@ -698,11 +698,9 @@ class TestExportResultFinalization:
         """Full-loop check: export_contacts's own empty-result, run through
         _finalize_result exactly as main() does, stays an error.
 
-        Historically (issue #505) export_contacts returned {"status": "ok",
-        "count": 0, "path": ""} here and _finalize_result had to catch it.
-        Issue #514 made export_contacts itself report "error" directly when
-        neither the .abcddb nor the .abcdp path yields any contacts, so this
-        is now a no-op pass-through rather than a state flip."""
+        export_contacts itself reports "error" directly when
+        neither the .abcddb nor the .abcdp path yields any contacts, so
+        _finalize_result is a no-op pass-through rather than a state flip."""
         from scripts.apple_data_export import export_contacts
 
         lib_ab = tmp_path / "Library" / "Application Support" / "AddressBook"
@@ -721,8 +719,8 @@ class TestExportResultFinalization:
 
 class TestContactsImportManifestAware:
     """import_contacts must not report success/skip when the Mac-side
-    export marked contacts as errored (issue #505 acceptance criteria:
-    "the Linux import surfaces it rather than reporting success")."""
+    export marked contacts as errored ("the Linux import surfaces it
+    rather than reporting success")."""
 
     def _write_contacts(self, import_dir: Path, contacts: list[dict]):
         import_dir.mkdir(parents=True, exist_ok=True)
@@ -740,7 +738,7 @@ class TestContactsImportManifestAware:
         }
 
     def test_missing_file_no_manifest_error_is_still_skipped(self, tmp_path):
-        """Regression check: unrelated to #505, unchanged behavior."""
+        """Regression guard: the missing-file-without-manifest-error path stays skipped."""
         from scripts.apple_data_import import import_contacts
 
         import_dir = tmp_path / "apple-imports"
@@ -751,8 +749,8 @@ class TestContactsImportManifestAware:
         assert result == {"status": "skipped", "reason": "contacts.json not found"}
 
     def test_missing_file_with_manifest_error_is_error(self, tmp_path):
-        """The exact issue #505 scenario: export never wrote contacts.json
-        (zero .abcdp files found), the export-side fix now marks that as an
+        """When export never wrote contacts.json
+        (zero .abcdp files found), the export side marks that as an
         error in the manifest, and the import must surface an error instead
         of a benign "skipped"."""
         from scripts.apple_data_import import import_contacts
@@ -859,14 +857,13 @@ class TestStalenessAlerting:
         assert any("10 days old" in r.message for r in caplog.records)
 
     def test_stale_7d_critical_sets_structured_message(self, tmp_path, caplog):
-        """Issue #646 regression guard: the staleness signal must be readable
+        """The staleness signal must be readable
         from check_manifest()'s return value, not just the log stream. A
         CRITICAL log line lands in the sync log file fine, but it doesn't
         drive record_failure/the run status/the nightly summary — only the
-        subprocess exit code does, and a prose-only CRITICAL (the pre-fix
-        behavior) never touches that. This test fails against that pre-fix
-        behavior: caplog would still show the CRITICAL, but
-        manifest["_staleness_critical_message"] wouldn't exist."""
+        subprocess exit code does, and a prose-only CRITICAL log line never
+        touches that: caplog would show the CRITICAL even though
+        manifest["_staleness_critical_message"] doesn't exist."""
         from scripts.apple_data_import import check_manifest
 
         import_dir = tmp_path / "apple-imports"
@@ -951,15 +948,14 @@ class TestStalenessAlerting:
 
 
 # ---------------------------------------------------------------------------
-# Per-source freshness (issue #820) — a partial export run must not refresh
+# Per-source freshness — a partial export run must not refresh
 # the manifest's top-level timestamp for sources it did not run.
 # ---------------------------------------------------------------------------
 
 class TestPerSourceStaleness:
     """check_manifest judges each source's staleness from its own recorded
     exported_at, not the shared top-level one — so a fresh run of source B
-    doesn't mask a week-old preserved entry for source A (#786 made that
-    preservation possible; this closes the staleness gap it opened)."""
+    doesn't mask a week-old preserved entry for source A."""
 
     def _write_manifest(self, import_dir: Path, top_level_exported_at: str, results: dict):
         import_dir.mkdir(parents=True, exist_ok=True)
@@ -972,7 +968,7 @@ class TestPerSourceStaleness:
             json.dump(manifest, f)
 
     def test_preserved_stale_entry_judged_on_own_timestamp(self, tmp_path, caplog):
-        """The exact #786/#820 scenario: source A (contacts) was preserved
+        """Source A (contacts) was preserved
         from a run 10 days ago; source B (whatsapp) ran moments ago and
         refreshed the top-level exported_at. A must still be flagged stale —
         judged from its own timestamp, not B's fresh one."""
@@ -1030,10 +1026,10 @@ class TestPerSourceStaleness:
         assert result.get("_stale_sources", {}) == {}
 
     def test_legacy_manifest_without_per_source_timestamps_falls_back(self, tmp_path, caplog):
-        """A manifest written before #820 has no per-source exported_at at
-        all — must still import, relying entirely on the pre-existing
-        top-level staleness check (already covered by TestStalenessAlerting)
-        rather than crashing or silently skipping staleness detection."""
+        """A legacy manifest with no per-source exported_at at
+        all — must still import, relying entirely on the top-level staleness
+        check (already covered by TestStalenessAlerting) rather than
+        crashing or silently skipping staleness detection."""
         from scripts.apple_data_import import check_manifest
 
         import_dir = tmp_path / "apple-imports"
@@ -1052,7 +1048,7 @@ class TestPerSourceStaleness:
 
         assert result is not None
         # No per-source signal (nothing to fall back to per-source), but the
-        # top-level check still fires exactly as it did before this change.
+        # top-level check still fires.
         assert result.get("_stale_sources", {}) == {}
         assert "10 days old" in result.get("_staleness_critical_message", "")
 
@@ -1102,7 +1098,7 @@ class TestPerSourceStaleness:
     ):
         """A source that is configured and healthy (fresh per-source
         timestamp, no error) must produce identical printed results and
-        SYNC_STATS after this change — the staleness/error overrides must be
+        SYNC_STATS — the staleness/error overrides must be
         true no-ops, not just "doesn't raise"."""
         import scripts.apple_data_import as import_mod
 
@@ -1152,7 +1148,7 @@ class TestPerSourceStaleness:
 
 
 # ---------------------------------------------------------------------------
-# Agent self-update SHA (issue #509) — export side
+# Agent self-update SHA — export side
 # ---------------------------------------------------------------------------
 
 class TestAgentShaExport:
@@ -1186,7 +1182,7 @@ class TestAgentShaExport:
             assert _get_agent_sha() is None
 
     def test_main_writes_agent_sha_to_manifest(self, tmp_path, monkeypatch):
-        """main() records the checked-out SHA in manifest.json (issue #509) so the
+        """main() records the checked-out SHA in manifest.json so the
         Linux side can tell which revision produced an export without SSHing."""
         import scripts.apple_data_export as export_mod
 
@@ -1241,7 +1237,7 @@ class TestAgentShaExport:
 
 
 # ---------------------------------------------------------------------------
-# Manifest merge on partial (single-source) export runs — issue #786
+# Manifest merge on partial (single-source) export runs
 # ---------------------------------------------------------------------------
 
 class TestManifestMergeOnPartialExport:
@@ -1283,16 +1279,16 @@ class TestManifestMergeOnPartialExport:
         manifest = json.loads((tmp_path / "manifest.json").read_text())
         results = manifest["results"]
         # The run source reflects the new result, stamped with this run's own
-        # freshness (issue #820: per-source exported_at/agent_sha)...
+        # freshness (per-source exported_at/agent_sha)...
         assert results["whatsapp"] == {
             "status": "ok", "count": 1, "path": "fake",
             "exported_at": manifest["exported_at"], "agent_sha": "newsha456",
         }
         # ...and every other source's prior entry is untouched, except for a
-        # backfilled exported_at/agent_sha (issue #820 follow-up): these
-        # entries predate per-source timestamps, and the old top-level
-        # values describing when they actually ran are only available right
-        # now, before this write replaces the top level with today's run.
+        # backfilled exported_at/agent_sha: these
+        # entries predate per-source timestamps, so the top-level
+        # values recording when they actually ran are only available
+        # until this write replaces the top level with today's run.
         assert results["contacts"] == {
             "status": "ok", "count": 5,
             "exported_at": "2026-01-01T00:00:00+00:00", "agent_sha": "oldsha123",
@@ -1416,7 +1412,7 @@ class TestManifestMergeOnPartialExport:
         }
 
     def test_single_source_dry_run_does_not_write_manifest(self, tmp_path, monkeypatch):
-        """Out of scope for #786: dry-run stays preview-only, no manifest
+        """Dry-run stays preview-only: no manifest
         write at all, merge or otherwise."""
         import scripts.apple_data_export as export_mod
 
@@ -1446,7 +1442,7 @@ class TestManifestMergeOnPartialExport:
     ):
         """A single-source run must never fall back to overwriting an
         unreadable/corrupt manifest with just its own result — that would
-        reproduce the exact data-loss bug #786 fixes, just triggered by
+        lose every other source's last-known state, just triggered by
         corruption instead of an ordinary single-source run."""
         import scripts.apple_data_export as export_mod
 
@@ -1506,7 +1502,7 @@ class TestManifestMergeOnPartialExport:
 
 
 # ---------------------------------------------------------------------------
-# Agent self-update SHA (issue #509) — import side
+# Agent self-update SHA — import side
 # ---------------------------------------------------------------------------
 
 class TestAgentShaImport:
@@ -1569,7 +1565,7 @@ class TestAgentShaImport:
         )
 
     def test_mismatched_sha_sets_structured_message(self, tmp_path, caplog):
-        """Issue #646: run_all_syncs.py reads this drift signal directly off
+        """run_all_syncs.py reads this drift signal directly off
         the manifest dict (not the subprocess log stream) so it can surface
         in the nightly Telegram/markdown summary — this must be readable
         from the return value, not just caplog."""
@@ -1601,7 +1597,7 @@ class TestAgentShaImport:
         assert "_agent_sha_drift_message" not in result
 
     def test_missing_agent_sha_handled_silently(self, tmp_path, caplog):
-        """Manifests written before this change have no agent_sha — must not
+        """A manifest with no agent_sha field must not
         warn or crash."""
         from scripts.apple_data_import import check_manifest
 
@@ -1634,7 +1630,7 @@ class TestAgentShaImport:
 
 
 # ---------------------------------------------------------------------------
-# Export agent label in alerts (issue #770) — no hardcoded hardware name
+# Export agent label in alerts — no hardcoded hardware name
 # ---------------------------------------------------------------------------
 
 class TestExportAgentLabelInAlerts:
@@ -1697,26 +1693,26 @@ class TestExportAgentLabelInAlerts:
 
     def test_default_setting_value_matches_current_hardcoded_wording_intent(self):
         """Regression guard: the default must be the generic label, not
-        empty or a specific machine name — a fresh clone must see no
-        difference in *meaning*, only in no longer naming hardware."""
+        empty or a specific machine name — a fresh clone must see the same
+        behavior, described generically rather than by naming hardware."""
         from config.settings import Settings
 
         assert Settings().apple_export_agent_label == "the export agent"
 
 
 # ---------------------------------------------------------------------------
-# WhatsApp export (issue #677) — a failed `wacli sync` must not export as
+# WhatsApp export — a failed `wacli sync` must not export as
 # status "ok", a 405 "Client outdated" must be diagnosed as client-version
 # (not auth), and a genuine auth failure must still be diagnosed as auth.
 # ---------------------------------------------------------------------------
 
 class TestWacliFailureDiagnosis:
     """_diagnose_wacli_failure classifies a failed `wacli sync` from its
-    combined stdout/stderr. Real sample output from issue #677 (synthetic
+    combined stdout/stderr. Real sample output (synthetic
     protocol/version numbers only, no personal data)."""
 
     # Captured 2026-08-24 on a wacli client frozen at 0.5.0 by a silent
-    # Homebrew tap rename (steipete/tap -> openclaw/tap) — see issue #677.
+    # Homebrew tap rename (steipete/tap -> openclaw/tap).
     SYNC_405_OUTPUT = (
         "[Client/Socket ERROR] Error reading from websocket: failed to get "
         "reader: failed to read frame header: EOF\n"
@@ -1899,8 +1895,8 @@ class TestExportWhatsapp:
         assert "reason" not in result
 
     def test_nonzero_sync_exit_marks_error_not_ok(self, tmp_path):
-        """Issue #677's core bug: a failing `wacli sync` used to export as
-        status "ok" and package whatever stale data was already on disk."""
+        """A failing `wacli sync` must export as status "error", not "ok"
+        with whatever stale data was already on disk."""
         result = self._run_export(
             tmp_path, sync_returncode=1, sync_output="[Client ERROR] connection refused",
         )
@@ -2081,7 +2077,7 @@ class TestPhoneImport:
         assert se.canonical_person_id == "person-abc"
 
     def test_unresolved_call_stores_orphan_source_entity(self, tmp_path):
-        """Issue #226 policy: an unresolved phone observation still produces
+        """An unresolved phone observation still produces
         an unlinked source_entity (``canonical_person_id IS NULL``), so
         ``link_source_entities`` can retro-link it once the matching Contact
         / email arrives. No Interaction is created — those require a person.
@@ -2198,13 +2194,13 @@ class TestPhoneImport:
 
 
 # ---------------------------------------------------------------------------
-# main() — missing import dir is a clean skip, not a hard failure (#698)
+# main() — missing import dir is a clean skip, not a hard failure
 # ---------------------------------------------------------------------------
 
 class TestMissingImportDirIsCleanSkip:
     """A fresh install with no Apple Data Agent ever configured must skip
     cleanly (exit 0, SYNC_SKIPPED marker) instead of failing loud every
-    night — the apple_import-shaped sibling of #687's clean-skip pattern."""
+    night."""
 
     def test_missing_import_dir_does_not_raise_and_prints_sync_skipped(
         self, tmp_path, monkeypatch, capsys
@@ -2215,8 +2211,8 @@ class TestMissingImportDirIsCleanSkip:
         monkeypatch.setattr(import_mod, "IMPORT_DIR", missing_dir)
         monkeypatch.setattr(import_mod.sys, "argv", ["apple_data_import.py", "--execute"])
 
-        # main() must fall through cleanly (no SystemExit) — a hard
-        # sys.exit(1) here is exactly the regression this issue fixes.
+        # main() must fall through cleanly (no SystemExit), never a hard
+        # sys.exit(1).
         import_mod.main()
 
         printed = capsys.readouterr().out
@@ -2224,8 +2220,8 @@ class TestMissingImportDirIsCleanSkip:
         assert "Apple Data Agent" in printed
 
     def test_existing_import_dir_with_manifest_is_unaffected(self, tmp_path, monkeypatch):
-        """A configured install (dir exists) must not take the new skip
-        branch at all — #646 behavior (staleness, per-source errors) is
+        """A configured install (dir exists) must not take the skip
+        branch at all — staleness and per-source error behavior is
         untouched."""
         import scripts.apple_data_import as import_mod
 
@@ -2257,18 +2253,17 @@ class TestMissingImportDirIsCleanSkip:
 
 
 # ---------------------------------------------------------------------------
-# main() — critical staleness must fail the run (issue #646)
+# main() — critical staleness must fail the run
 # ---------------------------------------------------------------------------
 
 class TestManifestStalenessFailsRun:
-    """Regression for issue #646's headline defect: a manifest whose every
+    """A manifest whose every
     source reports ok, but whose exported_at is older than
     STALENESS_CRITICAL_HOURS, must fail the run — not just log a CRITICAL
     that lands in the sync log file but never drives record_failure, the
     run status, or the nightly summary (only the subprocess exit code
-    does). This is the exact "27/27 succeeded" scenario from the linked
-    outage: a dead Mac Mini export agent left a stale-but-formally-healthy
-    manifest in place for 10 nights."""
+    does). A dead export agent can leave a stale-but-formally-healthy
+    manifest in place for many nights running."""
 
     def _stub_source(self, dry_run=False, **kwargs):
         return {"status": "ok", "created": 0}
@@ -2345,9 +2340,8 @@ class TestManifestStalenessFailsRun:
         import_mod.main()
 
     def test_per_source_error_still_fails_run_alongside_fresh_staleness(self, tmp_path, monkeypatch):
-        """Keep the existing per-source status=='error' behaviour working
-        unchanged (issue #646 acceptance criteria: don't regress it while
-        fixing staleness)."""
+        """Keep the existing per-source status=='error' behavior working
+        unchanged while fixing staleness."""
         import scripts.apple_data_import as import_mod
 
         import_dir = tmp_path / "apple-imports"
@@ -2383,17 +2377,16 @@ class TestManifestStalenessFailsRun:
 
 
 class TestManifestErrorOverridesLocalSuccess:
-    """Issue #646 follow-up: import_contacts/import_whatsapp check the
+    """import_contacts/import_whatsapp check the
     manifest internally (_manifest_source_errored) and already report
     "error" themselves when the Mac-side export failed. imessage, phone,
     photos, and health do NOT — they only look at whether their input file
     exists. If a stale file from a prior successful export is still on
     disk, the local import happily reprocesses it and reports "ok",
     silently masking a Mac-side export failure that check_manifest()'s
-    per-source walk only logs (never structurally surfaced before this
-    fix). main() must override that back to "error" and still fail the
-    run — the exact same "logged but not structured" trap as staleness,
-    just for a different signal."""
+    per-source walk only logs. main() must override that back to "error"
+    and still fail the run — the exact same "logged but not structured"
+    trap as staleness, just for a different signal."""
 
     def _run_with_manifest_error(self, tmp_path, monkeypatch, source_name, stub_result):
         import scripts.apple_data_import as import_mod

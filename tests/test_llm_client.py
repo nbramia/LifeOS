@@ -404,7 +404,7 @@ class TestParseResponse:
         assert resp.reasoning_starved is False
 
     def test_closing_only_think_tag_leaks_no_reasoning(self):
-        """Finding 1 (CRITICAL): many llama.cpp jinja templates pre-fill the
+        """Many llama.cpp jinja templates pre-fill the
         opening <think> into the prompt, so the model emits only a closing
         </think>. Everything before it is reasoning; everything after is the
         answer — none of the reasoning should leak into .text."""
@@ -425,7 +425,7 @@ class TestParseResponse:
         assert "internal reasoning" not in resp.text
 
     def test_literal_think_tag_in_legitimate_content_untouched(self):
-        """Finding 2 (MAJOR): a literal <think>...</think> pair appearing
+        """A literal <think>...</think> pair appearing
         after ordinary prose (not at the start of the response) is just text
         a user is asking about — it must not be corrupted or split into
         .reasoning."""
@@ -443,7 +443,7 @@ class TestParseResponse:
         assert resp.reasoning == ""
 
     def test_reasoning_starved_true_for_closing_only_truncation(self):
-        """Finding 3 (MAJOR): a closing-only <think> block that consumed the
+        """A closing-only <think> block that consumed the
         whole token budget must be flagged as reasoning_starved, same as the
         full-pair case."""
         client = self._client()
@@ -461,7 +461,7 @@ class TestParseResponse:
         assert resp.reasoning_starved is True
 
 
-# ---- Reasoning control (#566 PR 2: per-request thinking/reasoning_effort) ----
+# ---- Reasoning control ----
 
 
 class TestReasoningControlPayloadHelper:
@@ -499,7 +499,7 @@ class TestReasoningControlPayloadHelper:
 
 class TestCreateReasoningControl:
     """create()/acreate() forward reasoning control into the request body,
-    and the request body is byte-identical to before this feature existed
+    and the request body is unchanged from the plain request shape
     when neither knob is passed."""
 
     def _client(self):
@@ -590,9 +590,8 @@ class TestCreateReasoningControl:
 
 class TestRemoteProviderConfig:
     """LocalLLMClient is generic OpenAI-compatible plumbing, not
-    llama-server-specific (#654): a configured `model`/`api_key` reach the
-    wire, while every default reproduces the exact llama-server behavior
-    this class had before those parameters existed."""
+    llama-server-specific: a configured `model`/`api_key` reach the
+    wire, while every default reproduces plain llama-server behavior."""
 
     def _fake_sync_client(self):
         from unittest.mock import MagicMock
@@ -609,8 +608,7 @@ class TestRemoteProviderConfig:
 
     def test_default_has_no_auth_header(self):
         """The llama-server path (no api_key given) gets no Authorization
-        header at all — not an empty one — same as before this parameter
-        existed."""
+        header at all — not an empty one."""
         from api.services.llm_client import LocalLLMClient
         client = LocalLLMClient(base_url="http://fake:8080")
         assert "authorization" not in client.sync_client.headers
@@ -683,7 +681,7 @@ class TestRemoteProviderConfig:
 class TestBaseUrlV1Normalization:
     """LocalLLMClient.__init__ strips one trailing /v1 segment so both
     OpenAI-compatible URL conventions land on the same
-    /v1/chat/completions wire path (#706)."""
+    /v1/chat/completions wire path."""
 
     def test_strips_trailing_v1(self):
         from api.services.llm_client import LocalLLMClient
@@ -837,7 +835,7 @@ class TestSingleton:
         reset_local_llm()
 
     def test_anthropic_backend_no_key_raises_named_error(self):
-        """#771: a keyless anthropic-backend install gets a human-readable
+        """A keyless anthropic-backend install gets a human-readable
         error naming the missing setting, not a raw SDK exception surfacing
         later at first use."""
         from api.services.llm_client import get_local_llm, reset_local_llm, LLMBackendNotConfiguredError
@@ -850,7 +848,7 @@ class TestSingleton:
         reset_local_llm()
 
     def test_remote_backend_configured_returns_local_llm_client_pointed_at_provider(self):
-        """#771: LIFEOS_LLM_BACKEND=remote with a fully-configured provider
+        """LIFEOS_LLM_BACKEND=remote with a fully-configured provider
         builds a LocalLLMClient wired to the remote provider's settings."""
         from api.services.llm_client import get_local_llm, reset_local_llm, LocalLLMClient
         reset_local_llm()
@@ -869,7 +867,7 @@ class TestSingleton:
         reset_local_llm()
 
     def test_remote_backend_not_configured_raises_named_error(self):
-        """#771: LIFEOS_LLM_BACKEND=remote with an incomplete provider config
+        """LIFEOS_LLM_BACKEND=remote with an incomplete provider config
         fails fast with a named error rather than silently falling back to
         another backend."""
         from api.services.llm_client import get_local_llm, reset_local_llm, LLMBackendNotConfiguredError
@@ -883,8 +881,8 @@ class TestSingleton:
 
     def test_specialist_client_resolves_model_from_settings(self):
         """get_anthropic_llm() resolves LIFEOS_ANTHROPIC_SPECIALIST_MODEL,
-        independent of the orchestrator model (#470 — was a hardcoded dated
-        snapshot that retired and 404'd every specialist caller)."""
+        independent of the orchestrator model — a hardcoded dated snapshot
+        would eventually retire and 404 every specialist caller."""
         from api.services.llm_client import get_anthropic_llm, reset_local_llm, AnthropicLLMClient
         reset_local_llm()
         with patch("api.services.llm_client.settings") as mock_settings:
@@ -901,7 +899,7 @@ class TestSingleton:
         reset_local_llm()
 
     def test_specialist_client_keyed_install_never_probes_local(self):
-        """#772: the central "keyed install byte-for-byte unchanged"
+        """The central "keyed install byte-for-byte unchanged"
         requirement -- with a key set, get_anthropic_llm() must not
         construct or probe a LocalLLMClient at all, not just happen to
         return an AnthropicLLMClient."""
@@ -920,11 +918,11 @@ class TestSingleton:
         reset_local_llm()
 
     def test_specialist_client_falls_back_to_local_when_no_key(self):
-        """#772: a keyless install used to silently produce nothing from
-        relationship insights, fact extraction, and tone analysis, because
-        get_anthropic_llm() always built an AnthropicLLMClient regardless
+        """A keyless install must not silently produce nothing from
+        relationship insights, fact extraction, and tone analysis just
+        because get_anthropic_llm() built an AnthropicLLMClient regardless
         of LIFEOS_LLM_BACKEND. With no key and a reachable local
-        llama-server, it now falls back to that instead."""
+        llama-server, it falls back to that instead."""
         from api.services.llm_client import get_anthropic_llm, reset_local_llm, LocalLLMClient
         reset_local_llm()
         with patch("api.services.llm_client.settings") as mock_settings, \
@@ -940,7 +938,7 @@ class TestSingleton:
         reset_local_llm()
 
     def test_specialist_client_falls_back_to_remote_when_local_unreachable(self):
-        """#772: no key and the local llama-server is unreachable, but the
+        """No key and the local llama-server is unreachable, but the
         remote paid provider is fully configured -- falls back to it
         instead of the raw Anthropic no-key error."""
         from api.services.llm_client import get_anthropic_llm, reset_local_llm, LocalLLMClient
@@ -963,10 +961,10 @@ class TestSingleton:
         reset_local_llm()
 
     def test_specialist_client_degrades_when_nothing_configured(self):
-        """#772: no key, local unreachable, remote not configured -- this
+        """No key, local unreachable, remote not configured -- this
         function still returns a client (pointed at the unreachable local
         server) instead of raising, so each caller's existing try/except
-        around its `.create()` call degrades to its current empty/no-op
+        around its `.create()` call degrades to its empty/no-op
         result rather than an unhandled exception here."""
         from api.services.llm_client import get_anthropic_llm, reset_local_llm, LocalLLMClient
         reset_local_llm()
@@ -1206,7 +1204,7 @@ class TestRoutingHelpers:
             assert mod.is_local_routing_llm_available() is False
 
     def test_is_available_true_when_remote_configured_and_local_errors(self, _routing_singleton_reset):
-        """#773: is_local_routing_llm_available reports true when the local
+        """is_local_routing_llm_available reports true when the local
         probe fails but a remote provider is configured, so a caller
         gating on this doesn't skip straight to its no-op fallback while
         generate_text's own local-then-remote retry has a working remote
@@ -1237,7 +1235,7 @@ class TestRoutingHelpers:
     def test_remote_routing_client_builds_from_remote_settings(self, _routing_singleton_reset):
         """_remote_routing_client builds a LocalLLMClient pointed at the
         configured remote provider's settings, the fallback target
-        generate_text retries against (#773)."""
+        generate_text retries against."""
         mod = _routing_singleton_reset
 
         with patch.object(mod, "settings") as mock_settings:
@@ -1253,10 +1251,9 @@ class TestRoutingHelpers:
 
     @pytest.mark.asyncio
     async def test_generate_text_local_success_never_touches_remote(self, _routing_singleton_reset):
-        """#773: on a reachable local server, generate_text makes exactly
+        """On a reachable local server, generate_text makes exactly
         one call (local's acreate()) -- no availability probe, no remote
-        construction -- byte-for-byte the same request as before this
-        fallback existed."""
+        construction."""
         from unittest.mock import AsyncMock, MagicMock
         mod = _routing_singleton_reset
 
@@ -1272,8 +1269,8 @@ class TestRoutingHelpers:
 
     @pytest.mark.asyncio
     async def test_generate_text_falls_back_to_remote_when_local_fails(self, _routing_singleton_reset):
-        """#773: a keyless/local-less install (only a remote provider
-        configured) now gets query routing, conversation titling,
+        """A keyless/local-less install (only a remote provider
+        configured) must still get query routing, conversation titling,
         agent-activity summaries, and fact filtering instead of every one
         of those silently doing nothing -- generate_text retries once
         against the remote provider when the local call itself fails."""
@@ -1296,7 +1293,7 @@ class TestRoutingHelpers:
 
     @pytest.mark.asyncio
     async def test_generate_text_forwards_timeout_to_remote_fallback(self, _routing_singleton_reset):
-        """#773: a per-call timeout (three of four real callers pass one)
+        """A per-call timeout (three of four real callers pass one)
         must reach the remote fallback too, not just the transient local
         candidate."""
         from unittest.mock import AsyncMock, MagicMock
@@ -1318,11 +1315,10 @@ class TestRoutingHelpers:
 
     @pytest.mark.asyncio
     async def test_generate_text_propagates_local_failure_when_remote_not_configured(self, _routing_singleton_reset):
-        """#773: with no remote provider configured, a local failure
-        propagates exactly as it did before this fallback existed, so
-        every existing caller's own no-op/default handling (route()'s
-        keyword fallback, the titler's except Exception, etc.) still
-        applies unchanged."""
+        """With no remote provider configured, a local failure
+        propagates unchanged, so every existing caller's own
+        no-op/default handling (route()'s keyword fallback, the titler's
+        except Exception, etc.) still applies."""
         from unittest.mock import AsyncMock, MagicMock
         mod = _routing_singleton_reset
 
@@ -1336,7 +1332,7 @@ class TestRoutingHelpers:
 
     @pytest.mark.asyncio
     async def test_generate_text_never_falls_back_to_anthropic(self, _routing_singleton_reset):
-        """#773: routing-tier calls stay off the paid API even when local
+        """Routing-tier calls stay off the paid API even when local
         fails and Anthropic is the main orchestration backend -- only the
         configured remote provider (never Anthropic) is a fallback
         target."""
@@ -1551,7 +1547,7 @@ class TestAStreamReasoning:
 
     @pytest.mark.asyncio
     async def test_literal_think_tag_in_stream_not_corrupted(self):
-        """Finding 2 (MAJOR), streaming version: a literal <think>...</think>
+        """The streaming version: a literal <think>...</think>
         pair after ordinary prose (not a leading prefix) must reach the
         caller untouched, not be split into reasoning."""
         chunks = [
@@ -1587,12 +1583,12 @@ class TestAStreamReasoning:
 
     @pytest.mark.asyncio
     async def test_starvation_warning_fires_when_budget_exhausted_on_reasoning(self, caplog):
-        """#567: astream ignores reasoning_content deltas entirely, so a
+        """astream ignores reasoning_content deltas entirely, so a
         reasoning model that burns its whole max_tokens budget on
-        chain-of-thought and never reaches an answer used to fail silently
+        chain-of-thought and never reaches an answer must not fail silently
         (empty text, no signal). When no text was ever emitted, reasoning
         deltas WERE seen, and finish_reason=="length", a warning must be
-        logged naming the cause (thinking) and the fix (disable it / raise
+        logged naming the cause (thinking) and the remedy (disable it / raise
         max_tokens) — without changing what's yielded."""
         chunks = [
             {"choices": [{"delta": {"reasoning_content": "thinking, thinking..."}, "finish_reason": None}]},
@@ -1627,7 +1623,7 @@ class TestAStreamReasoning:
         assert warnings == []
 
 
-# ---- Anthropic prompt caching (#383 Phase 1) ----
+# ---- Anthropic prompt caching ----
 
 
 def _fake_message_start(*, input_tokens=100, output_tokens=1, cache_creation=0, cache_read=0):
@@ -1812,7 +1808,7 @@ class TestAnthropicCaching:
 
     @pytest.mark.asyncio
     async def test_astream_yields_usage_update_from_message_start_and_message_delta(self):
-        """#629: message_start (usage always fully populated) and
+        """message_start (usage always fully populated) and
         message_delta (only output_tokens guaranteed -- input_tokens/cache_*
         are frequently None) both surface as a "usage_update" event, so a
         caller cancelled mid-round can credit tokens already billed instead
@@ -1861,9 +1857,9 @@ class TestAnthropicCaching:
     async def test_astream_forwards_timeout_to_sdk(self):
         """astream accepts a per-request timeout and forwards it to the SDK.
 
-        Regression for #385: the agent loop's synthesis round calls
-        astream(..., timeout=180), which used to raise TypeError on the
-        Anthropic backend because the method had no timeout parameter.
+        The agent loop's synthesis round calls astream(..., timeout=180);
+        the Anthropic backend must accept a timeout parameter rather than
+        raising TypeError.
         """
         from types import SimpleNamespace
         client = _anthropic_client()

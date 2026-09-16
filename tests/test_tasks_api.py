@@ -170,7 +170,7 @@ class TestTasksAPI:
         assert response.status_code == 422
         assert "reserved" in response.json()["detail"]
 
-    # --- DRY RUN (#138) ---
+    # --- DRY RUN ---
 
     def test_dry_run_with_engine_tag_returns_preflight_preview(self, client, mock_task_manager):
         """dry_run=true on an engine-assigned task runs preflight and returns

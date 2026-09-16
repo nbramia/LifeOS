@@ -572,7 +572,7 @@ def test_executor_rejects_empty_prompt(stores, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# #379 — operator kill terminates the local codex subprocess (parity with
+# Operator kill terminates the local codex subprocess (parity with
 # the claude_code executor coverage)
 # ---------------------------------------------------------------------------
 

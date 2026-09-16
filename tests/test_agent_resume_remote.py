@@ -86,7 +86,7 @@ def test_remote_resume_wraps_launcher_in_ssh(client, remote_cc_session, monkeypa
     # The LOCAL ssh client must not cwd= into a path that only exists remotely.
     assert popen_mock.call_args.kwargs["cwd"] is None
 
-    # Round 1, finding #7: an ssh round trip routinely exceeds the 1.5s
+    # An ssh round trip routinely exceeds the 1.5s
     # local budget — the remote branch must pass the larger, connect-
     # timeout-derived value to communicate(), not the local one.
     from config.settings import settings

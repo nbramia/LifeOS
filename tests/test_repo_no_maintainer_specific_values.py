@@ -1,18 +1,16 @@
-"""Guard tracked code against maintainer-specific values (#789).
+"""Guard tracked code against maintainer-specific values.
 
-This project is meant to be installable by anyone, but nothing previously
-stopped maintainer-specific values from landing in the tracked codebase
-itself. Three instances were found by a person reading the code by hand:
-a hardcoded directory path rooted in the maintainer's own home folder
-(#767), a specific computer model named in operator-facing alert text
-(#770), and a data-store write restriction wired unconditionally to the
-maintainer's own personal capture pipeline (#769). This module is the
-standing guard against a fourth: a fast scan of tracked source for two of
-those value classes, each with a maintained allowlist/denylist rather
-than a fuzzy heuristic (see the third class -- #769's "hardcoded value
-tied to one person's pipeline" -- is not something a text pattern can
-express; it's out of scope for this scan, same as #789's own Out of Scope
-section says).
+This project is meant to be installable by anyone, so nothing should let
+maintainer-specific values land in the tracked codebase itself. Three
+instances are known: a hardcoded directory path rooted in the
+maintainer's own home folder, a specific computer model named in
+operator-facing alert text, and a data-store write restriction wired
+unconditionally to the maintainer's own personal capture pipeline. This
+module is the standing guard against a fourth: a fast scan of tracked
+source for two of those value classes, each with a maintained
+allowlist/denylist rather than a fuzzy heuristic (the third class -- a
+"hardcoded value tied to one person's pipeline" -- is not something a
+text pattern can express; it's out of scope for this scan).
 
 Two scans:
 
@@ -26,7 +24,7 @@ Two scans:
    maintainer username is never one of these.
 
 2. `find_hardware_name_violations` -- a specific device/computer model
-   name (seeded with "Mac Mini", #770) in tracked source, allowlisted at
+   name (seeded with "Mac Mini") in tracked source, allowlisted at
    the *file* level rather than by line number: line numbers drift as
    unrelated code above them changes (this repo's own issue tracker
    already needed a citation correction for exactly that reason), so a
@@ -66,10 +64,9 @@ _HARDWARE_MODEL_DENYLIST = ("Mac Mini",)
 # File-level allowlist for _HARDWARE_MODEL_DENYLIST matches. Repo-relative
 # path strings (as `git ls-files` reports them).
 _HARDWARE_NAME_ALLOWLIST = {
-    # #770 landed -- it genericized the operator-facing alert text
-    # ("Check Mac Mini cron and rsync pipeline.", etc.) and the specific
-    # comments its own acceptance criteria called out. These two files
-    # still contain OTHER "Mac Mini" mentions #770 didn't touch (docstrings
+    # These two files' operator-facing alert text ("Check Mac Mini cron
+    # and rsync pipeline.", etc.) is already generic. They still contain
+    # OTHER "Mac Mini" mentions that are not operator-facing (docstrings
     # like "Import phone call history from the Mac Mini's JSON export",
     # an argparse --help description, an unrelated SHA-drift-warning
     # comment) -- same not-operator-facing rationale as the four entries
@@ -80,8 +77,8 @@ _HARDWARE_NAME_ALLOWLIST = {
     # Not operator-facing (no alert or message a person sees at runtime) --
     # engineering comments/docstrings describing this maintainer's own
     # configured Apple Data Agent hardware for a future reader of the code.
-    # #770 does not cover these. Recorded here as a known instance of the
-    # same value class (not tracked by any issue yet) so a *new*
+    # Recorded here as a known instance of the
+    # same value class so a *new*
     # operator-facing mention elsewhere still fails the scan.
     "api/services/job_queue.py",
     "api/services/whatsapp.py",
@@ -100,17 +97,16 @@ _HARDWARE_NAME_ALLOWLIST = {
 # trivially bypassed by the other styling.
 _HARDWARE_MODEL_DENYLIST_LOWER = tuple(n.lower() for n in _HARDWARE_MODEL_DENYLIST)
 
-# #767 (investments SYNC_DIR hardcoded to the maintainer's home directory)
-# and #769 (vault.py's unconditional Journal-write reservation) are the
-# other two instances #789 was filed to allowlist. #767 is already fixed
-# on this integration branch (api/routes/investments.py now reads
-# settings.investments_sync_dir) -- no live path violation remains, so it
-# needs no entry above. #769 isn't a path or a hardware name -- it's the
-# third value class (a hardcoded value tied to one person's individual
-# pipeline), which isn't expressible as a text pattern for either scan
-# below and is out of scope for this check (see module docstring and
-# #789's own Out of Scope section); noted here for the record rather than
-# as a functioning allowlist entry.
+# Two other known instances of maintainer-specific values: a hardcoded
+# directory path rooted in the maintainer's home directory (investments
+# SYNC_DIR, read from settings.investments_sync_dir -- no live path
+# violation remains, so it needs no entry above), and vault.py's
+# unconditional Journal-write reservation, which isn't a path or a
+# hardware name -- it's the third value class (a hardcoded value tied to
+# one person's individual pipeline), which isn't expressible as a text
+# pattern for either scan below and is out of scope for this check (see
+# module docstring); noted here for the record rather than as a
+# functioning allowlist entry.
 
 # Path-segment placeholders that are unambiguously never a real username --
 # a single character, or a literal "...". Deliberately does NOT include
@@ -178,8 +174,8 @@ def _git_ls_files_root() -> Path:
 
 def _tracked_files() -> list[Path]:
     """Every git-tracked file, excluding tests/, docs/, and this file
-    itself (redundant with the tests/ exclusion today, kept explicit per
-    #789's own wording in case the allowlist ever moves out of tests/)."""
+    itself (redundant with the tests/ exclusion today, kept explicit
+    in case the allowlist ever moves out of tests/)."""
     result = subprocess.run(
         ["git", "ls-files"], cwd=_git_ls_files_root(), check=True, capture_output=True, text=True,
     )
@@ -248,7 +244,7 @@ def test_no_hardcoded_home_directory_paths():
 
 
 class TestScanFunctionsActuallyDetectViolations:
-    """#789's own Verification requirement: a fixture case proving each
+    """A fixture case proving each
     scan actually fails when it should, not just trivially passing because
     nothing in the current tree ever exercises its failure path."""
 
@@ -276,7 +272,7 @@ class TestScanFunctionsActuallyDetectViolations:
     def test_hardware_name_scan_is_case_insensitive(self, tmp_path):
         """Apple's own styling ("Mac mini") must be caught, not just this
         codebase's ("Mac Mini") -- a case-sensitive check would be
-        trivially bypassed by the other styling (Codex review finding)."""
+        trivially bypassed by the other styling."""
         bad = tmp_path / "bad_alert_lowercase.py"
         bad.write_text('ALERT = "Check the Mac mini agent."\n')
 

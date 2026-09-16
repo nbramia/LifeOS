@@ -662,7 +662,7 @@ def test_stream_reports_lane_and_pending_question(stores):
 
 
 # ---------------------------------------------------------------------------
-# Summary search (issue #252) — GET /api/agents/search + the cache-only
+# Summary search — GET /api/agents/search + the cache-only
 # search_cached_summaries helper. Seeds the disk cache directly so no LLM runs.
 # ---------------------------------------------------------------------------
 

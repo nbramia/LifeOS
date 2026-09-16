@@ -10,7 +10,7 @@ from api.services.entity_resolver import (
     ResolutionResult,
 )
 
-# #682: marked per-class/per-function rather than module-level, because
+# Marked per-class/per-function rather than module-level, because
 # TestResolveByName::test_create_with_context_inference needs a real
 # configured settings.current_work_path (see its own marker below) while
 # every other test in this file is fully isolated (temp_store/tmp_path).

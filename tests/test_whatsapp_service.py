@@ -561,7 +561,7 @@ class TestProcessWhatsAppMessagesLidPhone:
 
 
 # ---------------------------------------------------------------------------
-# Contact processing — LID contacts becoming source entities (#503)
+# Contact processing — LID contacts becoming source entities
 # ---------------------------------------------------------------------------
 
 class _FakePerson:

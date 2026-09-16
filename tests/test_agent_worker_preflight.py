@@ -76,16 +76,16 @@ def test_preflight_sanity_failure_passed_through():
 
 
 # ---------------------------------------------------------------------------
-# #747 — a sanity rejection must park, not cancel, unless the code itself can
+# A sanity rejection must park, not cancel, unless the code itself can
 # confirm the title is empty, deterministically destructive, or preflight
 # itself failed. `sane_fatal` is the signal the worker uses to distinguish.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_sane_false_on_mundane_title_is_not_fatal():
-    """Repro of the live #747 bug: the model rejects a routine UI task as
-    'not executable'. The title itself is ordinary — the classifier's own
-    inferred opinion must not be treated as fatal."""
+    """The model may reject a routine UI task as
+    'not executable' even though the title itself is ordinary — the
+    classifier's own inferred opinion must not be treated as fatal."""
     reply = _golden_reply(
         sane=False,
         sane_reason="This is a product specification or feature request, not a task an agent can execute.",
@@ -149,13 +149,13 @@ def test_preflight_unparseable_reply_sanity_is_not_fatal():
 
 
 # ---------------------------------------------------------------------------
-# #748 — a routing/method-of-execution question smuggled into `ambiguity`
+# A routing/method-of-execution question smuggled into `ambiguity`
 # must not block; routing (including the default route) owns that decision.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_routing_flavored_ambiguity_is_suppressed():
-    """Repro of the live #748 bug: the model raises 'should this go to a
+    """The model may raise 'should this go to a
     local agent or is it a design task for a human engineer' as ambiguity.
     That's a routing question, not a blocking ambiguity."""
     reply = _golden_reply(
@@ -190,8 +190,8 @@ def test_genuine_missing_referent_ambiguity_still_blocks():
 
 @pytest.mark.unit
 def test_default_route_applies_when_ambiguity_is_routing_flavored(monkeypatch):
-    """#707's default route must not be defeated by a spurious routing-
-    flavored ambiguity — this was the concrete way #748 broke #707."""
+    """The default route must not be defeated by a spurious routing-
+    flavored ambiguity."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "local")
     reply = _golden_reply(
@@ -286,7 +286,7 @@ def test_preflight_budget_partial_uses_defaults():
 
 
 # ---------------------------------------------------------------------------
-# Prompt-content tests — verify routing rules visible to Haiku (issue #119)
+# Prompt-content tests — verify routing rules visible to Haiku
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -320,7 +320,7 @@ def test_preflight_prompt_infers_claude_from_capability_phrases():
 def test_preflight_prompt_says_method_questions_are_not_ambiguity():
     """Repro of the live bug: preflight was flagging "summarize Julia's
     background" as ambiguous because the agent could use either local
-    docs or web search. The prompt now tells the classifier that
+    docs or web search. The prompt tells the classifier that
     method-of-execution choices are NEVER ambiguity — the agent picks
     one and adapts. Without this guidance Haiku over-blocks."""
     prompt = pf.build_preflight_prompt(title="anything", tags=["agent"])
@@ -346,7 +346,7 @@ def test_preflight_prompt_includes_ordered_precedence():
 
 
 # ---------------------------------------------------------------------------
-# Tag precedence (#139 §2)
+# Tag precedence
 # ---------------------------------------------------------------------------
 
 def _stub_caller(routing="claude", routing_explicit=False):
@@ -354,7 +354,7 @@ def _stub_caller(routing="claude", routing_explicit=False):
 
     `routing_explicit` mirrors the classifier's own flag: true only when the
     operator named the engine themselves. Cloud routes without it are
-    downgraded to `ask` (#584), so tests that want a real cloud dispatch either
+    downgraded to `ask`, so tests that want a real cloud dispatch either
     set it (with a title that names the engine) or use a `#cloud*` tag.
     """
     import json
@@ -403,7 +403,7 @@ def test_local_tag_overrides_to_local_model():
 
 @pytest.mark.unit
 def test_cloud_tag_routes_to_remote_provider_not_anthropic():
-    """(#809) `#cloud` now routes to the configured remote OpenAI-compatible
+    """`#cloud` routes to the configured remote OpenAI-compatible
     provider, never the Anthropic API — regardless of what preflight itself
     returned. `model` is left empty: the remote model id comes from
     `settings.remote_llm_model` at dispatch time, not from `ALLOWED_MODELS`."""
@@ -416,10 +416,9 @@ def test_cloud_tag_routes_to_remote_provider_not_anthropic():
 
 @pytest.mark.unit
 def test_untagged_cloud_route_is_downgraded_to_ask():
-    """An inferred cloud route never dispatches on its own (#584).
+    """An inferred cloud route never dispatches on its own.
 
-    Replaces the former "untagged cloud → Sonnet default" case: without a
-    `#cloud*` tag or an operator who named the engine, a `claude` route from
+    Without a `#cloud*` tag or an operator who named the engine, a `claude` route from
     the classifier is a guess, and guessing costs API credits. It becomes
     `ask`, and the model is left unset for the answer to decide.
     """
@@ -505,7 +504,7 @@ def test_claude_tag_beats_codex_tag():
 
 
 # ---------------------------------------------------------------------------
-# Preset class tag detection (#139 §3 wiring)
+# Preset class tag detection
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -560,7 +559,7 @@ def test_preset_class_set_on_empty_title_short_circuit():
 
 
 # ---------------------------------------------------------------------------
-# Cost gates: fail-fast budget check (#139 §6) + cost preview (#139 §7)
+# Cost gates: fail-fast budget check + cost preview
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -575,7 +574,7 @@ def test_cloud_route_emits_cost_estimate():
 
 @pytest.mark.unit
 def test_remote_route_emits_zero_estimate():
-    """(#809) `#cloud` (the remote provider) is treated like local/CLI for
+    """`#cloud` (the remote provider) is treated like local/CLI for
     preflight cost-preview purposes — the §6/§7 confirmation ceremony is
     specifically for the Anthropic-API 'expensive exception', not third-party
     spend in general. Real spend still records correctly at execution time
@@ -684,7 +683,7 @@ def test_cost_confirmation_disabled_when_threshold_zero(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# API-spend gate (#584): an inferred cloud route never dispatches on its own
+# API-spend gate: an inferred cloud route never dispatches on its own
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -732,12 +731,11 @@ def test_operator_naming_the_engine_dispatches_without_a_question(title):
 
 @pytest.mark.unit
 def test_bare_cloud_in_title_no_longer_corroborates_anthropic():
-    """(#809) Before #809, a title merely containing the bare word "cloud"
-    counted as corroboration for a model-claimed `routing="claude"` — safe
-    when "cloud" and "the Anthropic API" were the same thing. They no longer
-    are: `#cloud` the tag now means the configured remote provider, so this
-    title must NOT dispatch straight to the API any more — it falls through
-    to the #584 downgrade-to-`ask` path instead, same as any other
+    """A title merely containing the bare word "cloud" must not count as
+    corroboration for a model-claimed `routing="claude"`: `#cloud` the tag
+    means the configured remote provider, not the Anthropic API, so this
+    title must NOT dispatch straight to the API — it falls through
+    to the downgrade-to-`ask` path instead, same as any other
     unconfirmed cloud inference."""
     result = pf.run_preflight("run it on the cloud model", tags=["agent"],
                               caller=_stub_caller(routing="claude", routing_explicit=True))
@@ -753,8 +751,8 @@ def test_bare_cloud_in_title_no_longer_corroborates_anthropic():
 def test_cloud_tags_are_consent_and_still_dispatch(tag, expected_model):
     """`#cloud-haiku`/`#cloud-sonnet` tasks were explicitly tagged by the
     operator, so they keep dispatching straight to the API — the gate is
-    about inference only. (Bare `#cloud` is covered separately — #809
-    remapped it to the remote route, not the API.)"""
+    about inference only. (Bare `#cloud` is covered separately — it routes
+    to the remote provider, not the API.)"""
     result = pf.run_preflight("any task", tags=["agent", tag],
                               caller=_stub_caller(routing="claude"))
     assert result.routing == pf.ROUTE_CLAUDE
@@ -784,7 +782,7 @@ def test_preflight_max_tokens_floor():
 
 
 # ---------------------------------------------------------------------------
-# #704 — `_default_llm_caller` client-selection fallback order
+# `_default_llm_caller` client-selection fallback order
 # ---------------------------------------------------------------------------
 
 class _FakeLLMResponse:
@@ -795,7 +793,7 @@ class _FakeLLMResponse:
 @pytest.mark.unit
 def test_default_llm_caller_uses_anthropic_when_key_set_no_probe(monkeypatch):
     """Order 1: an Anthropic key selects AnthropicLLMClient with
-    agent_preflight_model, exactly as before #704 — and never touches
+    agent_preflight_model, and never touches
     LocalLLMClient.is_available (no reachability probe on this branch)."""
     from config.settings import settings
     from api.services.llm_client import AnthropicLLMClient, LocalLLMClient
@@ -873,7 +871,7 @@ def test_default_llm_caller_falls_back_to_local_when_reachable(monkeypatch):
 
 @pytest.mark.unit
 def test_default_llm_caller_falls_back_to_remote_when_local_unreachable(monkeypatch):
-    """Order 3: no Anthropic key, local unreachable, #699 remote provider
+    """Order 3: no Anthropic key, local unreachable, remote provider
     configured + enabled → runs on the remote OpenAI-compatible provider."""
     from config.settings import settings
     from api.services.llm_client import LocalLLMClient
@@ -902,7 +900,7 @@ def test_default_llm_caller_falls_back_to_remote_when_local_unreachable(monkeypa
     result = pf._default_llm_caller("some prompt")
 
     assert result == "remote reply"
-    # #706: LocalLLMClient strips one trailing /v1 segment so the wire
+    # LocalLLMClient strips one trailing /v1 segment so the wire
     # path is always {base}/v1/chat/completions, never .../v1/v1/....
     assert captured["base_url"] == "https://remote.example"
     assert captured["model"] == "accounts/fireworks/models/deepseek-v4-flash-0731"
@@ -940,8 +938,8 @@ def test_default_llm_caller_raises_when_no_client_usable(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# #808 — LIFEOS_AGENT_PREFLIGHT_ENGINE: which client `_default_llm_caller`
-# builds for the preflight classifier call, independent of the #704 auto
+# LIFEOS_AGENT_PREFLIGHT_ENGINE: which client `_default_llm_caller`
+# builds for the preflight classifier call, independent of the auto
 # order. Every test below monkeypatches anthropic_api_key, the full
 # remote_llm_* block, and agent_remote_executor explicitly (in addition to
 # agent_preflight_engine) — a host .env can set any of these ambiently, and
@@ -951,10 +949,10 @@ def test_default_llm_caller_raises_when_no_client_usable(monkeypatch):
 
 @pytest.mark.unit
 def test_preflight_engine_auto_explicit_matches_704_order(monkeypatch):
-    """Explicit engine="auto" reproduces the #704 Anthropic-first order —
+    """Explicit engine="auto" reproduces the Anthropic-first order —
     no probe of the local llama-server, same client construction. Proves
-    "auto" is a real branch, not just the unset-default case the untouched
-    #704 tests already cover."""
+    "auto" is a real branch, not just the unset-default case the other
+    tests already cover."""
     from config.settings import settings
     from api.services.llm_client import AnthropicLLMClient, LocalLLMClient
 
@@ -1029,7 +1027,7 @@ def test_preflight_engine_remote_configured_builds_remote_client(monkeypatch):
     result = pf._default_llm_caller("some prompt")
 
     assert result == "remote reply"
-    # #706: LocalLLMClient strips one trailing /v1 segment.
+    # LocalLLMClient strips one trailing /v1 segment.
     assert captured["base_url"] == "https://remote.example"
     assert captured["model"] == "accounts/fireworks/models/deepseek-v4-flash-0731"
     assert captured["timeout"] == 42
@@ -1230,7 +1228,7 @@ def test_preflight_engine_invalid_value_falls_back_to_auto(monkeypatch, caplog):
 
 
 # ---------------------------------------------------------------------------
-# #707 — LIFEOS_AGENT_DEFAULT_ROUTE: route "ask for lack of cues" outcomes
+# LIFEOS_AGENT_DEFAULT_ROUTE: route "ask for lack of cues" outcomes
 # instead of blocking, on installs with exactly one executor.
 # ---------------------------------------------------------------------------
 
@@ -1270,17 +1268,14 @@ def test_default_route_applies_to_llm_omitted_routing(monkeypatch):
 
 @pytest.mark.unit
 def test_default_route_demotes_ambiguity_and_applies(monkeypatch):
-    """#751: with a default route configured, a non-null ambiguity on an
+    """With a default route configured, a non-null ambiguity on an
     otherwise-runnable task is demoted to advisory (not discarded — it's
     preserved on `demoted_ambiguity` for the session log) and the default
     route applies, rather than the task blocking on the question.
 
-    This supersedes the pre-#751 `test_default_route_does_not_apply_on_ambiguity`
-    expectation (ambiguity used to hard-block even with a default route
-    configured) — the issue this fixes (#751) is specifically that a
-    configured default route is a standing "run untagged tasks without
+    A configured default route is a standing "run untagged tasks without
     asking me" instruction that a cheap classifier's hedging must not
-    override, and string-matching the hedge's prose (#748) proved to be
+    override, and string-matching the hedge's prose proved to be
     whack-a-mole once the model rephrased around the pattern.
     """
     from config.settings import settings
@@ -1339,7 +1334,7 @@ def test_default_route_does_not_apply_on_llm_error(monkeypatch):
 
 @pytest.mark.unit
 def test_default_route_does_not_apply_to_unconfirmed_cloud_inference(monkeypatch):
-    """Set + a #584 cloud-inference downgrade (a cue nobody confirmed, not a
+    """Set + a cloud-inference downgrade (a cue nobody confirmed, not a
     *lack* of cues) -> still ask. This is the case the plain
     `routing == ask and sane and ambiguity is None` gate would wrongly
     catch without the original-routing check."""
@@ -1353,10 +1348,10 @@ def test_default_route_does_not_apply_to_unconfirmed_cloud_inference(monkeypatch
 
 @pytest.mark.unit
 def test_default_route_does_not_rescue_unconfirmed_cloud_even_with_ambiguity(monkeypatch):
-    """#751 must not weaken #584: even though a configured default route now
-    demotes ambiguity, it must not also rescue an inferred (unconfirmed)
-    cloud route from the #584 downgrade — never auto-spend on inferred
-    cloud routing, ambiguity or not."""
+    """Demoting ambiguity for a configured default route must not weaken
+    the cloud-inference downgrade: it must not also rescue an inferred
+    (unconfirmed) cloud route from the downgrade — never auto-spend on
+    inferred cloud routing, ambiguity or not."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "local")
     reply = _golden_reply(
@@ -1367,7 +1362,7 @@ def test_default_route_does_not_rescue_unconfirmed_cloud_even_with_ambiguity(mon
     assert result.routing == pf.ROUTE_ASK
     assert "not explicitly requested" in result.routing_reason
     # The ambiguity is still demoted (advisory) — it just doesn't change the
-    # #584 outcome, since routing==ask blocks independently either way.
+    # ask outcome, since routing==ask blocks independently either way.
     assert result.ambiguity is None
     assert result.demoted_ambiguity == "Which recipient — no name given in the title?"
 
@@ -1390,9 +1385,10 @@ def test_default_route_invalid_value_logs_error_and_falls_back_to_ask(monkeypatc
 
 @pytest.mark.unit
 def test_default_route_invalid_value_does_not_demote_ambiguity(monkeypatch):
-    """#751 is gated on the setting being non-empty AND valid — a typo'd
-    value is not a standing instruction the operator successfully gave, so
-    ambiguity must still block exactly like the no-default-route case."""
+    """Ambiguity demotion is gated on the setting being non-empty AND
+    valid — a typo'd value is not a standing instruction the operator
+    successfully gave, so ambiguity must still block exactly like the
+    no-default-route case."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "bogus-route")
     reply = _golden_reply(
@@ -1416,18 +1412,19 @@ def test_default_route_tags_still_win(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# #803 — a non-fatal sanity opinion must not gate feature requests when a
+# A non-fatal sanity opinion must not gate feature requests when a
 # default route is configured: the operator's standing "run untagged tasks
 # without asking me" instruction outranks a cheap classifier's "this isn't
-# executable" hedge, exactly as #751 already does for `ambiguity`. Every
-# test here monkeypatches `settings.agent_default_route` explicitly (never
-# relies on it being unset) since a host `.env` can leak the setting in.
+# executable" hedge, the same way default-route demotion already works for
+# `ambiguity`. Every test here monkeypatches `settings.agent_default_route`
+# explicitly (never relies on it being unset) since a host `.env` can leak
+# the setting in.
 # ---------------------------------------------------------------------------
 
-# The two real field verdicts referenced in #803: the classifier calling an
+# Two real field verdicts: the classifier calling an
 # ordinary feature request "a product specification or feature request, not
-# a task an agent can execute" — once on the #747 voice-UI task, once on the
-# #774 macOS setup-script parity task.
+# a task an agent can execute" — once on a voice-UI task, once on a
+# macOS setup-script parity task.
 _FIELD_VERDICT_SANE_REASON = (
     "This is a product specification or feature request, not a task an "
     "agent can execute."
@@ -1442,7 +1439,7 @@ _FIELD_VERDICT_TITLES = [
 @pytest.mark.unit
 @pytest.mark.parametrize("title", _FIELD_VERDICT_TITLES)
 def test_default_route_demotes_field_verdict_sanity_and_runs(monkeypatch, title):
-    """#803 acceptance: given a default route and one of the real field
+    """Given a default route and one of the real field
     verdicts, the task routes and runs — the opinion is demoted to
     `demoted_sanity` and logged, not surfaced as a block."""
     from config.settings import settings
@@ -1460,7 +1457,7 @@ def test_default_route_demotes_field_verdict_sanity_and_runs(monkeypatch, title)
 
 @pytest.mark.unit
 def test_no_default_route_field_verdict_sanity_still_parks(monkeypatch):
-    """#3 acceptance: with no default route configured, #747's park
+    """With no default route configured, the sanity-opinion park
     behavior is unchanged — explicit empty setting, not ambient default,
     per the host-.env leak risk."""
     from config.settings import settings
@@ -1543,9 +1540,9 @@ def test_default_route_does_not_substitute_on_unparseable_reply(monkeypatch):
 
 @pytest.mark.unit
 def test_default_route_invalid_value_does_not_demote_sanity(monkeypatch):
-    """#803 is gated on the setting being non-empty AND valid — a typo'd
-    value is not a standing instruction the operator successfully gave, so
-    a non-fatal sanity objection must still park exactly like the
+    """Sanity demotion is gated on the setting being non-empty AND valid — a
+    typo'd value is not a standing instruction the operator successfully
+    gave, so a non-fatal sanity objection must still park exactly like the
     no-default-route case."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "bogus-route")
@@ -1561,7 +1558,7 @@ def test_default_route_invalid_value_does_not_demote_sanity(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# #757 — an uncorroborated LLM-invented route must not bypass
+# An uncorroborated LLM-invented route must not bypass
 # LIFEOS_AGENT_DEFAULT_ROUTE. All tests explicitly monkeypatch
 # `settings.agent_default_route` rather than relying on ambient env (a
 # freshly-filed issue exists about the host's real .env leaking into tests).
@@ -1569,7 +1566,7 @@ def test_default_route_invalid_value_does_not_demote_sanity(monkeypatch):
 
 @pytest.mark.unit
 def test_field_evidence_uncorroborated_local_route_demoted_to_default(monkeypatch):
-    """The exact field payload that motivated #757: LIFEOS_AGENT_DEFAULT_ROUTE
+    """A real field payload: LIFEOS_AGENT_DEFAULT_ROUTE
     configured, the model returns routing="local" with a plausible-sounding
     but non-cue reason, and the title has no rule-3 cue at all. The default
     route must win, and the demotion must be recorded on `demoted_routing`
@@ -1594,8 +1591,9 @@ def test_field_evidence_uncorroborated_local_route_demoted_to_default(monkeypatc
 @pytest.mark.unit
 def test_default_route_ignores_explicit_flag_without_title_corroboration(monkeypatch):
     """`routing_explicit=true` alone is not corroboration — same principle
-    #584 already applies to cloud, extended here to local/claude_code/codex.
-    A `true` with no matching title cue still gets demoted."""
+    the cloud-inference downgrade already applies to cloud, extended here
+    to local/claude_code/codex. A `true` with no matching title cue still
+    gets demoted."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "claude_code")
     reply = _golden_reply(
@@ -1641,12 +1639,13 @@ def test_title_names_claude_code_corroborates_and_wins_over_default(monkeypatch)
 
 @pytest.mark.unit
 def test_corroborated_cloud_route_stands_even_with_default_route_configured(monkeypatch):
-    """Combined #584/#757 case: a title that genuinely names the engine
+    """A title that genuinely names the engine
     (rule 3) still dispatches straight to Claude even though a default
-    route is configured for something else. #757's corroboration gate is
-    out of scope for ROUTE_CLAUDE entirely — #584's own, older
-    corroboration check inside `_apply_tag_overrides` already governs it —
-    so a corroborated cloud route is untouched by #757 either way."""
+    route is configured for something else. The route-corroboration gate
+    is out of scope for ROUTE_CLAUDE entirely — the cloud-inference
+    downgrade's own corroboration check inside `_apply_tag_overrides`
+    already governs it — so a corroborated cloud route is untouched by
+    route corroboration either way."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "local")
     result = pf.run_preflight(
@@ -1661,12 +1660,13 @@ def test_corroborated_cloud_route_stands_even_with_default_route_configured(monk
 @pytest.mark.unit
 def test_uncorroborated_cloud_inference_still_confirms_with_default_route_configured(monkeypatch):
     """The other half of the combined case: an *inferred* (not corroborated)
-    cloud route must still go through #584's confirmation flow — `ask`, not
-    silently redirected to the configured default and not silently
-    dispatched to the API. This duplicates the pre-existing
+    cloud route must still go through the cloud-inference downgrade's
+    confirmation flow — `ask`, not silently redirected to the configured
+    default and not silently dispatched to the API. This mirrors
     `test_default_route_does_not_apply_to_unconfirmed_cloud_inference`
-    coverage deliberately, right next to the #757 tests, as the explicit
-    proof that #757 does not weaken #584."""
+    deliberately, right next to the route-corroboration tests, as explicit
+    proof that route corroboration does not weaken the cloud-inference
+    downgrade."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "local")
     result = pf.run_preflight(
@@ -1680,9 +1680,10 @@ def test_uncorroborated_cloud_inference_still_confirms_with_default_route_config
 
 @pytest.mark.unit
 def test_tag_override_bypasses_route_corroboration_check(monkeypatch):
-    """A `#cloud-sonnet` tag is direct operator corroboration — #757's
-    title-cue check must not run on it at all, even though the model's own
-    uncorroborated route (local) would otherwise have been demoted."""
+    """A `#cloud-sonnet` tag is direct operator corroboration — the route-
+    corroboration title-cue check must not run on it at all, even though
+    the model's own uncorroborated route (local) would otherwise have been
+    demoted."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "claude_code")
     reply = _golden_reply(routing="local", routing_explicit=False, routing_reason="stub")
@@ -1693,7 +1694,7 @@ def test_tag_override_bypasses_route_corroboration_check(monkeypatch):
 
 @pytest.mark.unit
 def test_bare_cloud_tag_also_bypasses_route_corroboration_check(monkeypatch):
-    """(#809) Same bypass, for the bare `#cloud` tag routing to `remote` —
+    """Same bypass, for the bare `#cloud` tag routing to `remote` —
     it's still direct operator corroboration, just for a different route."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "claude_code")
@@ -1705,9 +1706,9 @@ def test_bare_cloud_tag_also_bypasses_route_corroboration_check(monkeypatch):
 
 @pytest.mark.unit
 def test_no_default_route_uncorroborated_local_route_is_unaffected():
-    """With no default route configured, #757 is a complete no-op: the
-    field-evidence payload's routing stands exactly as it did before this
-    fix — byte-identical to today for every fresh clone."""
+    """With no default route configured, route corroboration is a complete
+    no-op: the field-evidence payload's routing stands unchanged,
+    byte-identical for every fresh clone."""
     reply = _golden_reply(
         routing="local", routing_explicit=True,
         routing_reason="Software implementation task suitable for local execution.",

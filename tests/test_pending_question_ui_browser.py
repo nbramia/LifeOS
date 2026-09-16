@@ -75,7 +75,7 @@ def _install_conversation_mocks(page: Page, state: dict):
                 # session's result, #311) landing in a later poll.
                 "messages": list(state["messages"]),
                 "pending_question": None,
-                # #311: whether the spawned session is still running. The client
+                # Whether the spawned session is still running. The client
                 # stops polling once this is False AND no question is pending.
                 # Defaults to active so a test that never sets it keeps the
                 # historical "poll runs" behavior.

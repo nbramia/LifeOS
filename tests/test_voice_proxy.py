@@ -188,7 +188,7 @@ async def test_rejects_parent_traversal_path():
 
 
 # ---------------------------------------------------------------------------
-# Persistence tee (#711) — `_VoiceTurnPersister`
+# Persistence tee — `_VoiceTurnPersister`
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
