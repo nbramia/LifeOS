@@ -392,7 +392,7 @@ def test_routing_answer_parser_combined_replies():
     assert parse("codex") == "codex"
     assert parse("claude code") == "claude_code"
     assert parse("run it on claude-code") == "claude_code"
-    # A bare "claude" means the CLI, not the API (#584): both exist now, and
+    # A bare "claude" means the CLI, not the API: both exist, and
     # the subscription reading is the one where a misparse costs nothing.
     assert parse("CLAUDE please") == "claude_code"
     assert parse("It's John Doe, and let's use claude") == "claude_code"
@@ -400,9 +400,8 @@ def test_routing_answer_parser_combined_replies():
     assert parse("use opus") == "claude"
     assert parse("go ahead and use the api") == "claude"
     assert parse("use anthropic") == "claude"
-    # (#809) "cloud" no longer means the Anthropic API — it resolves to the
-    # configured remote provider, mirroring the `#cloud` tag's own remapped
-    # meaning.
+    # "cloud" resolves to the configured remote provider, not the Anthropic
+    # API, mirroring the `#cloud` tag's own meaning.
     assert parse("cloud") == "remote"
     assert parse("use deepseek") == "remote"
     # Combined: ambiguity answer first, engine second.
@@ -602,7 +601,7 @@ def test_lifeos_agent_user_ask_fails_when_telegram_unavailable(tmp_path: Path):
 
 
 # =============================================================================
-# Replyable terminal states + any-chunk matching (Issue #234)
+# Replyable terminal states + any-chunk matching
 # =============================================================================
 
 
@@ -695,7 +694,7 @@ def test_get_recent_resumable_followup_window(tmp_path: Path):
     row = store.get_recent_resumable_followup(within_seconds=1800)
     assert row is not None and row["task_id"] == "t1"
 
-    # Once answered, it is no longer resumable via this path.
+    # Once answered, it is not resumable via this path anymore.
     assert store.deposit_answer(500, "go")
     assert store.get_recent_resumable_followup(within_seconds=1800) is None
 
@@ -763,7 +762,7 @@ def test_native_reply_targets_specific_older_thread(tmp_path: Path):
 
 
 # =============================================================================
-# Operator root-spawn dispatch + routing-ask resolution (Issue #235)
+# Operator root-spawn dispatch + routing-ask resolution
 # =============================================================================
 
 

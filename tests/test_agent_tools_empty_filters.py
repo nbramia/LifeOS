@@ -1,22 +1,21 @@
 """
 Tests for filter echoing on empty results from the workout, task, and vault tools.
 
-Regression context (issue #535): same bug class as
-tests/test_agent_tools_scope_widening.py, one notch milder. These three tools
-applied the filters they were given, found nothing in the slice, and then
-described the *whole record* as empty — "No sessions logged.", "No tasks
-found.", "No vault results found." Asked whether any training happened in June,
-the workout log answered that no sessions are logged, which reads as "you have
-no training history"; a lift logged under another name read as never performed;
-a slightly misspelled task context read as an empty task list.
+Same bug class as tests/test_agent_tools_scope_widening.py, one notch
+milder: these three tools must not apply the filters they were given, find
+nothing in the slice, and then describe the *whole record* as empty — "No
+sessions logged.", "No tasks found.", "No vault results found." Asked
+whether any training happened in June, the workout log answering that no
+sessions are logged reads as "you have no training history"; a lift
+logged under another name would read as never performed; a slightly
+misspelled task context would read as an empty task list.
 
-No widening ladder belongs here — these corpora are cheap to re-query. The fix
-is only that the reply stops asserting more than the search established, so
-these tests pin the distinction that motivates the issue: a *filtered* empty
-must name its filters, while an *unfiltered* empty may still say the record is
-empty.
+No widening ladder belongs here — these corpora are cheap to re-query. The
+reply must only assert what the search established, so these tests pin the
+distinction: a *filtered* empty must name its filters, while an
+*unfiltered* empty may still say the record is empty.
 
-Second half of the same bug class (issue #537): a *non-empty* result that hides
+Second half of the same bug class: a *non-empty* result that hides
 its own ceiling, which is the more deceptive half — an empty answer invites a
 follow-up, a list that looks complete does not. Two things are pinned below for
 each capped path: the cap is disclosed when it binds (quoting the value actually
@@ -179,7 +178,8 @@ class TestWorkoutListCap:
         """Pinned against the corpus: the log holds 16 sessions in June 2026 and 18
         in its densest 30-day window, so the old default of 10 answered "how did
         June go" from 10 of 16. Also pinned at or above the store's own
-        list_sessions default, which the tool used to undercut fivefold."""
+        list_sessions default, so the tool's cap can never undercut the
+        service's own limit."""
         service_default = inspect.signature(fs.FitnessStore.list_sessions).parameters["limit"].default
         assert _WORKOUT_LIST_LIMIT >= 18
         assert _WORKOUT_LIST_LIMIT >= service_default
@@ -238,7 +238,7 @@ class TestWorkoutHistoryEmpty:
     def test_already_canonical_name_is_still_stated(self, store):
         out = _tool_manage_workouts({"action": "history", "exercise": "Flamingo Hold"})
         assert "Flamingo Hold" in out
-        # Nothing was rewritten, so claiming a normalisation would be noise.
+        # Nothing here got rewritten, so claiming a normalisation would be noise.
         assert "normalised from" not in out
         assert_no_fault_language(out)
 
