@@ -783,7 +783,7 @@ def get_repeated_yield_streak(source: str, value: float, limit: int = 50) -> int
     Complements :func:`get_consecutive_zero_yield_runs`, which only catches
     a source going silent (yield drops to zero). A source re-importing the
     same byte-identical stale upstream file every night can instead report
-    the *same non-zero* count forever — e.g. a dead Mac Mini export agent
+    the *same non-zero* count forever — e.g. a dead export agent
     that leaves ten nights reporting an identical "1294 created" while
     nothing had actually changed. A long streak of an identical
     non-zero count is the signature of that: real nightly variation almost
