@@ -547,9 +547,15 @@ class CodexExecutor:
         # interrupted stream that happens to exit 0) is still flagged there.
         if proc.returncode == 0:
             exit_meta = self._exit_metadata(proc, timed_out, state)
+            # `project=False`: a clean exit alone is not an earned completion —
+            # the dispatch layer's own check runs on the outcome this call
+            # returns. Recording the row without projecting keeps the
+            # cancelled/stale-turn detection below intact while leaving the
+            # card alone until that check decides this run actually completed.
             completed = self.session_store.update_status(
                 session.task_id, STATUS_COMPLETED,
                 attempt_id=session.attempt_id, turn_id=session.turn_id,
+                project=False,
             )
             if not completed:
                 if self.session_store.is_cancelled(

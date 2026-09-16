@@ -1490,6 +1490,7 @@ class SessionStore:
         turn_id: str | None = None,
         wait_type: str | None = None,
         wait_reason: str = "",
+        project: bool = True,
     ) -> bool:
         """Persist status, optionally only for the current execution turn.
 
@@ -1498,6 +1499,12 @@ class SessionStore:
         attempt's state, so identity-bearing callers get an atomic compare.
         The bool return is intentionally additive; legacy callers can ignore
         it while new lifecycle code can distinguish an ignored late write.
+
+        ``project=False`` persists the row and still applies the cancellation
+        fence and the atomic attempt/turn compare, but skips the
+        ``set_status_projector`` callback — for a caller that needs the row
+        (and its truthy/falsy return) updated before a later gate decides
+        whether this transition is allowed to reach the card at all.
         """
         where = ["task_id = ?"]
         params: list[object] = [task_id]
@@ -1529,7 +1536,10 @@ class SessionStore:
             )
         applied = cur.rowcount == 1
         projector = self._status_projector
-        if applied and projector is not None and status in TERMINAL_STATUSES | {STATUS_BLOCKED}:
+        if (
+            applied and project and projector is not None
+            and status in TERMINAL_STATUSES | {STATUS_BLOCKED}
+        ):
             projector(
                 task_id, status, attempt_id=attempt_id, turn_id=turn_id,
                 wait_type=wait_type, wait_reason=wait_reason,
