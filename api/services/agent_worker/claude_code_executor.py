@@ -787,7 +787,15 @@ class ClaudeCodeExecutor:
                 final_text=state.plan_text.strip(),
             )
 
-        if proc.returncode == 0 or state.terminal:
+        # A non-zero exit is authoritative even when the `result` event was
+        # parsed: the CLI process itself is reporting a bad end-of-run, and
+        # a turn that completed just before that is exactly the "stopped
+        # mid-thought but looks done" shape the terminal-evidence gate in
+        # normalize_outcome exists to catch, not a case for this executor to
+        # paper over. `state.terminal` still reaches `exit_meta` below either
+        # way, so a genuinely-clean run with no `result` event (an
+        # interrupted stream that happens to exit 0) is still flagged there.
+        if proc.returncode == 0:
             final_text = self._effective_final_text(state)
             exit_meta = self._exit_metadata(proc, timed_out, state)
             completed = self.session_store.update_status(
@@ -822,8 +830,9 @@ class ClaudeCodeExecutor:
                 exit_meta=exit_meta,
             )
 
-        # Subprocess exited non-zero without a terminal event — surface the
-        # stderr tail for the operator. Reading stderr after wait() is safe.
+        # Non-zero exit — surface the stderr tail for the operator, whether
+        # or not a `result` event was parsed. Reading stderr after wait() is
+        # safe.
         stderr_tail = ""
         try:
             stderr_tail = (proc.stderr.read() if proc.stderr else "") or ""
