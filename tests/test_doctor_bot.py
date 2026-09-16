@@ -1,4 +1,4 @@
-"""Tests for the doctor bot — the self-repair orchestration surface (#348).
+"""Tests for the doctor bot — the self-repair orchestration surface.
 
 Covers the four moving parts of bot-identity threading:
   1. Registry: the `doctor` entry loads with `orchestrates=True`.
@@ -56,7 +56,7 @@ class TestDoctorRegistry:
     def test_persona_file_encodes_orchestration_contract(self):
         """The doctor persona must carry the actual goal-first workflow, not a stub.
 
-        Beyond the original pipeline anchors, the goal-first rewrite (#397) wires
+        Beyond the original pipeline anchors, the goal-first rewrite wires
         in the enabler primitives: a [GOAL] gate, the integration-branch flow,
         pre-flight worktree cleanup, the detached restart primitive, and the
         configurable /implement base. These needles guard against the contract
@@ -115,7 +115,7 @@ class TestSessionStoreBotScoping:
         assert q is not None and q["session_id"] == pri_sid
 
     def test_primary_matches_legacy_null_bot(self, tmp_path):
-        """bot='primary' must still match pre-#348 rows that have NULL bot."""
+        """bot='primary' must still match legacy rows that have NULL bot."""
         store = self._store(tmp_path)
         store.create(task_id="pri", routing="claude_code", origin="operator")
         sid = store.get("pri").session_id
@@ -306,12 +306,11 @@ class TestDoctorListener:
 
     @pytest.mark.asyncio
     async def test_doctor_fresh_message_routes_through_chat_pipeline(self, monkeypatch):
-        """#684: doctor's direct-CC spawn entry (`_handle_orchestration_message`)
-        is retired — a fresh message now flows through the same chat pipeline
+        """A fresh message flows through the same chat pipeline
         as any other bot, resolving its persona via `persona_id` so it reaches
         Hermes (which supervises its own workers via `lifeos_agent_spawn`,
         config/personas/doctor.hermes.md) exactly like fitness/therapist/
-        finance/journal."""
+        finance/journal — there is no separate direct-CC spawn entry point."""
         monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
         listener = self._listener("doctor", "999", persona="DOCTOR CONTRACT", orchestrates=True)
         update = {"message": {"text": "search is broken", "chat": {"id": 999}, "message_id": 1}}
@@ -352,17 +351,13 @@ class TestDoctorListener:
         assert mock_chat.call_args.kwargs.get("backend") == "lifeos"
 
     # ------------------------------------------------------------------
-    # #453 guard, re-pinned for #684 (Codex adversarial review): the native
-    # fallback path still reaches chat.py's persona_id-gated orchestration
-    # spawn, which fires unconditionally for ANY message once persona_id
-    # names an orchestrating bot — so a bare affirmative reaching the
-    # NATIVE fallback (unlike the Hermes path, where spawning is the
+    # The native fallback path still reaches chat.py's persona_id-gated
+    # orchestration spawn, which fires unconditionally for ANY message once
+    # persona_id names an orchestrating bot — so a bare affirmative reaching
+    # the NATIVE fallback (unlike the Hermes path, where spawning is the
     # model's own deliberate tool call) must still be intercepted before it
-    # looks like a fresh "report". These replace the three tests removed
-    # earlier in this file that exercised the retired
-    # `_handle_orchestration_message` directly; the property they guarded
-    # is the same, only the call path changed (`_native_turn` /
-    # `_maybe_consume_bare_affirmative` in api/services/telegram.py).
+    # looks like a fresh "report". This is exercised via `_native_turn` /
+    # `_maybe_consume_bare_affirmative` in api/services/telegram.py.
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
@@ -419,7 +414,7 @@ class TestDoctorListener:
     async def test_doctor_native_fallback_real_report_still_dispatches(self, monkeypatch):
         """A real report that merely STARTS with an affirmative word exceeds
         the bare-affirmative bound (25 chars) and proceeds to the chat
-        pipeline normally, exactly as before #684."""
+        pipeline normally."""
         monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "")
         listener = self._listener("doctor", "999", persona="P", orchestrates=True)
         update = {"message": {
@@ -438,8 +433,8 @@ class TestDoctorListener:
     @pytest.mark.asyncio
     async def test_doctor_threaded_reply_runs_resume_hook(self):
         """Threaded-reply resume still short-circuits before the chat
-        pipeline is ever reached — unaffected by #684's retirement of the
-        direct-CC spawn entry for FRESH messages."""
+        pipeline is ever reached — independent of the fresh-message
+        chat-pipeline routing above."""
         listener = self._listener("doctor", "999", persona="P", orchestrates=True)
         update = {"message": {
             "text": "yes",
@@ -557,21 +552,14 @@ class TestDoctorListener:
         answered = store.list_answered_unprocessed_questions()
         assert len(answered) == 1
 
-    # #684 removed `_handle_orchestration_message`, the direct-CC entry for a
-    # FRESH message — including its bare-affirmative-routes-to-open-goal-gate
-    # special case (#453's "yes/approved orphan factory" guard). That guard
-    # existed only because every non-threaded message unconditionally spawned
-    # a session; on the new chat-pipeline path (Hermes, or the persona_id-
-    # gated native fallback) spawning is the model's own tool call, not an
-    # automatic per-message action, so the failure mode the guard protected
-    # against can't recur the same way. The three tests that exercised that
-    # method directly (`test_bare_affirmative_routes_to_open_goal_gate_not_spawn`,
-    # `test_bare_affirmative_with_no_gate_is_consumed_not_spawned`,
-    # `test_report_starting_with_yes_still_spawns`) were removed with it.
+    # There is no direct-CC entry for a FRESH message. On the chat-pipeline
+    # path (Hermes, or the persona_id-gated native fallback) spawning is the
+    # model's own tool call, not an automatic per-message action, so a bare
+    # affirmative reaching a fresh message cannot trigger an unwanted spawn
+    # the way an unconditional per-message spawn once could.
     # `_maybe_handle_claude_code_reply`'s own goal_approval handling (a
     # THREADED reply to the goal message, exercised above and in
-    # test_session_thread_replies.py) is unaffected and still covers the
-    # in-thread approval flow this retirement doesn't touch.
+    # test_session_thread_replies.py) covers the in-thread approval flow.
 
     @pytest.mark.asyncio
     async def test_pure_chat_bot_never_spawns_directly(self, monkeypatch):
@@ -593,7 +581,7 @@ class TestDoctorListener:
 
 # ---------------------------------------------------------------------------
 # 6. worker — a BLOCKED session whose reply-prompt can't be delivered escalates
-#    instead of hanging BLOCKED forever (#402)
+#    instead of hanging BLOCKED forever
 # ---------------------------------------------------------------------------
 
 class TestBlockedSessionEscalation:
@@ -717,7 +705,7 @@ class TestBlockedSessionEscalation:
 
 
 # ---------------------------------------------------------------------------
-# 6. [GOAL] tag → worker /goal injection on approval (#398)
+# 6. [GOAL] tag → worker /goal injection on approval
 # ---------------------------------------------------------------------------
 
 class TestGoalApproval:
@@ -792,7 +780,7 @@ class TestGoalApproval:
         assert not _is_affirmative("change it to all tests AND lint pass")
         assert not _is_affirmative("hmm")
         # "yes but ..." / "approve with changes" must NOT lock the stale goal —
-        # the refinement signal wins over the affirmative prefix (#406 review).
+        # the refinement signal wins over the affirmative prefix.
         assert not _is_affirmative("yes but make it stricter")
         assert not _is_affirmative("approve with changes: also require lint")
         assert not _is_affirmative("yes, also require lint")
@@ -800,10 +788,9 @@ class TestGoalApproval:
     def test_goal_block_registers_goal_approval_question(self, tmp_path):
         """A goal-approval BLOCKED outcome sends ONE anchored message — the
         goal body plus the threaded-reply instructions — and registers it as a
-        kind='goal_approval' pending question scoped to the doctor bot. (The
-        goal used to stream as its own message with a separate instruction
-        message as the reply anchor, which made "reply yes — to which
-        message?" ambiguous.)"""
+        kind='goal_approval' pending question scoped to the doctor bot. A
+        separate goal message with a separate instruction message as the
+        reply anchor would make "reply yes — to which message?" ambiguous."""
         from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
 
         w = self._make_worker(tmp_path, self._goal_blocked_stub())
